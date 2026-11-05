@@ -1,0 +1,18 @@
+[package]
+name = "giggles-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+giggles-consensus = { path = "../giggles-consensus" }
+giggles-core = { path = "../giggles-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen = "0.13"
+sha2 = "0.10"
