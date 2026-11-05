@@ -170,7 +170,7 @@ pub struct Report {
 }
 impl Report {
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1
+        if self.version != 2
             || self.scope != LOCAL_SCOPE
             || !(1..=8).contains(&self.samples_per_phase)
             || self.domains.len() != 3
@@ -237,12 +237,34 @@ impl Report {
                 sdk_validated_correlation_id,
             } = &i.outcome
             {
-                if *sdk_validated_correlation_id != i.correlation_id {
+                if *sdk_validated_correlation_id != i.correlation_id
+                    || reply["version"].as_u64() != Some(1)
+                    || reply["code"].as_u64() != Some(0)
+                {
                     return Err("response correlation mismatch".into());
                 }
                 let data: giggles_core::replica::NativeResponse =
                     serde_json::from_value(reply["data"].clone())?;
-                if data.version != 1 || data.operation.is_some_and(|v| v.0 != i.business_id) {
+                if data.version != 1
+                    || data.operation.map(|v| v.0) != Some(i.business_id)
+                    || !matches!(
+                        data.code.as_str(),
+                        "preview"
+                            | "committed"
+                            | "absent"
+                            | "28000"
+                            | "42501"
+                            | "55000"
+                            | "54000"
+                            | "GD001"
+                            | "GD002"
+                            | "22023"
+                            | "57014"
+                            | "53300"
+                            | "08007"
+                            | "XX000"
+                    )
+                {
                     return Err("response business ID mismatch".into());
                 }
                 if i.outcome.committed() {
@@ -300,6 +322,19 @@ impl Report {
             if statuses.is_empty() {
                 return Err("missing restored status reconciliation".into());
             }
+            let replays = self
+                .invocations
+                .iter()
+                .filter(|i| i.action == Action::Replay && i.business_id == *business)
+                .collect::<Vec<_>>();
+            if replays.len() != 1
+                || replays[0].phase != Phase::Restored
+                || !statuses
+                    .iter()
+                    .any(|s| s.end_micros <= replays[0].start_micros)
+            {
+                return Err("missing or invalid restored replay".into());
+            }
             if execute.outcome.committed() && !statuses.iter().any(|i| i.outcome.committed()) {
                 return Err("acknowledged commit not recovered".into());
             }
@@ -333,6 +368,7 @@ impl Report {
             return Err("receipt count differs from logical commits".into());
         }
         let mut receipt_ids = BTreeSet::new();
+        let mut expected_rows = BTreeMap::new();
         for record in records {
             let receipt: giggles_core::Receipt =
                 serde_json::from_value(record[1]["decision"]["Ok"].clone())?;
@@ -363,6 +399,12 @@ impl Report {
             {
                 return Err("receipt effects differ from requested single-row transition".into());
             }
+            if expected_rows
+                .insert(effect.key, effect.after.clone())
+                .is_some()
+            {
+                return Err("multiple campaign operations targeted the same row".into());
+            }
             let digest = Sha256::digest(serde_json::to_vec(&receipt.effects)?)
                 .iter()
                 .map(|b| format!("{b:02x}"))
@@ -374,7 +416,20 @@ impl Report {
                 return Err("actual receipt digest differs from SDK result".into());
             }
         }
+        // Every campaign execute is replayed successfully; each unique input row
+        // must therefore appear exactly once with its committed after-image.
+        if results.len() != executed.len() {
+            return Err("not every campaign operation committed on replay".into());
+        }
+        let rows: Vec<(giggles_core::Key, giggles_core::Row)> =
+            serde_json::from_value(self.final_inspection["reply"]["data"]["rows"].clone())?;
+        let row_count = rows.len();
+        let actual_rows = rows.into_iter().collect::<BTreeMap<_, _>>();
+        if row_count != actual_rows.len() || actual_rows != expected_rows {
+            return Err("inspected rows differ from committed effects".into());
+        }
         if self.barrier == 0
+            || self.final_inspection["applied"].as_u64() != Some(self.barrier)
             || self.catch_up.len() != 3
             || self
                 .catch_up
@@ -385,6 +440,25 @@ impl Report {
             || self.catch_up.iter().any(|c| c.applied < self.barrier)
         {
             return Err("catch-up incomplete".into());
+        }
+        for c in &self.catch_up {
+            let diagnostic = c.diagnostics["diagnostics"]
+                .as_str()
+                .ok_or("missing raw catch-up diagnostic")?;
+            let field = |name: &str| -> Option<u64> {
+                let values = diagnostic
+                    .split_whitespace()
+                    .filter_map(|s| s.strip_prefix(name))
+                    .collect::<Vec<_>>();
+                if values.len() == 1 {
+                    values[0].parse().ok()
+                } else {
+                    None
+                }
+            };
+            if field("id=") != Some(c.node) || field("applied=") != Some(c.applied) {
+                return Err("catch-up claim contradicts raw diagnostic".into());
+            }
         }
         if self.traces.len() != 9 {
             return Err("missing proxy traces".into());
@@ -491,6 +565,53 @@ impl Report {
             }
             if !live.is_empty() {
                 return Err("unfinished proxy connections".into());
+            }
+            for i in &self.invocations {
+                for direction in [Direction::Upstream, Direction::Downstream] {
+                    let expected = if name.starts_with("peer-") {
+                        let isolated_link = name
+                            .split('-')
+                            .skip(1)
+                            .any(|n| n == self.isolated_node.to_string());
+                        if i.phase == Phase::NoQuorum
+                            || (i.phase == Phase::DomainLoss && isolated_link)
+                        {
+                            Fault::Disconnect
+                        } else {
+                            Fault::Pass
+                        }
+                    } else if *name == format!("sdk-{}", self.isolated_node)
+                        && matches!(i.phase, Phase::DomainLoss | Phase::NoQuorum)
+                    {
+                        Fault::Disconnect
+                    } else if *name == format!("sdk-{}", self.initial_leader)
+                        && i.phase == Phase::Healthy
+                        && direction == Direction::Upstream
+                    {
+                        Fault::Delay { millis: 15 }
+                    } else {
+                        Fault::Pass
+                    };
+                    let controls = || {
+                        trace
+                            .events
+                            .iter()
+                            .filter(|e| e.kind == "control" && e.direction == Some(direction))
+                    };
+                    let active = controls()
+                        .rfind(|e| e.micros <= i.start_micros)
+                        .and_then(|e| e.fault)
+                        .unwrap_or(Fault::Pass);
+                    if active != expected
+                        || controls().any(|e| {
+                            e.micros > i.start_micros
+                                && e.micros <= i.end_micros
+                                && e.fault != Some(expected)
+                        })
+                    {
+                        return Err("fault controls do not cover the invocation phase".into());
+                    }
+                }
             }
         }
         Ok(())

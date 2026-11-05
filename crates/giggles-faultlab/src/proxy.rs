@@ -145,7 +145,7 @@ pub struct Proxy {
 }
 impl Proxy {
     pub async fn start(upstream: SocketAddr, limits: ProxyLimits) -> Result<Self> {
-        Self::start_inner(upstream, limits, None).await
+        Self::start_inner(upstream, limits, None, Instant::now()).await
     }
     /// Retain bounded JSONL events as they occur, including incomplete failed runs.
     pub async fn start_retained(
@@ -153,13 +153,23 @@ impl Proxy {
         limits: ProxyLimits,
         path: &Path,
     ) -> Result<Self> {
+        Self::start_retained_at(upstream, limits, path, Instant::now()).await
+    }
+    /// Share a monotonic origin with the campaign's invocation recorder.
+    pub async fn start_retained_at(
+        upstream: SocketAddr,
+        limits: ProxyLimits,
+        path: &Path,
+        start: Instant,
+    ) -> Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        Self::start_inner(upstream, limits, Some(file)).await
+        Self::start_inner(upstream, limits, Some(file), start).await
     }
     async fn start_inner(
         upstream: SocketAddr,
         limits: ProxyLimits,
         file: Option<File>,
+        start: Instant,
     ) -> Result<Self> {
         limits.validate()?;
         if !upstream.ip().is_loopback() || upstream.port() == 0 {
@@ -174,7 +184,7 @@ impl Proxy {
         });
         let log = Arc::new(Log {
             file: file.map(Mutex::new),
-            start: Instant::now(),
+            start,
             cap: limits.events,
             trace: Mutex::new(Trace {
                 events: Vec::new(),

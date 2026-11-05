@@ -78,6 +78,13 @@ raw start/end values retained. Election waiting is visible as gaps between calls
 the distributions are not election-time or sustained-recovery metrics. Replicas
 must all report applied indices at least the committed final inspection barrier.
 
+Report format 2 uses one monotonic clock origin for proxy events and SDK calls.
+Validation binds active faults to each call, raw catch-up diagnostics to the
+inspection barrier, final rows to receipt after-images, and every original
+operation to a restored replay. Format 1 reports remain historical artifacts;
+`check` rejects them because their separate clock origins cannot establish this
+timing contract. Capture a new campaign to obtain format 2 evidence.
+
 Verification uses one dedicated target directory:
 
 ```powershell

@@ -191,6 +191,7 @@ pub async fn run_with_loss(binary: &Path, samples: usize, lose_leader: bool) -> 
     }
 }
 async fn scenario(binary: &Path, samples: usize, root: &Path, lose_leader: bool) -> Result<Report> {
+    let campaign_start = Instant::now();
     let binary_hash = crate::process::file_sha256(binary)?;
     let (peer_ca, peer_key) = ca()?;
     let (task_ca, task_key) = ca()?;
@@ -226,13 +227,14 @@ async fn scenario(binary: &Path, samples: usize, root: &Path, lose_leader: bool)
             if from != to {
                 peer_proxies.insert(
                     (from, to),
-                    Proxy::start_retained(
+                    Proxy::start_retained_at(
                         peers[&to].address.parse()?,
                         ProxyLimits {
                             events: SCENARIO_EVENTS,
                             ..Default::default()
                         },
                         &root.join(format!("proxy-peer-{from}-{to}.jsonl")),
+                        campaign_start,
                     )
                     .await?,
                 );
@@ -240,13 +242,14 @@ async fn scenario(binary: &Path, samples: usize, root: &Path, lose_leader: bool)
         }
         sdk_proxies.insert(
             from,
-            Proxy::start_retained(
+            Proxy::start_retained_at(
                 task_addresses[&from],
                 ProxyLimits {
                     events: SCENARIO_EVENTS,
                     ..Default::default()
                 },
                 &root.join(format!("proxy-sdk-{from}.jsonl")),
+                campaign_start,
             )
             .await?,
         );
@@ -359,7 +362,7 @@ async fn scenario(binary: &Path, samples: usize, root: &Path, lose_leader: bool)
         json!({"op":"reload_credentials","expected":0,"bindings":[binding]}),
     )?)?;
     let mut rec = Recorder {
-        start: Instant::now(),
+        start: campaign_start,
         invocations: Vec::new(),
         log: std::fs::OpenOptions::new()
             .write(true)
@@ -506,7 +509,7 @@ async fn scenario(binary: &Path, samples: usize, root: &Path, lose_leader: bool)
         return Err("node binary changed during run".into());
     }
     Ok(Report {
-        version: 1,
+        version: 2,
         scope: LOCAL_SCOPE.into(),
         node_binary_sha256: binary_hash,
         host_os: std::env::consts::OS.into(),

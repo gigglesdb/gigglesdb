@@ -37,39 +37,31 @@ fn traces() -> std::collections::BTreeMap<String, Trace> {
                 },
             ];
             for d in [Direction::Upstream, Direction::Downstream] {
-                if name.starts_with("peer-") || name == "sdk-3" {
+                let mut control = |micros, fault| {
                     events.push(Event {
                         sequence: 0,
-                        micros: 2,
+                        micros,
                         connection: 0,
                         direction: Some(d),
                         kind: "control".into(),
                         bytes: 0,
-                        fault: Some(Fault::Disconnect),
-                    });
+                        fault: Some(fault),
+                    })
+                };
+                if name == "sdk-1" && d == Direction::Upstream {
+                    control(2, Fault::Delay { millis: 15 });
+                    control(1500, Fault::Pass);
                 }
-                events.push(Event {
-                    sequence: 0,
-                    micros: 2,
-                    connection: 0,
-                    direction: Some(d),
-                    kind: "control".into(),
-                    bytes: 0,
-                    fault: Some(Fault::Delay { millis: 15 }),
-                });
-                events.push(Event {
-                    sequence: 0,
-                    micros: 2,
-                    connection: 0,
-                    direction: Some(d),
-                    kind: "control".into(),
-                    bytes: 0,
-                    fault: Some(Fault::Pass),
-                });
+                if name.starts_with("peer-") || name == "sdk-3" {
+                    let isolated = name.split('-').skip(1).any(|n| n == "3");
+                    control(if isolated { 1500 } else { 2500 }, Fault::Disconnect);
+                }
+                control(3500, Fault::Pass);
             }
+            events.sort_by_key(|e| e.micros);
             events.push(Event {
                 sequence: 0,
-                micros: 3,
+                micros: 100000,
                 connection: 0,
                 direction: None,
                 kind: "stopped".into(),
@@ -93,6 +85,7 @@ fn fixture() -> Report {
     let mut invocations = Vec::new();
     let mut correlation = 1;
     let mut receipts = Vec::new();
+    let mut rows = Vec::new();
     for (n, phase) in [
         Phase::Healthy,
         Phase::DomainLoss,
@@ -131,6 +124,7 @@ fn fixture() -> Report {
             before,
             after,
         }];
+        rows.push(json!([effects[0].key, effects[0].after]));
         let digest = Sha256::digest(serde_json::to_vec(&effects).unwrap())
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -161,8 +155,8 @@ fn fixture() -> Report {
             action: Action::Execute,
             correlation_id: correlation,
             business_id: business,
-            start_micros: correlation * 100,
-            end_micros: correlation * 100 + 10,
+            start_micros: (n as u64 + 1) * 1000,
+            end_micros: (n as u64 + 1) * 1000 + 10,
             request: serde_json::from_slice(op.wire_bytes()).unwrap(),
             outcome: if phase == Phase::NoQuorum {
                 Observation::Unknown {
@@ -186,9 +180,23 @@ fn fixture() -> Report {
             outcome: response(correlation),
         });
         correlation += 1;
+        let mut replay: giggles_consensus::native::Request =
+            serde_json::from_slice(op.wire_bytes()).unwrap();
+        replay.id = correlation;
+        invocations.push(Invocation {
+            phase: Phase::Restored,
+            action: Action::Replay,
+            correlation_id: correlation,
+            business_id: business,
+            start_micros: 20000 + correlation * 100,
+            end_micros: 20000 + correlation * 100 + 10,
+            request: serde_json::to_value(replay).unwrap(),
+            outcome: response(correlation),
+        });
+        correlation += 1;
     }
     Report {
-        version: 1,
+        version: 2,
         scope: LOCAL_SCOPE.into(),
         node_binary_sha256: "a".repeat(64),
         host_os: "windows".into(),
@@ -210,12 +218,12 @@ fn fixture() -> Report {
         summary: summarize(&invocations),
         invocations,
         traces: traces(),
-        final_inspection: json!({"reply":{"data":{"tasks":[[1,{"transitions":4}]],"operations":receipts}}}),
+        final_inspection: json!({"applied":10,"reply":{"data":{"rows":rows,"tasks":[[1,{"transitions":4}]],"operations":receipts}}}),
         catch_up: (1..=3)
             .map(|node| CatchUp {
                 node,
                 applied: 10,
-                diagnostics: json!({}),
+                diagnostics: json!({"diagnostics":format!("id={node} applied=10")}),
             })
             .collect(),
         barrier: 10,
@@ -483,5 +491,165 @@ fn forged_proxy_forward_count_rejected() {
     e.kind = "forwarded".into();
     e.direction = Some(Direction::Upstream);
     e.bytes = 1;
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn review_recorded_reply_version_rejected() {
+    let mut r = fixture();
+    if let Observation::Recorded { reply, .. } = &mut r.invocations[0].outcome {
+        reply["version"] = json!(999);
+    }
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn review_missing_replays_rejected() {
+    let mut r = fixture();
+    r.invocations.retain(|i| i.action != Action::Replay);
+    r.summary = summarize(&r.invocations);
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn review_rows_contradicting_receipts_rejected() {
+    let mut r = fixture();
+    r.final_inspection["reply"]["data"]["rows"] = json!([]);
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn review_catchup_contradicting_diagnostics_rejected() {
+    let mut r = fixture();
+    r.catch_up[0].diagnostics = json!({"diagnostics":"applied=0"});
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn review_controls_after_traffic_rejected() {
+    let mut r = fixture();
+    for t in r.traces.values_mut() {
+        for e in &mut t.events {
+            if e.kind == "control" || e.kind == "stopped" {
+                e.micros += 1_000_000;
+            }
+        }
+    }
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn inspected_row_mutations_rejected() {
+    for field in [
+        "status",
+        "version",
+        "attempt_count",
+        "failed_at",
+        "key",
+        "duplicate",
+        "extra",
+    ] {
+        let mut r = fixture();
+        let rows = &mut r.final_inspection["reply"]["data"]["rows"];
+        match field {
+            "status" => rows[0][1][field] = json!("Failed"),
+            "key" => rows[0][0]["row"] = json!(999),
+            "duplicate" | "extra" => {
+                let mut copy = rows[0].clone();
+                if field == "extra" {
+                    copy[0]["row"] = json!(999);
+                }
+                rows.as_array_mut().unwrap().push(copy);
+            }
+            _ => rows[0][1][field] = json!(999),
+        }
+        assert!(r.validate().is_err(), "accepted row mutation {field}");
+    }
+}
+
+#[test]
+fn diagnostic_identity_duplicate_fields_and_barrier_rejected() {
+    for raw in [
+        "id=2 applied=10",
+        "id=1 applied=9",
+        "id=1 applied=10 applied=9",
+        "id=1 id=2 applied=10",
+        "id=1 applied=invalid",
+    ] {
+        let mut r = fixture();
+        r.catch_up[0].diagnostics["diagnostics"] = json!(raw);
+        assert!(r.validate().is_err(), "accepted {raw}");
+    }
+    let mut r = fixture();
+    r.final_inspection["applied"] = json!(11);
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn one_missing_replay_and_replay_before_status_rejected() {
+    for mode in 0..3 {
+        let mut r = fixture();
+        let index = r
+            .invocations
+            .iter()
+            .position(|i| i.action == Action::Replay)
+            .unwrap();
+        match mode {
+            0 => {
+                r.invocations.remove(index);
+            }
+            1 => {
+                r.invocations[index].start_micros = 1100;
+                r.invocations[index].end_micros = 1110;
+            }
+            _ => {
+                r.invocations[index].phase = Phase::Healthy;
+            }
+        }
+        r.summary = summarize(&r.invocations);
+        assert!(r.validate().is_err());
+    }
+}
+
+#[test]
+fn valid_summary_cannot_hide_invalid_sdk_envelope() {
+    for field in ["version", "code", "operation", "result_code"] {
+        let mut r = fixture();
+        if let Observation::Recorded { reply, .. } = &mut r.invocations[1].outcome {
+            match field {
+                "operation" => reply["data"]["operation"] = json!(null),
+                "result_code" => reply["data"]["code"] = json!("invented"),
+                _ => reply[field] = json!(999),
+            }
+        }
+        r.summary = summarize(&r.invocations);
+        assert!(r.validate().is_err(), "accepted {field}");
+    }
+}
+
+#[test]
+fn legacy_unaligned_timeline_cannot_pass_current_validation() {
+    let mut r = fixture();
+    r.version = 1;
+    assert!(r.validate().is_err());
+}
+
+#[test]
+fn disconnect_must_cover_entire_no_quorum_call() {
+    let mut r = fixture();
+    let trace = r.traces.get_mut("peer-1-2").unwrap();
+    trace.events.push(Event {
+        sequence: 0,
+        micros: 3005,
+        connection: 0,
+        direction: Some(Direction::Upstream),
+        kind: "control".into(),
+        bytes: 0,
+        fault: Some(Fault::Pass),
+    });
+    trace.events.sort_by_key(|e| e.micros);
+    for (n, e) in trace.events.iter_mut().enumerate() {
+        e.sequence = n as u64;
+    }
     assert!(r.validate().is_err());
 }

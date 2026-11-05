@@ -37,6 +37,51 @@ async fn actual_three_process_faults_and_reconciliation() {
         report.final_inspection["reply"]["data"]["tasks"][0][1]["transitions"],
         8
     );
+    // Independent-review regressions against genuine shared-clock evidence.
+    for mutation in 0..5 {
+        let mut forged = report.clone();
+        match mutation {
+            0 => {
+                forged.final_inspection["reply"]["data"]["rows"][0][1]["status"] =
+                    serde_json::json!("Failed")
+            }
+            1 => {
+                forged.catch_up[0].diagnostics["diagnostics"] = serde_json::json!("id=1 applied=0")
+            }
+            2 => {
+                for trace in forged.traces.values_mut() {
+                    let end = trace.events.last().unwrap().micros + 1;
+                    for event in &mut trace.events {
+                        if event.kind == "control" {
+                            event.micros = end;
+                        }
+                        if event.kind == "stopped" {
+                            event.micros = end + 1;
+                        }
+                    }
+                    trace.events.sort_by_key(|e| e.micros);
+                    for (n, e) in trace.events.iter_mut().enumerate() {
+                        e.sequence = n as u64;
+                    }
+                }
+            }
+            3 => {
+                for call in &mut forged.invocations {
+                    if let Observation::Recorded { reply, .. } = &mut call.outcome {
+                        reply["version"] = serde_json::json!(999);
+                    }
+                }
+            }
+            _ => {
+                forged.invocations.retain(|i| i.action != Action::Replay);
+                forged.summary = summarize(&forged.invocations);
+            }
+        }
+        assert!(
+            forged.validate().is_err(),
+            "accepted review mutation {mutation}"
+        );
+    }
     // Negative controls on the actual report, preserving its raw observations.
     let mut forged = report.clone();
     forged.summary.committed_responses += 1;
