@@ -459,6 +459,17 @@ pub struct Executor {
     credential: Credential,
 }
 impl Admin {
+    /// Trusted gateway clock high-watermark, in the existing atomic metadata.
+    /// This is not a wall-clock oracle; callers must establish time certainty.
+    pub fn certify_server_time(&self, lower: u64, upper: u64) -> Result<(), CoreError> {
+        self.inner.change(|s| {
+            if lower > upper || upper < s.last_time {
+                return Err(CoreError::Policy(Error::TimeRegression));
+            }
+            s.last_time = upper;
+            Ok(())
+        })
+    }
     fn attach(db: Database, limits: Limits) -> Result<Self, CoreError> {
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
@@ -805,6 +816,98 @@ impl Admin {
     }
 }
 impl Executor {
+    fn current(s: &mut State, task: TaskId, lower: u64, upper: u64) -> Result<(), CoreError> {
+        if lower > upper {
+            return Err(CoreError::Policy(Error::UncertainTime));
+        }
+        policy::clock(s, Time::Certified(upper)).map_err(CoreError::Policy)?;
+        let t = s
+            .view
+            .tasks
+            .get(&task)
+            .ok_or(CoreError::Policy(Error::Authentication))?;
+        policy::active(t, lower)
+            .and_then(|_| policy::active(t, upper))
+            .map_err(CoreError::Policy)
+    }
+    /// Remote decision: revalidate current task and the full trusted time interval
+    /// under the very same serialization gate as dedupe and commit.
+    pub fn execute_current(
+        &self,
+        r: Request,
+        lower: u64,
+        upper: u64,
+        approval: Option<ApprovalId>,
+    ) -> Result<Decision, CoreError> {
+        self.inner.request(&r)?;
+        self.inner.change(|s| {
+            self.auth(s)?;
+            Self::current(s, self.credential.task, lower, upper)?;
+            if !s
+                .view
+                .operations
+                .contains_key(&(self.credential.task, r.operation))
+            {
+                self.inner.selection_bound(s, self.credential.task, &r)?;
+            }
+            Ok(policy::execute(
+                s,
+                self.credential.task,
+                r,
+                Time::Certified(upper),
+                approval,
+            ))
+        })
+    }
+    pub fn preview_current(
+        &self,
+        r: &Request,
+        lower: u64,
+        upper: u64,
+    ) -> Result<Preview, CoreError> {
+        self.inner.request(r)?;
+        self.inner.change(|s| {
+            self.auth(s)?;
+            Self::current(s, self.credential.task, lower, upper)?;
+            self.inner.selection_bound(s, self.credential.task, r)?;
+            policy::preview(s, self.credential.task, r, Time::Certified(upper))
+                .map_err(CoreError::Policy)
+        })
+    }
+    /// Remote disclosure gate. Local forensic status intentionally remains usable
+    /// after revoke; network callers must use this current-authority variant.
+    pub fn status_current(
+        &self,
+        id: OperationId,
+        lower: u64,
+        upper: u64,
+    ) -> Result<OperationStatus, CoreError> {
+        self.inner.change(|s| {
+            self.auth(s)?;
+            Self::current(s, self.credential.task, lower, upper)?;
+            Ok(s.view
+                .operations
+                .get(&(self.credential.task, id))
+                .map_or(OperationStatus::Absent, |b| {
+                    OperationStatus::Decided(b.decision.clone())
+                }))
+        })
+    }
+    /// Current authorization without returning task metadata or decisions.
+    pub fn validate_current(&self, time: Time) -> Result<(), CoreError> {
+        self.inner.change(|s| {
+            self.auth(s)?;
+            let now = policy::clock(s, time).map_err(CoreError::Policy)?;
+            policy::active(
+                s.view
+                    .tasks
+                    .get(&self.credential.task)
+                    .ok_or(CoreError::Policy(Error::Authentication))?,
+                now,
+            )
+            .map_err(CoreError::Policy)
+        })
+    }
     fn auth(&self, s: &State) -> Result<(), CoreError> {
         let c = &self.credential;
         if c.domain != s.view.domain
@@ -881,6 +984,41 @@ impl Admin {
     }
 }
 impl SqlSession {
+    /// Resolve metadata only. Never executes, stages, charges or publishes SQL.
+    pub fn describe(
+        &mut self,
+        p: &relational::Prepared,
+    ) -> Result<relational::Description, CoreError> {
+        let result = (|| {
+            if self.aborted && p.control() != Some("rollback") {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if p.transaction.is_some() && p.transaction != self.transaction_id {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            let describe = |s: &State| {
+                if p.domain != s.view.domain {
+                    return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                }
+                p.describe(&s.sql).map_err(CoreError::Sql)
+            };
+            if let Some(s) = &self.staged {
+                describe(s)
+            } else {
+                self.admin.inner.inspect(describe)
+            }
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    /// A gateway parse/bind/authorization failure poisons an explicit transaction.
+    pub fn abort(&mut self) {
+        if self.staged.is_some() {
+            self.aborted = true;
+        }
+    }
     pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
         if self.aborted {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -910,9 +1048,15 @@ impl SqlSession {
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
         let mut result = if let Some(s) = &self.staged {
             if self.aborted {
-                return Err(CoreError::Sql(relational::SqlError::Aborted));
+                let p = relational::Prepared::parse(sql, s.view.domain, s.sql.epoch)
+                    .map_err(CoreError::Sql)?;
+                if p.control() != Some("rollback") {
+                    return Err(CoreError::Sql(relational::SqlError::Aborted));
+                }
+                Ok(p)
+            } else {
+                relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
             }
-            relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
         } else {
             self.admin.inner.inspect(|s| {
                 relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
@@ -953,7 +1097,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        if self.aborted {
+        if self.aborted && p.control() != Some("rollback") {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
         let inner = self.admin.inner.clone();

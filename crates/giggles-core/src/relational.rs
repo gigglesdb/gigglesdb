@@ -631,6 +631,9 @@ impl Parser {
             Statement::Delete { name, predicates }
         } else if self.word("begin") {
             Statement::Begin
+        } else if self.word("start") {
+            self.need("transaction")?;
+            Statement::Begin
         } else if self.word("commit") {
             Statement::Commit
         } else if self.word("rollback") {
@@ -653,6 +656,11 @@ pub struct Prepared {
     statement: Statement,
     params: usize,
 }
+#[derive(Debug, Clone)]
+pub struct Description {
+    pub parameters: Vec<DataType>,
+    pub columns: Vec<ColumnDef>,
+}
 /// Native ordered access compiled through the same binder and transaction path.
 #[derive(Debug, Clone)]
 pub struct Scan {
@@ -665,6 +673,118 @@ pub struct Scan {
     pub limit: usize,
 }
 impl Prepared {
+    pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
+        if self.epoch != state.epoch {
+            return Err(SqlError::StaleSchema);
+        }
+        let mut params = vec![None; self.params];
+        let mut columns = vec![];
+        if let Some(name) = self.table() {
+            if self.is_ddl() {
+                return Err(SqlError::Unsupported);
+            }
+            let t = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+            let mut bind = |e: &Expr, ty: &DataType| -> R<()> {
+                if let Expr::Param(n) = e {
+                    let slot = params.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                    if slot.as_ref().is_some_and(|old| old != ty) {
+                        return Err(SqlError::Type);
+                    }
+                    *slot = Some(ty.clone());
+                }
+                Ok(())
+            };
+            match &self.statement {
+                Statement::Insert {
+                    columns: names,
+                    values,
+                    ..
+                } => {
+                    let indexes = if names.is_empty() {
+                        (0..t.columns.len()).collect::<Vec<_>>()
+                    } else {
+                        names.iter().map(|n| col(t, n)).collect::<R<Vec<_>>>()?
+                    };
+                    if indexes.len() != values.len() {
+                        return Err(SqlError::Type);
+                    }
+                    for (i, e) in indexes.into_iter().zip(values) {
+                        bind(e, &t.columns[i].data_type)?;
+                    }
+                }
+                Statement::Select {
+                    projection,
+                    predicates,
+                    limit,
+                    ..
+                } => {
+                    columns = if projection.is_empty() {
+                        t.columns.clone()
+                    } else {
+                        projection
+                            .iter()
+                            .map(|n| Ok(t.columns[col(t, n)?].clone()))
+                            .collect::<R<Vec<_>>>()?
+                    };
+                    for p in predicates {
+                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                    }
+                    if let Some(e) = limit {
+                        bind(e, &DataType::BigInt)?;
+                    }
+                }
+                Statement::Update {
+                    sets, predicates, ..
+                } => {
+                    for (n, e) in sets {
+                        bind(e, &t.columns[col(t, n)?].data_type)?;
+                    }
+                    for p in predicates {
+                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                    }
+                }
+                Statement::Delete { predicates, .. } => {
+                    for p in predicates {
+                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Description {
+            parameters: params
+                .into_iter()
+                .map(|t| t.ok_or(SqlError::Parameters))
+                .collect::<R<Vec<_>>>()?,
+            columns,
+        })
+    }
+    /// Parsed table target for gateway authorization. Controls have no target.
+    pub fn table(&self) -> Option<&str> {
+        match &self.statement {
+            Statement::Create { name, .. }
+            | Statement::Insert { name, .. }
+            | Statement::Select { name, .. }
+            | Statement::Update { name, .. }
+            | Statement::Delete { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+    pub fn is_ddl(&self) -> bool {
+        matches!(self.statement, Statement::Create { .. })
+    }
+    pub fn command(&self) -> &'static str {
+        match self.statement {
+            Statement::Create { .. } => "CREATE TABLE",
+            Statement::Insert { .. } => "INSERT",
+            Statement::Select { .. } => "SELECT",
+            Statement::Update { .. } => "UPDATE",
+            Statement::Delete { .. } => "DELETE",
+            Statement::Begin => "BEGIN",
+            Statement::Commit => "COMMIT",
+            Statement::Rollback => "ROLLBACK",
+        }
+    }
     pub(crate) fn scan(scan: Scan, domain: u128, state: &Relational) -> R<Self> {
         ident(&scan.table)?;
         let t = state

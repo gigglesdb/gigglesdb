@@ -1,7 +1,7 @@
 # embedded relational contract (GD-0006)
 
 [Design, implementation plan and work log](https://app.archdocs.io/design-docs/14d046e2-cf09-4309-a392-2a12650f000e).
-This is a bounded embedded subset, not PostgreSQL or SQLite compatibility. P2 has not started.
+This is a bounded embedded subset, not PostgreSQL or SQLite compatibility. The later P2 service preview is documented in [the server README](../giggles-server/README.md); this document retains the trusted embedded contract.
 
 ## Authority and entry points
 
