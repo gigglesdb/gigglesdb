@@ -19,6 +19,15 @@ pub enum TaskAction {
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub enum Command {
     Admin(Vec<u8>),
+    /// Trusted consensus input only, not a remote identity/time envelope.
+    /// Produces redacted data, with a fresh disclosure debit after business work.
+    NativeTask {
+        task: TaskId,
+        principal: Principal,
+        lower: u64,
+        upper: u64,
+        action: TaskAction,
+    },
     Task {
         task: TaskId,
         principal: Principal,
@@ -92,6 +101,16 @@ impl Image {
         tx.commit().map_err(io)?;
         let a = Admin::attach(db, Limits::default())?;
         let reply = match command {
+            Command::NativeTask {
+                task,
+                principal,
+                lower,
+                upper,
+                action,
+            } => {
+                let response = native_task(&a, *task, *principal, *lower, *upper, action)?;
+                Reply::ok(serde_json::to_value(response).map_err(io)?)
+            }
             Command::Admin(input) => {
                 if input.len() > local::MAX_INPUT {
                     return Err(CoreError::Limit);
@@ -151,4 +170,121 @@ fn hex_token(p: &Preview) -> Result<String, CoreError> {
         return Err(CoreError::Limit);
     }
     Ok(b.iter().map(|v| format!("{v:02x}")).collect())
+}
+
+/// Redacted v1 task-only response. `sql` is always null in this bounded subset.
+/// This is the data inside the trusted local Reply, not its outer wire envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeResponse {
+    pub version: u32,
+    pub code: String,
+    pub operation: Option<OperationId>,
+    pub count: Option<usize>,
+    pub digest: Option<String>,
+    pub sql: Option<()>,
+}
+impl NativeResponse {
+    fn code(code: &str) -> Self {
+        Self {
+            version: 1,
+            code: code.into(),
+            operation: None,
+            count: None,
+            digest: None,
+            sql: None,
+        }
+    }
+    fn effects(code: &str, operation: OperationId, effects: &[Effect]) -> Result<Self, CoreError> {
+        let bytes = serde_json::to_vec(effects).map_err(io)?;
+        let digest = Sha256::digest(bytes)
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        Ok(Self {
+            operation: Some(operation),
+            count: Some(effects.len()),
+            digest: Some(digest),
+            ..Self::code(code)
+        })
+    }
+    fn decision(operation: OperationId, decision: Decision) -> Result<Self, CoreError> {
+        match decision {
+            Ok(receipt) => Self::effects("committed", operation, &receipt.effects),
+            Err(error) => Err(CoreError::Policy(error)),
+        }
+    }
+}
+// Same task-policy codes as P2. No diagnostic strings or raw errors escape.
+fn native_code(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
+        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope) => "42501",
+        CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
+        CoreError::Policy(Error::Budget) | CoreError::Limit => "54000",
+        CoreError::Policy(
+            Error::ApprovalRequired | Error::InvalidApproval | Error::StalePreview,
+        ) => "GD001",
+        CoreError::Policy(Error::IdConflict) => "GD002",
+        CoreError::Policy(_) => "22023",
+        CoreError::Cancelled => "57014",
+        CoreError::Busy => "53300",
+        CoreError::Storage(_) | CoreError::Fenced => "08007",
+        _ => "XX000",
+    }
+}
+fn native_task(
+    a: &Admin,
+    task: TaskId,
+    principal: Principal,
+    lower: u64,
+    upper: u64,
+    action: &TaskAction,
+) -> Result<NativeResponse, CoreError> {
+    let operation = match action {
+        TaskAction::Preview(r) | TaskAction::Execute(r, _) => r.operation,
+        TaskAction::Status(id) => *id,
+    };
+    let business = (|| {
+        let e = a.executor(task, principal)?;
+        match action {
+            TaskAction::Preview(r) => {
+                let preview = e.preview_current(r, lower, upper)?;
+                NativeResponse::effects("preview", operation, &preview.effects)
+            }
+            TaskAction::Execute(r, approval) => NativeResponse::decision(
+                operation,
+                e.execute_current(r.clone(), lower, upper, *approval)?,
+            ),
+            TaskAction::Status(id) => match e.status_current(*id, lower, upper)? {
+                OperationStatus::Absent => Ok(NativeResponse {
+                    operation: Some(operation),
+                    ..NativeResponse::code("absent")
+                }),
+                OperationStatus::Decided(d) => NativeResponse::decision(operation, d),
+            },
+        }
+    })();
+    let response = business.unwrap_or_else(|error| NativeResponse {
+        operation: Some(operation),
+        ..NativeResponse::code(native_code(&error))
+    });
+    let bytes = u64::try_from(serde_json::to_vec(&response).map_err(io)?.len())
+        .ok()
+        .and_then(|n| n.checked_add(1024))
+        .ok_or(CoreError::Limit)?;
+    // Separate from the business decision: re-open current authority, then debit
+    // every disclosure attempt, including protected errors and deduped receipts.
+    // A failed release must not undo an already decided business operation.
+    let release = a
+        .executor(task, principal)
+        .and_then(|e| e.reserve_disclosure(bytes, lower, upper));
+    Ok(match release {
+        Ok(()) => response,
+        Err(error) => NativeResponse::code(match error {
+            CoreError::Cancelled => "57014",
+            CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
+            _ => "42501",
+        }),
+    })
 }

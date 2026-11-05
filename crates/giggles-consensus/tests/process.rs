@@ -190,6 +190,118 @@ fn find_leader(nodes: &mut BTreeMap<u64, Running>) -> u64 {
     }
 }
 
+fn native_command(action: TaskAction) -> Command {
+    Command::NativeTask {
+        task: giggles_core::TaskId(1),
+        principal: giggles_core::Principal(2),
+        lower: 10,
+        upper: 10,
+        action,
+    }
+}
+
+#[test]
+fn real_three_process_redacted_native_lost_ack_failover_and_exhaustion() {
+    let s = setup();
+    let mut nodes = BTreeMap::new();
+    for id in VOTERS {
+        nodes.insert(id, Running::start(&s.configs[&id], &s.root, 0, id));
+    }
+    nodes.get_mut(&1).unwrap().send(json!({"op":"campaign"}));
+    let leader = find_leader(&mut nodes);
+    let mut index = 0;
+    for (id,command) in [
+        admin(json!({"command":"seed","key":key(0),"row":row()})),
+        admin(json!({"command":"grant","grant":grant(1,5)})),
+        admin(json!({"command":"provision_task_resources","task":1,"limits":{"read_rows":10000,"disclosed_rows":3,"encoded_bytes":100000}})),
+    ].into_iter().enumerate() {
+        let r=nodes.get_mut(&leader).unwrap().request(2000+id as u64,command);
+        assert_eq!(r["reply"]["code"],0); index=r["applied"].as_u64().unwrap();
+    }
+    let follower = VOTERS.into_iter().find(|id| *id != leader).unwrap();
+    let rejected = nodes.get_mut(&follower).unwrap().request(
+        2003,
+        native_command(TaskAction::Status(giggles_core::OperationId(77))),
+    );
+    assert_eq!(rejected["error"], "not leader");
+    // Do not read the proposing leader's outcome. Observe commitment at a
+    // follower, then kill that leader with its response still unread by caller.
+    nodes.get_mut(&leader).unwrap().send(json!({"op":"propose","id":2004,"command":native_command(TaskAction::Execute(request(77,&[0]),None))}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let d = nodes.get_mut(&follower).unwrap().diag();
+        let applied = d["diagnostics"]
+            .as_str()
+            .unwrap()
+            .split("applied=")
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        if applied > index {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower never observed committed native command"
+        );
+    }
+    nodes.get_mut(&leader).unwrap().kill();
+    drop(nodes.remove(&leader));
+    let successor = find_leader(&mut nodes);
+    let retry = nodes.get_mut(&successor).unwrap().request(
+        2005,
+        native_command(TaskAction::Execute(request(77, &[0]), None)),
+    );
+    assert_eq!(retry["reply"]["data"]["code"], "committed");
+    assert_eq!(retry["reply"]["data"]["count"], 1);
+    assert_eq!(retry["reply"]["data"].as_object().unwrap().len(), 6);
+    let status = nodes.get_mut(&successor).unwrap().request(
+        2006,
+        native_command(TaskAction::Status(giggles_core::OperationId(77))),
+    );
+    assert_eq!(status["reply"], retry["reply"]);
+    let exhausted = nodes.get_mut(&successor).unwrap().request(
+        2007,
+        native_command(TaskAction::Status(giggles_core::OperationId(77))),
+    );
+    let fixed =
+        json!({"version":1,"code":"42501","operation":null,"count":null,"digest":null,"sql":null});
+    assert_eq!(exhausted["reply"]["data"], fixed);
+    nodes.insert(
+        leader,
+        Running::start(&s.configs[&leader], &s.root, 1, leader),
+    );
+    // A current barrier confirms original business mutation exactly once.
+    nodes
+        .get_mut(&successor)
+        .unwrap()
+        .send(json!({"op":"read","id":2008}));
+    let inspection = nodes[&successor].until(|v| v["id"] == 2008, Duration::from_secs(5));
+    assert_eq!(
+        inspection["reply"]["data"]["operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(inspection["reply"]["data"]["tasks"][0][1]["transitions"], 1);
+    for n in nodes.values_mut() {
+        n.kill();
+    }
+    nodes.clear();
+    for id in VOTERS {
+        nodes.insert(id, Running::start(&s.configs[&id], &s.root, 2, id));
+    }
+    let restarted = find_leader(&mut nodes);
+    let after = nodes.get_mut(&restarted).unwrap().request(
+        2009,
+        native_command(TaskAction::Status(giggles_core::OperationId(77))),
+    );
+    assert_eq!(after["reply"]["data"], fixed);
+    std::fs::write(s.root.join("native-checker.txt"),"PASS trusted local native command; actual three mTLS peer processes; follower refuses; unread leader reply; failover receipt/status; exactly one transition; exhausted disclosure persists across full restart. NOT external task-client mTLS.\n").unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_three_process_mtls_failover_snapshot_and_lost_ack() {
     let s = setup();
