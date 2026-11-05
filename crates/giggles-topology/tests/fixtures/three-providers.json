@@ -1,0 +1,206 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "a",
+      "independence": "declared-a"
+    },
+    {
+      "id": "b",
+      "independence": "declared-b"
+    },
+    {
+      "id": "c",
+      "independence": "declared-c"
+    }
+  ],
+  "regions": [
+    {
+      "id": "ra",
+      "provider": "a"
+    },
+    {
+      "id": "rb",
+      "provider": "b"
+    },
+    {
+      "id": "rc",
+      "provider": "c"
+    }
+  ],
+  "zones": [
+    {
+      "id": "za",
+      "region": "ra"
+    },
+    {
+      "id": "zb",
+      "region": "rb"
+    },
+    {
+      "id": "zc",
+      "region": "rc"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "na",
+      "zone": "za"
+    },
+    {
+      "id": "nb",
+      "zone": "zb"
+    },
+    {
+      "id": "nc",
+      "zone": "zc"
+    }
+  ],
+  "groups": [
+    {
+      "id": "data",
+      "members": [
+        {
+          "node": "na",
+          "role": "full_data_voter"
+        },
+        {
+          "node": "nb",
+          "role": "full_data_voter"
+        },
+        {
+          "node": "nc",
+          "role": "full_data_voter"
+        }
+      ],
+      "profile": "three_independent_providers",
+      "policy": {
+        "allowed_regions": [
+          "ra",
+          "rb",
+          "rc"
+        ],
+        "allowed_providers": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "requirements": [
+        {
+          "category": "application",
+          "dependency": "alternatives"
+        },
+        {
+          "category": "gateway",
+          "dependency": "alternatives"
+        },
+        {
+          "category": "bootstrap_discovery",
+          "dependency": "alternatives"
+        },
+        {
+          "category": "auth",
+          "dependency": "alternatives"
+        },
+        {
+          "category": "kms",
+          "dependency": "alternatives"
+        },
+        {
+          "category": "dns",
+          "dependency": "alternatives"
+        }
+      ],
+      "capacity": {
+        "unit": "synthetic-test-units",
+        "demand": 2,
+        "measurements": [
+          {
+            "node": "na",
+            "available": 1,
+            "source": "Synthetic behavior fixture only, not measured performance."
+          },
+          {
+            "node": "nb",
+            "available": 1,
+            "source": "Synthetic behavior fixture only, not measured performance."
+          },
+          {
+            "node": "nc",
+            "available": 1,
+            "source": "Synthetic behavior fixture only, not measured performance."
+          }
+        ],
+        "assumptions": "Synthetic additive allocations solely for testing integer capacity; no benchmark or actual availability claim."
+      }
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "endpoint-a",
+      "expression": {
+        "kind": "endpoint",
+        "bindings": [
+          {
+            "kind": "node",
+            "id": "na"
+          }
+        ],
+        "assumptions": "Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+      }
+    },
+    {
+      "id": "endpoint-b",
+      "expression": {
+        "kind": "endpoint",
+        "bindings": [
+          {
+            "kind": "node",
+            "id": "nb"
+          }
+        ],
+        "assumptions": "Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+      }
+    },
+    {
+      "id": "endpoint-c",
+      "expression": {
+        "kind": "endpoint",
+        "bindings": [
+          {
+            "kind": "node",
+            "id": "nc"
+          }
+        ],
+        "assumptions": "Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+      }
+    },
+    {
+      "id": "alternatives",
+      "expression": {
+        "kind": "any",
+        "dependencies": [
+          "endpoint-a",
+          "endpoint-b",
+          "endpoint-c"
+        ]
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "two-providers",
+      "failed": [
+        {
+          "kind": "provider",
+          "id": "a"
+        },
+        {
+          "kind": "provider",
+          "id": "b"
+        }
+      ]
+    }
+  ]
+}

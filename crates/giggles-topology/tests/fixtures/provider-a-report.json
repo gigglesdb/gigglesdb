@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "disclaimer": "Declarative analysis only; not actual availability, independence, durability, RTO/RPO or qualification proof.",
+  "scenarios": [
+    {
+      "id": "loss:provider:a",
+      "failed": [
+        {
+          "kind": "provider",
+          "id": "a"
+        }
+      ],
+      "lost_nodes": [
+        "na"
+      ],
+      "dependencies": {
+        "alternatives": {
+          "verdict": "pass",
+          "reasons": [
+            "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+            "OR of 3 declared inputs => Pass"
+          ]
+        },
+        "endpoint-a": {
+          "verdict": "fail",
+          "reasons": [
+            "endpoint-a: endpoint lost bindings [{\"kind\":\"node\",\"id\":\"na\"}]; declared assumption: Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+          ]
+        },
+        "endpoint-b": {
+          "verdict": "pass",
+          "reasons": [
+            "endpoint-b: endpoint lost bindings []; declared assumption: Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+          ]
+        },
+        "endpoint-c": {
+          "verdict": "pass",
+          "reasons": [
+            "endpoint-c: endpoint lost bindings []; declared assumption: Synthetic fixture endpoint; declares all required paths on this node, not a runtime observation."
+          ]
+        }
+      },
+      "groups": [
+        {
+          "id": "data",
+          "voter_count": 3,
+          "quorum": 2,
+          "surviving_voters": [
+            "nb",
+            "nc"
+          ],
+          "voter_arithmetic": {
+            "verdict": "pass",
+            "reasons": [
+              "2 of 3 full-data voters survive; quorum requires 2; learners contribute zero votes"
+            ]
+          },
+          "dependency_reachability": {
+            "verdict": "pass",
+            "reasons": [
+              "AND of 6 declared inputs => Pass"
+            ]
+          },
+          "requirements": {
+            "application": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            },
+            "gateway": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            },
+            "bootstrap_discovery": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            },
+            "auth": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            },
+            "kms": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            },
+            "dns": {
+              "verdict": "pass",
+              "reasons": [
+                "alternatives: OR alternatives [\"endpoint-a\", \"endpoint-b\", \"endpoint-c\"]",
+                "OR of 3 declared inputs => Pass"
+              ]
+            }
+          },
+          "capacity": {
+            "assessment": {
+              "verdict": "pass",
+              "reasons": [
+                "supplied additive survivor capacity 2 synthetic-test-units against demand 2; provenance and allocations are caller declarations"
+              ]
+            },
+            "unit": "synthetic-test-units",
+            "demand": 2,
+            "surviving_available": 2,
+            "assumptions": "Synthetic additive allocations solely for testing integer capacity; no benchmark or actual availability claim."
+          }
+        }
+      ]
+    }
+  ]
+}
