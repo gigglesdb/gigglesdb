@@ -105,14 +105,19 @@ async fn serve_mode(
                         let Ok(Ok(mut stream))=timeout(IO_TIMEOUT,accept.accept(socket)).await else {return};
                         let Some(cert)=stream.get_ref().1.peer_certificates().and_then(|c|c.first()) else {return};
                         let Ok(mut session)=service.session(&tls::fingerprint(cert.as_ref())) else {return};
-                        if pg {let _=crate::pgwire::run(&mut stream,&mut session).await;return;}
+                        let blocking=service.blocking.clone();
+                        if pg {let _=crate::pgwire::run(&mut stream,session).await;return;}
                         while let Ok(b)=read_frame(&mut stream,MAX_FRAME).await {
                             let received=std::time::Instant::now();
-                            let response=match serde_json::from_slice::<Request>(&b) {
-                                Ok(request)=>session.handle_received(request,received),
-                                Err(_)=>{session.abort();Response::code("08P01")},
-                            };
-                            let Ok(b)=serde_json::to_vec(&response) else {break};
+                            let Ok((returned,encoded))=blocking.run(move || {
+                                let response=match serde_json::from_slice::<Request>(&b) {
+                                    Ok(request)=>session.handle_received(request,received),
+                                    Err(_)=>{session.abort();Response::code("08P01")},
+                                };
+                                (session,serde_json::to_vec(&response))
+                            }).await else {return};
+                            session=returned;
+                            let Ok(b)=encoded else {break};
                             if write_frame(&mut stream,&b,MAX_RESPONSE).await.is_err(){break;}
                         }
                     });

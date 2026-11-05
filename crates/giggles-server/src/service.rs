@@ -135,6 +135,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
     }
 }
 pub struct Service {
+    pub(crate) blocking: crate::blocking::Blocking,
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
@@ -171,6 +172,7 @@ impl Service {
             }
         }
         Ok(Arc::new(Self {
+            blocking: crate::blocking::Blocking::new(),
             task_gate: std::sync::Mutex::new(()),
             admin,
             clock,

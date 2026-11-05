@@ -23,6 +23,64 @@ use tokio::{
     net::TcpStream,
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_runtime_thread_native_and_actual_driver_transactions_progress() {
+    let f = Fixture::new().await;
+    let mut native = f.native(f.app.clone()).await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    let native_work = async {
+        for id in 0..16 {
+            assert_eq!(native.call(&sql("BEGIN", vec![])).await.unwrap().code, "ok");
+            assert_eq!(
+                native
+                    .call(&sql(
+                        "INSERT INTO app (id, body) VALUES ($1, $2)",
+                        vec![Value::Int(id), Value::Text("discard".into())]
+                    ))
+                    .await
+                    .unwrap()
+                    .code,
+                "ok"
+            );
+            assert_eq!(
+                native.call(&sql("ROLLBACK", vec![])).await.unwrap().code,
+                "ok"
+            );
+        }
+    };
+    let pg_work = async {
+        for id in 100i64..116 {
+            pg.execute(
+                "INSERT INTO app (id, body) VALUES ($1, $2)",
+                &[&id, &"kept"],
+            )
+            .await
+            .unwrap();
+            let rows = pg
+                .query("SELECT body FROM app WHERE id = $1", &[&id])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get::<_, String>(0), "kept");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(native_work, pg_work);
+    })
+    .await
+    .unwrap();
+    assert!(
+        pg.query("SELECT id FROM app WHERE id = 0", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(pg);
+    conn.await.unwrap();
+    drop(native);
+    f.stop().await;
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

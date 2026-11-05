@@ -46,6 +46,21 @@ or automatic app retry exists. Socket timeouts govern IO, not redb fsync latency
 Native deadlines are pre-dispatch only; PostgreSQL in-flight cancellation remains
 an explicit implementation gap.
 
+GD-0009 moves native decode/dispatch/encode and PostgreSQL frame processing
+(including prepare/describe, clock and core decisions) into a Service-shared
+blocking pool capped at32 submitted jobs across both listeners. Admission awaits
+before submission; each connected session retains at most one waiting frame.
+The existing per-listener connection limits bound waiting frames. Original frame
+receipt time survives queueing for native and simple task-wire deadlines. Session
+and protocol state have one owner and are moved into and back out of each job.
+Started jobs hold admission until actual completion even after socket shutdown;
+shutdown does not wait for detached blocking decisions and does not promise their
+rollback. Runtime teardown may wait for them. The synchronous Rust Session API
+remains synchronous for trusted embedded callers. This is a count bound, not a
+storage latency bound, rate limit, aggregate-memory qualification or fairness
+guarantee. Session construction/drop takes no storage mutex; final database
+teardown remains the trusted host's responsibility.
+
 Task responses contain only version, stable code, original operation ID, count
 and digest, with no full effects/rows/policies/dependencies/issuer identities or
 internal error text. SHA256 is supplied by a maintained library, not custom

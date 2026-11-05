@@ -50,3 +50,13 @@ operator, and decide how to reconcile. Never blindly replay an ambiguous write.
 Network fixtures and fault injection establish local behavior only. Device power
 loss, real skew/suspend, full-disk stress, independent security/correctness review,
 production packaging, wider client/OS and cloud qualification remain separate.
+
+GD-0009: network synchronous work is isolated behind32 shared blocking permits.
+Native/task-simple-wire pre-dispatch deadlines include blocking admission wait.
+Wire formats, persistence and C ABI are unchanged. Rust helper `pgwire::run` now
+takes ownership of `Session` rather than a mutable borrow so it can transfer the
+session safely to a blocking worker; direct Rust callers must pass the session
+by value. No broader Rust source compatibility promise is made for this0.1 crate.
+CancelRequest remains rejected and no BackendKeyData is advertised. Cancellation
+decision fencing, prepared task envelopes and durable disclosure accounting are
+still unimplemented.

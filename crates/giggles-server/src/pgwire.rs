@@ -295,7 +295,14 @@ struct State {
     drain: bool,
 }
 impl State {
-    fn handle(&mut self, tag: u8, b: &[u8], session: &mut Session, out: &mut Vec<u8>) -> R<bool> {
+    fn handle(
+        &mut self,
+        tag: u8,
+        b: &[u8],
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        received: std::time::Instant,
+    ) -> R<bool> {
         let mut r = Reader { b, at: 0 };
         if self.drain && tag != b'S' && tag != b'X' {
             return Ok(true);
@@ -329,7 +336,7 @@ impl State {
                     if matches!(req, Request::Sql { .. } | Request::Ping) {
                         return Err("42501");
                     }
-                    let response = session.handle(req);
+                    let response = session.handle_received(req, received);
                     let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
                     let d = Description {
                         parameters: vec![],
@@ -569,8 +576,9 @@ async fn send<S: AsyncWrite + Unpin>(s: &mut S, b: &[u8]) -> io::Result<()> {
 }
 pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-    session: &mut Session,
+    mut session: Session,
 ) -> io::Result<()> {
+    let blocking = session.service.blocking.clone();
     let startup = timeout(IO_TIMEOUT, async {
         let n = s.read_u32().await?;
         if !(9..=8192).contains(&n) {
@@ -639,7 +647,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         z(value, &mut b);
         frame(b'S', &b, &mut out).map_err(io::Error::other)?;
     }
-    ready(session, &mut out).map_err(io::Error::other)?;
+    ready(&session, &mut out).map_err(io::Error::other)?;
     send(s, &out).await?;
     let mut state = State {
         statements: BTreeMap::new(),
@@ -662,20 +670,33 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(Ok(v)) => v,
             _ => return Ok(()),
         };
-        out.clear();
-        match state.handle(tag, &b, session, &mut out) {
-            Ok(false) => return Ok(()),
-            Ok(true) => {}
-            Err(code) => {
-                session.abort();
-                error(code, &mut out);
-                if tag == b'Q' {
-                    ready(session, &mut out).map_err(io::Error::other)?;
-                } else {
-                    state.drain = true;
-                }
-            }
+        let received = std::time::Instant::now();
+        let (returned_session, returned_state, response, keep) = blocking
+            .run(move || {
+                let mut out = Vec::new();
+                let keep = match state.handle(tag, &b, &mut session, &mut out, received) {
+                    Ok(keep) => Ok(keep),
+                    Err(code) => {
+                        session.abort();
+                        error(code, &mut out);
+                        if tag == b'Q' {
+                            ready(&session, &mut out)
+                                .map(|()| true)
+                                .map_err(io::Error::other)
+                        } else {
+                            state.drain = true;
+                            Ok(true)
+                        }
+                    }
+                };
+                (session, state, out, keep)
+            })
+            .await?;
+        session = returned_session;
+        state = returned_state;
+        if !keep? {
+            return Ok(());
         }
-        send(s, &out).await?;
+        send(s, &response).await?;
     }
 }
