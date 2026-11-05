@@ -6,6 +6,63 @@ use giggles_ffi::*;
 use serde_json::{Value, json};
 use std::ptr::{null, null_mut};
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[test]
+fn trusted_sql_session_transaction_abort_and_executor_separation() {
+    let _serial = SERIAL.lock().unwrap();
+    let (path, a, e) = setup(1, 0);
+    let mut s = 0;
+    assert_eq!(unsafe { gd_v1_sql_session(e, &mut s) }, 18);
+    assert_eq!(s, 0);
+    assert_eq!(unsafe { gd_v1_sql_session(a, &mut s) }, 0);
+    call(s, json!({"sql":"BEGIN"}), 0);
+    call(
+        s,
+        json!({"sql":"CREATE TABLE c_rows (id BIGINT PRIMARY KEY, name TEXT)"}),
+        0,
+    );
+    call(
+        s,
+        json!({"sql":"INSERT INTO c_rows VALUES($1,$2)","params":[{"Int":-2},{"Text":"ffi ☃"}]}),
+        0,
+    );
+    call(
+        a,
+        json!({"command":"sql","sql":"SELECT * FROM c_rows LIMIT 2","params":[]}),
+        203,
+    );
+    call(s, json!({"sql":"COMMIT"}), 0);
+    let r = call(s, json!({"sql":"SELECT * FROM c_rows LIMIT 2"}), 0);
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":-2},{"Text":"ffi ☃"}]));
+    call(s, json!({"sql":"BEGIN"}), 0);
+    call(s, json!({"sql":"DELETE FROM c_rows WHERE id=-2"}), 0);
+    call(
+        s,
+        json!({"sql":"INSERT INTO c_rows VALUES(NULL,'bad')"}),
+        207,
+    );
+    call(s, json!({"sql":"COMMIT"}), 215);
+    call(s, json!({"sql":"ROLLBACK"}), 0);
+    call(
+        e,
+        json!({"command":"sql","sql":"BEGIN","operation":1,"time":{"Certified":10},"approval":null}),
+        12,
+    );
+    let mut rejected = 0;
+    assert_eq!(unsafe { gd_v1_sql_session(s, &mut rejected) }, 18);
+    call(s, json!({"sql":"BEGIN"}), 0);
+    call(s, json!({"sql":"DELETE FROM c_rows WHERE id=-2"}), 0);
+    assert_eq!(gd_v1_close(s), 0);
+    assert_eq!(gd_v1_close(e), 0);
+    assert_eq!(gd_v1_close(a), 0);
+    let a = open("open", &path);
+    let r = call(
+        a,
+        json!({"command":"sql","sql":"SELECT * FROM c_rows LIMIT 2","params":[]}),
+        0,
+    );
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(gd_v1_close(a), 0);
+}
 fn open(mode: &str, path: &std::path::Path) -> u64 {
     let data = json!({"mode":mode,"path":path}).to_string();
     let mut h = 0;

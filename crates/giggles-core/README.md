@@ -255,3 +255,5 @@ Full-state traversal/rewrite remains a prototype limitation. C registry handles
 and CLI principal/time fields do not provide remote authentication. Production
 redaction/disclosure budgets, trusted physical time integration, issuer delegation,
 packaging and platform/durability qualification remain separate work.
+
+P1 relational continuation: see [SQL.md](SQL.md) and [GD-0006](https://app.archdocs.io/design-docs/14d046e2-cf09-4309-a392-2a12650f000e) for the trusted generic SQL/native scan subset, format2 migration and compatibility matrix. The finite task repair SQL remains separate in authority.

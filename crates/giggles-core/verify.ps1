@@ -23,6 +23,6 @@ foreach ($entry in $commands) {
  Write-Output "$($entry.Name): exit $code"
  if ($code -ne 0) {$failed=$true}
 }
-$inputPaths=@('src','tests','examples','include','Cargo.toml','Cargo.lock','README.md','HANDOFF.md','LOCAL.md','verify.ps1','verify-c.ps1') | Where-Object {Test-Path -LiteralPath $_}
+$inputPaths=@('src','tests','examples','include','Cargo.toml','Cargo.lock','README.md','HANDOFF.md','LOCAL.md','SQL.md','verify.ps1','verify-c.ps1') | Where-Object {Test-Path -LiteralPath $_}
 rg --files @inputPaths | ForEach-Object { Get-FileHash -Algorithm SHA256 -LiteralPath $_ } | Format-Table -AutoSize | Out-String -Width 4096 | Set-Content -LiteralPath (Join-Path $artifactPath 'inputs-sha256.txt')
 if ($failed) {exit 1}

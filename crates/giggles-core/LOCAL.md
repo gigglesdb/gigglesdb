@@ -85,3 +85,5 @@ not authenticated protection against malicious filesystem owners. Restore makes
 a new database identity with old tasks and approvals revoked, preserves forensic
 receipts/origin, and rejects every existing destination (even incomplete ones).
 A failed install remains for inspection; retry into a different fresh path.
+
+Trusted generic application SQL and explicit SQL batches are documented in [SQL.md](SQL.md). Admin commands sql/sql_batch/catalog and additive C SQL session handles are trusted local surfaces; Executor generic SQL remains unsupported.

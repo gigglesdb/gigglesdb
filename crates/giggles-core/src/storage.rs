@@ -14,7 +14,7 @@ use std::{
     },
 };
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_v1");
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"GDEXP001";
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,7 @@ pub enum CoreError {
     Fenced,
     Limit,
     Policy(Error),
+    Sql(relational::SqlError),
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,6 +108,7 @@ fn recovery(
 }
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
+    pub sql: relational::Relational,
     pub view: Snapshot,
     pub last_time: u64,
     pub next_approval: u64,
@@ -123,6 +125,7 @@ struct Metadata {
 }
 fn empty(domain: u128) -> State {
     State {
+        sql: Default::default(),
         view: Snapshot {
             domain,
             schema: 0,
@@ -145,6 +148,7 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
 }
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let mut out = BTreeMap::new();
+    out.insert(vec![5], encode(&s.sql)?);
     out.insert(
         vec![0],
         encode(&Metadata {
@@ -194,10 +198,19 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    if m.format != FORMAT {
+    if m.format != FORMAT && m.format != 1 {
         return Err(CoreError::Unsupported);
     }
     let mut s = empty(m.domain);
+    match records.get(&vec![5]) {
+        Some(v) if m.format == FORMAT => s.sql = decode(v)?,
+        None if m.format == 1 => {}
+        _ => {
+            return Err(CoreError::Corrupt(
+                "relational format/namespace mismatch".into(),
+            ));
+        }
+    }
     s.view.schema = m.schema;
     s.last_time = m.last_time;
     s.next_approval = m.next_approval;
@@ -211,6 +224,7 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
         };
         match k.first() {
             Some(0) if k.len() == 1 => {}
+            Some(5) if k.len() == 1 => {}
             Some(1) if k.len() == 17 => {
                 s.view.rows.insert(
                     Key {
@@ -242,6 +256,9 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
     Ok(s)
 }
 fn validate(s: &State) -> Result<(), CoreError> {
+    s.sql
+        .validate()
+        .map_err(|e| CoreError::Corrupt(format!("relational invariant: {e:?}")))?;
     let bad = || CoreError::Corrupt("authority invariant".into());
     for (id, t) in &s.view.tasks {
         if *id != t.grant.task
@@ -278,6 +295,8 @@ struct Inner {
     db: Database,
     gate: Mutex<()>,
     admitted: AtomicUsize,
+    sql_transactions: AtomicUsize,
+    sql_operations: AtomicUsize,
     fenced: AtomicBool,
     limits: Limits,
     crash: Mutex<CrashPoint>,
@@ -289,6 +308,17 @@ impl Drop for Ticket<'_> {
     }
 }
 impl Inner {
+    fn enter_sql(&self) -> Result<Ticket<'_>, CoreError> {
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(CoreError::Fenced);
+        }
+        self.sql_operations
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(1).filter(|_| n < self.limits.admitted)
+            })
+            .map_err(|_| CoreError::Busy)?;
+        Ok(Ticket(&self.sql_operations))
+    }
     fn enter(&self) -> Result<Ticket<'_>, CoreError> {
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
@@ -340,6 +370,11 @@ impl Inner {
         })?;
         // Logical errors can still advance the trusted monotonic decision clock.
         let result = f(&mut s);
+        s.sql.generation = s
+            .sql
+            .generation
+            .checked_add(1)
+            .ok_or(CoreError::Sql(relational::SqlError::Overflow))?;
         let values = records(&s)?;
         let point = *self.crash.lock().map_err(|_| CoreError::Fenced)?;
         let persisted = (|| {
@@ -433,6 +468,8 @@ impl Admin {
                 db,
                 gate: Mutex::new(()),
                 admitted: AtomicUsize::new(0),
+                sql_transactions: AtomicUsize::new(0),
+                sql_operations: AtomicUsize::new(0),
                 fenced: AtomicBool::new(false),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
@@ -713,7 +750,9 @@ impl Admin {
         let mut header = [0u8; 52];
         f.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC
-            || u32::from_be_bytes(header[8..12].try_into().expect("length")) != FORMAT
+            || ![1, FORMAT].contains(&u32::from_be_bytes(
+                header[8..12].try_into().expect("length"),
+            ))
         {
             return Err(CoreError::Unsupported);
         }
@@ -819,6 +858,240 @@ impl Executor {
         })
     }
 }
+/// Trusted session only. Dropping a session discards its staged transaction.
+/// No lock or admission ticket lives across client calls.
+pub struct SqlSession {
+    admin: Admin,
+    staged: Option<State>,
+    aborted: bool,
+    transaction_id: Option<u128>,
+}
+impl Admin {
+    pub fn sql_session(&self) -> SqlSession {
+        SqlSession {
+            admin: self.clone(),
+            staged: None,
+            aborted: false,
+            transaction_id: None,
+        }
+    }
+    pub fn catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.inner
+            .inspect(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
+    }
+}
+impl SqlSession {
+    pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
+        if self.aborted {
+            return Err(CoreError::Sql(relational::SqlError::Aborted));
+        }
+        let result = (|| {
+            let mut prepared = if let Some(s) = &self.staged {
+                relational::Prepared::scan(scan, s.view.domain, &s.sql).map_err(CoreError::Sql)?
+            } else {
+                self.admin.inner.inspect(|s| {
+                    relational::Prepared::scan(scan, s.view.domain, &s.sql).map_err(CoreError::Sql)
+                })?
+            };
+            prepared.transaction = self.transaction_id;
+            self.execute_prepared(&prepared, &[], None)
+        })();
+        if result.is_err() && self.staged.is_some() {
+            self.aborted = true;
+        }
+        result
+    }
+    pub fn in_transaction(&self) -> bool {
+        self.staged.is_some()
+    }
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+    pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        let mut result = if let Some(s) = &self.staged {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+        } else {
+            self.admin.inner.inspect(|s| {
+                relational::Prepared::parse(sql, s.view.domain, s.sql.epoch).map_err(CoreError::Sql)
+            })
+        };
+        if let Ok(p) = &mut result {
+            p.transaction = self.transaction_id;
+        }
+        if result.is_err() && self.staged.is_some() {
+            self.aborted = true;
+        }
+        result
+    }
+    pub fn execute(
+        &mut self,
+        sql: &str,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        // ROLLBACK remains available after any parse/bind/statement/commit error.
+        if self.aborted {
+            let p = relational::Prepared::parse(sql, 0, 0).map_err(CoreError::Sql)?;
+            if p.control() != Some("rollback") {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if !params.is_empty() || expected_version.is_some() {
+                return Err(CoreError::Sql(relational::SqlError::Parameters));
+            }
+            self.rollback();
+            return Ok(Default::default());
+        }
+        let p = self.prepare(sql)?;
+        self.execute_prepared(&p, params, expected_version)
+    }
+    pub fn execute_prepared(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        if self.aborted {
+            return Err(CoreError::Sql(relational::SqlError::Aborted));
+        }
+        let inner = self.admin.inner.clone();
+        let _ticket = match inner.enter_sql() {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                if self.staged.is_some() {
+                    self.aborted = true;
+                }
+                return Err(e);
+            }
+        };
+        let result = self.run(p, params, expected_version);
+        if result.is_err() && self.staged.is_some() {
+            self.aborted = true;
+        }
+        result
+    }
+    fn run(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        use relational::SqlError as E;
+        if p.transaction.is_some() && p.transaction != self.transaction_id {
+            return Err(CoreError::Sql(E::StaleSchema));
+        }
+        if let Some(control) = p.control() {
+            let (domain, epoch) = match &self.staged {
+                Some(s) => (s.view.domain, s.sql.epoch),
+                None => self
+                    .admin
+                    .inner
+                    .inspect(|s| Ok((s.view.domain, s.sql.epoch)))?,
+            };
+            if p.domain != domain || p.epoch != epoch {
+                return Err(CoreError::Sql(E::StaleSchema));
+            }
+            if !params.is_empty() || expected_version.is_some() {
+                return Err(CoreError::Sql(E::Parameters));
+            }
+            match control {
+                "begin" => {
+                    if self.staged.is_some() {
+                        return Err(CoreError::Sql(E::Transaction));
+                    }
+                    let mut token = [0u8; 16];
+                    getrandom::fill(&mut token).map_err(io)?;
+                    self.admin
+                        .inner
+                        .sql_transactions
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                            if n < relational::MAX_TRANSACTIONS {
+                                Some(n + 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .map_err(|_| CoreError::Busy)?;
+                    match self.admin.inner.inspect(|s| Ok(s.clone())) {
+                        Ok(s) => {
+                            self.staged = Some(s);
+                            self.transaction_id = Some(u128::from_be_bytes(token));
+                        }
+                        Err(e) => {
+                            self.admin
+                                .inner
+                                .sql_transactions
+                                .fetch_sub(1, Ordering::AcqRel);
+                            return Err(e);
+                        }
+                    }
+                }
+                "rollback" => {
+                    if self.staged.is_none() {
+                        return Err(CoreError::Sql(E::Transaction));
+                    }
+                    self.rollback();
+                }
+                "commit" => {
+                    let staged = self
+                        .staged
+                        .as_ref()
+                        .ok_or(CoreError::Sql(E::Transaction))?
+                        .clone();
+                    self.publish(staged)?;
+                    self.rollback();
+                }
+                _ => unreachable!(),
+            }
+            return Ok(Default::default());
+        }
+        let mut s = match &self.staged {
+            Some(s) => s.clone(),
+            None => self.admin.inner.inspect(|s| Ok(s.clone()))?,
+        };
+        if p.domain != s.view.domain {
+            return Err(CoreError::Sql(E::StaleSchema));
+        }
+        let result = s
+            .sql
+            .execute(p, params, expected_version)
+            .map_err(CoreError::Sql)?;
+        // Reserve the complete durable/export envelope before accepting a stage.
+        records(&s)?;
+        if self.staged.is_some() {
+            self.staged = Some(s);
+        } else if !p.is_read() {
+            self.publish(s)?;
+        }
+        Ok(result)
+    }
+    fn publish(&self, staged: State) -> Result<(), CoreError> {
+        self.admin.inner.change(|s| {
+            if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation {
+                return Err(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            *s = staged;
+            Ok(())
+        })
+    }
+    pub fn rollback(&mut self) {
+        if self.staged.take().is_some() {
+            self.admin
+                .inner
+                .sql_transactions
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        self.aborted = false;
+        self.transaction_id = None;
+    }
+}
+impl Drop for SqlSession {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
 #[cfg(windows)]
 pub(crate) fn crash_now() -> ! {
     unsafe extern "system" {
@@ -850,6 +1123,103 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+    #[test]
+    fn legacy_format_read_migrate_and_preserve_original_artifacts() {
+        let mut state = empty(777);
+        state.view.rows.insert(
+            Key {
+                tenant: TenantId(42),
+                row: RowId(1),
+            },
+            Row {
+                status: Status::Failed,
+                failed_at: 103,
+                attempt_count: 0,
+                version: 3,
+            },
+        );
+        let mut values: BTreeMap<_, _> = records(&state)
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| *k != vec![5])
+            .collect();
+        values.insert(
+            vec![0],
+            encode(&Metadata {
+                format: 1,
+                domain: 777,
+                schema: 0,
+                last_time: 0,
+                next_approval: 0,
+                origin: None,
+            })
+            .unwrap(),
+        );
+        let path = fresh("legacy-source");
+        fs::create_dir(&path).unwrap();
+        let db = Database::create(path.join("data.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(RECORDS).unwrap();
+            for (k, v) in &values {
+                t.insert(k.as_slice(), v.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let original = fs::read(path.join("data.redb")).unwrap();
+        let legacy_export = fresh("legacy-export");
+        let payload = encode(&values).unwrap();
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend(1u32.to_be_bytes());
+        bytes.extend((payload.len() as u64).to_be_bytes());
+        bytes.extend(Sha256::digest(&payload));
+        bytes.extend(payload);
+        fs::write(&legacy_export, &bytes).unwrap();
+        assert_eq!(Admin::verify_export(&legacy_export).unwrap(), state.view);
+        let a = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(a.snapshot().unwrap(), state.view);
+        assert_eq!(a.catalog().unwrap(), (0, vec![]));
+        // Read-only attach has not changed any logical record; raw redb open may maintain its own header.
+        let t = a.inner.db.begin_read().unwrap();
+        let table = t.open_table(RECORDS).unwrap();
+        let m: Metadata = decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
+        assert_eq!(m.format, 1);
+        drop(table);
+        drop(t);
+        let preserved = fresh("legacy-original-redb");
+        fs::write(&preserved, &original).unwrap();
+        let mut s = a.sql_session();
+        s.execute(
+            "CREATE TABLE application (id BIGINT PRIMARY KEY)",
+            &[],
+            None,
+        )
+        .unwrap();
+        s.execute("INSERT INTO application VALUES(-1)", &[], None)
+            .unwrap();
+        let t = a.inner.db.begin_read().unwrap();
+        let table = t.open_table(RECORDS).unwrap();
+        let m: Metadata = decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
+        assert_eq!(m.format, 2);
+        assert_ne!(m.format, 1, "v1 reader rejects before decoding namespace5");
+        drop(table);
+        drop(t);
+        assert_eq!(a.snapshot().unwrap(), state.view);
+        drop(s);
+        drop(a);
+        let a = Admin::open(path, Limits::default()).unwrap();
+        assert_eq!(
+            a.sql_session()
+                .execute("SELECT * FROM application WHERE id=-1", &[], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![relational::Value::Int(-1)]
+        );
+        assert_eq!(fs::read(legacy_export).unwrap(), bytes);
+        assert_eq!(fs::read(preserved).unwrap(), original);
     }
     #[test]
     fn full_envelope_is_reserved_and_every_accepted_boundary_state_exports() {
@@ -928,6 +1298,15 @@ mod tests {
         assert_eq!(a.snapshot(), Err(CoreError::Busy));
         a.inner.admitted.store(0, Ordering::Release);
         assert!(a.snapshot().is_ok());
+        a.inner.sql_operations.store(usize::MAX, Ordering::Release);
+        assert_eq!(
+            a.sql_session().execute("BEGIN", &[], None),
+            Err(CoreError::Busy)
+        );
+        a.inner.sql_operations.store(0, Ordering::Release);
+        let mut session = a.sql_session();
+        session.execute("BEGIN", &[], None).unwrap();
+        session.execute("ROLLBACK", &[], None).unwrap();
     }
     #[test]
     fn ordered_namespace_tuple_encoding() {
@@ -946,7 +1325,7 @@ mod tests {
                     r.insert(
                         vec![0],
                         encode(&Metadata {
-                            format: 2,
+                            format: 99,
                             domain: 123,
                             schema: 0,
                             last_time: 0,

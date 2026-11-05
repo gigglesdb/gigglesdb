@@ -117,3 +117,5 @@ executable, raw outputs/hashes and databases. Run from this crate. Never clean
 artifacts. The C runner currently locates VS2022 Community; other toolchains and
 ABI/platform pairs need their own qualification. No installation packaging or
 header-generation compatibility campaign has been performed.
+
+P1 relational continuation GD-0006 adds gd_v1_sql_session(Admin,out). Its handle accepts {sql,params,expected_version} through gd_v1_call; close rolls back any staged transaction. Executor cannot create a SQL session. SQL codes200..216 and exact grammar/bounds/format2 migration are documented in ../giggles-core/SQL.md. Native Rust prepared/Scan APIs have no separate C opcode in this slice. Existing ABI version1 ownership and numeric policy codes remain stable.

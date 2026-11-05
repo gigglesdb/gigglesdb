@@ -165,7 +165,7 @@ fn main() {
     println!("{}", serde_json::to_string(&reply).expect("reply"));
     std::process::exit(if reply.code == 0 {
         0
-    } else if reply.code >= 100 {
+    } else if (100..200).contains(&reply.code) {
         2
     } else {
         3

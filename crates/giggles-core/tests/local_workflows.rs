@@ -2,6 +2,32 @@ mod common;
 use common::*;
 use giggles_core::*;
 use serde_json::{Value, json};
+#[test]
+fn trusted_sql_cli_batches_typed_rows_and_error_rollback() {
+    let mut c = Cli::new();
+    c.create();
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"CREATE TABLE cli_rows (id BIGINT PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO cli_rows VALUES($1,$2)","params":[{"Int":-5},{"Text":"雪"}]},{"sql":"COMMIT"}]}),0,0);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT * FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":-5},{"Text":"雪"}]));
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"DELETE FROM cli_rows WHERE id=-5"},{"sql":"INSERT INTO cli_rows VALUES(NULL,'bad')"},{"sql":"COMMIT"}]}),3,207);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT id FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":-5}]));
+    c.admin(json!({"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"DELETE FROM cli_rows WHERE id=-5"}]}),3,214);
+    let r = c.admin(
+        json!({"command":"sql","sql":"SELECT id FROM cli_rows LIMIT 5","params":[]}),
+        0,
+        0,
+    );
+    assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+}
 struct Cli {
     root: std::path::PathBuf,
     db: std::path::PathBuf,

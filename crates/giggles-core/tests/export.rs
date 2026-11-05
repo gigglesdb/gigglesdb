@@ -54,7 +54,7 @@ fn corrupt_truncated_extended_unknown_version_exports_reject() {
             0 => bytes[55] ^= 1,
             1 => bytes.truncate(25),
             2 => bytes.push(0),
-            3 => bytes[11] = 2,
+            3 => bytes[11] = 99,
             4 => bytes[0] = 0,
             5 => bytes[12..20].copy_from_slice(&u64::MAX.to_be_bytes()),
             _ => unreachable!(),

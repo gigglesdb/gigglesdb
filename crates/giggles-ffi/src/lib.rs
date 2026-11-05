@@ -13,6 +13,7 @@ const MAX_BUFFERS: usize = 128 * 1024 * 1024;
 enum Handle {
     Admin(Admin),
     Executor(Executor),
+    SqlSession(Box<SqlSession>),
     Buffer(Vec<u8>),
 }
 struct Registry {
@@ -188,9 +189,10 @@ pub unsafe extern "C" fn gd_v1_call(handle: u64, p: *const u8, len: usize, out: 
         if !r.capacity(local::MAX_OUTPUT) {
             return 16;
         }
-        let reply = match r.handles.get(&handle) {
+        let reply = match r.handles.get_mut(&handle) {
             Some(Handle::Admin(a)) => local::admin(a, b),
             Some(Handle::Executor(e)) => local::executor(e, b),
+            Some(Handle::SqlSession(s)) => local::sql_session(s, b),
             _ => return INVALID,
         };
         let code = reply.code;
@@ -207,6 +209,37 @@ pub unsafe extern "C" fn gd_v1_call(handle: u64, p: *const u8, len: usize, out: 
                     *out = id;
                 }
                 code
+            }
+            Err(c) => c,
+        }
+    })
+}
+/// Creates a trusted SQL session. Executor handles cannot create sessions.
+/// # Safety
+/// out must point to aligned writable u64 storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gd_v1_sql_session(admin: u64, out: *mut u64) -> u32 {
+    boundary(|| {
+        if out.is_null() {
+            return INVALID;
+        }
+        unsafe {
+            *out = 0;
+        }
+        let mut r = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if !r.capacity(0) {
+            return 16;
+        }
+        let session = match r.handles.get(&admin) {
+            Some(Handle::Admin(a)) => a.sql_session(),
+            _ => return INVALID,
+        };
+        match r.add(Handle::SqlSession(Box::new(session))) {
+            Ok(id) => {
+                unsafe {
+                    *out = id;
+                }
+                0
             }
             Err(c) => c,
         }

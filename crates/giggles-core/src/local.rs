@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub const MAX_INPUT: usize = 1024 * 1024;
 pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlInput {
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<relational::Value>,
+    pub expected_version: Option<u64>,
+}
+pub fn sql_session(session: &mut SqlSession, input: &[u8]) -> Reply {
+    match parse::<SqlInput>(input) {
+        Ok(s) => result(session.execute(&s.sql, &s.params, s.expected_version)),
+        Err(e) => e,
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Reply {
     pub version: u32,
@@ -60,6 +74,27 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::Busy => 14,
         CoreError::Fenced => 15,
         CoreError::Limit => 16,
+        CoreError::Sql(e) => {
+            200 + match e {
+                relational::SqlError::Unsupported => 0,
+                relational::SqlError::Syntax => 1,
+                relational::SqlError::Reserved => 2,
+                relational::SqlError::UnknownTable => 3,
+                relational::SqlError::UnknownColumn => 4,
+                relational::SqlError::Duplicate => 5,
+                relational::SqlError::Type => 6,
+                relational::SqlError::Null => 7,
+                relational::SqlError::Parameters => 8,
+                relational::SqlError::Limit => 9,
+                relational::SqlError::Unbounded => 10,
+                relational::SqlError::Version => 11,
+                relational::SqlError::Conflict => 12,
+                relational::SqlError::StaleSchema => 13,
+                relational::SqlError::Transaction => 14,
+                relational::SqlError::Aborted => 15,
+                relational::SqlError::Overflow => 16,
+            }
+        }
     };
     Reply::error(code, e)
 }
@@ -82,6 +117,15 @@ fn decision(d: Result<Decision, CoreError>) -> Reply {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
+    Sql {
+        sql: String,
+        params: Vec<relational::Value>,
+        expected_version: Option<u64>,
+    },
+    SqlBatch {
+        statements: Vec<SqlInput>,
+    },
+    Catalog,
     Seed {
         key: Key,
         row: Row,
@@ -170,6 +214,36 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
         Err(e) => return e,
     };
     match c {
+        AdminCommand::Sql {
+            sql,
+            params,
+            expected_version,
+        } => {
+            let mut session = a.sql_session();
+            let r = session.execute(&sql, &params, expected_version);
+            if r.is_ok() && session.in_transaction() {
+                return failure(CoreError::Sql(relational::SqlError::Transaction));
+            }
+            result(r)
+        }
+        AdminCommand::SqlBatch { statements } => {
+            if statements.len() > 256 {
+                return Reply::error(16, "batch limit");
+            }
+            let mut session = a.sql_session();
+            let mut results = Vec::new();
+            for s in statements {
+                match session.execute(&s.sql, &s.params, s.expected_version) {
+                    Ok(r) => results.push(r),
+                    Err(e) => return failure(e),
+                }
+            }
+            if session.in_transaction() {
+                return failure(CoreError::Sql(relational::SqlError::Transaction));
+            }
+            result(Ok(results))
+        }
+        AdminCommand::Catalog => result(a.catalog()),
         AdminCommand::Seed { key, row } => result(a.put(key, row)),
         AdminCommand::Grant { grant } => result(a.grant(grant).map(|_| ())),
         AdminCommand::Approve {
@@ -182,7 +256,7 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
         AdminCommand::Export { path } => result(a.export(path)),
         AdminCommand::Metadata => match a.authority_metadata() {
             Ok((domain, last_time, next_approval, origin)) => Reply::ok(
-                json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"format":1,"durability":"immediate","engine":"redb"}),
+                json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"write_format":2,"durability":"immediate","engine":"redb"}),
             ),
             Err(e) => failure(e),
         },

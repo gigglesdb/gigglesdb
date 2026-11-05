@@ -11,6 +11,24 @@ static char *call(gd_handle h,const char *json,uint32_t code) {
     assert(gd_v1_close(b)==0);assert(gd_v1_close(b)==18);puts(out);return out;
 }
 static void action(gd_handle h,const char *json,uint32_t code){char *s=call(h,json,code);free(s);}
+static void sql_workflow(gd_handle a,gd_handle e){
+    gd_handle s=0,bad=99;char *r;
+    assert(gd_v1_sql_session(e,&bad)==18);assert(bad==0);
+    assert(gd_v1_sql_session(a,&s)==0);
+    action(s,"{\"sql\":\"BEGIN\"}",0);
+    action(s,"{\"sql\":\"CREATE TABLE actual_c (tenant BIGINT,id BIGINT,body TEXT,raw BYTEA,PRIMARY KEY(tenant,id))\"}",0);
+    action(s,"{\"sql\":\"INSERT INTO actual_c VALUES($1,$2,$3,$4)\",\"params\":[{\"Int\":42},{\"Int\":-3},{\"Text\":\"typed C\"},{\"Bytes\":[0,255]}]}",0);
+    action(s,"{\"sql\":\"INSERT INTO actual_c VALUES(42,9,'second',NULL)\"}",0);
+    action(s,"{\"sql\":\"COMMIT\"}",0);
+    r=call(s,"{\"sql\":\"SELECT id,body,raw FROM actual_c WHERE tenant=42 ORDER BY id DESC LIMIT 2\"}",0);
+    assert(strstr(r,"\"Int\":9")<strstr(r,"\"Int\":-3"));assert(strstr(r,"\"Text\":\"typed C\""));assert(strstr(r,"\"Bytes\":[0,255]"));free(r);
+    action(s,"{\"sql\":\"BEGIN\"}",0);action(s,"{\"sql\":\"DELETE FROM actual_c WHERE tenant=42 AND id=-3\"}",0);
+    action(s,"{\"sql\":\"INSERT INTO actual_c VALUES(NULL,2,'bad',NULL)\"}",207);action(s,"{\"sql\":\"COMMIT\"}",215);action(s,"{\"sql\":\"ROLLBACK\"}",0);
+    action(s,"{\"sql\":\"DELETE FROM actual_c WHERE tenant=42\"}",210);
+    action(s,"{\"sql\":\"SELECT * FROM actual_c; COMMIT\"}",200);
+    action(s,"{\"sql\":\"BEGIN\"}",0);action(s,"{\"sql\":\"DELETE FROM actual_c WHERE tenant=42 AND id=9\"}",0);
+    assert(gd_v1_close(s)==0);
+}
 static gd_handle open_db(const char *mode,const char *path,const char *source){
     char json[4096];gd_handle h=0;
     if(source)snprintf(json,sizeof json,"{\"mode\":\"%s\",\"path\":\"%s\",\"export\":\"%s\"}",mode,path,source);
@@ -31,6 +49,7 @@ int main(int argc,char **argv){
     snprintf(json,sizeof json,"{\"command\":\"execute\",\"request\":%s,\"time\":{\"Certified\":10},\"approval\":0}",request);action(e,json,0);action(e,json,0);
     action(e,"{\"command\":\"status\",\"operation\":1}",0);action(e,"{\"command\":\"status\",\"operation\":99}",1);
     assert(gd_v1_executor(e,1,2,&bad)==18);assert(bad==0);
+    sql_workflow(a,e);
     snprintf(json,sizeof json,"{\"command\":\"export\",\"path\":\"%s\"}",argv[2]);action(a,json,0);action(a,json,13);
     assert(gd_v1_close(e)==0);assert(gd_v1_close(a)==0);
     a=open_db("open",argv[1],NULL);assert(gd_v1_executor(a,1,2,&e)==0);action(e,"{\"command\":\"status\",\"operation\":1}",0);

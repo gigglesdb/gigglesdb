@@ -37,6 +37,10 @@ enum gd_v1_code {
 uint32_t gd_v1_abi_version(void);
 uint32_t gd_v1_admin_open(const uint8_t*,size_t,gd_handle*);
 uint32_t gd_v1_executor(gd_handle,uint64_t,uint64_t,gd_handle*);
+/* Trusted Admin only; session call JSON: {"sql":"BEGIN", "params":[]}.
+   Session close rolls back staged changes. SQL errors 200..216, see core SQL.md.
+   Executor cannot create a session or submit generic SQL. */
+uint32_t gd_v1_sql_session(gd_handle,gd_handle*);
 uint32_t gd_v1_call(gd_handle,const uint8_t*,size_t,gd_handle*);
 uint32_t gd_v1_buffer_copy(gd_handle,uint8_t*,size_t,size_t*);
 uint32_t gd_v1_close(gd_handle);
