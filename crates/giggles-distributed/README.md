@@ -83,7 +83,7 @@ existing row version. Core assigns version 0 on insertion and increments it on
 replacement; the supplied row version is not authority. Request IDs are retained
 in the data range; repeating the same request/key/payload returns its prior
 version. Preserve the original key and operation when resolving an ambiguous
-response. There is no global application request-ID or task transaction service.
+response. Use the transaction API below for a durable home-scoped operation identity. Protected task transactions remain unavailable.
 
 The controller needs local leadership of each involved group. Contact the
 reported leader for individual typed steps, or colocate leadership using trusted
@@ -92,13 +92,90 @@ between processes; administrative requests are never forwarded over peer TLS.
 `RouteCache` is a bounded-retry library helper; the runtime always reads the root
 and uses no negative cache to authorize operations.
 
-`observe` bounds output to 4096 rows. It pins the current directory revision,
-checks exact descriptors and range fences after each group's current barrier,
-and rechecks the directory before releasing any rows. Ownership change or a
-fenced parent fails the whole observation. It is an ownership-coherent diagnostic
-observation: concurrent data changes across groups do not have a common SQL
-transaction snapshot. Strict cross-range reads require the future predicate-lock
-and decision protocol. No partial result is returned as a complete observation.
+`observe` acquires shared predicate/gap locks on every intersecting current
+range before releasing any rows. Locks survive prepare and restarts and resolve
+through a durable home decision. Readers meeting prepared work consult that home
+or fail without releasing a result. The typed observation bound is 32 rows per
+participant and 4096 rows overall. There is no MVCC historical-read API.
+
+## Typed transactions
+
+The owner API accepts `transact` with a `plan` and `outcome` (`Commit` or `Abort`).
+A plan contains `database` (domain), nonzero `nonce` (u128), exact `home` descriptor,
+and `participants` sorted by group. The home must be one participant. Each entry
+contains its exact `route`, `writes` and `reads`. A write is
+`{"key":KEY,"before":null,"row":ROW}` for an absent-key CAS; replacement requires
+the complete previous Row including version. A read is
+`{"bounds":BOUNDS,"expected":null}` for a complete observation; `expected` can
+instead be the complete ascending array of `[KEY,ROW]` pairs, including an empty
+array to protect absence. Reads observe before the transaction's own writes.
+Only typed row puts are supported. TaskWrite continues to reject.
+
+For example, in the initial unsplit data group, substitute descriptor D above:
+
+```text
+{"command":"transact","plan":{"database":42,"nonce":8001,"home":D,"participants":[{"route":D,"writes":[{"key":{"tenant":42,"row":1},"before":null,"row":{"status":"Failed","failed_at":103,"attempt_count":10,"version":999}}],"reads":[]}]},"outcome":"Commit"}
+{"command":"tx_status","home":D,"id":{"home":{"database":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,42],"range":10,"epoch":1},"nonce":8001}}
+{"command":"tx_recover","home":D,"id":ID,"outcome":"Commit"}
+```
+
+The first request durably stores the immutable full plan, registers and seals all
+participants, acquires all locks before any prepare, validates full before-images
+and predicates, stages redo, records all prepare votes at the home, chooses one
+durable outcome and finalizes every participant before success. Single-range work
+uses the same conservative protocol. `tx_status` returns durable home outcome and
+retained complete observations only after commit; no undecided read result is
+released. Repeating the same nonce/body is idempotent, a changed body fails, and
+an existing outcome always wins over a later requested outcome. There is no GC.
+A failed or timed-out coordinator call is indeterminate: preserve its plan/ID,
+inspect status and recover. Explicit owner-selected Abort is a replicated home
+decision, never unilateral participant timeout. Partially prepared operations may
+block until home quorum returns. `tx_recover` loads the stored plan after restart.
+
+Automatic `transact`, `tx_recover` and `observe` currently require local leadership
+of their groups. Independently led groups support the same real protocol through
+owner-routed `tx_step` requests:
+
+```text
+{"command":"tx_step","request":{"route":D,"step":{"Open":PLAN},"evidence":[]}}
+{"command":"tx_pin","route":D}
+```
+
+After Open, carry its home `tx_pin` response as evidence to `Begin {id}` on each
+participant. `Lock {id}` each participant with no evidence. Pin all locked groups
+and pass that vector to each `Prepare {id}`. Pin each prepared group and pass it
+to the home's `Vote {id,participant:DESCRIPTOR}`. `Decide {id,outcome}` at home
+uses no evidence. Finally carry a new home pin to every `Finalize {id}`. Step enum
+objects use the same externally tagged JSON form as Open. A step response exposes
+only group/applied/reply, with no partial observation results. An external owner
+coordinator can reconstruct its next step from pinned immutable plan, phase and
+home outcome after death; there is no cross-node administrative RPC forwarding.
+The process tests exercise this routing with different leaders.
+
+A pin is a committed-state locator and snapshot from a quorum-checked current
+barrier. It is **trusted owner control input, not a cryptographic certificate**.
+Copy only real responses from authenticated owner sessions; never accept pins
+from an untrusted remote user. Peer listeners still accept Raft only. `inspect`,
+`current`, and `tx_pin` expose full trusted diagnostics; these are not protected
+application read endpoints. Apply validates exact database/range/epoch,
+operation digest, sealed participants, engine position and applied-index binding
+through the transaction library's private evidence methods. It restores pinned
+state deterministically and never contacts the network during apply. Engine
+positions encode `raft_index * 256 + subcommand` for atomic bounded batches.
+Transaction state, applied index and core redo effects share one Immediate redb
+commit; response loss cannot cause redo to increment row versions twice.
+
+Each range retains at most 16 transaction records; a plan has at most 8
+participants, 8 combined reads/writes per participant and a 4 KiB canonical body.
+Each participant captures at most 32 rows in total. The transaction engine has a
+64 KiB snapshot bound with reserved resolution space. Admission prevalidates core
+writes and reserves row slots for admitted active/prepared inserts. Capacity
+exhaustion rejects new work; it does not evict locks, redo or terminal decisions.
+Direct Put conservatively rejects a range with any unresolved home/participant
+work. Split fencing rejects active, queued and prepared work. Terminal homes
+remain on retained parent groups; retry/status use their original descriptors.
+No transaction state migration or deletion is implemented. The on-disk range
+schema changed; automatic upgrade from older binaries is not provided.
 
 ## Split and recovery
 
@@ -117,7 +194,7 @@ child through its own quorum, verifies current durable child state, atomically
 publishes the directory, then activates children. Inactive children reject data
 writes. Publication followed by a crash may leave temporary unavailability;
 repeating `resume` activates remaining children. Parent state and log lineage are
-retained. Prepared-work guard must be empty. Parent writes remain fenced forever.
+retained. Actual unresolved transaction state must be drained; no prepared locks or intents may be omitted. Parent writes remain fenced forever.
 Same lifecycle ID and exact content is idempotent; conflicting content fails.
 
 The trusted controller derives readiness proofs from current group reads. Proofs
@@ -163,8 +240,8 @@ stdin only. `block` takes `group` and a list of peer IDs; restarting clears it.
 `arm_crash` takes `group` and `after` and exits the process with code 86 at the
 next applied atomic save. Neither removes artifacts.
 
-Membership moves, rigorous locks/prepared participants/replicated distributed
-decisions, general distributed SQL, catalog partitioning, transactional multi-range
-reads, CDC delivery/retention, dynamic placement and production/cloud/performance
+Membership moves, protected task authority/budget/approval/receipt integration,
+general distributed SQL, catalog partitioning, CDC delivery/retention, dynamic
+placement and production/cloud/performance
 qualification remain unavailable. Local tests imply no scaling or physical-time
 guarantee.

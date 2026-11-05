@@ -3,6 +3,7 @@ pub mod machine;
 pub mod node;
 pub mod runtime;
 pub mod store;
+pub mod transaction;
 pub mod transport;
 pub use machine::*;
 pub use node::Node;

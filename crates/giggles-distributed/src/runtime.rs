@@ -185,6 +185,190 @@ impl Drop for Runtime {
     }
 }
 impl Runtime {
+    /// Pin durable committed state at an authoritative barrier. The owner may
+    /// carry this to another independently led group; it is trusted control input.
+    pub async fn tx_pin(&self, route: &Descriptor) -> Result<crate::transaction::Pinned> {
+        let pinned =
+            crate::transaction::Pinned::from_current(self.group(route.group)?.current().await?)?;
+        if pinned.route != *route {
+            return Err("pin stale route".into());
+        }
+        Ok(pinned)
+    }
+    pub async fn tx_step(&self, request: crate::transaction::Request) -> Result<serde_json::Value> {
+        let o = self
+            .apply(request.route.group, Action::Transaction(Box::new(request)))
+            .await?;
+        Ok(serde_json::json!({"group":o.group,"applied":o.applied,"reply":o.reply}))
+    }
+    pub async fn tx_status(
+        &self,
+        home: &Descriptor,
+        id: giggles_transactions::TransactionId,
+    ) -> Result<serde_json::Value> {
+        if id.home != crate::transaction::domain(self.domain, home) {
+            return Err("status requires original transaction home".into());
+        }
+        let pinned = self.tx_pin(home).await?;
+        let crate::Machine::Range { data, .. } = self.group(home.group)?.current().await?.machine
+        else {
+            return Err("home missing".into());
+        };
+        crate::transaction::status(&data, pinned.database, id)
+    }
+    /// Automatic durable recovery when the relevant groups are led locally.
+    /// For independent leaders, route the same typed steps and tx_pin responses
+    /// through their trusted owner sessions. No timeout becomes an abort.
+    pub async fn transact(
+        &self,
+        plan: crate::transaction::Plan,
+        requested: giggles_transactions::Outcome,
+    ) -> Result<serde_json::Value> {
+        use crate::transaction::{Request, Step};
+        use giggles_transactions::{Outcome, Phase};
+        plan.validate()?;
+        if plan.database != self.domain {
+            return Err("wrong database".into());
+        }
+        let id = plan.id();
+        self.tx_step(Request {
+            route: plan.home.clone(),
+            step: Step::Open(plan.clone()),
+            evidence: Vec::new(),
+        })
+        .await?;
+        let mut home = self.tx_pin(&plan.home).await?.for_transaction(id);
+        let mut outcome = home
+            .state
+            .engine(self.domain, &plan.home)?
+            .outcome(id)
+            .map(|d| d.outcome);
+        if outcome.is_none() && requested == Outcome::Commit {
+            for p in &plan.participants {
+                let pin = self.tx_pin(&p.route).await?;
+                if pin.state.engine(self.domain, &p.route)?.phase(id).is_none() {
+                    self.tx_step(Request {
+                        route: p.route.clone(),
+                        step: Step::Begin { id },
+                        evidence: vec![home.clone()],
+                    })
+                    .await?;
+                }
+            }
+            for p in &plan.participants {
+                // A current reader may meet a prepared blocker after another
+                // participant finalized. Resolve only from that blocker's home.
+                let pin = self.tx_pin(&p.route).await?;
+                let engine = pin.state.engine(self.domain, &p.route)?;
+                for blocker in &pin.state.records {
+                    let other = blocker.plan.id();
+                    if other == id
+                        || !matches!(engine.phase(other), Some(Phase::Active | Phase::Prepared))
+                    {
+                        continue;
+                    }
+                    let durable = self
+                        .tx_pin(&blocker.plan.home)
+                        .await?
+                        .for_transaction(other);
+                    if durable
+                        .state
+                        .engine(self.domain, &blocker.plan.home)?
+                        .outcome(other)
+                        .is_some()
+                    {
+                        self.tx_step(Request {
+                            route: p.route.clone(),
+                            step: Step::Finalize { id: other },
+                            evidence: vec![durable],
+                        })
+                        .await?;
+                    }
+                }
+                self.tx_step(Request {
+                    route: p.route.clone(),
+                    step: Step::Lock { id },
+                    evidence: Vec::new(),
+                })
+                .await?;
+            }
+            let mut locked = Vec::new();
+            for p in &plan.participants {
+                locked.push(self.tx_pin(&p.route).await?.for_transaction(id));
+            }
+            for p in &plan.participants {
+                let phase = self
+                    .tx_pin(&p.route)
+                    .await?
+                    .state
+                    .engine(self.domain, &p.route)?
+                    .phase(id);
+                if phase == Some(Phase::Active) {
+                    self.tx_step(Request {
+                        route: p.route.clone(),
+                        step: Step::Prepare { id },
+                        evidence: locked.clone(),
+                    })
+                    .await?;
+                }
+            }
+            for p in &plan.participants {
+                let prepared = self.tx_pin(&p.route).await?.for_transaction(id);
+                self.tx_step(Request {
+                    route: plan.home.clone(),
+                    step: Step::Vote {
+                        id,
+                        participant: p.route.clone(),
+                    },
+                    evidence: vec![prepared],
+                })
+                .await?;
+            }
+        }
+        if outcome.is_none() {
+            self.tx_step(Request {
+                route: plan.home.clone(),
+                step: Step::Decide {
+                    id,
+                    outcome: requested,
+                },
+                evidence: Vec::new(),
+            })
+            .await?;
+            home = self.tx_pin(&plan.home).await?.for_transaction(id);
+            outcome = home
+                .state
+                .engine(self.domain, &plan.home)?
+                .outcome(id)
+                .map(|d| d.outcome);
+        }
+        for p in &plan.participants {
+            let pin = self.tx_pin(&p.route).await?;
+            let phase = pin.state.engine(self.domain, &p.route)?.phase(id);
+            // An unbegun participant has no locks/intents to resolve on abort.
+            if phase.is_none() && outcome == Some(Outcome::Abort) {
+                continue;
+            }
+            self.tx_step(Request {
+                route: p.route.clone(),
+                step: Step::Finalize { id },
+                evidence: vec![home.clone()],
+            })
+            .await?;
+        }
+        self.tx_status(&plan.home, id).await
+    }
+    /// Resume from the immutable durable home plan, rather than a caller's memory.
+    pub async fn tx_recover(
+        &self,
+        home: &Descriptor,
+        id: giggles_transactions::TransactionId,
+        outcome: giggles_transactions::Outcome,
+    ) -> Result<serde_json::Value> {
+        let pin = self.tx_pin(home).await?;
+        self.transact(pin.state.record(id)?.plan.clone(), outcome)
+            .await
+    }
     pub async fn start(config: Config) -> Result<Self> {
         if config.groups.is_empty() || config.groups.len() > MAX_GROUPS {
             return Err("group limit".into());
@@ -536,49 +720,90 @@ impl Runtime {
         )
         .await
     }
-    /// Bounded ownership-coherent observation, NOT a strict multi-range SQL
-    /// transaction: concurrent data writes require next scope's predicate locks.
+    /// Strict bounded current observation. Every range predicate is locked before
+    /// any rows are released; unresolved prepares block or resolve via their home.
     pub async fn observe(&self, bounds: Bounds) -> Result<Vec<(Key, giggles_core::Row)>> {
-        self.observe_interleaved(bounds, None).await
+        use crate::transaction::{Participant, Plan, Predicate};
+        if !bounds.valid() {
+            return Err("invalid predicate".into());
+        }
+        let directory = self.directory().await?;
+        let mut participants = Vec::new();
+        for route in directory.routes {
+            if route.bounds.end.is_some_and(|e| e <= bounds.start)
+                || bounds.end.is_some_and(|e| e <= route.bounds.start)
+            {
+                continue;
+            }
+            let start = route.bounds.start.max(bounds.start);
+            let end = match (route.bounds.end, bounds.end) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            participants.push(Participant {
+                route,
+                writes: Vec::new(),
+                reads: vec![Predicate {
+                    bounds: Bounds { start, end },
+                    expected: None,
+                }],
+            });
+        }
+        participants.sort_by_key(|p| p.route.group);
+        let mut nonce = [0u8; 16];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut nonce)
+            .map_err(|_| "transaction entropy unavailable")?;
+        let plan = Plan {
+            database: self.domain,
+            nonce: u128::from_be_bytes(nonce),
+            home: participants.first().ok_or("no routes")?.route.clone(),
+            participants,
+        };
+        let result = match self
+            .transact(plan.clone(), giggles_transactions::Outcome::Commit)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // This is an explicit coordinator choice, durably recorded at
+                // the home; prepared participants never infer it from timeout.
+                let _ = self
+                    .tx_recover(&plan.home, plan.id(), giggles_transactions::Outcome::Abort)
+                    .await;
+                return Err(format!(
+                    "observation indeterminate/blocked id={:?}: {error}",
+                    plan.id()
+                )
+                .into());
+            }
+        };
+        let observations: Vec<crate::transaction::Rows> =
+            serde_json::from_value(result["rows"].clone())?;
+        let mut rows = observations
+            .into_iter()
+            .flat_map(|r| r.predicates.into_iter().flatten())
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(key, _)| *key);
+        if rows.len() > LIMIT {
+            return Err("observation limit".into());
+        }
+        Ok(rows)
     }
-    /// Trusted deterministic scheduler seam: finish a pending lifecycle after
-    /// collecting rows and before the mandatory current-directory recheck.
+    /// Trusted split scheduler seam: a changed directory forces whole retry.
     pub async fn observe_interleaved(
         &self,
         bounds: Bounds,
         resume: Option<u64>,
     ) -> Result<Vec<(Key, giggles_core::Row)>> {
-        if !bounds.valid() {
-            return Err("invalid predicate".into());
-        }
-        let before = self.directory().await?;
-        let mut rows = Vec::new();
-        for route in &before.routes {
-            if route.bounds.end.is_some_and(|end| end <= bounds.start)
-                || bounds.end.is_some_and(|end| end <= route.bounds.start)
-            {
-                continue;
-            }
-            let o = self.group(route.group)?.current().await?;
-            let Machine::Range { data, .. } = o.machine else {
-                return Err("range missing; retry whole observation".into());
-            };
-            data.check(route, &route.bounds)?;
-            for (key, row) in data.image.snapshot()?.rows {
-                if bounds.contains(key) {
-                    rows.push((key, row));
-                    if rows.len() > LIMIT {
-                        return Err("observation limit".into());
-                    }
-                }
-            }
-        }
         if let Some(id) = resume {
+            let before = self.directory().await?.revision;
             self.resume(id).await?;
+            if self.directory().await?.revision != before {
+                return Err("ownership changed; retry entire observation".into());
+            }
         }
-        if self.directory().await?.revision != before.revision {
-            return Err("ownership changed; retry entire observation".into());
-        }
-        Ok(rows)
+        self.observe(bounds).await
     }
 }

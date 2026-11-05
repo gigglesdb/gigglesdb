@@ -18,6 +18,833 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn transaction_plan(nonce: u128) -> transaction::Plan {
+    let s = split();
+    let mut a = row();
+    a.attempt_count = 10;
+    let mut b = row();
+    b.attempt_count = 20;
+    transaction::Plan {
+        database: 42,
+        nonce,
+        home: s.left.clone(),
+        participants: vec![
+            transaction::Participant {
+                route: s.left,
+                writes: vec![transaction::Write {
+                    key: key(1),
+                    before: None,
+                    row: a,
+                }],
+                reads: vec![],
+            },
+            transaction::Participant {
+                route: s.right,
+                writes: vec![transaction::Write {
+                    key: key(60),
+                    before: None,
+                    row: b,
+                }],
+                reads: vec![],
+            },
+        ],
+    }
+}
+
+impl Processes {
+    fn independent(&mut self) {
+        for (group, target) in [(3, 2), (4, 3)] {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let leader = self.leader(group);
+                if leader == target {
+                    break;
+                }
+                let reply = self
+                    .nodes
+                    .get_mut(&leader)
+                    .unwrap()
+                    .request(json!({"command":"transfer","group":group,"to":target}));
+                assert!(
+                    Instant::now() < deadline,
+                    "independent transfer timeout: {reply}"
+                );
+            }
+        }
+    }
+    fn owner(&mut self, group: u64, input: Value) -> Value {
+        let leader = self.leader(group);
+        self.nodes.get_mut(&leader).unwrap().request(input)
+    }
+    fn pin(
+        &mut self,
+        route: &Descriptor,
+        id: giggles_transactions::TransactionId,
+    ) -> transaction::Pinned {
+        let reply = self.owner(route.group, json!({"command":"tx_pin","route":route}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        serde_json::from_value::<transaction::Pinned>(reply["data"].clone())
+            .unwrap()
+            .for_transaction(id)
+    }
+    fn tx(
+        &mut self,
+        route: &Descriptor,
+        step: transaction::Step,
+        evidence: Vec<transaction::Pinned>,
+    ) -> Value {
+        self.owner(route.group, json!({"command":"tx_step","request":transaction::Request { route:route.clone(), step, evidence }}))
+    }
+    fn tx_ok(
+        &mut self,
+        route: &Descriptor,
+        step: transaction::Step,
+        evidence: Vec<transaction::Pinned>,
+    ) {
+        let reply = self.tx(route, step, evidence);
+        assert_eq!(reply["ok"], true, "{reply}");
+    }
+    fn split_for_transactions(&mut self) {
+        self.apply(1, Action::Begin(split()));
+        self.resume();
+        self.independent();
+    }
+}
+
+#[test]
+fn real_transactions_typed_coordinator_recovery_status_cas_and_history() {
+    let mut p = Processes::new();
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let plan = transaction_plan(8001);
+    let reply = p.request(json!({"command":"transact","plan":plan,"outcome":"Commit"}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["data"]["decision"]["outcome"], "Commit");
+    // Lost client reply: restart the entire coordinator and recover by identity.
+    p.restart();
+    let recovered = p
+        .request(json!({"command":"tx_recover","home":plan.home,"id":plan.id(),"outcome":"Abort"}));
+    assert_eq!(recovered["ok"], true, "{recovered}");
+    assert_eq!(recovered["data"]["decision"], reply["data"]["decision"]);
+    let mut conflict = plan.clone();
+    conflict.participants[0].writes[0].row.attempt_count = 99;
+    let refused = p.request(json!({"command":"transact","plan":conflict,"outcome":"Commit"}));
+    assert_eq!(refused["ok"], false);
+    let mut stale_cas = plan.clone();
+    stale_cas.nonce += 1;
+    let refused = p.request(json!({"command":"transact","plan":stale_cas,"outcome":"Commit"}));
+    assert_eq!(refused["ok"], false);
+    let aborted = p.request(
+        json!({"command":"tx_recover","home":stale_cas.home,"id":stale_cas.id(),"outcome":"Abort"}),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    let scan = p.request(
+        json!({"command":"observe","bounds":Bounds { start: key(0), end: Some(key(100)) }}),
+    );
+    assert_eq!(scan["ok"], true, "{scan}");
+    let rows: Vec<(giggles_core::Key, giggles_core::Row)> =
+        serde_json::from_value(scan["data"].clone()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(k, r)| (k.row.0, r.attempt_count))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (60, 20)]
+    );
+    // Feed externally observed results to independent semantics; no evaluator
+    // output supplies expected observations. The adapter models attempt_count.
+    let history = giggles_history::History {
+        version: 1,
+        horizon: 5,
+        initial: BTreeMap::new(),
+        invariants: Default::default(),
+        attempts: vec![
+            giggles_history::Attempt {
+                id: "write-attempt".into(),
+                logical_id: "owner-8001".into(),
+                invoke: 1,
+                complete: Some(2),
+                outcome: giggles_history::Outcome::Committed,
+                durable: None,
+                decision_at: None,
+                ops: plan
+                    .participants
+                    .iter()
+                    .flat_map(|p| {
+                        p.writes.iter().map(|w| giggles_history::Op::Write {
+                            key: w.key.row.0 as i64,
+                            value: i64::try_from(w.row.attempt_count).unwrap(),
+                        })
+                    })
+                    .collect(),
+                observations: vec![],
+                receipt: None,
+            },
+            giggles_history::Attempt {
+                id: "read-attempt".into(),
+                logical_id: "owner-scan".into(),
+                invoke: 3,
+                complete: Some(4),
+                outcome: giggles_history::Outcome::Committed,
+                durable: None,
+                decision_at: None,
+                ops: vec![giggles_history::Op::Scan { start: 0, end: 100 }],
+                observations: vec![giggles_history::Observation::Scan {
+                    rows: rows
+                        .iter()
+                        .map(|(k, r)| (k.row.0 as i64, i64::try_from(r.attempt_count).unwrap()))
+                        .collect(),
+                }],
+                receipt: None,
+            },
+        ],
+    };
+    std::fs::write(
+        p.root.join("observed-transaction-history.json"),
+        serde_json::to_vec_pretty(&history).unwrap(),
+    )
+    .unwrap();
+    let check = giggles_history::check(&history, giggles_history::Limits::default()).unwrap();
+    std::fs::write(
+        p.root.join("independent-history-check.txt"),
+        format!("{check:?}"),
+    )
+    .unwrap();
+    assert!(matches!(check.verdict, giggles_history::Verdict::Pass));
+}
+
+#[test]
+fn real_independent_leaders_partial_finalize_blocks_then_resolves_and_snapshots() {
+    use transaction::Step;
+    let mut p = Processes::new();
+    p.split_for_transactions();
+    let plan = transaction_plan(8002);
+    let id = plan.id();
+    p.tx_ok(&plan.home, Step::Open(plan.clone()), vec![]);
+    let home = p.pin(&plan.home, id);
+    for part in &plan.participants {
+        p.tx_ok(&part.route, Step::Begin { id }, vec![home.clone()]);
+    }
+    for part in &plan.participants {
+        p.tx_ok(&part.route, Step::Lock { id }, vec![]);
+    }
+    let locked = plan
+        .participants
+        .iter()
+        .map(|part| p.pin(&part.route, id))
+        .collect::<Vec<_>>();
+    for part in &plan.participants {
+        p.tx_ok(&part.route, Step::Prepare { id }, locked.clone());
+    }
+    for part in &plan.participants {
+        let evidence = p.pin(&part.route, id);
+        p.tx_ok(
+            &plan.home,
+            Step::Vote {
+                id,
+                participant: part.route.clone(),
+            },
+            vec![evidence],
+        );
+    }
+    // A prepared participant has no unilateral timeout/abort surface.
+    let missing = p.tx(
+        &plan.participants[1].route,
+        Step::Finalize { id },
+        vec![home.clone()],
+    );
+    assert_eq!(missing["ok"], false);
+    p.tx_ok(
+        &plan.home,
+        Step::Decide {
+            id,
+            outcome: giggles_transactions::Outcome::Commit,
+        },
+        vec![],
+    );
+    let decision = p.pin(&plan.home, id);
+    p.tx_ok(&plan.home, Step::Finalize { id }, vec![decision.clone()]);
+    // A reader takes the first range's lock, but cannot expose its half while
+    // the second participant is still prepared. Drive independently led steps.
+    let mut read = plan.clone();
+    read.nonce += 100;
+    for part in &mut read.participants {
+        part.writes.clear();
+        part.reads = vec![transaction::Predicate {
+            bounds: part.route.bounds.clone(),
+            expected: None,
+        }];
+    }
+    let rid = read.id();
+    p.tx_ok(&read.home, Step::Open(read.clone()), vec![]);
+    let rh = p.pin(&read.home, rid);
+    for part in &read.participants {
+        p.tx_ok(&part.route, Step::Begin { id: rid }, vec![rh.clone()]);
+    }
+    p.tx_ok(&read.home, Step::Lock { id: rid }, vec![]);
+    let blocked = p.tx(&read.participants[1].route, Step::Lock { id: rid }, vec![]);
+    assert_eq!(blocked["ok"], false, "{blocked}");
+    let hidden = p.owner(
+        read.home.group,
+        json!({"command":"tx_status","home":read.home,"id":rid}),
+    );
+    assert!(hidden["data"]["rows"].is_null());
+    for route in [&plan.home, &plan.participants[1].route] {
+        let r = p.owner(
+            route.group,
+            json!({"command":"checkpoint","group":route.group}),
+        );
+        assert_eq!(r["ok"], true);
+    }
+    p.restart();
+    // Ordinary current observation resolves the prepared blocker from the
+    // durable home, after checkpoint/full restart, before exposing either row.
+    let automatic = p
+        .request(json!({"command":"observe","bounds":Bounds { start:key(0), end:Some(key(100)) }}));
+    assert_eq!(automatic["ok"], true, "{automatic}");
+    assert_eq!(automatic["data"].as_array().unwrap().len(), 2);
+    p.independent();
+    let home = p.pin(&plan.home, id);
+    p.tx_ok(
+        &plan.participants[1].route,
+        Step::Finalize { id },
+        vec![home],
+    );
+    p.tx_ok(&read.participants[1].route, Step::Lock { id: rid }, vec![]);
+    let locked = read
+        .participants
+        .iter()
+        .map(|part| p.pin(&part.route, rid))
+        .collect::<Vec<_>>();
+    for part in &read.participants {
+        p.tx_ok(&part.route, Step::Prepare { id: rid }, locked.clone());
+    }
+    for part in &read.participants {
+        let e = p.pin(&part.route, rid);
+        p.tx_ok(
+            &read.home,
+            Step::Vote {
+                id: rid,
+                participant: part.route.clone(),
+            },
+            vec![e],
+        );
+    }
+    p.tx_ok(
+        &read.home,
+        Step::Decide {
+            id: rid,
+            outcome: giggles_transactions::Outcome::Commit,
+        },
+        vec![],
+    );
+    let home = p.pin(&read.home, rid);
+    for part in &read.participants {
+        p.tx_ok(&part.route, Step::Finalize { id: rid }, vec![home.clone()]);
+    }
+    let result = p.owner(
+        read.home.group,
+        json!({"command":"tx_status","home":read.home,"id":rid}),
+    );
+    let rows: Vec<transaction::Rows> =
+        serde_json::from_value(result["data"]["rows"].clone()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .flat_map(|r| r.predicates.iter().flatten())
+            .map(|(k, r)| (k.row.0, r.attempt_count))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (60, 20)]
+    );
+}
+
+#[test]
+fn real_transactions_process_crash_at_every_prepare_vote_decision_finalize_boundary() {
+    use giggles_transactions::Outcome;
+    use transaction::{Request, Step};
+    // 2 outcomes * 7 durable transitions * both sides of redb commit.
+    // The armed process exits at the storage seam, remaining owned processes
+    // are killed, and all three real stores/listeners reopen for replay.
+    for outcome in [Outcome::Commit, Outcome::Abort] {
+        for boundary in 0..7 {
+            for after in [false, true] {
+                let mut p = Processes::new();
+                p.split_for_transactions();
+                let plan = transaction_plan(9000 + boundary as u128);
+                let id = plan.id();
+                std::fs::write(
+                    p.root.join("fault-schedule.json"),
+                    json!({"outcome":outcome,"boundary":boundary,"after":after,"id":id})
+                        .to_string(),
+                )
+                .unwrap();
+                p.tx_ok(&plan.home, Step::Open(plan.clone()), vec![]);
+                let home = p.pin(&plan.home, id);
+                for part in &plan.participants {
+                    p.tx_ok(&part.route, Step::Begin { id }, vec![home.clone()]);
+                }
+                for part in &plan.participants {
+                    p.tx_ok(&part.route, Step::Lock { id }, vec![]);
+                }
+                let locked = plan
+                    .participants
+                    .iter()
+                    .map(|part| p.pin(&part.route, id))
+                    .collect::<Vec<_>>();
+                for stage in 0..7 {
+                    let (route, step, evidence) = match stage {
+                        0 | 1 => (
+                            plan.participants[stage].route.clone(),
+                            Step::Prepare { id },
+                            locked.clone(),
+                        ),
+                        2 | 3 => {
+                            let route = plan.participants[stage - 2].route.clone();
+                            let e = p.pin(&route, id);
+                            (
+                                plan.home.clone(),
+                                Step::Vote {
+                                    id,
+                                    participant: route,
+                                },
+                                vec![e],
+                            )
+                        }
+                        4 => (plan.home.clone(), Step::Decide { id, outcome }, vec![]),
+                        5 | 6 => {
+                            let e = p.pin(&plan.home, id);
+                            (
+                                plan.participants[stage - 5].route.clone(),
+                                Step::Finalize { id },
+                                vec![e],
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+                    let request = Request {
+                        route: route.clone(),
+                        step,
+                        evidence,
+                    };
+                    if stage == boundary {
+                        let leader = p.leader(route.group);
+                        let arm = p.nodes.get_mut(&leader).unwrap().request(
+                            json!({"command":"arm_crash","group":route.group,"after":after}),
+                        );
+                        assert_eq!(arm["ok"], true);
+                        let node = p.nodes.get_mut(&leader).unwrap();
+                        node.send(json!({"command":"tx_step","request":request}));
+                        assert!(
+                            node.output.recv_timeout(Duration::from_secs(12)).is_err(),
+                            "armed process should exit"
+                        );
+                        assert_eq!(node.child.wait().unwrap().code(), Some(86));
+                        p.restart();
+                        p.independent();
+                    }
+                    // Repeating both lost and acknowledged transitions is safe.
+                    let reply =
+                        p.owner(route.group, json!({"command":"tx_step","request":request}));
+                    assert_eq!(
+                        reply["ok"], true,
+                        "outcome={outcome:?} boundary={boundary} after={after} stage={stage}: {reply}"
+                    );
+                }
+                let status = p.owner(
+                    plan.home.group,
+                    json!({"command":"tx_status","home":plan.home,"id":id}),
+                );
+                assert_eq!(status["ok"], true, "{status}");
+                assert_eq!(status["data"]["decision"]["outcome"], json!(outcome));
+                p.colocate();
+                let scan = p.request(
+                    json!({"command":"observe","bounds":Bounds{start:key(0),end:Some(key(100))}}),
+                );
+                assert_eq!(scan["ok"], true, "{scan}");
+                let rows: Vec<(giggles_core::Key, giggles_core::Row)> =
+                    serde_json::from_value(scan["data"].clone()).unwrap();
+                assert_eq!(rows.len(), if outcome == Outcome::Commit { 2 } else { 0 });
+                for (_, row) in &rows {
+                    assert_eq!(row.version, 0, "redo must apply once");
+                }
+                let ops = plan
+                    .participants
+                    .iter()
+                    .flat_map(|p| {
+                        p.writes.iter().map(|w| giggles_history::Op::Write {
+                            key: w.key.row.0 as i64,
+                            value: i64::try_from(w.row.attempt_count).unwrap(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let observed_outcome = match status["data"]["decision"]["outcome"].as_str().unwrap()
+                {
+                    "Commit" => giggles_history::Outcome::Committed,
+                    "Abort" => giggles_history::Outcome::Aborted,
+                    _ => panic!(),
+                };
+                let history = giggles_history::History {
+                    version: 1,
+                    horizon: 7,
+                    initial: BTreeMap::new(),
+                    invariants: Default::default(),
+                    attempts: vec![
+                        giggles_history::Attempt {
+                            id: "lost-response".into(),
+                            logical_id: "fault-operation".into(),
+                            invoke: 1,
+                            complete: Some(2),
+                            outcome: giggles_history::Outcome::Indeterminate,
+                            durable: None,
+                            decision_at: None,
+                            ops: ops.clone(),
+                            observations: vec![],
+                            receipt: None,
+                        },
+                        giggles_history::Attempt {
+                            id: "status-replay".into(),
+                            logical_id: "fault-operation".into(),
+                            invoke: 3,
+                            complete: Some(4),
+                            outcome: observed_outcome,
+                            durable: None,
+                            decision_at: None,
+                            ops,
+                            observations: vec![],
+                            receipt: None,
+                        },
+                        giggles_history::Attempt {
+                            id: "current-scan".into(),
+                            logical_id: "fault-scan".into(),
+                            invoke: 5,
+                            complete: Some(6),
+                            outcome: giggles_history::Outcome::Committed,
+                            durable: None,
+                            decision_at: None,
+                            ops: vec![giggles_history::Op::Scan { start: 0, end: 100 }],
+                            observations: vec![giggles_history::Observation::Scan {
+                                rows: rows
+                                    .iter()
+                                    .map(|(k, r)| {
+                                        (k.row.0 as i64, i64::try_from(r.attempt_count).unwrap())
+                                    })
+                                    .collect(),
+                            }],
+                            receipt: None,
+                        },
+                    ],
+                };
+                let check =
+                    giggles_history::check(&history, giggles_history::Limits::default()).unwrap();
+                std::fs::write(
+                    p.root.join("observed-fault-history.json"),
+                    serde_json::to_vec_pretty(&history).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    p.root.join("observed-fault-check.json"),
+                    serde_json::to_vec_pretty(&check).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(check.verdict, giggles_history::Verdict::Pass, "{check:?}");
+                if outcome == Outcome::Commit {
+                    let mut partial = history.clone();
+                    let giggles_history::Observation::Scan { rows } =
+                        &mut partial.attempts[2].observations[0]
+                    else {
+                        panic!()
+                    };
+                    rows.truncate(1);
+                    let rejected =
+                        giggles_history::check(&partial, giggles_history::Limits::default())
+                            .unwrap();
+                    std::fs::write(
+                        p.root.join("partial-negative-control.json"),
+                        serde_json::to_vec_pretty(&(partial, rejected.clone())).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(rejected.verdict, giggles_history::Verdict::Fail);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn real_transaction_home_minority_cannot_decide_or_release_prepared_participants() {
+    use transaction::Step;
+    let mut p = Processes::new();
+    p.split_for_transactions();
+    let plan = transaction_plan(9901);
+    let id = plan.id();
+    p.tx_ok(&plan.home, Step::Open(plan.clone()), vec![]);
+    let home = p.pin(&plan.home, id);
+    for part in &plan.participants {
+        p.tx_ok(&part.route, Step::Begin { id }, vec![home.clone()]);
+        p.tx_ok(&part.route, Step::Lock { id }, vec![]);
+    }
+    let locked = plan
+        .participants
+        .iter()
+        .map(|part| p.pin(&part.route, id))
+        .collect::<Vec<_>>();
+    for part in &plan.participants {
+        p.tx_ok(&part.route, Step::Prepare { id }, locked.clone());
+        let e = p.pin(&part.route, id);
+        p.tx_ok(
+            &plan.home,
+            Step::Vote {
+                id,
+                participant: part.route.clone(),
+            },
+            vec![e],
+        );
+    }
+    let before = p.pin(&plan.home, id);
+    let leader = p.leader(plan.home.group);
+    for voter in VOTERS {
+        let peers = VOTERS
+            .into_iter()
+            .filter(|other| *other != voter)
+            .collect::<Vec<_>>();
+        let reply = p
+            .nodes
+            .get_mut(&voter)
+            .unwrap()
+            .request(json!({"command":"block","group":plan.home.group,"peers":peers}));
+        assert_eq!(reply["ok"], true);
+    }
+    let refused=p.nodes.get_mut(&leader).unwrap().request(json!({"command":"tx_step","request":transaction::Request{route:plan.home.clone(),step:Step::Decide{id,outcome:giggles_transactions::Outcome::Commit},evidence:vec![]}}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    let unresolved = p.tx(
+        &plan.participants[1].route,
+        Step::Finalize { id },
+        vec![before],
+    );
+    assert_eq!(unresolved["ok"], false);
+    let right = p.pin(&plan.participants[1].route, id);
+    assert_eq!(
+        right.state.engine(42, &right.route).unwrap().phase(id),
+        Some(giggles_transactions::Phase::Prepared)
+    );
+    // Heal by full process restart. The previously submitted decision may now
+    // commit; resolution consults actual current home state and never guesses.
+    p.restart();
+    let resumed =
+        p.request(json!({"command":"tx_recover","home":plan.home,"id":id,"outcome":"Commit"}));
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    let scan =
+        p.request(json!({"command":"observe","bounds":Bounds{start:key(0),end:Some(key(100))}}));
+    assert_eq!(scan["ok"], true, "{scan}");
+    assert_eq!(scan["data"].as_array().unwrap().len(), 2);
+}
+
+impl Processes {
+    fn tx_begin_all(&mut self, plan: &transaction::Plan) {
+        let id = plan.id();
+        self.tx_ok(&plan.home, transaction::Step::Open(plan.clone()), vec![]);
+        let home = self.pin(&plan.home, id);
+        for part in &plan.participants {
+            self.tx_ok(
+                &part.route,
+                transaction::Step::Begin { id },
+                vec![home.clone()],
+            );
+        }
+    }
+    fn tx_prepare_all(&mut self, plan: &transaction::Plan) {
+        let id = plan.id();
+        for part in &plan.participants {
+            self.tx_ok(&part.route, transaction::Step::Lock { id }, vec![]);
+        }
+        let locked = plan
+            .participants
+            .iter()
+            .map(|part| self.pin(&part.route, id))
+            .collect::<Vec<_>>();
+        for part in &plan.participants {
+            self.tx_ok(
+                &part.route,
+                transaction::Step::Prepare { id },
+                locked.clone(),
+            );
+        }
+    }
+    fn tx_finish_all(&mut self, plan: &transaction::Plan, outcome: giggles_transactions::Outcome) {
+        let id = plan.id();
+        if outcome == giggles_transactions::Outcome::Commit {
+            for part in &plan.participants {
+                let e = self.pin(&part.route, id);
+                self.tx_ok(
+                    &plan.home,
+                    transaction::Step::Vote {
+                        id,
+                        participant: part.route.clone(),
+                    },
+                    vec![e],
+                );
+            }
+        }
+        self.tx_ok(
+            &plan.home,
+            transaction::Step::Decide { id, outcome },
+            vec![],
+        );
+        let home = self.pin(&plan.home, id);
+        for part in &plan.participants {
+            self.tx_ok(
+                &part.route,
+                transaction::Step::Finalize { id },
+                vec![home.clone()],
+            );
+        }
+    }
+}
+
+#[test]
+fn real_transactions_predicates_deadlock_exhaustion_evidence_and_split_guards() {
+    use giggles_transactions::Outcome;
+    use transaction::Step;
+    // Each case uses fresh durable three-voter stores and different leaders.
+    for case in 0..3 {
+        let mut p = Processes::new();
+        p.split_for_transactions();
+        std::fs::write(
+            p.root.join("negative-case.json"),
+            json!({"case":case}).to_string(),
+        )
+        .unwrap();
+        if case == 0 {
+            let mut reader = transaction_plan(12000);
+            for part in &mut reader.participants {
+                part.writes.clear();
+                part.reads = vec![transaction::Predicate {
+                    bounds: part.route.bounds.clone(),
+                    expected: Some(vec![]),
+                }];
+            }
+            p.tx_begin_all(&reader);
+            for part in &reader.participants {
+                p.tx_ok(&part.route, Step::Lock { id: reader.id() }, vec![]);
+            }
+            let writer = transaction_plan(12001);
+            p.tx_begin_all(&writer);
+            let blocked = p.tx(&writer.home, Step::Lock { id: writer.id() }, vec![]);
+            assert_eq!(blocked["ok"], false);
+            let direct=p.owner(writer.home.group,json!({"command":"apply","group":writer.home.group,"action":put(writer.home.clone(),55,key(2),None)}));
+            assert_eq!(direct["ok"], false);
+            p.tx_finish_all(&writer, Outcome::Abort);
+            p.tx_finish_all(&reader, Outcome::Abort);
+            let writer = transaction_plan(12002);
+            p.tx_begin_all(&writer);
+            p.tx_prepare_all(&writer);
+            p.tx_finish_all(&writer, Outcome::Commit);
+            reader.nonce = 12003;
+            p.tx_begin_all(&reader);
+            let phantom = p.tx(&reader.home, Step::Lock { id: reader.id() }, vec![]);
+            assert_eq!(phantom["ok"], false, "{phantom}");
+            p.tx_finish_all(&reader, Outcome::Abort);
+        } else if case == 1 {
+            let a = transaction_plan(12100);
+            let b = transaction_plan(12101);
+            p.tx_begin_all(&a);
+            p.tx_begin_all(&b);
+            p.tx_ok(&a.home, Step::Lock { id: a.id() }, vec![]);
+            p.tx_ok(&b.participants[1].route, Step::Lock { id: b.id() }, vec![]);
+            let left = p.tx(&a.participants[1].route, Step::Lock { id: a.id() }, vec![]);
+            assert_eq!(left["ok"], false);
+            let right = p.tx(&b.home, Step::Lock { id: b.id() }, vec![]);
+            assert_eq!(right["ok"], false);
+            // Refusal creates no prepare or implicit abort. Durable home aborts
+            // resolve the deliberately adversarial order without a wait cycle.
+            p.tx_finish_all(&a, Outcome::Abort);
+            p.tx_finish_all(&b, Outcome::Abort);
+            let next = transaction_plan(12102);
+            p.tx_begin_all(&next);
+            p.tx_prepare_all(&next);
+            p.tx_finish_all(&next, Outcome::Commit);
+        } else {
+            let plan = transaction_plan(12200);
+            let id = plan.id();
+            p.tx_begin_all(&plan);
+            let mut split = split();
+            split.id = 88;
+            split.parent = split.left.clone();
+            split.key = key(25);
+            split.left = split.parent.clone();
+            split.left.range = 50;
+            split.left.group = 5;
+            split.left.epoch += 1;
+            split.left.bounds.end = Some(split.key);
+            split.right = split.parent.clone();
+            split.right.range = 51;
+            split.right.group = 6;
+            split.right.epoch += 1;
+            split.right.bounds.start = split.key;
+            let active=p.owner(plan.home.group,json!({"command":"apply","group":plan.home.group,"action":Action::Fence(split.clone())}));
+            assert_eq!(active["ok"], false);
+            p.tx_prepare_all(&plan);
+            let prepared = p.owner(
+                plan.home.group,
+                json!({"command":"apply","group":plan.home.group,"action":Action::Fence(split)}),
+            );
+            assert_eq!(prepared["ok"], false);
+            let mut stale = plan.home.clone();
+            stale.epoch += 1;
+            let refused = p.tx(&stale, Step::Lock { id }, vec![]);
+            assert_eq!(refused["ok"], false);
+            let mut evidence = p.pin(&plan.participants[1].route, id);
+            evidence.applied = 0;
+            let refused = p.tx(
+                &plan.home,
+                Step::Vote {
+                    id,
+                    participant: plan.participants[1].route.clone(),
+                },
+                vec![evidence],
+            );
+            assert_eq!(refused["ok"], false);
+            let mut exhausted = false;
+            for n in 1..=transaction::MAX_TRANSACTIONS {
+                let mut more = plan.clone();
+                more.nonce += n as u128;
+                let reply = p.tx(&more.home, Step::Open(more.clone()), vec![]);
+                if reply["ok"] == false {
+                    exhausted = true;
+                    break;
+                }
+            }
+            assert!(exhausted);
+            for part in &plan.participants {
+                let e = p.pin(&part.route, id);
+                assert_eq!(
+                    e.state.engine(42, &part.route).unwrap().phase(id),
+                    Some(giggles_transactions::Phase::Prepared)
+                );
+            }
+            p.tx_finish_all(&plan, Outcome::Commit);
+            for part in &plan.participants {
+                let e = p.pin(&part.route, id);
+                assert_eq!(
+                    e.state.engine(42, &part.route).unwrap().phase(id),
+                    Some(giggles_transactions::Phase::Committed)
+                );
+                let current = p.owner(
+                    part.route.group,
+                    json!({"command":"current","group":part.route.group}),
+                );
+                assert_eq!(current["ok"], true);
+                let Machine::Range { data, .. } =
+                    serde_json::from_value(current["data"]["machine"].clone()).unwrap()
+                else {
+                    panic!()
+                };
+                let rows = data.image.snapshot().unwrap().rows;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows.values().next().unwrap().version, 0);
+            }
+        }
+    }
+}
+
 struct Running {
     child: Child,
     input: ChildStdin,
@@ -131,6 +958,41 @@ struct Processes {
 impl Processes {
     fn new() -> Self {
         let root = fresh("multi-process");
+        // Hash compiled source bytes, not mutable working files at test time.
+        // Every failed schedule retains the exact implementation/test identity.
+        {
+            use sha2::{Digest, Sha256};
+            let sources: [(&str, &[u8]); 10] = [
+                ("src/machine.rs", include_bytes!("../src/machine.rs")),
+                (
+                    "src/transaction.rs",
+                    include_bytes!("../src/transaction.rs"),
+                ),
+                ("src/runtime.rs", include_bytes!("../src/runtime.rs")),
+                ("src/node.rs", include_bytes!("../src/node.rs")),
+                ("src/store.rs", include_bytes!("../src/store.rs")),
+                ("src/transport.rs", include_bytes!("../src/transport.rs")),
+                (
+                    "src/bin/giggles-ranges.rs",
+                    include_bytes!("../src/bin/giggles-ranges.rs"),
+                ),
+                ("tests/process.rs", include_bytes!("process.rs")),
+                ("Cargo.lock", include_bytes!("../Cargo.lock")),
+                (
+                    "transactions/machine.rs",
+                    include_bytes!("../../giggles-transactions/src/machine.rs"),
+                ),
+            ];
+            let hashes = sources
+                .iter()
+                .map(|(name, bytes)| (*name, hex::encode(Sha256::digest(bytes))))
+                .collect::<BTreeMap<_, _>>();
+            std::fs::write(
+                root.join("compiled-source-sha256.json"),
+                serde_json::to_vec_pretty(&hashes).unwrap(),
+            )
+            .unwrap();
+        }
         let mut cp = CertificateParams::new(Vec::<String>::new()).unwrap();
         cp.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         cp.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -259,8 +1121,9 @@ impl Processes {
                     .get_mut(&leader)
                     .unwrap()
                     .request(json!({"command":"transfer","group":group,"to":1}));
-                assert_eq!(r["ok"], true, "{r}");
-                assert!(Instant::now() < deadline, "transfer timeout");
+                // Leadership can change after discovery during restart.
+                // Retry the trusted transfer against the next discovered leader.
+                assert!(Instant::now() < deadline, "transfer timeout: {r}");
             }
         }
     }

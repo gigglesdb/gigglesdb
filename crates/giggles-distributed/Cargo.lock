@@ -212,6 +212,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "giggles-core",
+ "giggles-history",
+ "giggles-transactions",
  "hex",
  "protobuf",
  "raft",
@@ -225,6 +227,23 @@ dependencies = [
  "slog",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "giggles-history"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "giggles-transactions"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

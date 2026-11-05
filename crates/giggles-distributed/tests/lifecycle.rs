@@ -231,9 +231,34 @@ fn lifecycle_restarts_at_every_boundary_preserve_independent_data_oracle() {
 #[test]
 fn prepared_guard_wrong_bootstrap_and_duplicate_conflict() {
     let mut m = initial(2);
-    if let Machine::Range { data, .. } = &mut m {
-        data.prepared.insert(999);
-    }
+    let plan = giggles_distributed::transaction::Plan {
+        database: 42,
+        nonce: 999,
+        home: descriptor(),
+        participants: vec![giggles_distributed::transaction::Participant {
+            route: descriptor(),
+            writes: vec![],
+            reads: vec![giggles_distributed::transaction::Predicate {
+                bounds: descriptor().bounds,
+                expected: None,
+            }],
+        }],
+    };
+    assert_eq!(
+        m.apply(
+            &command(
+                2,
+                Action::Transaction(Box::new(giggles_distributed::transaction::Request {
+                    route: descriptor(),
+                    step: giggles_distributed::transaction::Step::Open(plan),
+                    evidence: vec![],
+                }))
+            ),
+            7
+        )
+        .code,
+        0
+    );
     let old = m.clone();
     assert_ne!(m.apply(&command(2, Action::Fence(split())), 8).code, 0);
     assert_eq!(m, old);

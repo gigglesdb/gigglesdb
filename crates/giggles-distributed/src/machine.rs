@@ -181,9 +181,8 @@ pub struct Data {
     pub fence: Option<Fence>,
     pub active: bool,
     pub provenance: Option<Ready>,
-    /// Reserved durable guard. Future prepared participants must populate it;
-    /// a split cannot omit unresolved locks or intents.
-    pub prepared: BTreeSet<u64>,
+    /// Durable rigorous locks, intents, home decisions and retained retry plans.
+    pub transactions: crate::transaction::State,
     #[serde(with = "map_pairs")]
     pub retries: BTreeMap<u64, RetryRecord>,
 }
@@ -223,12 +222,12 @@ impl Data {
     }
     pub fn validate(&self, domain: u128) -> Result<()> {
         self.descriptor.validate()?;
+        self.transactions.validate(domain, &self.descriptor)?;
         let rows = self.image.snapshot()?.rows;
         if self.image.domain()? != domain
             || self.image.row_partition(minimum(), None)? != self.image
             || self.image.snapshot()?.rows.len() > LIMIT
             || self.retries.len() > LIMIT
-            || self.prepared.len() > LIMIT
             || self.retries.values().any(|r| {
                 r.digest.len() != 64
                     || !self.descriptor.bounds.contains(r.key)
@@ -265,7 +264,10 @@ impl Data {
     pub fn children(&self) -> Result<[Data; 2]> {
         self.validate(self.image.domain()?)?;
         let fence = self.fence.clone().ok_or("parent not fenced")?;
-        if !self.prepared.is_empty() {
+        if self
+            .transactions
+            .unresolved(self.image.domain()?, &self.descriptor)?
+        {
             return Err("prepared work blocks split".into());
         }
         let make = |descriptor: Descriptor| -> Result<Data> {
@@ -283,13 +285,14 @@ impl Data {
                 fence: fence.clone(),
                 digest: digest(&(&image, &retries))?,
             };
+            let transactions = crate::transaction::State::new(image.domain()?, &descriptor)?;
             Ok(Data {
                 descriptor,
                 image,
                 fence: None,
                 active: false,
                 provenance: Some(proof),
-                prepared: BTreeSet::new(),
+                transactions,
                 retries,
             })
         };
@@ -332,6 +335,7 @@ pub enum Action {
         proof: Ready,
         revision: u64,
     },
+    Transaction(Box<crate::transaction::Request>),
     TaskWrite,
     Move,
 }
@@ -366,12 +370,12 @@ impl Machine {
         let m = Self::Range {
             domain,
             data: Box::new(Data {
+                transactions: crate::transaction::State::new(domain, &descriptor)?,
                 descriptor,
                 image: Image::new(domain)?,
                 fence: None,
                 active: true,
                 provenance: None,
-                prepared: BTreeSet::new(),
                 retries: BTreeMap::new(),
             }),
         };
@@ -500,7 +504,10 @@ impl Machine {
                     }
                     return Err("parent already fenced".into());
                 }
-                if !data.active || data.descriptor != split.parent || !data.prepared.is_empty() {
+                if !data.active
+                    || data.descriptor != split.parent
+                    || data.transactions.unresolved(c.domain, &data.descriptor)?
+                {
                     return Err("parent epoch/prepared guard".into());
                 }
                 let f = Fence {
@@ -537,7 +544,7 @@ impl Machine {
                 if child.active
                     || child.descriptor.group != *group
                     || child.fence.is_some()
-                    || !child.prepared.is_empty()
+                    || child.transactions.unresolved(*domain, &child.descriptor)?
                     || p.digest != digest(&(&child.image, &child.retries))?
                     || p.fence.index == 0
                 {
@@ -577,6 +584,9 @@ impl Machine {
                     }
                     .point(),
                 )?;
+                if data.transactions.unresolved(c.domain, &data.descriptor)? {
+                    return Err("direct Put blocked by unresolved transactions".into());
+                }
                 if *operation == 0 {
                     return Err("operation id required".into());
                 }
@@ -622,6 +632,9 @@ impl Machine {
                     },
                 );
                 return Ok(serde_json::json!({"version":version,"replay":false}));
+            }
+            (Self::Range { data, .. }, Action::Transaction(request)) => {
+                return crate::transaction::apply(data, c.domain, index, request);
             }
             (_, Action::TaskWrite) => {
                 return Err("distributed task decision required; no effects".into());

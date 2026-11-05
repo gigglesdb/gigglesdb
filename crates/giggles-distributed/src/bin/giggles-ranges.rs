@@ -6,8 +6,27 @@ use giggles_distributed::{
 use serde::Deserialize;
 use std::io::{BufRead, Read, Write};
 #[derive(Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
+    TxPin {
+        route: Descriptor,
+    },
+    TxStep {
+        request: Box<transaction::Request>,
+    },
+    Transact {
+        plan: transaction::Plan,
+        outcome: giggles_transactions::Outcome,
+    },
+    TxStatus {
+        home: Descriptor,
+        id: giggles_transactions::TransactionId,
+    },
+    TxRecover {
+        home: Descriptor,
+        id: giggles_transactions::TransactionId,
+        outcome: giggles_transactions::Outcome,
+    },
     Inspect {
         group: u64,
     },
@@ -89,8 +108,24 @@ async fn main() -> Result<()> {
             if line.len() > MAX_COMMAND || line.last() != Some(&b'\n') {
                 return Err("owner input length/termination".into());
             }
-            let control: Control = serde_json::from_slice(&line)?;
+            // Serde's internally tagged content buffer rejects u128. Keep the
+            // existing {command:...} wire grammar while decoding the body via
+            // serde_json's arbitrary-precision Value deserializer instead.
+            let mut envelope: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&line)?;
+            let name = envelope.remove("command").ok_or("missing owner command")?;
+            let name = name.as_str().ok_or("invalid owner command")?;
+            let control: Control = serde_json::from_value(serde_json::json!({name:envelope}))?;
             let value = match control {
+                Control::TxPin { route } => serde_json::to_value(runtime.tx_pin(&route).await?)?,
+                Control::TxStep { request } => {
+                    serde_json::to_value(runtime.tx_step(*request).await?)?
+                }
+                Control::Transact { plan, outcome } => runtime.transact(plan, outcome).await?,
+                Control::TxStatus { home, id } => runtime.tx_status(&home, id).await?,
+                Control::TxRecover { home, id, outcome } => {
+                    runtime.tx_recover(&home, id, outcome).await?
+                }
                 Control::Inspect { group } => {
                     serde_json::to_value(runtime.group(group)?.inspect().await?)?
                 }
