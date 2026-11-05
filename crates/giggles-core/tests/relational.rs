@@ -412,7 +412,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
     for q in [
         "CREATE TABLE decimals (id DECIMAL PRIMARY KEY)",
         "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
-        "SELECT * FROM safe s LIMIT 1",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
         "SELECT * FROM public.safe LIMIT 1",
@@ -436,6 +435,8 @@ fn strict_rejection_matrix_and_resource_bounds() {
     err(&mut s, "SELECT * FROM safe LIMIT 1025", E::Limit);
     err(&mut s, "SELECT * FROM safe LIMIT -1", E::Limit);
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 0").rows.is_empty());
+    // Table aliases are now part of the bounded query contract.
+    assert!(run(&mut s, "SELECT * FROM safe s LIMIT 1").rows.is_empty());
     assert_eq!(
         s.execute(
             "INSERT INTO safe VALUES($1,$2)",

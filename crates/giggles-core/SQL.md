@@ -27,28 +27,28 @@ C: `gd_v1_sql_session(admin,&session)` accepts Admin only. Use existing `gd_v1_c
 
 ## Accepted grammar and semantics
 
-ASCII unquoted identifiers fold to lowercase, max63bytes. No quoted/qualified names. Reserved names include deliveries, tasks, operations, approvals, receipts, repair, internal, system, giggles, information_schema, pg_catalog and giggles_/system_/repair_/internal_/pg_ prefixes. Reserved names cannot shadow protected storage. Semicolon allowed only as a single trailing terminator; comments, aliases and multiple statements reject. String literals preserve UTF8 and doubled quotes; no backslash escapes. Parameters are `$1..$256`, contiguous with no unused supplied arguments. Values use `Null`, `{"Bool":true}`, `{"Int":-1}`, `{"Text":"..."}`, `{"Bytes":[0,255]}`. Types are checked at execution against the descriptor; no implicit coercions or truncation.
+ASCII unquoted identifiers fold to lowercase, max63bytes. No quoted identifiers. Qualified column references are supported on the bounded query path below. Reserved names include deliveries, tasks, operations, approvals, receipts, repair, internal, system, giggles, information_schema, pg_catalog and giggles_/system_/repair_/internal_/pg_ prefixes. Reserved names cannot shadow protected storage. Semicolon allowed only as a single trailing terminator; comments and multiple statements reject. Table aliases and AS projection aliases are supported on the bounded query path below. String literals preserve UTF8 and doubled quotes; no backslash escapes. Parameters are `$1..$256`, contiguous with no unused supplied arguments. Values use `Null`, `{"Bool":true}`, `{"Int":-1}`, `{"Text":"..."}`, `{"Bytes":[0,255]}`. Types are checked at execution against the descriptor; no implicit coercions or truncation.
 
 | Surface | Supported in this local subset | Rejected or untested |
 | --- | --- | --- |
 | CREATE TABLE | Columns; inline single PK or table-level composite PK; NOT NULL/NULL | ALTER/DROP, defaults, sequences, secondary/unique/check/FK constraints, schema jobs |
 | Types | BOOLEAN/BOOL; SMALLINT signed16; INTEGER/INT signed32; BIGINT signed64; UTF8 TEXT; BYTEA/BYTES; SQL NULL | Decimal, timestamp, date, UUID, JSON, floats and all other types explicitly unsupported |
 | INSERT | One VALUES tuple; optional unique column list; omitted nullable columns become NULL | Multirow, INSERT SELECT, RETURNING, UPSERT |
-| SELECT | Column list or star; full PK lookup; equality PK prefix and optional next-component lower/upper bound; bounded full ordered index scan | Non-PK filters, OR, expressions, joins/subqueries, aggregates, DISTINCT, OFFSET |
-| Order | Full PK or remaining PK suffix after equality prefix, all ASC or all DESC; default full PK ascending | Arbitrary sorts, mixed directions, locale collations |
+| SELECT | Column list or star; full PK lookup; equality PK prefix and optional next-component lower/upper bound; bounded full ordered index scan | Legacy path rejects non-PK filters; bounded joins and aggregates described below; OR, subqueries, DISTINCT, OFFSET reject |
+| Order | Legacy: full PK or remaining PK suffix, uniform direction; extended: bounded stable scalar sort below | Expressions, locale collations |
 | UPDATE/DELETE | Full PK equality only; updates to non-PK columns; optional API expected row version | Range/global mutations, PK rewrite, expression updates, unbounded fallback |
 | Transactions | BEGIN, COMMIT, ROLLBACK; read your writes, snapshot staging, conservative serial certification | Savepoints, nested transactions, task SQL transactions, distributed transactions |
-| Prepared | Rust handle with parsed statement and domain/epoch fence; typed parameters validated on execute | Parameter type introspection, C prepared-handle registry, privilege caching |
+| Prepared | Rust handle with domain/epoch/transaction fences; typed parameters validated on execute; describe returns parameter and result types | C prepared-handle registry, privilege caching |
 | Recovery | Shared immediate redb commit; reopen, versioned export/restore, process-boundary checks | Device power loss/internal redb torn-write qualification |
 | Client compatibility | Trusted native Rust, JSON CLI, actual version1 C ABI clients on current Windows host | pgwire, libpq, JDBC, drivers, ORMs, wire compatibility, other OS/filesystem qualification |
 
 Every PK column becomes NOT NULL, including declarations that omit NOT NULL. Duplicate keys reject; INSERT is not replacement. No automatic IDs or gapless sequence promise. Row `version` is a durable globally allocated nonzero u64 changed on every successful INSERT/UPDATE (including equal-value updates). Delete/reinsert gets a later version; rollback need not consume an identifier. Expected version on missing row also rejects Version. CAS is accepted only for UPDATE/DELETE; apply other conditions through full PK predicates. Returned SELECT rows include version independent of projection.
 
-Binary collation: bool false<true; signed integers numeric; TEXT compares UTF8 bytes; BYTES compares unsigned bytes. Canonical key encoding v1 uses type tags, signed integer sign-bit flip + big endian, and NUL escaping `(0,255)` terminated by `(0,0)` for text/bytes. Composite keys concatenate encodings; PK types cannot mix in one column. NULL has a canonical first-sorting tag but cannot appear in PKs. SQL NULL comparisons/IS NULL and arbitrary three-valued expressions are unsupported; NULL is a value for nullable non-PK columns only.
+Binary collation: bool false<true; signed integers numeric; TEXT compares UTF8 bytes; BYTES compares unsigned bytes. Canonical key encoding v1 uses type tags, signed integer sign-bit flip + big endian, and NUL escaping `(0,255)` terminated by `(0,0)` for text/bytes. Composite keys concatenate encodings; PK types cannot mix in one column. NULL has a canonical first-sorting tag but cannot appear in PKs. Legacy indexed predicates reject NULL key bounds. On the bounded query path, NULL comparisons never match; IS NULL and arbitrary three-valued expressions remain unsupported.
 
 ## Bounds and transactions
 
-64KiB SQL,4096tokens,64columns,128tables,256parameters;64KiB total parameter payload/row;1024rows per scan and1MiB selected raw value bytes. Full PK SELECT can omit LIMIT (at most one row); all other SELECTs require LIMIT0..1024 (literal or typed integer parameter). Mutations never fall back to scanning. Native Scan has the same limits, index bounds, projection, versions and transaction rules. Result limit errors return no partial result. These caps are distinct from the1MiB JSON input and64MiB ABI output envelope.
+64KiB SQL,4096tokens,64columns,128tables,256parameters;64KiB total parameter payload/row;1024rows per scan and1MiB selected raw value bytes. On the legacy simple SELECT path, full PK lookup can omit LIMIT (at most one row); other SELECTs require LIMIT0..1024 (literal or typed integer parameter). The extended path has independent candidate/intermediate caps described below. Mutations never fall back to scanning. Native Scan has the same limits, index bounds, projection, versions and transaction rules. Result limit errors return no partial result. These caps are distinct from the1MiB JSON input and64MiB ABI output envelope.
 
 Whole statement execution has its own admission counter held until the call returns, bounded by configured Limits.admitted (default32), covering transient autocommit state copies. At most8explicit staged transactions per shared Admin kernel; no client call retains a storage mutex or admission ticket. Snapshot BEGIN copies the entire bounded State; a statement evaluates against a private copy and only replaces staged state after success, including export-envelope validation. Any statement/parse/bind/native scan failure aborts an explicit transaction; COMMIT/queries then return Aborted until ROLLBACK (or native `rollback()`/drop). A transport JSON parse failure does not execute a statement. COMMIT compares the durable shared generation under the same gate as repair decisions, so intervening catalog/application/repair decisions conflict. Conflicts abort and require rollback/retry from BEGIN. Abandoned sessions release slots on drop. Autocommit SELECT is a point-in-time read and causes no write. Explicit read-only COMMIT still certifies against the shared generation. Denied repair decisions and failed conflict decisions may also advance generation conservatively.
 
@@ -65,3 +65,42 @@ The adapter still loads/validates the entire State and rewrites every current re
 P2 consumers can use native session/prepare/scan APIs after separately implementing authenticated authority, physical time, credential issuance, output disclosure and resource accounting. Generic task SQL remains fail closed until per-table/tenant/column/operation grants and their bypass tests are separately designed. No remote endpoint has been added.
 
 SQL error codes200..216: Unsupported,Syntax,Reserved,UnknownTable,UnknownColumn,Duplicate,Type,Null,Parameters,Limit,Unbounded,Version,Conflict,StaleSchema,Transaction,Aborted,Overflow respectively. Core storage/fencing codes10..16 and existing policy100..117 remain distinct. Errors describe rejection, not PostgreSQL SQLSTATE compatibility.
+
+## Bounded joins, global aggregates and EXPLAIN (GD-0033)
+
+The extended query path accepts qualified columns (`p.id`), explicit or implicit table aliases (`people AS p` or `people p`), and projection aliases with `AS`. Once a source is aliased, its original name is out of scope. Unqualified references must resolve to exactly one source; ambiguous names and duplicate aliases return `Duplicate`. Unknown columns/scopes return `UnknownColumn`. All sources and expressions bind before evaluation, including empty inputs and LIMIT 0. String literal contents never act as SQL keywords.
+
+`INNER JOIN` (or `JOIN`) and `LEFT [OUTER] JOIN` use indexed nested loops. Each right source must have equality bindings for **every primary-key column**, supplied by columns from preceding sources with the same declared type. Conjunctions may include further typed column equalities. Composite keys, repeated foreign keys, self joins with distinct aliases, and chains of up to eight sources work. A nonindexed right join rejects `Unbounded`; cross products, RIGHT/FULL/CROSS joins, inequalities in ON and unsupported expressions reject. NULL never equals NULL. Unmatched LEFT rows project NULL values with nullable column metadata. This is a local snapshot operator, with no distributed execution claim.
+
+```sql
+SELECT j.id, p.label AS owner
+FROM jobs j LEFT JOIN people p ON p.id = j.person
+ORDER BY j.id LIMIT 100;
+
+SELECT COUNT(*), COUNT(j.wage), SUM(j.wage), MIN(j.wage), MAX(j.wage)
+FROM jobs j JOIN people p ON p.id = j.person;
+```
+
+Global `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN` and `MAX` accept a projection list containing only aggregates. COUNT returns BIGINT and ignores NULL for COUNT(column). SUM accepts integer columns and returns checked signed64 BIGINT; overflow returns `Overflow`, even with LIMIT 0. MIN/MAX preserve the scalar input type and binary ordering. NULL inputs are ignored; empty/all-NULL SUM/MIN/MAX return NULL and COUNT returns zero. GROUP BY, HAVING, DISTINCT, windows and mixed aggregate/nonaggregate projections reject explicitly. Aggregate output aliases are accepted; aggregate ORDER BY is unsupported.
+
+The extended path scans at most1024 retained base/intermediate rows and1MiB raw values per intermediate stage, with a total4096 base-candidate visits plus indexed probes. The cap includes work before WHERE filtering and LIMIT; additional rows or oversized projected output return `Limit` with no partial result. The checked1MiB projected-byte cap applies before LIMIT, including LIMIT 0. Query syntax/parameter caps remain the same. Legacy simple SELECT/native Scan retains its existing ordered-page behavior. The extended path permits omitted LIMIT because it rejects exhausted resource caps; it supports bounded stable sorting by bound source columns, with NULL first ascending and last descending. No arbitrary expression or projection-alias ORDER BY resolution is provided.
+
+Legacy and extended single-source rows retain their durable row version. Joined and aggregate rows use **version0**, identifying a synthetic result with no writable row identity. CAS stays restricted to point UPDATE/DELETE; no C/wire/result struct or persisted format changes were made. All operations use the existing SqlSession snapshot, read-your-writes and conservative generation-conflict rules. Existing cancellation checks run at session admission and staging boundaries; these bounded operators do not add per-row cancellation polling.
+
+`EXPLAIN SELECT ...` binds the same physical plan and returns a `plan` TEXT column with `PrimaryKeyLookup`, `PrimaryKeyRangeScan` or `EmptyInput`, `InnerPrimaryKeyNestedLoop`/`LeftPrimaryKeyNestedLoop`, `GlobalAggregate`, `BoundedStableSort`, `OutputLimit` and resource caps as applicable. It reads no user rows, exposes no cardinality or literal values, and never executes a mutation. `EXPLAIN ANALYZE` and `EXPLAIN` of mutations reject. This is descriptive physical planning, without runtime statistics or cost estimates.
+
+The unchanged `Prepared::table()` API has only one target slot. Distinct-table extended queries return the reserved sentinel `giggles_join`, rather than presenting only one source to existing table allowlists. Existing gateways scoped to actual table names therefore reject these queries; trusted Admin/native sessions support them. Self joins return their single table name. Multi-table gateway authorization is a separate integration requirement; this change grants no Executor SQL access.
+
+For persistent CLI use, create a fresh path once (`giggles create PATH`), then run `giggles admin PATH @seed.json` with this request file:
+
+```json
+{"command":"sql_batch","statements":[{"sql":"BEGIN"},{"sql":"CREATE TABLE owners (id BIGINT PRIMARY KEY, label TEXT)"},{"sql":"CREATE TABLE entries (id BIGINT PRIMARY KEY, owner BIGINT, amount BIGINT)"},{"sql":"INSERT INTO owners VALUES(1,'persisted')"},{"sql":"INSERT INTO entries VALUES(1,1,12)"},{"sql":"INSERT INTO entries VALUES(2,1,-3)"},{"sql":"COMMIT"}]}
+```
+
+Each subsequent `giggles admin PATH @query.json` invocation reopens the database. This request returns typed values `[{"Int":2},{"Int":9}]` in one synthetic row:
+
+```json
+{"command":"sql","sql":"SELECT COUNT(*),SUM(e.amount) FROM entries e JOIN owners o ON o.id=e.owner","params":[],"expected_version":null}
+```
+
+The subprocess tests exercise these persistent reopen requests and rejected-query rollback through the actual `giggles` binary. These are local functional checks; production, security, cloud, performance and PostgreSQL-comparator qualification remain outside this deliverable.

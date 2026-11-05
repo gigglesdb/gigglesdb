@@ -1,6 +1,7 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+mod query;
 
 pub const MAX_SQL: usize = 64 * 1024;
 pub const MAX_ROWS: usize = 1024;
@@ -317,7 +318,7 @@ fn lex(s: &str) -> R<Vec<Token>> {
                 return Err(SqlError::Parameters);
             }
             out.push(Token::Param(n));
-        } else if b"(),*;".contains(&c) {
+        } else if b"(),*;.".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
         } else if b"=<>".contains(&c) {
@@ -357,6 +358,7 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    Query(query::Query),
     Create {
         name: String,
         columns: Vec<ColumnDef>,
@@ -677,6 +679,9 @@ impl Prepared {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
+        if let Statement::Query(q) = &self.statement {
+            return q.bind(state, self.params).map(|b| b.description());
+        }
         let mut params = vec![None; self.params];
         let mut columns = vec![];
         if let Some(name) = self.table() {
@@ -762,6 +767,7 @@ impl Prepared {
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
+            Statement::Query(q) => Some(q.target()),
             Statement::Create { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
@@ -775,6 +781,13 @@ impl Prepared {
     }
     pub fn command(&self) -> &'static str {
         match self.statement {
+            Statement::Query(ref q) => {
+                if q.explain {
+                    "EXPLAIN"
+                } else {
+                    "SELECT"
+                }
+            }
             Statement::Create { .. } => "CREATE TABLE",
             Statement::Insert { .. } => "INSERT",
             Statement::Select { .. } => "SELECT",
@@ -855,7 +868,19 @@ impl Prepared {
             at: 0,
             params: BTreeSet::new(),
         };
-        let statement = p.parse()?;
+        // Try the established grammar first, including identifiers named min/count.
+        let statement = match p.parse() {
+            Ok(statement) => statement,
+            Err(error) => {
+                if !matches!(p.tokens.first(), Some(Token::Word(w)) if w == "select" || w == "explain")
+                {
+                    return Err(error);
+                }
+                p.at = 0;
+                p.params.clear();
+                Statement::Query(query::Query::parse(&mut p)?)
+            }
+        };
         let params = p.params.last().copied().unwrap_or(0);
         if p.params.len() != params {
             return Err(SqlError::Parameters);
@@ -877,7 +902,10 @@ impl Prepared {
         }
     }
     pub(crate) fn is_read(&self) -> bool {
-        matches!(self.statement, Statement::Select { .. })
+        matches!(
+            self.statement,
+            Statement::Select { .. } | Statement::Query(_)
+        )
     }
 }
 fn col(t: &TableDef, name: &str) -> R<usize> {
@@ -1060,6 +1088,12 @@ impl Relational {
         payload_bound(params.iter())?;
         let mut result = SqlResult::default();
         match &prepared.statement {
+            Statement::Query(q) => {
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                return q.bind(self, prepared.params)?.execute(self, params);
+            }
             Statement::Create {
                 name,
                 columns,
