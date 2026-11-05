@@ -1,0 +1,12 @@
+[package]
+name = "giggles-history-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+giggles-history = { path = "../giggles-history" }
+serde_json = "1"
+sha2 = "0.10"
+rcgen = "0.13"
