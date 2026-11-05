@@ -1,0 +1,20 @@
+== permitted ==
+repair rows 0,2
+committed effects=2 lifetime_transitions=2 lifetime_distinct=2
+== unsafe-query ==
+repair includes row outside incident
+rejected Scope
+rows unchanged
+== stale-preview ==
+preview and approve 6 rows; row 0 then succeeds
+rejected Scope
+no repair effects committed
+== ambiguous-retry ==
+repair operation 1; reply lost
+unknown; resolve original operation ID
+status 1: committed
+retry 1: committed effects=1 lifetime_transitions=1 lifetime_distinct=1
+one logical receipt
+== lifetime-budget ==
+25 one-row repair operations committed
+26th: rejected Budget

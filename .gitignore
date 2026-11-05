@@ -1,0 +1,3 @@
+# Build products and retained local verification databases/logs.
+**/target/
+**/artifacts/

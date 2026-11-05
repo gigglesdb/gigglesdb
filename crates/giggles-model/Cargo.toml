@@ -1,0 +1,10 @@
+[package]
+name = "giggles-model"
+version = "0.1.0"
+edition = "2024"
+description = "Serial executable specification for bounded agent repairs"
+publish = false
+
+[workspace]
+
+[dependencies]
