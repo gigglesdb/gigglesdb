@@ -1,0 +1,15 @@
+[package]
+name = "giggles-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded trusted embedded SQL frontend for GigglesDB"
+
+[[bin]]
+name = "giggles-sql"
+path = "src/main.rs"
+
+[dependencies]
+giggles-core = { path = "../giggles-core" }
+serde_json = "1"
+
+[workspace]
