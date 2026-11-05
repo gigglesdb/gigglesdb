@@ -85,6 +85,28 @@ impl Image {
     pub fn snapshot(&self) -> Result<Snapshot, CoreError> {
         Ok(from_records(decode(&self.0)?)?.view)
     }
+    /// Trusted data-range projection. Builds a fresh kernel containing only
+    /// typed repair rows, preserving their versions. No grant, approval, receipt,
+    /// accounting, relational catalog or retry authority is inherited.
+    /// The caller must separately fence the source and verify its supported
+    /// namespaces before using this as a split bootstrap.
+    pub fn row_partition(&self, start: Key, end: Option<Key>) -> Result<Self, CoreError> {
+        if end.is_some_and(|end| start >= end) {
+            return Err(CoreError::Unsupported);
+        }
+        let source = from_records(decode(&self.0)?)?;
+        let mut target = empty(source.view.domain);
+        // This logical storage generation is not task authority. Retaining it
+        // lets a data-only image remain canonical after ordinary row commits.
+        target.sql.generation = source.sql.generation;
+        target.view.rows = source
+            .view
+            .rows
+            .into_iter()
+            .filter(|(key, _)| *key >= start && end.is_none_or(|end| *key < end))
+            .collect();
+        Ok(Self(encode(&records(&target)?)?))
+    }
     pub fn accounting(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
         Ok(from_records(decode(&self.0)?)?
             .accounting
