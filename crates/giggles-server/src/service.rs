@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "role", deny_unknown_fields)]
 pub enum Role {
     Task {
@@ -23,7 +23,7 @@ pub enum Role {
         tables: BTreeSet<String>,
     },
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub fingerprint: String,
@@ -142,15 +142,66 @@ pub struct Service {
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
-    bindings: BTreeMap<String, Role>,
+    pub(crate) authority_gate: std::sync::RwLock<()>,
+    bindings: std::sync::Mutex<Credentials>,
+    pub(crate) admission: crate::admission::Admission,
+}
+struct Credentials {
+    next: u64,
+    entries: BTreeMap<String, (Role, u64)>,
 }
 impl Service {
     pub fn new(admin: Admin, bindings: Vec<Binding>, clock: Clock) -> Result<Arc<Self>, CoreError> {
+        Self::with_limits(
+            admin,
+            bindings,
+            clock,
+            crate::admission::ServiceLimits::default(),
+        )
+    }
+    pub fn with_limits(
+        admin: Admin,
+        bindings: Vec<Binding>,
+        clock: Clock,
+        limits: crate::admission::ServiceLimits,
+    ) -> Result<Arc<Self>, CoreError> {
+        let map = Self::validate(&admin, bindings)?;
+        let mut next = 0u64;
+        let entries = map
+            .into_iter()
+            .map(|(fp, role)| {
+                next += 1;
+                (fp, (role, next))
+            })
+            .collect();
+        Ok(Arc::new(Self {
+            blocking: crate::blocking::Blocking::new(),
+            cancellations: crate::cancel::Registry::default(),
+            task_gate: std::sync::Mutex::new(()),
+            authority_gate: std::sync::RwLock::new(()),
+            bindings: std::sync::Mutex::new(Credentials { next, entries }),
+            admission: crate::admission::Admission::new(limits)?,
+            admin,
+            clock,
+        }))
+    }
+    fn validate(
+        admin: &Admin,
+        bindings: Vec<Binding>,
+    ) -> Result<BTreeMap<String, Role>, CoreError> {
+        if bindings.len() > 1024 {
+            return Err(CoreError::Limit);
+        }
         let domain = admin.authority_metadata()?.0.to_string();
         let mut map = BTreeMap::new();
-        let mut owners = BTreeSet::new();
+        let mut owners: BTreeMap<String, Role> = BTreeMap::new();
         for b in bindings {
-            if hex::decode(&b.fingerprint).is_err() || b.fingerprint.len() != 64 {
+            if b.fingerprint.len() != 64
+                || !b
+                    .fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
                 return Err(CoreError::Limit);
             }
             let bound = match &b.role {
@@ -160,38 +211,76 @@ impl Service {
                 return Err(CoreError::Policy(Error::Authentication));
             }
             if let Role::Application { tables, .. } = &b.role {
-                if tables.is_empty() {
+                if tables.is_empty() || tables.len() > 128 {
                     return Err(CoreError::Policy(Error::Scope));
                 }
-                // Exact one-owner tables; tenant sharing needs a separate policy design.
                 for table in tables {
-                    if !owners.insert(table.clone()) {
+                    if table.is_empty() || table.len() > 128 {
+                        return Err(CoreError::Limit);
+                    }
+                    if owners.get(table).is_some_and(|owner| owner != &b.role) {
                         return Err(CoreError::Policy(Error::Scope));
                     }
+                    owners.insert(table.clone(), b.role.clone());
                 }
             }
             if map.insert(b.fingerprint, b.role).is_some() {
                 return Err(CoreError::Policy(Error::Authentication));
             }
         }
-        Ok(Arc::new(Self {
-            blocking: crate::blocking::Blocking::new(),
-            cancellations: crate::cancel::Registry::default(),
-            task_gate: std::sync::Mutex::new(()),
-            admin,
-            clock,
-            bindings: map,
-        }))
+        Ok(map)
+    }
+    /// Trusted local control only. Validates completely before an atomic replacement.
+    /// Decisions already ordered before this lock are never undone.
+    pub fn reload_bindings(&self, bindings: Vec<Binding>) -> Result<u64, CoreError> {
+        let proposed = Self::validate(&self.admin, bindings)?;
+        let _gate = self.authority_gate.write().map_err(|_| CoreError::Fenced)?;
+        let mut current = self.bindings.lock().map_err(|_| CoreError::Fenced)?;
+        let mut next = current.next;
+        let mut entries = BTreeMap::new();
+        for (fp, role) in proposed {
+            let epoch = match current.entries.get(&fp) {
+                Some((old, epoch)) if old == &role => *epoch,
+                _ => {
+                    next = next.checked_add(1).ok_or(CoreError::Limit)?;
+                    next
+                }
+            };
+            entries.insert(fp, (role, epoch));
+        }
+        *current = Credentials { next, entries };
+        Ok(next)
+    }
+    pub(crate) fn cancel_bound(&self, session: &Session, pid: u32, secret: u32) {
+        // Hold registry snapshot through cancellation; reload cannot revoke
+        // between validation and signaling. Never wait for the decision gate.
+        let Ok(current) = self.bindings.lock() else {
+            return;
+        };
+        if current
+            .entries
+            .get(&session.fingerprint)
+            .is_some_and(|(role, epoch)| role == &session.role && *epoch == session.epoch)
+        {
+            self.cancellations
+                .cancel(&session.fingerprint, session.epoch, pid, secret);
+        }
     }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
-        let role = self
+        let (role, epoch) = self
             .bindings
+            .lock()
+            .map_err(|_| CoreError::Fenced)?
+            .entries
             .get(fingerprint)
             .cloned()
             .ok_or(CoreError::Policy(Error::Authentication))?;
         Ok(Session {
             service: self.clone(),
             role,
+            epoch,
+            scoped: false,
+            connection: None,
             fingerprint: fingerprint.to_owned(),
             sql: self.admin.sql_session(),
         })
@@ -201,9 +290,57 @@ pub struct Session {
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
     pub(crate) fingerprint: String,
+    pub(crate) epoch: u64,
+    scoped: bool,
+    pub(crate) connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) sql: SqlSession,
 }
 impl Session {
+    pub(crate) fn check_binding(&self) -> Result<(), CoreError> {
+        let credentials = self
+            .service
+            .bindings
+            .lock()
+            .map_err(|_| CoreError::Fenced)?;
+        if credentials
+            .entries
+            .get(&self.fingerprint)
+            .is_some_and(|(role, epoch)| *epoch == self.epoch && role == &self.role)
+        {
+            Ok(())
+        } else {
+            Err(CoreError::Policy(Error::Authentication))
+        }
+    }
+    pub(crate) fn authority_scope<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        if self.scoped {
+            self.check_binding()?;
+            return work(self);
+        }
+        let service = self.service.clone();
+        let _guard = loop {
+            giggles_core::cancellation::check()?;
+            match service.authority_gate.try_read() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(CoreError::Fenced),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+            }
+        };
+        self.check_binding()?;
+        self.scoped = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
+        self.scoped = false;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     pub fn abort(&mut self) {
         self.sql.abort();
     }
@@ -214,9 +351,11 @@ impl Session {
         self.sql.is_aborted()
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
-        let p = self.sql.prepare(sql)?;
-        self.authorize(&p)?;
-        Ok(p)
+        self.authority_scope(|session| {
+            let p = session.sql.prepare(sql)?;
+            session.authorize(&p)?;
+            Ok(p)
+        })
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         let allowed = matches!(&self.role, Role::Application { tables,.. }
@@ -232,10 +371,19 @@ impl Session {
         p: &Prepared,
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
-        self.authorize(p)?;
-        self.sql.execute_prepared(p, params, None)
+        self.authority_scope(|session| {
+            session.authorize(p)?;
+            session.sql.execute_prepared(p, params, None)
+        })
     }
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
+        self.authority_scope(|session| session.execute_sql_authorized(sql, params))
+    }
+    fn execute_sql_authorized(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<SqlResult, CoreError> {
         // Core's aborted-state ROLLBACK escape must remain reachable.
         if self.sql.is_aborted()
             && sql
@@ -249,6 +397,7 @@ impl Session {
         self.execute_prepared(&p, params)
     }
     fn executor(&self) -> Result<(Executor, (u64, u64)), CoreError> {
+        self.check_binding()?;
         let Role::Task {
             domain,
             task,
@@ -276,6 +425,10 @@ impl Session {
         self.handle_received(request, received)
     }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
+        self.authority_scope(|session| Ok(session.handle_authorized(request, received)))
+            .unwrap_or_else(|error| Response::error(&error))
+    }
+    fn handle_authorized(&mut self, request: Request, received: std::time::Instant) -> Response {
         let context = Cancellation::current().unwrap_or_default();
         context.scope(|| {
             let response = self.handle_scoped(request, received, &context);
@@ -411,5 +564,301 @@ impl Session {
             operation,
             ..Response::error(&e)
         })
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    fn fixture() -> (Arc<Service>, Vec<Binding>) {
+        let path = PathBuf::from("artifacts").join(format!(
+            "binding-unit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        println!("retained_fixture={}", path.display());
+        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        admin
+            .sql_session()
+            .execute("CREATE TABLE app (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        let bindings = vec![Binding {
+            fingerprint: "11".repeat(32),
+            role: Role::Application {
+                domain: admin.authority_metadata().unwrap().0.to_string(),
+                tables: BTreeSet::from(["app".into()]),
+            },
+        }];
+        (
+            Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
+            bindings,
+        )
+    }
+    #[test]
+    fn removal_readdition_never_resurrects_session_prepared_transaction_or_cancel_key() {
+        let (service, bindings) = fixture();
+        let mut old = service.session(&bindings[0].fingerprint).unwrap();
+        let prepared = old.prepare("INSERT INTO app (id) VALUES (1)").unwrap();
+        old.execute_sql("BEGIN", &[]).unwrap();
+        old.execute_prepared(&prepared, &[]).unwrap();
+        let backend = service
+            .cancellations
+            .register(&old.fingerprint, old.epoch)
+            .unwrap();
+        let active = backend.begin(true);
+        service.reload_bindings(vec![]).unwrap();
+        assert!(service.session(&old.fingerprint).is_err());
+        assert!(old.execute_sql("COMMIT", &[]).is_err());
+        assert!(old.execute_prepared(&prepared, &[]).is_err());
+        assert_eq!(old.handle(Request::Ping).code, "28000");
+        service.cancel_bound(&old, backend.pid, backend.secret);
+        assert!(active.context.check().is_ok());
+        service.reload_bindings(bindings).unwrap();
+        let mut fresh = service.session(&old.fingerprint).unwrap();
+        assert_ne!(old.epoch, fresh.epoch);
+        service.cancel_bound(&fresh, backend.pid, backend.secret);
+        assert!(active.context.check().is_ok());
+        assert!(old.prepare("SELECT id FROM app LIMIT 1").is_err());
+        assert!(
+            fresh
+                .execute_sql("SELECT id FROM app LIMIT 1", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+    #[test]
+    fn unchanged_overlap_rotation_preserves_only_exact_authority() {
+        let (service, mut bindings) = fixture();
+        let mut old = service.session(&bindings[0].fingerprint).unwrap();
+        bindings.push(Binding {
+            fingerprint: "22".repeat(32),
+            role: bindings[0].role.clone(),
+        });
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut new = service.session(&bindings[1].fingerprint).unwrap();
+        assert!(
+            old.execute_sql("INSERT INTO app (id) VALUES (1)", &[])
+                .is_ok()
+        );
+        assert_eq!(
+            new.execute_sql("SELECT id FROM app WHERE id=1", &[])
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        bindings.remove(0);
+        service.reload_bindings(bindings).unwrap();
+        assert!(old.execute_sql("DELETE FROM app WHERE id=1", &[]).is_err());
+        assert_eq!(
+            new.execute_sql("SELECT id FROM app WHERE id=1", &[])
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn invalid_reload_is_atomic_and_epoch_overflow_cannot_partially_replace() {
+        let (service, bindings) = fixture();
+        let mut old = service.session(&bindings[0].fingerprint).unwrap();
+        let mut overlapping = bindings.clone();
+        let mut other = bindings[0].clone();
+        other.fingerprint = "22".repeat(32);
+        if let Role::Application { tables, .. } = &mut other.role {
+            tables.insert("other".into());
+        }
+        overlapping.push(other);
+        let epoch = old.epoch;
+        for invalid in [
+            overlapping,
+            vec![bindings[0].clone(), bindings[0].clone()],
+            vec![Binding {
+                fingerprint: "AA".repeat(32),
+                role: bindings[0].role.clone(),
+            }],
+            vec![bindings[0].clone(); 1025],
+        ] {
+            assert!(service.reload_bindings(invalid).is_err());
+            assert_eq!(old.handle(Request::Ping).code, "ok");
+            assert_eq!(service.session(&old.fingerprint).unwrap().epoch, epoch);
+        }
+        service.bindings.lock().unwrap().next = u64::MAX;
+        let mut replacement = bindings[0].clone();
+        replacement.fingerprint = "33".repeat(32);
+        assert!(service.reload_bindings(vec![replacement]).is_err());
+        assert_eq!(old.handle(Request::Ping).code, "ok");
+    }
+    #[test]
+    fn role_change_and_change_back_never_revives_old_privileges() {
+        let (service, bindings) = fixture();
+        let mut old = service.session(&bindings[0].fingerprint).unwrap();
+        let mut changed = bindings.clone();
+        if let Role::Application { tables, .. } = &mut changed[0].role {
+            *tables = BTreeSet::from(["other".into()]);
+        }
+        service.reload_bindings(changed).unwrap();
+        assert!(
+            old.execute_sql("INSERT INTO app (id) VALUES (1)", &[])
+                .is_err()
+        );
+        service.reload_bindings(bindings).unwrap();
+        assert!(
+            old.execute_sql("INSERT INTO app (id) VALUES (1)", &[])
+                .is_err()
+        );
+        assert!(
+            service
+                .session(&old.fingerprint)
+                .unwrap()
+                .execute_sql("SELECT id FROM app LIMIT 1", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_blocking_work_rechecks_binding_before_any_side_effect() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let pool = service.blocking.clone();
+        // Pause the actual submitted worker before service execution.
+        let (started, rx) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let job = tokio::spawn(async move {
+            pool.run(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                session.handle(Request::Sql {
+                    sql: "INSERT INTO app (id) VALUES (1)".into(),
+                    params: vec![],
+                })
+            })
+            .await
+            .unwrap()
+        });
+        rx.await.unwrap();
+        service.reload_bindings(vec![]).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(job.await.unwrap().code, "28000");
+        assert!(
+            service
+                .admin
+                .sql_session()
+                .execute("SELECT id FROM app LIMIT 1", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_worker_retains_shared_session_admission_until_real_completion() {
+        let (original, bindings) = fixture();
+        let service = Service::with_limits(
+            original.admin.clone(),
+            bindings.clone(),
+            Clock::new(0, 3600).unwrap(),
+            crate::admission::ServiceLimits {
+                sessions: 1,
+                burst: 100,
+                per_second: 100,
+            },
+        )
+        .unwrap();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        session.connection = service.admission.connect();
+        assert!(session.connection.is_some());
+        let (started, rx) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let pool = service.blocking.clone();
+        let job = tokio::spawn(async move {
+            pool.run(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(session.handle(Request::Ping).code, "ok");
+                drop(session);
+                finished.send(()).unwrap();
+            })
+            .await
+        });
+        rx.await.unwrap();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert!(service.admission.connect().is_none());
+        release.send(()).unwrap();
+        done.await.unwrap();
+        assert!(service.admission.connect().is_some());
+    }
+    #[test]
+    fn unchanged_reload_preserves_existing_backend_and_changed_epoch_denies_it() {
+        let (service, bindings) = fixture();
+        let old = service.session(&bindings[0].fingerprint).unwrap();
+        let backend = service
+            .cancellations
+            .register(&old.fingerprint, old.epoch)
+            .unwrap();
+        service.reload_bindings(bindings.clone()).unwrap();
+        let active = backend.begin(true);
+        service.cancel_bound(&old, backend.pid, backend.secret);
+        assert_eq!(active.context.check(), Err(CoreError::Cancelled));
+        drop(active);
+        service.reload_bindings(vec![]).unwrap();
+        service.reload_bindings(bindings).unwrap();
+        let active = backend.begin(true);
+        let new = service.session(&old.fingerprint).unwrap();
+        service.cancel_bound(&new, backend.pid, backend.secret);
+        assert!(active.context.check().is_ok());
+    }
+    #[test]
+    fn cancelled_wait_for_reload_lease_returns_before_writer_releases_and_never_writes() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let writer = service.authority_gate.write().unwrap();
+        let context = Cancellation::default();
+        let worker_context = context.clone();
+        let (started, rx) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_context.scope(|| {
+                started.send(()).unwrap();
+                finished
+                    .send(session.handle(Request::Sql {
+                        sql: "INSERT INTO app (id) VALUES (1)".into(),
+                        params: vec![],
+                    }))
+                    .unwrap();
+            })
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        context.cancel();
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .code,
+            "57014"
+        );
+        drop(writer);
+        worker.join().unwrap();
+        assert!(
+            service
+                .admin
+                .sql_session()
+                .execute("SELECT id FROM app LIMIT 1", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 }

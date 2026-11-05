@@ -2,14 +2,15 @@
 
 Filesystem ownership, offline config/issuer/approver and host time are trusted.
 Mandatory rustls client verification authenticates a CA-issued client leaf, then
-the exact leaf fingerprint selects an immutable configured role and database
+the exact leaf fingerprint selects a live epoch-fenced configured role and database
 domain. Client user/database strings, principal integers, role SET and certified
 timestamps never confer authority. Empty bindings deny everyone. Config has no
 default identity, password or privilege. Provisioning/approval use the existing
-trusted local API, never the network JSON dispatcher. Certificate roles are fixed
-until restart; revocation/rotation of a certificate binding requires disconnecting
-its sessions and restarting with revised offline config. Task/approval revocation
-is checked through the shared kernel without restart.
+trusted local API, never the network JSON dispatcher. Trusted local binding reload
+revokes existing session epochs; identical-role certificate overlap is supported.
+CA/server certificate/key changes require restart. See CREDENTIALS_ADMISSION.md
+for precise handshake validity, synchronization and release semantics. Task/approval
+revocation is checked through the shared kernel without restart.
 
 Application tables are exclusively assigned to one configured role. Its entire
 table data is readable/writable via the finite inherited grammar. Internal/task
@@ -82,14 +83,14 @@ GD-0009 moves native decode/dispatch/encode and PostgreSQL frame processing
 (including prepare/describe, clock and core decisions) into a Service-shared
 blocking pool capped at32 submitted jobs across both listeners. Admission awaits
 before submission; each connected session retains at most one waiting frame.
-The existing per-listener connection limits bound waiting frames. Original frame
+Shared aggregate session admission plus per-listener limits bound waiting frames. Original frame
 receipt time survives queueing for native and simple task-wire deadlines. Session
 and protocol state have one owner and are moved into and back out of each job.
 Started jobs hold admission until actual completion even after socket shutdown;
 shutdown does not wait for detached blocking decisions and does not promise their
 rollback. Runtime teardown may wait for them. The synchronous Rust Session API
 remains synchronous for trusted embedded callers. This is a count bound, not a
-storage latency bound, rate limit, aggregate-memory qualification or fairness
+storage latency bound, aggregate-memory qualification or fairness
 guarantee. Session construction/drop takes no storage mutex; final database
 teardown remains the trusted host's responsibility.
 

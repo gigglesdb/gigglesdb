@@ -3,12 +3,12 @@
 The inherited SQL subset is specified in ../giggles-core/SQL.md. Network schema
 creation is deliberately unavailable: create tables through trusted local
 provisioning, then assign each entire application table to exactly one certificate
-binding. Multiple connections with that certificate can share its tables. There
+authority. Identical-authority certificates may overlap during trusted local reload. There
 is no row-level tenant sharing or generic task table grant.
 
 | Surface | Implemented/tested | Rejected or remaining |
 | --- | --- | --- |
-| TLS/auth | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext, password fallback, unbound/wrong-CA/no certificate; CRL/online rotation remain |
+| TLS/auth | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext, password fallback, unbound/wrong-CA/no certificate; CRL/CA/server-certificate hot rotation remain; trusted live binding reload supported |
 | Startup | SSLRequest then v3, fixed giggles user/database, UTF8 and application_name | Direct TLS, GSS, replication, options, alternate users/databases |
 | Simple query | One inherited statement; typed result description and text rows; empty query | Multi-statements, COPY, arbitrary SET, catalog/system SQL |
 | Extended | Parse/Bind/Describe/Execute/Sync/Close/Flush; named and unnamed objects; pipeline error drain to Sync | COPY, arbitrary PostgreSQL syntax |
@@ -24,10 +24,10 @@ is no row-level tenant sharing or generic task table grant.
 Frames: native request256KiB, response8MiB; pg startup8192bytes, post-startup frame
 256KiB including four-byte length, aggregate response8MiB. Validate lengths before
 allocation. Per listener1..128 connections, admitted before TLS; two configured
-listeners therefore allow at most256 total. Per session32 statements and32portals;
+listeners share at most128 total by default (configurable1..128). Per session32 statements and32portals;
 names63bytes, SQL64KiB. Parameter payloads retained by portals and materialized
-results each have an8MiB aggregate limit per session, checked before/after their
-respective allocation. A single bounded result can temporarily exceed retained
+results each have an8MiB aggregate limit per session; results are admitted
+before caching or emitting rows. A single bounded result can temporarily exceed retained
 capacity before rejection. Prepared SQL is at most32x64KiB per session. Core
 parameters256, row64KiB, result1024rows/1MiB raw values;8 staged transactions shared
 by the database; admitted core calls default32; whole persisted State16MiB.
@@ -64,4 +64,6 @@ cap. Native has no new Cancel endpoint; Deadline is its cooperative equivalent.
 Task OperationId keeps its original dedupe/status meaning; cancelled retries may
 refer to already committed operations. GD-0011 adds typed prepared task envelopes;
 see PREPARED_TASKS.md for grammar, bounds and fresh portal replay semantics.
-Durable cumulative disclosure accounting remains unimplemented.
+Durable cumulative task disclosure accounting is implemented; see TASK_ACCOUNTING.md.
+GD13 live binding lifecycle/shared rate limits and exact capacity dimensions are
+documented in CREDENTIALS_ADMISSION.md.

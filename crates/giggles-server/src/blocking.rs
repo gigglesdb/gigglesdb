@@ -73,11 +73,11 @@ mod tests {
             .await
             .unwrap();
         let registry = crate::cancel::Registry::default();
-        let backend = registry.register("bound-certificate").unwrap();
+        let backend = registry.register("bound-certificate", 1).unwrap();
         let active = backend.begin(true);
         let mut waiting = Box::pin(pool.admit(&active.context));
         pending(waiting.as_mut()).await;
-        registry.cancel("bound-certificate", backend.pid, backend.secret);
+        registry.cancel("bound-certificate", 1, backend.pid, backend.secret);
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
                 .await

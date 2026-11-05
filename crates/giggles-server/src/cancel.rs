@@ -20,11 +20,12 @@ pub(crate) struct Backend {
     pub(crate) pid: u32,
     pub(crate) secret: u32,
     fingerprint: String,
+    epoch: u64,
     open: AtomicBool,
     active: Mutex<Option<Cancellation>>,
 }
 impl Registry {
-    pub(crate) fn register(&self, fingerprint: &str) -> io::Result<Arc<Backend>> {
+    pub(crate) fn register(&self, fingerprint: &str, epoch: u64) -> io::Result<Arc<Backend>> {
         let mut entries = self
             .0
             .lock()
@@ -44,6 +45,7 @@ impl Registry {
                 pid,
                 secret: u32::from_be_bytes(bytes[4..].try_into().unwrap()),
                 fingerprint: fingerprint.into(),
+                epoch,
                 open: AtomicBool::new(true),
                 active: Mutex::new(None),
             });
@@ -52,12 +54,13 @@ impl Registry {
             return Ok(backend);
         }
     }
-    pub(crate) fn cancel(&self, fingerprint: &str, pid: u32, secret: u32) {
+    pub(crate) fn cancel(&self, fingerprint: &str, epoch: u64, pid: u32, secret: u32) {
         let Ok(entries) = self.0.lock() else { return };
         let Some(backend) = entries.live.get(&pid).and_then(Weak::upgrade) else {
             return;
         };
-        if backend.secret != secret || backend.fingerprint != fingerprint {
+        if backend.secret != secret || backend.fingerprint != fingerprint || backend.epoch != epoch
+        {
             return;
         }
         if let Ok(active) = backend.active.lock()
@@ -98,13 +101,13 @@ mod tests {
     #[test]
     fn key_lifecycle_idle_wrong_binding_closed_and_fresh_context() {
         let registry = Registry::default();
-        let backend = registry.register("certificate-A").unwrap();
-        registry.cancel("certificate-A", backend.pid, backend.secret); // idle
+        let backend = registry.register("certificate-A", 1).unwrap();
+        registry.cancel("certificate-A", 1, backend.pid, backend.secret); // idle
         let first = backend.begin(true);
-        registry.cancel("certificate-B", backend.pid, backend.secret);
-        registry.cancel("certificate-A", backend.pid, backend.secret ^ 1);
+        registry.cancel("certificate-B", 1, backend.pid, backend.secret);
+        registry.cancel("certificate-A", 1, backend.pid, backend.secret ^ 1);
         assert!(first.context.check().is_ok());
-        registry.cancel("certificate-A", backend.pid, backend.secret);
+        registry.cancel("certificate-A", 1, backend.pid, backend.secret);
         assert_eq!(
             first.context.check(),
             Err(giggles_core::CoreError::Cancelled)
@@ -113,15 +116,15 @@ mod tests {
         let next = backend.begin(true);
         assert!(next.context.check().is_ok());
         backend.close();
-        registry.cancel("certificate-A", backend.pid, backend.secret);
+        registry.cancel("certificate-A", 1, backend.pid, backend.secret);
         assert!(next.context.check().is_ok());
         let another_authority = Registry::default();
-        another_authority.cancel("certificate-A", backend.pid, backend.secret);
+        another_authority.cancel("certificate-A", 1, backend.pid, backend.secret);
         assert!(next.context.check().is_ok());
         drop(next);
         let old_pid = backend.pid;
         drop(backend);
-        let replacement = registry.register("certificate-A").unwrap();
+        let replacement = registry.register("certificate-A", 1).unwrap();
         assert_ne!(replacement.pid, old_pid);
         assert_eq!(registry.0.lock().unwrap().live.len(), 1);
     }
@@ -129,6 +132,6 @@ mod tests {
     fn anti_reuse_history_is_bounded_and_fails_closed() {
         let registry = Registry::default();
         registry.0.lock().unwrap().used.extend(0..65_536);
-        assert!(registry.register("certificate-A").is_err());
+        assert!(registry.register("certificate-A", 1).is_err());
     }
 }

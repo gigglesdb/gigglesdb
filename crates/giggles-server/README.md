@@ -118,3 +118,11 @@ Official sources consulted: [PostgreSQL protocol flow](https://www.postgresql.or
 [message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html),
 [rustls client verification](https://docs.rs/rustls/0.23.46/rustls/server/struct.WebPkiClientVerifier.html),
 and the pinned tokio-postgres source for START TRANSACTION and RowDescription.
+
+## Live credential and shared admission control
+
+See [CREDENTIALS_ADMISSION.md](CREDENTIALS_ADMISSION.md) for the bounded trusted
+stdin `reload`/`shutdown` workflow, binding epochs, identical-authority certificate
+overlap, restart-required CA/certificate changes, aggregate session/rate defaults,
+cancellation saturation behavior and capacity worksheet.
+See [Design documentation](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000) for the actual parent P2 row.

@@ -533,6 +533,14 @@ impl State {
                 }
             }
             b'E' => {
+                let retained = self
+                    .portals
+                    .values()
+                    .filter_map(|p| p.result.as_ref())
+                    .try_fold(0usize, |sum, result| {
+                        sum.checked_add(serde_json::to_vec(result).ok()?.len())
+                    })
+                    .ok_or("54000")?;
                 let was_transaction = session.in_transaction();
                 let name = r.text()?;
                 let max = r.u32()?;
@@ -564,7 +572,13 @@ impl State {
                     unreachable!()
                 };
                 if p.result.is_none() {
-                    p.result = Some(core(session.execute_prepared(prepared, &p.params))?);
+                    let result = core(session.execute_prepared(prepared, &p.params))?;
+                    let bytes = serde_json::to_vec(&result).map_err(|_| "54000")?.len();
+                    if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
+                        return Err("54000");
+                    }
+                    // Admit retained bytes before caching OR appending any rows.
+                    p.result = Some(result);
                 }
                 let result = p.result.as_ref().unwrap();
                 let end = if max == 0 {
@@ -581,18 +595,6 @@ impl State {
                 }
                 if was_transaction && !session.in_transaction() {
                     self.portals.clear();
-                }
-                let retained = self
-                    .portals
-                    .values()
-                    .filter_map(|p| p.result.as_ref())
-                    .try_fold(0usize, |sum, r| {
-                        sum.checked_add(serde_json::to_vec(r).ok()?.len())
-                    })
-                    .ok_or("54000")?;
-                if retained > MAX_RESPONSE {
-                    self.portals.clear();
-                    return Err("54000");
                 }
             }
             b'C' => {
@@ -628,6 +630,9 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut session: Session,
 ) -> io::Result<()> {
     let blocking = session.service.blocking.clone();
+    if !session.service.admission.request() {
+        return Ok(());
+    }
     let startup = timeout(IO_TIMEOUT, async {
         let n = s.read_u32().await?;
         if !(8..=8192).contains(&n) {
@@ -643,10 +648,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     if startup.len() == 12 && startup[..4] == 80877102u32.to_be_bytes() {
         let pid = u32::from_be_bytes(startup[4..8].try_into().unwrap());
         let secret = u32::from_be_bytes(startup[8..12].try_into().unwrap());
-        session
-            .service
-            .cancellations
-            .cancel(&session.fingerprint, pid, secret);
+        session.service.cancel_bound(&session, pid, secret);
         return Ok(());
     }
     let validate = (|| -> R<()> {
@@ -696,7 +698,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     let backend = session
         .service
         .cancellations
-        .register(&session.fingerprint)?;
+        .register(&session.fingerprint, session.epoch)?;
     struct Close(std::sync::Arc<crate::cancel::Backend>);
     impl Drop for Close {
         fn drop(&mut self) {
@@ -742,6 +744,9 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(Ok(v)) => v,
             _ => return Ok(()),
         };
+        if !session.service.admission.request() {
+            return Ok(());
+        }
         let received = std::time::Instant::now();
         // Sync/Close/Terminate must remain usable for protocol recovery.
         let active = backend.begin(matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E'));
@@ -769,7 +774,13 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                         .context
                         .check()
                         .map_err(|e| crate::service::sqlstate(&e))?;
-                    state.handle(tag, &b, &mut session, &mut out, received)
+                    // The authority gate covers cached portal output and the
+                    // actual core commit, not just Parse/Bind authorization.
+                    session
+                        .authority_scope(|session| {
+                            Ok(state.handle(tag, &b, session, &mut out, received))
+                        })
+                        .map_err(|e| crate::service::sqlstate(&e))?
                 }) {
                     Ok(keep) => Ok(keep),
                     Err(code) => {
@@ -792,6 +803,9 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         session = returned_session;
         state = returned_state;
         if !keep? {
+            return Ok(());
+        }
+        if session.check_binding().is_err() {
             return Ok(());
         }
         send(s, &response).await?;

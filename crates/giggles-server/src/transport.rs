@@ -97,6 +97,7 @@ async fn serve_mode(
                 Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
                 incoming=listener.accept()=>{
                     let (mut socket,_)=incoming?;
+                    let Some(shared)=service.admission.connect() else {continue};
                     let Ok(permit)=sem.clone().try_acquire_owned() else {continue};
                     let accept=accept.clone();let service=service.clone();
                     tasks.spawn(async move {
@@ -105,9 +106,11 @@ async fn serve_mode(
                         let Ok(Ok(mut stream))=timeout(IO_TIMEOUT,accept.accept(socket)).await else {return};
                         let Some(cert)=stream.get_ref().1.peer_certificates().and_then(|c|c.first()) else {return};
                         let Ok(mut session)=service.session(&tls::fingerprint(cert.as_ref())) else {return};
+                        session.connection=Some(shared);
                         let blocking=service.blocking.clone();
                         if pg {let _=crate::pgwire::run(&mut stream,session).await;return;}
                         while let Ok(b)=read_frame(&mut stream,MAX_FRAME).await {
+                            if !service.admission.request() { return; }
                             let received=std::time::Instant::now();
                             let Ok((returned,encoded))=blocking.run(move || {
                                 let response=match serde_json::from_slice::<Request>(&b) {
@@ -118,6 +121,7 @@ async fn serve_mode(
                             }).await else {return};
                             session=returned;
                             let Ok(b)=encoded else {break};
+                            if session.check_binding().is_err() { return; }
                             if write_frame(&mut stream,&b,MAX_RESPONSE).await.is_err(){break;}
                         }
                     });

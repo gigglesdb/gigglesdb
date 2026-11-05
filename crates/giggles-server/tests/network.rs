@@ -965,7 +965,8 @@ async fn approval_revocation_staleness_expiry_and_unknown_status() {
             .is_err()
     );
     let mut future = grant(5, 42, 1, 1);
-    future.policy.valid_from = now() + 1;
+    let before_valid = now();
+    future.policy.valid_from = before_valid + 1;
     f.admin.grant(future).unwrap();
     f.admin
         .provision_task_resources(
@@ -979,7 +980,7 @@ async fn approval_revocation_staleness_expiry_and_unknown_status() {
         .unwrap();
     let e = f.admin.executor(TaskId(5), Principal(2)).unwrap();
     assert!(
-        e.execute_current(repair(1, 0..1), now(), now() + 2, None)
+        e.execute_current(repair(1, 0..1), before_valid, before_valid + 2, None)
             .is_err()
     );
     drop(c);
@@ -1823,3 +1824,6 @@ mod prepared_network;
 
 #[path = "accounting_network.inc"]
 mod accounting_network;
+
+#[path = "lifecycle_network.inc"]
+mod lifecycle_network;
