@@ -26,6 +26,20 @@ can leave an artifact; retain it and choose another path. No daemon or listener.
 
 ## Integration interface
 
+The trusted consensus prerequisite
+[`replica::protected`](src/storage/replica/protected.rs) stages typed repairs with
+the real executor against one row-free authority and complete locked data-only
+range images. `stage` is speculative, `validate` rechecks exact before images
+and a fresh decision fence, and `publish` produces an atomic application bundle
+only after the runtime resolves the exact immutable committed decision. Opaque
+restart bytes are recomputed before use. This interface is owner-only; its
+`TrustedRuntime` implementation must establish authority placement, complete
+row/predicate locks, time freshness and decision evidence from committed state.
+It currently requires the entire typed row keyspace, at most 64 partitions and
+1,024 rows. A business receipt does not authorize disclosure. The module documents
+separate output reservation and the runtime's atomic/idempotent redo obligations.
+Distributed `TaskWrite` integration remains separate.
+
 `Admin::create(path, Limits)` explicitly creates a new database directory.
 `Admin::open(path, Limits)` only opens an existing `data.redb`; a missing, empty,
 corrupt or newer-format database never initializes a replacement. Clone an admin

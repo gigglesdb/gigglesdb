@@ -4,6 +4,8 @@
 use super::*;
 use crate::local::{AdminCommand, Reply};
 
+pub mod protected;
+
 /// Opaque, validated canonical kernel image; not an export that revokes authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Image(Vec<u8>);
@@ -116,6 +118,14 @@ impl Image {
     /// The Admin handle is constructed and destroyed here; it never escapes.
     pub fn evaluate(&self, command: &Command) -> Result<(Self, Reply), CoreError> {
         command.validate()?;
+        self.with_admin(|a| self.evaluate_admin(a, command))
+    }
+    // Share the real storage/Executor path with trusted protected staging.
+    // The temporary Admin never escapes and no persistent input is changed.
+    fn with_admin<T>(
+        &self,
+        work: impl FnOnce(&Admin) -> Result<T, CoreError>,
+    ) -> Result<(Self, T), CoreError> {
         let values: BTreeMap<Vec<u8>, Vec<u8>> = decode(&self.0)?;
         from_records(values.clone())?;
         let db = Database::builder()
@@ -131,6 +141,11 @@ impl Image {
         }
         tx.commit().map_err(io)?;
         let a = Admin::attach(db, Limits::default())?;
+        let reply = work(&a)?;
+        let image = Self(encode(&records(&a.inner.read()?)?)?);
+        Ok((image, reply))
+    }
+    fn evaluate_admin(&self, a: &Admin, command: &Command) -> Result<Reply, CoreError> {
         let reply = match command {
             Command::ValidateRelease {
                 task,
@@ -156,7 +171,7 @@ impl Image {
                 upper,
                 action,
             } => {
-                let response = native_task(&a, *task, *principal, *lower, *upper, action)?;
+                let response = native_task(a, *task, *principal, *lower, *upper, action)?;
                 Reply::ok(serde_json::to_value(response).map_err(io)?)
             }
             Command::Admin(input) => {
@@ -167,7 +182,7 @@ impl Image {
                 if matches!(c, AdminCommand::Export { .. }) {
                     return Err(CoreError::Unsupported);
                 }
-                local::admin(&a, input)
+                local::admin(a, input)
             }
             Command::Task {
                 task,
@@ -208,8 +223,7 @@ impl Image {
                 }
             }
         };
-        let image = Self(encode(&records(&a.inner.read()?)?)?);
-        Ok((image, reply))
+        Ok(reply)
     }
 }
 fn hex_token(p: &Preview) -> Result<String, CoreError> {
