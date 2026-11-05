@@ -8,6 +8,14 @@ use std::io::{BufRead, Read, Write};
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
+    MembershipBegin {
+        group: u64,
+        intent: giggles_membership::Intent,
+    },
+    MembershipResume {
+        group: u64,
+        id: u64,
+    },
     TxPin {
         route: Descriptor,
     },
@@ -117,6 +125,12 @@ async fn main() -> Result<()> {
             let name = name.as_str().ok_or("invalid owner command")?;
             let control: Control = serde_json::from_value(serde_json::json!({name:envelope}))?;
             let value = match control {
+                Control::MembershipBegin { group, intent } => {
+                    serde_json::to_value(runtime.group(group)?.membership_begin(intent).await?)?
+                }
+                Control::MembershipResume { group, id } => {
+                    serde_json::to_value(runtime.group(group)?.membership_resume(id).await?)?
+                }
                 Control::TxPin { route } => serde_json::to_value(runtime.tx_pin(&route).await?)?,
                 Control::TxStep { request } => {
                     serde_json::to_value(runtime.tx_step(*request).await?)?

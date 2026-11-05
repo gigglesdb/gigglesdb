@@ -37,7 +37,8 @@ struct Record {
     snapshot: Vec<u8>,
     log: BTreeMap<u64, Vec<u8>>,
 }
-pub(crate) fn expected_conf(m: &Membership) -> Result<ConfState> {
+/// Derive the full configuration represented by an atomic controller image.
+pub fn expected_conf(m: &Membership) -> Result<ConfState> {
     let mut c = ConfState {
         voters: m.voters.clone(),
         ..Default::default()
@@ -58,7 +59,8 @@ pub(crate) fn expected_conf(m: &Membership) -> Result<ConfState> {
     }
     Ok(c)
 }
-pub(crate) fn equal_conf(a: &ConfState, b: &ConfState) -> bool {
+/// Compare configuration sets without relying on protobuf repeated-field order.
+pub fn equal_conf(a: &ConfState, b: &ConfState) -> bool {
     let sorted = |v: &[u64]| {
         let mut v = v.to_vec();
         v.sort_unstable();

@@ -210,6 +210,17 @@ impl Rig {
     }
     fn pin(&self, r: &Descriptor, id: giggles_transactions::TransactionId) -> Pinned {
         Pinned::from_current(Observation {
+            membership: giggles_membership::Membership::new(
+                giggles_membership::Identity {
+                    group: r.group,
+                    owner_epoch: 1,
+                },
+                vec![1, 2, 3],
+                64,
+            )
+            .unwrap(),
+            term: 1,
+            snapshot_index: 0,
             is_leader: true,
             quorum_checked: true,
             group: r.group,

@@ -1,10 +1,10 @@
 # Bounded range runtime
 
-`giggles-ranges` hosts up to 16 independent, durable, fixed-three-voter Raft
+`giggles-ranges` hosts up to 16 independent, durable Raft
 groups in each process. Group 1 is the replicated directory; data group IDs and
 stable range IDs are separate identities. Each group uses its own redb file and
 mTLS peer port. Database domain and group are bound in peer frames, log commands
-and snapshots. The peer listener accepts Raft messages only.
+and snapshots. The peer listener accepts authenticated Raft messages and bounded internal learner durability probes.
 
 This is an owner-controlled typed row API, using GigglesDB core `Key`, `Row` and
 kernel images. It does not provide distributed application SQL or protected task
@@ -52,11 +52,11 @@ ports and absolute paths):
 Add data group 2 using the same descriptor under `"initial":{"Data":...}`.
 Preconfigure groups 3 and 4 with `"initial":"Vacant"` for a split. Use distinct
 database paths and peer port triplets for every group. All voters must have the
-same initial directory/data descriptors, domain and group set. Voter IDs are
-exactly 1, 2, 3. Each CA-signed leaf must support server/client authentication,
+same initial directory/data descriptors, domain and group set. New groups begin with voter IDs 1, 2, 3. Provisioned peer rosters may include
+up to 31 distinct node identities, including staged replacements. Each CA-signed leaf must support server/client authentication,
 verify as `localhost`, and match the configured SHA-256 DER fingerprint. Peer
 leaves must be distinct. Initial state is used only for a new file; reopen checks
-persisted node, domain and group identity. The implementation trusts the owner
+persisted node, domain, group and complete provisioned fingerprint roster. The implementation trusts the owner
 and honest peer processes; it is not Byzantine consensus.
 
 ## Owner operations
@@ -75,7 +75,7 @@ and honest peer processes; it is not Byzantine consensus.
 authorizes work. `current` requires leadership, ReadIndex quorum and applied-index
 completion and returns `quorum_checked:true`. Followers report the known leader
 in refusal messages. Each new group elects independently. `transfer` uses Raft
-leadership transfer within the existing fixed membership; it does not move data.
+leadership transfer within the current membership; it does not move data.
 
 `put` reads the current directory then submits an exact descriptor-fenced CAS to
 the chosen local group leader. `expected:null` means absent; a number means exact
@@ -155,7 +155,7 @@ The process tests exercise this routing with different leaders.
 A pin is a committed-state locator and snapshot from a quorum-checked current
 barrier. It is **trusted owner control input, not a cryptographic certificate**.
 Copy only real responses from authenticated owner sessions; never accept pins
-from an untrusted remote user. Peer listeners still accept Raft only. `inspect`,
+from an untrusted remote user. The peer listener never accepts owner commands. `inspect`,
 `current`, and `tx_pin` expose full trusted diagnostics; these are not protected
 application read endpoints. Apply validates exact database/range/epoch,
 operation digest, sealed participants, engine position and applied-index binding
@@ -174,8 +174,67 @@ exhaustion rejects new work; it does not evict locks, redo or terminal decisions
 Direct Put conservatively rejects a range with any unresolved home/participant
 work. Split fencing rejects active, queued and prepared work. Terminal homes
 remain on retained parent groups; retry/status use their original descriptors.
-No transaction state migration or deletion is implemented. The on-disk range
+Transaction identities never migrate to a different logical home; retained state is
+replicated in full during voter replacement. No transaction deletion is implemented. The on-disk range
 schema changed; automatic upgrade from older binaries is not provided.
+
+## Durable voter replacement
+
+Provision all four peer identities, endpoints and CA-signed certificates in each
+node's group configuration **before creating its store**. Start the fourth process
+with the same initial group descriptors; its Raft configuration initially excludes
+it. Provisioned fingerprints are persisted and must match exactly on restart.
+Restart cannot silently add, remove or rebind a certificate. This bounded interface
+does not provide live certificate rotation or dynamic roster provisioning.
+
+At the current data-group leader, submit a stable nonzero intent ID and current
+membership epoch (available under `current.membership.epoch`):
+
+```json
+{"command":"membership_begin","group":2,"intent":{"id":9001,"epoch":1,"learner":4,"remove":1}}
+{"command":"membership_resume","group":2,"id":9001}
+{"command":"current","group":2}
+```
+
+Repeat `membership_resume` at the reported leader until that exact receipt is
+`Complete`. Each call advances one durable stage: Planned ? learner configuration
+? authenticated applied proof ? explicit Joint ? Complete. A timeout is ambiguous;
+reuse the same intent and inspect status. Reusing an ID for a different payload
+fails. Receipts retain up to 64 intents; there is no GC or concurrent membership
+change. Directory/vacant/inactive/fenced groups reject replacement. TaskWrite
+remains rejected.
+
+The controller and ConfState are saved atomically with the complete Machine and
+applied index. Snapshots carry actual kernel rows, transaction homes/decisions,
+participant locks/redo, retries and split provenance. The learner's internal mTLS
+probe response is produced by its actor from its durable applied frontier and
+binds its certificate identity, database/group envelope, intent, epoch, leader
+term and barrier. The leader also checks Raft replication progress. The owner
+cannot supply a remote readiness assertion; transport enqueue acknowledgments
+are never durability proof. A new term requires a new proof before proposing
+joint consensus. During joint consensus both incoming and outgoing majorities
+are required. A removed leader stops serving writes/current reads and cannot
+continue leader heartbeats after its durable removal.
+
+`Descriptor.epoch` is the **logical ownership epoch**, while `membership.epoch`
+tracks Raft configuration. `Descriptor.voters` retains the original ownership
+placement, not live membership; read live voter placement from `membership` and
+ConfState. Replacing a voter does not alter a descriptor, directory revision,
+transaction home or receipt identity. Continue using original descriptors for
+status and exact retries. Independently led transaction groups still need trusted
+owner routing of `tx_step`/`tx_pin`; replacement adds no administrative forwarding.
+
+Splits are conservatively refused while membership is changing **and after any
+replacement on that parent**. Replaying a split cannot reactivate removed voter
+placement through a new child. A split fence that commits first prevents membership
+admission. A rejected fence leaves its directory intent retained and unpublished;
+inspect it and keep serving the original range. General online ownership movement,
+placement metadata refresh and splitting a replaced range need a later protocol.
+Changing a voter list alone does not move ownership or repoint the directory.
+
+The membership-aware durable format and snapshot version differ from earlier
+binaries. There is no automatic upgrade path; retain prior files and use newly
+provisioned stores for this local bounded runtime.
 
 ## Split and recovery
 
@@ -228,7 +287,7 @@ cap accommodates the declared maximum typed row/retry footprint. Chunked child
 bootstrap and changing retained lifecycle intent are not implemented.
 
 `cargo test --test lifecycle` runs persisted seeded transition schedules.
-`cargo test --test process -- --test-threads=1` creates actual three-process mTLS
+`cargo test --test process -- --test-threads=1` creates actual three- and four-process mTLS
 clusters under unique ignored `artifacts/multi-process-*` roots, retaining configs,
 certificates, databases, input/output and independent data oracles. The fixtures
 also demonstrate complete machine-generated configurations.
@@ -240,7 +299,7 @@ stdin only. `block` takes `group` and a list of peer IDs; restarting clears it.
 `arm_crash` takes `group` and `after` and exits the process with code 86 at the
 next applied atomic save. Neither removes artifacts.
 
-Membership moves, protected task authority/budget/approval/receipt integration,
+General online ownership movement, protected task authority/budget/approval/receipt integration,
 general distributed SQL, catalog partitioning, CDC delivery/retention, dynamic
 placement and production/cloud/performance
 qualification remain unavailable. Local tests imply no scaling or physical-time

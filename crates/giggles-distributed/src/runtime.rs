@@ -44,6 +44,9 @@ pub struct Config {
 type Answer = oneshot::Sender<std::result::Result<Observation, String>>;
 enum Input {
     Inspect(Answer),
+    MembershipBegin(giggles_membership::Intent, Answer),
+    MembershipChange(giggles_membership::Change, Answer),
+    MembershipReady(u64, giggles_membership::Readiness, Answer),
     Peer(transport::Event),
     Tick,
     Propose(Box<Command>, Answer),
@@ -58,6 +61,7 @@ enum Input {
 pub struct Handle {
     tx: mpsc::Sender<Input>,
     stop: Arc<AtomicBool>,
+    peer: transport::Configuration,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Observation {
@@ -68,6 +72,9 @@ pub struct Observation {
     pub applied: u64,
     pub machine: Machine,
     pub reply: Option<ReplyValue>,
+    pub membership: giggles_membership::Membership,
+    pub term: u64,
+    pub snapshot_index: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplyValue {
@@ -92,6 +99,71 @@ impl Handle {
             .await
             .map_err(|_| "indeterminate timeout; inspect/resume, never rollback")??
             .map_err(Into::into)
+    }
+    pub async fn membership_begin(
+        &self,
+        intent: giggles_membership::Intent,
+    ) -> Result<Observation> {
+        let observed = self.ask(|tx| Input::MembershipBegin(intent, tx)).await?;
+        if observed.reply.as_ref().is_some_and(|r| r.code != 0) {
+            return Err("membership begin rejected at apply".into());
+        }
+        Ok(observed)
+    }
+    /// One resumable durable stage. No owner-supplied readiness is accepted.
+    pub async fn membership_resume(&self, id: u64) -> Result<Observation> {
+        use giggles_membership::{Phase, Step};
+        let current = self.current().await?;
+        let progress = current
+            .membership
+            .receipts
+            .get(&id)
+            .ok_or("unknown intent")?;
+        let step = match progress.phase {
+            Phase::Complete => return Ok(current),
+            Phase::Planned => Step::AddLearner,
+            Phase::Joint => Step::LeaveJoint,
+            Phase::CatchingUp
+                if progress
+                    .readiness
+                    .as_ref()
+                    .is_some_and(|r| r.term == current.term) =>
+            {
+                Step::EnterJoint
+            }
+            Phase::CatchingUp => {
+                // Capture a current-term authenticated applied proof as its own
+                // durable stage. A later retry publishes the joint configuration.
+                let to = progress.intent.learner;
+                let probe = transport::Probe {
+                    intent: id,
+                    epoch: progress.intent.epoch,
+                    term: current.term,
+                    barrier: current.applied,
+                };
+                let r = transport::probe(&self.peer, to, probe.clone()).await?;
+                if r.intent != probe.intent
+                    || r.epoch != probe.epoch
+                    || r.term != probe.term
+                    || r.barrier != probe.barrier
+                    || r.durable_applied != probe.barrier
+                {
+                    return Err("learner response binding".into());
+                }
+                let ready = self.ask(|tx| Input::MembershipReady(to, r, tx)).await?;
+                if ready.reply.as_ref().is_some_and(|r| r.code != 0) {
+                    return Err("readiness rejected".into());
+                }
+                return Ok(ready);
+            }
+        };
+        let change = giggles_membership::Change {
+            identity: current.membership.identity,
+            intent: id,
+            epoch: progress.intent.epoch,
+            step,
+        };
+        self.ask(|tx| Input::MembershipChange(change, tx)).await
     }
     pub async fn propose(&self, c: Command) -> Result<Observation> {
         self.ask(|tx| Input::Propose(Box::new(c), tx)).await
@@ -128,6 +200,9 @@ fn observation(node: &Node, reply: Option<Reply>) -> Result<Observation> {
         applied: node.store.applied()?,
         machine: node.store.image()?,
         reply: reply.map(Into::into),
+        membership: node.store.membership()?,
+        term: node.store.state()?.hard()?.term,
+        snapshot_index: node.store.state()?.snap()?.get_metadata().index,
     })
 }
 fn complete(
@@ -160,6 +235,10 @@ fn complete(
     }
     for (context, _) in out.reads {
         if let Some(tx) = reads.remove(&context) {
+            if !node.is_leader() {
+                let _ = tx.send(Err("current read lost active leader authority".into()));
+                continue;
+            }
             let _ = tx.send(
                 observation(node, None)
                     .map(|mut o| {
@@ -404,6 +483,13 @@ impl Runtime {
                     g.initial.build(config.domain, g.peer.group)?,
                 )?
             };
+            store.provision(
+                g.peer
+                    .peers
+                    .iter()
+                    .map(|(id, p)| (*id, p.fingerprint.clone()))
+                    .collect(),
+            )?;
             let mut node = Node::new(store)?;
             let stop = Arc::new(AtomicBool::new(false));
             let actor_stop = stop.clone();
@@ -461,6 +547,65 @@ impl Runtime {
                     }
                     let result = (|| -> Result<()> {
                         match event {
+                            Input::MembershipBegin(_, tx)
+                            | Input::MembershipChange(_, tx)
+                            | Input::MembershipReady(_, _, tx)
+                                if pending.len() + reads.len() >= 32 =>
+                            {
+                                let _ = tx.send(Err("pending admission full".into()));
+                            }
+                            Input::MembershipBegin(intent, tx) => {
+                                serial = serial.checked_add(1).ok_or("context exhausted")?;
+                                let mut context = incarnation.to_vec();
+                                context.extend(serial.to_be_bytes());
+                                match node.membership_begin(context.clone(), intent) {
+                                    Ok(()) => {
+                                        pending.insert(context, tx);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e.to_string()));
+                                    }
+                                }
+                            }
+                            Input::MembershipChange(step, tx) => {
+                                serial = serial.checked_add(1).ok_or("context exhausted")?;
+                                let mut context = incarnation.to_vec();
+                                context.extend(serial.to_be_bytes());
+                                match node.membership_change(context.clone(), step) {
+                                    Ok(true) => {
+                                        pending.insert(context, tx);
+                                    }
+                                    Ok(false) => {
+                                        let _ = tx.send(
+                                            observation(&node, None).map_err(|e| e.to_string()),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e.to_string()));
+                                    }
+                                }
+                            }
+                            Input::MembershipReady(from, r, tx) => {
+                                serial = serial.checked_add(1).ok_or("context exhausted")?;
+                                let mut context = incarnation.to_vec();
+                                context.extend(serial.to_be_bytes());
+                                match node.accept_readiness(context.clone(), from, r) {
+                                    Ok(()) => {
+                                        pending.insert(context, tx);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e.to_string()));
+                                    }
+                                }
+                            }
+                            Input::Peer(transport::Event::Probe(from, probe, tx)) => {
+                                let r = if blocked.contains(&from) {
+                                    Err("peer partition".into())
+                                } else {
+                                    node.durable_probe(from, &probe).map_err(|e| e.to_string())
+                                };
+                                let _ = tx.send(r);
+                            }
                             Input::Inspect(tx) => {
                                 let _ =
                                     tx.send(observation(&node, None).map_err(|e| e.to_string()));
@@ -575,7 +720,14 @@ impl Runtime {
                     }
                 }
             });
-            runtime.groups.insert(g.peer.group, Handle { tx, stop });
+            runtime.groups.insert(
+                g.peer.group,
+                Handle {
+                    tx,
+                    stop,
+                    peer: g.peer.clone(),
+                },
+            );
         }
         Ok(runtime)
     }

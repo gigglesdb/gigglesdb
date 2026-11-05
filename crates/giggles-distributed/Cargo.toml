@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+giggles-membership = { path = "../giggles-membership" }
 giggles-core = { path = "../giggles-core" }
 giggles-transactions = { path = "../giggles-transactions" }
 raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }

@@ -957,6 +957,9 @@ struct Processes {
 }
 impl Processes {
     fn new() -> Self {
+        Self::with_members(3)
+    }
+    fn with_members(count: u64) -> Self {
         let root = fresh("multi-process");
         // Hash compiled source bytes, not mutable working files at test time.
         // Every failed schedule retains the exact implementation/test identity.
@@ -1000,7 +1003,7 @@ impl Processes {
         let ca = cp.self_signed(&cak).unwrap();
         std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
         let mut leaves = BTreeMap::new();
-        for id in VOTERS {
+        for id in 1..=count {
             let mut p = CertificateParams::new(vec!["localhost".into()]).unwrap();
             p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
             p.extended_key_usages = vec![
@@ -1018,7 +1021,7 @@ impl Processes {
         let mut listeners = Vec::new();
         for group in 1..=4 {
             let mut peers = BTreeMap::new();
-            for id in VOTERS {
+            for id in 1..=count {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 peers.insert(
                     id,
@@ -1029,7 +1032,7 @@ impl Processes {
                 );
                 listeners.push(listener);
             }
-            for id in VOTERS {
+            for id in 1..=count {
                 per_node.entry(id).or_default().push(GroupConfig {
                     initial: match group {
                         1 => Initial::Directory(descriptor()),
@@ -1076,7 +1079,7 @@ impl Processes {
     }
     fn start(&mut self) {
         self.round += 1;
-        for id in VOTERS {
+        for id in self.configs.keys().copied().collect::<Vec<_>>() {
             self.nodes.insert(
                 id,
                 Running::start(&self.configs[&id], &self.root, id, self.round),
@@ -1091,7 +1094,7 @@ impl Processes {
     fn leader(&mut self, group: u64) -> u64 {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            for id in VOTERS {
+            for id in self.configs.keys().copied().collect::<Vec<_>>() {
                 let v = self
                     .nodes
                     .get_mut(&id)
@@ -1668,4 +1671,539 @@ fn restart_never_reuses_log_context_for_a_different_pending_attempt() {
         serde_json::to_vec(&contexts).unwrap(),
     )
     .unwrap();
+}
+
+impl Processes {
+    fn member_current(&mut self, group: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let r = self.owner(group, json!({"command":"current","group":group}));
+            if r["ok"] == true {
+                return r;
+            }
+            assert!(Instant::now() < deadline, "current after election: {r}");
+        }
+    }
+    fn member(&mut self, group: u64, id: u64) -> Value {
+        self.owner(
+            group,
+            json!({"command":"membership_resume","group":group,"id":id}),
+        )
+    }
+    fn member_until(&mut self, group: u64, id: u64, phase: &str, ready: bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let current = self.owner(group, json!({"command":"current","group":group}));
+            if current["ok"] == true {
+                let m: giggles_membership::Membership =
+                    serde_json::from_value(current["data"]["membership"].clone()).unwrap();
+                let p = &m.receipts[&id];
+                if format!("{:?}", p.phase) == phase && (!ready || p.readiness.is_some()) {
+                    return current;
+                }
+            }
+            let result = self.member(group, id);
+            assert!(
+                Instant::now() < deadline,
+                "membership timeout {phase}: {result}; artifacts {}",
+                self.root.display()
+            );
+        }
+    }
+    fn block_group(&mut self, group: u64, partitions: &[(u64, Vec<u64>)]) {
+        for (id, peers) in partitions {
+            let r = self
+                .nodes
+                .get_mut(id)
+                .unwrap()
+                .request(json!({"command":"block","group":group,"peers":peers}));
+            assert_eq!(r["ok"], true, "{r}");
+        }
+    }
+    fn restart_unaligned(&mut self) {
+        self.nodes = BTreeMap::new();
+        self.round += 1;
+        for id in self.configs.keys().copied().collect::<Vec<_>>() {
+            self.nodes.insert(
+                id,
+                Running::start(&self.configs[&id], &self.root, id, self.round),
+            );
+        }
+    }
+}
+
+#[test]
+fn real_four_process_membership_full_transaction_snapshot_tail_joint_restart_removed_leader() {
+    let mut p = Processes::with_members(4);
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let plan = transaction_plan(26001);
+    let committed = p.request(json!({"command":"transact","plan":plan,"outcome":"Commit"}));
+    assert_eq!(committed["ok"], true, "{committed}");
+    p.block_group(
+        3,
+        &[(1, vec![4]), (2, vec![4]), (3, vec![4]), (4, vec![1, 2, 3])],
+    );
+    let intent = giggles_membership::Intent {
+        id: 2601,
+        epoch: 1,
+        learner: 4,
+        remove: 1,
+    };
+    let begin = p.request(json!({"command":"membership_begin","group":3,"intent":intent}));
+    assert_eq!(begin["ok"], true, "{begin}");
+    let duplicate = p.request(json!({"command":"membership_begin","group":3,"intent":intent}));
+    assert_eq!(duplicate["ok"], true, "{duplicate}");
+    let mut conflict = intent.clone();
+    conflict.remove = 2;
+    let refused = p.request(json!({"command":"membership_begin","group":3,"intent":conflict}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    p.member_until(3, intent.id, "CatchingUp", false);
+    let checkpoint = p.request(json!({"command":"checkpoint","group":3}));
+    assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+    p.apply(3, put(plan.home.clone(), 2602, key(2), None));
+    let refused = p.member(3, intent.id);
+    assert_eq!(
+        refused["ok"], false,
+        "partition cannot assert durable readiness: {refused}"
+    );
+    p.block_group(3, &[(1, vec![]), (2, vec![]), (3, vec![]), (4, vec![])]);
+    let ready = p.member_until(3, intent.id, "CatchingUp", true);
+    let learner = p
+        .nodes
+        .get_mut(&4)
+        .unwrap()
+        .request(json!({"command":"inspect","group":3}));
+    assert_eq!(learner["ok"], true, "{learner}");
+    assert_eq!(
+        learner["data"]["snapshot_index"], checkpoint["data"]["applied"],
+        "learner must install the checkpoint, then actual row tail"
+    );
+    assert!(
+        learner["data"]["applied"].as_u64().unwrap()
+            > learner["data"]["snapshot_index"].as_u64().unwrap()
+    );
+    let machine: Machine = serde_json::from_value(learner["data"]["machine"].clone()).unwrap();
+    let Machine::Range { data, .. } = machine else {
+        panic!()
+    };
+    assert_eq!(data.image.snapshot().unwrap().rows.len(), 2);
+    assert_eq!(data.transactions.record(plan.id()).unwrap().plan, plan);
+    assert_eq!(data.descriptor, plan.home);
+    assert!(learner["data"]["applied"].as_u64().unwrap() >= ready["data"]["membership"]["receipts"][intent.id.to_string()]["readiness"]["barrier"].as_u64().unwrap_or(0));
+    p.member_until(3, intent.id, "Joint", false);
+    p.restart_unaligned();
+    let joint = p.member_current(3);
+    let m: giggles_membership::Membership =
+        serde_json::from_value(joint["data"]["membership"].clone()).unwrap();
+    assert_eq!(
+        m.progress().unwrap().phase,
+        giggles_membership::Phase::Joint
+    );
+    p.member_until(3, intent.id, "Complete", false);
+    // A published split can be resumed after an already-active child replaces
+    // a voter; replaying activation must not reset its configuration or homes.
+    let activation=p.owner(3,json!({"command":"apply","group":3,"action":Action::Activate{proof:data.provenance.clone().unwrap(),revision:2}}));
+    assert_eq!(
+        activation["ok"], true,
+        "activation recovery replay: {activation}"
+    );
+    let leader = p.leader(3);
+    assert_ne!(leader, 1);
+    for command in ["current", "campaign"] {
+        let refused = p
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .request(json!({"command":command,"group":3}));
+        if command == "current" {
+            assert_eq!(refused["ok"], false, "removed current authority: {refused}");
+        }
+    }
+    let refused = p.nodes.get_mut(&1).unwrap().request(
+        json!({"command":"apply","group":3,"action":put(plan.home.clone(),2603,key(3),None)}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    let status = p.owner(
+        3,
+        json!({"command":"tx_status","home":plan.home,"id":plan.id()}),
+    );
+    assert_eq!(status["ok"], true, "{status}");
+    let retry = p.owner(3,json!({"command":"tx_step","request":transaction::Request{route:plan.home.clone(),step:transaction::Step::Open(plan.clone()),evidence:vec![]}}));
+    assert_eq!(retry["ok"], true, "{retry}");
+    let checkpoint = p.owner(3, json!({"command":"checkpoint","group":3}));
+    assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+    p.restart_unaligned();
+    let after = p.member_current(3);
+    let machine: Machine = serde_json::from_value(after["data"]["machine"].clone()).unwrap();
+    let Machine::Range { data, .. } = machine else {
+        panic!()
+    };
+    assert_eq!(data.image.snapshot().unwrap().rows.len(), 2);
+    assert_eq!(data.transactions.record(plan.id()).unwrap().plan, plan);
+    assert_eq!(data.descriptor, plan.home);
+    let m: giggles_membership::Membership =
+        serde_json::from_value(after["data"]["membership"].clone()).unwrap();
+    assert_eq!(m.voters, vec![2, 3, 4]);
+    assert_eq!(m.epoch, 2);
+    let replay = p.member(3, intent.id);
+    assert_eq!(replay["ok"], true, "{replay}");
+    let replay = p.owner(
+        3,
+        json!({"command":"membership_begin","group":3,"intent":intent}),
+    );
+    assert_eq!(
+        replay["ok"], true,
+        "lost reply exact intent retry: {replay}"
+    );
+}
+
+#[test]
+fn real_four_process_joint_requires_both_majorities_and_exact_retry_after_partition() {
+    let mut p = Processes::with_members(4);
+    let intent = giggles_membership::Intent {
+        id: 2610,
+        epoch: 1,
+        learner: 4,
+        remove: 1,
+    };
+    let begin = p.request(json!({"command":"membership_begin","group":2,"intent":intent}));
+    assert_eq!(begin["ok"], true, "{begin}");
+    p.member_until(2, intent.id, "Joint", false);
+    p.block_group(
+        2,
+        &[
+            (1, vec![3, 4]),
+            (2, vec![3, 4]),
+            (3, vec![1, 2]),
+            (4, vec![1, 2]),
+        ],
+    );
+    let attempted =
+        p.nodes.get_mut(&1).unwrap().request(
+            json!({"command":"apply","group":2,"action":put(descriptor(),2611,key(1),None)}),
+        );
+    assert_eq!(
+        attempted["ok"], false,
+        "old majority alone cannot commit: {attempted}"
+    );
+    for id in 1..=4 {
+        let read = p
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .request(json!({"command":"current","group":2}));
+        assert_eq!(read["ok"], false, "no partition has dual majority: {read}");
+    }
+    p.block_group(2, &[(1, vec![]), (2, vec![]), (3, vec![]), (4, vec![])]);
+    let retry = p.owner(
+        2,
+        json!({"command":"apply","group":2,"action":put(descriptor(),2611,key(1),None)}),
+    );
+    assert_eq!(retry["ok"], true, "{retry}");
+    p.member_until(2, intent.id, "Complete", false);
+    let current = p.member_current(2);
+    let Machine::Range { data, .. } =
+        serde_json::from_value(current["data"]["machine"].clone()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(data.image.snapshot().unwrap().rows.len(), 1);
+    assert_eq!(data.image.snapshot().unwrap().rows[&key(1)].version, 0);
+}
+
+#[test]
+fn real_four_process_each_configuration_publication_crash_before_after_and_recovery() {
+    for stage in 0..3 {
+        for after in [false, true] {
+            let mut p = Processes::with_members(4);
+            let id = 2620 + stage;
+            let intent = giggles_membership::Intent {
+                id,
+                epoch: 1,
+                learner: 4,
+                remove: 1,
+            };
+            p.apply(2, put(descriptor(), 1, key(1), None));
+            let begin = p.request(json!({"command":"membership_begin","group":2,"intent":intent}));
+            assert_eq!(begin["ok"], true, "{begin}");
+            let phase = match stage {
+                0 => "Planned",
+                1 => "CatchingUp",
+                _ => "Joint",
+            };
+            p.member_until(2, id, phase, stage == 1);
+            // Ensure follower2 has exactly the pre-publication controller before
+            // arming its next applied frontier. No unrelated data is proposed.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let r = p
+                    .nodes
+                    .get_mut(&2)
+                    .unwrap()
+                    .request(json!({"command":"inspect","group":2}));
+                let m: giggles_membership::Membership =
+                    serde_json::from_value(r["data"]["membership"].clone()).unwrap();
+                if m.receipts.get(&id).is_some_and(|r| {
+                    format!("{:?}", r.phase) == phase && (stage != 1 || r.readiness.is_some())
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "follower pre-barrier {r}");
+            }
+            let armed = p
+                .nodes
+                .get_mut(&2)
+                .unwrap()
+                .request(json!({"command":"arm_crash","group":2,"after":after}));
+            assert_eq!(armed["ok"], true, "{armed}");
+            let _ = p.member(2, id);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(exit) = p.nodes.get_mut(&2).unwrap().child.try_wait().unwrap() {
+                    assert_eq!(exit.code(), Some(86));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "follower failed to reach config crash stage{stage} after{after}"
+                );
+                std::thread::yield_now();
+            }
+            p.nodes.remove(&2); // Drop only this fixture's crashed process handle.
+            p.round += 1;
+            p.nodes
+                .insert(2, Running::start(&p.configs[&2], &p.root, 2, p.round));
+            p.member_until(2, id, "Complete", false);
+            let current = p.member_current(2);
+            let Machine::Range { data, .. } =
+                serde_json::from_value(current["data"]["machine"].clone()).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(data.image.snapshot().unwrap().rows[&key(1)].version, 0);
+            p.restart_unaligned();
+            let current = p.member_current(2);
+            let m: giggles_membership::Membership =
+                serde_json::from_value(current["data"]["membership"].clone()).unwrap();
+            assert_eq!(m.voters, vec![2, 3, 4]);
+        }
+    }
+}
+
+#[test]
+fn real_four_process_prepared_home_and_participant_recover_after_replacement() {
+    use giggles_transactions::Outcome;
+    let mut p = Processes::with_members(4);
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let plan = transaction_plan(26301);
+    p.tx_begin_all(&plan);
+    p.tx_prepare_all(&plan);
+    p.block_group(
+        3,
+        &[(1, vec![4]), (2, vec![4]), (3, vec![4]), (4, vec![1, 2, 3])],
+    );
+    let intent = giggles_membership::Intent {
+        id: 2630,
+        epoch: 1,
+        learner: 4,
+        remove: 1,
+    };
+    let begin = p.owner(
+        3,
+        json!({"command":"membership_begin","group":3,"intent":intent}),
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    p.member_until(3, intent.id, "CatchingUp", false);
+    let checkpoint = p.owner(3, json!({"command":"checkpoint","group":3}));
+    assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+    p.block_group(3, &[(1, vec![]), (2, vec![]), (3, vec![]), (4, vec![])]);
+    p.member_until(3, intent.id, "Complete", false);
+    p.restart_unaligned();
+    p.member_current(3);
+    let pinned = p.pin(&plan.home, plan.id());
+    assert_eq!(
+        pinned
+            .state
+            .engine(42, &plan.home)
+            .unwrap()
+            .phase(plan.id()),
+        Some(giggles_transactions::Phase::Prepared)
+    );
+    p.tx_finish_all(&plan, Outcome::Commit);
+    for part in &plan.participants {
+        let pinned = p.pin(&part.route, plan.id());
+        assert_eq!(
+            pinned
+                .state
+                .engine(42, &part.route)
+                .unwrap()
+                .phase(plan.id()),
+            Some(giggles_transactions::Phase::Committed)
+        );
+        let current = p.member_current(part.route.group);
+        let Machine::Range { data, .. } =
+            serde_json::from_value(current["data"]["machine"].clone()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            data.image
+                .snapshot()
+                .unwrap()
+                .rows
+                .values()
+                .next()
+                .unwrap()
+                .attempt_count,
+            if part.route.group == 3 { 10 } else { 20 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_four_process_probe_rejects_wrong_certificate_group_term_intent_and_forged_owner_readiness()
+ {
+    let mut p = Processes::with_members(4);
+    let intent = giggles_membership::Intent {
+        id: 2640,
+        epoch: 1,
+        learner: 4,
+        remove: 1,
+    };
+    let r = p.request(json!({"command":"membership_begin","group":2,"intent":intent}));
+    assert_eq!(r["ok"], true, "{r}");
+    let catching = p.member_until(2, intent.id, "CatchingUp", false);
+    let barrier = catching["data"]["applied"].as_u64().unwrap();
+    let term = catching["data"]["term"].as_u64().unwrap();
+    let config: Config = serde_json::from_slice(&std::fs::read(&p.configs[&4]).unwrap()).unwrap();
+    let target = &config
+        .groups
+        .iter()
+        .find(|g| g.peer.group == 2)
+        .unwrap()
+        .peer
+        .listen;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let o = p
+            .nodes
+            .get_mut(&4)
+            .unwrap()
+            .request(json!({"command":"inspect","group":2}));
+        if o["data"]["applied"].as_u64().unwrap() >= barrier {
+            break;
+        }
+        assert!(Instant::now() < deadline, "learner application {o}");
+    }
+    for mode in 0..6 {
+        let certificate = if mode == 0 { 2 } else { 1 };
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(
+            std::fs::File::open(p.root.join("ca.pem")).unwrap(),
+        )) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let chain = rustls_pemfile::certs(&mut BufReader::new(
+            std::fs::File::open(p.root.join(format!("{certificate}.pem"))).unwrap(),
+        ))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(
+            std::fs::File::open(p.root.join(format!("{certificate}.key.pem"))).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+        let tcp = tokio::net::TcpStream::connect(target).await.unwrap();
+        let mut tls = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        let request = json!({"domain":if mode==1{43}else{42},"group":if mode==2{3}else{2},"to":4,"probe":{"intent":if mode==3{2641}else{2640},"epoch":1,"term":if mode==4{term+1}else{term},"barrier":if mode==5{barrier+10000}else{barrier}}});
+        let mut bytes = b"GDRPRO01".to_vec();
+        bytes.extend(serde_json::to_vec(&request).unwrap());
+        transport::write_frame(&mut tls, &bytes).await.unwrap();
+        let response = transport::read_frame(&mut tls).await;
+        if mode == 1 || mode == 2 {
+            assert!(response.is_err());
+        } else {
+            let response: std::result::Result<giggles_membership::Readiness, String> =
+                serde_json::from_slice(&response.unwrap()).unwrap();
+            assert!(response.is_err(), "mode{mode}: {response:?}");
+        }
+    }
+    let forged=p.request(json!({"command":"membership_ready","group":2,"intent":intent.id,"durable_applied":barrier,"term":term}));
+    assert_eq!(
+        forged["ok"], false,
+        "owner cannot assert remote durability {forged}"
+    );
+    let current = p.member_current(2);
+    let m: giggles_membership::Membership =
+        serde_json::from_value(current["data"]["membership"].clone()).unwrap();
+    assert!(m.progress().unwrap().readiness.is_none());
+    p.member_until(2, intent.id, "Complete", false);
+}
+
+#[test]
+fn real_four_process_leader_crashes_before_after_each_configuration_publication() {
+    for stage in 0..3 {
+        for after in [false, true] {
+            let mut p = Processes::with_members(4);
+            let id = 2650 + stage;
+            let intent = giggles_membership::Intent {
+                id,
+                epoch: 1,
+                learner: 4,
+                remove: 1,
+            };
+            p.apply(2, put(descriptor(), 1, key(1), None));
+            let r = p.request(json!({"command":"membership_begin","group":2,"intent":intent}));
+            assert_eq!(r["ok"], true, "{r}");
+            p.member_until(
+                2,
+                id,
+                match stage {
+                    0 => "Planned",
+                    1 => "CatchingUp",
+                    _ => "Joint",
+                },
+                stage == 1,
+            );
+            // Colocated initial leader remains1; a single resume now publishes
+            // exactly the requested configuration, with no readiness write.
+            assert_eq!(p.leader(2), 1);
+            let arm = p.request(json!({"command":"arm_crash","group":2,"after":after}));
+            assert_eq!(arm["ok"], true, "{arm}");
+            p.nodes
+                .get_mut(&1)
+                .unwrap()
+                .send(json!({"command":"membership_resume","group":2,"id":id}));
+            let status = p.nodes.get_mut(&1).unwrap().child.wait().unwrap();
+            assert_eq!(status.code(), Some(86));
+            p.nodes.remove(&1);
+            p.round += 1;
+            p.nodes
+                .insert(1, Running::start(&p.configs[&1], &p.root, 1, p.round));
+            p.member_until(2, id, "Complete", false);
+            let current = p.member_current(2);
+            let Machine::Range { data, .. } =
+                serde_json::from_value(current["data"]["machine"].clone()).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(data.image.snapshot().unwrap().rows[&key(1)].version, 0);
+            let m: giggles_membership::Membership =
+                serde_json::from_value(current["data"]["membership"].clone()).unwrap();
+            assert_eq!(m.voters, vec![2, 3, 4]);
+        }
+    }
 }

@@ -213,6 +213,7 @@ dependencies = [
  "bincode",
  "giggles-core",
  "giggles-history",
+ "giggles-membership",
  "giggles-transactions",
  "hex",
  "protobuf",
@@ -235,6 +236,19 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "giggles-membership"
+version = "0.1.0"
+dependencies = [
+ "protobuf",
+ "raft",
+ "redb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slog",
 ]
 
 [[package]]

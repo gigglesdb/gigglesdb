@@ -26,11 +26,14 @@ fn corrupt() -> raft::Error {
     raft::Error::Store(StorageError::Other("invalid durable state".into()))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct State {
     pub domain: u128,
     pub node: u64,
     pub group: u64,
+    pub membership: giggles_membership::Membership,
+    pub conf: Vec<u8>,
+    pub roster: BTreeMap<u64, String>,
     pub hard: Vec<u8>,
     pub log: BTreeMap<u64, Vec<u8>>,
     pub snapshot: Vec<u8>,
@@ -43,7 +46,8 @@ struct SnapshotBody {
     version: u32,
     domain: u128,
     group: u64,
-    voters: Vec<u64>,
+    membership: giggles_membership::Membership,
+    roster: BTreeMap<u64, String>,
     index: u64,
     term: u64,
     image: Image,
@@ -74,6 +78,9 @@ fn conf() -> ConfState {
 }
 
 impl State {
+    pub fn conf(&self) -> Result<ConfState> {
+        Ok(ConfState::parse_from_bytes(&self.conf)?)
+    }
     pub fn hard(&self) -> Result<HardState> {
         Ok(HardState::parse_from_bytes(&self.hard)?)
     }
@@ -84,13 +91,14 @@ impl State {
         let mut s = Snapshot::default();
         s.mut_metadata().index = self.applied;
         s.mut_metadata().term = self.applied_term;
-        s.mut_metadata().set_conf_state(conf());
+        s.mut_metadata().set_conf_state(self.conf()?);
         s.set_data(
             pack(&SnapshotBody {
-                version: 2,
+                version: 3,
                 domain: self.domain,
                 group: self.group,
-                voters: VOTERS.to_vec(),
+                membership: self.membership.clone(),
+                roster: self.roster.clone(),
                 index: self.applied,
                 term: self.applied_term,
                 image: self.image.clone(),
@@ -99,22 +107,33 @@ impl State {
         );
         Ok(s)
     }
-    pub fn validate_snapshot(&self, s: &Snapshot) -> Result<Image> {
+    fn snapshot_body(&self, s: &Snapshot) -> Result<SnapshotBody> {
         let m = s.get_metadata();
         let b: SnapshotBody = unpack(s.get_data())?;
-        if b.version != 2
+        if b.version != 3
             || b.domain != self.domain
             || b.group != self.group
-            || b.voters != VOTERS
-            || m.get_conf_state() != &conf()
+            || b.roster != self.roster
+            || !giggles_membership::durable::equal_conf(
+                m.get_conf_state(),
+                &giggles_membership::durable::expected_conf(&b.membership)?,
+            )
             || b.index != m.index
             || b.term != m.term
             || b.index == 0
             || b.term == 0
             || b.index < self.applied
-            || (b.index == self.applied && (b.term != self.applied_term || b.image != self.image))
+            || (self.applied > 0 && b.membership.epoch < self.membership.epoch)
+            || (b.index == self.applied
+                && (b.term != self.applied_term
+                    || b.image != self.image
+                    || b.membership != self.membership))
         {
             return Err("snapshot identity/membership/index/term".into());
+        }
+        b.membership.validate(b.index)?;
+        if b.membership.identity.group != self.group || b.membership.identity.owner_epoch != 1 {
+            return Err("snapshot membership identity".into());
         }
         let image = b.image.clone();
         image.validate(self.domain, self.group)?;
@@ -128,11 +147,16 @@ impl State {
         {
             return Err("snapshot conflicts with committed log".into());
         }
-        Ok(image)
+        Ok(b)
+    }
+    pub fn validate_snapshot(&self, s: &Snapshot) -> Result<Image> {
+        Ok(self.snapshot_body(s)?.image)
     }
     pub fn install(&mut self, s: &Snapshot) -> Result<()> {
-        let image = self.validate_snapshot(s)?;
-        self.image = image;
+        let b = self.snapshot_body(s)?;
+        self.image = b.image;
+        self.membership = b.membership;
+        self.conf = s.get_metadata().get_conf_state().write_to_bytes()?;
         self.applied = s.get_metadata().index;
         self.applied_term = s.get_metadata().term;
         self.snapshot = s.write_to_bytes()?;
@@ -143,10 +167,32 @@ impl State {
         Ok(())
     }
     fn validate(&self) -> Result<()> {
-        if !VOTERS.contains(&self.node) || self.image.domain()? != self.domain {
+        if self.node == 0 || self.image.domain()? != self.domain {
             return Err("store identity".into());
         }
         self.image.validate(self.domain, self.group)?;
+        self.membership.validate(self.applied)?;
+        if self.membership.identity.group != self.group
+            || !giggles_membership::durable::equal_conf(
+                &self.conf()?,
+                &giggles_membership::durable::expected_conf(&self.membership)?,
+            )
+        {
+            return Err("atomic membership/configuration mismatch".into());
+        }
+        if self.roster.len() > 31
+            || (!self.roster.is_empty()
+                && (!self.roster.contains_key(&self.node)
+                    || self
+                        .conf()?
+                        .voters
+                        .iter()
+                        .chain(self.conf()?.voters_outgoing.iter())
+                        .chain(self.conf()?.learners.iter())
+                        .any(|id| !self.roster.contains_key(id))))
+        {
+            return Err("persisted roster coverage".into());
+        }
         let h = self.hard()?;
         let snap = self.snap()?;
         let base = snap.get_metadata().index;
@@ -215,7 +261,7 @@ impl Store {
         group: u64,
         image: Image,
     ) -> Result<Self> {
-        if !VOTERS.contains(&node) {
+        if node == 0 {
             return Err("unsupported member".into());
         }
         let file = OpenOptions::new()
@@ -230,6 +276,16 @@ impl Store {
             domain,
             node,
             group,
+            membership: giggles_membership::Membership::new(
+                giggles_membership::Identity {
+                    group,
+                    owner_epoch: 1,
+                },
+                VOTERS.to_vec(),
+                64,
+            )?,
+            conf: conf().write_to_bytes()?,
+            roster: BTreeMap::new(),
             hard: HardState::default().write_to_bytes()?,
             log: BTreeMap::new(),
             snapshot: Snapshot::default().write_to_bytes()?,
@@ -272,6 +328,22 @@ impl Store {
             save_fault: None,
         }))))
     }
+    /// Bind a trusted provisioned roster once. Restart may never rebind identities.
+    pub fn provision(&self, roster: BTreeMap<u64, String>) -> Result<()> {
+        self.update(|s| {
+            if !s.roster.is_empty() && s.roster != roster {
+                return Err("restart roster identity mismatch".into());
+            }
+            s.roster = roster;
+            Ok(())
+        })
+    }
+    pub fn membership(&self) -> Result<giggles_membership::Membership> {
+        Ok(self.state()?.membership)
+    }
+    pub fn configuration(&self) -> Result<ConfState> {
+        self.state()?.conf()
+    }
     pub(crate) fn state(&self) -> Result<State> {
         let g = self.0.lock().map_err(|_| "poison")?;
         if g.fenced {
@@ -286,6 +358,16 @@ impl Store {
             domain,
             node,
             group,
+            membership: giggles_membership::Membership::new(
+                giggles_membership::Identity {
+                    group,
+                    owner_epoch: 1,
+                },
+                VOTERS.to_vec(),
+                64,
+            )?,
+            conf: conf().write_to_bytes()?,
+            roster: BTreeMap::new(),
             hard: HardState::default().write_to_bytes()?,
             log: BTreeMap::new(),
             snapshot: Snapshot::default().write_to_bytes()?,
@@ -402,7 +484,10 @@ impl Store {
 impl Storage for Store {
     fn initial_state(&self) -> raft::Result<RaftState> {
         let s = self.state().map_err(|_| corrupt())?;
-        Ok(RaftState::new(s.hard().map_err(|_| corrupt())?, conf()))
+        Ok(RaftState::new(
+            s.hard().map_err(|_| corrupt())?,
+            s.conf().map_err(|_| corrupt())?,
+        ))
     }
     fn entries(
         &self,
@@ -466,10 +551,23 @@ impl Storage for Store {
             |(i, _)| *i,
         ))
     }
-    fn snapshot(&self, request: u64, _to: u64) -> raft::Result<Snapshot> {
+    fn snapshot(&self, request: u64, to: u64) -> raft::Result<Snapshot> {
         let s = self.state().map_err(|_| corrupt())?;
         if s.applied < request || s.applied == 0 {
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
+        }
+        // Prefer the checkpoint when it includes this receiver. Its retained
+        // tail then catches the learner up to the live applied frontier. A
+        // pre-learner checkpoint cannot bootstrap a node absent from ConfState.
+        let saved = s.snap().map_err(|_| corrupt())?;
+        let conf = saved.get_metadata().get_conf_state();
+        if !saved.is_empty()
+            && saved.get_metadata().index >= request
+            && (conf.voters.contains(&to)
+                || conf.voters_outgoing.contains(&to)
+                || conf.learners.contains(&to))
+        {
+            return Ok(saved);
         }
         s.snapshot_now().map_err(|_| corrupt())
     }

@@ -1,6 +1,6 @@
-//! Bounded real mTLS peer transport. Certificates bind exact fixed node IDs.
+//! Bounded real mTLS peer transport. Certificates bind provisioned node IDs.
 //! No administrative commands are accepted on this listener.
-use crate::{MAX_FRAME, Result, VOTERS};
+use crate::{MAX_FRAME, Result};
 use protobuf::Message as Pb;
 use raft::eraftpb::Message;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
@@ -33,9 +33,69 @@ pub struct Configuration {
     pub peers: BTreeMap<u64, Peer>,
     pub group: u64,
 }
+const PROBE_MAGIC: &[u8; 8] = b"GDRPRO01";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Probe {
+    pub intent: u64,
+    pub epoch: u64,
+    pub term: u64,
+    pub barrier: u64,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeEnvelope {
+    domain: u128,
+    group: u64,
+    to: u64,
+    probe: Probe,
+}
+/// Internal peer query. Its response is authenticated to the provisioned learner
+/// certificate; the remote actor generates it from durable applied state.
+pub(crate) async fn probe(
+    config: &Configuration,
+    to: u64,
+    probe: Probe,
+) -> Result<giggles_membership::Readiness> {
+    let (_, connector) = config.tls()?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let peer = config.peers.get(&to).ok_or("unprovisioned learner")?;
+        let tcp = TcpStream::connect(&peer.address).await?;
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost")?, tcp)
+            .await?;
+        let cert = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .ok_or("missing learner cert")?;
+        if fingerprint(cert) != peer.fingerprint {
+            return Err("learner certificate binding".into());
+        }
+        let mut bytes = PROBE_MAGIC.to_vec();
+        bytes.extend(serde_json::to_vec(&ProbeEnvelope {
+            domain: config.domain,
+            group: config.group,
+            to,
+            probe,
+        })?);
+        write_frame(&mut tls, &bytes).await?;
+        let response: std::result::Result<giggles_membership::Readiness, String> =
+            serde_json::from_slice(&read_frame(&mut tls).await?)?;
+        response.map_err(Into::into)
+    })
+    .await
+    .map_err(|_| "learner durable probe timeout")?
+}
 pub enum Event {
     Message(u64, Message),
     SnapshotResult(u64, bool),
+    Probe(
+        u64,
+        Probe,
+        tokio::sync::oneshot::Sender<std::result::Result<giggles_membership::Readiness, String>>,
+    ),
 }
 async fn snapshot_result(events: &mpsc::Sender<Event>, to: u64, success: bool) {
     let _ = events.send(Event::SnapshotResult(to, success)).await;
@@ -110,8 +170,13 @@ fn key(p: &PathBuf) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
 }
 impl Configuration {
     pub fn validate(&self) -> Result<()> {
-        if !VOTERS.contains(&self.id) || self.peers.keys().copied().collect::<Vec<_>>() != VOTERS {
-            return Err("fixed three member config required".into());
+        if self.id == 0
+            || !self.peers.contains_key(&self.id)
+            || self.peers.len() > 31
+            || self.peers.len() < 3
+            || self.peers.contains_key(&0)
+        {
+            return Err("bounded trusted roster required".into());
         }
         let mut seen = std::collections::BTreeSet::new();
         for p in self.peers.values() {
@@ -248,6 +313,23 @@ impl Transport {
                             .find_map(|(id, p)| (p.fingerprint == fp).then_some(*id))
                             .ok_or("unbound certificate")?;
                         let b = read_frame(&mut tls).await?;
+                        if b.starts_with(PROBE_MAGIC) {
+                            let request: ProbeEnvelope = serde_json::from_slice(&b[8..])?;
+                            if request.domain != domain
+                                || request.group != group
+                                || request.to != id
+                                || from == id
+                            {
+                                return Err("probe domain/group/node".into());
+                            }
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            events
+                                .try_send(Event::Probe(from, request.probe, tx))
+                                .map_err(|_| "probe admission full")?;
+                            let response = rx.await.map_err(|_| "probe actor closed")?;
+                            write_frame(&mut tls, &serde_json::to_vec(&response)?).await?;
+                            return Ok(());
+                        }
                         let m = decode_message(domain, group, &b)?;
                         if m.from != from || m.to != id || from == id {
                             return Err::<(), Box<dyn std::error::Error + Send + Sync>>(

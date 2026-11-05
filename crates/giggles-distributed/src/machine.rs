@@ -43,7 +43,8 @@ pub struct Descriptor {
     pub epoch: u64,
     pub group: u64,
     pub bounds: Bounds,
-    /// Fixed full-data voter placement, separate from ordering group identity.
+    /// Original ownership placement. Live Raft membership has a separate epoch;
+    /// replacement must not change this descriptor or retained transaction homes.
     pub voters: Vec<u64>,
 }
 impl Descriptor {
