@@ -7,8 +7,8 @@ use std::{
     path::PathBuf,
 };
 pub fn fresh(name: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("artifacts")
+    let p = std::env::temp_dir()
+        .join("giggles-distributed-retained")
         .join(format!(
             "{name}-{}-{}",
             std::process::id(),

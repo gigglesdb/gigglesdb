@@ -8,6 +8,19 @@ use std::io::{BufRead, Read, Write};
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
+    ProtectedPin {
+        group: u64,
+    },
+    ProtectedStep {
+        group: u64,
+        step: Box<protected::Step>,
+    },
+    ProtectedLogicalRecover {
+        nonce: u128,
+    },
+    ProtectedAbort {
+        nonce: u128,
+    },
     MembershipBegin {
         group: u64,
         intent: giggles_membership::Intent,
@@ -125,6 +138,16 @@ async fn main() -> Result<()> {
             let name = name.as_str().ok_or("invalid owner command")?;
             let control: Control = serde_json::from_value(serde_json::json!({name:envelope}))?;
             let value = match control {
+                Control::ProtectedPin { group } => {
+                    serde_json::to_value(runtime.protected_pin(group).await?)?
+                }
+                Control::ProtectedStep { group, step } => {
+                    runtime.protected_step(group, *step).await?
+                }
+                Control::ProtectedLogicalRecover { nonce } => {
+                    runtime.protected_logical_recover(nonce).await?
+                }
+                Control::ProtectedAbort { nonce } => runtime.protected_abort(nonce).await?,
                 Control::MembershipBegin { group, intent } => {
                     serde_json::to_value(runtime.group(group)?.membership_begin(intent).await?)?
                 }

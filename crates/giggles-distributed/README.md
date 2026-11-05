@@ -83,7 +83,7 @@ existing row version. Core assigns version 0 on insertion and increments it on
 replacement; the supplied row version is not authority. Request IDs are retained
 in the data range; repeating the same request/key/payload returns its prior
 version. Preserve the original key and operation when resolving an ambiguous
-response. Use the transaction API below for a durable home-scoped operation identity. Protected task transactions remain unavailable.
+response. Use the transaction API below for a durable home-scoped operation identity. Default physical protected task transactions remain fenced; the separate trusted-owner logical profile is described below.
 
 The controller needs local leadership of each involved group. Contact the
 reported leader for individual typed steps, or colocate leadership using trusted
@@ -304,3 +304,129 @@ general distributed SQL, catalog partitioning, CDC delivery/retention, dynamic
 placement and production/cloud/performance
 qualification remain unavailable. Local tests imply no scaling or physical-time
 guarantee.
+
+
+## Protected authority admission and physical-time fence
+
+The unique protected authority lives in directory Raft group 1, in a row-free
+core image persisted atomically with the directory/home records and applied
+index. Data groups remain authority-free. Owner controls are privileged local
+stdin input; neither pins nor staged material are safe external task responses.
+
+`protected_step { group, step }` accepts typed `Install { image }`, restricted
+`Admin { command }` (JSON bytes for Grant, Revoke, RevokeApproval or resource
+provisioning), `Open(plan)`, `Lock { plan, home }`, `Stage { nonce, rows }`,
+`Abort { nonce }`, `Unlock { plan, home }`, and `Complete { nonce, rows }`.
+`protected_pin { group }` obtains a current quorum snapshot for trusted owner
+routing between independent leaders. Do not construct pins from caller claims.
+
+A plan contains database, nonce, directory revision, task, the core protected
+Intent and the exact complete routes in keyspace order. Open reserves the whole
+authority image. Lock reserves each whole row range, including every gap and
+empty range. Stage needs all row pins in route order and invokes the actual core
+protected evaluator, storing opaque canonical staging bytes at the home without
+changing authority, rows, approvals, budget, receipts or disclosure counters.
+
+`Commit { nonce }` ALWAYS returns an error: the runtime has no trusted apply-time
+clock/pause fence satisfying core's decision freshness contract. A caller time
+interval or pre-proposal wall-clock check is insufficient under delayed Raft
+apply. Use only the explicitly installed trusted-owner logical profile below for
+protected publication; it provides no physical-time expiry. The legacy unit
+TaskWrite action continues to reject. Staging never grants publication permission.
+
+An unknown response retains the original nonce. An explicit Abort records the
+home outcome. Route Unlock using a fresh aborted home pin to every participant,
+including ranges never locked, then Complete with all released row pins. Abort
+tombstones prevent delayed old Lock replay. `protected_abort { nonce }` performs
+this recovery when all relevant groups are led locally. Independently led groups
+use the same owner-routed steps. There is no administrative forwarding or timeout
+rollback. Status is visible in the privileged current home record, not a task API.
+
+At most 8 retained identities per authority/range, 8 complete routes, 16 KiB plan
+and 512 KiB authority or staged body are admitted. There is no garbage collection.
+Whole-image serialization reserves shared generation/capacity by excluding every
+other mutator. Ordinary Put, transaction operations (including strict Observe),
+and lifecycle commands reject while a protected intent is active. Authority
+revoke waits behind physical-profile intents; the logical profile serializes
+revoke before or after its immutable decision. Retained row
+identities conservatively block future splits; membership replacement retains
+complete machine state and logical homes. Directory authority replacement is
+unsupported. No authority ownership migration is provided.
+
+Durable payloads have checksummed `GD44v005` magic; snapshots require version 5.
+Earlier files/snapshots fail closed and are retained. No automatic migration or
+old-reader compatibility is claimed. Logical existing receipts/retries remain in
+the current machine representation. New test fixtures are retained beneath the
+system temporary directory and are never automatically removed.
+
+
+For row Lock/Unlock, project the root current pin with
+`protected::Pin::for_home(nonce)`: `HomePin` carries only database/applied,
+immutable plan, opened/aborted indices, commit/finalization and release flags. No grant, approval,
+receipt or stage image enters a row-group log. For Complete, project each current
+row pin with `Pin::for_release(nonce)`: `Released` binds database, applied index,
+exact descriptor, nonce, canonical plan digest, acquired index and released flag.
+Completion proof size is independent of row images and ordinary transaction
+history, keeping abort resolution within proposal headroom. JSON owner callers
+must perform these same projections from authentic current responses; they do
+not turn caller assertions into certificates.
+
+
+## Trusted owner logical protected decisions
+
+`protected::Step::Logical` is a separately installed **trusted-owner logical**
+profile. `logical::Step::Install { image, profile }` declares that authority grant
+and approval bounds use logical ticks. A physical `Step::Install` authority cannot
+be converted. Default `Step::Commit` continues to reject, including after restart
+or term changes. This profile makes no physical expiry or production credential
+claim. Only the trusted owner may advance replicated epoch/tick state; an Intent
+must match that state and cannot advance it.
+
+Owner protocol (all pins from current quorum leaders):
+
+1. `Logical(Open(plan))`, then ordinary protected `Lock` on every exact full range.
+2. `Stage { nonce, rows }` persists the canonical original authority and compact
+   row before images. `ResumeStage { nonce }` needs no old pins; fresh barriers
+   cannot change the original digest.
+3. Project `Pin::logical_preparation` to each participant, apply `Logical(Prepare)`
+   and collect `Pin::logical_prepared`. Whole-range locks reserve the fixed-width
+   all-row rewrite footprint; this profile limits each image to 16 KiB and each
+   retained home record to 384 KiB. Capacity rejection occurs before a decision.
+4. `Logical(Commit { nonce, prepared })` performs real core validation at current
+   replicated logical authority state, persists one outcome plus exact validated
+   digest, complete prepare set, authority after bytes and participant after bytes.
+   A revoke ordered before this decision denies it. A committed decision finishes
+   after a later revoke without consuming budget or approval again.
+5. Carry authority-free `Pin::logical_finalization` to each participant. Apply
+   `Logical(Finalize)`, collect exact `Pin::logical_finalized`, then home
+   `Logical(ConfirmFinalized)`. Locks remain during partial publication.
+6. Use current `for_home` proof for `Unlock` everywhere, then `Complete` with all
+   `for_release` proofs. Ordinary reads/writes fail closed behind local barriers.
+
+`Runtime::protected_logical_recover` / owner control `protected_logical_recover`
+continues an already staged logical identity when the local process leads all
+involved groups. Independent leaders use the same steps through owner routing.
+Recovery explicitly re-runs core redo verification through `Logical(VerifyDecision)`
+against retained decision-time originals. Routine pin/shape checks use canonical
+integrity bindings rather than reexecuting the evaluator. A timeout is unknown,
+never an abort. All steps retain immutable retry identity.
+There is no retained-record garbage collection. Membership snapshots carry the
+same original home and data; splitting retained protected identities is fenced.
+Durable format v5 rejects earlier files without migration. Protected stores
+checkpoint an applied log prefix once retained log bytes exceed 16 MiB, preserving
+all unapplied entries and immutable original/decision records for recovery.
+
+`Logical(Output { nonce, principal })` is trusted owner control only. It requires
+complete publication and uses actual core `NativeTask::Status` disclosure debit
+and `ValidateRelease` separately for each attempt. It returns redacted output,
+never authority images. No task executor listener is exposed; owner commit success
+is distinct from delivering output to an executor. Full owner pins are privileged
+administration, never task output or remotely authenticated certificates.
+
+Existing exact approvals, if present in an installed canonical authority, remain
+bound and consumed by the real core evaluator. New distributed approval issuance
+is not provided: the current public core API cannot project an approved assembled
+workspace back to a row-free authority while retaining its approval. This profile
+therefore does not claim an end-to-end single-use approval provisioning campaign.
+No security, cloud, performance, PostgreSQL comparator or physical-clock
+qualification follows from these local tests.

@@ -1,0 +1,14 @@
+[package]
+name = "giggles-faultlab"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+giggles-client = { path = "../giggles-client" }
+giggles-core = { path = "../giggles-core" }
+giggles-consensus = { path = "../giggles-consensus" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+sha2 = "0.10"

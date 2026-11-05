@@ -1,6 +1,7 @@
 //! Bounded range lifecycle runtime. Owner controls are trusted local input.
 pub mod machine;
 pub mod node;
+pub mod protected;
 pub mod runtime;
 pub mod store;
 pub mod transaction;

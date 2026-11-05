@@ -264,6 +264,121 @@ impl Drop for Runtime {
     }
 }
 impl Runtime {
+    /// Full privileged snapshot obtained at a real current quorum barrier.
+    pub async fn protected_pin(&self, group: u64) -> Result<crate::protected::Pin> {
+        crate::protected::Pin::from_current(self.group(group)?.current().await?)
+    }
+    /// Trusted owner-only control. Default physical Commit remains fenced.
+    pub async fn protected_step(
+        &self,
+        group: u64,
+        step: crate::protected::Step,
+    ) -> Result<serde_json::Value> {
+        let o = self.apply(group, Action::Protected(Box::new(step))).await?;
+        let reply = o.reply.ok_or("protected apply missing reply")?;
+        if reply.code != 0 {
+            return Err(format!("protected apply refused: {}", reply.data).into());
+        }
+        Ok(reply.data)
+    }
+    /// Trusted owner logical continuation. Each group must be locally led;
+    /// independent leaders use the same typed steps through owner routing.
+    /// Timeout leaves an unknown outcome and never causes an inferred abort.
+    pub async fn protected_logical_recover(&self, nonce: u128) -> Result<serde_json::Value> {
+        use crate::protected::{Step as P, logical::Step as L};
+        let pin = self.protected_pin(DIRECTORY).await?;
+        let Machine::Root { protected: h, .. } = &pin.machine else {
+            return Err("home required".into());
+        };
+        let r = h.record(nonce)?;
+        if !r.logical {
+            return Err("physical profile remains fenced".into());
+        }
+        if r.released {
+            return Ok(crate::protected::status(r));
+        }
+        let plan = r.plan.clone();
+        if r.decision.is_none() {
+            self.protected_step(DIRECTORY, P::ResumeStage { nonce })
+                .await?;
+            let pin = self.protected_pin(DIRECTORY).await?;
+            let mut prepared = Vec::new();
+            for route in &plan.routes {
+                let prep = pin.logical_preparation(nonce, route.group)?;
+                self.protected_step(route.group, P::Logical(Box::new(L::Prepare(prep))))
+                    .await?;
+                prepared.push(
+                    self.protected_pin(route.group)
+                        .await?
+                        .logical_prepared(nonce)?,
+                );
+            }
+            self.protected_step(
+                DIRECTORY,
+                P::Logical(Box::new(L::Commit { nonce, prepared })),
+            )
+            .await?;
+        }
+        self.protected_step(DIRECTORY, P::Logical(Box::new(L::VerifyDecision { nonce })))
+            .await?;
+        let pin = self.protected_pin(DIRECTORY).await?;
+        let mut rows = Vec::new();
+        for route in &plan.routes {
+            let seal = pin.logical_finalization(nonce, route.group)?;
+            self.protected_step(route.group, P::Logical(Box::new(L::Finalize(seal.clone()))))
+                .await?;
+            rows.push(
+                self.protected_pin(route.group)
+                    .await?
+                    .logical_finalized(seal)?,
+            );
+        }
+        self.protected_step(
+            DIRECTORY,
+            P::Logical(Box::new(L::ConfirmFinalized { nonce, rows })),
+        )
+        .await?;
+        let home = self.protected_pin(DIRECTORY).await?.for_home(nonce)?;
+        let mut rows = Vec::new();
+        for route in &plan.routes {
+            self.protected_step(
+                route.group,
+                P::Unlock {
+                    plan: plan.clone(),
+                    home: Box::new(home.clone()),
+                },
+            )
+            .await?;
+            rows.push(self.protected_pin(route.group).await?.for_release(nonce)?);
+        }
+        self.protected_step(DIRECTORY, P::Complete { nonce, rows })
+            .await
+    }
+    /// Durable abort recovery only; timeout never invokes this automatically.
+    pub async fn protected_abort(&self, nonce: u128) -> Result<serde_json::Value> {
+        let pin = self.protected_pin(DIRECTORY).await?;
+        let Machine::Root { protected, .. } = pin.machine else {
+            return Err("protected home missing".into());
+        };
+        let plan = protected.record(nonce)?.plan.clone();
+        self.protected_step(DIRECTORY, crate::protected::Step::Abort { nonce })
+            .await?;
+        let home = self.protected_pin(DIRECTORY).await?.for_home(nonce)?;
+        let mut rows = Vec::new();
+        for route in &plan.routes {
+            self.protected_step(
+                route.group,
+                crate::protected::Step::Unlock {
+                    plan: plan.clone(),
+                    home: Box::new(home.clone()),
+                },
+            )
+            .await?;
+            rows.push(self.protected_pin(route.group).await?.for_release(nonce)?);
+        }
+        self.protected_step(DIRECTORY, crate::protected::Step::Complete { nonce, rows })
+            .await
+    }
     /// Pin durable committed state at an authoritative barrier. The owner may
     /// carry this to another independently led group; it is trusted control input.
     pub async fn tx_pin(&self, route: &Descriptor) -> Result<crate::transaction::Pinned> {

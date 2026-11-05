@@ -184,6 +184,7 @@ pub struct Data {
     pub provenance: Option<Ready>,
     /// Durable rigorous locks, intents, home decisions and retained retry plans.
     pub transactions: crate::transaction::State,
+    pub protected: crate::protected::Participant,
     #[serde(with = "map_pairs")]
     pub retries: BTreeMap<u64, RetryRecord>,
 }
@@ -224,6 +225,20 @@ impl Data {
     pub fn validate(&self, domain: u128) -> Result<()> {
         self.descriptor.validate()?;
         self.transactions.validate(domain, &self.descriptor)?;
+        self.protected.validate(domain, &self.descriptor)?;
+        for record in &self.protected.records {
+            if !record.released
+                && let Some(prepared) = &record.prepared
+            {
+                let expected = record
+                    .publication
+                    .as_ref()
+                    .map_or(&prepared.preparation.part.image, |seal| &seal.part.after);
+                if &self.image != expected {
+                    return Err("prepared/finalized protected image mismatch".into());
+                }
+            }
+        }
         let rows = self.image.snapshot()?.rows;
         if self.image.domain()? != domain
             || self.image.row_partition(minimum(), None)? != self.image
@@ -264,6 +279,10 @@ impl Data {
     }
     pub fn children(&self) -> Result<[Data; 2]> {
         self.validate(self.image.domain()?)?;
+        // Terminal protected identities cannot be silently discarded by split.
+        if !self.protected.records.is_empty() {
+            return Err("protected retained home blocks split".into());
+        }
         let fence = self.fence.clone().ok_or("parent not fenced")?;
         if self
             .transactions
@@ -294,6 +313,7 @@ impl Data {
                 active: false,
                 provenance: Some(proof),
                 transactions,
+                protected: Default::default(),
                 retries,
             })
         };
@@ -305,9 +325,19 @@ impl Data {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Machine {
-    Vacant { domain: u128, group: u64 },
-    Root { domain: u128, directory: Directory },
-    Range { domain: u128, data: Box<Data> },
+    Vacant {
+        domain: u128,
+        group: u64,
+    },
+    Root {
+        domain: u128,
+        directory: Directory,
+        protected: crate::protected::Home,
+    },
+    Range {
+        domain: u128,
+        data: Box<Data>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Command {
@@ -338,6 +368,7 @@ pub enum Action {
     },
     Transaction(Box<crate::transaction::Request>),
     TaskWrite,
+    Protected(Box<crate::protected::Step>),
     Move,
 }
 impl Machine {
@@ -358,6 +389,7 @@ impl Machine {
     pub fn root(domain: u128, descriptor: Descriptor) -> Result<Self> {
         let m = Self::Root {
             domain,
+            protected: crate::protected::Home::new(domain)?,
             directory: Directory {
                 revision: 1,
                 routes: vec![descriptor],
@@ -372,6 +404,7 @@ impl Machine {
             domain,
             data: Box::new(Data {
                 transactions: crate::transaction::State::new(domain, &descriptor)?,
+                protected: Default::default(),
                 descriptor,
                 image: Image::new(domain)?,
                 fence: None,
@@ -388,7 +421,14 @@ impl Machine {
             return Err("machine domain/group".into());
         }
         match self {
-            Self::Root { directory, .. } => directory.validate(),
+            Self::Root {
+                directory,
+                protected,
+                ..
+            } => {
+                directory.validate()?;
+                protected.validate(domain)
+            }
             Self::Range { data, .. } => data.validate(domain),
             Self::Vacant { group, .. } => {
                 if *group <= DIRECTORY {
@@ -416,14 +456,38 @@ impl Machine {
         if c.domain != self.domain()? || c.group != self.group() {
             return Err("wrong command domain/group".into());
         }
+        if let Action::Protected(step) = &c.action {
+            return crate::protected::apply(self, index, step);
+        }
+        if let Self::Root { protected, .. } = self
+            && protected.busy()
+        {
+            return Err("protected authority locks directory lifecycle".into());
+        }
+        if let Self::Range { data, .. } = self {
+            crate::protected::guard(data)?;
+        }
         match (&mut *self, &c.action) {
-            (Self::Root { directory, .. }, Action::Begin(split)) => {
+            (
+                Self::Root {
+                    directory,
+                    protected,
+                    ..
+                },
+                Action::Begin(split),
+            ) => {
                 split.validate()?;
                 if let Some(old) = directory.intents.get(&split.id) {
                     if old.split == *split {
                         return Ok(serde_json::json!({"id":split.id,"published":old.published}));
                     }
                     return Err("split id conflict".into());
+                }
+                // Retained protected row tombstones cannot be projected into
+                // children. Reject NEW work before storing an unfinishable
+                // intent; keep exact existing split receipt replay above.
+                if !protected.records.is_empty() {
+                    return Err("retained protected identities block new split intent".into());
                 }
                 if directory.route(split.key)? != split.parent
                     || directory

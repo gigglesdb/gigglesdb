@@ -1,4 +1,5 @@
 mod common;
+mod protected_support;
 use common::*;
 use giggles_distributed::{
     runtime::{Config, GroupConfig, Initial},
@@ -965,8 +966,17 @@ impl Processes {
         // Every failed schedule retains the exact implementation/test identity.
         {
             use sha2::{Digest, Sha256};
-            let sources: [(&str, &[u8]); 10] = [
+            let sources: [(&str, &[u8]); 13] = [
                 ("src/machine.rs", include_bytes!("../src/machine.rs")),
+                ("src/protected.rs", include_bytes!("../src/protected.rs")),
+                (
+                    "src/protected/logical.rs",
+                    include_bytes!("../src/protected/logical.rs"),
+                ),
+                (
+                    "tests/protected_support/mod.rs",
+                    include_bytes!("protected_support/mod.rs"),
+                ),
                 (
                     "src/transaction.rs",
                     include_bytes!("../src/transaction.rs"),
@@ -2206,4 +2216,783 @@ fn real_four_process_leader_crashes_before_after_each_configuration_publication(
             assert_eq!(m.voters, vec![2, 3, 4]);
         }
     }
+}
+
+fn protected_call(p: &mut Processes, group: u64, step: protected::Step) -> Value {
+    p.owner(
+        group,
+        json!({"command":"protected_step","group":group,"step":step}),
+    )
+}
+fn protected_ok(p: &mut Processes, group: u64, step: protected::Step) {
+    let reply = protected_call(p, group, step);
+    assert_eq!(reply["ok"], true, "{reply}");
+}
+fn protected_pin(p: &mut Processes, group: u64) -> protected::Pin {
+    let reply = p.owner(group, json!({"command":"protected_pin","group":group}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    serde_json::from_value(reply["data"].clone()).unwrap()
+}
+#[test]
+fn real_protected_stage_independent_leaders_restart_and_abort_without_effects() {
+    use protected::Step;
+    let mut p = Processes::new();
+    for n in [1, 60] {
+        p.apply(2, put(descriptor(), n, key(n), None));
+    }
+    p.split_for_transactions();
+    let s = split();
+    let plan = protected_support::plan(vec![s.left.clone(), s.right.clone()], 2, 91);
+    protected_ok(
+        &mut p,
+        1,
+        Step::Install {
+            image: protected_support::image(42, 2),
+        },
+    );
+    protected_ok(&mut p, 1, Step::Open(plan.clone()));
+    let home = protected_pin(&mut p, 1).for_home(plan.nonce).unwrap();
+    // Actual process termination after authority admission, before row locking.
+    p.restart();
+    p.independent();
+    for route in &plan.routes {
+        protected_ok(
+            &mut p,
+            route.group,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+    }
+    let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+    protected_ok(
+        &mut p,
+        1,
+        Step::Stage {
+            nonce: 91,
+            rows: rows.clone(),
+        },
+    );
+    let staged = protected_pin(&mut p, 1);
+    let Machine::Root { protected, .. } = staged.machine else {
+        panic!()
+    };
+    assert!(protected.record(91).unwrap().staged.is_some());
+    assert_eq!(
+        protected.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].transitions,
+        0
+    );
+    assert!(protected.image.snapshot().unwrap().operations.is_empty());
+    let rejected = protected_call(&mut p, 1, Step::Commit { nonce: 91 });
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert!(rejected["error"].as_str().unwrap().contains("clock/pause"));
+    // Caller cancellation/unknown result never silently aborts a retained home.
+    p.restart();
+    p.independent();
+    protected_ok(&mut p, 1, Step::Stage { nonce: 91, rows });
+    let mut altered = plan.clone();
+    altered.intent.principal = giggles_core::Principal(99);
+    assert_eq!(protected_call(&mut p, 1, Step::Open(altered))["ok"], false);
+    // Ordinary strict Observe must release no result through a protected intent.
+    p.colocate();
+    let observed = p.request(json!({"command":"observe","bounds":{"start":minimum(),"end":null}}));
+    assert_eq!(observed["ok"], false, "{observed}");
+    // Durable abort followed by process termination BETWEEN participant unlocks.
+    protected_ok(&mut p, 1, Step::Abort { nonce: 91 });
+    let home = protected_pin(&mut p, 1).for_home(plan.nonce).unwrap();
+    protected_ok(
+        &mut p,
+        3,
+        Step::Unlock {
+            plan: plan.clone(),
+            home: Box::new(home.clone()),
+        },
+    );
+    p.restart();
+    let aborted = p.request(json!({"command":"protected_abort","nonce":91}));
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    let again = p.request(json!({"command":"protected_abort","nonce":91}));
+    assert_eq!(again["ok"], true, "{again}");
+    for (group, k) in [(3, key(1)), (4, key(60))] {
+        let data = p.data(group);
+        assert_eq!(
+            data.image.snapshot().unwrap().rows[&k].status,
+            giggles_core::Status::Failed
+        );
+        assert!(!data.protected.busy());
+        assert!(data.image.snapshot().unwrap().tasks.is_empty());
+        let late = protected_call(
+            &mut p,
+            group,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+        assert_eq!(late["ok"], false, "{late}");
+    }
+    let observed = p.request(json!({"command":"observe","bounds":{"start":minimum(),"end":null}}));
+    assert_eq!(observed["ok"], true, "{observed}");
+    assert_eq!(observed["data"].as_array().unwrap().len(), 2);
+    // Retaining protected tombstones rejects new split intents, but never
+    // invalidates exact receipts for the already-published original split.
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+}
+
+#[test]
+fn real_protected_partial_admission_abort_tombstone_and_revoke_serialization() {
+    use protected::Step;
+    let mut p = Processes::new();
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let s = split();
+    let plan = protected_support::plan(vec![s.left, s.right], 2, 92);
+    protected_ok(
+        &mut p,
+        1,
+        Step::Install {
+            image: protected_support::image(42, 2),
+        },
+    );
+    protected_ok(&mut p, 1, Step::Open(plan.clone()));
+    let old = protected_pin(&mut p, 1).for_home(plan.nonce).unwrap();
+    protected_ok(
+        &mut p,
+        3,
+        Step::Lock {
+            plan: plan.clone(),
+            home: Box::new(old.clone()),
+        },
+    );
+    let command = serde_json::to_vec(&giggles_core::local::AdminCommand::Revoke {
+        task: giggles_core::TaskId(1),
+    })
+    .unwrap();
+    assert_eq!(
+        protected_call(
+            &mut p,
+            1,
+            Step::Admin {
+                command: command.clone()
+            }
+        )["ok"],
+        false
+    );
+    p.restart();
+    let reply = p.request(json!({"command":"protected_abort","nonce":92}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(
+        protected_call(
+            &mut p,
+            4,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(old)
+            }
+        )["ok"],
+        false
+    );
+    protected_ok(&mut p, 1, Step::Admin { command });
+    let pin = protected_pin(&mut p, 1);
+    let Machine::Root { protected, .. } = pin.machine else {
+        panic!()
+    };
+    assert!(protected.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].revoked);
+}
+
+#[test]
+fn real_protected_before_after_atomic_stage_and_abort_process_crashes() {
+    use protected::Step;
+    for after in [false, true] {
+        for abort in [false, true] {
+            let mut p = Processes::new();
+            for n in [1, 60] {
+                p.apply(2, put(descriptor(), n, key(n), None));
+            }
+            p.split_for_transactions();
+            let s = split();
+            let plan = protected_support::plan(vec![s.left, s.right], 2, 93);
+            protected_ok(
+                &mut p,
+                1,
+                Step::Install {
+                    image: protected_support::image(42, 2),
+                },
+            );
+            protected_ok(&mut p, 1, Step::Open(plan.clone()));
+            let home = protected_pin(&mut p, 1).for_home(plan.nonce).unwrap();
+            for route in &plan.routes {
+                protected_ok(
+                    &mut p,
+                    route.group,
+                    Step::Lock {
+                        plan: plan.clone(),
+                        home: Box::new(home.clone()),
+                    },
+                );
+            }
+            let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+            let step = if abort {
+                Step::Abort { nonce: 93 }
+            } else {
+                Step::Stage { nonce: 93, rows }
+            };
+            let leader = p.leader(1);
+            let node = p.nodes.get_mut(&leader).unwrap();
+            let armed = node.request(json!({"command":"arm_crash","group":1,"after":after}));
+            assert_eq!(armed["ok"], true);
+            node.send(json!({"command":"protected_step","group":1,"step":step}));
+            assert!(node.output.recv_timeout(Duration::from_secs(12)).is_err());
+            assert_eq!(node.child.wait().unwrap().code(), Some(86));
+            p.restart();
+            // Only the original quorum home resolves a lost reply. Retrying the
+            // same immutable step is valid whether the killed voter saved it or not.
+            protected_ok(&mut p, 1, step);
+            let result = p.request(json!({"command":"protected_abort","nonce":93}));
+            assert_eq!(result["ok"], true, "{result}");
+            for (g, k) in [(3, key(1)), (4, key(60))] {
+                let data = p.data(g);
+                assert_eq!(
+                    data.image.snapshot().unwrap().rows[&k].status,
+                    giggles_core::Status::Failed
+                );
+                assert!(!data.protected.busy());
+            }
+            let pin = protected_pin(&mut p, 1);
+            let Machine::Root { protected, .. } = pin.machine else {
+                panic!()
+            };
+            assert_eq!(
+                protected.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].transitions,
+                0
+            );
+            assert!(protected.record(93).unwrap().released);
+        }
+    }
+}
+
+#[test]
+fn real_protected_lock_survives_learner_snapshot_replacement_and_original_home_abort() {
+    use protected::Step;
+    let mut p = Processes::with_members(4);
+    for n in [1, 60] {
+        p.apply(2, put(descriptor(), n, key(n), None));
+    }
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let s = split();
+    let plan = protected_support::plan(vec![s.left, s.right], 2, 94);
+    protected_ok(
+        &mut p,
+        1,
+        Step::Install {
+            image: protected_support::image(42, 2),
+        },
+    );
+    protected_ok(&mut p, 1, Step::Open(plan.clone()));
+    let home = protected_pin(&mut p, 1).for_home(plan.nonce).unwrap();
+    for route in &plan.routes {
+        protected_ok(
+            &mut p,
+            route.group,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+    }
+    let rejected=p.request(json!({"command":"membership_begin","group":1,"intent":{"id":3600,"epoch":1,"learner":4,"remove":3}}));
+    assert_eq!(rejected["ok"], false);
+    let checkpoint = p.request(json!({"command":"checkpoint","group":3}));
+    assert_eq!(checkpoint["ok"], true);
+    let intent = giggles_membership::Intent {
+        id: 3601,
+        epoch: 1,
+        learner: 4,
+        remove: 3,
+    };
+    let begin = p.request(json!({"command":"membership_begin","group":3,"intent":intent}));
+    assert_eq!(begin["ok"], true, "{begin}");
+    p.member_until(3, intent.id, "CatchingUp", true);
+    p.member_until(3, intent.id, "Joint", true);
+    p.member_until(3, intent.id, "Complete", true);
+    let observed = p
+        .nodes
+        .get_mut(&4)
+        .unwrap()
+        .request(json!({"command":"inspect","group":3}));
+    assert_eq!(observed["ok"], true, "{observed}");
+    let machine: Machine = serde_json::from_value(observed["data"]["machine"].clone()).unwrap();
+    let Machine::Range { data, .. } = machine else {
+        panic!()
+    };
+    assert_eq!(data.descriptor, plan.routes[0]);
+    assert_eq!(data.protected.records[0].plan, plan);
+    assert!(data.protected.busy());
+    p.restart();
+    let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+    protected_ok(&mut p, 1, Step::Stage { nonce: 94, rows });
+    let result = p.request(json!({"command":"protected_abort","nonce":94}));
+    assert_eq!(result["ok"], true, "{result}");
+    let home = protected_pin(&mut p, 1);
+    let Machine::Root { protected, .. } = home.machine else {
+        panic!()
+    };
+    assert!(protected.record(94).unwrap().released);
+    assert_eq!(protected.record(94).unwrap().plan, plan);
+}
+fn logical_data(p: &mut Processes, group: u64) -> Data {
+    let pin = protected_pin(p, group);
+    let Machine::Range { data, .. } = pin.machine else {
+        panic!()
+    };
+    *data
+}
+fn logical_ok(p: &mut Processes, g: u64, s: protected::logical::Step) {
+    protected_ok(p, g, protected::Step::Logical(Box::new(s)));
+}
+fn logical_process_setup(nonce: u128) -> (Processes, protected::Plan) {
+    use protected::{
+        Step,
+        logical::{LogicalProfile, Step as L},
+    };
+    let mut p = Processes::new();
+    for n in [1, 60] {
+        p.apply(2, put(descriptor(), n, key(n), None));
+    }
+    p.split_for_transactions();
+    p.independent();
+    let s = split();
+    let mut plan = protected_support::plan(vec![s.left, s.right], 2, nonce);
+    plan.intent.lower = 12;
+    logical_ok(
+        &mut p,
+        1,
+        L::Install {
+            image: protected_support::image(42, 2),
+            profile: LogicalProfile { epoch: 1, tick: 12 },
+        },
+    );
+    logical_ok(&mut p, 1, L::Open(plan.clone()));
+    let home = protected_pin(&mut p, 1).for_home(nonce).unwrap();
+    for g in [3, 4] {
+        protected_ok(
+            &mut p,
+            g,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+    }
+    let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+    protected_ok(&mut p, 1, Step::Stage { nonce, rows });
+    (p, plan)
+}
+fn logical_process_prepare(p: &mut Processes, nonce: u128) -> Vec<protected::logical::Prepared> {
+    let pin = protected_pin(p, 1);
+    let mut proofs = Vec::new();
+    for g in [3, 4] {
+        logical_ok(
+            p,
+            g,
+            protected::logical::Step::Prepare(pin.logical_preparation(nonce, g).unwrap()),
+        );
+        proofs.push(protected_pin(p, g).logical_prepared(nonce).unwrap());
+    }
+    proofs
+}
+fn logical_process_finish(p: &mut Processes, nonce: u128) {
+    use protected::{Step, logical::Step as L};
+    logical_ok(p, 1, L::VerifyDecision { nonce });
+    let home = protected_pin(p, 1);
+    let mut rows = Vec::new();
+    for g in [3, 4] {
+        let seal = home.logical_finalization(nonce, g).unwrap();
+        logical_ok(p, g, L::Finalize(seal.clone()));
+        rows.push(protected_pin(p, g).logical_finalized(seal).unwrap());
+    }
+    logical_ok(p, 1, L::ConfirmFinalized { nonce, rows });
+    let home = protected_pin(p, 1).for_home(nonce).unwrap();
+    let plan = home.plan.clone();
+    for g in [3, 4] {
+        protected_ok(
+            p,
+            g,
+            Step::Unlock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+    }
+    let rows = [3, 4]
+        .into_iter()
+        .map(|g| protected_pin(p, g).for_release(nonce).unwrap())
+        .collect();
+    protected_ok(p, 1, Step::Complete { nonce, rows });
+}
+#[test]
+fn real_three_process_logical_commit_independent_leaders_no_partial_results_and_output_debits() {
+    use protected::{Step, logical::Step as L};
+    let (mut p, plan) = logical_process_setup(201);
+    let original = protected_pin(&mut p, 1);
+    let Machine::Root { protected: h, .. } = &original.machine else {
+        panic!()
+    };
+    let digest = h.record(201).unwrap().staged_digest;
+    // Drop original owner pins, restart all actual listeners/stores and resume.
+    drop(original);
+    p.restart();
+    p.independent();
+    protected_ok(&mut p, 1, Step::ResumeStage { nonce: 201 });
+    let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+    protected_ok(&mut p, 1, Step::Stage { nonce: 201, rows });
+    let pin = protected_pin(&mut p, 1);
+    let Machine::Root { protected: h, .. } = pin.machine else {
+        panic!()
+    };
+    assert_eq!(h.record(201).unwrap().staged_digest, digest);
+    let proofs = logical_process_prepare(&mut p, 201);
+    logical_ok(
+        &mut p,
+        1,
+        L::Commit {
+            nonce: 201,
+            prepared: proofs.clone(),
+        },
+    );
+    let seal = protected_pin(&mut p, 1)
+        .logical_finalization(201, 3)
+        .unwrap();
+    logical_ok(&mut p, 3, L::Finalize(seal));
+    p.colocate();
+    let result = p.request(json!({"command":"observe","bounds":Bounds {start:minimum(),end:None}}));
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(
+        result["error"].as_str().unwrap().contains("protected"),
+        "{result}"
+    );
+    assert!(result.get("data").is_none());
+    p.independent();
+    assert!(logical_data(&mut p, 3).protected.busy() && logical_data(&mut p, 4).protected.busy());
+    p.restart();
+    let completed = p.request(json!({"command":"protected_logical_recover","nonce":201}));
+    assert_eq!(completed["ok"], true, "{completed}");
+    p.independent();
+    logical_process_finish(&mut p, 201);
+    logical_ok(
+        &mut p,
+        1,
+        L::Commit {
+            nonce: 201,
+            prepared: proofs,
+        },
+    );
+    logical_ok(&mut p, 1, L::Open(plan.clone()));
+    for (g, k) in [(3, key(1)), (4, key(60))] {
+        let data = logical_data(&mut p, g);
+        assert_eq!(
+            data.image.snapshot().unwrap().rows[&k].status,
+            giggles_core::Status::Queued
+        );
+        assert_eq!(data.image.snapshot().unwrap().rows[&k].version, 1);
+        assert!(!data.protected.busy());
+    }
+    let pin = protected_pin(&mut p, 1);
+    let Machine::Root { protected: h, .. } = pin.machine else {
+        panic!()
+    };
+    let used = h.image.accounting(giggles_core::TaskId(1)).unwrap();
+    assert_eq!(
+        h.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].transitions,
+        2
+    );
+    logical_ok(
+        &mut p,
+        1,
+        L::Output {
+            nonce: 201,
+            principal: giggles_core::Principal(2),
+        },
+    );
+    let pin = protected_pin(&mut p, 1);
+    let Machine::Root { protected: h, .. } = pin.machine else {
+        panic!()
+    };
+    assert_ne!(h.image.accounting(giggles_core::TaskId(1)).unwrap(), used);
+    p.restart();
+    let reply = protected_call(&mut p, 1, Step::Commit { nonce: 201 });
+    assert_eq!(reply["ok"], false);
+}
+#[test]
+fn real_three_process_logical_crash_prepare_decision_publication_finalize_reopens_and_converges() {
+    use protected::{Step, logical::Step as L};
+    // Every boundary is an actual process death, before or after its atomic
+    // store/index transaction. Failed artifacts are retained by Processes.
+    for boundary in 0..5 {
+        for after in [false, true] {
+            let nonce = 210 + boundary as u128 * 2 + u128::from(after);
+            let (mut p, _) = logical_process_setup(nonce);
+            let (group, step) = if boundary == 0 {
+                (
+                    3,
+                    Step::Logical(Box::new(L::Prepare(
+                        protected_pin(&mut p, 1)
+                            .logical_preparation(nonce, 3)
+                            .unwrap(),
+                    ))),
+                )
+            } else {
+                let proofs = logical_process_prepare(&mut p, nonce);
+                if boundary == 1 {
+                    (
+                        1,
+                        Step::Logical(Box::new(L::Commit {
+                            nonce,
+                            prepared: proofs,
+                        })),
+                    )
+                } else {
+                    logical_ok(
+                        &mut p,
+                        1,
+                        L::Commit {
+                            nonce,
+                            prepared: proofs,
+                        },
+                    );
+                    if boundary == 2 {
+                        (
+                            3,
+                            Step::Logical(Box::new(L::Finalize(
+                                protected_pin(&mut p, 1)
+                                    .logical_finalization(nonce, 3)
+                                    .unwrap(),
+                            ))),
+                        )
+                    } else {
+                        let home = protected_pin(&mut p, 1);
+                        let mut rows = Vec::new();
+                        for g in [3, 4] {
+                            let seal = home.logical_finalization(nonce, g).unwrap();
+                            logical_ok(&mut p, g, L::Finalize(seal.clone()));
+                            rows.push(protected_pin(&mut p, g).logical_finalized(seal).unwrap());
+                        }
+                        if boundary == 3 {
+                            (
+                                1,
+                                Step::Logical(Box::new(L::ConfirmFinalized { nonce, rows })),
+                            )
+                        } else {
+                            logical_ok(&mut p, 1, L::ConfirmFinalized { nonce, rows });
+                            let home = protected_pin(&mut p, 1).for_home(nonce).unwrap();
+                            (
+                                3,
+                                Step::Unlock {
+                                    plan: home.plan.clone(),
+                                    home: Box::new(home),
+                                },
+                            )
+                        }
+                    }
+                }
+            };
+            let leader = p.leader(group);
+            let node = p.nodes.get_mut(&leader).unwrap();
+            assert_eq!(
+                node.request(json!({"command":"arm_crash","group":group,"after":after}))["ok"],
+                true
+            );
+            node.send(json!({"command":"protected_step","group":group,"step":step}));
+            assert!(node.output.recv_timeout(Duration::from_secs(12)).is_err());
+            assert_eq!(node.child.wait().unwrap().code(), Some(86));
+            p.restart();
+            p.independent();
+            protected_ok(&mut p, group, step);
+            let pin = protected_pin(&mut p, 1);
+            let Machine::Root { protected: h, .. } = pin.machine else {
+                panic!()
+            };
+            if h.record(nonce).unwrap().decision.is_none() {
+                let proofs = logical_process_prepare(&mut p, nonce);
+                logical_ok(
+                    &mut p,
+                    1,
+                    L::Commit {
+                        nonce,
+                        prepared: proofs,
+                    },
+                );
+            }
+            logical_process_finish(&mut p, nonce);
+            for (g, k) in [(3, key(1)), (4, key(60))] {
+                let data = logical_data(&mut p, g);
+                assert_eq!(data.image.snapshot().unwrap().rows[&k].version, 1);
+                assert_eq!(
+                    data.image.snapshot().unwrap().rows[&k].status,
+                    giggles_core::Status::Queued
+                );
+                assert!(!data.protected.busy());
+            }
+            let pin = protected_pin(&mut p, 1);
+            let Machine::Root { protected: h, .. } = pin.machine else {
+                panic!()
+            };
+            assert_eq!(
+                h.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].transitions,
+                2
+            );
+            assert!(h.record(nonce).unwrap().released);
+        }
+    }
+}
+#[test]
+fn real_logical_revoke_ordering_and_physical_commit_denial_after_leader_change() {
+    use protected::{Step, logical::Step as L};
+    for after in [false, true] {
+        let nonce = 240 + u128::from(after);
+        let (mut p, _) = logical_process_setup(nonce);
+        let proofs = logical_process_prepare(&mut p, nonce);
+        if after {
+            logical_ok(
+                &mut p,
+                1,
+                L::Commit {
+                    nonce,
+                    prepared: proofs.clone(),
+                },
+            );
+        }
+        protected_ok(
+            &mut p,
+            1,
+            Step::Admin {
+                command: serde_json::to_vec(&giggles_core::local::AdminCommand::Revoke {
+                    task: giggles_core::TaskId(1),
+                })
+                .unwrap(),
+            },
+        );
+        if after {
+            p.restart();
+            p.independent();
+            logical_process_finish(&mut p, nonce);
+        } else {
+            assert_eq!(
+                protected_call(
+                    &mut p,
+                    1,
+                    Step::Logical(Box::new(L::Commit {
+                        nonce,
+                        prepared: proofs
+                    }))
+                )["ok"],
+                false
+            );
+            p.colocate();
+            assert_eq!(
+                p.request(json!({"command":"protected_abort","nonce":nonce}))["ok"],
+                true
+            );
+        }
+        let leader = p.leader(1);
+        let target = if leader == 1 { 2 } else { 1 };
+        let moved = p
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .request(json!({"command":"transfer","group":1,"to":target}));
+        assert_eq!(moved["ok"], true);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while p.leader(1) != target {
+            assert!(
+                Instant::now() < deadline,
+                "logical authority transfer did not settle"
+            );
+        }
+        let answer = protected_call(&mut p, 1, Step::Commit { nonce });
+        assert_eq!(answer["ok"], false);
+        assert!(answer["error"].as_str().unwrap().contains("clock/pause"));
+        let pin = protected_pin(&mut p, 1);
+        let Machine::Root { protected: h, .. } = pin.machine else {
+            panic!()
+        };
+        assert_eq!(
+            h.image.snapshot().unwrap().tasks[&giggles_core::TaskId(1)].transitions,
+            if after { 2 } else { 0 }
+        );
+    }
+}
+#[test]
+fn real_logical_decided_prepare_survives_membership_snapshot_and_finishes_original_home() {
+    use protected::{
+        Step,
+        logical::{LogicalProfile, Step as L},
+    };
+    let mut p = Processes::with_members(4);
+    for n in [1, 60] {
+        p.apply(2, put(descriptor(), n, key(n), None));
+    }
+    p.apply(1, Action::Begin(split()));
+    p.resume();
+    let s = split();
+    let mut plan = protected_support::plan(vec![s.left, s.right], 2, 250);
+    plan.intent.lower = 12;
+    logical_ok(
+        &mut p,
+        1,
+        L::Install {
+            image: protected_support::image(42, 2),
+            profile: LogicalProfile { epoch: 1, tick: 12 },
+        },
+    );
+    logical_ok(&mut p, 1, L::Open(plan.clone()));
+    let home = protected_pin(&mut p, 1).for_home(250).unwrap();
+    for g in [3, 4] {
+        protected_ok(
+            &mut p,
+            g,
+            Step::Lock {
+                plan: plan.clone(),
+                home: Box::new(home.clone()),
+            },
+        );
+    }
+    let rows = vec![protected_pin(&mut p, 3), protected_pin(&mut p, 4)];
+    protected_ok(&mut p, 1, Step::Stage { nonce: 250, rows });
+    let prepared = logical_process_prepare(&mut p, 250);
+    logical_ok(
+        &mut p,
+        1,
+        L::Commit {
+            nonce: 250,
+            prepared,
+        },
+    );
+    assert_eq!(
+        p.request(json!({"command":"checkpoint","group":3}))["ok"],
+        true
+    );
+    let intent = giggles_membership::Intent {
+        id: 4401,
+        epoch: 1,
+        learner: 4,
+        remove: 3,
+    };
+    assert_eq!(
+        p.request(json!({"command":"membership_begin","group":3,"intent":intent}))["ok"],
+        true
+    );
+    for phase in ["CatchingUp", "Joint", "Complete"] {
+        p.member_until(3, intent.id, phase, true);
+    }
+    p.restart();
+    logical_process_finish(&mut p, 250);
+    let data = logical_data(&mut p, 3);
+    assert_eq!(data.protected.records[0].plan, plan);
+    assert!(data.protected.records[0].finalized);
+    assert!(data.protected.records[0].released);
+    assert_eq!(data.image.snapshot().unwrap().rows[&key(1)].version, 1);
 }

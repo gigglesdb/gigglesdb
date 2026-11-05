@@ -54,7 +54,8 @@ struct SnapshotBody {
 }
 
 fn pack<T: Serialize>(v: &T) -> Result<Vec<u8>> {
-    let payload = codec().serialize(v)?;
+    let mut payload = b"GD44v005".to_vec();
+    payload.extend(codec().serialize(v)?);
     if payload.len() as u64 > MAX_STORE - 32 {
         return Err("store limit".into());
     }
@@ -69,7 +70,12 @@ fn unpack<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<T> {
     {
         return Err("checksum/size".into());
     }
-    Ok(codec().deserialize(&bytes[32..])?)
+    if bytes.get(32..40) != Some(b"GD44v005") {
+        return Err(
+            "unsupported durable format: protected v5 required; no automatic migration".into(),
+        );
+    }
+    Ok(codec().deserialize(&bytes[40..])?)
 }
 fn conf() -> ConfState {
     let mut c = ConfState::default();
@@ -94,7 +100,7 @@ impl State {
         s.mut_metadata().set_conf_state(self.conf()?);
         s.set_data(
             pack(&SnapshotBody {
-                version: 3,
+                version: 5,
                 domain: self.domain,
                 group: self.group,
                 membership: self.membership.clone(),
@@ -110,7 +116,7 @@ impl State {
     fn snapshot_body(&self, s: &Snapshot) -> Result<SnapshotBody> {
         let m = s.get_metadata();
         let b: SnapshotBody = unpack(s.get_data())?;
-        if b.version != 3
+        if b.version != 5
             || b.domain != self.domain
             || b.group != self.group
             || b.roster != self.roster
@@ -418,6 +424,30 @@ impl Store {
         let mut next = g.state.clone();
         let out = f(&mut next)?;
         next.validate()?;
+        // Reserve terminal publication headroom even when an owner retained many
+        // already applied log entries. This is logical Raft compaction into an
+        // exact snapshot; durable files and protected retry identities remain.
+        let protected = match &next.image {
+            Image::Root { protected, .. } => {
+                protected.logical.is_some() || !protected.records.is_empty()
+            }
+            Image::Range { data, .. } => !data.protected.records.is_empty(),
+            Image::Vacant { .. } => false,
+        };
+        if protected
+            && next.applied > 0
+            && next.log.values().map(Vec::len).sum::<usize>() > 16 * 1024 * 1024
+        {
+            let snapshot = next.snapshot_now()?;
+            next.snapshot = snapshot.write_to_bytes()?;
+            next.log = next.log.split_off(
+                &next
+                    .applied
+                    .checked_add(1)
+                    .ok_or("applied index overflow")?,
+            );
+            next.validate()?;
+        }
         let bytes = pack(&next)?;
         let crash = if next.applied > g.state.applied {
             g.crash.take()
@@ -572,3 +602,7 @@ impl Storage for Store {
         s.snapshot_now().map_err(|_| corrupt())
     }
 }
+
+#[cfg(test)]
+#[path = "store_capacity_tests.rs"]
+mod capacity_tests;
