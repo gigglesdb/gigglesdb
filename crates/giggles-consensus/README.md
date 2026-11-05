@@ -129,8 +129,8 @@ The transport `ok` is a queue receipt, **not a Raft replication acknowledgment**
 only later library responses released after persistence count toward consensus.
 
 No dynamic changes, multi-range work, snapshot streaming/resumption, process
-controller retry API, certificate hot rotation/CRL, external task-client binding,
-wall-clock uncertainty service, automatic checkpoint policy or operational
+controller retry API, peer certificate hot rotation/CRL, external task-client listener,
+automatic checkpoint policy or operational
 deployment is implemented. An out-of-space state-image/log error fails closed and
 requires operator recovery; graceful capacity admission needs more P3 work.
 
@@ -154,3 +154,19 @@ models atomic transactions and does not simulate device flush internals. A separ
 independent exhaustive checker searches serial orders for six overlapping proposals
 with identical/conflicting IDs and budget2 (seeds40..49). It covers that bounded
 history class, not arbitrary concurrent SQL.
+
+
+## internal authority/time lifecycle
+
+[Design documentation](https://app.archdocs.io/design-docs/d4bf94d5-2625-414d-8e76-b1b9b9984ceb) documents the new
+replicated credential reload epochs, automatic trusted leader OS clock, committed
+watermark/time-term fences and opaque authenticated decision/held-output release
+APIs used by the actual trusted stdin runtime. No external task listener was added.
+The historical explicit principal/time controls above remain trusted process-owner
+only; future listeners must use the new authority API and must not dispatch them.
+
+Snapshots now use body version2 and an extended durable prototype schema. No old
+store upgrade or rolling compatibility is implemented. Time correctness depends
+on explicit calibrated host/skew/pause assumptions; asynchronous consensus does
+not enforce the five-second sample-to-decision bound. See the design documentation's precise
+expiry/release semantics and remaining physical delivery-pause limitation.

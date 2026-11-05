@@ -1,4 +1,5 @@
 //! Bounded single-range Raft integration. Local tests are not HA qualification.
+pub mod authority;
 pub mod node;
 pub mod store;
 pub mod transport;

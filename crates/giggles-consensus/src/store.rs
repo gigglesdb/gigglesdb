@@ -34,6 +34,7 @@ pub(crate) struct State {
     pub log: BTreeMap<u64, Vec<u8>>,
     pub snapshot: Vec<u8>,
     pub image: Image,
+    pub authority: crate::authority::Authority,
     pub applied: u64,
     pub applied_term: u64,
 }
@@ -45,6 +46,7 @@ struct SnapshotBody {
     index: u64,
     term: u64,
     image: Image,
+    authority: crate::authority::Authority,
 }
 
 fn pack<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -85,12 +87,13 @@ impl State {
         s.mut_metadata().set_conf_state(conf());
         s.set_data(
             pack(&SnapshotBody {
-                version: 1,
+                version: 2,
                 domain: self.domain,
                 voters: VOTERS.to_vec(),
                 index: self.applied,
                 term: self.applied_term,
                 image: self.image.clone(),
+                authority: self.authority.clone(),
             })?
             .into(),
         );
@@ -99,7 +102,7 @@ impl State {
     pub fn validate_snapshot(&self, s: &Snapshot) -> Result<Image> {
         let m = s.get_metadata();
         let b: SnapshotBody = unpack(s.get_data())?;
-        if b.version != 1
+        if b.version != 2
             || b.domain != self.domain
             || b.voters != VOTERS
             || m.get_conf_state() != &conf()
@@ -108,10 +111,14 @@ impl State {
             || b.index == 0
             || b.term == 0
             || b.index < self.applied
-            || (b.index == self.applied && (b.term != self.applied_term || b.image != self.image))
+            || (b.index == self.applied
+                && (b.term != self.applied_term
+                    || b.image != self.image
+                    || b.authority != self.authority))
         {
             return Err("snapshot identity/membership/index/term".into());
         }
+        b.authority.validate(self.domain)?;
         let image = Image::from_bytes(b.image.bytes().to_vec())?;
         if image.domain()? != self.domain {
             return Err("snapshot kernel domain".into());
@@ -128,6 +135,8 @@ impl State {
     pub fn install(&mut self, s: &Snapshot) -> Result<()> {
         let image = self.validate_snapshot(s)?;
         self.image = image;
+        let body: SnapshotBody = unpack(s.get_data())?;
+        self.authority = body.authority;
         self.applied = s.get_metadata().index;
         self.applied_term = s.get_metadata().term;
         self.snapshot = s.write_to_bytes()?;
@@ -142,6 +151,7 @@ impl State {
             return Err("store identity".into());
         }
         Image::from_bytes(self.image.bytes().to_vec())?;
+        self.authority.validate(self.domain)?;
         let h = self.hard()?;
         let snap = self.snap()?;
         let base = snap.get_metadata().index;
@@ -222,6 +232,7 @@ impl Store {
             log: BTreeMap::new(),
             snapshot: Snapshot::default().write_to_bytes()?,
             image: Image::new(domain)?,
+            authority: Default::default(),
             applied: 0,
             applied_term: 0,
         };
@@ -277,6 +288,7 @@ impl Store {
             log: BTreeMap::new(),
             snapshot: Snapshot::default().write_to_bytes()?,
             image: Image::new(domain)?,
+            authority: Default::default(),
             applied: 0,
             applied_term: 0,
         };
@@ -362,6 +374,9 @@ impl Store {
     /// Trusted local diagnostics only; current remote reads go through Node ReadIndex.
     pub fn image(&self) -> Result<Image> {
         Ok(self.state()?.image)
+    }
+    pub fn authority(&self) -> Result<crate::authority::Authority> {
+        Ok(self.state()?.authority)
     }
     pub fn applied(&self) -> Result<u64> {
         Ok(self.state()?.applied)

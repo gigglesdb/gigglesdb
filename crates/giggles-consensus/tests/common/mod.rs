@@ -82,6 +82,7 @@ pub struct Cluster {
     pub nodes: BTreeMap<u64, Node>,
     pub queue: Vec<Message>,
     pub root: PathBuf,
+    pub applied_events: BTreeMap<(u64, Vec<u8>), Applied>,
     pub responses: BTreeMap<Vec<u8>, serde_json::Value>,
     pub reads: BTreeSet<Vec<u8>>,
     pub blocked: BTreeSet<(u64, u64)>,
@@ -106,6 +107,7 @@ impl Cluster {
             nodes,
             queue: Vec::new(),
             root,
+            applied_events: BTreeMap::new(),
             responses: BTreeMap::new(),
             reads: BTreeSet::new(),
             blocked: BTreeSet::new(),
@@ -128,14 +130,15 @@ impl Cluster {
         for (id, n) in &mut self.nodes {
             let out = n.drain().unwrap();
             for a in out.applied {
-                let value = serde_json::to_value(a.reply).unwrap();
+                let value = serde_json::to_value(&a.reply).unwrap();
                 writeln!(
                     self.trace,
                     "{}",
                     json!({"node":id,"apply":a.index,"context":a.context,"reply":value})
                 )
                 .unwrap();
-                self.responses.insert(a.context, value);
+                self.responses.insert(a.context.clone(), value);
+                self.applied_events.insert((*id, a.context.clone()), a);
             }
             for (ctx, idx) in out.reads {
                 assert!(n.store.applied().unwrap() >= idx);

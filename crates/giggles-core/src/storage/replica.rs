@@ -19,6 +19,15 @@ pub enum TaskAction {
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub enum Command {
     Admin(Vec<u8>),
+    /// Trusted consensus release revalidation. No disclosure debit: the held
+    /// immutable response was already reserved by NativeTask. Never dispatch
+    /// this as a standalone external request.
+    ValidateRelease {
+        task: TaskId,
+        principal: Principal,
+        lower: u64,
+        upper: u64,
+    },
     /// Trusted consensus input only, not a remote identity/time envelope.
     /// Produces redacted data, with a fresh disclosure debit after business work.
     NativeTask {
@@ -101,6 +110,23 @@ impl Image {
         tx.commit().map_err(io)?;
         let a = Admin::attach(db, Limits::default())?;
         let reply = match command {
+            Command::ValidateRelease {
+                task,
+                principal,
+                lower,
+                upper,
+            } => {
+                let result = a.executor(*task, *principal).and_then(|e| {
+                    e.inner.change_decision(|s| {
+                        e.auth(s)?;
+                        Executor::current(s, *task, *lower, *upper)
+                    })
+                });
+                match result {
+                    Ok(()) => Reply::ok(serde_json::json!({"authorized":true})),
+                    Err(error) => local::failure(error),
+                }
+            }
             Command::NativeTask {
                 task,
                 principal,

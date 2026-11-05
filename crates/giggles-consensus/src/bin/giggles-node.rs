@@ -1,4 +1,5 @@
 //! Trusted stdin control only. Network listener accepts authenticated Raft peers.
+use giggles_consensus::authority::{Binding, LeaderClock, OsClock};
 use giggles_consensus::{
     transport::{Configuration, Event, Transport},
     *,
@@ -15,12 +16,36 @@ use tokio::sync::mpsc;
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Control {
-    Propose { id: u64, command: Command },
-    Read { id: u64 },
+    Propose {
+        id: u64,
+        command: Command,
+    },
+    ReloadCredentials {
+        id: u64,
+        expected: u64,
+        bindings: Vec<Binding>,
+    },
+    Authenticate {
+        fingerprint: String,
+    },
+    NativeDecide {
+        id: u64,
+        session: u64,
+        action: TaskAction,
+    },
+    NativeRelease {
+        id: u64,
+        decision: u64,
+    },
+    Read {
+        id: u64,
+    },
     Checkpoint,
     Diagnostics,
     Campaign,
-    CrashNextApply { after_commit: bool },
+    CrashNextApply {
+        after_commit: bool,
+    },
 }
 fn emit(v: serde_json::Value) {
     println!("{v}");
@@ -65,20 +90,59 @@ async fn main() -> Result<()> {
     });
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut reads = BTreeMap::new();
+    let parameter = |name: &str, default: u64| -> Result<u64> {
+        Ok(std::env::var(name)
+            .ok()
+            .map(|v| v.parse())
+            .transpose()?
+            .unwrap_or(default))
+    };
+    let mut clock = LeaderClock::new(
+        OsClock::default(),
+        parameter("GIGGLES_CLOCK_SKEW_SECONDS", 1)?,
+        parameter("GIGGLES_CLOCK_MAX_PAUSE_SECONDS", 10)?,
+    )?;
+    let mut clock_term = 0;
+    let mut sessions = BTreeMap::new();
+    let mut next_session = 0u64;
+    let mut decisions = std::collections::BTreeSet::new();
+    let mut releases = BTreeMap::new();
+    let mut held = BTreeMap::new();
     emit(json!({"ready":true,"diagnostics":node.diagnostics()}));
     loop {
         tokio::select! {
-         _=tick.tick()=>node.tick(),
+         _=tick.tick()=>{
+             node.tick();
+             // Observe even while idle or following, so the pause bound measures
+             // actor scheduling gaps rather than time since the last request.
+             if !clock.is_fenced()
+                 && let Err(e)=clock.interval(node.store.authority()?.watermark,0) {
+                 eprintln!("runtime clock unavailable: {e}");
+             }
+         },
          Some(event)=incoming.recv()=>match event{Event::Message(from,m)=>if let Err(e)=node.step(from,m){eprintln!("peer rejected: {e}");},Event::SnapshotResult(to,ok)=>node.report_snapshot(to,ok)},
          Some(line)=input.recv()=>{match serde_json::from_slice::<Control>(&line){
           Ok(Control::Propose{id,command})=>{let result=node.propose(id.to_be_bytes().to_vec(),&command);if let Err(e)=result{emit(json!({"id":id,"error":e.to_string(),"leader":node.leader()}));}},
+          Ok(Control::ReloadCredentials{id,expected,bindings})=>{if let Err(e)=node.reload_credentials(id.to_be_bytes().to_vec(),expected,bindings){emit(json!({"id":id,"error":e.to_string()}));}},
+          Ok(Control::Authenticate{fingerprint})=>{if sessions.len()>=32{emit(json!({"error":"session limit"}));}else{match node.authenticate(&fingerprint){Ok(session)=>{next_session=next_session.checked_add(1).ok_or("session overflow")?;sessions.insert(next_session,session);emit(json!({"session":next_session}));},Err(e)=>emit(json!({"error":e.to_string()}))}}},
+          Ok(Control::NativeDecide{id,session,action})=>{let result=(||->Result<()>{if held.len()+decisions.len()+releases.len()>=32 || decisions.contains(&id) || held.contains_key(&id) || releases.contains_key(&id){return Err("held/pending limit or duplicate id".into());}node.decide(id.to_be_bytes().to_vec(),sessions.get(&session).ok_or("unknown session")?,action,&mut clock)?;decisions.insert(id);Ok(())})();if let Err(e)=result{emit(json!({"id":id,"error":e.to_string()}));}},
+          Ok(Control::NativeRelease{id,decision})=>{let result=(||->Result<()>{if releases.contains_key(&id) || decisions.contains(&id) || held.contains_key(&id){return Err("duplicate id".into());}let value=held.remove(&decision).ok_or("unknown held decision")?;node.request_release(id.to_be_bytes().to_vec(),&value,&mut clock)?;releases.insert(id,value);Ok(())})();if let Err(e)=result{emit(json!({"id":id,"error":e.to_string()}));}},
           Ok(Control::Read{id})=>{if reads.len()>=32{emit(json!({"id":id,"error":"read queue full"}));}else{let ctx=id.to_be_bytes().to_vec();match node.read_barrier(ctx.clone()){Ok(())=>{reads.insert(ctx,id);},Err(e)=>emit(json!({"id":id,"error":e.to_string(),"leader":node.leader()}))}}},
           Ok(Control::Checkpoint)=>match node.store.checkpoint(){Ok(s)=>emit(json!({"checkpoint":s.get_metadata().index})),Err(e)=>emit(json!({"error":e.to_string()}))},
-          Ok(Control::Diagnostics)=>emit(json!({"diagnostics":node.diagnostics(),"leader":node.leader(),"is_leader":node.is_leader()})),
+          Ok(Control::Diagnostics)=>emit(json!({"diagnostics":node.diagnostics(),"leader":node.leader(),"is_leader":node.is_leader(),"authority_ready":node.is_leader() && !clock.is_fenced() && node.store.authority()?.term==node.term()})),
           Ok(Control::Campaign)=>{node.campaign()?;},
           Ok(Control::CrashNextApply{after_commit})=>{node.store.arm_apply_crash(if after_commit{store::ApplyCrash::AfterCommit}else{store::ApplyCrash::BeforeCommit})?;emit(json!({"crash_armed":true}));},
           Err(e)=>emit(json!({"error":e.to_string()})),
          }},
+        }
+        if node.is_leader() && node.term() != clock_term {
+            match node.establish_time(Vec::new(), &mut clock) {
+                Ok(()) => clock_term = node.term(),
+                Err(e) => {
+                    eprintln!("leader time unavailable: {e}");
+                    clock_term = node.term();
+                }
+            }
         }
         let output = node.drain()?;
         for m in output.messages {
@@ -91,7 +155,26 @@ async fn main() -> Result<()> {
         for a in output.applied {
             if a.context.len() == 8 {
                 let id = u64::from_be_bytes(a.context.as_slice().try_into()?);
-                emit(json!({"id":id,"applied":a.index,"reply":a.reply}));
+                if decisions.remove(&id) {
+                    let index = a.index;
+                    match node.hold(a) {
+                        Ok(value) => {
+                            held.insert(id, value);
+                            emit(json!({"id":id,"held":index}));
+                        }
+                        Err(e) => emit(json!({"id":id,"error":e.to_string()})),
+                    }
+                } else if let Some(value) = releases.remove(&id) {
+                    let result = node
+                        .release_proof(a)
+                        .and_then(|proof| node.finish_release(value, proof, &mut clock));
+                    match result {
+                        Ok(reply) => emit(json!({"id":id,"released":true,"reply":reply})),
+                        Err(e) => emit(json!({"id":id,"error":e.to_string()})),
+                    }
+                } else if !a.is_authenticated() {
+                    emit(json!({"id":id,"applied":a.index,"reply":a.reply}));
+                }
             }
         }
         for (ctx, index) in output.reads {

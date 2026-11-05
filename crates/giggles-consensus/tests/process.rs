@@ -178,7 +178,7 @@ fn find_leader(nodes: &mut BTreeMap<u64, Running>) -> u64 {
     let start = Instant::now();
     loop {
         for (id, n) in nodes.iter_mut() {
-            if n.diag()["is_leader"] == true {
+            if n.diag()["authority_ready"] == true {
                 return *id;
             }
         }
@@ -198,6 +198,142 @@ fn native_command(action: TaskAction) -> Command {
         upper: 10,
         action,
     }
+}
+
+fn control(n: &mut Running, id: u64, mut value: Value) -> Value {
+    value["id"] = json!(id);
+    n.send(value);
+    n.until(|v| v["id"] == id, Duration::from_secs(10))
+}
+fn authenticate(n: &mut Running, fingerprint: &str) -> u64 {
+    n.send(json!({"op":"authenticate","fingerprint":fingerprint}));
+    n.until(
+        |v| v.get("session").is_some() || v.get("error").is_some(),
+        Duration::from_secs(5),
+    )["session"]
+        .as_u64()
+        .expect("authentication failed")
+}
+fn native_roundtrip(n: &mut Running, id: u64, session: u64, action: TaskAction) -> Value {
+    let held = control(
+        n,
+        id,
+        json!({"op":"native_decide","session":session,"action":action}),
+    );
+    assert!(held["held"].is_u64(), "{held}");
+    control(n, id + 1, json!({"op":"native_release","decision":id}))
+}
+
+#[test]
+fn real_three_process_credential_epochs_held_output_restart_failover_and_automatic_time() {
+    use giggles_consensus::authority::Binding;
+    use giggles_core::{OperationId, Principal, TaskId};
+    let s = setup();
+    let mut nodes = BTreeMap::new();
+    for id in VOTERS {
+        nodes.insert(id, Running::start(&s.configs[&id], &s.root, 0, id));
+    }
+    nodes.get_mut(&1).unwrap().send(json!({"op":"campaign"}));
+    let leader = find_leader(&mut nodes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut g = grant(10, 10);
+    g.policy.valid_from = now - 10;
+    g.policy.expires = now + 3600;
+    for (i,command) in [admin(json!({"command":"seed","key":key(0),"row":row()})),admin(json!({"command":"grant","grant":g})),admin(json!({"command":"provision_task_resources","task":1,"limits":{"read_rows":10000,"disclosed_rows":20,"encoded_bytes":100000}}))].into_iter().enumerate(){assert_eq!(nodes.get_mut(&leader).unwrap().request(3000+i as u64,command)["reply"]["code"],0);}
+    let b = Binding {
+        fingerprint: format!("{:064x}", 1),
+        domain: 42,
+        task: TaskId(1),
+        principal: Principal(2),
+    };
+    let b2 = Binding {
+        fingerprint: format!("{:064x}", 2),
+        ..b.clone()
+    };
+    let n = nodes.get_mut(&leader).unwrap();
+    assert_eq!(
+        control(
+            n,
+            3010,
+            json!({"op":"reload_credentials","expected":0,"bindings":[b,b2]})
+        )["reply"]["data"]["epoch"],
+        1
+    );
+    let session = authenticate(n, &b.fingerprint);
+    // An idle but ticking actor must not confuse lack of requests with a host
+    // pause. Exceed the default ten-second pause bound without sending control.
+    std::thread::sleep(Duration::from_secs(11));
+    let idle = native_roundtrip(n, 3090, session, TaskAction::Status(OperationId(3090)));
+    assert_eq!(idle["reply"]["data"]["code"], "absent", "{idle}");
+    let bad = control(
+        n,
+        3011,
+        json!({"op":"reload_credentials","expected":1,"bindings":[b,b]}),
+    );
+    assert!(bad["error"].is_string());
+    // Successful old session proves invalid reload did not mutate committed map.
+    let held = control(
+        n,
+        3012,
+        json!({"op":"native_decide","session":session,"action":TaskAction::Execute(request(3012,&[0]),None)}),
+    );
+    assert!(held["held"].is_u64());
+    assert_eq!(
+        control(
+            n,
+            3013,
+            json!({"op":"reload_credentials","expected":1,"bindings":[b2]})
+        )["reply"]["data"]["epoch"],
+        2
+    );
+    assert!(control(n, 3014, json!({"op":"native_release","decision":3012}))["error"].is_string());
+    assert_eq!(
+        control(
+            n,
+            3015,
+            json!({"op":"reload_credentials","expected":2,"bindings":[b,b2]})
+        )["reply"]["data"]["epoch"],
+        3
+    );
+    assert!(control(n,3016,json!({"op":"native_decide","session":session,"action":TaskAction::Status(OperationId(3012))}))["error"].is_string());
+    let session = authenticate(n, &b.fingerprint);
+    let recovered = native_roundtrip(n, 3020, session, TaskAction::Status(OperationId(3012)));
+    assert_eq!(recovered["reply"]["data"]["code"], "committed");
+    // Persist snapshots with binding metadata, then restart every executable.
+    for n in nodes.values_mut() {
+        n.send(json!({"op":"checkpoint"}));
+        n.until(|v| v.get("checkpoint").is_some(), Duration::from_secs(5));
+        n.kill();
+    }
+    drop(nodes);
+    let mut nodes = BTreeMap::new();
+    for id in VOTERS {
+        nodes.insert(id, Running::start(&s.configs[&id], &s.root, 1, id));
+    }
+    let leader = find_leader(&mut nodes);
+    let n = nodes.get_mut(&leader).unwrap();
+    let session = authenticate(n, &b.fingerprint);
+    assert_eq!(
+        native_roundtrip(n, 3030, session, TaskAction::Status(OperationId(3012)))["reply"]["data"]
+            ["code"],
+        "committed"
+    );
+    // Hold charged output, kill leader, recover receipt through new term's clock.
+    assert!(control(n,3032,json!({"op":"native_decide","session":session,"action":TaskAction::Status(OperationId(3012))}))["held"].is_u64());
+    n.kill();
+    drop(nodes.remove(&leader));
+    let successor = find_leader(&mut nodes);
+    let n = nodes.get_mut(&successor).unwrap();
+    let session = authenticate(n, &b2.fingerprint);
+    assert_eq!(
+        native_roundtrip(n, 3040, session, TaskAction::Status(OperationId(3012)))["reply"]["data"]
+            ["code"],
+        "committed"
+    );
+    std::fs::write(s.root.join("authority-checker.txt"),"PASS: atomic invalid reload; overlap; revoke/readd ABA; denied release preserves mutation/receipt; snapshot full restart; held leader loss; automatic OS time on each leader. Trusted stdin only, no external listener qualification.\n").unwrap();
 }
 
 #[test]
