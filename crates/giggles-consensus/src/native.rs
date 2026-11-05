@@ -91,17 +91,17 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, b: &[u8]) -> Result<(
     w.flush().await?;
     Ok(())
 }
-fn chain(p: &PathBuf) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn chain(p: &PathBuf) -> Result<Vec<CertificateDer<'static>>> {
     Ok(
         rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(p)?))
             .collect::<std::io::Result<_>>()?,
     )
 }
-fn key(p: &PathBuf) -> Result<PrivateKeyDer<'static>> {
+pub(crate) fn key(p: &PathBuf) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut BufReader::new(std::fs::File::open(p)?))?
         .ok_or_else(|| "missing key".into())
 }
-fn roots(p: &PathBuf) -> Result<RootCertStore> {
+pub(crate) fn roots(p: &PathBuf) -> Result<RootCertStore> {
     let mut r = RootCertStore::empty();
     for c in chain(p)? {
         r.add(c)?;
@@ -117,6 +117,32 @@ pub struct Released {
     pub reply: Reply,
     pub permit: OwnedSemaphorePermit,
 }
+#[derive(Default)]
+pub struct Cancellation {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+impl Cancellation {
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub async fn wait(&self) {
+        loop {
+            let n = self.notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            n.await;
+        }
+    }
+}
 pub enum Event {
     Authenticate {
         fingerprint: String,
@@ -126,6 +152,7 @@ pub enum Event {
     Decide {
         session: Session,
         action: TaskAction,
+        cancellation: Option<Arc<Cancellation>>,
         deadline: Instant,
         permit: OwnedSemaphorePermit,
         reply: oneshot::Sender<std::result::Result<Ready, &'static str>>,
@@ -216,12 +243,16 @@ impl Actor {
             Event::Decide {
                 session,
                 action,
+                cancellation,
                 deadline,
                 permit,
                 reply,
             } => {
                 let result = (|| -> Result<Vec<u8>> {
-                    if Instant::now() >= deadline || reply.is_closed() {
+                    if Instant::now() >= deadline
+                        || reply.is_closed()
+                        || cancellation.as_ref().is_some_and(|c| c.is_cancelled())
+                    {
                         return Err("deadline".into());
                     }
                     if self.pending.len() >= MAX_PENDING {
@@ -229,7 +260,9 @@ impl Actor {
                     }
                     let ctx = self.context()?;
                     node.decide_when(ctx.clone(), &session, action, clock, || {
-                        Instant::now() < deadline && !reply.is_closed()
+                        Instant::now() < deadline
+                            && !reply.is_closed()
+                            && !cancellation.as_ref().is_some_and(|c| c.is_cancelled())
                     })?;
                     Ok(ctx)
                 })();
@@ -246,11 +279,15 @@ impl Actor {
                         );
                     }
                     Err(_) => {
-                        let _ = reply.send(Err(if Instant::now() >= deadline {
-                            "deadline_before_submission"
-                        } else {
-                            "unavailable"
-                        }));
+                        let _ = reply.send(Err(
+                            if Instant::now() >= deadline
+                                || cancellation.as_ref().is_some_and(|c| c.is_cancelled())
+                            {
+                                "deadline_before_submission"
+                            } else {
+                                "unavailable"
+                            },
+                        ));
                     }
                 }
             }
@@ -360,6 +397,55 @@ pub async fn bind(
     peers: BTreeSet<String>,
     events: mpsc::Sender<Event>,
 ) -> Result<()> {
+    bind_shared(config, peers, events, Limits::default()).await
+}
+/// Shared across external transports; no independently spendable admission pool.
+#[derive(Clone)]
+pub struct Limits {
+    pub sessions: Arc<Semaphore>,
+    pub requests: Arc<Semaphore>,
+    rate: Arc<std::sync::Mutex<(Instant, u32)>>,
+    work_rate: Arc<std::sync::Mutex<(Instant, u32)>>,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
+            requests: Arc::new(Semaphore::new(MAX_PENDING)),
+            rate: Arc::new(std::sync::Mutex::new((Instant::now(), 0))),
+            work_rate: Arc::new(std::sync::Mutex::new((Instant::now(), 0))),
+        }
+    }
+}
+impl Limits {
+    pub fn work(&self) -> bool {
+        let Ok(mut r) = self.work_rate.lock() else {
+            return false;
+        };
+        if r.0.elapsed() >= Duration::from_secs(1) {
+            *r = (Instant::now(), 0);
+        }
+        r.1 = r.1.saturating_add(1);
+        r.1 <= 128
+    }
+    pub fn accept(&self) -> Option<OwnedSemaphorePermit> {
+        let mut r = self.rate.lock().ok()?;
+        if r.0.elapsed() >= Duration::from_secs(1) {
+            *r = (Instant::now(), 0);
+        }
+        r.1 = r.1.saturating_add(1);
+        if r.1 > 128 {
+            return None;
+        }
+        self.sessions.clone().try_acquire_owned().ok()
+    }
+}
+pub async fn bind_shared(
+    config: Configuration,
+    peers: BTreeSet<String>,
+    events: mpsc::Sender<Event>,
+    limits: Limits,
+) -> Result<()> {
     let verifier =
         rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(&config.ca)?)).build()?;
     let mut server = ServerConfig::builder()
@@ -368,24 +454,12 @@ pub async fn bind(
     server.alpn_protocols = vec![b"giggles-native/1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(server));
     let listener = TcpListener::bind(&config.listen).await?;
-    let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
-    let requests = Arc::new(Semaphore::new(MAX_PENDING));
+    let requests = limits.requests.clone();
     let peers = Arc::new(peers);
     tokio::spawn(async move {
-        let mut rate_start = Instant::now();
-        let mut accepts = 0;
         while let Ok((tcp, _)) = listener.accept().await {
-            // Receipt includes any delay before the connection task is scheduled.
             let receipt = Instant::now();
-            if rate_start.elapsed() >= Duration::from_secs(1) {
-                rate_start = Instant::now();
-                accepts = 0;
-            }
-            accepts += 1;
-            if accepts > 128 {
-                continue;
-            }
-            let Ok(permit) = sessions.clone().try_acquire_owned() else {
+            let Some(permit) = limits.accept() else {
                 continue;
             };
             let acceptor = acceptor.clone();
@@ -393,6 +467,7 @@ pub async fn bind(
             let events = events.clone();
             let requests = requests.clone();
             let peers = peers.clone();
+            let limits = limits.clone();
             tokio::spawn(async move {
                 let _session = permit;
                 let ceiling = receipt + Duration::from_millis(MAX_DEADLINE_MS);
@@ -443,6 +518,9 @@ pub async fn bind(
                         verifier
                             .verify_client_cert(leaf, &certs[1..], UnixTime::now())
                             .map_err(|_| "certificate no longer valid")?;
+                        if !limits.work() {
+                            return Ok(Response::error(request.id, "capacity"));
+                        }
                         let permit = match requests.try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
@@ -457,6 +535,7 @@ pub async fn bind(
                             .try_send(Event::Decide {
                                 session,
                                 action: request.action,
+                                cancellation: None,
                                 deadline,
                                 permit,
                                 reply: tx,
@@ -588,4 +667,29 @@ pub async fn call(config: &ClientConfiguration, request: &Request) -> Result<Res
         return Ok(Response::error(request.id, "indeterminate"));
     }
     last.ok_or_else(|| "indeterminate: resolve original OperationId against quorum".into())
+}
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn transports_clone_one_session_work_and_rate_pool() {
+        let native = Limits::default();
+        let pg = native.clone();
+        let sessions = (0..MAX_SESSIONS)
+            .map(|_| native.accept().unwrap())
+            .collect::<Vec<_>>();
+        assert!(pg.accept().is_none());
+        drop(sessions);
+        assert!(pg.accept().is_some());
+        let work = (0..MAX_PENDING)
+            .map(|_| native.requests.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(pg.requests.clone().try_acquire_owned().is_err());
+        drop(work);
+        for i in 0..128 {
+            assert!(if i % 2 == 0 { native.work() } else { pg.work() });
+        }
+        assert!(!native.work());
+        assert!(!pg.work());
+    }
 }

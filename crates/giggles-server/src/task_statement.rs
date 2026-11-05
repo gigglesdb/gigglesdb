@@ -7,13 +7,13 @@ use giggles_core::{
 type R<T> = Result<T, &'static str>;
 
 #[derive(Clone, Copy)]
-pub(crate) enum TaskStatement {
+pub enum TaskStatement {
     Status,
     Key { execute: bool },
     Range { execute: bool },
 }
 impl TaskStatement {
-    pub(crate) fn parse(sql: &str) -> R<Self> {
+    pub fn parse(sql: &str) -> R<Self> {
         if sql.len() > 4096 {
             return Err("54000");
         }
@@ -58,7 +58,7 @@ impl TaskStatement {
         }
         Ok(plan)
     }
-    pub(crate) fn description(self) -> Description {
+    pub fn description(self) -> Description {
         use DataType::*;
         let parameters = match self {
             Self::Status => vec![Bytes],
@@ -87,7 +87,7 @@ impl TaskStatement {
             }],
         }
     }
-    pub(crate) fn bind(self, p: &[Value]) -> R<Request> {
+    pub fn bind(self, p: &[Value]) -> R<Request> {
         if p.len() != self.description().parameters.len() {
             return Err("08P01");
         }

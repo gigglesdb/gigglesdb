@@ -192,3 +192,21 @@ SQL/RepairSql, broader P3 operations and external qualification remain unfinishe
 GD16's five-second sample-to-quorum timing assumption is still not enforced by
 asynchronous consensus. Fresh quorum release is requested at socket write
 readiness; a later post-check pause before delivery remains possible.
+
+## bounded pgwire TASK listener
+
+Optional `pgwire` config enables a separate SSLRequest+mTLS TASK listener sharing
+the native consensus actor, current authority, accounting and fresh quorum
+release. Simple GIGGLES envelopes and typed prepared STATUS/PREVIEW/EXECUTE
+KEY/RANGE are implemented; every Execute re-enters consensus. Authenticated
+CancelRequest has certificate/epoch-bound random keys and perquery contexts.
+See [Design documentation](https://app.archdocs.io/design-docs/9764877f-7152-4998-9df9-af1ab0eac3eb) for config, driver examples,
+SQLSTATEs, bounds, verification and conditional timing/uncertainty limits.
+
+```powershell
+cargo test --test process external_pgwire -- --nocapture
+```
+
+Historical statements above listing all distributed pgwire as missing now apply
+to application SQL/RepairSql/Ping and broader operational work. This is a declared
+TASK subset, without full PostgreSQL or production/cloud compatibility claims.

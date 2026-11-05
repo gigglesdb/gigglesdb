@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+giggles-server = { path = "../giggles-server" }
 giggles-core = { path = "../giggles-core" }
 raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
 protobuf = "=2.28.0"
@@ -21,3 +22,6 @@ hex = "0.4"
 
 [dev-dependencies]
 rcgen = "0.13"
+
+tokio-postgres = "=0.7.15"
+tokio-postgres-rustls = "0.13"

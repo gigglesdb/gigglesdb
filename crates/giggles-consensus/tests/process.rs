@@ -31,6 +31,7 @@ impl Running {
         let mut child = Process::new(env!("CARGO_BIN_EXE_giggles-node"))
             .arg(path)
             .env("GIGGLES_NATIVE_TEST_HOOK_ROOT", root.join("native-hooks"))
+            .env("GIGGLES_PGWIRE_TEST_HOOK_ROOT", root.join("pgwire-hooks"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(err)
@@ -150,6 +151,7 @@ fn setup() -> Setup {
             ca: root.join("ca.pem"),
             peers: peers.clone(),
             task: None,
+            pgwire: None,
         };
         let path = root.join(format!("node-{id}.json"));
         std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -985,6 +987,7 @@ async fn external_native_lost_response_failover_status_old_leader_and_no_quorum(
         4,
     );
     let follower = VOTERS.into_iter().find(|i| *i != leader).unwrap();
+    wait_binding(nodes.get_mut(&follower).unwrap(), &n.binding.fingerprint);
     assert_eq!(
         nc(
             &n,
@@ -1742,3 +1745,5 @@ async fn external_native_isolated_old_leader_held_term_and_configured_node_retry
     );
     std::fs::write(n.s.root.join("external-isolated-leader-checker.txt"),"PASS actual peer-isolated old leader withheld current data and held output; remaining majority elected; same caller ID on new origin; configured follower->leader retry original business operation exactly once.\n").unwrap();
 }
+
+include!("pgwire_process.inc");

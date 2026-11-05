@@ -27,27 +27,27 @@ pub async fn ssl_request<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> io::Re
     .await
     .map_err(io::Error::other)?
 }
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
+pub struct Reader<'a> {
+    pub b: &'a [u8],
+    pub at: usize,
 }
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> R<&'a [u8]> {
+    pub fn take(&mut self, n: usize) -> R<&'a [u8]> {
         let end = self.at.checked_add(n).ok_or("08P01")?;
         let b = self.b.get(self.at..end).ok_or("08P01")?;
         self.at = end;
         Ok(b)
     }
-    fn byte(&mut self) -> R<u8> {
+    pub fn byte(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> R<usize> {
+    pub fn u16(&mut self) -> R<usize> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as usize)
     }
-    fn u32(&mut self) -> R<u32> {
+    pub fn u32(&mut self) -> R<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn text(&mut self) -> R<String> {
+    pub fn text(&mut self) -> R<String> {
         let n = self.b[self.at..]
             .iter()
             .position(|b| *b == 0)
@@ -55,7 +55,7 @@ impl<'a> Reader<'a> {
         let b = self.take(n + 1)?;
         String::from_utf8(b[..n].to_vec()).map_err(|_| "22021")
     }
-    fn end(&self) -> R<()> {
+    pub fn end(&self) -> R<()> {
         if self.at == self.b.len() {
             Ok(())
         } else {
@@ -63,7 +63,7 @@ impl<'a> Reader<'a> {
         }
     }
 }
-fn frame(tag: u8, b: &[u8], out: &mut Vec<u8>) -> R<()> {
+pub fn frame(tag: u8, b: &[u8], out: &mut Vec<u8>) -> R<()> {
     let len = b.len().checked_add(4).ok_or("54000")?;
     let total = out
         .len()
@@ -78,7 +78,7 @@ fn frame(tag: u8, b: &[u8], out: &mut Vec<u8>) -> R<()> {
     out.extend(b);
     Ok(())
 }
-fn z(s: &str, b: &mut Vec<u8>) {
+pub fn z(s: &str, b: &mut Vec<u8>) {
     b.extend(s.as_bytes());
     b.push(0);
 }
@@ -95,7 +95,7 @@ fn ready(session: &Session, out: &mut Vec<u8>) -> R<()> {
         out,
     )
 }
-fn error(code: &str, out: &mut Vec<u8>) {
+pub fn error(code: &str, out: &mut Vec<u8>) {
     out.clear();
     let mut b = vec![b'S'];
     z("ERROR", &mut b);
@@ -106,7 +106,7 @@ fn error(code: &str, out: &mut Vec<u8>) {
     b.push(0);
     let _ = frame(b'E', &b, out);
 }
-fn oid(t: &DataType) -> u32 {
+pub fn oid(t: &DataType) -> u32 {
     match t {
         DataType::Boolean => 16,
         DataType::SmallInt => 21,
@@ -125,14 +125,14 @@ fn size(t: &DataType) -> i16 {
         _ => -1,
     }
 }
-fn format_at(formats: &[u16], i: usize) -> u16 {
+pub fn format_at(formats: &[u16], i: usize) -> u16 {
     if formats.len() == 1 {
         formats[0]
     } else {
         *formats.get(i).unwrap_or(&0)
     }
 }
-fn formats(r: &mut Reader<'_>, count: usize) -> R<Vec<u16>> {
+pub fn formats(r: &mut Reader<'_>, count: usize) -> R<Vec<u16>> {
     let n = r.u16()?;
     if n != 0 && n != 1 && n != count {
         return Err("08P01");
@@ -147,7 +147,7 @@ fn formats(r: &mut Reader<'_>, count: usize) -> R<Vec<u16>> {
     }
     Ok(v)
 }
-fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R<()> {
+pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R<()> {
     if d.columns.is_empty() {
         return frame(b'n', &[], out);
     }
@@ -164,7 +164,7 @@ fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R<()>
     }
     frame(b'T', &b, out)
 }
-fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
+pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {

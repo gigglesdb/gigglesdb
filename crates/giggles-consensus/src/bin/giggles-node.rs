@@ -71,18 +71,37 @@ async fn run() -> Result<()> {
     let mut node = Node::new(store)?;
     let (events, mut incoming) = mpsc::channel(64);
     let (native_events, mut native_input) = mpsc::channel(32);
+    let limits = native::Limits::default();
     if let Some(task) = config.task.clone() {
         if task.listen == config.listen {
             return Err("task and peer listeners must differ".into());
         }
-        native::bind(
+        native::bind_shared(
             task,
             config
                 .peers
                 .values()
                 .map(|p| p.fingerprint.clone())
                 .collect(),
+            native_events.clone(),
+            limits.clone(),
+        )
+        .await?;
+    }
+    if let Some(pg) = config.pgwire.clone() {
+        if pg.listen == config.listen || config.task.as_ref().is_some_and(|t| t.listen == pg.listen)
+        {
+            return Err("external and peer listeners must differ".into());
+        }
+        pgwire::bind(
+            pg,
+            config
+                .peers
+                .values()
+                .map(|p| p.fingerprint.clone())
+                .collect(),
             native_events,
+            limits,
         )
         .await?;
     }

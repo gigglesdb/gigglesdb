@@ -2,6 +2,7 @@
 pub mod authority;
 pub mod native;
 pub mod node;
+pub mod pgwire;
 pub mod store;
 pub mod transport;
 pub use giggles_core::replica::{Command, Image, TaskAction};
