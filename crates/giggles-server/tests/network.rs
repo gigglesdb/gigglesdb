@@ -1753,3 +1753,6 @@ async fn extended_rollback_recovers_an_aborted_transaction() {
     conn.await.unwrap();
     f.stop().await;
 }
+
+#[path = "cancellation_network.inc"]
+mod cancellation_network;

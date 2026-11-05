@@ -32,7 +32,8 @@ pub struct Binding {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Request {
-    /// Relative pre-dispatch budget. It is never a certified time assertion.
+    /// Relative cooperative decision budget, measured from frame receipt.
+    /// It is never a certified time assertion or proof a previous attempt rolled back.
     Deadline {
         budget_ms: u64,
         request: Box<Request>,
@@ -129,6 +130,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::Aborted) => "25P02",
         CoreError::Sql(S::Overflow) => "22003",
+        CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
         _ => "XX000",
@@ -136,6 +138,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
 }
 pub struct Service {
     pub(crate) blocking: crate::blocking::Blocking,
+    pub(crate) cancellations: crate::cancel::Registry,
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
@@ -173,6 +176,7 @@ impl Service {
         }
         Ok(Arc::new(Self {
             blocking: crate::blocking::Blocking::new(),
+            cancellations: crate::cancel::Registry::default(),
             task_gate: std::sync::Mutex::new(()),
             admin,
             clock,
@@ -188,6 +192,7 @@ impl Service {
         Ok(Session {
             service: self.clone(),
             role,
+            fingerprint: fingerprint.to_owned(),
             sql: self.admin.sql_session(),
         })
     }
@@ -195,6 +200,7 @@ impl Service {
 pub struct Session {
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
+    pub(crate) fingerprint: String,
     pub(crate) sql: SqlSession,
 }
 impl Session {
@@ -262,6 +268,15 @@ impl Session {
         self.handle_received(request, std::time::Instant::now())
     }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
+        let context = Cancellation::current().unwrap_or_default();
+        context.scope(|| self.handle_scoped(request, received, &context))
+    }
+    fn handle_scoped(
+        &mut self,
+        request: Request,
+        received: std::time::Instant,
+        context: &Cancellation,
+    ) -> Response {
         let (request, budget) = match request {
             Request::Deadline { budget_ms, request } => {
                 if budget_ms > 10_000 || matches!(*request, Request::Deadline { .. }) {
@@ -272,20 +287,38 @@ impl Session {
             }
             request => (request, None),
         };
+        if let Some(budget) = budget {
+            context.deadline(received + budget);
+        }
+        let operation = match &request {
+            Request::Execute { request, .. } => Some(request.operation),
+            Request::RepairSql { operation, .. } | Request::Status { operation } => {
+                Some(*operation)
+            }
+            _ => None,
+        };
         // Keep time issuance in decision order across both transports. Core
         // still revalidates revoke/expiry atomically; this gate adds no authority.
         let service = self.service.clone();
         let _gate = if matches!(self.role, Role::Task { .. }) {
-            match service.task_gate.lock() {
+            match giggles_core::cancellation::lock(&service.task_gate) {
                 Ok(g) => Some(g),
-                Err(_) => return Response::code("55000"),
+                Err(e) => {
+                    return Response {
+                        operation,
+                        ..Response::error(&e)
+                    };
+                }
             }
         } else {
             None
         };
-        if budget.is_some_and(|b| received.elapsed() >= b) {
+        if context.check().is_err() {
             self.abort();
-            return Response::code("57014");
+            return Response {
+                operation,
+                ..Response::code("57014")
+            };
         }
         let result = (|| -> Result<Response, CoreError> {
             match request {
@@ -337,6 +370,9 @@ impl Session {
                 }
             }
         })();
-        result.unwrap_or_else(|e| Response::error(&e))
+        result.unwrap_or_else(|e| Response {
+            operation,
+            ..Response::error(&e)
+        })
     }
 }

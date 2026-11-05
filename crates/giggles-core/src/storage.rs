@@ -25,6 +25,7 @@ pub enum CoreError {
     Exists,
     Busy,
     Fenced,
+    Cancelled,
     Limit,
     Policy(Error),
     Sql(relational::SqlError),
@@ -291,6 +292,15 @@ fn validate(s: &State) -> Result<(), CoreError> {
     }
     Ok(())
 }
+/// Trusted deterministic synchronization seam, never set by network inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionPoint {
+    WaitingLock,
+    BeforeDecision,
+    Decided,
+    Committed,
+}
+type DecisionHook = Arc<dyn Fn(DecisionPoint) + Send + Sync>;
 struct Inner {
     db: Database,
     gate: Mutex<()>,
@@ -300,6 +310,7 @@ struct Inner {
     fenced: AtomicBool,
     limits: Limits,
     crash: Mutex<CrashPoint>,
+    decision_hook: Mutex<Option<DecisionHook>>,
 }
 struct Ticket<'a>(&'a AtomicUsize);
 impl Drop for Ticket<'_> {
@@ -308,7 +319,18 @@ impl Drop for Ticket<'_> {
     }
 }
 impl Inner {
+    fn decision_point(&self, point: DecisionPoint) {
+        let hook = self
+            .decision_hook
+            .lock()
+            .expect("decision hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
     fn enter_sql(&self) -> Result<Ticket<'_>, CoreError> {
+        crate::cancellation::check()?;
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
@@ -320,6 +342,7 @@ impl Inner {
         Ok(Ticket(&self.sql_operations))
     }
     fn enter(&self) -> Result<Ticket<'_>, CoreError> {
+        crate::cancellation::check()?;
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
@@ -347,7 +370,9 @@ impl Inner {
     }
     fn inspect<T>(&self, f: impl FnOnce(&State) -> Result<T, CoreError>) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
-        let _guard = self.gate.lock().map_err(|_| CoreError::Fenced)?;
+        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+            self.decision_point(DecisionPoint::WaitingLock)
+        })?;
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
@@ -360,8 +385,23 @@ impl Inner {
         &self,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
+        self.change_inner(false, f)
+    }
+    fn change_decision<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        self.change_inner(true, f)
+    }
+    fn change_inner<T>(
+        &self,
+        decision: bool,
+        f: impl FnOnce(&mut State) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
-        let _guard = self.gate.lock().map_err(|_| CoreError::Fenced)?;
+        let _guard = crate::cancellation::lock_notified(&self.gate, || {
+            self.decision_point(DecisionPoint::WaitingLock)
+        })?;
         if self.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced);
         }
@@ -392,7 +432,17 @@ impl Inner {
             if point == CrashPoint::ErrorBeforeCommit {
                 return Err(CoreError::Storage("injected before commit".into()));
             }
+            if decision {
+                self.decision_point(DecisionPoint::BeforeDecision);
+                crate::cancellation::decide()?;
+                self.decision_point(DecisionPoint::Decided);
+            } else {
+                crate::cancellation::check()?;
+            }
             tx.commit().map_err(io)?;
+            if decision {
+                self.decision_point(DecisionPoint::Committed);
+            }
             if point == CrashPoint::AfterCommit {
                 crash_now();
             }
@@ -405,6 +455,9 @@ impl Inner {
             Ok(())
         })();
         if let Err(e) = persisted {
+            if e == CoreError::Cancelled {
+                return Err(e);
+            }
             self.fenced.store(true, Ordering::Release);
             return Err(e);
         }
@@ -459,6 +512,10 @@ pub struct Executor {
     credential: Credential,
 }
 impl Admin {
+    /// Trusted test seam for deterministic local race verification. Not a wire API.
+    pub fn set_decision_hook(&self, hook: Option<Arc<dyn Fn(DecisionPoint) + Send + Sync>>) {
+        *self.inner.decision_hook.lock().expect("decision hook lock") = hook;
+    }
     /// Trusted gateway clock high-watermark, in the existing atomic metadata.
     /// This is not a wall-clock oracle; callers must establish time certainty.
     pub fn certify_server_time(&self, lower: u64, upper: u64) -> Result<(), CoreError> {
@@ -484,6 +541,7 @@ impl Admin {
                 fenced: AtomicBool::new(false),
                 limits,
                 crash: Mutex::new(CrashPoint::None),
+                decision_hook: Mutex::new(None),
             }),
         };
         a.inner.read()?;
@@ -840,7 +898,7 @@ impl Executor {
         approval: Option<ApprovalId>,
     ) -> Result<Decision, CoreError> {
         self.inner.request(&r)?;
-        self.inner.change(|s| {
+        self.inner.change_decision(|s| {
             self.auth(s)?;
             Self::current(s, self.credential.task, lower, upper)?;
             if !s
@@ -937,7 +995,7 @@ impl Executor {
         approval: Option<ApprovalId>,
     ) -> Result<Decision, CoreError> {
         self.inner.request(&r)?;
-        self.inner.change(|s| {
+        self.inner.change_decision(|s| {
             self.auth(s)?;
             if !s
                 .view
@@ -1110,7 +1168,8 @@ impl SqlSession {
                 return Err(e);
             }
         };
-        let result = self.run(p, params, expected_version);
+        let result =
+            crate::cancellation::check().and_then(|()| self.run(p, params, expected_version));
         if result.is_err() && self.staged.is_some() {
             self.aborted = true;
         }
@@ -1205,6 +1264,7 @@ impl SqlSession {
         // Reserve the complete durable/export envelope before accepting a stage.
         records(&s)?;
         if self.staged.is_some() {
+            crate::cancellation::check()?;
             self.staged = Some(s);
         } else if !p.is_read() {
             self.publish(s)?;
@@ -1212,7 +1272,7 @@ impl SqlSession {
         Ok(result)
     }
     fn publish(&self, staged: State) -> Result<(), CoreError> {
-        self.admin.inner.change(|s| {
+        self.admin.inner.change_decision(|s| {
             if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }

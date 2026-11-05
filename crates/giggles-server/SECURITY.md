@@ -39,12 +39,44 @@ assumptions. Clock uncertainty is not a certified external time service: real
 pause/skew/clock-accuracy production qualification is unfinished. Offline callers
 can advance the shared bound; an erroneous future timestamp fences remote tasks.
 
-The commit boundary is the synchronous core invocation after request validation,
-role checks and optional deadline check. Once inside core, timeout, disconnect,
-cancel or shutdown cannot undo a committed decision. No detached rollback claim
-or automatic app retry exists. Socket timeouts govern IO, not redb fsync latency.
-Native deadlines are pre-dispatch only; PostgreSQL in-flight cancellation remains
-an explicit implementation gap.
+The cancellation boundary is an atomic pending/cancelled/decided request fence
+immediately before the existing redb business commit. A cancellation that wins
+prevents publication of that invocation's business rows, task budgets, approval
+consumption and operation receipt. Trusted intermediate clock metadata may still
+advance. Once decision wins, cancellation cannot overwrite success, the original
+policy result or ambiguous storage IO. Recover task writes using the original
+OperationId/status after reopening fenced storage; a cancelled retry never proves
+that an earlier attempt rolled back. Application SQL has no new durable operation
+identifier and still requires application reconciliation after a missing ACK.
+
+Core uses an explicit synchronous Cancellation scope with panic-safe thread-local
+restoration. Trusted callers must create a fresh context per invocation and must
+not return async work or hold the scope across await. Network workers enter the
+scope only inside the owned synchronous closure. Core/service lock waits check
+cooperatively; checks do not interrupt redb/OS IO or provide a storage latency bound.
+Native Deadline includes queue wait but is discovered by decode after admission.
+PostgreSQL cancellation observes waiting admission without submitting a worker;
+started workers retain their32-pool permit through actual completion. Socket loss
+and shutdown do not set cancellation or claim rollback.
+
+PostgreSQL cancellation requires SSLRequest, mandatory mTLS and an exact configured
+leaf fingerprint, identical to the target session binding in the same Service and
+database authority. Backend PID/secret are generated from OS crypto randomness;
+PID reuse is prohibited during a Service lifetime. Historical PIDs are capped at
+65536; new backend registration then fails closed until restart. The32-bit secret
+has the protocol's fixed width; certificate authentication is an additional boundary.
+Closed socket tasks invalidate registration even if a worker continues. Wrong,
+stale, cross-certificate and idle requests have no effect and return no details.
+Fresh per-frame contexts prevent inherited cancellation. PostgreSQL has no query
+generation in CancelRequest: a delayed request can cancel a later active frame on
+the same live backend; applications must coordinate query/cancel reuse themselves.
+Pinned tokio-postgres0.7.15 cancel_query/cancel_query_raw/connect_tls sources were
+inspected and actual SSLRequest+mTLS cancellation tested. Plaintext and direct TLS
+without SSLRequest on the pg listener remain rejected.
+
+Trusted Admin::set_decision_hook is a deterministic test seam, never a network API
+or environmental switch. It can pause real lock/decision/commit paths; local race
+tests are not independent security or storage qualification.
 
 GD-0009 moves native decode/dispatch/encode and PostgreSQL frame processing
 (including prepare/describe, clock and core decisions) into a Service-shared

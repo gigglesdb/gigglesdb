@@ -17,7 +17,7 @@ is no row-level tenant sharing or generic task table grant.
 | Transactions | BEGIN / START TRANSACTION, COMMIT, ROLLBACK; abort until rollback, conflict SQLSTATE40001 | Transaction options, isolation-level SET, savepoints, distributed transactions |
 | Portals | Bounded materialized rows; Execute max_rows/suspension; close on transaction end or idle Sync | Streaming unbounded results, server cursors across transactions |
 | Task wire | Simple GIGGLES JSON envelope with explicit operation/approval IDs; same native response | Generic deliveries/application SQL, task transactions and role rebinding |
-| Cancellation | Native/task envelope pre-dispatch deadline57014, no mutation; 10s socket/handshake/read/write limits | In-flight cancellation and pg CancelRequest are unimplemented, fail closed; no BackendKeyData is advertised |
+| Cancellation | Cooperative native/task Deadline and certificate-bound pg CancelRequest/BackendKeyData; pinned tokio-postgres0.7.15 with SSLRequest+mTLS | Before-decision57014 prevents this invocation publishing; after decision success/ambiguous IO is preserved. No plaintext cancel, no query-generation guarantee, no unsafe IO interruption |
 | Outcome | Original task operation ID status/retry; bounded stable decision digest/count | General application idempotent commits/status remain absent; no exactly-once claim |
 | Driver | Actual tokio-postgres0.7.15 with tokio-postgres-rustls0.13.0 over local sockets | libpq/psql,JDBC,ODBC,ORMs, other clients or full PostgreSQL compatibility unqualified |
 
@@ -52,11 +52,15 @@ loss, real skew/suspend, full-disk stress, independent security/correctness revi
 production packaging, wider client/OS and cloud qualification remain separate.
 
 GD-0009: network synchronous work is isolated behind32 shared blocking permits.
-Native/task-simple-wire pre-dispatch deadlines include blocking admission wait.
+Native/task-simple-wire deadlines include blocking admission wait, checked after decoding.
 Wire formats, persistence and C ABI are unchanged. Rust helper `pgwire::run` now
 takes ownership of `Session` rather than a mutable borrow so it can transfer the
 session safely to a blocking worker; direct Rust callers must pass the session
 by value. No broader Rust source compatibility promise is made for this0.1 crate.
-CancelRequest remains rejected and no BackendKeyData is advertised. Cancellation
-decision fencing, prepared task envelopes and durable disclosure accounting are
-still unimplemented.
+GD-0010 adds the cancellation decision fence and authenticated CancelRequest,
+with a fresh active context per frame and crypto backend keys. See SECURITY.md
+for the delayed-packet/query-generation limit and65536-session Service lifetime
+cap. Native has no new Cancel endpoint; Deadline is its cooperative equivalent.
+Task OperationId keeps its original dedupe/status meaning; cancelled retries may
+refer to already committed operations. Prepared task envelopes and durable
+disclosure accounting remain unimplemented.

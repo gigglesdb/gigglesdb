@@ -581,7 +581,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     let blocking = session.service.blocking.clone();
     let startup = timeout(IO_TIMEOUT, async {
         let n = s.read_u32().await?;
-        if !(9..=8192).contains(&n) {
+        if !(8..=8192).contains(&n) {
             return Err(io::Error::other("startup limit"));
         }
         let mut b = vec![0; n as usize - 4];
@@ -590,6 +590,16 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     })
     .await
     .map_err(io::Error::other)??;
+    // SSLRequest and mandatory mTLS already completed, including role binding.
+    if startup.len() == 12 && startup[..4] == 80877102u32.to_be_bytes() {
+        let pid = u32::from_be_bytes(startup[4..8].try_into().unwrap());
+        let secret = u32::from_be_bytes(startup[8..12].try_into().unwrap());
+        session
+            .service
+            .cancellations
+            .cancel(&session.fingerprint, pid, secret);
+        return Ok(());
+    }
     let validate = (|| -> R<()> {
         let mut r = Reader { b: &startup, at: 0 };
         if r.u32()? != 196608 {
@@ -634,7 +644,20 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         send(s, &out).await?;
         return Ok(());
     }
+    let backend = session
+        .service
+        .cancellations
+        .register(&session.fingerprint)?;
+    struct Close(std::sync::Arc<crate::cancel::Backend>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _close = Close(backend.clone());
     frame(b'R', &0u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
+    let key = [backend.pid.to_be_bytes(), backend.secret.to_be_bytes()].concat();
+    frame(b'K', &key, &mut out).map_err(io::Error::other)?;
     for (key, value) in [
         ("server_version", "14.0"),
         ("client_encoding", "UTF8"),
@@ -671,10 +694,34 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             _ => return Ok(()),
         };
         let received = std::time::Instant::now();
-        let (returned_session, returned_state, response, keep) = blocking
-            .run(move || {
+        // Sync/Close/Terminate must remain usable for protocol recovery.
+        let active = backend.begin(matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E'));
+        let permit = match blocking.admit(&active.context).await {
+            Ok(permit) => permit,
+            Err(e) => {
+                session.abort();
                 let mut out = Vec::new();
-                let keep = match state.handle(tag, &b, &mut session, &mut out, received) {
+                error(crate::service::sqlstate(&e), &mut out);
+                if tag == b'Q' {
+                    ready(&session, &mut out).map_err(io::Error::other)?;
+                } else {
+                    state.drain = true;
+                }
+                drop(active);
+                send(s, &out).await?;
+                continue;
+            }
+        };
+        let (returned_session, returned_state, response, keep) = blocking
+            .run_admitted(permit, move || {
+                let mut out = Vec::new();
+                let keep = match active.context.scope(|| {
+                    active
+                        .context
+                        .check()
+                        .map_err(|e| crate::service::sqlstate(&e))?;
+                    state.handle(tag, &b, &mut session, &mut out, received)
+                }) {
                     Ok(keep) => Ok(keep),
                     Err(code) => {
                         session.abort();
@@ -689,6 +736,7 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                 };
+                drop(active);
                 (session, state, out, keep)
             })
             .await?;

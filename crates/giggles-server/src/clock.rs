@@ -35,9 +35,14 @@ impl Clock {
             return Err(uncertain());
         }
         let (lower, upper) = interval(now, self.skew)?;
-        if admin.certify_server_time(lower, upper).is_err() {
-            s.2 = true;
-            return Err(uncertain());
+        match admin.certify_server_time(lower, upper) {
+            Ok(()) => {}
+            // A cancelled invocation is not evidence of an uncertain host clock.
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            Err(_) => {
+                s.2 = true;
+                return Err(uncertain());
+            }
         }
         *s = (Instant::now(), now, false);
         Ok((lower, upper))
@@ -73,6 +78,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Admin::create(dir.join("db.redb"), Default::default()).unwrap()
+    }
+    #[test]
+    fn cancelled_watermark_does_not_latch_clock_uncertainty() {
+        let a = admin();
+        let c = Clock::new(0, 10).unwrap();
+        let request = giggles_core::Cancellation::default();
+        assert!(request.cancel());
+        assert_eq!(request.scope(|| c.now(&a)), Err(CoreError::Cancelled));
+        assert!(c.now(&a).is_ok());
     }
     #[test]
     fn backward_clock_latches_uncertainty() {

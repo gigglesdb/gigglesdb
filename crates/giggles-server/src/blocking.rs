@@ -1,6 +1,6 @@
 //! Service-wide admission before submission to Tokio's blocking executor.
 use std::{io, sync::Arc};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const MAX_BLOCKING: usize = 32;
 
@@ -10,6 +10,38 @@ pub(crate) struct Blocking(Arc<Semaphore>);
 impl Blocking {
     pub(crate) fn new() -> Self {
         Self(Arc::new(Semaphore::new(MAX_BLOCKING)))
+    }
+
+    /// Cancellation remains observable before any worker is submitted.
+    pub(crate) async fn admit(
+        &self,
+        context: &giggles_core::Cancellation,
+    ) -> Result<OwnedSemaphorePermit, giggles_core::CoreError> {
+        let acquire = self.0.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            context.check()?;
+            tokio::select! {
+                permit=&mut acquire => {
+                    let permit=permit.map_err(|_| giggles_core::CoreError::Busy)?;
+                    context.check()?;
+                    return Ok(permit);
+                }
+                _=tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+    }
+    pub(crate) async fn run_admitted<T: Send + 'static>(
+        &self,
+        permit: OwnedSemaphorePermit,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> io::Result<T> {
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .map_err(io::Error::other)
     }
 
     pub(crate) async fn run<T: Send + 'static>(
@@ -25,17 +57,42 @@ impl Blocking {
             .acquire_owned()
             .await
             .map_err(io::Error::other)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        })
-        .await
-        .map_err(io::Error::other)
+        self.run_admitted(permit, work).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_cancellation_while_all_permits_held_never_submits_work() {
+        let pool = super::Blocking::new();
+        let held = pool
+            .0
+            .clone()
+            .acquire_many_owned(super::MAX_BLOCKING as u32)
+            .await
+            .unwrap();
+        let registry = crate::cancel::Registry::default();
+        let backend = registry.register("bound-certificate").unwrap();
+        let active = backend.begin(true);
+        let mut waiting = Box::pin(pool.admit(&active.context));
+        pending(waiting.as_mut()).await;
+        registry.cancel("bound-certificate", backend.pid, backend.secret);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .unwrap_err(),
+            giggles_core::CoreError::Cancelled
+        );
+        assert_eq!(pool.0.available_permits(), 0);
+        drop(active);
+        drop(held);
+        let next = backend.begin(true);
+        let permit = pool.admit(&next.context).await.unwrap();
+        assert_eq!(pool.run_admitted(permit, || 42).await.unwrap(), 42);
+        assert_eq!(pool.0.available_permits(), super::MAX_BLOCKING);
+    }
     use super::*;
     use std::{
         future::Future,

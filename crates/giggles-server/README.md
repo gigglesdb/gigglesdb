@@ -62,12 +62,28 @@ typed repair Request. Approval IDs come from a separate trusted local approver.
 Remote Preview returns only count/digest; an approver independently obtains the
 exact full preview through trusted local APIs. Network clients cannot approve.
 
-An optional `{"kind":"Deadline","budget_ms":0,"request":{...}}` cancels
-before dispatch and returns 57014. Budgets are relative durations, maximum 10000ms,
-starting after a complete frame is read; frame reading has its own 10s timeout.
-One envelope only. The deadline is checked after parsing and waiting for the task
-gate, immediately before entering the synchronous operation. It cannot interrupt
-an operation that has entered core. Native clients do not automatically retry.
+An optional `{"kind":"Deadline","budget_ms":0,"request":{...}}` supplies a
+cooperative decision budget (maximum10000ms) from complete-frame receipt. Frame
+reading retains its separate10s timeout. One envelope only. Expiry before the
+atomic business decision returns57014 without that invocation publishing business
+rows, approvals, budgets or receipts. Checks include task/core lock waits and the
+final redb commit fence. Native decode still awaits blocking admission; the budget
+includes that wait and is checked once decoded, without a queue latency promise.
+After decision wins, expiry cannot replace success or ambiguous storage errors.
+No unsafe interruption or automatic retry is used. Task OperationId identifies the
+original durable operation, not the current invocation:57014 on a retry never
+proves an earlier attempt rolled back; reconcile its status.
+
+PostgreSQL BackendKeyData is generated with OS crypto randomness. Use the pinned
+driver's `cancel_token().cancel_query(...)` with the same mTLS client certificate
+and required TLS configuration. Cancel connections must negotiate SSLRequest then
+mTLS, like normal sessions. Wrong/stale keys and different certificates are silent
+no-ops; idle cancellation is not carried into the next request. PostgreSQL's wire
+packet has no per-query generation: a delayed packet can target a later active
+query on the same live backend. Keys are invalidated when the socket task ends;
+backend IDs are never reused within one Service lifetime. The historical ID set
+is capped at65536 registered sessions; exhaustion requires a Service restart.
+Socket disconnect/shutdown alone does not cancel admitted work.
 
 To use pgwire, use `tokio-postgres = "=0.7.15"` with
 `tokio-postgres-rustls = "0.13"`, require TLS, load the generated CA and app client

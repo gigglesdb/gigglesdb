@@ -348,6 +348,7 @@ dependencies = [
 name = "giggles-server"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "giggles-core",
  "hex",
  "rcgen",
