@@ -1756,3 +1756,6 @@ async fn extended_rollback_recovers_an_aborted_transaction() {
 
 #[path = "cancellation_network.inc"]
 mod cancellation_network;
+
+#[path = "prepared_network.inc"]
+mod prepared_network;

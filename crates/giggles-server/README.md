@@ -98,6 +98,13 @@ for preview/execute/repair/status (optionally Deadline). It returns one TEXT JSO
 column named `decision`. The same structured code/count/digest/operation response
 is returned natively. Task SQL never obtains a generic SqlSession.
 
+Prepared task requests use the finite typed grammar documented in
+[PREPARED_TASKS.md](PREPARED_TASKS.md). Parse, Describe and Bind return static
+metadata or validate typed values; only Execute enters task authority. Repeated
+Execute on the same portal checks current authority and returns a fresh redacted
+decision. Durable operation IDs deduplicate mutations across native, simple and
+extended requests. See [GD-0011](https://app.archdocs.io/design-docs/4a6a02da-d8a0-4f41-8141-7c26a5e6c313).
+
 ## Verification and retained evidence
 
 `./verify.ps1 -ArtifactDirectory artifacts/UNIQUE-NAME` runs fmt, warning-free

@@ -106,3 +106,15 @@ alone is not a human-readable approval review.
 Generated test CA/client/server keys are explicitly TEST-ONLY fixtures. Do not use
 them for deployment. Logs store no private keys or certificate PEM contents;
 private fixture files remain intentionally local under unique artifact folders.
+
+## Prepared task authority
+
+GD-0011 adds only the finite grammar in PREPARED_TASKS.md. Bind builds typed core
+requests without substitution; preparation and Describe expose static metadata.
+Task portals never cache decisions: each Execute re-enters current task authority,
+then rechecks current authority/time before protected output release. An expired
+postcommit response can be denied while its original durable decision stays
+committed. Native canonical payloads and approval exactness remain authoritative.
+There is no generic SQL grant or identity parameter. A repeated original ID is a
+retry, including its original durable denial; a new approved attempt needs a new
+ID. Durable cumulative rows/bytes disclosure accounting remains unimplemented.

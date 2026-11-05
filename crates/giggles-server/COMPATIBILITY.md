@@ -11,12 +11,12 @@ is no row-level tenant sharing or generic task table grant.
 | TLS/auth | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext, password fallback, unbound/wrong-CA/no certificate; CRL/online rotation remain |
 | Startup | SSLRequest then v3, fixed giggles user/database, UTF8 and application_name | Direct TLS, GSS, replication, options, alternate users/databases |
 | Simple query | One inherited statement; typed result description and text rows; empty query | Multi-statements, COPY, arbitrary SET, catalog/system SQL |
-| Extended | Parse/Bind/Describe/Execute/Sync/Close/Flush; named and unnamed objects; pipeline error drain to Sync | Extended task envelopes, COPY, arbitrary PostgreSQL syntax |
+| Extended | Parse/Bind/Describe/Execute/Sync/Close/Flush; named and unnamed objects; pipeline error drain to Sync | COPY, arbitrary PostgreSQL syntax |
 | Binding | Inferred or matching explicit OIDs; NULL; text/binary bool,int2,int4,int8,text,bytea | All other OIDs, implicit casts, text bytea escape format (only hex accepted) |
 | Describe | Parsed metadata only, without executing any write; domain/schema/transaction fences | Types not inferable from supported columns/LIMIT |
 | Transactions | BEGIN / START TRANSACTION, COMMIT, ROLLBACK; abort until rollback, conflict SQLSTATE40001 | Transaction options, isolation-level SET, savepoints, distributed transactions |
 | Portals | Bounded materialized rows; Execute max_rows/suspension; close on transaction end or idle Sync | Streaming unbounded results, server cursors across transactions |
-| Task wire | Simple GIGGLES JSON envelope with explicit operation/approval IDs; same native response | Generic deliveries/application SQL, task transactions and role rebinding |
+| Task wire | Simple GIGGLES JSON plus finite typed prepared KEY/RANGE preview/execute and STATUS; same native redaction | Generic deliveries/application SQL, task transactions and role rebinding |
 | Cancellation | Cooperative native/task Deadline and certificate-bound pg CancelRequest/BackendKeyData; pinned tokio-postgres0.7.15 with SSLRequest+mTLS | Before-decision57014 prevents this invocation publishing; after decision success/ambiguous IO is preserved. No plaintext cancel, no query-generation guarantee, no unsafe IO interruption |
 | Outcome | Original task operation ID status/retry; bounded stable decision digest/count | General application idempotent commits/status remain absent; no exactly-once claim |
 | Driver | Actual tokio-postgres0.7.15 with tokio-postgres-rustls0.13.0 over local sockets | libpq/psql,JDBC,ODBC,ORMs, other clients or full PostgreSQL compatibility unqualified |
@@ -62,5 +62,6 @@ with a fresh active context per frame and crypto backend keys. See SECURITY.md
 for the delayed-packet/query-generation limit and65536-session Service lifetime
 cap. Native has no new Cancel endpoint; Deadline is its cooperative equivalent.
 Task OperationId keeps its original dedupe/status meaning; cancelled retries may
-refer to already committed operations. Prepared task envelopes and durable
-disclosure accounting remain unimplemented.
+refer to already committed operations. GD-0011 adds typed prepared task envelopes;
+see PREPARED_TASKS.md for grammar, bounds and fresh portal replay semantics.
+Durable cumulative disclosure accounting remains unimplemented.

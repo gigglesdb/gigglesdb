@@ -267,6 +267,36 @@ impl Session {
     pub fn handle(&mut self, request: Request) -> Response {
         self.handle_received(request, std::time::Instant::now())
     }
+    /// A prepared portal never carries authority from an earlier frame. Check
+    /// current authority again after producing protected output: storage hooks
+    /// or a stalled decision may have allowed revoke/expiry before release.
+    pub(crate) fn handle_prepared_task(
+        &mut self,
+        request: Request,
+        received: std::time::Instant,
+    ) -> Response {
+        let response = self.handle_received(request, received);
+        if matches!(response.code.as_str(), "committed" | "preview" | "absent") {
+            let check = (|| {
+                // Keep fresh release-time issuance ordered with both listeners.
+                let _gate = giggles_core::cancellation::lock(&self.service.task_gate)?;
+                let (executor, time) = self.executor()?;
+                executor.status_current(
+                    response.operation.ok_or(CoreError::Limit)?,
+                    time.0,
+                    time.1,
+                )?;
+                Ok::<_, CoreError>(())
+            })();
+            if let Err(e) = check {
+                return Response {
+                    operation: response.operation,
+                    ..Response::error(&e)
+                };
+            }
+        }
+        response
+    }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
         let context = Cancellation::current().unwrap_or_default();
         context.scope(|| self.handle_scoped(request, received, &context))

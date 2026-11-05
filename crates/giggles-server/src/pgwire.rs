@@ -278,9 +278,22 @@ fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
 }
 #[derive(Clone)]
+enum Plan {
+    Sql(Prepared),
+    Task(crate::task_statement::TaskStatement),
+}
+#[derive(Clone)]
 struct Statement {
-    p: Prepared,
+    p: Plan,
     d: Description,
+}
+impl Statement {
+    fn describe(&self, session: &mut Session) -> R<Description> {
+        match &self.p {
+            Plan::Sql(p) => core(session.sql.describe(p)),
+            Plan::Task(_) => Ok(self.d.clone()),
+        }
+    }
 }
 struct Portal {
     s: Statement,
@@ -407,8 +420,20 @@ impl State {
                 if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
-                let p = core(session.prepare(&sql))?;
-                let d = core(session.sql.describe(&p))?;
+                let (p, d) = if sql
+                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                    .starts_with("GIGGLES")
+                {
+                    if !matches!(session.role, Role::Task { .. }) {
+                        return Err("42501");
+                    }
+                    let task = crate::task_statement::TaskStatement::parse(&sql)?;
+                    (Plan::Task(task), task.description())
+                } else {
+                    let p = core(session.prepare(&sql))?;
+                    let d = core(session.sql.describe(&p))?;
+                    (Plan::Sql(p), d)
+                };
                 if n > d.parameters.len() {
                     return Err("08P01");
                 }
@@ -424,7 +449,7 @@ impl State {
                 let name = r.text()?;
                 let stmt = r.text()?;
                 let s = self.statements.get(&stmt).ok_or("26000")?.clone();
-                core(session.sql.describe(&s.p))?;
+                s.describe(session)?;
                 let fmts = formats(&mut r, s.d.parameters.len())?;
                 let n = r.u16()?;
                 if n != s.d.parameters.len() {
@@ -442,6 +467,9 @@ impl State {
                             format_at(&fmts, i),
                         )?
                     });
+                }
+                if let Plan::Task(task) = s.p {
+                    task.bind(&params)?;
                 }
                 let output = formats(&mut r, s.d.columns.len())?;
                 r.end()?;
@@ -487,7 +515,7 @@ impl State {
                 match kind {
                     b'S' => {
                         let s = self.statements.get(&name).ok_or("26000")?;
-                        let d = core(session.sql.describe(&s.p))?;
+                        let d = s.describe(session)?;
                         let mut b = vec![];
                         b.extend((d.parameters.len() as u16).to_be_bytes());
                         for t in &d.parameters {
@@ -498,7 +526,7 @@ impl State {
                     }
                     b'P' => {
                         let p = self.portals.get(&name).ok_or("34000")?;
-                        let d = core(session.sql.describe(&p.s.p))?;
+                        let d = p.s.describe(session)?;
                         row_description(&d, &p.formats, out)?;
                     }
                     _ => return Err("08P01"),
@@ -513,9 +541,30 @@ impl State {
                     return Err("08P01");
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
-                core(session.sql.describe(&p.s.p))?;
+                p.s.describe(session)?;
+                // Task results are never retained in a portal. Each Execute is a
+                // fresh native invocation, including completed-portal replays.
+                if let Plan::Task(task) = p.s.p {
+                    let request = task.bind(&p.params)?;
+                    let response = session.handle_prepared_task(request, received);
+                    let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
+                    let result = SqlResult {
+                        columns: vec!["decision".into()],
+                        rows: vec![giggles_core::relational::SqlRow {
+                            values: vec![Value::Text(value)],
+                            version: 0,
+                        }],
+                        affected: 0,
+                    };
+                    rows(&result, &p.s.d, &p.formats, 0, 1, out)?;
+                    complete("SELECT", &result, out)?;
+                    return Ok(true);
+                }
+                let Plan::Sql(prepared) = &p.s.p else {
+                    unreachable!()
+                };
                 if p.result.is_none() {
-                    p.result = Some(core(session.execute_prepared(&p.s.p, &p.params))?);
+                    p.result = Some(core(session.execute_prepared(prepared, &p.params))?);
                 }
                 let result = p.result.as_ref().unwrap();
                 let end = if max == 0 {
@@ -528,7 +577,7 @@ impl State {
                 if end < result.rows.len() {
                     frame(b's', &[], out)?;
                 } else {
-                    complete(p.s.p.command(), result, out)?;
+                    complete(prepared.command(), result, out)?;
                 }
                 if was_transaction && !session.in_transaction() {
                     self.portals.clear();
