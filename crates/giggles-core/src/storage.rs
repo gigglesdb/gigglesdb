@@ -1,4 +1,5 @@
 use crate::*;
+pub mod replica;
 use bincode::Options;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
