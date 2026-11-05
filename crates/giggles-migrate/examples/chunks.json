@@ -1,0 +1,239 @@
+[
+    {
+        "id":  "capture-first",
+        "events":  [
+                       {
+                           "id":  "delete-old-message",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  2,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "tombstone",
+                                            "target":  {
+                                                           "scope":  "row",
+                                                           "key":  [
+                                                                       {
+                                                                           "type":  "int",
+                                                                           "value":  1
+                                                                       }
+                                                                   ]
+                                                       },
+                                            "timestamp":  30
+                                        },
+                           "source_position":  "opaque-cdc-token/2"
+                       },
+                       {
+                           "id":  "edited-message",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  1,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "put",
+                                            "key":  [
+                                                        {
+                                                            "type":  "int",
+                                                            "value":  2
+                                                        }
+                                                    ],
+                                            "column":  "body",
+                                            "value":  {
+                                                          "type":  "text",
+                                                          "value":  "edited"
+                                                      },
+                                            "timestamp":  20,
+                                            "expires_at":  null
+                                        },
+                           "source_position":  "opaque-cdc-token/1"
+                       },
+                       {
+                           "id":  "expired-message",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  3,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "put",
+                                            "key":  [
+                                                        {
+                                                            "type":  "int",
+                                                            "value":  3
+                                                        }
+                                                    ],
+                                            "column":  "body",
+                                            "value":  {
+                                                          "type":  "text",
+                                                          "value":  "expired"
+                                                      },
+                                            "timestamp":  25,
+                                            "expires_at":  10000000
+                                        },
+                           "source_position":  "opaque-cdc-token/3"
+                       }
+                   ]
+    },
+    {
+        "id":  "delayed-backfill",
+        "events":  [
+                       {
+                           "id":  "backfill-message",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  0,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "put",
+                                            "key":  [
+                                                        {
+                                                            "type":  "int",
+                                                            "value":  1
+                                                        }
+                                                    ],
+                                            "column":  "body",
+                                            "value":  {
+                                                          "type":  "text",
+                                                          "value":  "must stay deleted"
+                                                      },
+                                            "timestamp":  10,
+                                            "expires_at":  null
+                                        },
+                           "source_position":  "opaque-cdc-token/0"
+                       },
+                       {
+                           "id":  "backfill-edit",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  4,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "put",
+                                            "key":  [
+                                                        {
+                                                            "type":  "int",
+                                                            "value":  2
+                                                        }
+                                                    ],
+                                            "column":  "body",
+                                            "value":  {
+                                                          "type":  "text",
+                                                          "value":  "old"
+                                                      },
+                                            "timestamp":  10,
+                                            "expires_at":  null
+                                        },
+                           "source_position":  "opaque-cdc-token/4"
+                       },
+                       {
+                           "id":  "empty-attachment",
+                           "source":  "fixture-source",
+                           "stream":  "stream-A",
+                           "position":  5,
+                           "schema_epoch":  1,
+                           "topology_epoch":  1,
+                           "partition":  [
+                                             {
+                                                 "type":  "int",
+                                                 "value":  42
+                                             },
+                                             {
+                                                 "type":  "bytes",
+                                                 "value":  [
+                                                               0,
+                                                               255
+                                                           ]
+                                             }
+                                         ],
+                           "mutation":  {
+                                            "kind":  "put",
+                                            "key":  [
+                                                        {
+                                                            "type":  "int",
+                                                            "value":  2
+                                                        }
+                                                    ],
+                                            "column":  "attachment",
+                                            "value":  {
+                                                          "type":  "bytes",
+                                                          "value":  [
+
+                                                                    ]
+                                                      },
+                                            "timestamp":  20,
+                                            "expires_at":  null
+                                        },
+                           "source_position":  "opaque-cdc-token/5"
+                       }
+                   ]
+    }
+]

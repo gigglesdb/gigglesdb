@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "source": "fixture-source",
+  "table": "messages",
+  "schema_epoch": 1,
+  "topology_epoch": 1,
+  "partition_types": ["int", "bytes"],
+  "clustering_types": ["int"],
+  "clustering_order": ["desc"],
+  "columns": {"body": "text", "attachment": "bytes"},
+  "cell_semantics": {
+    "timestamp_unit": "microseconds_i64",
+    "expiry": "absolute_microseconds_exclusive",
+    "tombstone_retention": "permanent_for_rehearsal",
+    "tombstone_scopes": ["cell", "row", "partition", "range"]
+  },
+  "streams": [{"id": "stream-A", "start": 0, "end": 5}],
+  "horizon_micros": 10000000,
+  "tie_policy": "reject_ambiguous",
+  "unsupported_features": [],
+  "bounds": {"max_events": 128, "max_chunk_bytes": 48000, "max_state_bytes": 48000, "max_rows": 64}
+}
