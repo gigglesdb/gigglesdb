@@ -425,7 +425,7 @@ async fn actual_native_task_deadline_preserves_operation_approval_budget_and_sta
     let (mut native, response) = job.await.unwrap();
     f.admin.set_decision_hook(None);
     assert_eq!(response.code, "57014");
-    assert_eq!(response.operation, Some(request.operation));
+    assert_eq!(response.operation, None); // Unreserved cancellation envelope carries no task outcome.
     assert_eq!(f.admin.snapshot().unwrap(), before);
     assert_eq!(
         native
@@ -554,7 +554,7 @@ async fn actual_driver_task_repair_cancel_before_decision_has_absent_status() {
     let (pg, result) = job.await.unwrap();
     f.admin.set_decision_hook(None);
     assert_eq!(result.code, "57014");
-    assert_eq!(result.operation, Some(OperationId(9992)));
+    assert_eq!(result.operation, None); // Unreserved cancellation envelope carries no task outcome.
     assert_eq!(
         task_wire(
             &pg,

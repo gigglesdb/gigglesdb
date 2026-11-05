@@ -102,5 +102,6 @@ Tests in `tests/prepared_network.inc` use actual TLS sockets, driver metadata an
 binary binding, raw text/binary wire cases, real durable decisions and deterministic
 decision barriers. Their local evidence is not cloud, production, broad client
 compatibility or independent security qualification. Durable cumulative disclosure
-accounting remains the next scope. Certificate rotation/rate bounds and P3 are
+accounting now applies across native/simple/prepared task responses; see
+[TASK_ACCOUNTING.md](TASK_ACCOUNTING.md). Certificate rotation/rate bounds and P3 are
 not implemented here; PostgreSQL comparison CONTROL remains deferred.

@@ -118,6 +118,13 @@ fn decision(d: Result<Decision, CoreError>) -> Reply {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
+    ProvisionTaskResources {
+        task: TaskId,
+        limits: TaskResources,
+    },
+    TaskResources {
+        task: TaskId,
+    },
     Sql {
         sql: String,
         params: Vec<relational::Value>,
@@ -245,6 +252,10 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
             result(Ok(results))
         }
         AdminCommand::Catalog => result(a.catalog()),
+        AdminCommand::ProvisionTaskResources { task, limits } => {
+            result(a.provision_task_resources(task, limits))
+        }
+        AdminCommand::TaskResources { task } => result(a.task_resources(task)),
         AdminCommand::Seed { key, row } => result(a.put(key, row)),
         AdminCommand::Grant { grant } => result(a.grant(grant).map(|_| ())),
         AdminCommand::Approve {
@@ -257,7 +268,7 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
         AdminCommand::Export { path } => result(a.export(path)),
         AdminCommand::Metadata => match a.authority_metadata() {
             Ok((domain, last_time, next_approval, origin)) => Reply::ok(
-                json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"write_format":2,"durability":"immediate","engine":"redb"}),
+                json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"write_format":3,"durability":"immediate","engine":"redb"}),
             ),
             Err(e) => failure(e),
         },

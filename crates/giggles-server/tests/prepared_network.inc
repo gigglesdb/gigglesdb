@@ -1,7 +1,7 @@
 use super::*;
 use tokio_postgres::types::{ToSql, Type};
 
-async fn connect_at(
+pub(super) async fn connect_at(
     address: std::net::SocketAddr,
     config: Arc<ClientConfig>,
 ) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
@@ -25,7 +25,7 @@ async fn connect_at(
         }),
     )
 }
-fn task_service(f: &Fixture, task: u64, skew: u64) -> Arc<Service> {
+pub(super) fn task_service(f: &Fixture, task: u64, skew: u64) -> Arc<Service> {
     let cert = std::fs::read_to_string(f.path.join("task.pem")).unwrap();
     let der = rustls_pemfile::certs(&mut std::io::Cursor::new(cert))
         .next()
@@ -53,6 +53,16 @@ async fn prepared_task_expired_after_commit_withholds_output_but_preserves_origi
     g.policy.expires = now() + 3;
     let expiry = g.policy.expires;
     f.admin.grant(g).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(3),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let running = serve_pg(
         "127.0.0.1:0".parse().unwrap(),
         task_service(&f, 3, 0),
@@ -113,6 +123,16 @@ async fn prepared_task_expired_approval_at_execute_is_not_consumed() {
     g.policy.expires = now() + 2;
     let expiry = g.policy.expires;
     f.admin.grant(g).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(3),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let executor = f.admin.executor(TaskId(3), Principal(2)).unwrap();
     let preview = executor
         .preview(&repair(4851, 0..1), Time::Certified(now()))
@@ -275,6 +295,16 @@ async fn prepared_task_statement_and_portal_caps_do_not_execute_or_advance_clock
 async fn prepared_task_native_simple_extended_last_budget_race_has_one_winner() {
     let f = Fixture::new().await;
     f.admin.grant(grant(3, 42, 1, 1)).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(3),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let service = task_service(&f, 3, 0);
     let native = serve(
         "127.0.0.1:0".parse().unwrap(),
@@ -431,6 +461,16 @@ async fn prepared_task_expiry_between_metadata_execute_and_cached_replay() {
         g.policy.expires = now() + 2;
         let expiry = g.policy.expires;
         f.admin.grant(g).unwrap();
+        f.admin
+            .provision_task_resources(
+                TaskId(3),
+                giggles_core::TaskResources {
+                    read_rows: 1_000_000,
+                    disclosed_rows: 1_000_000,
+                    encoded_bytes: 1_000_000_000,
+                },
+            )
+            .unwrap();
         let running = serve_pg(
             "127.0.0.1:0".parse().unwrap(),
             task_service(&f, 3, 0),
@@ -801,7 +841,7 @@ async fn key(
     )
     .await
 }
-async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
+pub(super) async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut s = raw_tls(f, f.task.clone(), true).await;
     let mut startup = 196608u32.to_be_bytes().to_vec();
     startup.extend(b"user\0giggles\0database\0giggles\0\0");
@@ -810,7 +850,7 @@ async fn raw_task(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
     while pg_read(&mut s).await.0 != b'Z' {}
     s
 }
-fn row_response(frames: &[(u8, Vec<u8>)]) -> Response {
+pub(super) fn row_response(frames: &[(u8, Vec<u8>)]) -> Response {
     assert!(!frames.iter().any(|f| f.0 == b'E'), "{frames:?}");
     let b = &frames.iter().find(|f| f.0 == b'D').expect("decision row").1;
     assert_eq!(&b[..2], &1u16.to_be_bytes());
@@ -818,7 +858,7 @@ fn row_response(frames: &[(u8, Vec<u8>)]) -> Response {
     assert_eq!(n + 6, b.len());
     serde_json::from_slice(&b[6..]).unwrap()
 }
-async fn raw_execute(
+pub(super) async fn raw_execute(
     s: &mut tokio_rustls::client::TlsStream<TcpStream>,
     portal: &str,
     max: u32,

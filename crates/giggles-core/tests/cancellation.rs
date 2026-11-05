@@ -173,6 +173,15 @@ fn cancelled_core_lock_wait_returns_while_holder_still_owns_gate() {
 #[test]
 fn cancelled_protected_write_consumes_neither_approval_budget_nor_receipt() {
     let (_path, a, e) = fixture(6);
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000000,
+            disclosed_rows: 1000000,
+            encoded_bytes: 1000000000,
+        },
+    )
+    .unwrap();
     let r = request(71, &[0, 1, 2, 3, 4, 5]);
     let preview = e.preview_current(&r, 10, 10).unwrap();
     let approval = a
@@ -207,7 +216,17 @@ fn cancelled_protected_write_consumes_neither_approval_budget_nor_receipt() {
 #[test]
 fn postdecision_lost_ack_keeps_ambiguity_and_restart_original_status() {
     let (path, a, e) = fixture(1);
-    a.set_crash_point(CrashPoint::ErrorAfterCommit).unwrap();
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000000,
+            disclosed_rows: 1000000,
+            encoded_bytes: 1000000000,
+        },
+    )
+    .unwrap();
+    a.set_crash_point(CrashPoint::ErrorAfterDecisionCommit)
+        .unwrap();
     let (entered, release) = pause(&a, DecisionPoint::Committed);
     let executor = e.clone();
     let job = std::thread::spawn(move || {
@@ -234,6 +253,15 @@ fn postdecision_lost_ack_keeps_ambiguity_and_restart_original_status() {
 #[test]
 fn deadline_after_clock_metadata_still_prevents_business_commit() {
     let (_path, a, e) = fixture(1);
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000000,
+            disclosed_rows: 1000000,
+            encoded_bytes: 1000000000,
+        },
+    )
+    .unwrap();
     let c = Cancellation::new(Some(Instant::now() + WAIT));
     let result = c.scope(|| {
         a.certify_server_time(10, 10).unwrap();
@@ -269,6 +297,15 @@ fn expired_deadline_before_admission_and_scope_restored_after_panic() {
 #[test]
 fn cancelled_retry_does_not_erase_a_previous_committed_operation() {
     let (_path, a, e) = fixture(1);
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000000,
+            disclosed_rows: 1000000,
+            encoded_bytes: 1000000000,
+        },
+    )
+    .unwrap();
     let r = request(81, &[0]);
     let receipt = e.execute_current(r.clone(), 10, 10, None).unwrap().unwrap();
     let c = Cancellation::default();
@@ -291,6 +328,15 @@ fn cancelled_retry_does_not_erase_a_previous_committed_operation() {
 #[test]
 fn late_cancel_preserves_original_durable_policy_rejection() {
     let (_path, a, e) = fixture(6);
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000000,
+            disclosed_rows: 1000000,
+            encoded_bytes: 1000000000,
+        },
+    )
+    .unwrap();
     let r = request(82, &[0, 1, 2, 3, 4, 5]);
     let (entered, release) = pause(&a, DecisionPoint::Decided);
     let executor = e.clone();

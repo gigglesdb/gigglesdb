@@ -14,7 +14,7 @@ use std::{
     },
 };
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_v1");
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"GDEXP001";
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +78,8 @@ pub enum CrashPoint {
     BeforeAck,
     ErrorBeforeCommit,
     ErrorAfterCommit,
+    /// Skip intermediate read admissions; fail after the business/release decision.
+    ErrorAfterDecisionCommit,
 }
 /// Trusted administrative recovery test seams; never controlled by environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,7 @@ fn recovery(
 }
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
+    pub accounting: BTreeMap<TaskId, TaskAccounting>,
     pub sql: relational::Relational,
     pub view: Snapshot,
     pub last_time: u64,
@@ -126,6 +129,7 @@ struct Metadata {
 }
 fn empty(domain: u128) -> State {
     State {
+        accounting: BTreeMap::new(),
         sql: Default::default(),
         view: Snapshot {
             domain,
@@ -149,6 +153,9 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
 }
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let mut out = BTreeMap::new();
+    for (task, account) in &s.accounting {
+        out.insert(key(6, &[task.0]), encode(account)?);
+    }
     out.insert(vec![5], encode(&s.sql)?);
     out.insert(
         vec![0],
@@ -199,12 +206,12 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    if m.format != FORMAT && m.format != 1 {
+    if ![1, 2, FORMAT].contains(&m.format) {
         return Err(CoreError::Unsupported);
     }
     let mut s = empty(m.domain);
     match records.get(&vec![5]) {
-        Some(v) if m.format == FORMAT => s.sql = decode(v)?,
+        Some(v) if m.format >= 2 => s.sql = decode(v)?,
         None if m.format == 1 => {}
         _ => {
             return Err(CoreError::Corrupt(
@@ -224,6 +231,9 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             Ok(u64::from_be_bytes(b.try_into().expect("length")))
         };
         match k.first() {
+            Some(6) if k.len() == 9 && m.format == FORMAT => {
+                s.accounting.insert(TaskId(num(1)?), decode(&v)?);
+            }
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
             Some(1) if k.len() == 17 => {
@@ -257,6 +267,11 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
     Ok(s)
 }
 fn validate(s: &State) -> Result<(), CoreError> {
+    for (task, account) in &s.accounting {
+        if !s.view.tasks.contains_key(task) || !account.used.fits(account.limits) {
+            return Err(CoreError::Corrupt("task accounting invariant".into()));
+        }
+    }
     s.sql
         .validate()
         .map_err(|e| CoreError::Corrupt(format!("relational invariant: {e:?}")))?;
@@ -410,12 +425,40 @@ impl Inner {
         })?;
         // Logical errors can still advance the trusted monotonic decision clock.
         let result = f(&mut s);
+        self.persist(&mut s, decision)?;
+        result
+    }
+    /// Hold authority serialization across durable read admission and evaluation.
+    fn change_accounted<T>(
+        &self,
+        decision: bool,
+        admission: impl FnOnce(&mut State) -> Result<(), CoreError>,
+        work: impl FnOnce(&mut State) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        let _ticket = self.enter()?;
+        let _guard = crate::cancellation::lock(&self.gate)?;
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(CoreError::Fenced);
+        }
+        let mut s = self.read().inspect_err(|_| {
+            self.fenced.store(true, Ordering::Release);
+        })?;
+        let admitted = admission(&mut s);
+        // This write does not decide the business operation. A cancelled or lost
+        // invocation can consume read work but cannot publish an unreserved read.
+        self.persist(&mut s, false)?;
+        admitted?;
+        let result = work(&mut s);
+        self.persist(&mut s, decision)?;
+        result
+    }
+    fn persist(&self, s: &mut State, decision: bool) -> Result<(), CoreError> {
         s.sql.generation = s
             .sql
             .generation
             .checked_add(1)
             .ok_or(CoreError::Sql(relational::SqlError::Overflow))?;
-        let values = records(&s)?;
+        let values = records(s)?;
         let point = *self.crash.lock().map_err(|_| CoreError::Fenced)?;
         let persisted = (|| {
             let mut tx = self.db.begin_write().map_err(io)?;
@@ -446,7 +489,9 @@ impl Inner {
             if point == CrashPoint::AfterCommit {
                 crash_now();
             }
-            if point == CrashPoint::ErrorAfterCommit {
+            if point == CrashPoint::ErrorAfterCommit
+                || (decision && point == CrashPoint::ErrorAfterDecisionCommit)
+            {
                 return Err(CoreError::Storage("injected lost commit response".into()));
             }
             if point == CrashPoint::BeforeAck {
@@ -461,7 +506,7 @@ impl Inner {
             self.fenced.store(true, Ordering::Release);
             return Err(e);
         }
-        result
+        Ok(())
     }
     fn request(&self, r: &Request) -> Result<(), CoreError> {
         if let Selection::Keys(k) = &r.selection
@@ -512,6 +557,33 @@ pub struct Executor {
     credential: Credential,
 }
 impl Admin {
+    /// One-time trusted provisioning. A task's counters and caps cannot be reset.
+    /// Missing provisioning (including legacy formats) denies remote disclosure.
+    pub fn provision_task_resources(
+        &self,
+        task: TaskId,
+        limits: TaskResources,
+    ) -> Result<(), CoreError> {
+        self.inner.change(|s| {
+            if !s.view.tasks.contains_key(&task) {
+                return Err(CoreError::Policy(Error::UnknownTask));
+            }
+            if s.accounting.contains_key(&task) {
+                return Err(CoreError::Policy(Error::TaskExists));
+            }
+            s.accounting.insert(
+                task,
+                TaskAccounting {
+                    limits,
+                    used: TaskResources::default(),
+                },
+            );
+            Ok(())
+        })
+    }
+    pub fn task_resources(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
+        self.inner.inspect(|s| Ok(s.accounting.get(&task).copied()))
+    }
     /// Trusted test seam for deterministic local race verification. Not a wire API.
     pub fn set_decision_hook(&self, hook: Option<Arc<dyn Fn(DecisionPoint) + Send + Sync>>) {
         *self.inner.decision_hook.lock().expect("decision hook lock") = hook;
@@ -819,7 +891,7 @@ impl Admin {
         let mut header = [0u8; 52];
         f.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC
-            || ![1, FORMAT].contains(&u32::from_be_bytes(
+            || ![1, 2, FORMAT].contains(&u32::from_be_bytes(
                 header[8..12].try_into().expect("length"),
             ))
         {
@@ -835,6 +907,14 @@ impl Admin {
             return Err(CoreError::Corrupt("export checksum".into()));
         }
         let values: BTreeMap<Vec<u8>, Vec<u8>> = decode(&payload)?;
+        let metadata: Metadata = decode(
+            values
+                .get(&vec![0])
+                .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
+        )?;
+        if metadata.format != u32::from_be_bytes(header[8..12].try_into().expect("length")) {
+            return Err(CoreError::Corrupt("export format mismatch".into()));
+        }
         if encode(&values)? != payload {
             return Err(CoreError::Corrupt("noncanonical export".into()));
         }
@@ -874,6 +954,68 @@ impl Admin {
     }
 }
 impl Executor {
+    fn debit(s: &mut State, task: TaskId, debit: TaskResources) -> Result<(), CoreError> {
+        let a = s
+            .accounting
+            .get_mut(&task)
+            .ok_or(CoreError::Policy(Error::Budget))?;
+        a.used = a.used.add(debit, a.limits)?;
+        Ok(())
+    }
+    fn read_debit(s: &mut State, task: TaskId, r: &Request) -> Result<(), CoreError> {
+        // Covers both selection_bound and enumerate. Charge even on rejection.
+        let selected = match &r.selection {
+            Selection::Keys(keys) => u64::try_from(keys.len()).map_err(|_| CoreError::Limit)?,
+            Selection::Predicate { .. } => u64::try_from(s.view.rows.len())
+                .ok()
+                .and_then(|n| n.checked_mul(3))
+                .and_then(|n| n.checked_add(1))
+                .ok_or(CoreError::Limit)?,
+        };
+        let cached = s
+            .view
+            .operations
+            .get(&(task, r.operation))
+            .and_then(|b| b.decision.as_ref().ok())
+            .map_or(0, |r| r.effects.len());
+        let rows = selected.max(
+            u64::try_from(cached)
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .ok_or(CoreError::Limit)?,
+        );
+        Self::debit(
+            s,
+            task,
+            TaskResources {
+                read_rows: rows.max(1),
+                ..Default::default()
+            },
+        )
+    }
+    /// Trusted gateway release primitive: reserve immutable encoded content before
+    /// publishing it. Successful reservations are never refunded or deduplicated.
+    /// The caller must provide a fresh trusted interval and a safe encoded bound.
+    pub fn reserve_disclosure(
+        &self,
+        encoded_bytes: u64,
+        lower: u64,
+        upper: u64,
+    ) -> Result<(), CoreError> {
+        self.inner.change_decision(|s| {
+            self.auth(s)?;
+            Self::current(s, self.credential.task, lower, upper)?;
+            Self::debit(
+                s,
+                self.credential.task,
+                TaskResources {
+                    disclosed_rows: 1,
+                    encoded_bytes,
+                    ..Default::default()
+                },
+            )
+        })
+    }
     fn current(s: &mut State, task: TaskId, lower: u64, upper: u64) -> Result<(), CoreError> {
         if lower > upper {
             return Err(CoreError::Policy(Error::UncertainTime));
@@ -898,24 +1040,34 @@ impl Executor {
         approval: Option<ApprovalId>,
     ) -> Result<Decision, CoreError> {
         self.inner.request(&r)?;
-        self.inner.change_decision(|s| {
-            self.auth(s)?;
-            Self::current(s, self.credential.task, lower, upper)?;
-            if !s
-                .view
-                .operations
-                .contains_key(&(self.credential.task, r.operation))
-            {
-                self.inner.selection_bound(s, self.credential.task, &r)?;
-            }
-            Ok(policy::execute(
-                s,
-                self.credential.task,
-                r,
-                Time::Certified(upper),
-                approval,
-            ))
-        })
+        let admission_request = r.clone();
+        self.inner.change_accounted(
+            true,
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                Self::read_debit(s, self.credential.task, &admission_request)?;
+                Ok(())
+            },
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                if !s
+                    .view
+                    .operations
+                    .contains_key(&(self.credential.task, r.operation))
+                {
+                    self.inner.selection_bound(s, self.credential.task, &r)?;
+                }
+                Ok(policy::execute(
+                    s,
+                    self.credential.task,
+                    r,
+                    Time::Certified(upper),
+                    approval,
+                ))
+            },
+        )
     }
     pub fn preview_current(
         &self,
@@ -924,13 +1076,22 @@ impl Executor {
         upper: u64,
     ) -> Result<Preview, CoreError> {
         self.inner.request(r)?;
-        self.inner.change(|s| {
-            self.auth(s)?;
-            Self::current(s, self.credential.task, lower, upper)?;
-            self.inner.selection_bound(s, self.credential.task, r)?;
-            policy::preview(s, self.credential.task, r, Time::Certified(upper))
-                .map_err(CoreError::Policy)
-        })
+        self.inner.change_accounted(
+            false,
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                Self::read_debit(s, self.credential.task, r)?;
+                Ok(())
+            },
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                self.inner.selection_bound(s, self.credential.task, r)?;
+                policy::preview(s, self.credential.task, r, Time::Certified(upper))
+                    .map_err(CoreError::Policy)
+            },
+        )
     }
     /// Remote disclosure gate. Local forensic status intentionally remains usable
     /// after revoke; network callers must use this current-authority variant.
@@ -940,16 +1101,42 @@ impl Executor {
         lower: u64,
         upper: u64,
     ) -> Result<OperationStatus, CoreError> {
-        self.inner.change(|s| {
-            self.auth(s)?;
-            Self::current(s, self.credential.task, lower, upper)?;
-            Ok(s.view
-                .operations
-                .get(&(self.credential.task, id))
-                .map_or(OperationStatus::Absent, |b| {
-                    OperationStatus::Decided(b.decision.clone())
-                }))
-        })
+        self.inner.change_accounted(
+            false,
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                let rows = s
+                    .view
+                    .operations
+                    .get(&(self.credential.task, id))
+                    .and_then(|b| b.decision.as_ref().ok())
+                    .map_or(0, |r| r.effects.len());
+                let read_rows = u64::try_from(rows)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(CoreError::Limit)?;
+                Self::debit(
+                    s,
+                    self.credential.task,
+                    TaskResources {
+                        read_rows,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(())
+            },
+            |s| {
+                self.auth(s)?;
+                Self::current(s, self.credential.task, lower, upper)?;
+                Ok(s.view
+                    .operations
+                    .get(&(self.credential.task, id))
+                    .map_or(OperationStatus::Absent, |b| {
+                        OperationStatus::Decided(b.decision.clone())
+                    }))
+            },
+        )
     }
     /// Current authorization without returning task metadata or decisions.
     pub fn validate_current(&self, time: Time) -> Result<(), CoreError> {
@@ -1316,6 +1503,128 @@ pub(crate) fn crash_now() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accounting_format_migration_future_versions_and_corruption_fail_closed() {
+        let mut state = empty(9);
+        let g = Grant {
+            task: TaskId(1),
+            issuer: Principal(1),
+            executor: Principal(2),
+            approver: Principal(3),
+            policy: Policy {
+                tenant: TenantId(42),
+                columns: std::collections::BTreeSet::from([Column::Status]),
+                transitions: std::collections::BTreeSet::from([(Status::Failed, Status::Queued)]),
+                incident: (100, 107),
+                distinct_limit: 1,
+                transition_limit: 1,
+                approval_above: 1,
+                valid_from: 1,
+                expires: 1000,
+            },
+        };
+        state.view.tasks.insert(
+            TaskId(1),
+            TaskState {
+                grant: g,
+                revoked: false,
+                touched: Default::default(),
+                transitions: 0,
+            },
+        );
+        let legacy = records(&state).unwrap();
+        for version in [1, 2, 3, 4, u32::MAX] {
+            let mut r = legacy.clone();
+            if version == 1 {
+                r.remove(&vec![5]);
+            } // In-memory record fixture, no filesystem cleanup.
+            r.insert(
+                vec![0],
+                encode(&Metadata {
+                    format: version,
+                    domain: 9,
+                    schema: 0,
+                    last_time: 0,
+                    next_approval: 0,
+                    origin: None,
+                })
+                .unwrap(),
+            );
+            if version <= 3 {
+                let parsed = from_records(r.clone()).unwrap();
+                assert!(parsed.accounting.is_empty());
+                let path = fresh("accounting-legacy");
+                fs::create_dir(&path).unwrap();
+                let db = Database::create(path.join("data.redb")).unwrap();
+                let tx = db.begin_write().unwrap();
+                {
+                    let mut table = tx.open_table(RECORDS).unwrap();
+                    for (key, value) in &r {
+                        table.insert(key.as_slice(), value.as_slice()).unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+                drop(db);
+                fs::copy(path.join("data.redb"), path.join("legacy-original.redb")).unwrap();
+                let a = Admin::open(&path, Limits::default()).unwrap();
+                let e = a.executor(TaskId(1), Principal(2)).unwrap();
+                assert_eq!(
+                    e.reserve_disclosure(1, 10, 10),
+                    Err(CoreError::Policy(Error::Budget))
+                );
+                a.provision_task_resources(
+                    TaskId(1),
+                    TaskResources {
+                        read_rows: 1,
+                        disclosed_rows: 1,
+                        encoded_bytes: 1,
+                    },
+                )
+                .unwrap();
+                e.reserve_disclosure(1, 10, 10).unwrap();
+                let export = fresh("accounting-format-export");
+                a.export(&export).unwrap();
+                let mut bytes = fs::read(&export).unwrap();
+                bytes[8..12].copy_from_slice(&2u32.to_be_bytes());
+                let mismatch = fresh("accounting-header-mismatch");
+                fs::write(&mismatch, bytes).unwrap();
+                assert!(matches!(
+                    Admin::verify_export(mismatch),
+                    Err(CoreError::Corrupt(_))
+                ));
+            } else {
+                assert!(matches!(
+                    from_records(r.clone()),
+                    Err(CoreError::Unsupported)
+                ));
+            }
+            r.insert(
+                key(6, &[1]),
+                encode(&TaskAccounting {
+                    limits: TaskResources::default(),
+                    used: TaskResources {
+                        read_rows: 1,
+                        ..Default::default()
+                    },
+                })
+                .unwrap(),
+            );
+            assert!(from_records(r).is_err());
+        }
+        for value in [
+            vec![],
+            vec![255],
+            encode(&TaskAccounting {
+                limits: TaskResources::default(),
+                used: TaskResources::default(),
+            })
+            .unwrap(),
+        ] {
+            let mut r = legacy.clone();
+            r.insert(key(6, &[999]), value);
+            assert!(from_records(r).is_err());
+        }
+    }
     fn fresh(name: &str) -> std::path::PathBuf {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
         fs::create_dir_all(&root).unwrap();
@@ -1406,7 +1715,7 @@ mod tests {
         let t = a.inner.db.begin_read().unwrap();
         let table = t.open_table(RECORDS).unwrap();
         let m: Metadata = decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
-        assert_eq!(m.format, 2);
+        assert_eq!(m.format, 3);
         assert_ne!(m.format, 1, "v1 reader rejects before decoding namespace5");
         drop(table);
         drop(t);

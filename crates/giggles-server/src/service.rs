@@ -267,39 +267,46 @@ impl Session {
     pub fn handle(&mut self, request: Request) -> Response {
         self.handle_received(request, std::time::Instant::now())
     }
-    /// A prepared portal never carries authority from an earlier frame. Check
-    /// current authority again after producing protected output: storage hooks
-    /// or a stalled decision may have allowed revoke/expiry before release.
+    /// All task transports use the same immutable-response reservation gate.
     pub(crate) fn handle_prepared_task(
         &mut self,
         request: Request,
         received: std::time::Instant,
     ) -> Response {
-        let response = self.handle_received(request, received);
-        if matches!(response.code.as_str(), "committed" | "preview" | "absent") {
-            let check = (|| {
-                // Keep fresh release-time issuance ordered with both listeners.
-                let _gate = giggles_core::cancellation::lock(&self.service.task_gate)?;
-                let (executor, time) = self.executor()?;
-                executor.status_current(
-                    response.operation.ok_or(CoreError::Limit)?,
-                    time.0,
-                    time.1,
-                )?;
-                Ok::<_, CoreError>(())
-            })();
-            if let Err(e) = check {
-                return Response {
-                    operation: response.operation,
-                    ..Response::error(&e)
-                };
-            }
-        }
-        response
+        self.handle_received(request, received)
     }
     pub fn handle_received(&mut self, request: Request, received: std::time::Instant) -> Response {
         let context = Cancellation::current().unwrap_or_default();
-        context.scope(|| self.handle_scoped(request, received, &context))
+        context.scope(|| {
+            let response = self.handle_scoped(request, received, &context);
+            if !matches!(self.role, Role::Task { .. }) {
+                return response;
+            }
+            // Freeze exactly the Response later encoded by both transports. A
+            // 1024-byte allowance covers their bounded decision framing/control.
+            let reserve = (|| {
+                let size = serde_json::to_vec(&response)
+                    .map_err(|_| CoreError::Limit)?
+                    .len();
+                let bytes = u64::try_from(size)
+                    .ok()
+                    .and_then(|n| n.checked_add(1024))
+                    .ok_or(CoreError::Limit)?;
+                let _gate = giggles_core::cancellation::lock(&self.service.task_gate)?;
+                let (executor, time) = self.executor()?;
+                executor.reserve_disclosure(bytes, time.0, time.1)
+            })();
+            if let Err(error) = reserve {
+                // Fixed envelope: never echo operation, counts, digests, original
+                // denial or remaining allowance when release is unauthorized.
+                return Response::code(match error {
+                    CoreError::Cancelled => "57014",
+                    CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
+                    _ => "42501",
+                });
+            }
+            response
+        })
     }
     fn handle_scoped(
         &mut self,

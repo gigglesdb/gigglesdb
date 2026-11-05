@@ -134,6 +134,14 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_task_resources(giggles_core::TaskResources {
+            read_rows: 1_000_000,
+            disclosed_rows: 1_000_000,
+            encoded_bytes: 1_000_000_000,
+        })
+        .await
+    }
+    async fn with_task_resources(task_limits: giggles_core::TaskResources) -> Self {
         let path = PathBuf::from("artifacts").join(format!(
             "network-fixture-{}-{}-{}",
             std::process::id(),
@@ -197,7 +205,20 @@ impl Fixture {
                 .unwrap();
         }
         admin.grant(grant(1, 42, 25, 5)).unwrap();
+        admin
+            .provision_task_resources(TaskId(1), task_limits)
+            .unwrap();
         admin.grant(grant(2, 43, 25, 5)).unwrap();
+        admin
+            .provision_task_resources(
+                TaskId(2),
+                giggles_core::TaskResources {
+                    read_rows: 1_000_000,
+                    disclosed_rows: 1_000_000,
+                    encoded_bytes: 1_000_000_000,
+                },
+            )
+            .unwrap();
         let domain = admin.authority_metadata().unwrap().0.to_string();
         let bindings = vec![
             Binding {
@@ -686,6 +707,16 @@ async fn ten_real_tls_sessions_race_for_last_slot() {
     let f = Fixture::new().await;
     // Offline provision a distinct grant with one slot; use an isolated service binding.
     f.admin.grant(grant(3, 42, 1, 1)).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(3),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let fingerprint = f.service.session(&tls::fingerprint(f.ca.cert.der()));
     assert!(fingerprint.is_err());
     let certificate = std::fs::read_to_string(f.path.join("task.pem")).unwrap();
@@ -916,6 +947,16 @@ async fn approval_revocation_staleness_expiry_and_unknown_status() {
     let mut expired = grant(4, 42, 1, 1);
     expired.policy.expires = now() - 1;
     f.admin.grant(expired).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(4),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let e = f.admin.executor(TaskId(4), Principal(2)).unwrap();
     assert!(e.status_current(OperationId(1), now(), now()).is_err());
     assert!(e.preview_current(&repair(1, 0..1), now(), now()).is_err());
@@ -926,6 +967,16 @@ async fn approval_revocation_staleness_expiry_and_unknown_status() {
     let mut future = grant(5, 42, 1, 1);
     future.policy.valid_from = now() + 1;
     f.admin.grant(future).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(5),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let e = f.admin.executor(TaskId(5), Principal(2)).unwrap();
     assert!(
         e.execute_current(repair(1, 0..1), now(), now() + 2, None)
@@ -1629,6 +1680,16 @@ async fn expired_task_and_revoked_approval_are_denied_on_both_network_paths() {
     let mut expired = grant(4, 42, 25, 5);
     expired.policy.expires = now() - 1;
     f.admin.grant(expired).unwrap();
+    f.admin
+        .provision_task_resources(
+            TaskId(4),
+            giggles_core::TaskResources {
+                read_rows: 1_000_000,
+                disclosed_rows: 1_000_000,
+                encoded_bytes: 1_000_000_000,
+            },
+        )
+        .unwrap();
     let der = tls::certs(f.path.join("task.pem")).unwrap().remove(0);
     let service = Service::new(
         f.admin.clone(),
@@ -1759,3 +1820,6 @@ mod cancellation_network;
 
 #[path = "prepared_network.inc"]
 mod prepared_network;
+
+#[path = "accounting_network.inc"]
+mod accounting_network;

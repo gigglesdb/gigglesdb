@@ -33,7 +33,7 @@ existing metadata last_time, with immediate redb durability. Both lower and uppe
 bounds must be within grant validity. Decreasing wall time, excess pause, clock
 discontinuity, overflow or sample upper below persisted bound fails closed and
 latches uncertainty until restart after correcting host time. No request supplies
-authority time. Storage format is unchanged. Restart respects the existing bound.
+authority time. Storage format 3 adds cumulative task accounting (see TASK_ACCOUNTING.md). Restart respects the existing bound.
 Host accuracy and no excessive unobserved pause between sample and decision are
 assumptions. Clock uncertainty is not a certified external time service: real
 pause/skew/clock-accuracy production qualification is unfinished. Offline callers
@@ -97,9 +97,9 @@ Task responses contain only version, stable code, original operation ID, count
 and digest, with no full effects/rows/policies/dependencies/issuer identities or
 internal error text. SHA256 is supplied by a maintained library, not custom
 cryptography. Minimal output still reveals counts, correlation, existence within
-the authorized task, timing and repeated observations. No cumulative read/egress
-budget, rate-limited security audit, signed receipts or strong timing isolation is
-implemented. Do not claim the parent's read/egress accounting contract. The
+the authorized task, timing and repeated observations. Cumulative logical task read/disclosure/egress reservations are now implemented
+as specified in [TASK_ACCOUNTING.md](TASK_ACCOUNTING.md). Rate-limited security
+audit, signed receipts and strong timing isolation remain unimplemented. The
 trusted approver must retrieve and review full exact effects locally; a count/digest
 alone is not a human-readable approval review.
 
@@ -117,4 +117,4 @@ postcommit response can be denied while its original durable decision stays
 committed. Native canonical payloads and approval exactness remain authoritative.
 There is no generic SQL grant or identity parameter. A repeated original ID is a
 retry, including its original durable denial; a new approved attempt needs a new
-ID. Durable cumulative rows/bytes disclosure accounting remains unimplemented.
+ID. Durable cumulative reservations now apply to native/simple/prepared task responses; see [TASK_ACCOUNTING.md](TASK_ACCOUNTING.md).

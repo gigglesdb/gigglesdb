@@ -1,5 +1,7 @@
 //! Durable local task-repair kernel. See README for authority and durability limits.
+mod accounting;
 mod types;
+pub use accounting::{TaskAccounting, TaskResources};
 pub use types::*;
 mod policy;
 mod storage;

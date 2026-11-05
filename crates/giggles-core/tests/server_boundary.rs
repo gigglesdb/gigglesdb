@@ -145,6 +145,15 @@ fn remote_decision_and_status_require_current_task_even_on_dedupe() {
             },
         })
         .unwrap();
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000,
+            disclosed_rows: 1000,
+            encoded_bytes: 1000000,
+        },
+    )
+    .unwrap();
     let r = Request {
         operation: OperationId(1),
         selection: Selection::Keys(vec![key]),
@@ -194,6 +203,15 @@ fn remote_retry_revocation_gate_differs_from_trusted_forensic_status() {
             },
         })
         .unwrap();
+    a.provision_task_resources(
+        TaskId(1),
+        TaskResources {
+            read_rows: 1000,
+            disclosed_rows: 1000,
+            encoded_bytes: 1000000,
+        },
+    )
+    .unwrap();
     let r = Request {
         operation: OperationId(1),
         selection: Selection::Keys(vec![key]),

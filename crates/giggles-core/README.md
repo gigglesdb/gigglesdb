@@ -1,3 +1,9 @@
+Current P2 continuation: storage writes format 3 and remote task disclosure requires
+explicit trusted cumulative accounting provisioning. See
+[task accounting](../giggles-server/TASK_ACCOUNTING.md). The original embedded
+repair interfaces below retain their trusted P0 model; historical format-1 details
+are superseded by format-2 relational and format-3 accounting extensions.
+
 # GigglesDB durable embedded core (P1 safety slice)
 
 Standalone Rust crate; phase [GD-0002](https://app.archdocs.io/design-docs/f386f1a9-661e-4d62-9d03-8a51e050ebe6).
