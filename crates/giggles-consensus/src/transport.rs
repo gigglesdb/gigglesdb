@@ -31,6 +31,8 @@ pub struct Configuration {
     pub key: PathBuf,
     pub ca: PathBuf,
     pub peers: BTreeMap<u64, Peer>,
+    #[serde(default)]
+    pub task: Option<crate::native::Configuration>,
 }
 pub enum Event {
     Message(u64, Message),

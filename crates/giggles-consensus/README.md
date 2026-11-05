@@ -13,7 +13,8 @@ and one database owner. No embedded Admin handle or independent authoritative co
 database exists inside a consensus process. The P2 server is unchanged and cannot
 open this consensus file as a local database.
 
-The network listener accepts **Raft peer traffic only**. All peers authenticate
+The peer listener accepts **Raft peer traffic only**. A separately configured
+external native task listener now exists; see [Design documentation](https://app.archdocs.io/design-docs/249430f8-bbb5-4302-8bf7-e59fed450039). All peers authenticate
 through maintained rustls WebPKI chain/signature/time verification, `localhost`
 server-name verification and an exact SHA256 leaf fingerprint mapped to node ID.
 A CA-valid certificate without a membership binding has no authority. A peer may
@@ -26,8 +27,8 @@ The bounded native command interface is a trusted **stdin control interface**.
 current-authority kernel paths. It is not an authenticated external task-client
 protocol. `Command::Admin` is for the trusted process owner only. The current
 native implementation does not accept a remote task principal, client-chosen
-time, or trusted Admin over TLS. Network task sessions/P2 pgwire routing are exact
-remaining P3 work, rather than an implicit claim that every P2 path is replicated.
+time, or trusted Admin over TLS. External native Preview/Execute/Status sessions use the separate GD17 listener;
+P2 pgwire/SQL routing remains P3 work. No claim that every P2 path is replicated.
 
 ## State and durability
 
@@ -72,8 +73,8 @@ Administrative SQL/provisioning commands have no general retry guarantee.
 
 Cancellation before proposal may prevent submission. Once submitted, timeout,
 disconnect or process death means **indeterminate**, never rollback. Resolve the
-original task operation through a quorum and current authority. This slice has no
-external cancellation protocol.
+original task operation through a quorum and current authority. External native cancellation uses deadline/disconnect, with no rollback promise
+after proposal. It has no separate cancellation message.
 
 ## Running a real three-process demonstration
 
@@ -129,7 +130,7 @@ The transport `ok` is a queue receipt, **not a Raft replication acknowledgment**
 only later library responses released after persistence count toward consensus.
 
 No dynamic changes, multi-range work, snapshot streaming/resumption, process
-controller retry API, peer certificate hot rotation/CRL, external task-client listener,
+controller retry API, peer certificate hot rotation/CRL,
 automatic checkpoint policy or operational
 deployment is implemented. An out-of-space state-image/log error fails closed and
 requires operator recovery; graceful capacity admission needs more P3 work.
@@ -170,3 +171,24 @@ store upgrade or rolling compatibility is implemented. Time correctness depends
 on explicit calibrated host/skew/pause assumptions; asynchronous consensus does
 not enforce the five-second sample-to-decision bound. See the design documentation's precise
 expiry/release semantics and remaining physical delivery-pause limitation.
+
+
+## external native task listener
+
+The optional `task` configuration enables a separate mandatory mTLS task listener.
+It accepts only version1 Preview/Execute/Status, authenticates the verified leaf
+against committed credential bindings and uses opaque Node decision/held/release
+primitives. `giggles-task CLIENT-CONFIG.json REQUEST.json` is a runnable client.
+See [Design documentation](https://app.archdocs.io/design-docs/249430f8-bbb5-4302-8bf7-e59fed450039) for complete config,
+wire grammar, deadlines, retry semantics, limits and retained verification.
+
+```powershell
+cargo test --test process external_native -- --nocapture
+cargo run --bin giggles-task -- K:/path/to/task-client.json K:/path/to/request.json
+```
+
+This completes the bounded native network subset only. Distributed pgwire,
+SQL/RepairSql, broader P3 operations and external qualification remain unfinished.
+GD16's five-second sample-to-quorum timing assumption is still not enforced by
+asynchronous consensus. Fresh quorum release is requested at socket write
+readiness; a later post-check pause before delivery remains possible.

@@ -590,3 +590,93 @@ fn periodic_idle_observation_keeps_clock_live_but_actor_pause_fences() {
         1
     );
 }
+
+#[test]
+fn native_deadline_gate_after_serialization_never_submits_or_charges() {
+    let (mut c, _, mut clock) = setup();
+    let session = c.nodes[&1].authenticate(&binding(1).fingerprint).unwrap();
+    let before = c.nodes[&1].store.image().unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(
+        c.nodes
+            .get_mut(&1)
+            .unwrap()
+            .decide_when(
+                ctx(991),
+                &session,
+                TaskAction::Execute(request(991, &[0]), None),
+                &mut clock,
+                || {
+                    called.set(true);
+                    false
+                }
+            )
+            .is_err()
+    );
+    assert!(called.get());
+    c.pump();
+    assert!(!c.applied_events.contains_key(&(1, ctx(991))));
+    assert_eq!(c.nodes[&1].store.image().unwrap(), before);
+    let held = decision(&mut c, &mut clock, 992);
+    let before = c.nodes[&1].store.image().unwrap();
+    assert!(
+        c.nodes
+            .get_mut(&1)
+            .unwrap()
+            .request_release_when(ctx(993), &held, &mut clock, || false)
+            .is_err()
+    );
+    c.pump();
+    assert!(!c.applied_events.contains_key(&(1, ctx(993))));
+    assert_eq!(c.nodes[&1].store.image().unwrap(), before);
+}
+#[test]
+fn final_release_resamples_after_core_validation_and_fences_pause() {
+    struct Jump(u8);
+    impl ClockSource for Jump {
+        fn sample(&mut self) -> Result<(u64, u64)> {
+            self.0 += 1;
+            Ok(if self.0 == 1 { (10, 0) } else { (100, 90) })
+        }
+    }
+    let (mut c, _, mut clock) = setup();
+    let held = decision(&mut c, &mut clock, 994);
+    c.nodes
+        .get_mut(&1)
+        .unwrap()
+        .request_release(ctx(995), &held, &mut clock)
+        .unwrap();
+    c.pump();
+    let applied = event(&mut c, 1, 995);
+    let proof = c.nodes[&1].release_proof(applied).unwrap();
+    let used = c.nodes[&1]
+        .store
+        .image()
+        .unwrap()
+        .accounting(TaskId(1))
+        .unwrap()
+        .unwrap()
+        .used;
+    let mut jumping = LeaderClock::new(Jump(0), 0, 10).unwrap();
+    assert!(
+        c.nodes[&1]
+            .finish_release(held, proof, &mut jumping)
+            .is_err()
+    );
+    assert!(jumping.is_fenced());
+    assert_eq!(
+        c.nodes[&1]
+            .store
+            .image()
+            .unwrap()
+            .accounting(TaskId(1))
+            .unwrap()
+            .unwrap()
+            .used,
+        used
+    );
+    assert_eq!(
+        c.nodes[&1].store.image().unwrap().snapshot().unwrap().tasks[&TaskId(1)].transitions,
+        1
+    );
+}

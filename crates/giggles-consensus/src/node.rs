@@ -49,6 +49,14 @@ impl Node {
         self.store.authority()?.session(verified_fingerprint)
     }
     fn propose_authority(&mut self, context: Vec<u8>, entry: AuthorityEntry) -> Result<()> {
+        self.propose_authority_when(context, entry, || true)
+    }
+    fn propose_authority_when(
+        &mut self,
+        context: Vec<u8>,
+        entry: AuthorityEntry,
+        may_submit: impl FnOnce() -> bool,
+    ) -> Result<()> {
         if !self.is_leader() {
             return Err("not leader".into());
         }
@@ -56,6 +64,9 @@ impl Node {
         bytes.extend(serde_json::to_vec(&entry)?);
         if bytes.len() > MAX_COMMAND || context.len() > 64 {
             return Err("proposal limit".into());
+        }
+        if !may_submit() {
+            return Err("cancelled/deadline before proposal".into());
         }
         self.raw.propose(context, bytes)?;
         Ok(())
@@ -122,8 +133,24 @@ impl Node {
         action: crate::TaskAction,
         clock: &mut LeaderClock<C>,
     ) -> Result<()> {
+        self.decide_when(context, session, action, clock, || true)
+    }
+    /// Local cancellation/deadline gate checked after serialization immediately
+    /// before RawNode submission; false means no proposal was submitted.
+    pub fn decide_when<C: ClockSource>(
+        &mut self,
+        context: Vec<u8>,
+        session: &Session,
+        action: crate::TaskAction,
+        clock: &mut LeaderClock<C>,
+        may_submit: impl FnOnce() -> bool,
+    ) -> Result<()> {
         let fence = self.fresh_fence(session, clock, authority::DECISION_HORIZON)?;
-        self.propose_authority(context, AuthorityEntry::Decide { fence, action })
+        self.propose_authority_when(
+            context,
+            AuthorityEntry::Decide { fence, action },
+            may_submit,
+        )
     }
     /// Consume a decision from this node's trusted output stream. The runtime must
     /// correlate its locally submitted context; follower apply events are not ACKs.
@@ -144,6 +171,16 @@ impl Node {
         held: &HeldOutput,
         clock: &mut LeaderClock<C>,
     ) -> Result<()> {
+        self.request_release_when(context, held, clock, || true)
+    }
+    /// Socket runtime uses the same final pre-submission admission gate.
+    pub fn request_release_when<C: ClockSource>(
+        &mut self,
+        context: Vec<u8>,
+        held: &HeldOutput,
+        clock: &mut LeaderClock<C>,
+        may_submit: impl FnOnce() -> bool,
+    ) -> Result<()> {
         if held.fence.term != self.term() {
             return Err("stale held term".into());
         }
@@ -152,12 +189,13 @@ impl Node {
             epoch: held.fence.epoch,
         };
         let fence = self.fresh_fence(&session, clock, authority::DECISION_HORIZON)?;
-        self.propose_authority(
+        self.propose_authority_when(
             context,
             AuthorityEntry::Release {
                 fence,
                 decision: held.index,
             },
+            may_submit,
         )
     }
     pub fn release_proof(&self, applied: Applied) -> Result<ReleaseProof> {
@@ -203,6 +241,11 @@ impl Node {
         })?;
         if check.code != 0 {
             return Err("current task denied release".into());
+        }
+        // Core validation may itself take time. Sample once more after it; a
+        // long actor pause must not hand a previously fresh result to the socket.
+        if self.fresh_fence(&session, clock, 0)?.upper > proof.fence.upper {
+            return Err("release proof expired after validation".into());
         }
         Ok(held.reply)
     }

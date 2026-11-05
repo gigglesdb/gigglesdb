@@ -1,4 +1,4 @@
-//! Trusted stdin control only. Network listener accepts authenticated Raft peers.
+//! Trusted stdin controls plus separately configured external native task TLS.
 use giggles_consensus::authority::{Binding, LeaderClock, OsClock};
 use giggles_consensus::{
     transport::{Configuration, Event, Transport},
@@ -42,6 +42,9 @@ enum Control {
     },
     Checkpoint,
     Diagnostics,
+    PausePeers {
+        paused: bool,
+    },
     Campaign,
     CrashNextApply {
         after_commit: bool,
@@ -53,6 +56,10 @@ fn emit(v: serde_json::Value) {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(run())).await?
+}
+async fn run() -> Result<()> {
     let config: Configuration = serde_json::from_slice(&std::fs::read(
         std::env::args().nth(1).ok_or("config path required")?,
     )?)?;
@@ -63,6 +70,23 @@ async fn main() -> Result<()> {
     };
     let mut node = Node::new(store)?;
     let (events, mut incoming) = mpsc::channel(64);
+    let (native_events, mut native_input) = mpsc::channel(32);
+    if let Some(task) = config.task.clone() {
+        if task.listen == config.listen {
+            return Err("task and peer listeners must differ".into());
+        }
+        native::bind(
+            task,
+            config
+                .peers
+                .values()
+                .map(|p| p.fingerprint.clone())
+                .collect(),
+            native_events,
+        )
+        .await?;
+    }
+    let mut native_actor = native::Actor::new(config.id)?;
     let transport = Transport::bind(config).await?;
     let outbound = transport.run(events);
     let (controls, mut input) = mpsc::channel(16);
@@ -90,6 +114,7 @@ async fn main() -> Result<()> {
     });
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut reads = BTreeMap::new();
+    let mut peers_paused = false;
     let parameter = |name: &str, default: u64| -> Result<u64> {
         Ok(std::env::var(name)
             .ok()
@@ -120,7 +145,8 @@ async fn main() -> Result<()> {
                  eprintln!("runtime clock unavailable: {e}");
              }
          },
-         Some(event)=incoming.recv()=>match event{Event::Message(from,m)=>if let Err(e)=node.step(from,m){eprintln!("peer rejected: {e}");},Event::SnapshotResult(to,ok)=>node.report_snapshot(to,ok)},
+         Some(event)=native_input.recv()=>native_actor.handle(event,&mut node,&mut clock),
+         Some(event)=incoming.recv()=>match event{Event::Message(from,m)=>if !peers_paused && let Err(e)=node.step(from,m){eprintln!("peer rejected: {e}");},Event::SnapshotResult(to,ok)=>node.report_snapshot(to,ok)},
          Some(line)=input.recv()=>{match serde_json::from_slice::<Control>(&line){
           Ok(Control::Propose{id,command})=>{let result=node.propose(id.to_be_bytes().to_vec(),&command);if let Err(e)=result{emit(json!({"id":id,"error":e.to_string(),"leader":node.leader()}));}},
           Ok(Control::ReloadCredentials{id,expected,bindings})=>{if let Err(e)=node.reload_credentials(id.to_be_bytes().to_vec(),expected,bindings){emit(json!({"id":id,"error":e.to_string()}));}},
@@ -129,6 +155,7 @@ async fn main() -> Result<()> {
           Ok(Control::NativeRelease{id,decision})=>{let result=(||->Result<()>{if releases.contains_key(&id) || decisions.contains(&id) || held.contains_key(&id){return Err("duplicate id".into());}let value=held.remove(&decision).ok_or("unknown held decision")?;node.request_release(id.to_be_bytes().to_vec(),&value,&mut clock)?;releases.insert(id,value);Ok(())})();if let Err(e)=result{emit(json!({"id":id,"error":e.to_string()}));}},
           Ok(Control::Read{id})=>{if reads.len()>=32{emit(json!({"id":id,"error":"read queue full"}));}else{let ctx=id.to_be_bytes().to_vec();match node.read_barrier(ctx.clone()){Ok(())=>{reads.insert(ctx,id);},Err(e)=>emit(json!({"id":id,"error":e.to_string(),"leader":node.leader()}))}}},
           Ok(Control::Checkpoint)=>match node.store.checkpoint(){Ok(s)=>emit(json!({"checkpoint":s.get_metadata().index})),Err(e)=>emit(json!({"error":e.to_string()}))},
+          Ok(Control::PausePeers{paused})=>{peers_paused=paused;emit(json!({"peers_paused":paused}));},
           Ok(Control::Diagnostics)=>emit(json!({"diagnostics":node.diagnostics(),"leader":node.leader(),"is_leader":node.is_leader(),"authority_ready":node.is_leader() && !clock.is_fenced() && node.store.authority()?.term==node.term()})),
           Ok(Control::Campaign)=>{node.campaign()?;},
           Ok(Control::CrashNextApply{after_commit})=>{node.store.arm_apply_crash(if after_commit{store::ApplyCrash::AfterCommit}else{store::ApplyCrash::BeforeCommit})?;emit(json!({"crash_armed":true}));},
@@ -144,8 +171,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        native_actor.reap(&node);
         let output = node.drain()?;
         for m in output.messages {
+            if peers_paused {
+                continue;
+            }
             let to = m.to;
             let snapshot = m.has_snapshot();
             if outbound.try_send(m).is_err() && snapshot {
@@ -153,6 +184,9 @@ async fn main() -> Result<()> {
             }
         }
         for a in output.applied {
+            let Some(a) = native_actor.applied(a, &mut node, &mut clock) else {
+                continue;
+            };
             if a.context.len() == 8 {
                 let id = u64::from_be_bytes(a.context.as_slice().try_into()?);
                 if decisions.remove(&id) {
