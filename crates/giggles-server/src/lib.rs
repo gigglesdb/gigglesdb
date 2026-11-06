@@ -15,3 +15,4 @@ pub mod task_statement;
 
 pub mod admission;
 pub mod api;
+pub mod auth;
