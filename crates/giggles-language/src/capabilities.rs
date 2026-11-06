@@ -147,6 +147,9 @@ pub struct CapabilityLimits {
     pub once_max_retention_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub once_max_clock_lease_seconds: Option<u64>,
+    /// Core's logical catalog-inspection metadata metric, not wire encoding size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspection_metadata_bytes: Option<usize>,
     pub columns_per_table: usize,
     pub catalog_tables: usize,
     pub concurrent_explicit_sessions: usize,
@@ -196,6 +199,42 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         CapabilityInterface::RustTree,
         CapabilityInterface::Cli,
     ] {
+        if version == LanguageVersion::Embedded012 {
+            add(
+                interface,
+                "local_discovery",
+                CapabilityState::Implemented,
+                "Explicit 0.12: SHOW CAPABILITIES returns the selected finite native capability manifest; SHOW LIMITS returns its admission limits. These are library-profile facts, not database/server authorization or performance claims. The CLI resolves both before opening the supplied path, including missing or locked paths; inspection accepts no bindings.",
+                vec![
+                    evidence(
+                        "crates/giggles-language/tests/inspection_capabilities.rs",
+                        "inspection_cli_local_discovery_precedes_database_open",
+                    ),
+                    evidence(
+                        "crates/giggles-language/tests/inspection.rs",
+                        "inspection_catalog_text_and_tree_match_without_sql_or_effects",
+                    ),
+                ],
+                vec![],
+            );
+            add(
+                interface,
+                "catalog_inspection",
+                CapabilityState::Implemented,
+                "Explicit 0.12 trusted embedded catalog inspection: SHOW TABLES returns complete table summaries (stable ID/name, column count and primary-key column count); DESCRIBE TABLE returns the exact descriptor, including SQL SmallInt. Each catalog result carries core contract version, database domain and catalog epoch from one fresh committed view; JSON encodes the u128 domain as a canonical decimal string. No data rows, row counts, indexes, EXPLAIN, prepared inspection or policy authority. Logical metadata is admitted against 65536 bytes before cloning; this is not a network-encoding bound.",
+                vec![
+                    evidence(
+                        "crates/giggles-language/tests/inspection.rs",
+                        "inspection_catalog_text_and_tree_match_without_sql_or_effects",
+                    ),
+                    evidence(
+                        "crates/giggles-language/tests/inspection_capabilities.rs",
+                        "inspection_cli_catalog_and_version_selection_are_explicit",
+                    ),
+                ],
+                vec![],
+            );
+        }
         if version != LanguageVersion::Embedded01 {
             add(
                 interface,
@@ -928,6 +967,40 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
 
     // These are complete rejection fixtures, not proposed grammar fragments.
     for interface in [CapabilityInterface::RustText, CapabilityInterface::Cli] {
+        if version == LanguageVersion::Embedded012 {
+            for (feature, examples) in [
+                (
+                    "inspection_scope",
+                    vec![
+                        "show rows",
+                        "show indexes",
+                        "show tables where true",
+                        "describe table missing",
+                        "describe table items select id",
+                        "explain items",
+                        "transaction { show tables }",
+                        "show tables once \"inspect\" for 1h",
+                    ],
+                ),
+                (
+                    "inspection_names",
+                    vec![
+                        "describe table public.items",
+                        "describe table $table",
+                        "describe table `Items`",
+                    ],
+                ),
+            ] {
+                add(
+                    interface,
+                    feature,
+                    CapabilityState::Rejected,
+                    "Outside the four-command 0.12 inspection contract: unknown/malformed targets, row/schema/index inspection, EXPLAIN, query modifiers, parameters, blocks and once wrappers are not supported by this slice.",
+                    vec![rejection_evidence(version)],
+                    examples,
+                );
+            }
+        }
         if version.supports_once() {
             for (feature, examples) in [
                 (
@@ -1530,6 +1603,8 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             once_min_retention_seconds: version.supports_once().then_some(1),
             once_max_retention_seconds: version.supports_once().then_some(core_once::MAX_ONCE_RETENTION_SECONDS),
             once_max_clock_lease_seconds: version.supports_once().then_some(core_once::MAX_ONCE_CLOCK_LEASE_SECONDS),
+            inspection_metadata_bytes: (version == LanguageVersion::Embedded012)
+                .then_some(giggles_core::operations::MAX_INSPECTION_METADATA_BYTES),
             columns_per_table: relational::MAX_COLUMNS,
             catalog_tables: relational::MAX_TABLES,
             concurrent_explicit_sessions: relational::MAX_TRANSACTIONS,
@@ -1587,6 +1662,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded012 => (
+            "crates/giggles-language/tests/inspection_capabilities.rs",
+            "inspection_selected_manifest_rejections_use_selected_version",
         ),
     };
     evidence(path, test)

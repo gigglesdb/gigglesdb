@@ -11,6 +11,7 @@ pub use crate::relational::{SqlRow, Value};
 #[cfg(test)]
 mod case_tests;
 mod catalog;
+mod inspection;
 pub mod once;
 #[cfg(test)]
 mod scalar_tests;
@@ -25,6 +26,7 @@ use crate::{
     storage::CompleteRelation,
 };
 pub use catalog::*;
+pub use inspection::*;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,

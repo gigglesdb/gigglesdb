@@ -1,6 +1,7 @@
 use giggles_core::{Admin, Limits};
 use giggles_language::{
-    Bindings, Engine, Error, LanguageVersion, MAX_INPUT, ParsedInput, parse_input_with_version,
+    Bindings, Engine, Error, InspectionOutcome, InspectionStatement, LanguageVersion, MAX_INPUT,
+    ParsedInput, parse_input_with_version,
 };
 fn run() -> std::result::Result<serde_json::Value, Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -79,6 +80,7 @@ fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error
         "0.9" => Ok(LanguageVersion::Embedded09),
         "0.10" => Ok(LanguageVersion::Embedded010),
         "0.11" => Ok(LanguageVersion::Embedded011),
+        "0.12" => Ok(LanguageVersion::Embedded012),
         _ => Err(Error::Unsupported),
     }
 }
@@ -93,6 +95,24 @@ fn execute(
     // decisions require a certified clock. This CLI supplies neither context.
     if matches!(input, ParsedInput::Once(_) | ParsedInput::Outcome(_)) {
         return Err(Error::Unsupported);
+    }
+    if let ParsedInput::Inspection(statement) = &input {
+        if !bindings.is_empty() {
+            return Err(Error::Bind("inspection bindings".into()));
+        }
+        // Discovery describes the selected library profile, not a database.
+        let local = match statement {
+            InspectionStatement::ShowCapabilities => Some(InspectionOutcome::Capabilities(
+                giggles_language::capability_manifest_for(version),
+            )),
+            InspectionStatement::ShowLimits => Some(InspectionOutcome::Limits(
+                giggles_language::capability_manifest_for(version).limits,
+            )),
+            InspectionStatement::ShowTables | InspectionStatement::DescribeTable { .. } => None,
+        };
+        if let Some(outcome) = local {
+            return serde_json::to_value(outcome).map_err(|_| Error::Type);
+        }
     }
     let admin = Admin::open(path, Limits::default()).map_err(|e| Error::Core(e.to_string()))?;
     let engine = Engine::with_version(admin, version);
@@ -110,6 +130,7 @@ fn execute(
             serde_json::to_value(engine.execute_catalog(&statement)?)
         }
         ParsedInput::Once(_) | ParsedInput::Outcome(_) => return Err(Error::Unsupported),
+        ParsedInput::Inspection(statement) => serde_json::to_value(engine.inspect(&statement)?),
     }
     .map_err(|_| Error::Type)
 }

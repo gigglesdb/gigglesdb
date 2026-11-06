@@ -74,7 +74,7 @@ pub(crate) fn retention_seconds(retention: &DurationLiteral) -> Result<u64> {
 }
 
 fn selected_version(actual: LanguageVersion, selected: LanguageVersion) -> Result<()> {
-    if selected != LanguageVersion::Embedded011 || actual != selected {
+    if !selected.supports_once() || actual != selected {
         return Err(Error::Unsupported);
     }
     Ok(())

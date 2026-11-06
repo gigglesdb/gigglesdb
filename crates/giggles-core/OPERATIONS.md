@@ -640,3 +640,50 @@ engine execution method directly. Architecture tests show that SQL calls are
 caught before effects, then run native text, AST and bound requests in that scope.
 Normal builds do not enable this feature. See the [native profile](../giggles-language/README.md)
 and the [SQL contract](SQL.md) for the supported syntax and public limits.
+
+## Trusted catalog inspection
+
+`Engine::inspect(&InspectionRequest)` accepts `Tables` or `Table { table }`.
+It reads fresh committed catalog metadata under the engine's existing trusted
+`Admin` authority. The returned `InspectionOutcome` includes the engine contract
+version, database domain, catalog epoch and `complete: true`. `Tables` returns
+name-sorted `TableSummary` entries with stable ID, name, column count and primary
+key column count. These counts describe the schema; no business row count is
+computed or returned. `Table` returns the exact `TableDef`, including column IDs,
+all six existing scalar types, nullability, column order and primary-key order.
+
+Domain, epoch and descriptors come from one borrowed committed snapshot. No SQL
+parser, SQL execution, row query, explicit transaction or publication occurs.
+Inspection does not consume a SQL transaction slot or advance generation, row
+versions or catalog allocators. It does not see another session's staged DDL.
+The storage kernel still loads and validates its bounded whole state, including
+stored rows; this is not metadata-only physical I/O or a new scan-work guarantee.
+There is no extra whole-state clone or relation materialization for inspection.
+
+Requests use canonical lowercase names of at most 63 bytes. Oversized names
+return `Limit`; other invalid names return `Bind("identifier")`; an absent table
+returns `Bind("table")`. Inspection has no parameters, prepared handle, receipt,
+data-block step, DDL mutation or remote/task authority contract. It cannot inspect
+built-in repair state, roles, secondary indexes, jobs or topology. Cancellation
+and storage/admission failures expose no partial metadata. Since there is no
+commit, these failures are not an ambiguous business decision (`Unknown`).
+
+Metadata is admitted before copying any returned names or descriptors, with at
+most 128 summaries and 64 columns/primary-key components in a table descriptor.
+`MAX_INSPECTION_METADATA_BYTES` is 65,536. The logical metric charges 30 bytes for
+the outcome header (4 contract + 16 domain + 8 epoch + 1 completion + 1 result
+tag), 8 for every ID, collection length, count and primary-key index, 8 plus the
+UTF-8 length for each returned name, and 1 each for a column's data-type tag and
+nullability flag. Thus a summary costs `32 + name.len()` after its vector length;
+a table costs `32 + name.len() + sum(18 + column.name.len()) + 8 * pk.len()` after
+the outcome header. These are admission units, not a persistent/network codec,
+serialized JSON size or total heap bound. Current maximum valid result shapes
+fit below this byte ceiling; helper tests also exercise exact admission bounds.
+
+`database_domain` is a `u128` in Rust and canonical decimal **text** in serialized
+inspection results, preserving values above `u64::MAX` through JSON values and
+CLI output. Deserialization accepts only checked decimal strings without signs,
+whitespace or leading zeroes (except `"0"`). Other numeric fields retain their
+usual serialization. Reopen preserves catalog/domain identity; restore reports
+the restored database's new domain with the preserved catalog descriptors.
+Inspection adds no persisted schema, value, storage or export format.

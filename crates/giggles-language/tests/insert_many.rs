@@ -645,7 +645,7 @@ fn insert_many_cli_and_selected_manifest_match_version_six() {
                 Ok(ParsedInput::Catalog(_)) => {
                     panic!("profile 0.6 accepted catalog syntax: {source}");
                 }
-                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_)) => {
+                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
                     panic!("earlier profile admitted a retry envelope: {source}")
                 }
                 Err(_) => {}

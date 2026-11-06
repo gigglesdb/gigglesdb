@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 mod capabilities;
 mod execute;
+mod inspection;
 pub mod once;
 mod parser;
 pub use capabilities::{
@@ -30,10 +31,12 @@ pub use capabilities::{
     capability_manifest_for,
 };
 pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine};
+pub use inspection::InspectionOutcome;
 pub use once::{OnceError, OnceResult, OnceScope};
 pub use parser::{
-    parse, parse_catalog_with_version, parse_input_with_version, parse_once_with_version,
-    parse_outcome_with_version, parse_transaction_with_version, parse_with_version,
+    parse, parse_catalog_with_version, parse_input_with_version, parse_inspection_with_version,
+    parse_once_with_version, parse_outcome_with_version, parse_transaction_with_version,
+    parse_with_version,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -58,6 +61,8 @@ pub const MAX_INSERT_ROWS: usize = giggles_core::operations::MAX_INSERT_ROWS;
 pub const MAX_INSERT_BYTES: usize = giggles_core::operations::MAX_INSERT_BYTES;
 pub const MAX_FUNCTION_ARGUMENTS: usize = giggles_core::operations::MAX_FUNCTION_ARGUMENTS;
 pub const MAX_CASE_ARMS: usize = giggles_core::operations::MAX_CASE_ARMS;
+pub const MAX_INSPECTION_METADATA_BYTES: usize =
+    giggles_core::operations::MAX_INSPECTION_METADATA_BYTES;
 
 /// Explicit finite language selection. No version claims full native v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +89,8 @@ pub enum LanguageVersion {
     Embedded010,
     #[serde(rename = "0.11")]
     Embedded011,
+    #[serde(rename = "0.12")]
+    Embedded012,
 }
 impl LanguageVersion {
     pub const fn as_str(self) -> &'static str {
@@ -99,6 +106,7 @@ impl LanguageVersion {
             Self::Embedded09 => "0.9",
             Self::Embedded010 => "0.10",
             Self::Embedded011 => "0.11",
+            Self::Embedded012 => "0.12",
         }
     }
     pub const fn profile_name(self) -> &'static str {
@@ -114,6 +122,7 @@ impl LanguageVersion {
             Self::Embedded09 => "embedded-trusted-native-0.9",
             Self::Embedded010 => "embedded-trusted-native-0.10",
             Self::Embedded011 => "embedded-trusted-native-0.11",
+            Self::Embedded012 => "embedded-trusted-native-0.12",
         }
     }
     pub(crate) const fn supports_computed(self) -> bool {
@@ -128,6 +137,7 @@ impl LanguageVersion {
                 | Self::Embedded09
                 | Self::Embedded010
                 | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_return(self) -> bool {
@@ -141,6 +151,7 @@ impl LanguageVersion {
                 | Self::Embedded09
                 | Self::Embedded010
                 | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_transactions(self) -> bool {
@@ -153,6 +164,7 @@ impl LanguageVersion {
                 | Self::Embedded09
                 | Self::Embedded010
                 | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_insert_many(self) -> bool {
@@ -164,6 +176,7 @@ impl LanguageVersion {
                 | Self::Embedded09
                 | Self::Embedded010
                 | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_catalog(self) -> bool {
@@ -174,31 +187,42 @@ impl LanguageVersion {
                 | Self::Embedded09
                 | Self::Embedded010
                 | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_scalar_functions(self) -> bool {
         matches!(
             self,
-            Self::Embedded08 | Self::Embedded09 | Self::Embedded010 | Self::Embedded011
+            Self::Embedded08
+                | Self::Embedded09
+                | Self::Embedded010
+                | Self::Embedded011
+                | Self::Embedded012
         )
     }
     pub(crate) const fn supports_case(self) -> bool {
         matches!(
             self,
-            Self::Embedded09 | Self::Embedded010 | Self::Embedded011
+            Self::Embedded09 | Self::Embedded010 | Self::Embedded011 | Self::Embedded012
         )
     }
     pub(crate) const fn supports_quoted_identifiers(self) -> bool {
         matches!(
             self,
-            Self::Embedded09 | Self::Embedded010 | Self::Embedded011
+            Self::Embedded09 | Self::Embedded010 | Self::Embedded011 | Self::Embedded012
         )
     }
     pub(crate) const fn supports_upsert(self) -> bool {
-        matches!(self, Self::Embedded010 | Self::Embedded011)
+        matches!(
+            self,
+            Self::Embedded010 | Self::Embedded011 | Self::Embedded012
+        )
     }
     pub(crate) const fn supports_once(self) -> bool {
-        matches!(self, Self::Embedded011)
+        matches!(self, Self::Embedded011 | Self::Embedded012)
+    }
+    pub(crate) const fn supports_inspection(self) -> bool {
+        matches!(self, Self::Embedded012)
     }
 }
 
@@ -457,6 +481,15 @@ pub struct OutcomeQuery {
     pub key: ValueExpr,
 }
 
+/// Standalone trusted discovery; never a data-block or once-envelope body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InspectionStatement {
+    ShowCapabilities,
+    ShowLimits,
+    ShowTables,
+    DescribeTable { table: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedInput {
     Statement(Statement),
@@ -464,6 +497,7 @@ pub enum ParsedInput {
     Catalog(CatalogStatement),
     Once(OnceEnvelope),
     Outcome(OutcomeQuery),
+    Inspection(InspectionStatement),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
@@ -651,7 +685,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
                 "secondary unique conflict targets",
                 "cursors",
             ],
-            LanguageVersion::Embedded011 => &[
+            LanguageVersion::Embedded011 | LanguageVersion::Embedded012 => &[
                 "once without explicit original scope and trusted clock",
                 "CLI once execution and outcome lookup",
                 "duration parameters",

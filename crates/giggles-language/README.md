@@ -28,6 +28,9 @@ Explicit version 0.11 selects `embedded-trusted-native-0.11`, adding trusted Rus
 once execution and outcome lookup with explicit original scope and a certified
 clock. The CLI rejects these two forms before opening a database; ordinary 0.11
 commands remain usable.
+Explicit version 0.12 selects `embedded-trusted-native-0.12`, adding local
+capability/limit discovery and trusted committed catalog inspection. It inherits
+0.11 once support in Rust; CLI once/outcome still require unavailable context.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:
@@ -49,6 +52,7 @@ $cli='crates/giggles-language/target-native/debug/giggles-language.exe'
 & $cli capability-manifest --language-version 0.9
 & $cli capability-manifest --language-version 0.10
 & $cli capability-manifest --language-version 0.11
+& $cli capability-manifest --language-version 0.12
 & $cli init example.db 'create table work (id bigint primary key, state text not null, note text)'
 & $cli run example.db 'insert work set id=1,state="ready"'
 & $cli run example.db 'work where state=$state order by id desc limit 10 select id,state' '{"state":{"Text":"ready"}}'
@@ -84,9 +88,9 @@ explicit tree rejection entry describes it.
 
 The versioned CLI grammar is `run --language-version VERSION PATH NATIVE
 [BINDINGS_JSON]`; `capabilities` and `capability-manifest` also accept
-`--language-version VERSION`. Versions are exactly `0.1` through `0.11`; other values
+`--language-version VERSION`. Versions are exactly `0.1` through `0.12`; other values
 return `Unsupported` before opening a database. Unversioned commands retain
-0.1 behavior. Rust callers select `LanguageVersion::Embedded02` through `Embedded011` using
+0.1 behavior. Rust callers select `LanguageVersion::Embedded02` through `Embedded012` using
 `Engine::with_version(admin, version)` and `parse_with_version(text, version)`;
 `profile_for(version)` and `capability_manifest_for(version)` describe that
 selection. `Engine::new`, `parse`, `profile` and `capability_manifest` retain
@@ -636,7 +640,7 @@ nested transaction expressions. SQL grammar remains unchanged. The 0.10 conflict
 increment does not implement secondary uniqueness, once/receipts, authorization
 or complete native v1 write semantics.
 
-Version 0.11 provides separate trusted Rust once APIs over the core's unchanged
+Versions 0.11 and 0.12 provide separate trusted Rust once APIs over the core's unchanged
 Once V1 contract. A standalone write places `once` after its ordinary clauses
 and cap, before `return`; a writing block places it in the transaction header:
 
@@ -657,8 +661,9 @@ retry. Use `outcome_text(text, bindings, scope)` or `outcome(query, bindings,
 scope)` for lookup; lookup needs no clock. `parse_once_with_version` and
 `parse_outcome_with_version` expose typed `OnceEnvelope` and `OutcomeQuery`, and
 `parse_input_with_version` returns `ParsedInput::Once` or `ParsedInput::Outcome`.
-These trees carry their selected language version; earlier profiles and
-mismatched versions reject them. Ordinary execute/prepare methods do not execute
+These trees carry their exact selected language version: a 0.11 tree cannot
+execute through a 0.12 engine or vice versa. Profiles 0.1 through 0.10 reject
+them. Ordinary execute/prepare methods do not execute
 envelopes, and there is no prepared once handle or automatic retry.
 
 The caller must persist the original `OnceScope { database_domain, tenant,
@@ -753,7 +758,61 @@ submission. No provisional receipt is returned on uncertain publication.
 layouts are not a stable network protocol; protocol adapters must define their
 own versioned wire DTOs and authorization. The CLI has neither original scope
 nor a certified clock and returns `Unsupported` for valid once/outcome input
-before database open, including under 0.11. It fabricates neither context.
+before database open, including under 0.11 and 0.12. It fabricates neither context.
+
+Version 0.12 adds four standalone inspection commands through separate
+`Engine::inspect_text(text)` and `Engine::inspect(&InspectionStatement)` APIs.
+They accept no bindings and cannot appear in transaction blocks, once envelopes,
+data projections or prepared operations. `parse_inspection_with_version` returns
+the typed statement, and general parsing returns `ParsedInput::Inspection`.
+Profiles 0.1 through 0.11 reject the new command forms. `show` and `describe`
+remain ordinary table names when the inspection command prefix is absent.
+
+```powershell
+# These describe the selected native library profile; the path is not opened.
+& $cli run --language-version 0.12 missing.db 'show capabilities'
+& $cli run --language-version 0.12 missing.db 'show limits'
+# These inspect an existing database's committed catalog.
+& $cli run --language-version 0.12 example.db 'show tables'
+& $cli run --language-version 0.12 example.db 'describe table work'
+```
+
+`show capabilities` returns `InspectionOutcome::Capabilities` containing the
+selected version's full `CapabilityManifest`, and `show limits` returns
+`InspectionOutcome::Limits` containing its `CapabilityLimits`. These are local
+library facts, not observations of a database, live server or caller's grants.
+The CLI returns them before opening even a missing or locked path. Nonempty
+inspection bindings fail before database open for all four commands. The
+existing CLI `capabilities` command retains its compact profile output;
+`capability-manifest` retains its direct manifest output without the inspection
+wrapper. Unversioned commands still select 0.1.
+
+`show tables` returns `InspectionOutcome::Catalog` with a complete list of
+`TableSummary { id, name, column_count, primary_key_columns }`; both count fields
+count columns, and neither is a row count. `describe table name` returns the exact
+`TableDef`, including stable column IDs, declared types, nullability and
+primary-key indexes. SQL-created `SmallInt` columns remain `SmallInt`. Names use
+the existing canonical lowercase ASCII identifier rules; 0.12 also accepts
+canonical backtick names. Qualified names and table-name parameters are not
+part of this slice. A missing table returns `Bind("table")`.
+
+Every catalog result contains `contract_version`, `database_domain`,
+`catalog_epoch`, `complete` and `result` (`Tables` or `Table`). The Rust domain is
+`u128`; its serde/CLI representation is a canonical decimal **string** so the full
+128-bit value survives JSON conversion. Catalog inspection reads one fresh
+committed view without executing SQL, scanning business rows, publishing a
+generation or copying the whole database state. Uncommitted DDL in another
+session stays invisible. Result descriptors are immutable copies of that view;
+they confer no execution authority and are not a continuing snapshot handle.
+
+The manifest advertises only `local_discovery` and `catalog_inspection` for this
+increment. `inspection_metadata_bytes` is 65,536, the core's logical catalog
+metadata accounting limit checked before cloning output. It is **not** a JSON,
+protobuf or total heap size bound. Table/column catalog limits remain in force.
+No data rows, row counts, indexes, schemas, dependencies, EXPLAIN or policy
+inspection are added. This is trusted embedded inspection under `Admin`; it
+does not qualify the reference's full Local core bundle, authenticated service
+discovery or task authorization, and changes no server/protocol API.
 
 Singular writes count the entire WHERE set before testing WHEN: zero gives
 `NotFound`, two or more `AmbiguousMatch`. Bulk caps are mandatory and atomic:
@@ -788,9 +847,9 @@ exit nonzero. `Conflict` rejects staged data changes; a commit conflict may stil
 advance the core's trusted decision/generation metadata. `Unknown` means a
 storage error occurred during COMMIT and effects may have persisted. **Do not
 blindly retry Unknown.** Unkeyed operations require application-state
-reconciliation; explicitly keyed 0.11 Rust calls use the original identity
+reconciliation; explicitly keyed 0.11/0.12 Rust calls use the original identity
 resolution described above. Ordinary APIs and profiles 0.1 through 0.10 do not
-provide receipts. The 0.11 adapter delegates its durable decisions to the trusted
+provide receipts. The 0.11/0.12 adapter delegates its durable decisions to the trusted
 core [`operations::once` API](../giggles-core/OPERATIONS.md).
 
 The larger native tour/writes/permissions contracts remain design targets.

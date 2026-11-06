@@ -1,4 +1,5 @@
 use crate::*;
+mod catalog_inspection;
 pub(crate) mod native_once;
 pub mod replica;
 use bincode::Options;

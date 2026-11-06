@@ -614,7 +614,7 @@ fn catalog_cli_empty_init_and_selected_manifest_match_version_seven() {
                     assert!(engine.execute_catalog(&tree).is_err());
                     assert!(engine.prepare_catalog_bound(&tree).is_err());
                 }
-                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_)) => {
+                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
                     panic!("earlier profile admitted a retry envelope: {source}")
                 }
                 Err(_) => {}

@@ -390,7 +390,8 @@ impl Parser {
             | LanguageVersion::Embedded08
             | LanguageVersion::Embedded09
             | LanguageVersion::Embedded010
-            | LanguageVersion::Embedded011 => self.sum(d),
+            | LanguageVersion::Embedded011
+            | LanguageVersion::Embedded012 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -983,7 +984,16 @@ impl Parser {
                 Intent::Claim { order },
             ));
         }
-        let table = self.name()?;
+        // A read clause disambiguates SHOW only when the profile permits its identifier.
+        let table = if semantic_identifier("show", self.version)
+            && matches!(self.peek(), Some(Token::Word(word)) if word == "show")
+            && matches!(self.tokens.get(self.pos + 1), Some((Token::Word(next), _)) if matches!(next.as_str(), "where" | "order" | "limit" | "select"))
+        {
+            self.pos += 1;
+            "show".into()
+        } else {
+            self.name()?
+        };
         let filter = self.filter()?;
         let order = self.sorts()?;
         let limit = if self.word("limit") {
@@ -1018,6 +1028,34 @@ impl Parser {
                 })
                 .collect(),
         })
+    }
+    fn inspection_prefix(&self) -> bool {
+        let tokens = &self.tokens[self.pos..];
+        matches!(tokens, [(Token::Word(word), _), (Token::Word(target), _), ..]
+            if word == "show" && matches!(target.as_str(), "tables" | "capabilities" | "limits"))
+            || matches!(tokens, [(Token::Word(describe), _), (Token::Word(table), _), ..] if describe == "describe" && table == "table")
+    }
+    fn inspection(&mut self) -> Result<InspectionStatement> {
+        if !self.version.supports_inspection() {
+            return Err(Error::Unsupported);
+        }
+        if self.word("show") {
+            if self.word("capabilities") {
+                Ok(InspectionStatement::ShowCapabilities)
+            } else if self.word("limits") {
+                Ok(InspectionStatement::ShowLimits)
+            } else if self.word("tables") {
+                Ok(InspectionStatement::ShowTables)
+            } else {
+                Err(self.error())
+            }
+        } else {
+            self.need("describe")?;
+            self.need("table")?;
+            Ok(InspectionStatement::DescribeTable {
+                table: self.name()?,
+            })
+        }
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
@@ -1291,6 +1329,29 @@ pub fn parse_catalog_with_version(s: &str, version: LanguageVersion) -> Result<C
     Ok(statement)
 }
 
+/// Parse one standalone discovery operation in its selected finite profile.
+pub fn parse_inspection_with_version(
+    s: &str,
+    version: LanguageVersion,
+) -> Result<InspectionStatement> {
+    if !version.supports_inspection() {
+        return Err(Error::Unsupported);
+    }
+    let mut p = Parser {
+        tokens: lex(s, version)?,
+        pos: 0,
+        end: s.len(),
+        version,
+    };
+    let statement = p.inspection()?;
+    p.symbol(';');
+    if p.peek().is_some() {
+        return Err(p.error());
+    }
+    inspection::validate(&statement, version)?;
+    Ok(statement)
+}
+
 /// Parse a complete keyed write or outer transaction, without executing it.
 pub fn parse_once_with_version(s: &str, version: LanguageVersion) -> Result<OnceEnvelope> {
     if !version.supports_once() {
@@ -1321,7 +1382,11 @@ pub fn parse_input_with_version(s: &str, version: LanguageVersion) -> Result<Par
         end: s.len(),
         version,
     };
-    let input = if version.supports_catalog() && p.catalog_prefix() {
+    let input = if version.supports_inspection() && p.inspection_prefix() {
+        let statement = p.inspection()?;
+        inspection::validate(&statement, version)?;
+        ParsedInput::Inspection(statement)
+    } else if version.supports_catalog() && p.catalog_prefix() {
         let statement = p.catalog()?;
         execute::validate_catalog(&statement, version)?;
         ParsedInput::Catalog(statement)

@@ -1132,7 +1132,7 @@ fn outcome(outcome: operations::Outcome) -> Outcome {
         conflict_results,
     }
 }
-fn error(error: operations::Error) -> Error {
+pub(crate) fn error(error: operations::Error) -> Error {
     match error {
         operations::Error::Syntax { offset } => Error::Syntax { offset },
         operations::Error::Unsupported => Error::Unsupported,
