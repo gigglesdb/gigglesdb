@@ -7,6 +7,14 @@ It is under active development. The embedded SQL shell is usable today;
 distributed features have different implementation and verification limits.
 This is not a production-qualified release or a PostgreSQL-compatible replacement.
 
+## Run from IntelliJ
+
+Shared run configurations are included. Run **01 Setup local demo**, then
+**02 Server**, then **03 Client Ping**. The setup creates and retains a local
+database and development TLS credentials. The run selector also includes SQL and
+native queries, backup/restore, multi-node failover suites, and per-crate tests.
+See [IntelliJ setup and run guide](scripts/README.md) for requirements and details.
+
 ## Start a server
 
 For a local server you can connect to and query, use **`giggles-server`**. It opens
