@@ -162,6 +162,37 @@ fn actual_process_seeded_campaign() {
                 && e["value"]["complete"] == read.complete.unwrap())
         );
         // Attribution negative controls mutate copies only, never raw artifacts.
+        let mut changed_ops = h.clone();
+        changed_ops
+            .attempts
+            .iter_mut()
+            .find(|a| a.id == "predecision-loss")
+            .unwrap()
+            .ops = vec![giggles_history::Op::Transfer {
+            from: 60,
+            to: 1,
+            amount: 999,
+        }];
+        assert!(giggles_range_history::validate_trace(&changed_ops, &raw).is_err());
+        let mut partial_refusal = raw.clone();
+        if by_tick[&read.complete.unwrap()]["value"]["ok"] == false {
+            partial_refusal
+                .iter_mut()
+                .find(|e| e["tick"] == read.complete.unwrap())
+                .unwrap()["value"]["data"] = json!(["partial-row"]);
+            assert!(giggles_range_history::validate_trace(&h, &partial_refusal).is_err());
+        }
+        let committed = h
+            .attempts
+            .iter()
+            .find(|a| a.id == "normal-transfer")
+            .unwrap();
+        let mut aborted_reply = raw.clone();
+        aborted_reply
+            .iter_mut()
+            .find(|e| e["tick"] == committed.complete.unwrap())
+            .unwrap()["value"]["data"]["decision"]["outcome"] = json!("Abort");
+        assert!(giggles_range_history::validate_trace(&h, &aborted_reply).is_err());
         let mut bad = h.clone();
         bad.attempts
             .iter_mut()
