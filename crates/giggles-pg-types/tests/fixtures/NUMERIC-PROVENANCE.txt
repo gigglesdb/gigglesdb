@@ -1,0 +1,48 @@
+﻿Numeric nonlinear fixture provenance
+
+Source: PostgreSQL REL_18_0 src/backend/utils/adt/numeric.c
+https://raw.githubusercontent.com/postgres/postgres/REL_18_0/src/backend/utils/adt/numeric.c
+SHA256 C0E106FC5C0F19D6B1F31050754D691C8E7A253953DC2041392BB6E915B9853A
+Copyright (c) 1998-2025 PostgreSQL Global Development Group; see POSTGRESQL-COPYRIGHT.
+ln_var, log_var, exp_var algorithms and constants adapted in src/numeric_math.rs;
+sqrt uses independent integer rational square root with REL18 scale policy.
+
+Actual PostgreSQL 18.0 (server_version_num 180000) fixtures generated against:
+postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c
+Dedicated Docker containers, network none, tmpfs /var/lib/postgresql.
+SQL generators retained alongside fixtures. No database needed for fixture tests.
+
+numeric_sqrt_pg18.txt: 220 rows, SHA256
+DF2E347F4D8D275EC3E4AB05A914C8C009FC1FB79F123B71AC1FE8BF8A0EE2A3
+Byte-for-byte copy of prior sqrt-oracle.txt; retains prior seed 68018 random200.
+numeric_nonlinear_pg18.txt: 651 rows, SHA256
+2CDB925BDB1042BEA61EA2DAD70012C4639851E2DDD8CCD0BE0AFCF5E59E75F2
+SQL deterministic independent seedless modular input generator plus boundaries.
+Columns: operation|input|result text|dscale|numeric_send hex.
+
+Stable APIs:
+Numeric::checked_sqrt(&self) -> Result<Self, Error>
+Numeric::checked_exp(&self) -> Result<Self, Error>
+Numeric::checked_ln(&self) -> Result<Self, Error>
+Numeric::checked_log(base: &Self, value: &Self) -> Result<Self, Error>
+checked_pow is ABSENT: retain unsupported power gate.
+
+Limits: existing Numeric representation ceilings unchanged. Result arithmetic
+uses bounded BigInt decimal scratch, signed scales for range reduction, REL18
+rounding/guard digits. f64 used ONLY for REL18 scale/range estimates, never
+result digits. Series terminate by rounded-zero terms/REL18 significance test;
+no iteration cap returns an approximation. Scratch power-of-ten guard 60000
+is derived conservatively from <=16384-digit inputs and selected <=1000 output
+scale (log intermediate scale may exceed 1000 near base 1). Existing finite
+validation retains narrower coefficient limits than PostgreSQL. Source guard
+digits reproduce PG algorithm rather than asserting universal correctly-rounded
+transcendental values. Fixtures sample behavior; not exhaustive rounding proof.
+Error::Range maps logarithm domain and exponential overflow; no SQLSTATE claim.
+
+Tests: numeric_math 6 tests (220 fixtures, 1000 exact squares, midpoint neighbors).
+numeric_nonlinear 4 tests (651 fixtures, 100 monotonicity/identity property cases,
+NaN/infinity/error precedence, huge/tiny/near1/exponent boundaries). No power
+matrix claim. Further independent adversarial last-digit rounding search and
+full power family remain. No dependencies, lockfiles, frozen modules or harness
+were edited by this worker. No commits, pushes, or subagents.
+

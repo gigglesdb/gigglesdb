@@ -1,0 +1,26 @@
+Source and license: REL_18_0 numeric.c, PostgreSQL Global Development Group,
+Copyright (c) 1998-2025. Full license: crates/giggles-pg-types/tests/fixtures/POSTGRESQL-COPYRIGHT.
+Source/hash/image/version/API/fixture counts: manifest.json. Source retained numeric.c.
+Adapted numeric_power, power_var, power_var_int; reused ln_var and exp_var adaptation.
+Power integer path uses rounded repeated squaring with REL18 variable precision,
+not generic exp(ln(x)*y). Fractional and large integer path uses REL18 two-pass
+ln scale selection, independent final power scale and guarded exp computation.
+Floating point used only for source scale/range estimates; result digits BigInt.
+The shared Decimal exp refactor preserves checked_exp scale policy.
+Full decimal parse supplies REL18 double estimates, avoiding truncated-leading-digit estimates.
+
+Generator generate.py captures SQL oracle.sql; actual PG18 network-none tmpfs owned
+oracle. Durable fixture columns op|base/input|exponent/value|text|dscale|binary hex.
+ERROR rows preserve actual SQLSTATE; API maps these domain/overflow errors to Range.
+NaN/infinity/zero/negative-base precedence, int32 edges and large integral parity,
+fixed-seed random cases, modular samples, near-one cancellation to16000 places,
+scale1000 caps, huge/tiny ln/log and exp underflow boundaries included.
+Properties are supporting samples, not proofs of last-digit rounding.
+Representation ceiling stays MAX_DIGITS16384/MAX_SCALE16383, narrower than PG.
+One oracle result exceeds coefficient ceiling and explicitly expects Limit.
+Integer intermediates have explicit pre-multiplication bit budgets and significant
+digit bound: Limit can occur even where a PostgreSQL result is representable.
+Scratch decimal powers retain60000 bound derived from input/guard scales; no
+iteration cap silently returns approximations. Source guard-digit algorithms
+reproduce PostgreSQL behavior, not a universal correctly-rounded theorem.
+No deps/locks/old arithmetic/float/temporal/core/harness modifications.
