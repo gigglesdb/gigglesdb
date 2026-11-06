@@ -1,118 +1,395 @@
 use crate::*;
-use giggles_core::{
-    Admin, CoreError, SqlSession,
-    relational::{ColumnDef, DataType, SqlError, TableDef},
-};
-use std::{cmp::Ordering, collections::BTreeSet};
+use giggles_core::{Admin, operations};
+use std::io::{self, Write};
 
-/// Trusted embedded executor. Independent Admin holders retain unrestricted SQL authority.
+/// Trusted embedded native frontend for the common typed operation engine.
+/// Independent Admin holders retain unrestricted SQL authority.
 #[derive(Clone)]
 pub struct Engine {
-    admin: Admin,
+    pub(crate) inner: operations::Engine,
+    pub(crate) version: LanguageVersion,
 }
-fn core(e: CoreError) -> Error {
-    match e {
-        CoreError::Sql(SqlError::Conflict) => Error::Conflict,
-        _ => Error::Core(e.to_string()),
+
+/// An immutable operation with argument values captured at preparation.
+///
+/// This handle has no parameter slots, database session, network encoding or
+/// authority credential. Executing it again starts another operation; it is not
+/// an idempotency key. Only the receiving [`Engine`]'s trusted Admin executes it.
+///
+/// Handles deliberately have no serialization format:
+/// ```compile_fail
+/// fn encode(operation: &giggles_language::BoundOperation) {
+///     let _ = serde_json::to_string(operation);
+/// }
+/// ```
+#[derive(Clone)]
+pub struct BoundOperation {
+    inner: operations::BoundOperation,
+    language_version: &'static str,
+    profile: &'static str,
+}
+impl BoundOperation {
+    pub fn language_version(&self) -> &'static str {
+        self.language_version
+    }
+    pub fn profile(&self) -> &'static str {
+        self.profile
+    }
+    /// Stable catalog identities and typed output columns captured at prepare.
+    /// A returned description is metadata, not permission to execute.
+    pub fn description(&self) -> &operations::BoundDescription {
+        self.inner.description()
     }
 }
+
+/// Immutable local transaction plan with frozen argument values and catalog fences.
+/// It has no serialization or retry/receipt contract.
+#[derive(Clone, Debug)]
+pub struct BoundTransaction {
+    inner: operations::BoundTransaction,
+    version: LanguageVersion,
+}
+impl BoundTransaction {
+    pub fn language_version(&self) -> &'static str {
+        self.version.as_str()
+    }
+    pub fn profile(&self) -> &'static str {
+        self.version.profile_name()
+    }
+    pub fn description(&self) -> &operations::BoundTransactionDescription {
+        self.inner.description()
+    }
+}
+
+/// Immutable proposed catalog definition, with no allocated table or column IDs.
+/// The handle is local, value-bound, and not a migration receipt or credential.
+#[derive(Clone, Debug)]
+pub struct BoundCatalogOperation {
+    inner: operations::BoundCatalogOperation,
+    version: LanguageVersion,
+}
+impl BoundCatalogOperation {
+    pub fn language_version(&self) -> &'static str {
+        self.version.as_str()
+    }
+    pub fn profile(&self) -> &'static str {
+        self.version.profile_name()
+    }
+    pub fn description(&self) -> &operations::BoundCatalogDescription {
+        self.inner.description()
+    }
+}
+
 impl Engine {
     pub fn new(admin: Admin) -> Self {
-        Self { admin }
+        Self::with_version(admin, LanguageVersion::Embedded01)
+    }
+    pub fn with_version(admin: Admin, version: LanguageVersion) -> Self {
+        Self {
+            inner: operations::Engine::new(admin),
+            version,
+        }
     }
     pub fn execute_text(&self, text: &str, bindings: &Bindings) -> Result<Outcome> {
-        self.execute(&parse(text)?, bindings)
+        self.execute(&parse_with_version(text, self.version)?, bindings)
     }
     pub fn execute(&self, stmt: &Statement, bindings: &Bindings) -> Result<Outcome> {
-        validate_depth(stmt)?;
-        if serde_json::to_vec(stmt).map_err(|_| Error::Limit)?.len() > MAX_INPUT {
-            return Err(Error::Limit);
+        let request = lower_checked(stmt, self.version)?;
+        self.inner
+            .execute(&request, bindings)
+            .map(outcome)
+            .map_err(error)
+    }
+
+    /// Parse and bind text with the exact supplied values, without executing it.
+    pub fn prepare_bound_text(&self, text: &str, bindings: &Bindings) -> Result<BoundOperation> {
+        self.prepare_bound(&parse_with_version(text, self.version)?, bindings)
+    }
+
+    /// Bind an immutable operation against a fresh committed catalog snapshot.
+    ///
+    /// All arguments are required now and are copied into the bound operation.
+    /// Preparation checks names and types but does not scan rows, evaluate
+    /// cardinality/guards, or make durable changes. Subsequent argument changes
+    /// require preparing another handle. The existing [`Engine::execute`] API
+    /// continues binding and executing in a single transaction.
+    pub fn prepare_bound(&self, stmt: &Statement, bindings: &Bindings) -> Result<BoundOperation> {
+        let request = lower_checked(stmt, self.version)?;
+        let inner = self
+            .inner
+            .prepare_bound(&request, bindings)
+            .map_err(error)?;
+        Ok(BoundOperation {
+            inner,
+            language_version: self.version.as_str(),
+            profile: self.version.profile_name(),
+        })
+    }
+
+    /// Execute frozen intent against fresh rows after checking its catalog fence.
+    ///
+    /// Schema changes or another database domain reject the handle before
+    /// effects. Data changes are observed at execution, so caps and singular
+    /// cardinality are checked again. There are no automatic retries; an
+    /// [`Error::Unknown`] commit still needs application reconciliation.
+    pub fn execute_bound(&self, operation: &BoundOperation) -> Result<Outcome> {
+        if operation.language_version != self.version.as_str()
+            || operation.profile != self.version.profile_name()
+        {
+            return Err(Error::Unsupported);
         }
-        if !parser::identifier(stmt.table()) {
-            return Err(Error::Bind("identifier".into()));
+        self.inner
+            .execute_bound(&operation.inner)
+            .map(outcome)
+            .map_err(error)
+    }
+    pub fn execute_transaction_text(
+        &self,
+        text: &str,
+        bindings: &Bindings,
+    ) -> Result<TransactionOutcome> {
+        self.execute_transaction(
+            &parse_transaction_with_version(text, self.version)?,
+            bindings,
+        )
+    }
+    pub fn execute_transaction(
+        &self,
+        transaction: &Transaction,
+        bindings: &Bindings,
+    ) -> Result<TransactionOutcome> {
+        let transaction = lower_transaction_checked(transaction, self.version)?;
+        self.inner
+            .execute_transaction(&transaction, bindings)
+            .map_err(error)
+    }
+    pub fn prepare_transaction_bound_text(
+        &self,
+        text: &str,
+        bindings: &Bindings,
+    ) -> Result<BoundTransaction> {
+        self.prepare_transaction_bound(
+            &parse_transaction_with_version(text, self.version)?,
+            bindings,
+        )
+    }
+    pub fn prepare_transaction_bound(
+        &self,
+        transaction: &Transaction,
+        bindings: &Bindings,
+    ) -> Result<BoundTransaction> {
+        let transaction = lower_transaction_checked(transaction, self.version)?;
+        Ok(BoundTransaction {
+            inner: self
+                .inner
+                .prepare_transaction_bound(&transaction, bindings)
+                .map_err(error)?,
+            version: self.version,
+        })
+    }
+    pub fn execute_transaction_bound(
+        &self,
+        transaction: &BoundTransaction,
+    ) -> Result<TransactionOutcome> {
+        if self.version != transaction.version || !self.version.supports_transactions() {
+            return Err(Error::Unsupported);
         }
-        let (epoch, tables) = self.admin.catalog().map_err(core)?;
-        let table = tables
-            .into_iter()
-            .find(|t| t.name == stmt.table())
-            .ok_or_else(|| Error::Bind("table".into()))?;
-        let mut session = self.admin.sql_session();
-        session.execute("begin", &[], None).map_err(core)?;
-        let staged = (|| {
-            // This prevents borrowing a primary-key definition from before BEGIN.
-            if self.admin.catalog().map_err(core)?.0 != epoch {
-                return Err(Error::Conflict);
-            }
-            let sql = format!("select * from {} limit {}", table.name, MAX_ROWS);
-            let p = session.prepare(&sql).map_err(core)?;
-            if session.describe(&p).map_err(core)?.columns != table.columns {
-                return Err(Error::Conflict);
-            }
-            let mut binder = Binder {
-                table: &table,
-                bindings,
-                used: BTreeSet::new(),
-            };
-            let operation = binder.bind(stmt)?;
-            if binder.used != bindings.keys().cloned().collect() {
-                return Err(Error::Bind("parameters".into()));
-            }
-            let rows = session.execute_prepared(&p, &[], None).map_err(core)?.rows;
-            if rows.len() == MAX_ROWS {
-                // MAX_ROWS is a core result-page bound, NOT a table capacity.
-                // Compare the complete PK at the end of this page to the true
-                // maximum in the same snapshot, including composite keys.
-                let maximum = session
-                    .scan(giggles_core::relational::Scan {
-                        table: table.name.clone(),
-                        projection: table
-                            .primary_key
-                            .iter()
-                            .map(|i| table.columns[*i].name.clone())
-                            .collect(),
-                        prefix: vec![],
-                        lower: None,
-                        upper: None,
-                        reverse: true,
-                        limit: 1,
-                    })
-                    .map_err(core)?;
-                let last = rows.last().ok_or(Error::Limit)?;
-                let key: Vec<_> = table
-                    .primary_key
-                    .iter()
-                    .map(|i| last.values[*i].clone())
-                    .collect();
-                if maximum.rows.first().is_none_or(|r| r.values != key) {
-                    return Err(Error::Limit);
-                }
-                if matches!(operation, Operation::Insert(_)) {
-                    return Err(Error::Limit);
-                }
-            }
-            run(&mut session, &table, operation, rows)
-        })();
-        let outcome = match staged {
-            Ok(v) => v,
-            Err(e) => {
-                session.rollback();
-                return Err(e);
-            }
-        };
-        match session.execute("commit", &[], None) {
-            Ok(_) => Ok(outcome),
-            Err(e) => {
-                session.rollback();
-                Err(match e {
-                    CoreError::Storage(_) => Error::Unknown,
-                    _ => core(e),
-                })
-            }
+        self.inner
+            .execute_transaction_bound(&transaction.inner)
+            .map_err(error)
+    }
+
+    /// Execute one safe catalog operation in its own transaction.
+    pub fn execute_catalog_text(&self, text: &str) -> Result<CatalogOutcome> {
+        self.execute_catalog(&parse_catalog_with_version(text, self.version)?)
+    }
+    pub fn execute_catalog(&self, statement: &CatalogStatement) -> Result<CatalogOutcome> {
+        let request = lower_catalog_checked(statement, self.version)?;
+        self.inner.execute_catalog(&request).map_err(error)
+    }
+    /// Validate an immutable proposed definition without allocating catalog IDs.
+    /// Population policy is checked against fresh state only at execution.
+    pub fn prepare_catalog_bound_text(&self, text: &str) -> Result<BoundCatalogOperation> {
+        self.prepare_catalog_bound(&parse_catalog_with_version(text, self.version)?)
+    }
+    pub fn prepare_catalog_bound(
+        &self,
+        statement: &CatalogStatement,
+    ) -> Result<BoundCatalogOperation> {
+        let request = lower_catalog_checked(statement, self.version)?;
+        Ok(BoundCatalogOperation {
+            inner: self.inner.prepare_catalog_bound(&request).map_err(error)?,
+            version: self.version,
+        })
+    }
+    pub fn execute_catalog_bound(
+        &self,
+        operation: &BoundCatalogOperation,
+    ) -> Result<CatalogOutcome> {
+        if self.version != operation.version || !self.version.supports_catalog() {
+            return Err(Error::Unsupported);
         }
+        self.inner
+            .execute_catalog_bound(&operation.inner)
+            .map_err(error)
     }
 }
+
+pub(crate) fn validate_catalog(
+    statement: &CatalogStatement,
+    version: LanguageVersion,
+) -> Result<()> {
+    let CatalogStatement::CreateTable {
+        table,
+        columns,
+        primary_key,
+    } = statement;
+    if columns.len() > giggles_core::relational::MAX_COLUMNS
+        || primary_key.len() > giggles_core::relational::MAX_COLUMNS
+    {
+        return Err(Error::Limit);
+    }
+    // Every name is checked before any definition strings are cloned.
+    if !parser::semantic_identifier(table, version)
+        || columns
+            .iter()
+            .any(|column| !parser::semantic_identifier(&column.name, version))
+        || primary_key
+            .iter()
+            .any(|key| !parser::semantic_identifier(key, version))
+    {
+        return Err(Error::Bind("identifier".into()));
+    }
+    validate_size(statement)
+}
+
+fn lower_catalog_checked(
+    statement: &CatalogStatement,
+    version: LanguageVersion,
+) -> Result<operations::CatalogRequest> {
+    if !version.supports_catalog() {
+        return Err(Error::Unsupported);
+    }
+    validate_catalog(statement, version)?;
+    let CatalogStatement::CreateTable {
+        table,
+        columns,
+        primary_key,
+    } = statement;
+    Ok(operations::CatalogRequest::CreateTable {
+        table: table.clone(),
+        columns: columns
+            .iter()
+            .map(|column| operations::ColumnSpec {
+                name: column.name.clone(),
+                data_type: match column.data_type {
+                    CatalogType::Bool => giggles_core::relational::DataType::Boolean,
+                    CatalogType::Int32 => giggles_core::relational::DataType::Integer,
+                    CatalogType::Int64 => giggles_core::relational::DataType::BigInt,
+                    CatalogType::Text => giggles_core::relational::DataType::Text,
+                    CatalogType::Bytes => giggles_core::relational::DataType::Bytes,
+                },
+                not_null: !column.nullable,
+            })
+            .collect(),
+        primary_key: primary_key.clone(),
+    })
+}
+
+pub(crate) fn lower_checked(
+    stmt: &Statement,
+    version: LanguageVersion,
+) -> Result<operations::Request> {
+    // Check caller-supplied trees before serialization or recursive lowering.
+    validate_depth(stmt)?;
+    validate_size(stmt)?;
+    validate_version(stmt, version)?;
+    lower_statement(stmt, version)
+}
+
 pub(crate) fn validate_depth(stmt: &Statement) -> Result<()> {
-    let mut pending = vec![];
+    validate_statement_depth(stmt, &mut 0)
+}
+struct StatementParts<'a> {
+    statement: &'a Statement,
+    projection: Option<&'a [Projection]>,
+    conflict: Option<(&'a [String], &'a ConflictAction)>,
+}
+// Admit only optional RETURN -> optional ON CONFLICT -> direct operation.
+// Inspect at most two boxes, before serialization or recursive lowering.
+fn statement_parts(statement: &Statement) -> Result<StatementParts<'_>> {
+    let (statement, projection) = if let Statement::Returning {
+        statement,
+        projection,
+    } = statement
+    {
+        (statement.as_ref(), Some(projection.as_slice()))
+    } else {
+        (statement, None)
+    };
+    let (statement, conflict) = if let Statement::OnConflict {
+        statement,
+        target,
+        action,
+    } = statement
+    {
+        if !matches!(
+            statement.as_ref(),
+            Statement::Insert { .. }
+                | Statement::InsertExpressions { .. }
+                | Statement::InsertMany { .. }
+        ) {
+            return Err(Error::Unsupported);
+        }
+        if target.len() > giggles_core::relational::MAX_COLUMNS {
+            return Err(Error::Limit);
+        }
+        if let ConflictAction::Update { values, .. } = action
+            && (values.is_empty() || values.len() > giggles_core::relational::MAX_COLUMNS)
+        {
+            return Err(Error::Bind("assignments".into()));
+        }
+        (statement.as_ref(), Some((target.as_slice(), action)))
+    } else {
+        (statement, None)
+    };
+    if matches!(
+        statement,
+        Statement::Returning { .. } | Statement::OnConflict { .. }
+    ) || (projection.is_some()
+        && !matches!(
+            statement,
+            Statement::Insert { .. }
+                | Statement::InsertExpressions { .. }
+                | Statement::InsertMany { .. }
+                | Statement::Update { .. }
+                | Statement::UpdateExpressions { .. }
+                | Statement::Delete { .. }
+        ))
+    {
+        return Err(Error::Unsupported);
+    }
+    if projection.is_some_and(|projection| projection.len() > giggles_core::relational::MAX_COLUMNS)
+    {
+        return Err(Error::Limit);
+    }
+    Ok(StatementParts {
+        statement,
+        projection,
+        conflict,
+    })
+}
+fn validate_statement_depth(stmt: &Statement, nodes: &mut usize) -> Result<()> {
+    let parts = statement_parts(stmt)?;
+    let mut pending = Vec::new();
+    if let Some(projection) = parts.projection {
+        pending.extend(projection.iter().map(|p| (&p.expression, 0)));
+    }
+    if let Some((_, ConflictAction::Update { guard, values })) = parts.conflict {
+        pending.extend(guard.iter().map(|expr| (expr, 0)));
+        pending.extend(values.iter().map(|(_, expr)| (expr, 0)));
+    }
+    let stmt = parts.statement;
     match stmt {
         Statement::Read {
             filter: Some(e), ..
@@ -123,590 +400,757 @@ pub(crate) fn validate_depth(stmt: &Statement) -> Result<()> {
                 pending.push((e, 0))
             }
         }
+        Statement::UpdateExpressions {
+            filter,
+            guard,
+            values,
+            ..
+        } => {
+            if values.len() > giggles_core::relational::MAX_COLUMNS {
+                return Err(Error::Bind("assignments".into()));
+            }
+            pending.push((filter, 0));
+            pending.extend(guard.iter().map(|e| (e, 0)));
+            pending.extend(values.iter().map(|(_, e)| (e, 0)));
+        }
+        Statement::ReadExpressions {
+            filter, projection, ..
+        } => {
+            if projection.len() > giggles_core::relational::MAX_COLUMNS {
+                return Err(Error::Limit);
+            }
+            pending.extend(filter.iter().map(|e| (e, 0)));
+            pending.extend(projection.iter().map(|p| (&p.expression, 0)));
+        }
+        Statement::InsertExpressions { values, .. } => {
+            if values.len() > giggles_core::relational::MAX_COLUMNS {
+                return Err(Error::Bind("assignments".into()));
+            }
+            pending.extend(values.iter().map(|(_, expr)| (expr, 0)));
+        }
+        Statement::InsertMany { columns, rows, .. } => {
+            // Check every collection and arity before gathering expression roots.
+            if columns.len() > giggles_core::relational::MAX_COLUMNS || rows.len() > MAX_INSERT_ROWS
+            {
+                return Err(Error::Limit);
+            }
+            if columns.is_empty() {
+                return Err(Error::Bind("columns".into()));
+            }
+            if rows.iter().any(|row| row.len() != columns.len()) {
+                return Err(Error::Type);
+            }
+            let roots = rows.len().checked_mul(columns.len()).ok_or(Error::Limit)?;
+            if nodes
+                .checked_add(pending.len())
+                .and_then(|n| n.checked_add(roots))
+                .is_none_or(|n| n > MAX_EXPRESSION_NODES)
+            {
+                return Err(Error::Limit);
+            }
+            pending.extend(rows.iter().flatten().map(|expr| (expr, 0)));
+        }
         _ => (),
     }
-    let mut nodes = 0;
+    validate_nodes(pending, nodes)
+}
+pub(crate) fn validate_call(function: ScalarFunction, count: usize) -> Result<()> {
+    if count > MAX_FUNCTION_ARGUMENTS {
+        return Err(Error::Limit);
+    }
+    if match function {
+        ScalarFunction::Coalesce => count < 2,
+        ScalarFunction::Abs | ScalarFunction::Length => count != 1,
+    } {
+        return Err(Error::Type);
+    }
+    Ok(())
+}
+pub(crate) fn validate_case(count: usize) -> Result<()> {
+    if count > MAX_CASE_ARMS {
+        return Err(Error::Limit);
+    }
+    if count == 0 {
+        return Err(Error::Type);
+    }
+    Ok(())
+}
+fn validate_nodes(mut pending: Vec<(&Expr, usize)>, nodes: &mut usize) -> Result<()> {
     while let Some((e, d)) = pending.pop() {
-        nodes += 1;
-        if d > MAX_DEPTH || nodes > 4096 {
+        *nodes += 1;
+        if d > MAX_DEPTH || *nodes > MAX_EXPRESSION_NODES {
             return Err(Error::Limit);
         }
         match e {
-            Expr::Compare(a, _, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            Expr::Compare(a, _, b)
+            | Expr::And(a, b)
+            | Expr::Or(a, b)
+            | Expr::Arithmetic(a, _, b) => {
                 pending.push((a, d + 1));
                 pending.push((b, d + 1))
             }
-            Expr::IsNull(e, _) | Expr::Not(e) => pending.push((e, d + 1)),
+            Expr::IsNull(e, _) | Expr::Not(e) | Expr::Negate(e) => pending.push((e, d + 1)),
+            Expr::Call {
+                function,
+                arguments,
+            } => {
+                validate_call(*function, arguments.len())?;
+                pending.extend(arguments.iter().map(|argument| (argument, d + 1)));
+            }
+            Expr::Case {
+                operand,
+                arms,
+                else_expr,
+            } => {
+                validate_case(arms.len())?;
+                pending.extend(operand.iter().map(|expr| (expr.as_ref(), d + 1)));
+                for (condition, result) in arms {
+                    pending.push((condition, d + 1));
+                    pending.push((result, d + 1));
+                }
+                pending.extend(else_expr.iter().map(|expr| (expr.as_ref(), d + 1)));
+            }
             _ => (),
         }
     }
     Ok(())
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ty {
-    Bool,
-    Int,
-    Text,
-    Bytes,
-}
-fn ty(v: &Value) -> Option<Ty> {
-    match v {
-        Value::Null => None,
-        Value::Bool(_) => Some(Ty::Bool),
-        Value::Int(_) => Some(Ty::Int),
-        Value::Text(_) => Some(Ty::Text),
-        Value::Bytes(_) => Some(Ty::Bytes),
+
+pub(crate) fn validate_version(stmt: &Statement, version: LanguageVersion) -> Result<()> {
+    let parts = statement_parts(stmt)?;
+    if parts.projection.is_some() && !version.supports_return() {
+        return Err(Error::Unsupported);
     }
-}
-fn colty(c: &ColumnDef) -> Ty {
-    match c.data_type {
-        DataType::Boolean => Ty::Bool,
-        DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
-        DataType::Text => Ty::Text,
-        DataType::Bytes => Ty::Bytes,
+    if parts.conflict.is_some() && !version.supports_upsert() {
+        return Err(Error::Unsupported);
     }
-}
-fn check(v: &Value, c: &ColumnDef) -> Result<()> {
-    if *v == Value::Null {
-        return if c.not_null { Err(Error::Type) } else { Ok(()) };
+    let stmt = parts.statement;
+    if matches!(stmt, Statement::InsertMany { .. }) && !version.supports_insert_many() {
+        return Err(Error::Unsupported);
     }
-    if ty(v) != Some(colty(c)) {
-        return Err(Error::Type);
-    }
-    if let Value::Int(n) = v {
-        match c.data_type {
-            DataType::SmallInt if i16::try_from(*n).is_err() => return Err(Error::Type),
-            DataType::Integer if i32::try_from(*n).is_err() => return Err(Error::Type),
+    if !version.supports_transactions() {
+        match stmt {
+            Statement::InsertExpressions { .. } => return Err(Error::Unsupported),
+            Statement::Update {
+                guard: Some(_),
+                intent: Intent::Many { .. },
+                ..
+            }
+            | Statement::UpdateExpressions {
+                guard: Some(_),
+                intent: Intent::Many { .. },
+                ..
+            }
+            | Statement::Delete {
+                guard: Some(_),
+                cap: Some(_),
+                ..
+            } => return Err(Error::Unsupported),
             _ => (),
         }
     }
-    Ok(())
+    if matches!(
+        stmt,
+        Statement::ReadExpressions { .. } | Statement::UpdateExpressions { .. }
+    ) && !version.supports_computed()
+    {
+        return Err(Error::Unsupported);
+    }
+    let mut pending = Vec::new();
+    if let Some(projection) = parts.projection {
+        pending.extend(projection.iter().map(|p| &p.expression));
+    }
+    if let Some((_, ConflictAction::Update { guard, values })) = parts.conflict {
+        pending.extend(guard.iter());
+        pending.extend(values.iter().map(|(_, expr)| expr));
+    }
+    match stmt {
+        Statement::Read { filter, .. } => pending.extend(filter.iter()),
+        Statement::Update { filter, guard, .. } | Statement::Delete { filter, guard, .. } => {
+            pending.push(filter);
+            pending.extend(guard.iter());
+        }
+        Statement::Insert { .. } => (),
+        Statement::ReadExpressions {
+            filter, projection, ..
+        } => {
+            pending.extend(filter.iter());
+            pending.extend(projection.iter().map(|p| &p.expression));
+        }
+        Statement::UpdateExpressions {
+            filter,
+            guard,
+            values,
+            ..
+        } => {
+            pending.push(filter);
+            pending.extend(guard.iter());
+            pending.extend(values.iter().map(|(_, expr)| expr));
+        }
+        Statement::InsertExpressions { values, .. } => {
+            pending.extend(values.iter().map(|(_, expr)| expr))
+        }
+        Statement::InsertMany { rows, .. } => pending.extend(rows.iter().flatten()),
+        Statement::Returning { .. } | Statement::OnConflict { .. } => {
+            unreachable!("wrappers normalized")
+        }
+    }
+    validate_expression_version(pending, version)
 }
-#[derive(Clone)]
-enum Bound {
-    Value(Value),
-    Field(usize),
-    Compare(Box<Bound>, Compare, Box<Bound>),
-    IsNull(Box<Bound>, bool),
-    Not(Box<Bound>),
-    And(Box<Bound>, Box<Bound>),
-    Or(Box<Bound>, Box<Bound>),
-}
-struct Binder<'a> {
-    table: &'a TableDef,
-    bindings: &'a Bindings,
-    used: BTreeSet<String>,
-}
-impl Binder<'_> {
-    fn field(&self, s: &str) -> Result<usize> {
-        if !parser::identifier(s) {
-            return Err(Error::Bind("identifier".into()));
-        }
-        self.table
-            .columns
-            .iter()
-            .position(|c| c.name == s)
-            .ok_or_else(|| Error::Bind("column".into()))
-    }
-    fn value(&mut self, e: &ValueExpr) -> Result<Value> {
-        match e {
-            ValueExpr::Literal(v) => Ok(v.clone()),
-            ValueExpr::Parameter(n) => {
-                if n.len() > 63
-                    || n.is_empty()
-                    || !(n.as_bytes()[0].is_ascii_alphabetic() || n.starts_with('_'))
-                    || !n
-                        .bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-                {
-                    return Err(Error::Bind("parameter name".into()));
-                }
-                self.used.insert(n.clone());
-                self.bindings
-                    .get(n)
-                    .cloned()
-                    .ok_or_else(|| Error::Bind("parameter missing".into()))
-            }
-        }
-    }
-    fn count(&mut self, e: &ValueExpr) -> Result<usize> {
-        match self.value(e)? {
-            Value::Int(n) if (0..=MAX_ROWS as i64).contains(&n) => Ok(n as usize),
-            _ => Err(Error::Type),
-        }
-    }
-    fn expr(&mut self, e: &Expr, d: usize) -> Result<(Bound, Option<Ty>)> {
-        if d > MAX_DEPTH {
-            return Err(Error::Limit);
-        }
-        let boolean = |t: Option<Ty>| {
-            if t.is_none() || t == Some(Ty::Bool) {
-                Ok(())
-            } else {
-                Err(Error::Type)
-            }
-        };
-        Ok(match e {
-            Expr::Value(v) => {
-                let v = self.value(v)?;
-                let t = ty(&v);
-                (Bound::Value(v), t)
-            }
-            Expr::Field(n) => {
-                let i = self.field(n)?;
-                (Bound::Field(i), Some(colty(&self.table.columns[i])))
-            }
-            Expr::Compare(a, op, b) => {
-                let (a, ta) = self.expr(a, d + 1)?;
-                let (b, tb) = self.expr(b, d + 1)?;
-                if ta.is_some() && tb.is_some() && ta != tb {
-                    return Err(Error::Type);
-                }
-                (
-                    Bound::Compare(Box::new(a), *op, Box::new(b)),
-                    Some(Ty::Bool),
-                )
-            }
-            Expr::IsNull(e, neg) => {
-                let (e, _) = self.expr(e, d + 1)?;
-                (Bound::IsNull(Box::new(e), *neg), Some(Ty::Bool))
-            }
-            Expr::Not(e) => {
-                let (e, t) = self.expr(e, d + 1)?;
-                boolean(t)?;
-                (Bound::Not(Box::new(e)), Some(Ty::Bool))
-            }
-            Expr::And(a, b) | Expr::Or(a, b) => {
-                let (a, ta) = self.expr(a, d + 1)?;
-                let (b, tb) = self.expr(b, d + 1)?;
-                boolean(ta)?;
-                boolean(tb)?;
-                (
-                    if matches!(e, Expr::And(..)) {
-                        Bound::And(Box::new(a), Box::new(b))
-                    } else {
-                        Bound::Or(Box::new(a), Box::new(b))
-                    },
-                    Some(Ty::Bool),
-                )
-            }
-        })
-    }
-    fn predicate(&mut self, e: &Expr) -> Result<Bound> {
-        let (e, t) = self.expr(e, 0)?;
-        if t.is_some() && t != Some(Ty::Bool) {
-            return Err(Error::Type);
-        }
-        Ok(e)
-    }
-    fn optional(&mut self, e: &Option<Expr>) -> Result<Bound> {
-        match e {
-            Some(e) => self.predicate(e),
-            None => Ok(Bound::Value(Value::Bool(true))),
-        }
-    }
-    fn order(&self, order: &[Sort]) -> Result<Vec<(usize, bool)>> {
-        let mut seen = BTreeSet::new();
-        let mut out = vec![];
-        for o in order {
-            let i = self.field(&o.field)?;
-            if !seen.insert(i) {
-                return Err(Error::Bind("duplicate order".into()));
-            }
-            out.push((i, o.descending))
-        }
-        for i in &self.table.primary_key {
-            if seen.insert(*i) {
-                out.push((*i, false))
-            }
-        }
-        Ok(out)
-    }
-    fn assignments(
-        &mut self,
-        v: &[(String, ValueExpr)],
-        insert: bool,
-    ) -> Result<Vec<(usize, Value)>> {
-        if v.is_empty() || v.len() > giggles_core::relational::MAX_COLUMNS {
-            return Err(Error::Bind("assignments".into()));
-        }
-        let mut seen = BTreeSet::new();
-        let mut out = vec![];
-        for (n, e) in v {
-            let i = self.field(n)?;
-            if !seen.insert(i) {
-                return Err(Error::Bind("duplicate assignment".into()));
-            }
-            if !insert && self.table.primary_key.contains(&i) {
+
+fn validate_expression_version(mut pending: Vec<&Expr>, version: LanguageVersion) -> Result<()> {
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::ConflictField { .. } if !version.supports_upsert() => {
                 return Err(Error::Unsupported);
             }
-            let v = self.value(e)?;
-            check(&v, &self.table.columns[i])?;
-            out.push((i, v))
-        }
-        Ok(out)
-    }
-    fn bind(&mut self, s: &Statement) -> Result<Operation> {
-        Ok(match s {
-            Statement::Read {
-                filter,
-                order,
-                limit,
-                projection,
-                ..
-            } => {
-                let filter = self.optional(filter)?;
-                let order = self.order(order)?;
-                let limit = match limit {
-                    Some(v) => self.count(v)?,
-                    None => 100,
-                };
-                let projection = if projection.is_empty() {
-                    (0..self.table.columns.len()).collect()
-                } else {
-                    let mut seen = BTreeSet::new();
-                    let mut out = vec![];
-                    for n in projection {
-                        let i = self.field(n)?;
-                        if !seen.insert(i) {
-                            return Err(Error::Bind("duplicate projection".into()));
-                        }
-                        out.push(i)
-                    }
-                    out
-                };
-                Operation::Read {
-                    filter,
-                    order,
-                    limit,
-                    projection,
-                }
+            Expr::Local(_) if !version.supports_transactions() => {
+                return Err(Error::Unsupported);
             }
-            Statement::Insert { values, .. } => {
-                let a = self.assignments(values, true)?;
-                let mut values = vec![Value::Null; self.table.columns.len()];
-                for (i, v) in a {
-                    values[i] = v
-                }
-                for (v, c) in values.iter().zip(&self.table.columns) {
-                    check(v, c)?
-                }
-                Operation::Insert(values)
+            Expr::Negate(_) | Expr::Arithmetic(..) if version == LanguageVersion::Embedded01 => {
+                return Err(Error::Unsupported);
             }
-            Statement::Update {
-                filter,
-                guard,
-                values,
-                intent,
-                ..
-            } => {
-                if guard.is_some() && !matches!(intent, Intent::One) {
+            Expr::Compare(a, _, b)
+            | Expr::And(a, b)
+            | Expr::Or(a, b)
+            | Expr::Arithmetic(a, _, b) => {
+                pending.push(a);
+                pending.push(b);
+            }
+            Expr::IsNull(expr, _) | Expr::Not(expr) | Expr::Negate(expr) => pending.push(expr),
+            Expr::Call { arguments, .. } => {
+                if !version.supports_scalar_functions() {
                     return Err(Error::Unsupported);
                 }
-                let filter = self.predicate(filter)?;
-                let guard = self.optional(guard)?;
-                let sets = self.assignments(values, false)?;
-                let selection = match intent {
-                    Intent::One => Selection::One,
-                    Intent::Many { cap } => Selection::Many(self.count(cap)?),
-                    Intent::Claim { order } => {
-                        if order.is_empty() {
-                            return Err(Error::Bind("claim order".into()));
-                        }
-                        Selection::Claim(self.order(order)?)
-                    }
-                };
-                Operation::Mutate {
-                    filter,
-                    guard,
-                    sets: Some(sets),
-                    selection,
-                }
+                pending.extend(arguments);
             }
-            Statement::Delete {
-                filter, guard, cap, ..
+            Expr::Case {
+                operand,
+                arms,
+                else_expr,
             } => {
-                if cap.is_some() && guard.is_some() {
+                if !version.supports_case() {
                     return Err(Error::Unsupported);
                 }
-                Operation::Mutate {
-                    filter: self.predicate(filter)?,
-                    guard: self.optional(guard)?,
-                    sets: None,
-                    selection: match cap {
-                        Some(v) => Selection::Many(self.count(v)?),
-                        None => Selection::One,
-                    },
+                pending.extend(operand.iter().map(Box::as_ref));
+                for (condition, result) in arms {
+                    pending.push(condition);
+                    pending.push(result);
                 }
+                pending.extend(else_expr.iter().map(Box::as_ref));
             }
-        })
-    }
-}
-enum Selection {
-    One,
-    Many(usize),
-    Claim(Vec<(usize, bool)>),
-}
-enum Operation {
-    Read {
-        filter: Bound,
-        order: Vec<(usize, bool)>,
-        limit: usize,
-        projection: Vec<usize>,
-    },
-    Insert(Vec<Value>),
-    Mutate {
-        filter: Bound,
-        guard: Bound,
-        sets: Option<Vec<(usize, Value)>>,
-        selection: Selection,
-    },
-}
-fn compare(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Text(a), Value::Text(b)) => a.cmp(b),
-        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
-        _ => unreachable!("bound comparable types"),
-    }
-}
-fn truth(v: Value) -> Option<bool> {
-    match v {
-        Value::Bool(b) => Some(b),
-        Value::Null => None,
-        _ => unreachable!("bound boolean"),
-    }
-}
-fn boolval(v: Option<bool>) -> Value {
-    v.map_or(Value::Null, Value::Bool)
-}
-impl Bound {
-    fn eval(&self, row: &[Value]) -> Value {
-        match self {
-            Self::Value(v) => v.clone(),
-            Self::Field(i) => row[*i].clone(),
-            Self::Compare(a, op, b) => {
-                let a = a.eval(row);
-                let b = b.eval(row);
-                if a == Value::Null || b == Value::Null {
-                    return Value::Null;
-                }
-                let c = compare(&a, &b);
-                Value::Bool(match op {
-                    Compare::Eq => c == Ordering::Equal,
-                    Compare::Ne => c != Ordering::Equal,
-                    Compare::Lt => c == Ordering::Less,
-                    Compare::Le => c != Ordering::Greater,
-                    Compare::Gt => c == Ordering::Greater,
-                    Compare::Ge => c != Ordering::Less,
-                })
-            }
-            Self::IsNull(e, neg) => Value::Bool((e.eval(row) == Value::Null) != *neg),
-            Self::Not(e) => boolval(truth(e.eval(row)).map(|b| !b)),
-            Self::And(a, b) => {
-                let a = truth(a.eval(row));
-                let b = truth(b.eval(row));
-                boolval(if a == Some(false) || b == Some(false) {
-                    Some(false)
-                } else if a == Some(true) && b == Some(true) {
-                    Some(true)
-                } else {
-                    None
-                })
-            }
-            Self::Or(a, b) => {
-                let a = truth(a.eval(row));
-                let b = truth(b.eval(row));
-                boolval(if a == Some(true) || b == Some(true) {
-                    Some(true)
-                } else if a == Some(false) && b == Some(false) {
-                    Some(false)
-                } else {
-                    None
-                })
-            }
+            Expr::Value(_) | Expr::Field(_) | Expr::Local(_) | Expr::ConflictField { .. } => (),
         }
     }
-    fn accepts(&self, row: &SqlRow) -> bool {
-        self.eval(&row.values) == Value::Bool(true)
+    Ok(())
+}
+
+// Enforce the existing serialized-AST bound without allocating an unbounded
+// temporary buffer for a caller-supplied string or vector.
+pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
+    struct Budget(usize);
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| io::Error::other("native statement exceeds input bound"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(MAX_INPUT), stmt).map_err(|_| Error::Limit)
+}
+
+fn identifier(name: &str, version: LanguageVersion) -> Result<String> {
+    if parser::semantic_identifier(name, version) {
+        Ok(name.to_owned())
+    } else {
+        Err(Error::Bind("identifier".into()))
     }
 }
-fn sort(rows: &mut [SqlRow], order: &[(usize, bool)]) {
-    rows.sort_by(|a, b| {
-        for (i, desc) in order {
-            let c = compare(&a.values[*i], &b.values[*i]);
-            let c = if *desc { c.reverse() } else { c };
-            if c != Ordering::Equal {
-                return c;
-            }
-        }
-        Ordering::Equal
+fn local_reference(reference: &LocalRef, version: LanguageVersion) -> Result<operations::LocalRef> {
+    Ok(match reference {
+        LocalRef::Field { local, field } => operations::LocalRef::Field {
+            local: identifier(local, version)?,
+            field: identifier(field, version)?,
+        },
+        LocalRef::Status { local } => operations::LocalRef::Status {
+            local: identifier(local, version)?,
+        },
+        LocalRef::Changed { local } => operations::LocalRef::Changed {
+            local: identifier(local, version)?,
+        },
+        LocalRef::Count { local } => operations::LocalRef::Count {
+            local: identifier(local, version)?,
+        },
     })
 }
-fn key_predicate(t: &TableDef, start: usize) -> String {
-    t.primary_key
-        .iter()
-        .enumerate()
-        .map(|(n, i)| format!("{} = ${}", t.columns[*i].name, n + start))
-        .collect::<Vec<_>>()
-        .join(" and ")
+
+pub(crate) fn validate_transaction(
+    transaction: &Transaction,
+    version: LanguageVersion,
+) -> Result<()> {
+    if !version.supports_transactions() {
+        return Err(Error::Unsupported);
+    }
+    let count = transaction
+        .steps
+        .len()
+        .checked_add(usize::from(transaction.emit.is_some()))
+        .ok_or(Error::Limit)?;
+    if count == 0 {
+        return Err(Error::Bind("transaction".into()));
+    }
+    if count > MAX_TRANSACTION_ITEMS {
+        return Err(Error::Limit);
+    }
+    let mut nodes = 0;
+    let mut locals = 0;
+    for step in &transaction.steps {
+        match step {
+            TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. } => {
+                validate_statement_depth(statement, &mut nodes)?;
+                validate_version(statement, version)?;
+                let statement = statement_parts(statement)?.statement;
+                if matches!(
+                    statement,
+                    Statement::Update {
+                        intent: Intent::Claim { .. },
+                        ..
+                    } | Statement::UpdateExpressions {
+                        intent: Intent::Claim { .. },
+                        ..
+                    }
+                ) {
+                    return Err(Error::Unsupported);
+                }
+                if transaction.read_only
+                    && !matches!(
+                        statement,
+                        Statement::Read { .. } | Statement::ReadExpressions { .. }
+                    )
+                {
+                    return Err(Error::Unsupported);
+                }
+                if matches!(step, TransactionStep::Let { .. }) {
+                    locals += 1;
+                }
+            }
+            TransactionStep::Require(expr) => {
+                validate_nodes(vec![(expr, 0)], &mut nodes)?;
+                validate_expression_version(vec![expr], version)?;
+            }
+        }
+    }
+    if locals > MAX_TRANSACTION_LOCALS {
+        return Err(Error::Limit);
+    }
+    if let Some(emit) = &transaction.emit {
+        if emit.is_empty() {
+            return Err(Error::Bind("emit".into()));
+        }
+        if emit.len() > MAX_EMIT_VALUES {
+            return Err(Error::Limit);
+        }
+        for value in emit {
+            if let EmitExpr::Scalar(expr) = value {
+                validate_nodes(vec![(expr, 0)], &mut nodes)?;
+                validate_expression_version(vec![expr], version)?;
+            }
+        }
+    }
+    validate_size(transaction)
 }
-fn run(s: &mut SqlSession, t: &TableDef, op: Operation, rows: Vec<SqlRow>) -> Result<Outcome> {
-    let mut out = Outcome::default();
+pub(crate) fn lower_transaction_checked(
+    transaction: &Transaction,
+    version: LanguageVersion,
+) -> Result<operations::Transaction> {
+    validate_transaction(transaction, version)?;
+    Ok(operations::Transaction {
+        read_only: transaction.read_only,
+        steps: transaction
+            .steps
+            .iter()
+            .map(|step| {
+                Ok(match step {
+                    TransactionStep::Execute(statement) => {
+                        operations::TransactionStep::Execute(lower_statement(statement, version)?)
+                    }
+                    TransactionStep::Let { name, statement } => operations::TransactionStep::Let {
+                        name: identifier(name, version)?,
+                        request: lower_statement(statement, version)?,
+                    },
+                    TransactionStep::Require(expr) => {
+                        operations::TransactionStep::Require(expression(expr, version)?)
+                    }
+                })
+            })
+            .collect::<Result<_>>()?,
+        emit: transaction
+            .emit
+            .as_ref()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        Ok(match value {
+                            EmitExpr::Scalar(expr) => {
+                                operations::EmitExpr::Scalar(expression(expr, version)?)
+                            }
+                            EmitExpr::Row(local) => {
+                                operations::EmitExpr::Row(identifier(local, version)?)
+                            }
+                            EmitExpr::Rows(local) => {
+                                operations::EmitExpr::Rows(identifier(local, version)?)
+                            }
+                        })
+                    })
+                    .collect::<Result<_>>()
+            })
+            .transpose()?,
+    })
+}
+fn value(value: &ValueExpr) -> operations::ValueExpr {
+    match value {
+        ValueExpr::Literal(value) => operations::ValueExpr::Literal(value.clone()),
+        ValueExpr::Parameter(name) => operations::ValueExpr::Parameter(name.clone()),
+    }
+}
+fn compare(compare: Compare) -> operations::Compare {
+    match compare {
+        Compare::Eq => operations::Compare::Eq,
+        Compare::Ne => operations::Compare::Ne,
+        Compare::Lt => operations::Compare::Lt,
+        Compare::Le => operations::Compare::Le,
+        Compare::Gt => operations::Compare::Gt,
+        Compare::Ge => operations::Compare::Ge,
+    }
+}
+fn arithmetic(op: Arithmetic) -> operations::Arithmetic {
     match op {
-        Operation::Read {
+        Arithmetic::Add => operations::Arithmetic::Add,
+        Arithmetic::Subtract => operations::Arithmetic::Subtract,
+        Arithmetic::Multiply => operations::Arithmetic::Multiply,
+        Arithmetic::Divide => operations::Arithmetic::Divide,
+        Arithmetic::Remainder => operations::Arithmetic::Remainder,
+    }
+}
+fn expression(expr: &Expr, version: LanguageVersion) -> Result<operations::Expr> {
+    Ok(match expr {
+        Expr::Value(v) => operations::Expr::Value(value(v)),
+        Expr::Field(name) => operations::Expr::Field(identifier(name, version)?),
+        Expr::ConflictField { source, field } => operations::Expr::ConflictField {
+            source: match source {
+                ConflictSource::Existing => operations::ConflictSource::Existing,
+                ConflictSource::Incoming => operations::ConflictSource::Incoming,
+            },
+            field: identifier(field, version)?,
+        },
+        Expr::Compare(left, op, right) => operations::Expr::Compare(
+            Box::new(expression(left, version)?),
+            compare(*op),
+            Box::new(expression(right, version)?),
+        ),
+        Expr::IsNull(expr, negate) => {
+            operations::Expr::IsNull(Box::new(expression(expr, version)?), *negate)
+        }
+        Expr::Not(expr) => operations::Expr::Not(Box::new(expression(expr, version)?)),
+        Expr::And(left, right) => operations::Expr::And(
+            Box::new(expression(left, version)?),
+            Box::new(expression(right, version)?),
+        ),
+        Expr::Or(left, right) => operations::Expr::Or(
+            Box::new(expression(left, version)?),
+            Box::new(expression(right, version)?),
+        ),
+        Expr::Negate(expr) => operations::Expr::Negate(Box::new(expression(expr, version)?)),
+        Expr::Arithmetic(left, op, right) => operations::Expr::Arithmetic(
+            Box::new(expression(left, version)?),
+            arithmetic(*op),
+            Box::new(expression(right, version)?),
+        ),
+        Expr::Local(reference) => operations::Expr::Local(local_reference(reference, version)?),
+        Expr::Call {
+            function,
+            arguments,
+        } => operations::Expr::Call {
+            function: match function {
+                ScalarFunction::Coalesce => operations::ScalarFunction::Coalesce,
+                ScalarFunction::Abs => operations::ScalarFunction::Abs,
+                ScalarFunction::Length => operations::ScalarFunction::Length,
+            },
+            arguments: arguments
+                .iter()
+                .map(|expr| expression(expr, version))
+                .collect::<Result<_>>()?,
+        },
+        Expr::Case {
+            operand,
+            arms,
+            else_expr,
+        } => operations::Expr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| expression(expr, version).map(Box::new))
+                .transpose()?,
+            arms: arms
+                .iter()
+                .map(|(condition, result)| {
+                    Ok((
+                        expression(condition, version)?,
+                        expression(result, version)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            else_expr: else_expr
+                .as_deref()
+                .map(|expr| expression(expr, version).map(Box::new))
+                .transpose()?,
+        },
+    })
+}
+fn sorts(order: &[Sort], version: LanguageVersion) -> Result<Vec<operations::Sort>> {
+    order
+        .iter()
+        .map(|sort| {
+            Ok(operations::Sort {
+                field: identifier(&sort.field, version)?,
+                descending: sort.descending,
+            })
+        })
+        .collect()
+}
+fn assignments(
+    values: &[(String, ValueExpr)],
+    version: LanguageVersion,
+) -> Result<Vec<(String, operations::ValueExpr)>> {
+    values
+        .iter()
+        .map(|(name, v)| Ok((identifier(name, version)?, value(v))))
+        .collect()
+}
+fn projections(
+    items: &[Projection],
+    version: LanguageVersion,
+) -> Result<Vec<operations::Projection>> {
+    items
+        .iter()
+        .map(|p| {
+            Ok(operations::Projection {
+                expression: expression(&p.expression, version)?,
+                alias: p
+                    .alias
+                    .as_deref()
+                    .map(|name| identifier(name, version))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+fn intent(intent: &Intent, version: LanguageVersion) -> Result<operations::Intent> {
+    Ok(match intent {
+        Intent::One => operations::Intent::One,
+        Intent::Many { cap } => operations::Intent::Many { cap: value(cap) },
+        Intent::Claim { order } => operations::Intent::Claim {
+            order: sorts(order, version)?,
+        },
+    })
+}
+fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operations::Request> {
+    Ok(match stmt {
+        Statement::Read {
+            table,
             filter,
             order,
             limit,
             projection,
-        } => {
-            let mut rows: Vec<_> = rows.into_iter().filter(|r| filter.accepts(r)).collect();
-            sort(&mut rows, &order);
-            out.matched = rows.len();
-            out.complete = rows.len() <= limit;
-            out.columns = projection
+        } => operations::Request::Read {
+            table: identifier(table, version)?,
+            filter: filter
+                .as_ref()
+                .map(|expr| expression(expr, version))
+                .transpose()?,
+            order: sorts(order, version)?,
+            limit: limit.as_ref().map(value),
+            projection: projection
                 .iter()
-                .map(|i| t.columns[*i].name.clone())
-                .collect();
-            out.rows = rows
-                .into_iter()
-                .take(limit)
-                .map(|r| SqlRow {
-                    version: r.version,
-                    values: projection.iter().map(|i| r.values[*i].clone()).collect(),
-                })
-                .collect()
-        }
-        Operation::Insert(values) => {
-            let names = t
-                .columns
-                .iter()
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let params = (1..=values.len())
-                .map(|i| format!("${i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            s.execute(
-                &format!("insert into {} ({names}) values ({params})", t.name),
-                &values,
-                None,
-            )
-            .map_err(core)?;
-            out.matched = 1;
-            out.affected = 1;
-            out.changed = 1;
-        }
-        Operation::Mutate {
+                .map(|name| identifier(name, version))
+                .collect::<Result<_>>()?,
+        },
+        Statement::Insert { table, values } => operations::Request::Insert {
+            table: identifier(table, version)?,
+            values: assignments(values, version)?,
+        },
+        Statement::Update {
+            table,
             filter,
             guard,
-            sets,
-            selection,
-        } => {
-            let mut matches: Vec<_> = rows.into_iter().filter(|r| filter.accepts(r)).collect();
-            match &selection {
-                Selection::One => {
-                    if matches.is_empty() {
-                        return Err(Error::NotFound);
-                    }
-                    if matches.len() != 1 {
-                        return Err(Error::AmbiguousMatch);
-                    }
-                }
-                Selection::Many(cap) => {
-                    if matches.len() > *cap {
-                        return Err(Error::TooManyMatches);
-                    }
-                }
-                Selection::Claim(order) => {
-                    sort(&mut matches, order);
-                    matches.truncate(1)
-                }
-            }
-            out.matched = matches.len();
-            if matches.iter().any(|r| !guard.accepts(r)) {
-                return Err(Error::ConditionFailed);
-            }
-            let mut work = vec![];
-            let mut claimed_key = None;
-            if matches!(selection, Selection::Claim(_)) {
-                out.columns = t.columns.iter().map(|c| c.name.clone()).collect();
-                claimed_key = matches.first().map(|r| {
-                    t.primary_key
+            values,
+            intent: write_intent,
+        } => operations::Request::Update {
+            table: identifier(table, version)?,
+            filter: expression(filter, version)?,
+            guard: guard
+                .as_ref()
+                .map(|expr| expression(expr, version))
+                .transpose()?,
+            values: assignments(values, version)?,
+            intent: intent(write_intent, version)?,
+        },
+        Statement::Delete {
+            table,
+            filter,
+            guard,
+            cap,
+        } => operations::Request::Delete {
+            table: identifier(table, version)?,
+            filter: expression(filter, version)?,
+            guard: guard
+                .as_ref()
+                .map(|expr| expression(expr, version))
+                .transpose()?,
+            cap: cap.as_ref().map(value),
+        },
+        Statement::UpdateExpressions {
+            table,
+            filter,
+            guard,
+            values,
+            intent: write_intent,
+        } => operations::Request::UpdateExpressions {
+            table: identifier(table, version)?,
+            filter: expression(filter, version)?,
+            guard: guard
+                .as_ref()
+                .map(|expr| expression(expr, version))
+                .transpose()?,
+            values: values
+                .iter()
+                .map(|(name, expr)| Ok((identifier(name, version)?, expression(expr, version)?)))
+                .collect::<Result<_>>()?,
+            intent: intent(write_intent, version)?,
+        },
+        Statement::ReadExpressions {
+            table,
+            filter,
+            order,
+            limit,
+            projection,
+        } => operations::Request::ReadExpressions {
+            table: identifier(table, version)?,
+            filter: filter
+                .as_ref()
+                .map(|expr| expression(expr, version))
+                .transpose()?,
+            order: sorts(order, version)?,
+            limit: limit.as_ref().map(value),
+            projection: projections(projection, version)?,
+        },
+        Statement::OnConflict {
+            statement,
+            target,
+            action,
+        } => operations::Request::OnConflict {
+            request: Box::new(lower_statement(statement, version)?),
+            target: target
+                .iter()
+                .map(|name| identifier(name, version))
+                .collect::<Result<_>>()?,
+            action: match action {
+                ConflictAction::Nothing => operations::ConflictAction::Nothing,
+                ConflictAction::Update { guard, values } => operations::ConflictAction::Update {
+                    guard: guard
+                        .as_ref()
+                        .map(|expr| expression(expr, version))
+                        .transpose()?,
+                    values: values
                         .iter()
-                        .map(|i| r.values[*i].clone())
-                        .collect::<Vec<_>>()
-                });
-            }
-            for row in matches {
-                let mut post = row.values.clone();
-                if let Some(sets) = &sets {
-                    for (i, v) in sets {
-                        post[*i] = v.clone()
-                    }
-                }
-                if matches!(selection, Selection::Claim(_))
-                    && filter.eval(&post) == Value::Bool(true)
-                {
-                    return Err(Error::ClaimNotConsumed);
-                }
-                out.affected += 1;
-                if sets.is_some() && post == row.values {
-                    continue;
-                }
-                out.changed += 1;
-                let mut params = vec![];
-                let sql = if let Some(sets) = &sets {
-                    let setsql = sets
-                        .iter()
-                        .enumerate()
-                        .map(|(n, (i, v))| {
-                            params.push(v.clone());
-                            format!("{} = ${}", t.columns[*i].name, n + 1)
+                        .map(|(name, expr)| {
+                            Ok((identifier(name, version)?, expression(expr, version)?))
                         })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "update {} set {} where {}",
-                        t.name,
-                        setsql,
-                        key_predicate(t, params.len() + 1)
-                    )
-                } else {
-                    format!("delete from {} where {}", t.name, key_predicate(t, 1))
-                };
-                params.extend(t.primary_key.iter().map(|i| row.values[*i].clone()));
-                let p = s.prepare(&sql).map_err(core)?;
-                s.describe(&p).map_err(core)?;
-                work.push((p, params, row.version));
-            }
-            for (p, params, version) in work {
-                let result = s
-                    .execute_prepared(&p, &params, Some(version))
-                    .map_err(core)?;
-                if result.affected != 1 {
-                    return Err(Error::Conflict);
-                }
-            }
-            if let Some(key) = claimed_key {
-                let result = s
-                    .execute(
-                        &format!("select * from {} where {}", t.name, key_predicate(t, 1)),
-                        &key,
-                        None,
-                    )
-                    .map_err(core)?;
-                if result.rows.len() != 1 {
-                    return Err(Error::Conflict);
-                }
-                out.rows = result.rows;
-            }
-        }
+                        .collect::<Result<_>>()?,
+                },
+            },
+        },
+        Statement::Returning {
+            statement,
+            projection,
+        } => operations::Request::Returning {
+            request: Box::new(lower_statement(statement, version)?),
+            projection: projections(projection, version)?,
+        },
+        Statement::InsertExpressions { table, values } => operations::Request::InsertExpressions {
+            table: identifier(table, version)?,
+            values: values
+                .iter()
+                .map(|(name, expr)| Ok((identifier(name, version)?, expression(expr, version)?)))
+                .collect::<Result<_>>()?,
+        },
+        Statement::InsertMany {
+            table,
+            columns,
+            rows,
+            cap,
+        } => operations::Request::InsertMany {
+            table: identifier(table, version)?,
+            columns: columns
+                .iter()
+                .map(|name| identifier(name, version))
+                .collect::<Result<_>>()?,
+            rows: rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|expr| expression(expr, version))
+                        .collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?,
+            cap: value(cap),
+        },
+    })
+}
+fn outcome(outcome: operations::Outcome) -> Outcome {
+    let operations::Outcome {
+        columns,
+        rows,
+        matched,
+        affected,
+        changed,
+        complete,
+        conflict_results,
+    } = outcome;
+    Outcome {
+        columns,
+        rows,
+        matched,
+        affected,
+        changed,
+        complete,
+        conflict_results,
     }
-    Ok(out)
+}
+fn error(error: operations::Error) -> Error {
+    match error {
+        operations::Error::Syntax { offset } => Error::Syntax { offset },
+        operations::Error::Unsupported => Error::Unsupported,
+        operations::Error::Limit => Error::Limit,
+        operations::Error::Bind(message) => Error::Bind(message),
+        operations::Error::Type => Error::Type,
+        operations::Error::NotFound => Error::NotFound,
+        operations::Error::AmbiguousMatch => Error::AmbiguousMatch,
+        operations::Error::ConditionFailed => Error::ConditionFailed,
+        operations::Error::TooManyMatches => Error::TooManyMatches,
+        operations::Error::ClaimNotConsumed => Error::ClaimNotConsumed,
+        operations::Error::Conflict => Error::Conflict,
+        operations::Error::Core(message) => Error::Core(message),
+        operations::Error::Unknown => Error::Unknown,
+        operations::Error::Overflow => Error::Overflow,
+        operations::Error::DivisionByZero => Error::DivisionByZero,
+        operations::Error::RequirementFailed => Error::RequirementFailed,
+        operations::Error::DuplicateTarget => Error::DuplicateTarget,
+        operations::Error::PlanRequired => Error::PlanRequired,
+    }
 }

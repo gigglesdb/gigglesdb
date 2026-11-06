@@ -7,3 +7,6 @@ edition = "2024"
 giggles-core = { path = "../giggles-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+giggles-core = { path = "../giggles-core", features = ["test-sql-parser-trap"] }

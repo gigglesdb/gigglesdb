@@ -1,0 +1,1982 @@
+{
+  "format_version": 1,
+  "design_doc_id": "81f3abec-f5f0-4909-9450-ed6767cb6916",
+  "scope": "Every fenced block from the six pinned supporting document revisions, plus complete executable examples embedded in prose. Fenced grammar productions are preserved as non-executable fragments. Complete scripts split only at top-level semicolons; explicitly separated submissions split at blank lines. Fenced-source byte offsets refer to each preserved block, and skipped separators are whitespace only. Inline examples separately preserve their source paragraph, section, line and exact byte span; they are not fictional fences. Mere inline syntax/type/identifier mentions and non-standalone expression fragments are not executable examples.",
+  "profile": "embedded-trusted-native-0.1; current bounded SQL is a separate interface; no proposed-v1 or PostgreSQL compatibility claim",
+  "documents": [
+    {
+      "alias": "tour",
+      "id": "22093487-1032-431b-aefa-dd2088bb2bec",
+      "revision": 1,
+      "title": "Native language 1 of 4 — tour, types and queries",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/22093487-1032-431b-aefa-dd2088bb2bec?revision=1",
+      "expected_fence_count": 10,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 17,
+          "closing_line": 27,
+          "section": "Read this like a developer",
+          "language": "text",
+          "source": "deliveries\n\ndeliveries where merchant_id = 42 and state = \"failed\"\n\ndeliveries\nwhere merchant_id = 42 and state = \"failed\"\norder by created_at desc, id desc\nlimit 10\nselect id, event_id, last_error\n",
+          "examples": [
+            {
+              "id": "tour-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 10,
+              "source": "deliveries",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-supported",
+              "reason": "Accepted by the current native parser only. The source table deliveries is reserved by the SQL catalog, so this exact reference cannot be provisioned or executed in the current embedded relational profile.",
+              "features": [
+                "native_reads"
+              ],
+              "execution_fixture": "deliveries_reserved_boundary",
+              "execution": {
+                "expectation": "execute-rejected",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "bindings": {},
+                "error": {
+                  "Bind": "table"
+                },
+                "verify_sql": {
+                  "source": "SELECT * FROM reference_probe LIMIT 1024",
+                  "rows": [
+                    [
+                      {
+                        "Int": 1
+                      },
+                      {
+                        "Text": "unchanged"
+                      }
+                    ]
+                  ]
+                }
+              }
+            },
+            {
+              "id": "tour-fence01-example02",
+              "start_byte": 12,
+              "end_byte": 66,
+              "source": "deliveries where merchant_id = 42 and state = \"failed\"",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-supported",
+              "reason": "Accepted by the current native parser only. The source table deliveries is reserved by the SQL catalog, so this exact reference cannot be provisioned or executed in the current embedded relational profile.",
+              "features": [
+                "native_reads"
+              ],
+              "execution_fixture": "deliveries_reserved_boundary",
+              "execution": {
+                "expectation": "execute-rejected",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "bindings": {},
+                "error": {
+                  "Bind": "table"
+                },
+                "verify_sql": {
+                  "source": "SELECT * FROM reference_probe LIMIT 1024",
+                  "rows": [
+                    [
+                      {
+                        "Int": 1
+                      },
+                      {
+                        "Text": "unchanged"
+                      }
+                    ]
+                  ]
+                }
+              }
+            },
+            {
+              "id": "tour-fence01-example03",
+              "start_byte": 68,
+              "end_byte": 197,
+              "source": "deliveries\nwhere merchant_id = 42 and state = \"failed\"\norder by created_at desc, id desc\nlimit 10\nselect id, event_id, last_error",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-supported",
+              "reason": "Accepted by the current native parser only. The source table deliveries is reserved by the SQL catalog, so this exact reference cannot be provisioned or executed in the current embedded relational profile.",
+              "features": [
+                "native_reads"
+              ],
+              "execution_fixture": "deliveries_reserved_boundary",
+              "execution": {
+                "expectation": "execute-rejected",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "bindings": {},
+                "error": {
+                  "Bind": "table"
+                },
+                "verify_sql": {
+                  "source": "SELECT * FROM reference_probe LIMIT 1024",
+                  "rows": [
+                    [
+                      {
+                        "Int": 1
+                      },
+                      {
+                        "Text": "unchanged"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "opening_line": 31,
+          "closing_line": 37,
+          "section": "Read this like a developer",
+          "language": "sql",
+          "source": "SELECT id, event_id, last_error\nFROM deliveries\nWHERE merchant_id = 42 AND state = 'failed'\nORDER BY created_at DESC, id DESC\nLIMIT 10;\n",
+          "examples": [
+            {
+              "id": "tour-fence02-example01",
+              "start_byte": 0,
+              "end_byte": 135,
+              "source": "SELECT id, event_id, last_error\nFROM deliveries\nWHERE merchant_id = 42 AND state = 'failed'\nORDER BY created_at DESC, id DESC\nLIMIT 10;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "The exact SQL reference names deliveries, a reserved SQL catalog identifier. Preparation rejects with Reserved before the query can bind; no alternate table name is substituted.",
+              "features": [
+                "sql_reserved_catalog_names"
+              ],
+              "prepare_error": "Reserved"
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "opening_line": 47,
+          "closing_line": 53,
+          "section": "Syntax shared by all chapters",
+          "language": "text",
+          "source": "statement = read | write | transaction | ddl | migration | access | operations\nname      = identifier [ \".\" identifier ]\nparam     = \"$\" variable_name\nfield     = identifier { \".\" identifier }\ncall      = identifier \"(\" [ expr { \",\" expr } ] \")\"\n",
+          "examples": [
+            {
+              "id": "tour-fence03-example01",
+              "start_byte": 0,
+              "end_byte": 246,
+              "source": "statement = read | write | transaction | ddl | migration | access | operations\nname      = identifier [ \".\" identifier ]\nparam     = \"$\" variable_name\nfield     = identifier { \".\" identifier }\ncall      = identifier \"(\" [ expr { \",\" expr } ] \")\"\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "opening_line": 78,
+          "closing_line": 104,
+          "section": "Expressions",
+          "language": "text",
+          "source": "expr       = andexpr { \"or\" andexpr }\nandexpr    = notexpr { \"and\" notexpr }\nnotexpr    = \"not\" notexpr | comparison\ncomparison = sumexpr [ cmp sumexpr | \"is\" [ \"not\" ] \"null\"\n                     | \"in\" \"(\" exprlist \")\" | \"like\" sumexpr ]\ncmp        = \"=\" | \"!=\" | \"<\" | \"<=\" | \">\" | \">=\"\nsumexpr    = product { (\"+\" | \"-\") product }\nproduct    = unary { (\"*\" | \"/\" | \"%\") unary }\nunary      = \"-\" unary | atom\natom       = literal | typedliteral | param | field | call [ over ] | local | caseexpr | \"scalar\" \"(\" read \")\" | \"(\" expr \")\"\n           | \"cast\" \"(\" expr \"as\" type \")\" | \"exists\" \"(\" read \")\"\nlocal      = \"@\" variable_name { \".\" variable_name }\ncaseexpr   = \"case\" [ expr ] arm { arm } [ \"else\" expr ] \"end\"\narm        = \"when\" expr \"then\" expr\nover       = \"over\" \"(\" [ \"partition by\" exprlist ] [ \"order by\" sortlist ] [ frame ] \")\"\nframe      = \"rows between\" bound \"and\" bound\nbound      = \"unbounded preceding\" | \"unbounded following\" | \"current row\"\n           | value (\"preceding\" | \"following\")\nliteral    = \"true\" | \"false\" | \"null\" | string | integer | decimal_literal\n           | float_literal | duration_literal | byte_literal\ntypedliteral = (\"timestamp\" | \"date\" | \"uuid\" | \"bytes\" | \"duration\" | \"json\") \"(\" string \")\"\nvalue      = literal | param | typedliteral\nduration_value = value\nalias      = identifier\nstrings    = string { \",\" string }\n",
+          "examples": [
+            {
+              "id": "tour-fence04-example01",
+              "start_byte": 0,
+              "end_byte": 1373,
+              "source": "expr       = andexpr { \"or\" andexpr }\nandexpr    = notexpr { \"and\" notexpr }\nnotexpr    = \"not\" notexpr | comparison\ncomparison = sumexpr [ cmp sumexpr | \"is\" [ \"not\" ] \"null\"\n                     | \"in\" \"(\" exprlist \")\" | \"like\" sumexpr ]\ncmp        = \"=\" | \"!=\" | \"<\" | \"<=\" | \">\" | \">=\"\nsumexpr    = product { (\"+\" | \"-\") product }\nproduct    = unary { (\"*\" | \"/\" | \"%\") unary }\nunary      = \"-\" unary | atom\natom       = literal | typedliteral | param | field | call [ over ] | local | caseexpr | \"scalar\" \"(\" read \")\" | \"(\" expr \")\"\n           | \"cast\" \"(\" expr \"as\" type \")\" | \"exists\" \"(\" read \")\"\nlocal      = \"@\" variable_name { \".\" variable_name }\ncaseexpr   = \"case\" [ expr ] arm { arm } [ \"else\" expr ] \"end\"\narm        = \"when\" expr \"then\" expr\nover       = \"over\" \"(\" [ \"partition by\" exprlist ] [ \"order by\" sortlist ] [ frame ] \")\"\nframe      = \"rows between\" bound \"and\" bound\nbound      = \"unbounded preceding\" | \"unbounded following\" | \"current row\"\n           | value (\"preceding\" | \"following\")\nliteral    = \"true\" | \"false\" | \"null\" | string | integer | decimal_literal\n           | float_literal | duration_literal | byte_literal\ntypedliteral = (\"timestamp\" | \"date\" | \"uuid\" | \"bytes\" | \"duration\" | \"json\") \"(\" string \")\"\nvalue      = literal | param | typedliteral\nduration_value = value\nalias      = identifier\nstrings    = string { \",\" string }\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 5,
+          "opening_line": 110,
+          "closing_line": 131,
+          "section": "Reads",
+          "language": "text",
+          "source": "read       = [ with ] query { setop query }\nwith       = \"with\" (binding { \",\" binding } | recbinding)\nrecbinding = \"recursive\" identifier \"=\" \"(\" read \")\" (\"union\" | \"union all\")\n             \"(\" read \")\" \"max depth\" value\nbinding    = identifier \"=\" \"(\" read \")\"\nsetop      = \"union all\" | \"union\" | \"intersect\" | \"except\"\nquery      = source [ \"as\" alias ] [ \"at snapshot\" value ] [ \"via\" name ]\n             { join } [ \"where\" expr ] [ \"group by\" exprlist ] [ \"having\" expr ]\n             [ \"order by\" sortlist ] [ \"after\" value | \"before\" value ]\n             [ \"limit\" value ] [ \"select\" projection ] [ budget ]\nsource     = name | \"(\" read \")\"\njoin       = (\"join\" | \"left join\") source \"as\" alias \"on\" expr\nsortlist   = sort { \",\" sort }\nsort       = expr [ \"asc\" | \"desc\" ] [ \"nulls first\" | \"nulls last\" ]\nprojection = item { \",\" item }\nitem       = expr [ \"as\" identifier ] | \"*\"\n           | \"object\" \"{\" projection \"}\" \"as\" identifier\nexprlist   = expr { \",\" expr }\nbudget     = \"budget\" dimension value { \",\" dimension value }\ndimension  = \"scan_bytes\" | \"ranges\" | \"result_bytes\" | \"timeout\"\n",
+          "examples": [
+            {
+              "id": "tour-fence05-example01",
+              "start_byte": 0,
+              "end_byte": 1107,
+              "source": "read       = [ with ] query { setop query }\nwith       = \"with\" (binding { \",\" binding } | recbinding)\nrecbinding = \"recursive\" identifier \"=\" \"(\" read \")\" (\"union\" | \"union all\")\n             \"(\" read \")\" \"max depth\" value\nbinding    = identifier \"=\" \"(\" read \")\"\nsetop      = \"union all\" | \"union\" | \"intersect\" | \"except\"\nquery      = source [ \"as\" alias ] [ \"at snapshot\" value ] [ \"via\" name ]\n             { join } [ \"where\" expr ] [ \"group by\" exprlist ] [ \"having\" expr ]\n             [ \"order by\" sortlist ] [ \"after\" value | \"before\" value ]\n             [ \"limit\" value ] [ \"select\" projection ] [ budget ]\nsource     = name | \"(\" read \")\"\njoin       = (\"join\" | \"left join\") source \"as\" alias \"on\" expr\nsortlist   = sort { \",\" sort }\nsort       = expr [ \"asc\" | \"desc\" ] [ \"nulls first\" | \"nulls last\" ]\nprojection = item { \",\" item }\nitem       = expr [ \"as\" identifier ] | \"*\"\n           | \"object\" \"{\" projection \"}\" \"as\" identifier\nexprlist   = expr { \",\" expr }\nbudget     = \"budget\" dimension value { \",\" dimension value }\ndimension  = \"scan_bytes\" | \"ranges\" | \"result_bytes\" | \"timeout\"\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 6,
+          "opening_line": 137,
+          "closing_line": 152,
+          "section": "Reads",
+          "language": "text",
+          "source": "deliveries as d\nleft join endpoints as e on e.merchant_id = d.merchant_id and e.id = d.endpoint_id\nwhere d.merchant_id = $merchant and d.state = \"failed\"\norder by d.created_at desc, d.id desc\nlimit 20\nselect d.id, d.event_id, object { e.id, e.url } as endpoint\n\ndeliveries\nwhere merchant_id = $merchant and state = \"failed\"\ngroup by endpoint_id\nhaving count() >= 5\norder by count() desc, endpoint_id asc\nlimit 10\nselect endpoint_id, count() as failures\n",
+          "examples": [
+            {
+              "id": "tour-fence06-example01",
+              "start_byte": 0,
+              "end_byte": 260,
+              "source": "deliveries as d\nleft join endpoints as e on e.merchant_id = d.merchant_id and e.id = d.endpoint_id\nwhere d.merchant_id = $merchant and d.state = \"failed\"\norder by d.created_at desc, d.id desc\nlimit 20\nselect d.id, d.event_id, object { e.id, e.url } as endpoint",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Source aliases, joins, qualified fields and nested object projections are not in the current native grammar.",
+              "features": [
+                "native_joins",
+                "native_nested_outputs"
+              ]
+            },
+            {
+              "id": "tour-fence06-example02",
+              "start_byte": 262,
+              "end_byte": 452,
+              "source": "deliveries\nwhere merchant_id = $merchant and state = \"failed\"\ngroup by endpoint_id\nhaving count() >= 5\norder by count() desc, endpoint_id asc\nlimit 10\nselect endpoint_id, count() as failures",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Grouping, HAVING, aggregate functions and expression aliases are not in the current native grammar.",
+              "features": [
+                "native_aggregates"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 7,
+          "opening_line": 162,
+          "closing_line": 170,
+          "section": "Pagination, consistency and sharding",
+          "language": "text",
+          "source": "messages via channel_timeline\nwhere channel_id = $channel\norder by message_id desc\nafter $cursor\nlimit 50\nselect message_id, author_id, body\nbudget scan_bytes 2MiB, ranges 8, result_bytes 256KiB, timeout 250ms\n",
+          "examples": [
+            {
+              "id": "tour-fence07-example01",
+              "start_byte": 0,
+              "end_byte": 209,
+              "source": "messages via channel_timeline\nwhere channel_id = $channel\norder by message_id desc\nafter $cursor\nlimit 50\nselect message_id, author_id, body\nbudget scan_bytes 2MiB, ranges 8, result_bytes 256KiB, timeout 250ms",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named access paths, cursor continuation and explicit query budgets are proposed features, not current native clauses.",
+              "features": [
+                "native_paths",
+                "native_cursors",
+                "native_budgets"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 8,
+          "opening_line": 178,
+          "closing_line": 185,
+          "section": "Conditional expressions, scalar reads and windows",
+          "language": "text",
+          "source": "deliveries as d\nwhere d.merchant_id = $merchant\nselect d.id,\n  case when d.attempts >= 3 then \"escalate\" else \"retry\" end as action,\n  scalar (merchant_settings as s where s.merchant_id = d.merchant_id\n          select s.retry_delay) as retry_delay\n",
+          "examples": [
+            {
+              "id": "tour-fence08-example01",
+              "start_byte": 0,
+              "end_byte": 248,
+              "source": "deliveries as d\nwhere d.merchant_id = $merchant\nselect d.id,\n  case when d.attempts >= 3 then \"escalate\" else \"retry\" end as action,\n  scalar (merchant_settings as s where s.merchant_id = d.merchant_id\n          select s.retry_delay) as retry_delay",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Aliased sources, CASE expressions and correlated scalar reads are not in the current native grammar.",
+              "features": [
+                "native_case",
+                "native_scalar_reads"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 9,
+          "opening_line": 189,
+          "closing_line": 198,
+          "section": "Conditional expressions, scalar reads and windows",
+          "language": "text",
+          "source": "(deliveries where state = \"failed\"\n select merchant_id, id, payload,\n        row_number() over (\n          partition by merchant_id order by created_at desc, id desc\n        ) as position) as ranked\nwhere ranked.position <= 3\norder by ranked.merchant_id, ranked.position\nselect ranked.merchant_id, ranked.id, ranked.payload\n",
+          "examples": [
+            {
+              "id": "tour-fence09-example01",
+              "start_byte": 0,
+              "end_byte": 323,
+              "source": "(deliveries where state = \"failed\"\n select merchant_id, id, payload,\n        row_number() over (\n          partition by merchant_id order by created_at desc, id desc\n        ) as position) as ranked\nwhere ranked.position <= 3\norder by ranked.merchant_id, ranked.position\nselect ranked.merchant_id, ranked.id, ranked.payload",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Parenthesized derived sources and window functions are not in the current native grammar.",
+              "features": [
+                "native_nested_reads",
+                "native_windows"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 10,
+          "opening_line": 204,
+          "closing_line": 212,
+          "section": "Recursive hierarchies",
+          "language": "text",
+          "source": "with recursive ancestors = (\n  access_roles where id = $role select id\n) union (\n  role_edges as e join ancestors as a on e.child_id = a.id\n  select e.parent_id as id\n) max depth 32\nancestors order by id select id\n",
+          "examples": [
+            {
+              "id": "tour-fence10-example01",
+              "start_byte": 0,
+              "end_byte": 213,
+              "source": "with recursive ancestors = (\n  access_roles where id = $role select id\n) union (\n  role_edges as e join ancestors as a on e.child_id = a.id\n  select e.parent_id as id\n) max depth 32\nancestors order by id select id",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Recursive WITH, joins, set operations and max-depth clauses are not in the current native grammar.",
+              "features": [
+                "native_recursive_reads"
+              ]
+            }
+          ]
+        }
+      ],
+      "inline_examples": [],
+      "expected_inline_count": 0
+    },
+    {
+      "alias": "writes",
+      "id": "9252b8cc-42d0-4d54-8764-0d4ffeb9c72b",
+      "revision": 1,
+      "title": "Native language 2 of 4 — writes, transactions and retries",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/9252b8cc-42d0-4d54-8764-0d4ffeb9c72b?revision=1",
+      "expected_fence_count": 12,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 17,
+          "closing_line": 35,
+          "section": "Grammar",
+          "language": "text",
+          "source": "write      = (insert | update | claim | delete) [ once ] [ returning ] [ budget ]\ninsert     = \"insert\" [ \"many\" ] \"into\" name \"(\" names \")\" feedinput\n             [ \"on conflict\" \"(\" names \")\" upsert ] [ cap ]\nfeedinput  = \"values\" tuple { \",\" tuple } | \"from\" \"(\" read \")\"\ntuple      = \"(\" exprlist \")\"\nupsert     = \"do nothing\" | \"do update\" [ guard ] \"set\" assignments\nupdate     = \"update\" [ \"many\" ] name [ \"as\" alias ] [ sourcejoin ] target [ guard ] \"set\" assignments [ cap ]\nclaim      = \"claim\" name \"where\" expr \"order by\" sortlist \"set\" assignments\ndelete     = \"delete\" [ \"many\" ] \"from\" name [ \"as\" alias ] [ sourcejoin ] target [ guard ] [ cap ]\nsourcejoin = \"using\" source \"as\" alias\ntarget     = \"where\" expr | \"all\"\nguard      = \"when\" expr\nassignments= identifier \"=\" expr { \",\" identifier \"=\" expr }\nnames      = identifier { \",\" identifier }\ncap        = \"at most\" value\nonce       = \"once\" value \"for\" duration_value\nreturning  = \"return\" projection\n",
+          "examples": [
+            {
+              "id": "writes-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 972,
+              "source": "write      = (insert | update | claim | delete) [ once ] [ returning ] [ budget ]\ninsert     = \"insert\" [ \"many\" ] \"into\" name \"(\" names \")\" feedinput\n             [ \"on conflict\" \"(\" names \")\" upsert ] [ cap ]\nfeedinput  = \"values\" tuple { \",\" tuple } | \"from\" \"(\" read \")\"\ntuple      = \"(\" exprlist \")\"\nupsert     = \"do nothing\" | \"do update\" [ guard ] \"set\" assignments\nupdate     = \"update\" [ \"many\" ] name [ \"as\" alias ] [ sourcejoin ] target [ guard ] \"set\" assignments [ cap ]\nclaim      = \"claim\" name \"where\" expr \"order by\" sortlist \"set\" assignments\ndelete     = \"delete\" [ \"many\" ] \"from\" name [ \"as\" alias ] [ sourcejoin ] target [ guard ] [ cap ]\nsourcejoin = \"using\" source \"as\" alias\ntarget     = \"where\" expr | \"all\"\nguard      = \"when\" expr\nassignments= identifier \"=\" expr { \",\" identifier \"=\" expr }\nnames      = identifier { \",\" identifier }\ncap        = \"at most\" value\nonce       = \"once\" value \"for\" duration_value\nreturning  = \"return\" projection\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "opening_line": 43,
+          "closing_line": 68,
+          "section": "Create, deduplicate, update and delete",
+          "language": "text",
+          "source": "insert into deliveries (merchant_id, id, endpoint_id, provider, event_id, created_at)\nvalues ($merchant, $id, $endpoint, \"stripe\", $event, now())\nreturn id, state\n\ninsert into deliveries (merchant_id, id, endpoint_id, provider, event_id, created_at)\nvalues ($merchant, $id, $endpoint, \"stripe\", $event, now())\non conflict (merchant_id, endpoint_id, provider, event_id) do nothing\nreturn id\n\nupdate deliveries\nwhere merchant_id = 42 and provider = \"stripe\" and event_id = \"evt_abc\"\nwhen state = \"failed\"\nset state = \"queued\", attempts = attempts + 1\nonce $repair for 24h\nreturn id, state, attempts\n\ndelete from deliveries\nwhere merchant_id = 42 and id = $id\nwhen state = \"delivered\"\nreturn id\n\ndelete many from deliveries\nwhere merchant_id = 42 and state = \"delivered\" and created_at < $cutoff\nat most 100\n",
+          "examples": [
+            {
+              "id": "writes-fence02-example01",
+              "start_byte": 0,
+              "end_byte": 162,
+              "source": "insert into deliveries (merchant_id, id, endpoint_id, provider, event_id, created_at)\nvalues ($merchant, $id, $endpoint, \"stripe\", $event, now())\nreturn id, state",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Proposed INSERT column-list/VALUES spelling, now(), RETURN and conflict actions are not implemented; existing native INSERT uses SET assignments.",
+              "features": [
+                "native_insert_values",
+                "native_upsert",
+                "native_returning"
+              ]
+            },
+            {
+              "id": "writes-fence02-example02",
+              "start_byte": 164,
+              "end_byte": 389,
+              "source": "insert into deliveries (merchant_id, id, endpoint_id, provider, event_id, created_at)\nvalues ($merchant, $id, $endpoint, \"stripe\", $event, now())\non conflict (merchant_id, endpoint_id, provider, event_id) do nothing\nreturn id",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Proposed INSERT column-list/VALUES spelling, now(), RETURN and conflict actions are not implemented; existing native INSERT uses SET assignments.",
+              "features": [
+                "native_insert_values",
+                "native_upsert",
+                "native_returning"
+              ]
+            },
+            {
+              "id": "writes-fence02-example03",
+              "start_byte": 391,
+              "end_byte": 596,
+              "source": "update deliveries\nwhere merchant_id = 42 and provider = \"stripe\" and event_id = \"evt_abc\"\nwhen state = \"failed\"\nset state = \"queued\", attempts = attempts + 1\nonce $repair for 24h\nreturn id, state, attempts",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Expression assignments, ONCE retention and RETURN clauses are not implemented by current native writes.",
+              "features": [
+                "native_assignment_expressions",
+                "native_receipts",
+                "native_returning"
+              ]
+            },
+            {
+              "id": "writes-fence02-example04",
+              "start_byte": 598,
+              "end_byte": 691,
+              "source": "delete from deliveries\nwhere merchant_id = 42 and id = $id\nwhen state = \"delivered\"\nreturn id",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Proposed DELETE FROM spelling and any RETURN clause are not implemented; current native DELETE names its table directly.",
+              "features": [
+                "native_delete_from",
+                "native_returning"
+              ]
+            },
+            {
+              "id": "writes-fence02-example05",
+              "start_byte": 693,
+              "end_byte": 804,
+              "source": "delete many from deliveries\nwhere merchant_id = 42 and state = \"delivered\" and created_at < $cutoff\nat most 100",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Proposed DELETE FROM spelling and any RETURN clause are not implemented; current native DELETE names its table directly.",
+              "features": [
+                "native_delete_from",
+                "native_returning"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "opening_line": 78,
+          "closing_line": 85,
+          "section": "Working example with PostgreSQL",
+          "language": "sql",
+          "source": "UPDATE deliveries\nSET state = 'queued', attempts = attempts + 1\nWHERE merchant_id = 42 AND provider = 'stripe'\n  AND event_id = 'evt_abc' AND endpoint_id = 73\n  AND state = 'failed'\nRETURNING id, state, attempts;\n",
+          "examples": [
+            {
+              "id": "writes-fence03-example01",
+              "start_byte": 0,
+              "end_byte": 212,
+              "source": "UPDATE deliveries\nSET state = 'queued', attempts = attempts + 1\nWHERE merchant_id = 42 AND provider = 'stripe'\n  AND event_id = 'evt_abc' AND endpoint_id = 73\n  AND state = 'failed'\nRETURNING id, state, attempts;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "SQL assignment arithmetic and RETURNING are outside the current bounded SQL write grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_assignment_expressions",
+                "sql_returning"
+              ],
+              "prepare_error": "Unsupported"
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "opening_line": 91,
+          "closing_line": 98,
+          "section": "Working example with PostgreSQL",
+          "language": "text",
+          "source": "claim deliveries\nwhere merchant_id = $merchant and state = \"queued\"\norder by created_at asc, id asc\nset state = \"processing\", worker_id = $worker, attempts = attempts + 1,\n    lease_until = now() + 5m\nreturn id, event_id, attempts, lease_until\n",
+          "examples": [
+            {
+              "id": "writes-fence04-example01",
+              "start_byte": 0,
+              "end_byte": 243,
+              "source": "claim deliveries\nwhere merchant_id = $merchant and state = \"queued\"\norder by created_at asc, id asc\nset state = \"processing\", worker_id = $worker, attempts = attempts + 1,\n    lease_until = now() + 5m\nreturn id, event_id, attempts, lease_until",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Claim itself exists, but this example requires expression assignments, now(), duration literals and RETURN, which are not implemented.",
+              "features": [
+                "native_assignment_expressions",
+                "native_temporal_types",
+                "native_returning"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 5,
+          "opening_line": 100,
+          "closing_line": 113,
+          "section": "Working example with PostgreSQL",
+          "language": "sql",
+          "source": "WITH candidate AS (\n  SELECT merchant_id, id FROM deliveries\n  WHERE merchant_id = $1 AND state = 'queued'\n  ORDER BY created_at, id\n  LIMIT 1 FOR UPDATE SKIP LOCKED\n)\nUPDATE deliveries AS d\nSET state = 'processing', worker_id = $2, attempts = d.attempts + 1,\n    lease_until = transaction_timestamp() + interval '5 minutes'\nFROM candidate AS c\nWHERE (d.merchant_id, d.id) = (c.merchant_id, c.id)\nRETURNING d.id, d.event_id, d.attempts, d.lease_until;\n",
+          "examples": [
+            {
+              "id": "writes-fence05-example01",
+              "start_byte": 0,
+              "end_byte": 451,
+              "source": "WITH candidate AS (\n  SELECT merchant_id, id FROM deliveries\n  WHERE merchant_id = $1 AND state = 'queued'\n  ORDER BY created_at, id\n  LIMIT 1 FOR UPDATE SKIP LOCKED\n)\nUPDATE deliveries AS d\nSET state = 'processing', worker_id = $2, attempts = d.attempts + 1,\n    lease_until = transaction_timestamp() + interval '5 minutes'\nFROM candidate AS c\nWHERE (d.merchant_id, d.id) = (c.merchant_id, c.id)\nRETURNING d.id, d.event_id, d.attempts, d.lease_until;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "SQL CTE, locking/SKIP LOCKED, UPDATE FROM, arithmetic, temporal expressions and RETURNING are not implemented by the bounded SQL write grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_ctes",
+                "sql_joined_writes",
+                "sql_row_locking",
+                "sql_temporal_types",
+                "sql_returning"
+              ],
+              "prepare_error": "Unsupported"
+            }
+          ]
+        },
+        {
+          "ordinal": 6,
+          "opening_line": 119,
+          "closing_line": 124,
+          "section": "Working example with PostgreSQL",
+          "language": "text",
+          "source": "update many deliveries\nwhere merchant_id = 42 and state = \"failed\"\nset state = \"queued\"\nat most 100\n",
+          "examples": [
+            {
+              "id": "writes-fence06-example01",
+              "start_byte": 0,
+              "end_byte": 99,
+              "source": "update many deliveries\nwhere merchant_id = 42 and state = \"failed\"\nset state = \"queued\"\nat most 100",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-supported",
+              "reason": "Accepted by the current native parser only. The source table deliveries is reserved by the SQL catalog, so this exact reference cannot be provisioned or executed in the current embedded relational profile.",
+              "features": [
+                "native_capped_writes"
+              ],
+              "execution_fixture": "deliveries_reserved_boundary",
+              "execution": {
+                "expectation": "execute-rejected",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "bindings": {},
+                "error": {
+                  "Bind": "table"
+                },
+                "verify_sql": {
+                  "source": "SELECT * FROM reference_probe LIMIT 1024",
+                  "rows": [
+                    [
+                      {
+                        "Int": 1
+                      },
+                      {
+                        "Text": "unchanged"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ordinal": 7,
+          "opening_line": 130,
+          "closing_line": 138,
+          "section": "Transactions",
+          "language": "text",
+          "source": "transaction = \"transaction\" [ \"read only\" ] [ once ] \"{\"\n                txitem { \";\" txitem } [ \";\" ] \"}\"\ntxitem      = read | write | \"let\" identifier \"=\" \"(\" (read | write) \")\"\n            | \"require\" expr | \"emit\" exprlist | checkpoint | attempt | invokeproc\ncheckpoint  = \"savepoint\" identifier | \"rollback to\" identifier | \"release\" identifier\nattempt     = \"attempt\" \"{\" txitems \"}\" \"recover\" \"(\" names \")\" \"{\" txitems \"}\"\ntxitems     = txitem { \";\" txitem } [ \";\" ]\n",
+          "examples": [
+            {
+              "id": "writes-fence07-example01",
+              "start_byte": 0,
+              "end_byte": 474,
+              "source": "transaction = \"transaction\" [ \"read only\" ] [ once ] \"{\"\n                txitem { \";\" txitem } [ \";\" ] \"}\"\ntxitem      = read | write | \"let\" identifier \"=\" \"(\" (read | write) \")\"\n            | \"require\" expr | \"emit\" exprlist | checkpoint | attempt | invokeproc\ncheckpoint  = \"savepoint\" identifier | \"rollback to\" identifier | \"release\" identifier\nattempt     = \"attempt\" \"{\" txitems \"}\" \"recover\" \"(\" names \")\" \"{\" txitems \"}\"\ntxitems     = txitem { \";\" txitem } [ \";\" ]\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 8,
+          "opening_line": 144,
+          "closing_line": 157,
+          "section": "Transactions",
+          "language": "text",
+          "source": "transaction once $request for 24h {\n  let delivery = (\n    update deliveries\n    where merchant_id = $merchant and id = $id\n    when state = \"failed\"\n    set state = \"queued\"\n    return id, state\n  );\n  insert into outbox (merchant_id, id, kind, delivery_id)\n  values ($merchant, $outbox_id, \"delivery.requeued\", @delivery.row.id);\n  emit @delivery.row.id, @delivery.row.state\n}\n",
+          "examples": [
+            {
+              "id": "writes-fence08-example01",
+              "start_byte": 0,
+              "end_byte": 378,
+              "source": "transaction once $request for 24h {\n  let delivery = (\n    update deliveries\n    where merchant_id = $merchant and id = $id\n    when state = \"failed\"\n    set state = \"queued\"\n    return id, state\n  );\n  insert into outbox (merchant_id, id, kind, delivery_id)\n  values ($merchant, $outbox_id, \"delivery.requeued\", @delivery.row.id);\n  emit @delivery.row.id, @delivery.row.state\n}",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Transaction blocks, ONCE receipts, block locals, VALUES inserts and RETURN/EMIT are not implemented.",
+              "features": [
+                "native_transactions",
+                "native_receipts",
+                "native_block_locals"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 9,
+          "opening_line": 165,
+          "closing_line": 171,
+          "section": "Writes fed by other tables",
+          "language": "text",
+          "source": "insert many into delivery_archive (merchant_id, delivery_id, last_error)\nfrom (deliveries where state = \"failed\" and created_at < $cutoff\n      select merchant_id, id, last_error)\nat most 1000\nonce $archive_run for 24h\n",
+          "examples": [
+            {
+              "id": "writes-fence09-example01",
+              "start_byte": 0,
+              "end_byte": 218,
+              "source": "insert many into delivery_archive (merchant_id, delivery_id, last_error)\nfrom (deliveries where state = \"failed\" and created_at < $cutoff\n      select merchant_id, id, last_error)\nat most 1000\nonce $archive_run for 24h",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "INSERT FROM a read, column-list feed syntax and ONCE receipts are not implemented.",
+              "features": [
+                "native_insert_from_read",
+                "native_receipts"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 10,
+          "opening_line": 175,
+          "closing_line": 188,
+          "section": "Writes fed by other tables",
+          "language": "text",
+          "source": "update many deliveries as d\nusing merchant_settings as s\nwhere d.merchant_id = s.merchant_id and d.state = \"failed\"\nset lease_until = d.created_at + s.retry_delay\nat most 100\nreturn id, lease_until\n\ndelete many from deliveries as d\nusing expired_events as e\nwhere d.merchant_id = e.merchant_id and d.event_id = e.event_id\nwhen d.state = \"delivered\"\nat most 100\n",
+          "examples": [
+            {
+              "id": "writes-fence10-example01",
+              "start_byte": 0,
+              "end_byte": 197,
+              "source": "update many deliveries as d\nusing merchant_settings as s\nwhere d.merchant_id = s.merchant_id and d.state = \"failed\"\nset lease_until = d.created_at + s.retry_delay\nat most 100\nreturn id, lease_until",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Aliased joined writes/USING, qualified expression assignments and proposed DELETE FROM/RETURN forms are not implemented.",
+              "features": [
+                "native_joined_writes"
+              ]
+            },
+            {
+              "id": "writes-fence10-example02",
+              "start_byte": 199,
+              "end_byte": 360,
+              "source": "delete many from deliveries as d\nusing expired_events as e\nwhere d.merchant_id = e.merchant_id and d.event_id = e.event_id\nwhen d.state = \"delivered\"\nat most 100",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Aliased joined writes/USING, qualified expression assignments and proposed DELETE FROM/RETURN forms are not implemented.",
+              "features": [
+                "native_joined_writes"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 11,
+          "opening_line": 194,
+          "closing_line": 205,
+          "section": "Recoverable steps within a transaction",
+          "language": "text",
+          "source": "transaction once $repair_run for 24h {\n  update deliveries where merchant_id = $merchant and id = $id\n    when state = \"failed\" set state = \"queued\";\n  attempt {\n    insert into repair_tags (merchant_id, delivery_id, tag)\n    values ($merchant, $id, \"manual\")\n  } recover (unique_violation) {\n    require true\n  }\n}\n",
+          "examples": [
+            {
+              "id": "writes-fence11-example01",
+              "start_byte": 0,
+              "end_byte": 315,
+              "source": "transaction once $repair_run for 24h {\n  update deliveries where merchant_id = $merchant and id = $id\n    when state = \"failed\" set state = \"queued\";\n  attempt {\n    insert into repair_tags (merchant_id, delivery_id, tag)\n    values ($merchant, $id, \"manual\")\n  } recover (unique_violation) {\n    require true\n  }\n}",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Transaction blocks, attempt/recover and ONCE receipts are not implemented.",
+              "features": [
+                "native_transactions",
+                "native_recoverable_steps",
+                "native_receipts"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 12,
+          "opening_line": 209,
+          "closing_line": 217,
+          "section": "Recoverable steps within a transaction",
+          "language": "text",
+          "source": "transaction {\n  savepoint before_experiment;\n  update deliveries where merchant_id = $merchant and id = $id\n    set attempts = attempts + 1;\n  rollback to before_experiment;\n  release before_experiment\n}\n",
+          "examples": [
+            {
+              "id": "writes-fence12-example01",
+              "start_byte": 0,
+              "end_byte": 203,
+              "source": "transaction {\n  savepoint before_experiment;\n  update deliveries where merchant_id = $merchant and id = $id\n    set attempts = attempts + 1;\n  rollback to before_experiment;\n  release before_experiment\n}",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Transaction blocks, named savepoints/rollback/release and expression assignments are not implemented.",
+              "features": [
+                "native_transactions",
+                "native_savepoints"
+              ]
+            }
+          ]
+        }
+      ],
+      "inline_examples": [
+        {
+          "ordinal": 1,
+          "line": 233,
+          "section": "once, outcomes and lost replies",
+          "source_line": "| Timeout with unknown decision | outcome $key or replay the identical request. A timeout alone conveys no commit decision. |",
+          "example": {
+            "id": "writes-inline01",
+            "start_byte": 34,
+            "end_byte": 46,
+            "source": "outcome $key",
+            "interface": "native",
+            "kind": "statement",
+            "expectation": "parse-rejected",
+            "reason": "Native outcome/receipt lookup syntax is not implemented. Existing parser consumes outcome as a table then rejects the trailing parameter.",
+            "features": [
+              "native_receipts"
+            ]
+          }
+        }
+      ],
+      "expected_inline_count": 1
+    },
+    {
+      "alias": "schemas",
+      "id": "0f861b66-2cf4-4d24-8a99-2a6b46381836",
+      "revision": 2,
+      "title": "Native language 3 of 4 — schemas, online changes and migrations",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/0f861b66-2cf4-4d24-8a99-2a6b46381836?revision=2",
+      "expected_fence_count": 9,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 7,
+          "closing_line": 54,
+          "section": "Define a real service",
+          "language": "text",
+          "source": "create schema billing;\n\ncreate type billing.delivery_state as enum\n  (\"queued\", \"processing\", \"delivered\", \"failed\");\n\ncreate table billing.endpoints (\n  merchant_id int64,\n  id int64,\n  url text,\n  primary key (merchant_id, id)\n);\n\ncreate table billing.deliveries (\n  merchant_id int64,\n  id int64,\n  endpoint_id int64,\n  provider text,\n  event_id text,\n  state enum billing.delivery_state default \"queued\",\n  attempts int32 default 0,\n  worker_id nullable text,\n  lease_until nullable timestamp,\n  last_error nullable text,\n  payload nullable json,\n  created_at timestamp default now(),\n  primary key (merchant_id, id),\n  constraint event_per_endpoint unique (merchant_id, endpoint_id, provider, event_id),\n  constraint nonnegative_attempts check (attempts >= 0),\n  constraint delivery_endpoint foreign key (merchant_id, endpoint_id)\n    references billing.endpoints (merchant_id, id) on delete restrict\n) partition by hash (merchant_id);\n\ncreate index billing.delivery_queue on billing.deliveries\n  (merchant_id, state, created_at, id);\n\ncreate table billing.outbox (\n  merchant_id int64,\n  id uuid,\n  kind text,\n  delivery_id int64,\n  primary key (merchant_id, id)\n);\n\ncreate view billing.failed_deliveries as (\n  billing.deliveries where state = \"failed\" select merchant_id, id, endpoint_id, created_at\n);\n",
+          "examples": [
+            {
+              "id": "schemas-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 22,
+              "source": "create schema billing;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example02",
+              "start_byte": 24,
+              "end_byte": 117,
+              "source": "create type billing.delivery_state as enum\n  (\"queued\", \"processing\", \"delivered\", \"failed\");",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example03",
+              "start_byte": 119,
+              "end_byte": 231,
+              "source": "create table billing.endpoints (\n  merchant_id int64,\n  id int64,\n  url text,\n  primary key (merchant_id, id)\n);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example04",
+              "start_byte": 233,
+              "end_byte": 940,
+              "source": "create table billing.deliveries (\n  merchant_id int64,\n  id int64,\n  endpoint_id int64,\n  provider text,\n  event_id text,\n  state enum billing.delivery_state default \"queued\",\n  attempts int32 default 0,\n  worker_id nullable text,\n  lease_until nullable timestamp,\n  last_error nullable text,\n  payload nullable json,\n  created_at timestamp default now(),\n  primary key (merchant_id, id),\n  constraint event_per_endpoint unique (merchant_id, endpoint_id, provider, event_id),\n  constraint nonnegative_attempts check (attempts >= 0),\n  constraint delivery_endpoint foreign key (merchant_id, endpoint_id)\n    references billing.endpoints (merchant_id, id) on delete restrict\n) partition by hash (merchant_id);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example05",
+              "start_byte": 942,
+              "end_byte": 1039,
+              "source": "create index billing.delivery_queue on billing.deliveries\n  (merchant_id, state, created_at, id);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example06",
+              "start_byte": 1041,
+              "end_byte": 1171,
+              "source": "create table billing.outbox (\n  merchant_id int64,\n  id uuid,\n  kind text,\n  delivery_id int64,\n  primary key (merchant_id, id)\n);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence01-example07",
+              "start_byte": 1173,
+              "end_byte": 1310,
+              "source": "create view billing.failed_deliveries as (\n  billing.deliveries where state = \"failed\" select merchant_id, id, endpoint_id, created_at\n);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native schema/type/table/index/view DDL, qualified names and the proposed schema profile are not implemented by the current data-only native parser.",
+              "features": [
+                "native_ddl"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "opening_line": 62,
+          "closing_line": 99,
+          "section": "Catalog grammar",
+          "language": "text",
+          "source": "ddl        = \"create schema\" name | \"drop schema\" name\n           | \"create type\" name \"as enum\" \"(\" strings \")\"\n           | \"alter type\" name \"add value\" string | \"drop type\" name\n           | \"create table\" name \"(\" entry { \",\" entry } \")\" [ partition ]\n           | \"alter table\" name alteration | \"drop table\" name\n           | \"create\" [ \"unique\" ] \"index\" name \"on\" name \"(\" indexkeys \")\"\n             [ \"include\" \"(\" names \")\" ] [ \"where\" expr ]\n           | \"drop index\" name\n           | \"create path\" name \"on\" name \"using\" name\n           | \"drop path\" name\n           | \"create view\" name \"as\" \"(\" read \")\" | \"drop view\" name\n           | storeddef\nstoreddef  = \"create procedure\" name \"(\" [ formals ] \")\" \"{\" txitems \"}\"\n           | \"drop procedure\" name\n           | \"create trigger\" identifier \"after\" event \"on\" name [ \"when\" expr ] \"do\" write\n           | \"drop trigger\" identifier \"on\" name\nformals    = identifier type { \",\" identifier type }\nevent      = \"insert\" | \"update\" | \"delete\"\ninvokeproc = \"run\" name \"(\" [ namedargs ] \")\"\nentry      = column | \"primary key\" \"(\" names \")\" | \"constraint\" identifier constraint\ncolumn     = identifier [ \"nullable\" ] type [ \"default\" expr ]\ntype       = \"bool\" | \"int32\" | \"int64\" | \"decimal\" \"(\" integer \",\" integer \")\"\n           | \"float64\" | \"text\" | \"bytes\" | \"uuid\" | \"date\" | \"timestamp\"\n           | \"duration\" | \"json\" | \"enum\" name\nconstraint = \"unique\" \"(\" names \")\" | \"check\" \"(\" expr \")\"\n           | \"foreign key\" \"(\" names \")\" \"references\" name \"(\" names \")\"\n             [ \"on delete restrict\" ]\npartition  = \"partition by\" (\"hash\" | \"range\") \"(\" names \")\"\nindexkeys  = identifier [ \"asc\" | \"desc\" ] { \",\" identifier [ \"asc\" | \"desc\" ] }\nalteration = \"add column\" column | \"drop column\" identifier\n           | \"rename column\" identifier \"to\" identifier | \"rename to\" identifier\n           | \"alter column\" identifier ( \"set default\" expr | \"drop default\"\n             | \"set required\" | \"set nullable\" | \"set type\" type )\n           | \"add constraint\" identifier constraint [ \"not valid\" ]\n           | \"validate constraint\" identifier | \"drop constraint\" identifier\n           | partition\n",
+          "examples": [
+            {
+              "id": "schemas-fence02-example01",
+              "start_byte": 0,
+              "end_byte": 2170,
+              "source": "ddl        = \"create schema\" name | \"drop schema\" name\n           | \"create type\" name \"as enum\" \"(\" strings \")\"\n           | \"alter type\" name \"add value\" string | \"drop type\" name\n           | \"create table\" name \"(\" entry { \",\" entry } \")\" [ partition ]\n           | \"alter table\" name alteration | \"drop table\" name\n           | \"create\" [ \"unique\" ] \"index\" name \"on\" name \"(\" indexkeys \")\"\n             [ \"include\" \"(\" names \")\" ] [ \"where\" expr ]\n           | \"drop index\" name\n           | \"create path\" name \"on\" name \"using\" name\n           | \"drop path\" name\n           | \"create view\" name \"as\" \"(\" read \")\" | \"drop view\" name\n           | storeddef\nstoreddef  = \"create procedure\" name \"(\" [ formals ] \")\" \"{\" txitems \"}\"\n           | \"drop procedure\" name\n           | \"create trigger\" identifier \"after\" event \"on\" name [ \"when\" expr ] \"do\" write\n           | \"drop trigger\" identifier \"on\" name\nformals    = identifier type { \",\" identifier type }\nevent      = \"insert\" | \"update\" | \"delete\"\ninvokeproc = \"run\" name \"(\" [ namedargs ] \")\"\nentry      = column | \"primary key\" \"(\" names \")\" | \"constraint\" identifier constraint\ncolumn     = identifier [ \"nullable\" ] type [ \"default\" expr ]\ntype       = \"bool\" | \"int32\" | \"int64\" | \"decimal\" \"(\" integer \",\" integer \")\"\n           | \"float64\" | \"text\" | \"bytes\" | \"uuid\" | \"date\" | \"timestamp\"\n           | \"duration\" | \"json\" | \"enum\" name\nconstraint = \"unique\" \"(\" names \")\" | \"check\" \"(\" expr \")\"\n           | \"foreign key\" \"(\" names \")\" \"references\" name \"(\" names \")\"\n             [ \"on delete restrict\" ]\npartition  = \"partition by\" (\"hash\" | \"range\") \"(\" names \")\"\nindexkeys  = identifier [ \"asc\" | \"desc\" ] { \",\" identifier [ \"asc\" | \"desc\" ] }\nalteration = \"add column\" column | \"drop column\" identifier\n           | \"rename column\" identifier \"to\" identifier | \"rename to\" identifier\n           | \"alter column\" identifier ( \"set default\" expr | \"drop default\"\n             | \"set required\" | \"set nullable\" | \"set type\" type )\n           | \"add constraint\" identifier constraint [ \"not valid\" ]\n           | \"validate constraint\" identifier | \"drop constraint\" identifier\n           | partition\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "opening_line": 107,
+          "closing_line": 118,
+          "section": "Catalog grammar",
+          "language": "text",
+          "source": "create table messages (\n  channel_id int64,\n  message_id int64,\n  author_id int64,\n  body text,\n  primary key (channel_id, message_id)\n) partition by range (channel_id);\n\ncreate index message_order on messages (channel_id, message_id desc);\ncreate path channel_timeline on messages using message_order;\n",
+          "examples": [
+            {
+              "id": "schemas-fence03-example01",
+              "start_byte": 0,
+              "end_byte": 169,
+              "source": "create table messages (\n  channel_id int64,\n  message_id int64,\n  author_id int64,\n  body text,\n  primary key (channel_id, message_id)\n) partition by range (channel_id);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native table/index/access-path DDL and partitioning are not implemented.",
+              "features": [
+                "native_ddl",
+                "native_paths"
+              ]
+            },
+            {
+              "id": "schemas-fence03-example02",
+              "start_byte": 171,
+              "end_byte": 240,
+              "source": "create index message_order on messages (channel_id, message_id desc);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native table/index/access-path DDL and partitioning are not implemented.",
+              "features": [
+                "native_ddl",
+                "native_paths"
+              ]
+            },
+            {
+              "id": "schemas-fence03-example03",
+              "start_byte": 241,
+              "end_byte": 302,
+              "source": "create path channel_timeline on messages using message_order;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native table/index/access-path DDL and partitioning are not implemented.",
+              "features": [
+                "native_ddl",
+                "native_paths"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "opening_line": 128,
+          "closing_line": 138,
+          "section": "Change a live schema",
+          "language": "text",
+          "source": "migration add_retry_schedule {\n  alter table deliveries add column next_attempt_at nullable timestamp;\n  alter table deliveries alter column next_attempt_at set default now();\n  create index retry_schedule on deliveries (merchant_id, state, next_attempt_at, id)\n};\n\nplan migration add_retry_schedule;\napply migration add_retry_schedule digest $plan_digest;\nshow job $job;\n",
+          "examples": [
+            {
+              "id": "schemas-fence04-example01",
+              "start_byte": 0,
+              "end_byte": 264,
+              "source": "migration add_retry_schedule {\n  alter table deliveries add column next_attempt_at nullable timestamp;\n  alter table deliveries alter column next_attempt_at set default now();\n  create index retry_schedule on deliveries (merchant_id, state, next_attempt_at, id)\n};",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, native ALTER/index DDL, digest-bound apply and job inspection are not implemented.",
+              "features": [
+                "native_migrations"
+              ]
+            },
+            {
+              "id": "schemas-fence04-example02",
+              "start_byte": 266,
+              "end_byte": 300,
+              "source": "plan migration add_retry_schedule;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, native ALTER/index DDL, digest-bound apply and job inspection are not implemented.",
+              "features": [
+                "native_migrations"
+              ]
+            },
+            {
+              "id": "schemas-fence04-example03",
+              "start_byte": 301,
+              "end_byte": 356,
+              "source": "apply migration add_retry_schedule digest $plan_digest;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, native ALTER/index DDL, digest-bound apply and job inspection are not implemented.",
+              "features": [
+                "native_migrations"
+              ]
+            },
+            {
+              "id": "schemas-fence04-example04",
+              "start_byte": 357,
+              "end_byte": 371,
+              "source": "show job $job;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, native ALTER/index DDL, digest-bound apply and job inspection are not implemented.",
+              "features": [
+                "native_migrations"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 5,
+          "opening_line": 144,
+          "closing_line": 160,
+          "section": "Change a live schema",
+          "language": "text",
+          "source": "migration require_retry_schedule {\n  alter table deliveries add constraint retry_time_present\n    check (next_attempt_at is not null) not valid;\n  backfill deliveries\n    where next_attempt_at is null\n    set next_attempt_at = created_at\n    batch 500 budget scan_bytes 8MiB;\n  alter table deliveries validate constraint retry_time_present;\n  alter table deliveries alter column next_attempt_at set required;\n  alter table deliveries drop constraint retry_time_present\n};\n\nplan migration require_retry_schedule;\napply migration require_retry_schedule digest $plan_digest;\nshow migration require_retry_schedule;\n",
+          "examples": [
+            {
+              "id": "schemas-fence05-example01",
+              "start_byte": 0,
+              "end_byte": 471,
+              "source": "migration require_retry_schedule {\n  alter table deliveries add constraint retry_time_present\n    check (next_attempt_at is not null) not valid;\n  backfill deliveries\n    where next_attempt_at is null\n    set next_attempt_at = created_at\n    batch 500 budget scan_bytes 8MiB;\n  alter table deliveries validate constraint retry_time_present;\n  alter table deliveries alter column next_attempt_at set required;\n  alter table deliveries drop constraint retry_time_present\n};",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, constraints/backfill, digest-bound apply and migration inspection are not implemented.",
+              "features": [
+                "native_migrations",
+                "native_backfill"
+              ]
+            },
+            {
+              "id": "schemas-fence05-example02",
+              "start_byte": 473,
+              "end_byte": 511,
+              "source": "plan migration require_retry_schedule;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, constraints/backfill, digest-bound apply and migration inspection are not implemented.",
+              "features": [
+                "native_migrations",
+                "native_backfill"
+              ]
+            },
+            {
+              "id": "schemas-fence05-example03",
+              "start_byte": 512,
+              "end_byte": 571,
+              "source": "apply migration require_retry_schedule digest $plan_digest;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, constraints/backfill, digest-bound apply and migration inspection are not implemented.",
+              "features": [
+                "native_migrations",
+                "native_backfill"
+              ]
+            },
+            {
+              "id": "schemas-fence05-example04",
+              "start_byte": 572,
+              "end_byte": 610,
+              "source": "show migration require_retry_schedule;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Named migrations, constraints/backfill, digest-bound apply and migration inspection are not implemented.",
+              "features": [
+                "native_migrations",
+                "native_backfill"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 6,
+          "opening_line": 166,
+          "closing_line": 189,
+          "section": "Change a live schema",
+          "language": "sql",
+          "source": "ALTER TABLE deliveries ADD COLUMN next_attempt_at timestamptz;\nALTER TABLE deliveries ALTER COLUMN next_attempt_at SET DEFAULT now();\nCREATE INDEX CONCURRENTLY retry_schedule\n    ON deliveries (merchant_id, state, next_attempt_at, id);\n\nALTER TABLE deliveries ADD CONSTRAINT retry_time_present\n    CHECK (next_attempt_at IS NOT NULL) NOT VALID;\n\n-- Run in repeated bounded transactions until the remaining count is zero.\nWITH batch AS (\n    SELECT merchant_id, id FROM deliveries\n    WHERE next_attempt_at IS NULL\n    ORDER BY merchant_id, id LIMIT 500 FOR UPDATE SKIP LOCKED\n)\nUPDATE deliveries AS d SET next_attempt_at = d.created_at\nFROM batch AS b\nWHERE d.merchant_id = b.merchant_id AND d.id = b.id\n  AND d.next_attempt_at IS NULL;\n\nALTER TABLE deliveries VALIDATE CONSTRAINT retry_time_present;\nALTER TABLE deliveries ALTER COLUMN next_attempt_at SET NOT NULL;\nALTER TABLE deliveries DROP CONSTRAINT retry_time_present;\n",
+          "examples": [
+            {
+              "id": "schemas-fence06-example01",
+              "start_byte": 0,
+              "end_byte": 62,
+              "source": "ALTER TABLE deliveries ADD COLUMN next_attempt_at timestamptz;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example02",
+              "start_byte": 63,
+              "end_byte": 133,
+              "source": "ALTER TABLE deliveries ALTER COLUMN next_attempt_at SET DEFAULT now();",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example03",
+              "start_byte": 134,
+              "end_byte": 235,
+              "source": "CREATE INDEX CONCURRENTLY retry_schedule\n    ON deliveries (merchant_id, state, next_attempt_at, id);",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Syntax"
+            },
+            {
+              "id": "schemas-fence06-example04",
+              "start_byte": 237,
+              "end_byte": 344,
+              "source": "ALTER TABLE deliveries ADD CONSTRAINT retry_time_present\n    CHECK (next_attempt_at IS NOT NULL) NOT VALID;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example05",
+              "start_byte": 346,
+              "end_byte": 736,
+              "source": "-- Run in repeated bounded transactions until the remaining count is zero.\nWITH batch AS (\n    SELECT merchant_id, id FROM deliveries\n    WHERE next_attempt_at IS NULL\n    ORDER BY merchant_id, id LIMIT 500 FOR UPDATE SKIP LOCKED\n)\nUPDATE deliveries AS d SET next_attempt_at = d.created_at\nFROM batch AS b\nWHERE d.merchant_id = b.merchant_id AND d.id = b.id\n  AND d.next_attempt_at IS NULL;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example06",
+              "start_byte": 738,
+              "end_byte": 800,
+              "source": "ALTER TABLE deliveries VALIDATE CONSTRAINT retry_time_present;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example07",
+              "start_byte": 801,
+              "end_byte": 866,
+              "source": "ALTER TABLE deliveries ALTER COLUMN next_attempt_at SET NOT NULL;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "schemas-fence06-example08",
+              "start_byte": 867,
+              "end_byte": 925,
+              "source": "ALTER TABLE deliveries DROP CONSTRAINT retry_time_present;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_online_schema_changes"
+              ],
+              "prepare_error": "Unsupported"
+            }
+          ]
+        },
+        {
+          "ordinal": 7,
+          "opening_line": 195,
+          "closing_line": 202,
+          "section": "Migration grammar and lifecycle",
+          "language": "text",
+          "source": "migration  = \"migration\" name \"{\" step { \";\" step } [ \";\" ] \"}\"\n           | \"plan migration\" name | \"apply migration\" name \"digest\" value\n           | \"show migration\" name | \"show job\" value\n           | (\"pause job\" | \"resume job\" | \"cancel job\") value\nstep       = ddl | \"backfill\" name \"where\" expr \"set\" assignments\n             \"batch\" value [ budget ]\n",
+          "examples": [
+            {
+              "id": "schemas-fence07-example01",
+              "start_byte": 0,
+              "end_byte": 360,
+              "source": "migration  = \"migration\" name \"{\" step { \";\" step } [ \";\" ] \"}\"\n           | \"plan migration\" name | \"apply migration\" name \"digest\" value\n           | \"show migration\" name | \"show job\" value\n           | (\"pause job\" | \"resume job\" | \"cancel job\") value\nstep       = ddl | \"backfill\" name \"where\" expr \"set\" assignments\n             \"batch\" value [ budget ]\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 8,
+          "opening_line": 224,
+          "closing_line": 235,
+          "section": "Stored procedures and transactional triggers",
+          "language": "text",
+          "source": "create procedure billing.retry_one (p_merchant int64, p_delivery int64) {\n  let changed = (\n    update billing.deliveries where merchant_id = $p_merchant and id = $p_delivery\n    when state = \"failed\" set state = \"queued\"\n    return id, state\n  );\n  emit @changed.row.id, @changed.row.state\n};\n\nrun billing.retry_one(p_merchant = 42, p_delivery = 8172) once $request for 24h;\n",
+          "examples": [
+            {
+              "id": "schemas-fence08-example01",
+              "start_byte": 0,
+              "end_byte": 293,
+              "source": "create procedure billing.retry_one (p_merchant int64, p_delivery int64) {\n  let changed = (\n    update billing.deliveries where merchant_id = $p_merchant and id = $p_delivery\n    when state = \"failed\" set state = \"queued\"\n    return id, state\n  );\n  emit @changed.row.id, @changed.row.state\n};",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native stored procedure definition/invocation, qualified names, block locals and ONCE receipts are not implemented.",
+              "features": [
+                "native_stored_logic"
+              ]
+            },
+            {
+              "id": "schemas-fence08-example02",
+              "start_byte": 295,
+              "end_byte": 375,
+              "source": "run billing.retry_one(p_merchant = 42, p_delivery = 8172) once $request for 24h;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native stored procedure definition/invocation, qualified names, block locals and ONCE receipts are not implemented.",
+              "features": [
+                "native_stored_logic"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 9,
+          "opening_line": 239,
+          "closing_line": 247,
+          "section": "Stored procedures and transactional triggers",
+          "language": "text",
+          "source": "create table billing.created_delivery_audit (\n  merchant_id int64, delivery_id int64, primary key (merchant_id, delivery_id)\n);\n\ncreate trigger record_delivery_created after insert on billing.deliveries\ndo insert into billing.created_delivery_audit (merchant_id, delivery_id)\n   values (new.merchant_id, new.id);\n",
+          "examples": [
+            {
+              "id": "schemas-fence09-example01",
+              "start_byte": 0,
+              "end_byte": 127,
+              "source": "create table billing.created_delivery_audit (\n  merchant_id int64, delivery_id int64, primary key (merchant_id, delivery_id)\n);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native table/trigger DDL and triggered writes are not implemented.",
+              "features": [
+                "native_stored_logic",
+                "native_ddl"
+              ]
+            },
+            {
+              "id": "schemas-fence09-example02",
+              "start_byte": 129,
+              "end_byte": 312,
+              "source": "create trigger record_delivery_created after insert on billing.deliveries\ndo insert into billing.created_delivery_audit (merchant_id, delivery_id)\n   values (new.merchant_id, new.id);",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native table/trigger DDL and triggered writes are not implemented.",
+              "features": [
+                "native_stored_logic",
+                "native_ddl"
+              ]
+            }
+          ]
+        }
+      ],
+      "inline_examples": [],
+      "expected_inline_count": 0
+    },
+    {
+      "alias": "permissions",
+      "id": "a614da1c-c7e4-4668-9229-46102a9c6a14",
+      "revision": 3,
+      "title": "Native language 4 of 4 — permissions, operations and conformance",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/a614da1c-c7e4-4668-9229-46102a9c6a14?revision=3",
+      "expected_fence_count": 6,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 15,
+          "closing_line": 35,
+          "section": "Who can express a change, and who can commit it",
+          "language": "text",
+          "source": "access = \"create role\" identifier | \"drop role\" identifier\n       | (\"grant\" | \"revoke\") privileges \"on\" resource (\"to\" | \"from\") identifier\n       | (\"grant role\" identifier \"to\" | \"revoke role\" identifier \"from\") principal\n       | \"create policy\" name \"on\" name \"to\" identifier\n         \"visible when\" expr [ \"write when\" expr ]\n       | \"drop policy\" name \"on\" name\n       | taskdef | \"revoke task\" value | \"show task\" value\n       | \"preview\" \"{\" write \"}\" \"using task\" value\n       | \"approve change\" value \"digest\" value\n       | \"apply change\" value \"digest\" value \"once\" value \"for\" duration_value\n       | \"outcome\" value | \"show receipt\" value\ntaskdef= \"create task\" value \"for\" principal \"on\" name\n         \"visible when\" expr \"allow update\" \"(\" names \")\"\n         \"from\" expr \"to\" expr \"at most\" value \"distinct rows\"\n         \"and\" value \"transitions\" \"expires\" value \"approve above\" value\nprincipal = \"principal\" value\nresource  = \"database\" name | \"schema\" name | \"table\" name | \"profile\" name | \"procedure\" name\nprivileges= privilege { \",\" privilege }\nprivilege = privname [ \"(\" names \")\" ]\n",
+          "examples": [
+            {
+              "id": "permissions-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 1108,
+              "source": "access = \"create role\" identifier | \"drop role\" identifier\n       | (\"grant\" | \"revoke\") privileges \"on\" resource (\"to\" | \"from\") identifier\n       | (\"grant role\" identifier \"to\" | \"revoke role\" identifier \"from\") principal\n       | \"create policy\" name \"on\" name \"to\" identifier\n         \"visible when\" expr [ \"write when\" expr ]\n       | \"drop policy\" name \"on\" name\n       | taskdef | \"revoke task\" value | \"show task\" value\n       | \"preview\" \"{\" write \"}\" \"using task\" value\n       | \"approve change\" value \"digest\" value\n       | \"apply change\" value \"digest\" value \"once\" value \"for\" duration_value\n       | \"outcome\" value | \"show receipt\" value\ntaskdef= \"create task\" value \"for\" principal \"on\" name\n         \"visible when\" expr \"allow update\" \"(\" names \")\"\n         \"from\" expr \"to\" expr \"at most\" value \"distinct rows\"\n         \"and\" value \"transitions\" \"expires\" value \"approve above\" value\nprincipal = \"principal\" value\nresource  = \"database\" name | \"schema\" name | \"table\" name | \"profile\" name | \"procedure\" name\nprivileges= privilege { \",\" privilege }\nprivilege = privname [ \"(\" names \")\" ]\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "opening_line": 41,
+          "closing_line": 58,
+          "section": "Who can express a change, and who can commit it",
+          "language": "text",
+          "source": "create role repairer;\ngrant read (merchant_id, id, state, attempts), update (state, attempts)\n  on table deliveries to repairer;\ngrant role repairer to principal \"svc/oncall-repair\";\n\ncreate policy merchant_isolation on deliveries to repairer\n  visible when merchant_id = context(\"tenant\")\n  write when old.merchant_id = context(\"tenant\")\n         and new.merchant_id = context(\"tenant\");\n\ncreate task \"inc-436\" for principal \"svc/oncall-repair\" on deliveries\n  visible when merchant_id = 42\n  allow update (state)\n  from old.state = \"failed\" to new.state = \"queued\"\n  at most 25 distinct rows and 25 transitions\n  expires timestamp(\"2026-11-05T17:30:00Z\") approve above 5;\n",
+          "examples": [
+            {
+              "id": "permissions-fence02-example01",
+              "start_byte": 0,
+              "end_byte": 21,
+              "source": "create role repairer;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native role/grant/policy/task-definition syntax is proposed; current native Engine uses trusted embedded Admin and does not implement this authority interface.",
+              "features": [
+                "native_authorization"
+              ]
+            },
+            {
+              "id": "permissions-fence02-example02",
+              "start_byte": 22,
+              "end_byte": 128,
+              "source": "grant read (merchant_id, id, state, attempts), update (state, attempts)\n  on table deliveries to repairer;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native role/grant/policy/task-definition syntax is proposed; current native Engine uses trusted embedded Admin and does not implement this authority interface.",
+              "features": [
+                "native_authorization"
+              ]
+            },
+            {
+              "id": "permissions-fence02-example03",
+              "start_byte": 129,
+              "end_byte": 182,
+              "source": "grant role repairer to principal \"svc/oncall-repair\";",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native role/grant/policy/task-definition syntax is proposed; current native Engine uses trusted embedded Admin and does not implement this authority interface.",
+              "features": [
+                "native_authorization"
+              ]
+            },
+            {
+              "id": "permissions-fence02-example04",
+              "start_byte": 184,
+              "end_byte": 388,
+              "source": "create policy merchant_isolation on deliveries to repairer\n  visible when merchant_id = context(\"tenant\")\n  write when old.merchant_id = context(\"tenant\")\n         and new.merchant_id = context(\"tenant\");",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native role/grant/policy/task-definition syntax is proposed; current native Engine uses trusted embedded Admin and does not implement this authority interface.",
+              "features": [
+                "native_authorization"
+              ]
+            },
+            {
+              "id": "permissions-fence02-example05",
+              "start_byte": 390,
+              "end_byte": 673,
+              "source": "create task \"inc-436\" for principal \"svc/oncall-repair\" on deliveries\n  visible when merchant_id = 42\n  allow update (state)\n  from old.state = \"failed\" to new.state = \"queued\"\n  at most 25 distinct rows and 25 transitions\n  expires timestamp(\"2026-11-05T17:30:00Z\") approve above 5;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native role/grant/policy/task-definition syntax is proposed; current native Engine uses trusted embedded Admin and does not implement this authority interface.",
+              "features": [
+                "native_authorization"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "opening_line": 62,
+          "closing_line": 73,
+          "section": "Who can express a change, and who can commit it",
+          "language": "text",
+          "source": "preview {\n  update many deliveries\n  where merchant_id = 42 and state = \"failed\"\n  set state = \"queued\"\n  at most 25\n} using task \"inc-436\";\n\napprove change $change digest $digest;\napply change $change digest $digest once $request for 24h;\noutcome $request;\n",
+          "examples": [
+            {
+              "id": "permissions-fence03-example01",
+              "start_byte": 0,
+              "end_byte": 140,
+              "source": "preview {\n  update many deliveries\n  where merchant_id = 42 and state = \"failed\"\n  set state = \"queued\"\n  at most 25\n} using task \"inc-436\";",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native preview/approval/apply/outcome and retained-receipt syntax is not implemented.",
+              "features": [
+                "native_authorization",
+                "native_receipts"
+              ]
+            },
+            {
+              "id": "permissions-fence03-example02",
+              "start_byte": 142,
+              "end_byte": 180,
+              "source": "approve change $change digest $digest;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native preview/approval/apply/outcome and retained-receipt syntax is not implemented.",
+              "features": [
+                "native_authorization",
+                "native_receipts"
+              ]
+            },
+            {
+              "id": "permissions-fence03-example03",
+              "start_byte": 181,
+              "end_byte": 239,
+              "source": "apply change $change digest $digest once $request for 24h;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native preview/approval/apply/outcome and retained-receipt syntax is not implemented.",
+              "features": [
+                "native_authorization",
+                "native_receipts"
+              ]
+            },
+            {
+              "id": "permissions-fence03-example04",
+              "start_byte": 240,
+              "end_byte": 257,
+              "source": "outcome $request;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native preview/approval/apply/outcome and retained-receipt syntax is not implemented.",
+              "features": [
+                "native_authorization",
+                "native_receipts"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "opening_line": 81,
+          "closing_line": 105,
+          "section": "Administration grammar and boundaries",
+          "language": "text",
+          "source": "operations = \"show capabilities\" | \"show limits\" | \"show schemas\" | \"show tables\"\n           | \"show roles\" | \"show jobs\" | \"show grants\" identifier\n           | \"describe\" (\"table\" | \"type\" | \"view\" | \"index\" | \"path\") name\n           | \"show databases\" | \"create database\" name\n           | \"plan drop database\" name | \"drop database\" name \"digest\" value\n           | \"show dependencies\" name | \"show placement\" name\n           | \"explain\" (read | write) | \"explain analyze\" read\n           | \"explain survival\" name \"lose\" (\"region\" | \"cloud\") value\n           | \"plan placement\" name \"using profile\" name\n           | \"apply placement\" name \"digest\" value\n           | \"backup database\" name \"to\" handle\n           | \"verify backup\" handle\n           | \"restore backup\" handle [ \"at\" value ] \"as database\" name\n           | \"export\" \"(\" read \")\" \"to\" handle \"format\" format\n           | \"import into\" name \"from\" handle \"format\" format \"at most\" value\n           | \"create feed\" name \"on\" name \"select\" names\n           | \"subscribe\" name (\"from snapshot\" | \"after\" value) \"limit\" value\n           | \"ack feed\" name \"through\" value | \"drop feed\" name\n           | invokeproc [ once ]\n           | \"call\" name \".\" identifier \"(\" [ namedargs ] \")\" [ once ]\nhandle     = param | string\nformat     = \"ndjson\" | \"csv\"\nnamedargs  = identifier \"=\" expr { \",\" identifier \"=\" expr }\n",
+          "examples": [
+            {
+              "id": "permissions-fence04-example01",
+              "start_byte": 0,
+              "end_byte": 1378,
+              "source": "operations = \"show capabilities\" | \"show limits\" | \"show schemas\" | \"show tables\"\n           | \"show roles\" | \"show jobs\" | \"show grants\" identifier\n           | \"describe\" (\"table\" | \"type\" | \"view\" | \"index\" | \"path\") name\n           | \"show databases\" | \"create database\" name\n           | \"plan drop database\" name | \"drop database\" name \"digest\" value\n           | \"show dependencies\" name | \"show placement\" name\n           | \"explain\" (read | write) | \"explain analyze\" read\n           | \"explain survival\" name \"lose\" (\"region\" | \"cloud\") value\n           | \"plan placement\" name \"using profile\" name\n           | \"apply placement\" name \"digest\" value\n           | \"backup database\" name \"to\" handle\n           | \"verify backup\" handle\n           | \"restore backup\" handle [ \"at\" value ] \"as database\" name\n           | \"export\" \"(\" read \")\" \"to\" handle \"format\" format\n           | \"import into\" name \"from\" handle \"format\" format \"at most\" value\n           | \"create feed\" name \"on\" name \"select\" names\n           | \"subscribe\" name (\"from snapshot\" | \"after\" value) \"limit\" value\n           | \"ack feed\" name \"through\" value | \"drop feed\" name\n           | invokeproc [ once ]\n           | \"call\" name \".\" identifier \"(\" [ namedargs ] \")\" [ once ]\nhandle     = param | string\nformat     = \"ndjson\" | \"csv\"\nnamedargs  = identifier \"=\" expr { \",\" identifier \"=\" expr }\n",
+              "interface": "grammar",
+              "kind": "fragment",
+              "expectation": "non-executable",
+              "reason": "EBNF grammar production definitions and metavariables; not a submitted language statement.",
+              "features": [
+                "grammar"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 5,
+          "opening_line": 121,
+          "closing_line": 132,
+          "section": "Administration grammar and boundaries",
+          "language": "text",
+          "source": "explain deliveries where merchant_id = 42 and state = \"failed\" limit 10;\ndescribe table deliveries;\nexplain survival payments lose cloud \"aws\";\nplan placement deliveries using profile three_provider_quorum;\napply placement deliveries digest $placement_digest;\nbackup database payments to \"weekly-vault\";\nrestore backup $backup at timestamp(\"2026-11-05T12:30:00Z\") as database payments_drill;\ncreate feed delivery_changes on deliveries select merchant_id, id, state;\nsubscribe delivery_changes from snapshot limit 100;\nack feed delivery_changes through $frontier;\n",
+          "examples": [
+            {
+              "id": "permissions-fence05-example01",
+              "start_byte": 0,
+              "end_byte": 72,
+              "source": "explain deliveries where merchant_id = 42 and state = \"failed\" limit 10;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example02",
+              "start_byte": 73,
+              "end_byte": 99,
+              "source": "describe table deliveries;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example03",
+              "start_byte": 100,
+              "end_byte": 143,
+              "source": "explain survival payments lose cloud \"aws\";",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example04",
+              "start_byte": 144,
+              "end_byte": 206,
+              "source": "plan placement deliveries using profile three_provider_quorum;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example05",
+              "start_byte": 207,
+              "end_byte": 259,
+              "source": "apply placement deliveries digest $placement_digest;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example06",
+              "start_byte": 260,
+              "end_byte": 303,
+              "source": "backup database payments to \"weekly-vault\";",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example07",
+              "start_byte": 304,
+              "end_byte": 391,
+              "source": "restore backup $backup at timestamp(\"2026-11-05T12:30:00Z\") as database payments_drill;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example08",
+              "start_byte": 392,
+              "end_byte": 465,
+              "source": "create feed delivery_changes on deliveries select merchant_id, id, state;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example09",
+              "start_byte": 466,
+              "end_byte": 517,
+              "source": "subscribe delivery_changes from snapshot limit 100;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            },
+            {
+              "id": "permissions-fence05-example10",
+              "start_byte": 518,
+              "end_byte": 562,
+              "source": "ack feed delivery_changes through $frontier;",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "This native administrative/placement/backup/changefeed command is not implemented by the bounded data-operation parser.",
+              "features": [
+                "native_administration"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 6,
+          "opening_line": 140,
+          "closing_line": 145,
+          "section": "Optional typed modules",
+          "language": "text",
+          "source": "call ledger.post_transfer(\n  ledger_id = $ledger, transfer_id = $transfer, debit_account = $buyer,\n  credit_account = $seller, asset = \"USD\", amount_minor = $cents\n)\n",
+          "examples": [
+            {
+              "id": "permissions-fence06-example01",
+              "start_byte": 0,
+              "end_byte": 165,
+              "source": "call ledger.post_transfer(\n  ledger_id = $ledger, transfer_id = $transfer, debit_account = $buyer,\n  credit_account = $seller, asset = \"USD\", amount_minor = $cents\n)",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Native typed-module CALL syntax and ledger posting are not implemented.",
+              "features": [
+                "native_modules"
+              ]
+            }
+          ]
+        }
+      ],
+      "inline_examples": [],
+      "expected_inline_count": 0
+    },
+    {
+      "alias": "sql",
+      "id": "e5dadca6-9f0f-409b-8184-94fb2ea6960c",
+      "revision": 2,
+      "title": "SQL, partition access, online schema changes and compatibility",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/e5dadca6-9f0f-409b-8184-94fb2ea6960c?revision=2",
+      "expected_fence_count": 1,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 11,
+          "closing_line": 27,
+          "section": "One logical data model",
+          "language": "",
+          "source": "CREATE TABLE messages (\n  channel_id BIGINT NOT NULL,\n  bucket INTEGER NOT NULL,\n  message_id BIGINT NOT NULL,\n  author_id BIGINT NOT NULL,\n  body TEXT NOT NULL,\n  edited_at TIMESTAMPTZ,\n  PRIMARY KEY (channel_id, bucket, message_id)\n);\n-- Proposed optional physical directive, independent of SQL query semantics\nALTER TABLE messages SET PARTITION KEY (channel_id, bucket);\n\nSELECT message_id, author_id, body FROM messages\n WHERE channel_id = $1 AND bucket = $2 AND message_id < $3\n ORDER BY message_id DESC LIMIT $4;\n",
+          "examples": [
+            {
+              "id": "sql-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 236,
+              "source": "CREATE TABLE messages (\n  channel_id BIGINT NOT NULL,\n  bucket INTEGER NOT NULL,\n  message_id BIGINT NOT NULL,\n  author_id BIGINT NOT NULL,\n  body TEXT NOT NULL,\n  edited_at TIMESTAMPTZ,\n  PRIMARY KEY (channel_id, bucket, message_id)\n);",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "TIMESTAMPTZ is outside the current SQL scalar type set; this full proposed CREATE TABLE is not accepted.",
+              "features": [
+                "sql_temporal_types"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "sql-fence01-example02",
+              "start_byte": 237,
+              "end_byte": 373,
+              "source": "-- Proposed optional physical directive, independent of SQL query semantics\nALTER TABLE messages SET PARTITION KEY (channel_id, bucket);",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "ALTER TABLE SET PARTITION KEY is a proposed physical directive, absent from the current SQL grammar.",
+              "features": [
+                "sql_partitioning"
+              ],
+              "prepare_error": "Unsupported"
+            },
+            {
+              "id": "sql-fence01-example03",
+              "start_byte": 375,
+              "end_byte": 518,
+              "source": "SELECT message_id, author_id, body FROM messages\n WHERE channel_id = $1 AND bucket = $2 AND message_id < $3\n ORDER BY message_id DESC LIMIT $4;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-supported",
+              "reason": "Bounded SQL SELECT with named columns, typed positional bindings when present, predicates, order and limit; exercised only through SqlSession.",
+              "features": [
+                "sql_read"
+              ],
+              "execution_fixture": "messages_v0",
+              "execution": {
+                "positional_bindings": [
+                  {
+                    "Int": 42
+                  },
+                  {
+                    "Int": 0
+                  },
+                  {
+                    "Int": 30
+                  },
+                  {
+                    "Int": 1
+                  }
+                ],
+                "columns": [
+                  "message_id",
+                  "author_id",
+                  "body"
+                ],
+                "rows": [
+                  [
+                    {
+                      "Int": 20
+                    },
+                    {
+                      "Int": 2
+                    },
+                    {
+                      "Text": "newer"
+                    }
+                  ]
+                ],
+                "expectation": "execute-supported",
+                "reason": "Bounded SQL SELECT executes against the explicit scalar-only messages fixture through SqlSession."
+              }
+            }
+          ]
+        }
+      ],
+      "inline_examples": [],
+      "expected_inline_count": 0
+    },
+    {
+      "alias": "postgresql",
+      "id": "da366690-816c-481e-93a0-f6563c096f0a",
+      "revision": 2,
+      "title": "PostgreSQL service compatibility — language design, migration matrix and acceptance criteria",
+      "revision_url": "https://app.archdocs.io/design-docs/81f3abec-f5f0-4909-9450-ed6767cb6916/supporting/da366690-816c-481e-93a0-f6563c096f0a?revision=2",
+      "expected_fence_count": 6,
+      "blocks": [
+        {
+          "ordinal": 1,
+          "opening_line": 9,
+          "closing_line": 15,
+          "section": "The workload that changed the design",
+          "language": "text",
+          "source": "insert many into delivery_archive (merchant_id, delivery_id, last_error)\nfrom (deliveries where merchant_id = $merchant and state = \"failed\"\n      select merchant_id, id, last_error)\nat most 1000\nonce $run_id for 24h\n",
+          "examples": [
+            {
+              "id": "postgresql-fence01-example01",
+              "start_byte": 0,
+              "end_byte": 216,
+              "source": "insert many into delivery_archive (merchant_id, delivery_id, last_error)\nfrom (deliveries where merchant_id = $merchant and state = \"failed\"\n      select merchant_id, id, last_error)\nat most 1000\nonce $run_id for 24h",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "INSERT FROM a read with a bulk cap and ONCE receipt is proposed; current native INSERT accepts SET values only.",
+              "features": [
+                "native_insert_from_read",
+                "native_receipts"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "opening_line": 19,
+          "closing_line": 24,
+          "section": "The workload that changed the design",
+          "language": "sql",
+          "source": "INSERT INTO delivery_archive (merchant_id, delivery_id, last_error)\nSELECT merchant_id, id, last_error\nFROM deliveries\nWHERE merchant_id = $1 AND state = 'failed';\n",
+          "examples": [
+            {
+              "id": "postgresql-fence02-example01",
+              "start_byte": 0,
+              "end_byte": 163,
+              "source": "INSERT INTO delivery_archive (merchant_id, delivery_id, last_error)\nSELECT merchant_id, id, last_error\nFROM deliveries\nWHERE merchant_id = $1 AND state = 'failed';",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "INSERT ... SELECT is not implemented; the current SQL INSERT accepts one VALUES tuple. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_insert_from_read"
+              ],
+              "prepare_error": "Syntax"
+            }
+          ]
+        },
+        {
+          "ordinal": 3,
+          "opening_line": 60,
+          "closing_line": 65,
+          "section": "Three examples that catch false equivalence",
+          "language": "text",
+          "source": "update many deliveries as d using merchant_settings as s\nwhere d.merchant_id = s.merchant_id and d.state = \"failed\"\nset lease_until = d.created_at + s.retry_delay\nat most 100\n",
+          "examples": [
+            {
+              "id": "postgresql-fence03-example01",
+              "start_byte": 0,
+              "end_byte": 174,
+              "source": "update many deliveries as d using merchant_settings as s\nwhere d.merchant_id = s.merchant_id and d.state = \"failed\"\nset lease_until = d.created_at + s.retry_delay\nat most 100",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Joined UPDATE USING, source aliases and expression assignments are not implemented.",
+              "features": [
+                "native_joined_writes"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 4,
+          "opening_line": 67,
+          "closing_line": 72,
+          "section": "Three examples that catch false equivalence",
+          "language": "sql",
+          "source": "UPDATE deliveries AS d\nSET lease_until = d.created_at + s.retry_delay\nFROM merchant_settings AS s\nWHERE d.merchant_id = s.merchant_id AND d.state = 'failed';\n",
+          "examples": [
+            {
+              "id": "postgresql-fence04-example01",
+              "start_byte": 0,
+              "end_byte": 157,
+              "source": "UPDATE deliveries AS d\nSET lease_until = d.created_at + s.retry_delay\nFROM merchant_settings AS s\nWHERE d.merchant_id = s.merchant_id AND d.state = 'failed';",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "UPDATE aliases/FROM and expression assignments are outside the bounded SQL point-write grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_joined_writes",
+                "sql_assignment_expressions"
+              ],
+              "prepare_error": "Unsupported"
+            }
+          ]
+        },
+        {
+          "ordinal": 5,
+          "opening_line": 78,
+          "closing_line": 85,
+          "section": "Three examples that catch false equivalence",
+          "language": "text",
+          "source": "(deliveries where state = \"failed\"\n select merchant_id, id, payload,\n        row_number() over (partition by merchant_id order by created_at desc, id desc) as pos) as r\nwhere r.pos <= 3\norder by r.merchant_id, r.pos\nselect r.merchant_id, r.id, r.payload\n",
+          "examples": [
+            {
+              "id": "postgresql-fence05-example01",
+              "start_byte": 0,
+              "end_byte": 253,
+              "source": "(deliveries where state = \"failed\"\n select merchant_id, id, payload,\n        row_number() over (partition by merchant_id order by created_at desc, id desc) as pos) as r\nwhere r.pos <= 3\norder by r.merchant_id, r.pos\nselect r.merchant_id, r.id, r.payload",
+              "interface": "native",
+              "kind": "statement",
+              "expectation": "parse-rejected",
+              "reason": "Derived sources and row_number OVER window expressions are not implemented by the native parser.",
+              "features": [
+                "native_nested_reads",
+                "native_windows"
+              ]
+            }
+          ]
+        },
+        {
+          "ordinal": 6,
+          "opening_line": 87,
+          "closing_line": 95,
+          "section": "Three examples that catch false equivalence",
+          "language": "sql",
+          "source": "SELECT merchant_id, id, payload FROM (\n  SELECT merchant_id, id, payload,\n         row_number() OVER (\n           PARTITION BY merchant_id ORDER BY created_at DESC, id DESC\n         ) AS pos\n  FROM deliveries WHERE state = 'failed'\n) AS r WHERE pos <= 3 ORDER BY merchant_id, pos;\n",
+          "examples": [
+            {
+              "id": "postgresql-fence06-example01",
+              "start_byte": 0,
+              "end_byte": 280,
+              "source": "SELECT merchant_id, id, payload FROM (\n  SELECT merchant_id, id, payload,\n         row_number() OVER (\n           PARTITION BY merchant_id ORDER BY created_at DESC, id DESC\n         ) AS pos\n  FROM deliveries WHERE state = 'failed'\n) AS r WHERE pos <= 3 ORDER BY merchant_id, pos;",
+              "interface": "sql",
+              "kind": "statement",
+              "expectation": "prepare-rejected",
+              "reason": "Nested derived tables and row_number OVER window expressions are outside the bounded SQL read grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "features": [
+                "sql_nested_reads",
+                "sql_windows"
+              ],
+              "prepare_error": "Syntax"
+            }
+          ]
+        }
+      ],
+      "inline_examples": [
+        {
+          "ordinal": 1,
+          "line": 74,
+          "section": "Three examples that catch false equivalence",
+          "source_line": "PostgreSQL warns that when a target joins to multiple source rows, which row supplies the update is unpredictable. GigglesDB reports ambiguous_source and aborts. To retire events, DELETE FROM deliveries AS d USING expired_events AS e WHERE d.merchant_id=e.merchant_id AND d.event_id=e.event_id corresponds to native delete many from deliveries as d using expired_events as e where … at most N. Multiple expiry records still identify one target. Check target-only outputs and tenant filters.",
+          "example": {
+            "id": "postgresql-inline01",
+            "start_byte": 180,
+            "end_byte": 293,
+            "source": "DELETE FROM deliveries AS d USING expired_events AS e WHERE d.merchant_id=e.merchant_id AND d.event_id=e.event_id",
+            "interface": "sql",
+            "kind": "statement",
+            "expectation": "prepare-rejected",
+            "reason": "deliveries is a reserved SQL catalog name; beyond that boundary, DELETE USING/target aliases are also outside the bounded SQL grammar.",
+            "features": [
+              "sql_reserved_catalog_names",
+              "sql_joined_writes"
+            ],
+            "prepare_error": "Reserved"
+          }
+        }
+      ],
+      "expected_inline_count": 1
+    }
+  ],
+  "execution_fixtures": [
+    {
+      "id": "deliveries_reserved_boundary",
+      "scope": "Rejection fixture for exact deliveries references. The reserved table is deliberately not created or renamed. An unrelated permitted table checks that failed native execution preserves data and versions.",
+      "setup_sql": [
+        "CREATE TABLE reference_probe (id BIGINT PRIMARY KEY, marker TEXT)",
+        "INSERT INTO reference_probe VALUES (1,'unchanged')"
+      ],
+      "denied_sql": [
+        {
+          "source": "CREATE TABLE deliveries (id BIGINT PRIMARY KEY)",
+          "error": "Reserved"
+        }
+      ]
+    },
+    {
+      "id": "messages_v0",
+      "scope": "Small trusted embedded SQL read fixture using supported scalar columns only. The source CREATE TABLE with TIMESTAMPTZ and the physical partition directive remain rejected and are not silently rewritten or advertised as supported.",
+      "setup_sql": [
+        "CREATE TABLE messages (channel_id BIGINT, bucket INTEGER, message_id BIGINT, author_id BIGINT, body TEXT, PRIMARY KEY (channel_id, bucket, message_id))",
+        "INSERT INTO messages VALUES (42,0,10,1,'earlier')",
+        "INSERT INTO messages VALUES (42,0,20,2,'newer')",
+        "INSERT INTO messages VALUES (42,1,15,9,'other bucket')",
+        "INSERT INTO messages VALUES (9,0,12,8,'other channel')"
+      ]
+    }
+  ]
+}
