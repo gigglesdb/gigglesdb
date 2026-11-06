@@ -531,17 +531,21 @@ fn discovery_incorrect_rows_cannot_pass() {
 #[test]
 fn discovery_untested_templates_prevent_support() {
     let mut c = capture();
-    c.stdout = format!(
-        "VERSION\t42.7.3\n{}{}{}{}{}{}{}",
-        record("dg_IsSuperUser", "PASS", "assertions satisfied"),
-        record("dg_ListDatabases", "PASS", "assertions satisfied"),
-        record("dg_ListSchemas", "PASS", "assertions satisfied"),
-        record("dg_ListExistentLanguages", "PASS", "assertions satisfied"),
-        record("dg_ListLanguages", "PASS", "assertions satisfied"),
-        record("dg_RetrieveEventTriggers", "PASS", "assertions satisfied"),
-        record("dg_remaining_templates", "UNTESTED", "templates pending")
-    )
-    .into_bytes();
+    c.stdout = b"VERSION\t42.7.3\n".to_vec();
+    for (name, _) in DISCOVERY_CASES {
+        c.stdout.extend(
+            record(
+                name,
+                if *name == "dg_remaining_templates" {
+                    "UNTESTED"
+                } else {
+                    "PASS"
+                },
+                "assertions satisfied",
+            )
+            .bytes(),
+        );
+    }
     assert_eq!(
         evaluate(
             "pgJDBC",
@@ -637,4 +641,141 @@ fn required_registries_have_unique_cases_and_preserve_main_contract() {
     ] {
         assert!(JDBC_CASES.iter().any(|(key, _)| *key == id));
     }
+}
+
+#[test]
+fn expanded_batch_sql_is_exact_and_every_case_is_required() {
+    use sha2::{Digest, Sha256};
+    let captured: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../probes/datagrip-2026.2.5/latest-expanded-queries.json"
+    ))
+    .unwrap();
+    assert_eq!(captured.len(), 14);
+    let java = include_str!("../probes/JdbcProbe.java");
+    for row in captured {
+        let sql = row["sql"].as_str().unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(sql.as_bytes())),
+            row["hash"].as_str().unwrap()
+        );
+        assert_eq!(row["sha_match_raw"], true);
+        let id = row["case"].as_str().unwrap();
+        assert!(
+            DISCOVERY_CASES.iter().any(|(name, _)| *name == id),
+            "unrequired captured case {id}"
+        );
+        assert!(
+            java.contains(&format!(
+                "batchQuery({},{},",
+                serde_json::to_string(id).unwrap(),
+                serde_json::to_string(sql).unwrap()
+            )),
+            "unexecuted/drifting captured SQL {id}"
+        );
+    }
+}
+#[test]
+fn unsupported_mvcc_never_becomes_client_support() {
+    let mut c = capture();
+    c.stdout = b"VERSION\t42.7.3\n".to_vec();
+    for (id, _) in DISCOVERY_CASES {
+        let unsupported = matches!(*id, "dg_StateNumber" | "dg_CurrentXid");
+        c.stdout.extend(
+            record(
+                id,
+                if unsupported { "UNTESTED" } else { "PASS" },
+                if unsupported {
+                    "UNSUPPORTED PostgreSQL MVCC; asserted SQLSTATE=0A000; rejection is not support"
+                } else {
+                    "assertions satisfied"
+                },
+            )
+            .bytes(),
+        );
+    }
+    let result = evaluate(
+        "pgJDBC",
+        "datagrip-discovery",
+        "42.7.3",
+        DISCOVERY_CASES,
+        &c,
+    );
+    assert_eq!(result.verdict, Status::Untested);
+    assert!(result.integrity.is_empty());
+    assert_eq!(
+        result
+            .cases
+            .iter()
+            .filter(|c| c.status == Status::Untested)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn installed_app_templates_and_fixture_contract_are_independently_pinned() {
+    use sha2::{Digest, Sha256};
+    let resource = include_str!("../probes/datagrip-2026.2.5/PgIntroQueries.sql");
+    let java = include_str!("../probes/JdbcProbe.java");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../probes/datagrip-2026.2.5/app-expanded-queries.json"
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 7);
+    for row in rows {
+        let name = row["name"].as_str().unwrap();
+        let template = row["template"].as_str().unwrap();
+        let sql = row["sql"].as_str().unwrap();
+        let marker = format!("---- {name} ----");
+        let installed = resource
+            .split_once(&marker)
+            .unwrap()
+            .1
+            .split("----")
+            .next()
+            .unwrap()
+            .trim();
+        assert_eq!(
+            installed,
+            template.trim(),
+            "installed source template drift: {name}"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(template.as_bytes())),
+            row["template_sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(sql.as_bytes())),
+            row["expanded_sha256"].as_str().unwrap()
+        );
+        assert!(!sql.contains('#'), "unexpanded template macro");
+        assert!(
+            sql.contains(":schema_id::oid"),
+            "schema OID must be discovered at runtime"
+        );
+        let id = row["case"].as_str().unwrap();
+        assert!(DISCOVERY_CASES.iter().any(|(required, _)| *required == id));
+        assert!(
+            java.contains(&format!(
+                "appQuery({},{},",
+                serde_json::to_string(id).unwrap(),
+                serde_json::to_string(sql).unwrap()
+            )),
+            "unexecuted app template {name}"
+        );
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../probes/datagrip-2026.2.5/fixture-contract.json"
+    ))
+    .unwrap();
+    let names: Vec<_> = fixture["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["id", "body", "flag", "small", "num", "data"]);
+    assert_eq!(fixture["primary_key"], serde_json::json!(["id"]));
+    assert_eq!(fixture["hidden_table"], "other");
+    assert!(java.contains("hidden other catalog disclosed"));
 }

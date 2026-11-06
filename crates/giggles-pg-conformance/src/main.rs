@@ -147,6 +147,18 @@ async fn matrix(m: &Manifest, output: &Path, report: &mut Report) -> Result<(), 
             "datagrip-inventory.json",
             include_bytes!("../probes/datagrip-2026.2.5/inventory.json").as_slice(),
         ),
+        (
+            "datagrip-latest-expanded-queries.json",
+            include_bytes!("../probes/datagrip-2026.2.5/latest-expanded-queries.json").as_slice(),
+        ),
+        (
+            "datagrip-fixture-contract.json",
+            include_bytes!("../probes/datagrip-2026.2.5/fixture-contract.json").as_slice(),
+        ),
+        (
+            "datagrip-app-expanded-queries.json",
+            include_bytes!("../probes/datagrip-2026.2.5/app-expanded-queries.json").as_slice(),
+        ),
     ] {
         let path = output.join(name);
         std::fs::write(&path, bytes)?;

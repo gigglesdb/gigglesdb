@@ -1,0 +1,176 @@
+[
+  {
+    "hash": "47f8353fef2e3865283ddb6d687f385ec78425bd332ef823c371daa23298ac6c",
+    "phase": "parse",
+    "sql": "show DateStyle",
+    "sha256": "47f8353fef2e3865283ddb6d687f385ec78425bd332ef823c371daa23298ac6c",
+    "sha_match_raw": true,
+    "template_candidates": [],
+    "family": "DateStyle",
+    "expected_facts_and_limitations": "One text DateStyle setting matching actual supported date/time formatting; parser rejected SHOW before catalog planning.",
+    "case": "dg_Batch_DateStyle"
+  },
+  {
+    "hash": "44c936363ae39ed03eec8fa839c78c755f5fa810884853149000db0fa6713374",
+    "phase": "catalog planning",
+    "sql": "select name, is_dst from pg_catalog.pg_timezone_names\nunion distinct\nselect abbrev as name, is_dst from pg_catalog.pg_timezone_abbrevs",
+    "sha256": "44c936363ae39ed03eec8fa839c78c755f5fa810884853149000db0fa6713374",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveTimeZones"
+    ],
+    "family": "RetrieveTimeZones",
+    "expected_facts_and_limitations": "Distinct name/is_dst pairs from implemented timezone facts; avoid claiming unsupported IANA or DST behavior.",
+    "case": "dg_Batch_RetrieveTimeZones"
+  },
+  {
+    "hash": "d2c91bcaf2b389a2b23b65162cf63f789c1d0f781609c7c9d943dea2bf0dcd8b",
+    "phase": "catalog planning",
+    "sql": "select R.oid::bigint as role_id, rolname as role_name,\n  rolsuper is_super, rolinherit is_inherit,\n  rolcreaterole can_createrole, rolcreatedb can_createdb,\n  rolcanlogin can_login, rolreplication /* false */ is_replication,\n  rolconnlimit conn_limit, rolvaliduntil valid_until,\n  rolbypassrls /* false */ bypass_rls, rolconfig config,\n  D.description\nfrom pg_catalog.pg_roles R\n  left join pg_catalog.pg_shdescription D on D.objoid = R.oid",
+    "sha256": "d2c91bcaf2b389a2b23b65162cf63f789c1d0f781609c7c9d943dea2bf0dcd8b",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveRoles"
+    ],
+    "family": "RetrieveRoles",
+    "expected_facts_and_limitations": "Actual role capabilities/config/expiry/comment; no invented superuser flags.",
+    "case": "dg_Batch_RetrieveRoles"
+  },
+  {
+    "hash": "6cc3b48585aa59fbb9c42ec1b39f91f12983942525c106979df4b27823f4ec46",
+    "phase": "catalog planning",
+    "sql": "select member id, roleid role_id, admin_option\n          from pg_catalog.pg_auth_members order by id, roleid::text",
+    "sha256": "6cc3b48585aa59fbb9c42ec1b39f91f12983942525c106979df4b27823f4ec46",
+    "sha_match_raw": true,
+    "template_candidates": [],
+    "family": "role memberships",
+    "expected_facts_and_limitations": "Actual member/role/admin-option edges; empty only when no granted membership exists.",
+    "case": "dg_Batch_RetrieveRoleGrants"
+  },
+  {
+    "hash": "cf7eb19af49c41106336c99bda52cb1db41b71038a6c312aceb767fbf895c146",
+    "phase": "catalog planning",
+    "sql": "select T.oid::bigint as id, T.spcname as name,\n       T.xmin as state_number, pg_catalog.pg_get_userbyid(T.spcowner) as owner,\n       pg_catalog.pg_tablespace_location(T.oid) /* null */ as location,\n       T.spcoptions /* null */ as options,\n       D.description as comment\nfrom pg_catalog.pg_tablespace T\n  left join pg_catalog.pg_shdescription D on D.objoid = T.oid\n--  where pg_catalog.age(T.xmin) <= #TXAGE",
+    "sha256": "cf7eb19af49c41106336c99bda52cb1db41b71038a6c312aceb767fbf895c146",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveTablespaces"
+    ],
+    "family": "RetrieveTablespaces",
+    "expected_facts_and_limitations": "Real tablespace identities/owner/location/options/comment and explicitly defined state_number policy.",
+    "case": "dg_Batch_RetrieveTablespaces"
+  },
+  {
+    "hash": "1da2fa93dc01a18907929a1c0b30133fcc02af9d9da7864fffd6fb05323f2075",
+    "phase": "catalog planning",
+    "sql": "select T.oid as object_id,\n                 T.spcacl as acl\n          from pg_catalog.pg_tablespace T \n          union all\n          select T.oid as object_id,\n                 T.datacl as acl\n          from pg_catalog.pg_database T ",
+    "sha256": "1da2fa93dc01a18907929a1c0b30133fcc02af9d9da7864fffd6fb05323f2075",
+    "sha_match_raw": true,
+    "template_candidates": [],
+    "family": "shared ACLs",
+    "expected_facts_and_limitations": "Tablespace and database ACL values, preserving SQL UNION ALL and null ACL semantics.",
+    "case": "dg_Batch_DatabaseTablespaceACL"
+  },
+  {
+    "hash": "a87f59249c2d1e16b08e7a20f7b36d0ed23cb883f5ce27bda98de077ca27a871",
+    "phase": "catalog planning",
+    "sql": "select fdw.oid as id,\n       fdw.xmin as state_number,\n       fdw.fdwname as name,\n       pr.proname as handler,\n       nspc.nspname as handler_schema,\n       pr2.proname as validator,\n       nspc2.nspname as validator_schema,\n       fdw.fdwoptions as options,\n       pg_catalog.pg_get_userbyid(fdw.fdwowner) as \"owner\"\nfrom pg_catalog.pg_foreign_data_wrapper fdw\n     left outer join pg_catalog.pg_proc pr on fdw.fdwhandler = pr.oid\n     left outer join pg_catalog.pg_namespace nspc on pr.pronamespace = nspc.oid\n     left outer join pg_catalog.pg_proc pr2 on fdw.fdwvalidator = pr2.oid\n     left outer join pg_catalog.pg_namespace nspc2 on pr2.pronamespace = nspc2.oid\n--  where pg_catalog.age(fdw.xmin) <= #TXAGE",
+    "sha256": "a87f59249c2d1e16b08e7a20f7b36d0ed23cb883f5ce27bda98de077ca27a871",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveForeignDataWrappers"
+    ],
+    "family": "RetrieveForeignDataWrappers",
+    "expected_facts_and_limitations": "Actual installed wrappers and handlers/validators/options/owners. Empty when unsupported feature has no installed objects; state_number remains MVCC question.",
+    "case": "dg_Batch_RetrieveForeignDataWrappers"
+  },
+  {
+    "hash": "fc31e7569a27d20d68ad56168aa007001b6e54e843cb55098bcaa6a2fe074a7e",
+    "phase": "catalog planning",
+    "sql": "select srv.oid as id,\n       srv.srvfdw as fdw_id,\n       srv.xmin as state_number,\n       srv.srvname as name,\n       srv.srvtype as type,\n       srv.srvversion as version,\n       srv.srvoptions as options,\n       pg_catalog.pg_get_userbyid(srv.srvowner) as \"owner\"\nfrom pg_catalog.pg_foreign_server srv\n--  where pg_catalog.age(srv.xmin) <= #TXAGE",
+    "sha256": "fc31e7569a27d20d68ad56168aa007001b6e54e843cb55098bcaa6a2fe074a7e",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveForeignServers"
+    ],
+    "family": "RetrieveForeignServers",
+    "expected_facts_and_limitations": "Actual foreign servers, wrapper linkage/options/owner. Empty if none; state_number policy required.",
+    "case": "dg_Batch_RetrieveForeignServers"
+  },
+  {
+    "hash": "5b3890fbf57a18342911cebae67bc118f263150293407ab19588bc8349749f14",
+    "phase": "catalog planning",
+    "sql": "select umid as id,\n       srvid as server_id,\n       usename as user,\n       umoptions as options\nfrom pg_catalog.pg_user_mappings\norder by server_id",
+    "sha256": "5b3890fbf57a18342911cebae67bc118f263150293407ab19588bc8349749f14",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveUserMappings"
+    ],
+    "family": "RetrieveUserMappings",
+    "expected_facts_and_limitations": "Actual mappings with visibility-respecting options. Empty if none.",
+    "case": "dg_Batch_RetrieveUserMappings"
+  },
+  {
+    "hash": "adacca7f2fe622ace6dfabd37a6fcd12a0f7c7f0d9937b055dc842e5fa116b42",
+    "phase": "catalog planning",
+    "sql": "select A.oid as access_method_id,\n       A.xmin as state_number,\n       A.amname as access_method_name\n       ,\n       A.amhandler::oid as handler_id,\n       pg_catalog.quote_ident(N.nspname) || '.' || pg_catalog.quote_ident(P.proname) as handler_name,\n       A.amtype as access_method_type\n       \nfrom pg_am A\n     join pg_proc P on A.amhandler::oid = P.oid\n     join pg_namespace N on P.pronamespace = N.oid\n     \n--  where pg_catalog.age(A.xmin) <= #TXAGE",
+    "sha256": "adacca7f2fe622ace6dfabd37a6fcd12a0f7c7f0d9937b055dc842e5fa116b42",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveAccessMethods"
+    ],
+    "family": "RetrieveAccessMethods",
+    "expected_facts_and_limitations": "Only access methods truly implemented; handler links and quoted qualified names. xmin policy required; logged request rejection.",
+    "case": "dg_Batch_RetrieveAccessMethods"
+  },
+  {
+    "hash": "1cc79daf5adbec3ec155609c45ac43c50a803aae9845bb42f375556d38ad2c63",
+    "phase": "catalog planning",
+    "sql": "select E.oid        as id,\n       E.xmin       as state_number,\n       extname      as name,\n       extversion   as version,\n       extnamespace as schema_id,\n       nspname      as schema_name\n       ,\n       array(select unnest\n             from unnest(available_versions)\n             where unnest > extversion) as available_updates\n       \nfrom pg_catalog.pg_extension E\n       join pg_namespace N on E.extnamespace = N.oid\n       left join (select name, array_agg(version) as available_versions\n                  from pg_available_extension_versions()\n                  group by name) V on E.extname = V.name\n       \n--  where pg_catalog.age(E.xmin) <= #TXAGE",
+    "sha256": "1cc79daf5adbec3ec155609c45ac43c50a803aae9845bb42f375556d38ad2c63",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveExtensions"
+    ],
+    "family": "RetrieveExtensions",
+    "expected_facts_and_limitations": "Only installed extensions, namespace/version plus available updates. Array subquery/unnest and grouped available versions are actual query semantics; xmin policy required.",
+    "case": "dg_Batch_RetrieveExtensions"
+  },
+  {
+    "hash": "29995a6946a247183c1f8390709217bed2ea9875b1c289c85e991a9096f54109",
+    "phase": "catalog planning",
+    "sql": "select T.oid as object_id,\n                 T.fdwacl as acl\n          from pg_catalog.pg_foreign_data_wrapper T \n          union all\n          select T.oid as object_id,\n                 T.lanacl as acl\n          from pg_catalog.pg_language T \n          union all\n          select T.oid as object_id,\n                 T.nspacl as acl\n          from pg_catalog.pg_namespace T \n          union all\n          select T.oid as object_id,\n                 T.srvacl as acl\n          from pg_catalog.pg_foreign_server T \n          ",
+    "sha256": "29995a6946a247183c1f8390709217bed2ea9875b1c289c85e991a9096f54109",
+    "sha_match_raw": true,
+    "template_candidates": [],
+    "family": "catalog ACLs",
+    "expected_facts_and_limitations": "Actual FDW/language/namespace/server ACL values with UNION ALL preserving rows.",
+    "case": "dg_Batch_SchemaForeignACL"
+  },
+  {
+    "hash": "e27b41ad59786a076cecfc4e396d0a69d68ce6aa3da45a4e9496458746210d61",
+    "phase": "catalog planning",
+    "sql": "select C.oid,\n       C.xmin as state_number,\n       C.castsource as castsource_id,\n       pg_catalog.quote_ident(SN.nspname) || '.' || pg_catalog.quote_ident(S.typname) as castsource_name,\n       C.casttarget as casttarget_id,\n       pg_catalog.quote_ident(TN.nspname) || '.' || pg_catalog.quote_ident(T.typname) as casttarget_name,\n       C.castfunc as castfunc_id,\n       pg_catalog.quote_ident(FN.nspname) || '.' || pg_catalog.quote_ident(F.proname) as castfunc_name,\n       C.castcontext,\n       C.castmethod\nfrom pg_cast C\n     left outer join pg_proc F on C.castfunc::oid = F.oid\n     left outer join pg_namespace FN on F.pronamespace = FN.oid\n     join pg_type S on C.castsource::oid = S.oid\n     join pg_namespace SN on S.typnamespace = SN.oid\n     join pg_type T on C.casttarget::oid = T.oid\n     join pg_namespace TN on T.typnamespace = TN.oid\n--  where pg_catalog.age(C.xmin) <= #TXAGE",
+    "sha256": "e27b41ad59786a076cecfc4e396d0a69d68ce6aa3da45a4e9496458746210d61",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "ListCasts"
+    ],
+    "family": "ListCasts",
+    "expected_facts_and_limitations": "Only implemented cast routes with real source/target/function identities, context/method; xmin policy required.",
+    "case": "dg_Batch_ListCasts"
+  },
+  {
+    "hash": "0776efd8392dd1c5c28bab74fbdd7dd5dc417d4a4fd9962e508b4fdb4d8b7a56",
+    "phase": "application prepare",
+    "sql": "select E.oid   as extension_id,\n       D.objid as member_id\nfrom pg_extension E\n     join pg_depend D on E.oid = D.refobjid and\n                         D.refclassid = 'pg_extension'::regclass::oid\nwhere D.deptype = 'e'\norder by extension_id",
+    "sha256": "0776efd8392dd1c5c28bab74fbdd7dd5dc417d4a4fd9962e508b4fdb4d8b7a56",
+    "sha_match_raw": true,
+    "template_candidates": [
+      "RetrieveExtensionMembers"
+    ],
+    "family": "RetrieveExtensionMembers",
+    "expected_facts_and_limitations": "Actual extension dependency membership; regclass relation-OID conversion and join filters must be respected.",
+    "case": "dg_Batch_RetrieveExtensionMembers"
+  }
+]

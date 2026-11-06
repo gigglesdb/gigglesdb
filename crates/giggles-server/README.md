@@ -131,7 +131,9 @@ Startup rejection messages distinguish an incorrect/missing user or database
 (`28000`), unsupported startup fields or encoding (`0A000`), and malformed startup
 packets (`08P01`). The console writes fixed rejection reasons to stderr, plus
 transport stages for SSL negotiation, TLS handshake, certificate binding, and
-wire I/O errors. PostgreSQL query rejections include their SQLSTATE. Diagnostics
+wire I/O errors. PostgreSQL query rejections include SQLSTATE, a static phase,
+and a SHA256 fingerprint of the exact SQL bytes. Prepared execution retains the
+original query fingerprint; each new message resets its diagnostic context. Diagnostics
 never include submitted startup values, SQL, certificate bytes, or key material.
 After updating the binary, restart the server to get these diagnostics.
 

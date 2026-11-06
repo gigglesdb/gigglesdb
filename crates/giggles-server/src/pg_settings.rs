@@ -4,10 +4,20 @@ pub(crate) enum Setting {
     ApplicationName(String),
     ExtraFloatDigits(i32),
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub application_name: String,
     pub extra_float_digits: i32,
+    pub timezone: String,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            application_name: String::new(),
+            extra_float_digits: 0,
+            timezone: "UTC".into(),
+        }
+    }
 }
 impl Settings {
     pub fn apply(&mut self, setting: &Setting) {
@@ -48,6 +58,8 @@ pub(crate) enum Show {
     ClientEncoding,
     ServerVersion,
     StandardConformingStrings,
+    DateStyle,
+    TimeZone,
 }
 impl Show {
     pub fn value(self, settings: &Settings) -> (&'static str, String) {
@@ -61,6 +73,8 @@ impl Show {
             Self::SearchPath => ("search_path", "public".into()),
             Self::ClientEncoding => ("client_encoding", "UTF8".into()),
             Self::ServerVersion => ("server_version", "14.0".into()),
+            Self::DateStyle => ("DateStyle", "ISO".into()),
+            Self::TimeZone => ("TimeZone", settings.timezone.clone()),
             Self::StandardConformingStrings => ("standard_conforming_strings", "on".into()),
         };
         (name, value)
@@ -84,6 +98,8 @@ pub(crate) fn show(sql: &str) -> Result<Option<Show>> {
             }
             Show::TransactionIsolation
         }
+        "datestyle" => Show::DateStyle,
+        "timezone" => Show::TimeZone,
         "search_path" => Show::SearchPath,
         "client_encoding" => Show::ClientEncoding,
         "server_version" => Show::ServerVersion,
@@ -279,6 +295,26 @@ mod tests {
             Show::TransactionIsolation.value(&Settings::default()).1,
             "serializable"
         );
+    }
+    #[test]
+    fn presentation_inspection_matches_negotiated_values_and_rejects_suffixes() {
+        assert_eq!(show("show DateStyle"), Ok(Some(Show::DateStyle)));
+        assert_eq!(show("SHOW timezone;"), Ok(Some(Show::TimeZone)));
+        let mut settings = Settings::default();
+        assert_eq!(
+            Show::DateStyle.value(&settings),
+            ("DateStyle", "ISO".into())
+        );
+        assert_eq!(Show::TimeZone.value(&settings).1, "UTC");
+        settings.timezone = "America/Chicago".into();
+        assert_eq!(Show::TimeZone.value(&settings).1, "America/Chicago");
+        for sql in [
+            "SHOW DateStyle; DELETE FROM app",
+            "SHOW TimeZone FROM secret",
+        ] {
+            assert_eq!(show(sql), Err("42601"));
+        }
+        assert_eq!(parse("SET DateStyle='SQL'"), Err("0A000"));
     }
     #[test]
     fn empty_sql_scanner_never_hides_effectful_suffixes() {

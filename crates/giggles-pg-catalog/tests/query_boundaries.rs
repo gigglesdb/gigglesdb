@@ -55,3 +55,80 @@ fn unsupported_distinct_on_is_not_silently_treated_as_full_row_distinct() {
         Err(Error::Unsupported)
     ));
 }
+
+#[test]
+fn detected_identity_and_startup_are_truthful_and_execution_scoped() {
+    use giggles_pg_catalog::{PgType, Value, execute_with_startup};
+    let snapshot = CatalogSnapshot::default();
+    for sql in [
+        "select version()",
+        "SELECT pg_catalog.version() AS identity",
+    ] {
+        let p = plan(sql).unwrap().unwrap();
+        let r = execute(&p, &snapshot, &[]).unwrap();
+        assert_eq!(r.fields[0].data_type, PgType::Text);
+        let Value::Text(v) = &r.rows[0][0] else {
+            panic!()
+        };
+        assert!(v.starts_with("GigglesDB "));
+    }
+    let sql = "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time";
+    let p = plan(sql).unwrap().unwrap();
+    assert_eq!(execute(&p, &snapshot, &[]), Err(Error::Unsupported));
+    for start in [123, 456] {
+        let r = execute_with_startup(&p, &snapshot, &[], Some(start)).unwrap();
+        assert_eq!(r.fields[0].data_type, PgType::Int8);
+        assert_eq!(r.rows, vec![vec![Value::Int(start)]]);
+    }
+    assert_eq!(
+        execute_with_startup(&p, &snapshot, &[], Some(-1)),
+        Err(Error::Unsupported)
+    );
+    for sql in [
+        "select version(1)",
+        "select pg_postmaster_start_time()",
+        "select round(extract(epoch from pg_postmaster_start_time() at time zone 'PST'))",
+        "select txid_current()",
+    ] {
+        assert!(plan(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn jdbc_secondary_type_lookup_reports_xid_and_array_identity() {
+    use giggles_pg_catalog::Value;
+    let p = plan(include_str!("fixtures/jdbc-column-type-lookup.sql"))
+        .unwrap()
+        .unwrap();
+    for (oid, name, array) in [
+        (28, "xid", false),
+        (23, "int4", false),
+        (1007, "_int4", true),
+    ] {
+        let r = execute(&p, &CatalogSnapshot::default(), &[Value::Int(oid)]).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Value::Bool(array));
+        assert_eq!(r.rows[0][2], Value::Text(name.into()));
+    }
+}
+
+#[test]
+fn numeric_wire_override_cannot_change_projected_parameter_types() {
+    for sql in [
+        "select $1",
+        "select $1::int8",
+        "select x from (select $1 as x from pg_type) t",
+        "select coalesce($1, 1)",
+    ] {
+        assert!(
+            !plan(sql).unwrap().unwrap().allows_numeric_input_override(),
+            "{sql}"
+        );
+    }
+    assert!(
+        plan("select oid from pg_type where oid=$1")
+            .unwrap()
+            .unwrap()
+            .allows_numeric_input_override()
+    );
+}

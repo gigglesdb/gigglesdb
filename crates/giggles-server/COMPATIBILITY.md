@@ -30,6 +30,22 @@ only for explicitly modeled absent features, such as procedural languages and
 event triggers. See [catalog query limits](../giggles-pg-catalog/README.md). See [the driver conformance runner](../giggles-pg-conformance/README.md)
 for reproducible per-case results, including failed and untested cases.
 
+Captured DataGrip discovery includes role/member/ACL and absent-feature catalogs,
+plus actual table, column, primary-key constraint and index definitions. `SHOW
+DateStyle` reports ISO; `SHOW TimeZone` reports the accepted startup presentation
+label. Those labels do not add timestamp or timezone-conversion support. The
+startup-time expression returns the hosting service initialization epoch, and
+`version()` identifies GigglesDB. PostgreSQL transaction-age/MVCC probes remain
+explicitly unsupported; the observed optional StateNumber probe is ignored by
+DataGrip. No synthetic transaction ID or lock-state marker is returned.
+
+Catalog integer/OID parameter wire widths may differ only when no SELECT
+projection contains parameters, including nested/UNION/CTE projections. Decoding
+uses the declared width; the engine checks inferred-type ranges. Projected
+parameters retain exact type agreement. Catalog vectors preserve zero-based
+indexing and their actual wire OIDs; empty internal `"char"` values are distinct
+from SQL NULL.
+
 Stock pgJDBC cancellation sends plaintext CancelRequest and cannot cancel this
 server's authenticated mTLS session. Do not rely on JDBC query timeout as proof
 that a write stopped. The pinned Rust driver's TLS cancel transport is tested.

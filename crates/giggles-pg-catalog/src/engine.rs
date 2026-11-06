@@ -1,7 +1,13 @@
 use crate::{catalog, *};
 use a::{BinaryOperator as Op, Expr as A};
 use sqlparser::ast::{Visit, Visitor};
-use sqlparser::{ast as a, dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::{
+    ast as a,
+    dialect::PostgreSqlDialect,
+    keywords::Keyword,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer},
+};
 use std::{collections::BTreeMap, ops::ControlFlow};
 
 #[derive(Debug, Clone)]
@@ -9,8 +15,14 @@ pub struct Plan {
     query: Query,
     parameters: usize,
     parameter_types: Vec<PgType>,
+    projection_parameters: bool,
 }
 impl Plan {
+    /// Conservative wire widening is safe only when no SELECT projection
+    /// (including a derived query) contains a parameter expression.
+    pub fn allows_numeric_input_override(&self) -> bool {
+        !self.projection_parameters
+    }
     pub fn parameter_count(&self) -> usize {
         self.parameters
     }
@@ -43,6 +55,7 @@ enum K {
     Cast(Box<E>, PgType),
     Regclass(Box<E>),
     Regproc(Box<E>),
+    Regoper(Box<E>),
     Case(Option<Box<E>>, Vec<(E, E)>, Box<E>),
     Call(String, Vec<E>),
     Array(Vec<E>),
@@ -51,6 +64,8 @@ enum K {
     Any(Box<E>, Op, Box<E>),
     In(Box<E>, Vec<E>, bool),
     Subquery(Box<Query>),
+    ArrayQuery(Box<Query>),
+    ArrayAgg(Box<E>, Vec<Order>),
     RowNumber(Vec<E>, Vec<Order>),
     Expand(Box<E>),
 }
@@ -64,10 +79,14 @@ struct Order {
 #[derive(Debug, Clone, PartialEq)]
 enum Source {
     Unit,
+    Empty,
     Catalog(String),
-    Derived(Box<Query>),
+    Derived(std::sync::Arc<Query>),
+    Union(Box<Query>, Box<Query>, bool),
     Series(E, E),
-    Join(Box<Source>, Box<Source>, E, bool, usize),
+    Unnest(E, bool),
+    Scalar(E),
+    Join(Box<Source>, Box<Source>, E, bool, usize, bool),
 }
 #[derive(Debug, Clone, PartialEq)]
 struct Query {
@@ -80,11 +99,14 @@ struct Query {
     distinct: bool,
     expand: Option<E>,
     source_width: usize,
+    group: Vec<E>,
+    aggregate: bool,
 }
 struct Compiler {
     parameters: usize,
     qcount: usize,
     sources: usize,
+    ctes: BTreeMap<String, std::sync::Arc<Query>>,
 }
 fn ident(i: &a::Ident) -> String {
     if i.quote_style.is_some() {
@@ -149,10 +171,46 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     if sql.len() > MAX_SQL {
         return Err(Error::Limit);
     }
+    // sqlparser's recursion guard does not bound left-associative ASTs:
+    // rejecting a deep tree after parsing can still overflow during Drop.
+    // Tokenize first (flat storage), then bound tokens that can construct AST
+    // layers before allowing the parser to allocate any recursive structure.
+    // Strings/comments/quoted identifiers are tokens, never scanned as SQL.
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize()
+        .map_err(|_| Error::Syntax)?;
+    let mut count = 0usize;
+    let mut constructors = 0usize;
+    for token in &tokens {
+        if matches!(token, Token::Whitespace(_) | Token::EOF) {
+            continue;
+        }
+        count += 1;
+        let leaf = matches!(token,Token::Word(w) if w.keyword==Keyword::NoKeyword)
+            || matches!(
+                token,
+                Token::Number(..)
+                    | Token::SingleQuotedString(_)
+                    | Token::DoubleQuotedString(_)
+                    | Token::DollarQuotedString(_)
+                    | Token::EscapedStringLiteral(_)
+                    | Token::NationalStringLiteral(_)
+                    | Token::HexStringLiteral(_)
+                    | Token::Placeholder(_)
+                    | Token::Comma
+                    | Token::RParen
+                    | Token::RBracket
+            );
+        if !leaf {
+            constructors += 1;
+        }
+        if count > 8192 || constructors > 256 {
+            return Err(Error::Limit);
+        }
+    }
     let statements = Parser::new(&PostgreSqlDialect {})
         .with_recursion_limit(64)
-        .try_with_sql(sql)
-        .map_err(|_| Error::Syntax)?
+        .with_tokens(tokens)
         .parse_statements()
         .map_err(|_| Error::Syntax)?;
     if statements.is_empty() {
@@ -164,9 +222,21 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
         nodes: usize,
         depth: usize,
         mutation: bool,
+        ctes: std::collections::BTreeSet<String>,
     }
     impl Visitor for Scan {
         type Break = Error;
+        fn pre_visit_query(&mut self, q: &a::Query) -> ControlFlow<Error> {
+            if let Some(with) = &q.with {
+                if with.recursive {
+                    return ControlFlow::Break(Error::Unsupported);
+                }
+                for cte in &with.cte_tables {
+                    self.ctes.insert(ident(&cte.alias.name));
+                }
+            }
+            ControlFlow::Continue(())
+        }
         fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
             let p = object(n);
             let is_catalog = match p.as_slice() {
@@ -176,7 +246,8 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
             };
             if is_catalog {
                 self.catalog = true
-            } else if !matches!(p.as_slice(),[n] if n=="generate_series") {
+            } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="unnest" || n=="pg_available_extension_versions" || self.ctes.contains(n))
+            {
                 self.user = true
             }
             ControlFlow::Continue(())
@@ -229,6 +300,7 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
         nodes: 0,
         depth: 0,
         mutation: false,
+        ctes: Default::default(),
     };
     if let ControlFlow::Break(e) = statements.visit(&mut scan) {
         return Err(e);
@@ -245,10 +317,45 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     let a::Statement::Query(q) = &statements[0] else {
         return Err(Error::Mutation);
     };
+    struct ProjectionParameters(bool);
+    impl Visitor for ProjectionParameters {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &a::Query) -> ControlFlow<()> {
+            fn body(body: &a::SetExpr) -> bool {
+                if let a::SetExpr::Select(s) = body {
+                    struct Parameter(bool);
+                    impl Visitor for Parameter {
+                        type Break = ();
+                        fn pre_visit_expr(&mut self, e: &A) -> ControlFlow<()> {
+                            if matches!(e, A::Value(a::Value::Placeholder(_))) {
+                                self.0 = true;
+                            }
+                            ControlFlow::Continue(())
+                        }
+                    }
+                    let mut p = Parameter(false);
+                    let _ = s.projection.visit(&mut p);
+                    return p.0;
+                }
+                if let a::SetExpr::SetOperation { left, right, .. } = body {
+                    return body_projection(left) || body_projection(right);
+                }
+                false
+            }
+            fn body_projection(expr: &a::SetExpr) -> bool {
+                body(expr)
+            }
+            self.0 |= body(&q.body);
+            ControlFlow::Continue(())
+        }
+    }
+    let mut projection_parameters = ProjectionParameters(false);
+    let _ = q.visit(&mut projection_parameters);
     let mut c = Compiler {
         parameters: 0,
         qcount: 0,
         sources: 0,
+        ctes: BTreeMap::new(),
     };
     let query = c.query(q, &vec![])?;
     if query.fields.iter().any(|f| f.data_type == PgType::Record) {
@@ -257,6 +364,7 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     let mut types = vec![None; c.parameters];
     collect_parameters(&query, &mut types)?;
     Ok(Some(Plan {
+        projection_parameters: projection_parameters.0,
         query,
         parameters: c.parameters,
         parameter_types: types
@@ -269,6 +377,16 @@ pub fn describe(plan: &Plan) -> R<Vec<Field>> {
     Ok(plan.query.fields.clone())
 }
 pub fn execute(plan: &Plan, snapshot: &CatalogSnapshot, parameters: &[Value]) -> R<ResultSet> {
+    execute_with_startup(plan, snapshot, parameters, None)
+}
+/// Execute with the hosting service's actual initialization epoch (seconds).
+/// Without a supplied timestamp, startup introspection fails explicitly.
+pub fn execute_with_startup(
+    plan: &Plan,
+    snapshot: &CatalogSnapshot,
+    parameters: &[Value],
+    startup: Option<i64>,
+) -> R<ResultSet> {
     if parameters.len() != plan.parameters {
         return Err(Error::Parameters);
     }
@@ -283,6 +401,7 @@ pub fn execute(plan: &Plan, snapshot: &CatalogSnapshot, parameters: &[Value]) ->
     let catalogs = catalog::build(snapshot)?;
     let mut rt = Runtime {
         catalogs: &catalogs,
+        startup,
         parameters: &parameters,
         work: 0,
     };
@@ -294,12 +413,17 @@ pub fn execute(plan: &Plan, snapshot: &CatalogSnapshot, parameters: &[Value]) ->
 }
 impl Compiler {
     fn query(&mut self, q: &a::Query, outer: &Schema) -> R<Query> {
+        let previous = self.ctes.clone();
+        let result = self.query_scoped(q, outer);
+        self.ctes = previous;
+        result
+    }
+    fn query_scoped(&mut self, q: &a::Query, outer: &Schema) -> R<Query> {
         self.qcount += 1;
         if self.qcount > 32 {
             return Err(Error::Limit);
         }
-        if q.with.is_some()
-            || q.fetch.is_some()
+        if q.fetch.is_some()
             || !q.locks.is_empty()
             || q.offset.is_some()
             || !q.limit_by.is_empty()
@@ -308,6 +432,121 @@ impl Compiler {
             || q.format_clause.is_some()
         {
             return Err(Error::Unsupported);
+        }
+        if let Some(with) = &q.with {
+            if with.recursive {
+                return Err(Error::Unsupported);
+            }
+            for cte in &with.cte_tables {
+                if !cte.alias.columns.is_empty() || cte.from.is_some() || cte.materialized.is_some()
+                {
+                    return Err(Error::Unsupported);
+                }
+                let name = ident(&cte.alias.name);
+                if self.ctes.contains_key(&name) || catalog::schema(&name).is_some() {
+                    return Err(Error::Unsupported);
+                }
+                let compiled = self.query(&cte.query, &vec![])?;
+                self.ctes.insert(name, std::sync::Arc::new(compiled));
+            }
+        }
+        if let a::SetExpr::SetOperation {
+            op: a::SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } = q.body.as_ref()
+        {
+            let distinct = match set_quantifier {
+                a::SetQuantifier::All => false,
+                a::SetQuantifier::Distinct | a::SetQuantifier::None => true,
+                _ => return Err(Error::Unsupported),
+            };
+            let mut branch = q.clone();
+            branch.order_by = None;
+            branch.with = None;
+            branch.limit = None;
+            branch.body = left.clone();
+            let l = self.query(&branch, outer)?;
+            branch.body = right.clone();
+            let r = self.query(&branch, outer)?;
+            if l.fields.len() != r.fields.len()
+                || l.fields
+                    .iter()
+                    .zip(&r.fields)
+                    .any(|(l, r)| l.data_type != r.data_type)
+            {
+                return Err(Error::Type);
+            }
+            let fields = l.fields.clone();
+            let projection = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| column(i, f.data_type))
+                .collect();
+            let mut order = vec![];
+            if let Some(o) = &q.order_by {
+                if o.interpolate.is_some() {
+                    return Err(Error::Unsupported);
+                }
+                for x in &o.exprs {
+                    if x.with_fill.is_some() {
+                        return Err(Error::Unsupported);
+                    }
+                    let i = match &x.expr {
+                        A::Identifier(n) => {
+                            let matches: Vec<_> = fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, f)| f.name == ident(n))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if matches.len() != 1 {
+                                return Err(Error::UnknownColumn);
+                            }
+                            matches[0]
+                        }
+                        A::Value(a::Value::Number(n, _)) => n
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| i.checked_sub(1))
+                            .ok_or(Error::UnknownColumn)?,
+                        _ => return Err(Error::Unsupported),
+                    };
+                    let f = fields.get(i).ok_or(Error::UnknownColumn)?;
+                    let asc = x.asc.unwrap_or(true);
+                    order.push(Order {
+                        e: null(),
+                        output: Some(i),
+                        asc,
+                        nulls_first: x.nulls_first.unwrap_or(!asc),
+                    });
+                    let _ = f;
+                }
+            }
+            let limit = match &q.limit {
+                None => MAX_ROWS,
+                Some(A::Value(a::Value::Number(n, _))) => {
+                    n.parse::<usize>().map_err(|_| Error::Limit)?
+                }
+                _ => return Err(Error::Unsupported),
+            };
+            if limit > MAX_ROWS {
+                return Err(Error::Limit);
+            }
+            return Ok(Query {
+                source: Source::Union(Box::new(l), Box::new(r), distinct),
+                filter: truth(),
+                projection,
+                source_width: fields.len(),
+                fields,
+                order,
+                limit,
+                distinct: false,
+                expand: None,
+                group: vec![],
+                aggregate: false,
+            });
         }
         let a::SetExpr::Select(s) = q.body.as_ref() else {
             return Err(Error::Unsupported);
@@ -318,7 +557,7 @@ impl Compiler {
         if s.top.is_some()
             || !s.lateral_views.is_empty()
             || s.prewhere.is_some()
-            || !matches!(&s.group_by,a::GroupByExpr::Expressions(x,m) if x.is_empty()&&m.is_empty())
+            || !matches!(&s.group_by,a::GroupByExpr::Expressions(_,m) if m.is_empty())
             || s.having.is_some()
             || s.qualify.is_some()
             || !s.named_window.is_empty()
@@ -336,17 +575,27 @@ impl Compiler {
         let mut source = Source::Unit;
         let mut schema = vec![];
         for from in &s.from {
-            let (rhs, rs) = self.table(&from.relation)?;
+            let (rhs, rs) = self.table(&from.relation, outer)?;
             if schema.is_empty() {
                 source = rhs;
                 schema = rs;
             } else {
                 let width = rs.len();
-                source = Source::Join(Box::new(source), Box::new(rhs), truth(), false, width);
+                source = Source::Join(
+                    Box::new(source),
+                    Box::new(rhs),
+                    truth(),
+                    false,
+                    width,
+                    false,
+                );
                 schema.extend(rs)
             }
             for j in &from.joins {
-                let (rhs, rs) = self.table(&j.relation)?;
+                let mut lateral_schema = schema.clone();
+                lateral_schema.extend(outer.clone());
+                let (rhs, rs) = self.table(&j.relation, &lateral_schema)?;
+                let lateral = matches!(rhs, Source::Unnest(..) | Source::Scalar(_));
                 let old_width = schema.len();
                 let width = rs.len();
                 schema.extend(rs);
@@ -381,7 +630,7 @@ impl Compiler {
                 };
                 expect(&mut on, PgType::Bool)?;
                 no_set_or_window(&on)?;
-                source = Source::Join(Box::new(source), Box::new(rhs), on, left, width);
+                source = Source::Join(Box::new(source), Box::new(rhs), on, left, width, lateral);
             }
         }
         if schema.len() > 256 {
@@ -397,6 +646,19 @@ impl Compiler {
             .unwrap_or_else(truth);
         expect(&mut filter, PgType::Bool)?;
         no_set_or_window(&filter)?;
+        let a::GroupByExpr::Expressions(group, _) = &s.group_by else {
+            return Err(Error::Unsupported);
+        };
+        let group = group
+            .iter()
+            .map(|e| self.expr(e, &schema))
+            .collect::<R<Vec<_>>>()?;
+        for e in &group {
+            no_set_or_window(e)?;
+            if has_aggregate(e) {
+                return Err(Error::Unsupported);
+            }
+        }
         let mut projection = vec![];
         let mut fields = vec![];
         let mut expand = None;
@@ -437,6 +699,15 @@ impl Compiler {
         if projection.len() > 128 {
             return Err(Error::Limit);
         }
+        let aggregate = !group.is_empty() || projection.iter().any(has_aggregate);
+        if aggregate {
+            if expand.is_some() {
+                return Err(Error::Unsupported);
+            }
+            for e in &projection {
+                validate_group(e, &group)?;
+            }
+        }
         let mut order = vec![];
         if let Some(o) = &q.order_by {
             if o.interpolate.is_some() {
@@ -474,6 +745,9 @@ impl Compiler {
                 };
                 let asc = x.asc.unwrap_or(true);
                 no_set_or_window(&e)?;
+                if aggregate {
+                    validate_group(&e, &group)?;
+                }
                 order.push(Order {
                     e,
                     output,
@@ -502,9 +776,11 @@ impl Compiler {
             distinct: s.distinct.is_some(),
             expand,
             source_width,
+            group,
+            aggregate,
         })
     }
-    fn table(&mut self, t: &a::TableFactor) -> R<(Source, Schema)> {
+    fn table(&mut self, t: &a::TableFactor, outer: &Schema) -> R<(Source, Schema)> {
         self.sources += 1;
         if self.sources > 32 {
             return Err(Error::Limit);
@@ -534,30 +810,90 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 }
                 if let Some(args) = args {
-                    if n != "generate_series" || args.args.len() != 2 || args.settings.is_some() {
-                        return Err(Error::Unsupported);
+                    if n == "pg_available_extension_versions"
+                        && args.args.is_empty()
+                        && args.settings.is_none()
+                    {
+                        (
+                            Source::Empty,
+                            vec![
+                                Field {
+                                    name: "name".into(),
+                                    data_type: PgType::Name,
+                                },
+                                Field {
+                                    name: "version".into(),
+                                    data_type: PgType::Text,
+                                },
+                            ],
+                            alias,
+                            n,
+                        )
+                    } else if n == "unnest" && args.args.len() == 1 && args.settings.is_none() {
+                        let mut es = self.args(&args.args, outer)?;
+                        let e = es.remove(0);
+                        no_set_or_window(&e)?;
+                        let ty = array_element(e.ty)?;
+                        (
+                            Source::Unnest(e, false),
+                            vec![Field {
+                                name: n.clone(),
+                                data_type: ty,
+                            }],
+                            alias,
+                            n,
+                        )
+                    } else if n == "pg_indexam_has_property" && args.settings.is_none() {
+                        let args = self.args(&args.args, outer)?;
+                        let mut e = E {
+                            ty: call_type(&n, &args)?,
+                            kind: K::Call(n.clone(), args),
+                        };
+                        check_expr(&mut e)?;
+                        no_set_or_window(&e)?;
+                        let name = alias.as_ref().map_or(n.clone(), |a| ident(&a.name));
+                        (
+                            Source::Scalar(e),
+                            vec![Field {
+                                name,
+                                data_type: PgType::Bool,
+                            }],
+                            alias,
+                            n,
+                        )
+                    } else {
+                        if n != "generate_series" || args.args.len() != 2 || args.settings.is_some()
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        let mut es = self.args(&args.args, &vec![])?;
+                        for e in &mut es {
+                            expect(e, PgType::Int4)?;
+                            no_set_or_window(e)?;
+                        }
+                        (
+                            Source::Series(es[0].clone(), es[1].clone()),
+                            vec![Field {
+                                name: n.clone(),
+                                data_type: PgType::Int4,
+                            }],
+                            alias,
+                            n,
+                        )
                     }
-                    let mut es = self.args(&args.args, &vec![])?;
-                    for e in &mut es {
-                        expect(e, PgType::Int4)?;
-                        no_set_or_window(e)?;
-                    }
-                    (
-                        Source::Series(es[0].clone(), es[1].clone()),
-                        vec![Field {
-                            name: n.clone(),
-                            data_type: PgType::Int4,
-                        }],
-                        alias,
-                        n,
-                    )
                 } else {
-                    (
-                        Source::Catalog(n.clone()),
-                        catalog::schema(&n).ok_or(Error::Unsupported)?,
-                        alias,
-                        n,
-                    )
+                    if p.len() == 1 && self.ctes.contains_key(&n) {
+                        let q = self.ctes[&n].clone();
+                        let fields = q.fields.clone();
+                        (Source::Derived(q), fields, alias, n)
+                    } else {
+                        (
+                            Source::Catalog(n.clone()),
+                            catalog::schema(&n).ok_or(Error::Unsupported)?,
+                            alias,
+                            n,
+                        )
+                    }
                 }
             }
             a::TableFactor::Derived {
@@ -567,7 +903,42 @@ impl Compiler {
             } => {
                 let q = self.query(subquery, &vec![])?;
                 let fs = q.fields.clone();
-                (Source::Derived(Box::new(q)), fs, alias, String::new())
+                (
+                    Source::Derived(std::sync::Arc::new(q)),
+                    fs,
+                    alias,
+                    String::new(),
+                )
+            }
+            a::TableFactor::UNNEST {
+                alias,
+                array_exprs,
+                with_offset,
+                with_offset_alias,
+                with_ordinality,
+            } => {
+                if array_exprs.len() != 1 || *with_offset || with_offset_alias.is_some() {
+                    return Err(Error::Unsupported);
+                }
+                let e = self.expr(&array_exprs[0], outer)?;
+                no_set_or_window(&e)?;
+                let ty = array_element(e.ty)?;
+                let mut fields = vec![Field {
+                    name: "unnest".into(),
+                    data_type: ty,
+                }];
+                if *with_ordinality {
+                    fields.push(Field {
+                        name: "ordinality".into(),
+                        data_type: PgType::Int8,
+                    });
+                }
+                (
+                    Source::Unnest(e, *with_ordinality),
+                    fields,
+                    alias,
+                    "unnest".into(),
+                )
             }
             _ => return Err(Error::Unsupported),
         };
@@ -610,6 +981,32 @@ impl Compiler {
         Ok(result)
     }
     fn expr_inner(&mut self, e: &A, schema: &Schema) -> R<E> {
+        // A bounded structural adapter for the installed DataGrip startup query.
+        // Match the parsed expression, never a SQL prefix; no general timestamp
+        // or PostgreSQL postmaster semantics are claimed by this profile.
+        static STARTUP: std::sync::LazyLock<A> = std::sync::LazyLock::new(|| {
+            let statements = Parser::parse_sql(
+                &PostgreSqlDialect {},
+                "SELECT round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC'))",
+            )
+            .expect("constant SQL");
+            let a::Statement::Query(q) = &statements[0] else {
+                unreachable!()
+            };
+            let a::SetExpr::Select(s) = q.body.as_ref() else {
+                unreachable!()
+            };
+            let a::SelectItem::UnnamedExpr(e) = &s.projection[0] else {
+                unreachable!()
+            };
+            e.clone()
+        });
+        if e == &*STARTUP {
+            return Ok(E {
+                kind: K::Call("_service_start_epoch".into(), vec![]),
+                ty: PgType::Int8,
+            });
+        }
         let (kind, ty) = match e {
             A::Identifier(n) => {
                 let i = lookup(schema, &[ident(n)])?;
@@ -765,6 +1162,7 @@ impl Compiler {
                 match name.as_str() {
                     "regclass" => (K::Regclass(e), PgType::Oid),
                     "regproc" => (K::Regproc(e), PgType::Oid),
+                    "regoper" => (K::Regoper(e), PgType::Oid),
                     _ => {
                         let ty = cast_type(&name)?;
                         (K::Cast(e, ty), ty)
@@ -807,6 +1205,66 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 }
                 let n = function(&f.name)?;
+                if n == "array"
+                    && let a::FunctionArguments::Subquery(q) = &f.args
+                {
+                    if f.over.is_some() {
+                        return Err(Error::Unsupported);
+                    }
+                    let q = self.query(q, schema)?;
+                    if q.fields.len() != 1 {
+                        return Err(Error::Type);
+                    }
+                    let ty = array_type(q.fields[0].data_type)?;
+                    return Ok(E {
+                        kind: K::ArrayQuery(Box::new(q)),
+                        ty,
+                    });
+                }
+                if n == "array_agg" {
+                    if f.over.is_some() {
+                        return Err(Error::Unsupported);
+                    }
+                    let a::FunctionArguments::List(args) = &f.args else {
+                        return Err(Error::Unsupported);
+                    };
+                    if args.duplicate_treatment.is_some() || args.args.len() != 1 {
+                        return Err(Error::Unsupported);
+                    }
+                    let arg = self.args(&args.args, schema)?.remove(0);
+                    no_set_or_window(&arg)?;
+                    if has_aggregate(&arg) {
+                        return Err(Error::Unsupported);
+                    }
+                    let mut order = vec![];
+                    for clause in &args.clauses {
+                        let a::FunctionArgumentClause::OrderBy(orders) = clause else {
+                            return Err(Error::Unsupported);
+                        };
+                        for o in orders {
+                            if o.with_fill.is_some() {
+                                return Err(Error::Unsupported);
+                            }
+                            let e = self.expr(&o.expr, schema)?;
+                            no_set_or_window(&e)?;
+                            if has_aggregate(&e) {
+                                return Err(Error::Unsupported);
+                            }
+                            let asc = o.asc.unwrap_or(true);
+                            order.push(Order {
+                                e,
+                                output: None,
+                                asc,
+                                nulls_first: o.nulls_first.unwrap_or(!asc),
+                            });
+                        }
+                    }
+                    let ty = array_type(arg.ty)?;
+                    return Ok(E {
+                        kind: K::ArrayAgg(Box::new(arg), order),
+                        ty,
+                    });
+                }
                 let args = match &f.args {
                     a::FunctionArguments::None => vec![],
                     a::FunctionArguments::List(l)
@@ -940,6 +1398,15 @@ impl Compiler {
                 let ty = q.fields[0].data_type;
                 (K::Subquery(Box::new(q)), ty)
             }
+            A::Tuple(es) => (
+                K::Call(
+                    "_row".into(),
+                    es.iter()
+                        .map(|e| self.expr(e, schema))
+                        .collect::<R<Vec<_>>>()?,
+                ),
+                PgType::Record,
+            ),
             _ => return Err(Error::Unsupported),
         };
         Ok(E { kind, ty })
@@ -961,6 +1428,38 @@ fn lookup(schema: &[Col], p: &[String]) -> R<usize> {
         _ => Err(Error::AmbiguousColumn),
     }
 }
+fn array_type(t: PgType) -> R<PgType> {
+    Ok(match t {
+        PgType::Bool => PgType::BoolArray,
+        PgType::Int2 => PgType::Int2Array,
+        PgType::Int4 => PgType::Int4Array,
+        PgType::Int8 => PgType::Int8Array,
+        PgType::Oid => PgType::OidArray,
+        PgType::Text => PgType::TextArray,
+        PgType::Name => PgType::NameArray,
+        PgType::Char => PgType::CharArray,
+        PgType::Bytea => PgType::ByteaArray,
+        _ => return Err(Error::Unsupported),
+    })
+}
+fn has_aggregate(e: &E) -> bool {
+    matches!(e.kind, K::ArrayAgg(..)) || children(e).into_iter().any(has_aggregate)
+}
+fn validate_group(e: &E, group: &[E]) -> R<()> {
+    if group.contains(e) || matches!(e.kind, K::ArrayAgg(..)) {
+        return Ok(());
+    }
+    if matches!(
+        e.kind,
+        K::Column(_) | K::RowNumber(..) | K::Expand(_) | K::Subquery(_) | K::ArrayQuery(_)
+    ) {
+        return Err(Error::Unsupported);
+    }
+    for c in children(e) {
+        validate_group(c, group)?;
+    }
+    Ok(())
+}
 fn cast_type(n: &str) -> R<PgType> {
     Ok(match n {
         "bool" | "boolean" => PgType::Bool,
@@ -968,6 +1467,8 @@ fn cast_type(n: &str) -> R<PgType> {
         "int" | "integer" | "int4" => PgType::Int4,
         "bigint" | "int8" => PgType::Int8,
         "oid" => PgType::Oid,
+        "int[]" | "integer[]" | "int4[]" => PgType::Int4Array,
+        "oid[]" => PgType::OidArray,
         "text" | "varchar" | "character varying" => PgType::Text,
         "name" => PgType::Name,
         "char" | "\"char\"" => PgType::Char,
@@ -980,6 +1481,8 @@ fn numeric(t: PgType) -> bool {
 fn array_element(t: PgType) -> R<PgType> {
     if t == PgType::Int2Vector {
         Ok(PgType::Int2)
+    } else if t == PgType::OidVector {
+        Ok(PgType::Oid)
     } else {
         t.array_element().ok_or(Error::Type)
     }
@@ -1013,6 +1516,39 @@ fn compatible(l: &mut E, r: &mut E) -> R<()> {
     } else {
         expect(r, l.ty)
     }
+}
+fn common_type<'a>(expressions: impl Iterator<Item = &'a E>) -> R<PgType> {
+    let mut result = None;
+    for e in expressions.filter(|e| !unknown(e)) {
+        result = Some(match result {
+            None => e.ty,
+            Some(t) if t == e.ty => t,
+            Some(t) if numeric(t) && numeric(e.ty) => {
+                if matches!(t, PgType::Oid | PgType::Int8)
+                    || matches!(e.ty, PgType::Oid | PgType::Int8)
+                {
+                    PgType::Int8
+                } else if t == PgType::Int4 || e.ty == PgType::Int4 {
+                    PgType::Int4
+                } else {
+                    PgType::Int2
+                }
+            }
+            Some(t) if textual(t) && textual(e.ty) => PgType::Text,
+            _ => return Err(Error::Type),
+        });
+    }
+    Ok(result.unwrap_or(PgType::Text))
+}
+fn coerce(e: &mut E, t: PgType) -> R<()> {
+    expect(e, t)?;
+    if e.ty != t {
+        *e = E {
+            kind: K::Cast(Box::new(e.clone()), t),
+            ty: t,
+        };
+    }
+    Ok(())
 }
 fn check_expr(e: &mut E) -> R<()> {
     match &mut e.kind {
@@ -1053,24 +1589,33 @@ fn check_expr(e: &mut E) -> R<()> {
             if !es.is_empty() {
                 let ty = array_element(e.ty)?;
                 for x in es {
-                    expect(x, ty)?
+                    coerce(x, ty)?
                 }
             }
         }
         K::Case(operand, pairs, el) => {
-            let t = e.ty;
+            let t = common_type(
+                pairs
+                    .iter()
+                    .map(|(_, r)| r)
+                    .chain(std::iter::once(el.as_ref())),
+            )?;
             for (c, r) in pairs {
                 if let Some(o) = operand.as_mut() {
                     compatible(o, c)?
                 } else {
                     expect(c, PgType::Bool)?
                 }
-                expect(r, t)?
+                coerce(r, t)?
             }
-            expect(el, t)?;
+            coerce(el, t)?;
+            e.ty = t;
         }
         K::Call(n, args) => match n.as_str() {
             "current_schemas" => expect(&mut args[0], PgType::Bool)?,
+            "quote_ident" => expect(&mut args[0], PgType::Text)?,
+            "chr" => expect(&mut args[0], PgType::Int4)?,
+            "pg_tablespace_location" | "pg_get_partkeydef" => expect(&mut args[0], PgType::Oid)?,
             "replace" | "like" => {
                 for x in args {
                     expect(x, PgType::Text)?
@@ -1092,6 +1637,15 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(&mut args[0], PgType::Oid)?;
                 expect(&mut args[1], PgType::Int4)?;
             }
+            "pg_indexam_has_property" => {
+                expect(&mut args[0], PgType::Oid)?;
+                expect(&mut args[1], PgType::Text)?;
+            }
+            "pg_get_indexdef" => {
+                expect(&mut args[0], PgType::Oid)?;
+                expect(&mut args[1], PgType::Int4)?;
+                expect(&mut args[2], PgType::Bool)?;
+            }
             "obj_description" => {
                 expect(&mut args[0], PgType::Oid)?;
                 expect(&mut args[1], PgType::Text)?;
@@ -1103,14 +1657,16 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(&mut args[1], PgType::Text)?
             }
             "nullif" => {
-                let (a, b) = args.split_at_mut(1);
-                compatible(&mut a[0], &mut b[0])?;
-                e.ty = a[0].ty;
+                let t = common_type(args.iter())?;
+                for x in args {
+                    coerce(x, t)?;
+                }
+                e.ty = t;
             }
             "coalesce" => {
-                let t = args.iter().find(|e| !unknown(e)).map_or(e.ty, |e| e.ty);
+                let t = common_type(args.iter())?;
                 for x in args {
-                    expect(x, t)?
+                    coerce(x, t)?
                 }
                 e.ty = t;
             }
@@ -1125,6 +1681,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("current_database" | "current_schema" | "current_user" | "session_user", 0) => {
             PgType::Name
         }
+        ("version", 0) => PgType::Text,
         ("current_schemas", 1) => PgType::NameArray,
         ("replace", 3)
         | ("pg_get_expr", 2)
@@ -1132,6 +1689,10 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         | ("obj_description", 2)
         | ("col_description", 2) => PgType::Text,
         ("pg_get_userbyid", 1) => PgType::Name,
+        ("pg_get_indexdef", 3) => PgType::Text,
+        ("pg_indexam_has_property", 2) => PgType::Bool,
+        ("chr", 1) => PgType::Text,
+        ("quote_ident" | "pg_tablespace_location" | "pg_get_partkeydef", 1) => PgType::Text,
         ("array_upper" | "array_lower", 2) | ("cardinality" | "length", 1) => PgType::Int4,
         ("nullif", 2) => a[0].ty,
         ("coalesce", n) if n > 0 => a[0].ty,
@@ -1170,9 +1731,13 @@ fn children(e: &E) -> Vec<&E> {
         | K::Cast(a, _)
         | K::Regclass(a)
         | K::Regproc(a)
+        | K::Regoper(a)
         | K::Member(a, _)
         | K::Expand(a) => vec![a],
         K::Call(_, es) | K::Array(es) => es.iter().collect(),
+        K::ArrayAgg(e, order) => std::iter::once(e.as_ref())
+            .chain(order.iter().map(|o| &o.e))
+            .collect(),
         K::In(a, es, _) => std::iter::once(a.as_ref()).chain(es.iter()).collect(),
         K::Case(a, es, b) => a
             .iter()
@@ -1188,7 +1753,7 @@ fn has_expand(e: &E) -> bool {
     matches!(e.kind, K::Expand(_)) || children(e).into_iter().any(has_expand)
 }
 fn no_set_or_window(e: &E) -> R<()> {
-    if matches!(e.kind, K::Expand(_) | K::RowNumber(_, _)) {
+    if matches!(e.kind, K::Expand(_) | K::RowNumber(_, _) | K::ArrayAgg(..)) {
         return Err(Error::Unsupported);
     }
     for c in children(e) {
@@ -1210,7 +1775,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 _ => return Err(Error::Type),
             });
         }
-        if let K::Subquery(q) = &e.kind {
+        if let K::Subquery(q) | K::ArrayQuery(q) = &e.kind {
             collect_parameters(q, types)?;
         }
         for c in children(e) {
@@ -1229,7 +1794,11 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
     fn source(s: &Source, types: &mut [Option<PgType>]) -> R<()> {
         match s {
             Source::Derived(q) => collect_parameters(q, types)?,
-            Source::Join(l, r, on, _, _) => {
+            Source::Union(l, r, _) => {
+                collect_parameters(l, types)?;
+                collect_parameters(r, types)?;
+            }
+            Source::Join(l, r, on, _, _, _) => {
                 source(l, types)?;
                 source(r, types)?;
                 expr(on, types, None)?
@@ -1238,6 +1807,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 expr(a, types, None)?;
                 expr(b, types, None)?
             }
+            Source::Unnest(e, _) | Source::Scalar(e) => expr(e, types, None)?,
             _ => {}
         }
         Ok(())
@@ -1250,10 +1820,14 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
     for o in &q.order {
         expr(&o.e, types, None)?
     }
+    for e in &q.group {
+        expr(e, types, None)?;
+    }
     Ok(())
 }
 
 struct Runtime<'a> {
+    startup: Option<i64>,
     catalogs: &'a BTreeMap<String, catalog::Relation>,
     parameters: &'a [Value],
     work: usize,
@@ -1334,16 +1908,38 @@ impl Runtime<'_> {
             Ok(())
         }
     }
-    fn source(&mut self, s: &Source) -> R<Vec<Vec<Value>>> {
+    fn source(&mut self, s: &Source, outer: &[Value]) -> R<Vec<Vec<Value>>> {
         self.charge(1)?;
         match s {
             Source::Unit => Ok(vec![vec![]]),
+            Source::Empty => Ok(vec![]),
             Source::Catalog(n) => {
                 let r = self.catalogs.get(n).ok_or(Error::Unsupported)?;
                 self.charge(r.rows.len())?;
                 Ok(r.rows.clone())
             }
             Source::Derived(q) => self.query(q, &[]),
+            Source::Union(l, r, distinct) => {
+                let mut out = self.query(l, outer)?;
+                let rhs = self.query(r, outer)?;
+                let mut bytes = out.iter().flatten().map(Value::bytes).sum();
+                let mut seen = std::collections::BTreeSet::new();
+                if *distinct {
+                    out.retain(|row| seen.insert(row.clone()));
+                    bytes = out.iter().flatten().map(Value::bytes).sum();
+                }
+                for row in rhs {
+                    self.charge(1)?;
+                    if !*distinct || !seen.contains(&row) {
+                        admit(&out, &row, &mut bytes)?;
+                        if *distinct {
+                            seen.insert(row.clone());
+                        }
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
             Source::Series(a, b) => {
                 let start = integer(self.eval(a, &[], None, 0, &[], None)?)?;
                 let end = integer(self.eval(b, &[], None, 0, &[], None)?)?;
@@ -1352,14 +1948,47 @@ impl Runtime<'_> {
                 }
                 Ok((start..=end).map(|i| vec![Value::Int(i)]).collect())
             }
-            Source::Join(l, r, on, left, rwidth) => {
-                let ls = self.source(l)?;
-                let rs = self.source(r)?;
+            Source::Scalar(e) => Ok(vec![vec![self.eval(e, outer, None, 0, &[], None)?]]),
+            Source::Unnest(e, ordinality) => match self.eval(e, outer, None, 0, &[], None)? {
+                Value::Null => Ok(vec![]),
+                Value::Array(values) => {
+                    let mut out = vec![];
+                    let mut bytes = 0;
+                    for (i, v) in values.into_iter().enumerate() {
+                        self.charge(1)?;
+                        let mut row = vec![v];
+                        if *ordinality {
+                            row.push(Value::Int(i as i64 + 1));
+                        }
+                        admit(&out, &row, &mut bytes)?;
+                        out.push(row);
+                    }
+                    Ok(out)
+                }
+                _ => Err(Error::Type),
+            },
+            Source::Join(l, r, on, left, rwidth, lateral) => {
+                let ls = self.source(l, outer)?;
+                let rs = if *lateral {
+                    vec![]
+                } else {
+                    self.source(r, outer)?
+                };
                 let mut out = vec![];
                 let mut bytes = 0;
                 for l in &ls {
+                    let lateral_rows = if *lateral {
+                        if l.iter().chain(outer).map(Value::bytes).sum::<usize>() > MAX_BYTES {
+                            return Err(Error::Limit);
+                        }
+                        let args = l.iter().chain(outer).cloned().collect::<Vec<_>>();
+                        self.source(r, &args)?
+                    } else {
+                        vec![]
+                    };
+                    let rs = if *lateral { &lateral_rows } else { &rs };
                     let mut matched = false;
-                    for r in &rs {
+                    for r in rs {
                         self.charge(1)?;
                         // Candidate is admitted before cloning; it is released before the next candidate.
                         let size = l.iter().chain(r).map(Value::bytes).sum::<usize>();
@@ -1386,7 +2015,7 @@ impl Runtime<'_> {
         }
     }
     fn query(&mut self, q: &Query, outer: &[Value]) -> R<Vec<Vec<Value>>> {
-        let source = self.source(&q.source)?;
+        let source = self.source(&q.source, outer)?;
         let mut filtered = vec![];
         let mut bytes = 0;
         for mut row in source {
@@ -1404,66 +2033,97 @@ impl Runtime<'_> {
         }
         let mut material = vec![];
         let mut bytes: usize = 0;
-        for (idx, row) in filtered.iter().enumerate() {
-            let expansion = if let Some(e) = &q.expand {
-                match self.eval(e, row, None, 0, &[], None)? {
-                    Value::Array(v) => v,
-                    Value::Null => vec![],
-                    _ => return Err(Error::Type),
-                }
+        let mut groups: Vec<Vec<Vec<Value>>> = vec![];
+        if q.aggregate {
+            if q.group.is_empty() {
+                groups.push(filtered);
             } else {
-                vec![Value::Null]
-            };
-            for (ei, elem) in expansion.iter().enumerate() {
-                let expanded = q
-                    .expand
-                    .as_ref()
-                    .map(|_| Value::Record(vec![elem.clone(), Value::Int(ei as i64 + 1)]));
-                let mut result = vec![];
-                let mut keys = vec![];
-                for e in &q.projection {
-                    let v = self.eval(
-                        e,
-                        row,
-                        expanded.as_ref(),
-                        idx,
-                        &filtered,
-                        Some(MAX_BYTES - bytes),
+                let mut indexed = BTreeMap::<Vec<Value>, Vec<Vec<Value>>>::new();
+                let mut key_bytes = 0usize;
+                for row in filtered {
+                    let key = collect_values(
+                        q.group
+                            .iter()
+                            .map(|e| self.eval(e, &row, None, 0, &[], None)),
                     )?;
-                    let n = v.bytes();
-                    if bytes.checked_add(n).ok_or(Error::Limit)? > MAX_BYTES {
+                    key_bytes = key_bytes
+                        .checked_add(key.iter().map(Value::bytes).sum::<usize>())
+                        .ok_or(Error::Limit)?;
+                    if key_bytes > MAX_BYTES {
                         return Err(Error::Limit);
                     }
-                    bytes += n;
-                    result.push(v);
+                    indexed.entry(key).or_default().push(row);
                 }
-                for o in &q.order {
-                    let v = if let Some(i) = o.output {
-                        let v = result.get(i).ok_or(Error::UnknownColumn)?;
-                        if v.bytes() > MAX_BYTES - bytes {
-                            return Err(Error::Limit);
-                        }
-                        v.clone()
-                    } else {
-                        self.eval(
-                            &o.e,
+                groups.extend(indexed.into_values());
+            }
+        } else {
+            groups.push(filtered);
+        }
+        for filtered in &groups {
+            let empty = vec![Value::Null; q.source_width + outer.len()];
+            let count = if q.aggregate { 1 } else { filtered.len() };
+            for idx in 0..count {
+                let row = filtered.get(idx).unwrap_or(&empty);
+                let expansion = if let Some(e) = &q.expand {
+                    match self.eval(e, row, None, 0, &[], None)? {
+                        Value::Array(v) => v,
+                        Value::Null => vec![],
+                        _ => return Err(Error::Type),
+                    }
+                } else {
+                    vec![Value::Null]
+                };
+                for (ei, elem) in expansion.iter().enumerate() {
+                    let expanded = q
+                        .expand
+                        .as_ref()
+                        .map(|_| Value::Record(vec![elem.clone(), Value::Int(ei as i64 + 1)]));
+                    let mut result = vec![];
+                    let mut keys = vec![];
+                    for e in &q.projection {
+                        let v = self.eval(
+                            e,
                             row,
                             expanded.as_ref(),
                             idx,
-                            &filtered,
+                            filtered,
                             Some(MAX_BYTES - bytes),
-                        )?
-                    };
-                    bytes = bytes.checked_add(v.bytes()).ok_or(Error::Limit)?;
-                    if bytes > MAX_BYTES {
+                        )?;
+                        let n = v.bytes();
+                        if bytes.checked_add(n).ok_or(Error::Limit)? > MAX_BYTES {
+                            return Err(Error::Limit);
+                        }
+                        bytes += n;
+                        result.push(v);
+                    }
+                    for o in &q.order {
+                        let v = if let Some(i) = o.output {
+                            let v = result.get(i).ok_or(Error::UnknownColumn)?;
+                            if v.bytes() > MAX_BYTES - bytes {
+                                return Err(Error::Limit);
+                            }
+                            v.clone()
+                        } else {
+                            self.eval(
+                                &o.e,
+                                row,
+                                expanded.as_ref(),
+                                idx,
+                                filtered,
+                                Some(MAX_BYTES - bytes),
+                            )?
+                        };
+                        bytes = bytes.checked_add(v.bytes()).ok_or(Error::Limit)?;
+                        if bytes > MAX_BYTES {
+                            return Err(Error::Limit);
+                        }
+                        keys.push(v)
+                    }
+                    if material.len() >= MAX_ROWS {
                         return Err(Error::Limit);
                     }
-                    keys.push(v)
+                    material.push((result, keys));
                 }
-                if material.len() >= MAX_ROWS {
-                    return Err(Error::Limit);
-                }
-                material.push((result, keys));
             }
         }
         self.charge(
@@ -1580,6 +2240,10 @@ impl Runtime<'_> {
                 S(s) if s == "pg_catalog.array_in" || s == "array_in" => I(750),
                 _ => return Err(Error::Unsupported),
             },
+            K::Regoper(e) => match ev(e)? {
+                N => N,
+                _ => return Err(Error::Unsupported),
+            },
             K::Case(operand, pairs, el) => {
                 let o = operand.as_ref().map(|e| ev(e)).transpose()?;
                 let mut value = None;
@@ -1624,7 +2288,7 @@ impl Runtime<'_> {
                 }
                 let value = self.call(n, values)?;
                 if matches!(n.as_str(), "array_upper" | "array_lower")
-                    && args[0].ty == PgType::Int2Vector
+                    && matches!(args[0].ty, PgType::Int2Vector | PgType::OidVector)
                 {
                     match value {
                         I(i) => I(i - 1),
@@ -1648,7 +2312,11 @@ impl Runtime<'_> {
                 Value::Array(values)
             }
             K::Index(a, i) => {
-                let lower = if a.ty == PgType::Int2Vector { 0 } else { 1 };
+                let lower = if matches!(a.ty, PgType::Int2Vector | PgType::OidVector) {
+                    0
+                } else {
+                    1
+                };
                 let a = ev(a)?;
                 let i = ev(i)?;
                 match (a, i) {
@@ -1720,6 +2388,42 @@ impl Runtime<'_> {
                     _ => return Err(Error::Type),
                 }
             }
+            K::ArrayQuery(q) => {
+                let rows = self.query(q, row)?;
+                Value::Array(rows.into_iter().map(|mut r| r.remove(0)).collect())
+            }
+            K::ArrayAgg(arg, order) => {
+                if all.is_empty() {
+                    N
+                } else {
+                    let mut values = vec![];
+                    let mut bytes = 8usize;
+                    for r in all {
+                        let v = self.eval(arg, r, None, 0, &[], Some(MAX_BYTES - bytes))?;
+                        let keys =
+                            collect_values(order.iter().map(|o| {
+                                self.eval(&o.e, r, None, 0, &[], Some(MAX_BYTES - bytes))
+                            }))?;
+                        bytes = bytes
+                            .checked_add(
+                                v.bytes() + 4 + keys.iter().map(Value::bytes).sum::<usize>(),
+                            )
+                            .ok_or(Error::Limit)?;
+                        if bytes > MAX_BYTES {
+                            return Err(Error::Limit);
+                        }
+                        values.push((v, keys));
+                    }
+                    self.charge(
+                        values
+                            .len()
+                            .saturating_mul(values.len().max(1).ilog2() as usize + 1)
+                            .saturating_mul(order.len()),
+                    )?;
+                    values.sort_by(|l, r| compare_keys(&l.1, &r.1, order));
+                    Value::Array(values.into_iter().map(|(v, _)| v).collect())
+                }
+            }
             K::Expand(_) => expanded.cloned().ok_or(Error::Unsupported)?,
             K::RowNumber(partition, order) => {
                 let p = collect_values(partition.iter().map(&mut ev))?;
@@ -1766,6 +2470,15 @@ impl Runtime<'_> {
             return Ok(N);
         }
         Ok(match n {
+            "version" => S(concat!(
+                "GigglesDB ",
+                env!("CARGO_PKG_VERSION"),
+                " (bounded PostgreSQL 14 wire compatibility)"
+            )
+            .into()),
+            "_service_start_epoch" => {
+                I(self.startup.filter(|v| *v >= 0).ok_or(Error::Unsupported)?)
+            }
             "current_database" | "current_user" | "session_user" => S("giggles".into()),
             "current_schema" => S("public".into()),
             "current_schemas" => {
@@ -1826,6 +2539,21 @@ impl Runtime<'_> {
                     N
                 }
             }
+            "quote_ident" => {
+                let name = text(v[0].clone())?;
+                // Always quoting is valid identifier SQL and avoids a keyword list.
+                S(format!("\"{}\"", name.replace('"', "\"\"")))
+            }
+            "pg_tablespace_location" | "pg_get_partkeydef" => N,
+            "_row" => Value::Record(v),
+            "pg_indexam_has_property" => N,
+            "pg_get_indexdef" => return Err(Error::Unsupported),
+            "chr" => S(char::from_u32(
+                u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?,
+            )
+            .filter(|c| *c != '\0')
+            .ok_or(Error::Type)?
+            .to_string()),
             "pg_get_expr" => return Err(Error::Unsupported),
             "obj_description" | "col_description" => N,
             "format_type" => {

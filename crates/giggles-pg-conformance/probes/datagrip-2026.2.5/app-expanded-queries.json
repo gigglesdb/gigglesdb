@@ -1,0 +1,100 @@
+[
+  {
+    "case": "dg_App_RetrieveExistentTables",
+    "name": "RetrieveExistentTables",
+    "template": "select oid from pg_catalog.pg_class C\nwhere relkind in ('r', 'm', 'v', 'p', 'f')\n  and relnamespace = :schema_id::oid\n;",
+    "template_sha256": "4701f50827f5f6f2d54eed818aedf17d0fc831d1ea46cf2328ee81a2a01b8417",
+    "sql": "select oid from pg_catalog.pg_class C\nwhere relkind in ('r', 'm', 'v', 'p', 'f')\n  and relnamespace = :schema_id::oid\n;",
+    "expanded_sha256": "4701f50827f5f6f2d54eed818aedf17d0fc831d1ea46cf2328ee81a2a01b8417",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveTables",
+    "name": "RetrieveTables",
+    "template": "select T.relkind as table_kind,\n       T.relname as table_name,\n       T.oid as table_id,\n       T.xmin as table_state_number,\n       #V120: false #: T.relhasoids #. as table_with_oids,\n       T.reltablespace as tablespace_id,\n       T.reloptions as options,\n       #V91>T.relpersistence as persistence,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where T.oid = inhrelid) as ancestors,\n       (select pg_catalog.array_agg(inhrelid::bigint order by inhrelid)::varchar from pg_catalog.pg_inherits where T.oid = inhparent) as successors,\n       #V99: T.relispartition #: false #. as is_partition,\n       #V99: pg_catalog.pg_get_partkeydef(T.oid) #: null #. as partition_key,\n       #V99: pg_catalog.pg_get_expr(T.relpartbound, T.oid) #: null #. as partition_expression,\n       T.relam am_id,\n       pg_catalog.pg_get_userbyid(T.relowner) as \"owner\"\nfrom pg_catalog.pg_class T\nwhere relnamespace = :schema_id::oid\n       and relkind in ('r', 'm', 'v', 'f', 'p')\n#INC>  and pg_catalog.age(T.xmin) <= #TXAGE\n#FRAG> and T.relname in ( :[*f_names] )\norder by table_kind, table_id\n;",
+    "template_sha256": "2145787c4e3bf7c13974528aec0e0ab972f1d737041d839576cff128fc305332",
+    "sql": "select T.relkind as table_kind,\n       T.relname as table_name,\n       T.oid as table_id,\n       T.xmin as table_state_number,\n       false as table_with_oids,\n       T.reltablespace as tablespace_id,\n       T.reloptions as options,\n       T.relpersistence as persistence,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where T.oid = inhrelid) as ancestors,\n       (select pg_catalog.array_agg(inhrelid::bigint order by inhrelid)::varchar from pg_catalog.pg_inherits where T.oid = inhparent) as successors,\n       T.relispartition as is_partition,\n       pg_catalog.pg_get_partkeydef(T.oid) as partition_key,\n       pg_catalog.pg_get_expr(T.relpartbound, T.oid) as partition_expression,\n       T.relam am_id,\n       pg_catalog.pg_get_userbyid(T.relowner) as \"owner\"\nfrom pg_catalog.pg_class T\nwhere relnamespace = :schema_id::oid\n       and relkind in ('r', 'm', 'v', 'f', 'p')\n\n\norder by table_kind, table_id\n;",
+    "expanded_sha256": "331148333441b5b8cf9a9c679089d46c9b0347dd375cca268352b70706cc6a71",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveColumns",
+    "name": "RetrieveColumns",
+    "template": "with T as ( select #INC>distinct\n                  T.oid as table_id, T.relname as table_name\n            from pg_catalog.pg_class T\n                 #INC>, pg_catalog.pg_attribute A\n            where T.relnamespace = :schema_id::oid\n              and T.relkind in ('r', 'm', 'v', 'f', 'p')\n              #INC> and (pg_catalog.age(A.xmin) <= #TXAGE or pg_catalog.age(T.xmin) <= #TXAGE)\n              #INC> and A.attrelid = T.oid\n             #FRAG> and T.relname in ( :[*f_names] )\n            )\nselect T.table_id,\n       C.attnum as column_position,\n       C.attname as column_name,\n       C.xmin as column_state_number,\n       C.atttypmod as type_mod,\n       C.attndims as dimensions_number,\n       pg_catalog.format_type(C.atttypid, C.atttypmod) as type_spec,\n       C.atttypid as type_id,\n       C.attnotnull as mandatory,\n       #V120: pg_catalog.pg_get_expr(D.adbin, T.table_id) #: D.adsrc #. as column_default_expression,\n       not C.attislocal as column_is_inherited,\n       #V92> C.attfdwoptions as options,\n       C.attisdropped as column_is_dropped,\n       #V99: C.attidentity #: null #. as identity_kind,\n       #V120: C.attgenerated #: null #. as generated\nfrom T\n  join pg_catalog.pg_attribute C on T.table_id = C.attrelid\n  left join pg_catalog.pg_attrdef D on (C.attrelid, C.attnum) = (D.adrelid, D.adnum)\nwhere attnum > 0\norder by table_id, attnum\n;",
+    "template_sha256": "0fd13795ef5b3a56b1f9e35666766d56b34b1f4627df77ed99351c8d2b3960ce",
+    "sql": "with T as ( select \n                  T.oid as table_id, T.relname as table_name\n            from pg_catalog.pg_class T\n                 \n            where T.relnamespace = :schema_id::oid\n              and T.relkind in ('r', 'm', 'v', 'f', 'p')\n              \n              \n             \n            )\nselect T.table_id,\n       C.attnum as column_position,\n       C.attname as column_name,\n       C.xmin as column_state_number,\n       C.atttypmod as type_mod,\n       C.attndims as dimensions_number,\n       pg_catalog.format_type(C.atttypid, C.atttypmod) as type_spec,\n       C.atttypid as type_id,\n       C.attnotnull as mandatory,\n       pg_catalog.pg_get_expr(D.adbin, T.table_id) as column_default_expression,\n       not C.attislocal as column_is_inherited,\n        C.attfdwoptions as options,\n       C.attisdropped as column_is_dropped,\n       C.attidentity as identity_kind,\n       C.attgenerated as generated\nfrom T\n  join pg_catalog.pg_attribute C on T.table_id = C.attrelid\n  left join pg_catalog.pg_attrdef D on (C.attrelid, C.attnum) = (D.adrelid, D.adnum)\nwhere attnum > 0\norder by table_id, attnum\n;",
+    "expanded_sha256": "70d694dc074e404daf5a93f85a4483140df613924c1c15441f310ce4858c154d",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveIndices",
+    "name": "RetrieveIndices",
+    "template": "select tab.oid               table_id,\n       tab.relkind           table_kind,\n       ind_stor.relname      index_name,\n       ind_head.indexrelid   index_id,\n       ind_stor.xmin         state_number,\n       ind_head.indisunique  is_unique,\n       ind_head.indisprimary is_primary,\n       #V150: ind_head.indnullsnotdistinct #: false #. nulls_not_distinct,\n       pg_catalog.pg_get_expr(ind_head.indpred, ind_head.indrelid) as condition,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where ind_stor.oid = inhrelid) as ancestors,\n       ind_stor.reltablespace tablespace_id,\n       opcmethod as access_method_id\nfrom pg_catalog.pg_class tab\n         join pg_catalog.pg_index ind_head\n              on ind_head.indrelid = tab.oid\n         join pg_catalog.pg_class ind_stor\n              on tab.relnamespace = ind_stor.relnamespace and ind_stor.oid = ind_head.indexrelid\n         left join pg_catalog.pg_opclass on pg_opclass.oid = ANY(indclass)\nwhere tab.relnamespace = :schema_id::oid\n        and tab.relkind in ('r', 'm', 'v', 'p')\n        and ind_stor.relkind in ('i', 'I')\n#FRAG>  and tab.relname in ( :[*f_names] )\n#INC>   and pg_catalog.age(ind_stor.xmin) <= #TXAGE",
+    "template_sha256": "0803ceb921e8548c15eb5df835a8636d6bf355bfb0dd84dd813ccbe89b263144",
+    "sql": "select tab.oid               table_id,\n       tab.relkind           table_kind,\n       ind_stor.relname      index_name,\n       ind_head.indexrelid   index_id,\n       ind_stor.xmin         state_number,\n       ind_head.indisunique  is_unique,\n       ind_head.indisprimary is_primary,\n       false nulls_not_distinct,\n       pg_catalog.pg_get_expr(ind_head.indpred, ind_head.indrelid) as condition,\n       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar from pg_catalog.pg_inherits where ind_stor.oid = inhrelid) as ancestors,\n       ind_stor.reltablespace tablespace_id,\n       opcmethod as access_method_id\nfrom pg_catalog.pg_class tab\n         join pg_catalog.pg_index ind_head\n              on ind_head.indrelid = tab.oid\n         join pg_catalog.pg_class ind_stor\n              on tab.relnamespace = ind_stor.relnamespace and ind_stor.oid = ind_head.indexrelid\n         left join pg_catalog.pg_opclass on pg_opclass.oid = ANY(indclass)\nwhere tab.relnamespace = :schema_id::oid\n        and tab.relkind in ('r', 'm', 'v', 'p')\n        and ind_stor.relkind in ('i', 'I')\n\n",
+    "expanded_sha256": "df868a7476767ab4d0baedbfc085a1324246cb2d4618ff968dfd6bb0cebde2f0",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveConstraints",
+    "name": "RetrieveConstraints",
+    "template": "select T.oid table_id,\n       relkind table_kind,\n       C.oid::bigint con_id,\n       C.xmin::varchar::bigint con_state_id,\n       conname con_name,\n       contype con_kind,\n       conkey con_columns,\n       conindid index_id,\n       confrelid ref_table_id,\n       condeferrable is_deferrable,\n       condeferred is_init_deferred,\n       #V180: not conenforced #: false #. is_not_enforced,\n       #V180: not convalidated #: false #. is_not_validated,\n       #V180: conperiod #: false #. is_defined_with_period,\n       confupdtype on_update,\n       confdeltype on_delete,\n       confmatchtype match_type,\n       #V92> connoinherit no_inherit,\n       #V120: pg_catalog.pg_get_expr(conbin, T.oid) #: consrc #. con_expression,\n       confkey ref_columns,\n       conexclop::int[] excl_operators,\n       array(select unnest::regoper::varchar from unnest(conexclop)) excl_operators_str\nfrom pg_catalog.pg_constraint C\n         join pg_catalog.pg_class T\n              on C.conrelid = T.oid\nwhere relkind in ('r', 'v', 'f', 'p')\n  and relnamespace = :schema_id::oid\n  and contype in ('p', 'u', 'f', 'c', 'x')\n  and connamespace = :schema_id::oid\n  #INC> and pg_catalog.age(T.xmin) <= #TXAGE or pg_catalog.age(c.xmin) <= #TXAGE\n;",
+    "template_sha256": "c2bc152dda9e6eb2ecda8497663eb90d921c188decf7682f2e22deb1dd6995b9",
+    "sql": "select T.oid table_id,\n       relkind table_kind,\n       C.oid::bigint con_id,\n       C.xmin::varchar::bigint con_state_id,\n       conname con_name,\n       contype con_kind,\n       conkey con_columns,\n       conindid index_id,\n       confrelid ref_table_id,\n       condeferrable is_deferrable,\n       condeferred is_init_deferred,\n       false is_not_enforced,\n       false is_not_validated,\n       false is_defined_with_period,\n       confupdtype on_update,\n       confdeltype on_delete,\n       confmatchtype match_type,\n        connoinherit no_inherit,\n       pg_catalog.pg_get_expr(conbin, T.oid) con_expression,\n       confkey ref_columns,\n       conexclop::int[] excl_operators,\n       array(select unnest::regoper::varchar from unnest(conexclop)) excl_operators_str\nfrom pg_catalog.pg_constraint C\n         join pg_catalog.pg_class T\n              on C.conrelid = T.oid\nwhere relkind in ('r', 'v', 'f', 'p')\n  and relnamespace = :schema_id::oid\n  and contype in ('p', 'u', 'f', 'c', 'x')\n  and connamespace = :schema_id::oid\n  \n;",
+    "expanded_sha256": "a03ffdacecee1e910d9b16536d33f3b1c9742a2cc3d7e53a9341daa183f96278",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveExistentConstraints",
+    "name": "RetrieveExistentConstraints",
+    "template": "select oid\nfrom pg_catalog.pg_constraint\nwhere conrelid != 0 and connamespace = :schema_id::oid\n;",
+    "template_sha256": "21519045d4f3c8c7bc20e3e17814f029765ae038370e14e66bad7599062223c7",
+    "sql": "select oid\nfrom pg_catalog.pg_constraint\nwhere conrelid != 0 and connamespace = :schema_id::oid\n;",
+    "expanded_sha256": "21519045d4f3c8c7bc20e3e17814f029765ae038370e14e66bad7599062223c7",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  },
+  {
+    "case": "dg_App_RetrieveIndexColumns",
+    "name": "RetrieveIndexColumns",
+    "template": "#FRAG:\nwith T as (\n  select T.oid as oid\n  from pg_catalog.pg_class T\n  where T.relnamespace = :schema_id::oid\n    and T.relkind in ('r', 'm', 'v', 'p', 'f')\n    and T.relname in ( :[*f_names] )\n)\n#.\nselect ind_head.indexrelid index_id,\n       k col_idx,\n       #V120: k <= indnkeyatts #: true #. in_key,\n       ind_head.indkey[k-1] column_position,\n       ind_head.indoption[k-1] column_options,\n       #V91: ind_head.indcollation[k-1] #: null #. as collation,\n       #V91: colln.nspname #: null #. as collation_schema,\n       #V91: collname #: null #. as collation_str,\n       ind_head.indclass[k-1] as opclass,\n       case when opcdefault then null else opcn.nspname end as opclass_schema,\n       case when opcdefault then null else opcname end as opclass_str,\n       case\n           when indexprs is null then null\n           when ind_head.indkey[k-1] = 0 then chr(27) || pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n           else pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n       end as expression,\n       amcanorder can_order\nfrom #V94: pg_catalog.pg_index #: (select *, pg_catalog.generate_subscripts(indkey::int[], 1) + 1 k from pg_catalog.pg_index) #. ind_head\n         join pg_catalog.pg_class ind_stor\n              on ind_stor.oid = ind_head.indexrelid\n#V94>    cross join unnest(ind_head.indkey) with ordinality u(u, k)\n#V91>         left join pg_catalog.pg_collation\n#V91>                   on pg_collation.oid = ind_head.indcollation[k-1]\n#V91>         left join pg_catalog.pg_namespace colln on collnamespace = colln.oid\n#V96:  cross join pg_catalog.pg_indexam_has_property(ind_stor.relam, 'can_order') amcanorder #: left join pg_catalog.pg_am am on ind_stor.relam = am.oid#.\n         left join pg_catalog.pg_opclass\n                   on pg_opclass.oid = ind_head.indclass[k-1]\n         left join pg_catalog.pg_namespace opcn on opcnamespace = opcn.oid\n  #FRAG> join T on ind_head.indrelid = T.oid\nwhere ind_stor.relnamespace = :schema_id::oid\n  and ind_stor.relkind in ('i', 'I')\n#INC>  and pg_catalog.age(ind_stor.xmin) <= #TXAGE\norder by index_id, k",
+    "template_sha256": "6a2edac226391d82e282f16281e08a03412e0ae7c4f8cef0eefc6508d561238a",
+    "sql": "\nselect ind_head.indexrelid index_id,\n       k col_idx,\n       k <= indnkeyatts in_key,\n       ind_head.indkey[k-1] column_position,\n       ind_head.indoption[k-1] column_options,\n       ind_head.indcollation[k-1] as collation,\n       colln.nspname as collation_schema,\n       collname as collation_str,\n       ind_head.indclass[k-1] as opclass,\n       case when opcdefault then null else opcn.nspname end as opclass_schema,\n       case when opcdefault then null else opcname end as opclass_str,\n       case\n           when indexprs is null then null\n           when ind_head.indkey[k-1] = 0 then chr(27) || pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n           else pg_catalog.pg_get_indexdef(ind_head.indexrelid, k::int, true)\n       end as expression,\n       amcanorder can_order\nfrom pg_catalog.pg_index ind_head\n         join pg_catalog.pg_class ind_stor\n              on ind_stor.oid = ind_head.indexrelid\n    cross join unnest(ind_head.indkey) with ordinality u(u, k)\n         left join pg_catalog.pg_collation\n                   on pg_collation.oid = ind_head.indcollation[k-1]\n         left join pg_catalog.pg_namespace colln on collnamespace = colln.oid\ncross join pg_catalog.pg_indexam_has_property(ind_stor.relam, 'can_order') amcanorder\n         left join pg_catalog.pg_opclass\n                   on pg_opclass.oid = ind_head.indclass[k-1]\n         left join pg_catalog.pg_namespace opcn on opcnamespace = opcn.oid\n  \nwhere ind_stor.relnamespace = :schema_id::oid\n  and ind_stor.relkind in ('i', 'I')\n\norder by index_id, k",
+    "expanded_sha256": "98fd3d2ec09ee1ab891411b3fa04a1b29e4ff197c122d9858804492f3223c45a",
+    "expansion": {
+      "server_version": 140,
+      "incremental": false,
+      "fragment": false,
+      "schema_id": "runtime positive oid from public namespace query"
+    }
+  }
+]

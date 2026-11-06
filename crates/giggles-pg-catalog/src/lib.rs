@@ -3,15 +3,17 @@
 //!
 //! `plan` returns `None` for parsed ordinary application statements. Recognized
 //! catalog statements must be a single read-only SELECT; mixed application
-//! relations, unknown catalog columns/functions, writes, CTEs, set operations,
-//! aggregates, locking, and unsupported expression forms fail explicitly.
+//! relations, unknown catalog columns/functions, writes, locking, and unsupported
+//! expression forms fail explicitly. Nonrecursive CTEs, UNION, grouped/ordered
+//! array_agg and lateral unnest form part of the finite metadata profile.
 //! Parse errors are `Error::Syntax`, so the caller controls application fallback.
 //! `describe` performs no execution; `execute` binds parameters and rebuilds the
 //! virtual relations exclusively from the supplied snapshot on every invocation.
 //! The caller owns fresh authorization, coherent schema snapshots, transaction
 //! fencing, and admission of the complete result into its session/wire cache.
 //!
-//! Limits: 64 KiB SQL, parser recursion 64, expression nesting 48 / 4096 AST
+//! Limits: 64 KiB SQL, 8192 flat tokens / 256 constructor tokens before parsing,
+//! parser recursion 64, expression nesting 48 / 4096 AST
 //! expressions, 32 sources and queries, 128 projection columns, 256 parameters,
 //! 128 input tables / 64 columns each / 64 KiB total input names. Materialized
 //! operator results admit at most 8192 rows / 4 MiB conservative escaped bytes;
@@ -21,11 +23,11 @@
 //! This is a finite virtual catalog, not a PostgreSQL server: application types
 //! are only the six `ScalarType` variants. Catalog arrays, vectors, and rowtype
 //! identities do not grant additional application SQL types. No PostgreSQL MVCC
-//! tuple exists (`xmin` is NULL); transaction IDs, uptime, procedural execution,
+//! tuple exists (`xmin` is NULL); transaction IDs, general timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
 mod engine;
-pub use engine::{Plan, describe, execute, plan};
+pub use engine::{Plan, describe, execute, execute_with_startup, plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
@@ -74,6 +76,7 @@ pub enum PgType {
     ByteaArray,
     CharArray,
     Int2Vector,
+    OidVector,
     OidArray,
     TextArray,
     NameArray,
@@ -100,6 +103,7 @@ impl PgType {
             Self::ByteaArray => 1001,
             Self::CharArray => 1002,
             Self::Int2Vector => 22,
+            Self::OidVector => 30,
             Self::OidArray => 1028,
             Self::TextArray => 1009,
             Self::NameArray => 1003,
@@ -120,7 +124,7 @@ impl PgType {
     }
     /// Non-null array wire encoders can use this instead of matching each variant.
     /// AclItemArray is only used for NULL catalog cells and has no scalar variant.
-    /// Int2Vector uses a space-separated vector representation, not array braces.
+    /// Int2Vector/OidVector use a space-separated representation, not array braces.
     pub fn array_element(self) -> Option<Self> {
         Some(match self {
             Self::Int2Array => Self::Int2,

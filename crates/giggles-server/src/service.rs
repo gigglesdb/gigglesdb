@@ -165,6 +165,7 @@ impl Service {
         clock: Clock,
         limits: crate::admission::ServiceLimits,
     ) -> Result<Arc<Self>, CoreError> {
+        crate::pg_catalog_wire::initialize_startup();
         let map = Self::validate(&admin, bindings)?;
         let mut next = 0u64;
         let entries = map

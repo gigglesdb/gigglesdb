@@ -284,7 +284,7 @@ fn rejects_unimplemented_even_empty() {
         "SELECT * FROM pg_catalog.made_up",
         "SELECT * FROM pg_class FOR UPDATE",
         "SELECT count(*) FROM pg_class",
-        "SELECT relname FROM pg_class UNION SELECT relname FROM pg_class",
+        "SELECT relname FROM pg_class INTERSECT SELECT relname FROM pg_class",
     ] {
         assert!(plan(sql).is_err(), "{sql}");
     }
@@ -420,9 +420,9 @@ fn captured_datagrip_discovery_and_absent_features() {
         assert!(run(sql).rows.is_empty());
     }
     assert!(matches!(
-        plan(
+        execute(&plan(
             "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time"
-        ),
+        ).unwrap().unwrap(), &CatalogSnapshot::default(), &[]),
         Err(Error::Unsupported)
     ));
 }

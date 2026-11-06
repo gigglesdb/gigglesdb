@@ -58,6 +58,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("reloptions", T::TextArray),
             ("relacl", T::AclItemArray),
             ("xmin", T::Xid),
+            ("relpartbound", T::Text),
         ],
         "pg_attribute" => &[
             ("attrelid", T::Oid),
@@ -72,6 +73,10 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("attgenerated", T::Char),
             ("atthasdef", T::Bool),
             ("attcollation", T::Oid),
+            ("xmin", T::Xid),
+            ("attndims", T::Int4),
+            ("attislocal", T::Bool),
+            ("attfdwoptions", T::TextArray),
         ],
         "pg_type" => &[
             ("oid", T::Oid),
@@ -89,6 +94,10 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("typinput", T::Oid),
             ("typdelim", T::Char),
             ("typowner", T::Oid),
+            ("xmin", T::Xid),
+            ("typndims", T::Int4),
+            ("typdefault", T::Text),
+            ("typisdefined", T::Bool),
         ],
         "pg_index" => &[
             ("indexrelid", T::Oid),
@@ -101,6 +110,9 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("indkey", T::Int2Vector),
             ("indpred", T::Text),
             ("indexprs", T::Text),
+            ("indoption", T::Int2Vector),
+            ("indcollation", T::OidVector),
+            ("indclass", T::OidVector),
         ],
         "pg_constraint" => &[
             ("oid", T::Oid),
@@ -115,6 +127,14 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("condeferrable", T::Bool),
             ("condeferred", T::Bool),
             ("convalidated", T::Bool),
+            ("xmin", T::Xid),
+            ("contypid", T::Oid),
+            ("confupdtype", T::Char),
+            ("confdeltype", T::Char),
+            ("confmatchtype", T::Char),
+            ("connoinherit", T::Bool),
+            ("conbin", T::Text),
+            ("conexclop", T::OidArray),
         ],
         "pg_description" | "pg_shdescription" => &[
             ("objoid", T::Oid),
@@ -134,6 +154,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("datdba", T::Oid),
             ("datistemplate", T::Bool),
             ("datallowconn", T::Bool),
+            ("datacl", T::AclItemArray),
         ],
         "pg_user" => &[
             ("usename", T::Name),
@@ -149,6 +170,120 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("laninline", T::Oid),
             ("lanvalidator", T::Oid),
             ("xmin", T::Xid),
+            ("lanacl", T::AclItemArray),
+        ],
+        "pg_roles" => &[
+            ("oid", T::Oid),
+            ("rolname", T::Name),
+            ("rolsuper", T::Bool),
+            ("rolinherit", T::Bool),
+            ("rolcreaterole", T::Bool),
+            ("rolcreatedb", T::Bool),
+            ("rolcanlogin", T::Bool),
+            ("rolreplication", T::Bool),
+            ("rolconnlimit", T::Int4),
+            ("rolvaliduntil", T::Text),
+            ("rolbypassrls", T::Bool),
+            ("rolconfig", T::TextArray),
+        ],
+        "pg_auth_members" => &[
+            ("roleid", T::Oid),
+            ("member", T::Oid),
+            ("grantor", T::Oid),
+            ("admin_option", T::Bool),
+        ],
+        "pg_timezone_names" => &[("name", T::Text), ("is_dst", T::Bool)],
+        "pg_timezone_abbrevs" => &[("abbrev", T::Text), ("is_dst", T::Bool)],
+        "pg_tablespace" => &[
+            ("oid", T::Oid),
+            ("spcname", T::Name),
+            ("spcowner", T::Oid),
+            ("spcoptions", T::TextArray),
+            ("spcacl", T::AclItemArray),
+            ("xmin", T::Xid),
+        ],
+        "pg_foreign_data_wrapper" => &[
+            ("oid", T::Oid),
+            ("fdwname", T::Name),
+            ("fdwowner", T::Oid),
+            ("fdwhandler", T::Oid),
+            ("fdwvalidator", T::Oid),
+            ("fdwoptions", T::TextArray),
+            ("fdwacl", T::AclItemArray),
+            ("xmin", T::Xid),
+        ],
+        "pg_foreign_server" => &[
+            ("oid", T::Oid),
+            ("srvname", T::Name),
+            ("srvowner", T::Oid),
+            ("srvfdw", T::Oid),
+            ("srvtype", T::Text),
+            ("srvversion", T::Text),
+            ("srvoptions", T::TextArray),
+            ("srvacl", T::AclItemArray),
+            ("xmin", T::Xid),
+        ],
+        "pg_user_mappings" => &[
+            ("umid", T::Oid),
+            ("srvid", T::Oid),
+            ("usename", T::Name),
+            ("umoptions", T::TextArray),
+        ],
+        "pg_am" => &[
+            ("oid", T::Oid),
+            ("amname", T::Name),
+            ("amhandler", T::Oid),
+            ("amtype", T::Char),
+            ("xmin", T::Xid),
+        ],
+        "pg_extension" => &[
+            ("oid", T::Oid),
+            ("extname", T::Name),
+            ("extowner", T::Oid),
+            ("extnamespace", T::Oid),
+            ("extversion", T::Text),
+            ("xmin", T::Xid),
+        ],
+        "pg_depend" => &[
+            ("classid", T::Oid),
+            ("objid", T::Oid),
+            ("objsubid", T::Int4),
+            ("refclassid", T::Oid),
+            ("refobjid", T::Oid),
+            ("refobjsubid", T::Int4),
+            ("deptype", T::Char),
+        ],
+        "pg_cast" => &[
+            ("oid", T::Oid),
+            ("castsource", T::Oid),
+            ("casttarget", T::Oid),
+            ("castfunc", T::Oid),
+            ("castcontext", T::Char),
+            ("castmethod", T::Char),
+            ("xmin", T::Xid),
+        ],
+        "pg_inherits" => &[
+            ("inhrelid", T::Oid),
+            ("inhparent", T::Oid),
+            ("inhseqno", T::Int4),
+        ],
+        "pg_foreign_table" => &[
+            ("ftrelid", T::Oid),
+            ("ftserver", T::Oid),
+            ("ftoptions", T::TextArray),
+            ("xmin", T::Xid),
+        ],
+        "pg_opclass" => &[
+            ("oid", T::Oid),
+            ("opcname", T::Name),
+            ("opcnamespace", T::Oid),
+            ("opcmethod", T::Oid),
+            ("opcdefault", T::Bool),
+        ],
+        "pg_collation" => &[
+            ("oid", T::Oid),
+            ("collname", T::Name),
+            ("collnamespace", T::Oid),
         ],
         "pg_proc" => &[
             ("oid", T::Oid),
@@ -184,6 +319,22 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_language",
         "pg_proc",
         "pg_event_trigger",
+        "pg_roles",
+        "pg_auth_members",
+        "pg_timezone_names",
+        "pg_timezone_abbrevs",
+        "pg_tablespace",
+        "pg_foreign_data_wrapper",
+        "pg_foreign_server",
+        "pg_user_mappings",
+        "pg_am",
+        "pg_extension",
+        "pg_depend",
+        "pg_cast",
+        "pg_inherits",
+        "pg_foreign_table",
+        "pg_opclass",
+        "pg_collation",
     ]
 }
 pub(crate) fn relation_oid(name: &str) -> Option<u32> {
@@ -202,6 +353,22 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_proc" => 1255,
         "pg_event_trigger" => 3466,
         "pg_user" => 12001,
+        "pg_roles" => 12002,
+        "pg_auth_members" => 1261,
+        "pg_timezone_names" => 12003,
+        "pg_timezone_abbrevs" => 12004,
+        "pg_tablespace" => 1213,
+        "pg_foreign_data_wrapper" => 2328,
+        "pg_foreign_server" => 1417,
+        "pg_user_mappings" => 12005,
+        "pg_am" => 2601,
+        "pg_extension" => 3079,
+        "pg_depend" => 2608,
+        "pg_cast" => 2605,
+        "pg_inherits" => 2611,
+        "pg_foreign_table" => 3118,
+        "pg_opclass" => 2616,
+        "pg_collation" => 3456,
         _ => return None,
     })
 }
@@ -293,9 +460,30 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }
     add(
         "pg_database",
-        vec![I(16384), s("giggles"), I(10), B(false), B(true)],
+        vec![I(16384), s("giggles"), I(10), B(false), B(true), N],
     );
     add("pg_user", vec![s("giggles"), I(10), B(false)]);
+    // One certificate-bound presentation identity; PostgreSQL role management,
+    // inheritance, expiration and role connection-limit policies do not exist.
+    add(
+        "pg_roles",
+        vec![
+            I(10),
+            s("giggles"),
+            B(false),
+            B(false),
+            B(false),
+            B(false),
+            B(true),
+            B(false),
+            N,
+            N,
+            B(false),
+            N,
+        ],
+    );
+    // No timezone conversion database exists. Startup timezone presentation
+    // labels do not establish a PostgreSQL timezone catalog.
     // Catalog relations are genuine virtual tables, with their actual columns below.
     for &name in known_names() {
         let oid = relation_oid(name).unwrap() as i64;
@@ -315,6 +503,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(32768 + oid),
                 I(0),
                 I(0),
+                N,
                 N,
                 N,
                 N,
@@ -340,6 +529,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(""),
                     B(false),
                     I(0),
+                    N,
+                    I(0),
+                    B(true),
+                    N,
                 ],
             );
         }
@@ -375,6 +568,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }
     add("pg_type", type_row(22, "int2vector", -1, 21, 1006, false));
     add("pg_type", type_row(1006, "_int2vector", -1, 22, 0, true));
+    add("pg_type", type_row(30, "oidvector", -1, 26, 1013, false));
+    add("pg_type", type_row(1013, "_oidvector", -1, 30, 0, true));
     for t in &snapshot.tables {
         let oid = table_oid(t.id)? as i64;
         let has_pk = !t.primary_key.is_empty();
@@ -393,6 +588,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(oid + 3),
                 I(0),
                 I(0),
+                N,
                 N,
                 N,
                 N,
@@ -419,6 +615,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(""),
                     B(false),
                     I(0),
+                    N,
+                    I(0),
+                    B(true),
+                    N,
                 ],
             );
         }
@@ -443,6 +643,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     N,
                     N,
                     N,
+                    N,
                 ],
             );
             add(
@@ -458,6 +659,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     key.clone(),
                     N,
                     N,
+                    Value::Array(vec![I(0); t.primary_key.len()]),
+                    Value::Array(vec![I(0); t.primary_key.len()]),
+                    Value::Array(vec![I(0); t.primary_key.len()]),
                 ],
             );
             for (i, k) in t.primary_key.iter().enumerate() {
@@ -478,6 +682,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                         s(""),
                         B(false),
                         I(0),
+                        N,
+                        I(0),
+                        B(true),
+                        N,
                     ],
                 );
             }
@@ -496,6 +704,14 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     B(false),
                     B(false),
                     B(true),
+                    N,
+                    I(0),
+                    s(" "),
+                    s(" "),
+                    s(" "),
+                    B(true),
+                    N,
+                    N,
                 ],
             );
         }
@@ -540,6 +756,10 @@ fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64) -> Vec<Val
         I(0),
         s(","),
         I(10),
+        N,
+        I(0),
+        N,
+        B(true),
     ]
 }
 fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: bool) -> Vec<Value> {
@@ -559,7 +779,7 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             "U"
         } else if oid == 18 {
             "Z"
-        } else if oid == 22 {
+        } else if matches!(oid, 22 | 30) {
             "A"
         } else {
             "S"
@@ -573,5 +793,9 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
         I(if is_array { 750 } else { 0 }),
         s(","),
         I(10),
+        N,
+        I(0),
+        N,
+        B(true),
     ]
 }

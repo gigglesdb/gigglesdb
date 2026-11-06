@@ -127,3 +127,44 @@ authorized table cases remain UNTESTED because the offline fixture grants only
 pgJDBC 42.7.3 intentionally reports NULL TABLE_CAT/TABLE_CATALOG in schemas,
 tables, columns and primary-key results; the probes require NULL plus wasNull.
 getCatalogs instead returns the actual `giggles` database name.
+
+The DataGrip discovery profile also exercises the installed connection helper's
+`version()` query, stable service startup epoch, and pgJDBC's secondary `xid`
+column-type lookup. These are actual JDBC calls, not a claim of complete GUI
+introspection support. Optional PostgreSQL lock-age/MVCC probes remain unsupported.
+
+PostgreSQL query errors include a static `phase` and SHA256 `query_id` in the
+ErrorResponse detail and server console. The hash identifies the original SQL
+bytes across prepared execution; SQL text and bound values are not logged.
+
+The latest captured discovery batch retains fourteen expanded statements and raw
+SQL SHA-256 identities in `latest-expanded-queries.json`. Each required
+`dg_Batch_*` case replays the exact statement through both simple and prepared
+JDBC execution, checks every result column label and metadata type, and checks
+independent fixture facts: one application role, no timezone database, one database,
+two authorized schemas, and no invented foreign objects, extensions, casts, or
+role grants. Empty results still resolve all column metadata, including the
+secondary pgJDBC custom-type queries. The fixture does not model PostgreSQL role
+inheritance, connection-limit policy, validity, configuration, or ACLs; metadata
+must preserve false/NULL as specified by the probe.
+
+`dg_StateNumber` and `dg_CurrentXid` assert the explicit unsupported SQLSTATE
+`0A000` and remain UNTESTED. An unexpected success or different rejection is a
+failure. An expected rejection never becomes a passing client-support claim.
+The full discovery profile remains UNTESTED while unreplayed templates remain.
+
+Timezone catalog rows are empty because the engine has no timezone conversion
+database. A startup TimeZone label and SHOW response do not establish timezone
+conversion support.
+
+Seven additional `dg_App_*` cases execute installed table/column/constraint/index
+queries against the six-column `app` fixture. They derive schema/table/index/PK
+OIDs from the real catalog, substitute the schema OID into the pinned PostgreSQL
+14 full-schema expansions, and assert both simple and prepared result metadata,
+column order/types/nullability, PK membership and object links. Every case
+rejects disclosure of the real hidden `other` table. The installed templates,
+expansions, hashes and independent fixture contract are frozen with each matrix.
+The bounded catalog normalizes `varchar` casts to its TEXT representation; the
+probes explicitly check TEXT metadata for those casts. Index option/collation/
+opclass IDs are zero where no PostgreSQL access-method mapping exists; absent
+method capabilities remain NULL.

@@ -19,6 +19,110 @@ use tokio::{
 pub const CAP: usize = 256 * 1024;
 pub const DISCOVERY_CASES: &[(&str, &str)] = &[
     (
+        "dg_App_RetrieveExistentTables",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveTables",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveColumns",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveIndices",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveConstraints",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveExistentConstraints",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_App_RetrieveIndexColumns",
+        "installed schema-level template with runtime real OIDs, exact app facts and hidden other negative",
+    ),
+    (
+        "dg_Batch_DateStyle",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveTimeZones",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveRoles",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveRoleGrants",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveTablespaces",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_DatabaseTablespaceACL",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveForeignDataWrappers",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveForeignServers",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveUserMappings",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveAccessMethods",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveExtensions",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_SchemaForeignACL",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_ListCasts",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_Batch_RetrieveExtensionMembers",
+        "exact captured expanded SQL in simple/prepared paths with metadata and independent fixture facts",
+    ),
+    (
+        "dg_StateNumber",
+        "unsupported PostgreSQL MVCC is explicitly UNTESTED after asserted rejection",
+    ),
+    (
+        "dg_CurrentXid",
+        "unsupported PostgreSQL transaction identity is explicitly UNTESTED after asserted rejection",
+    ),
+    (
+        "dg_DetectionVersion",
+        "installed helper version query identifies GigglesDB",
+    ),
+    (
+        "dg_ServerStartupTime",
+        "installed startup expression returns stable actual service epoch",
+    ),
+    (
+        "dg_ColumnTypeLookup",
+        "actual JDBC metadata resolves xid without fabricated tuple version",
+    ),
+    (
         "dg_IsSuperUser",
         "exact installed IsSuperUser SQL: one non-superuser row",
     ),

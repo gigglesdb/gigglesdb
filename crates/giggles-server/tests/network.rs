@@ -1186,6 +1186,28 @@ async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority(
                 }
             }
             assert!(statuses.iter().any(|v| v == "DateStyle\0ISO\0"));
+            let expected_timezone = statuses
+                .iter()
+                .find_map(|v| v.strip_prefix("TimeZone\0"))
+                .unwrap()
+                .trim_end_matches('\0');
+            pg_send(&mut s, b'Q', b"SHOW TimeZone\0").await;
+            let mut returned = false;
+            loop {
+                let (tag, body) = pg_read(&mut s).await;
+                assert_ne!(tag, b'E');
+                if tag == b'D' {
+                    assert_eq!(&body[..2], &1u16.to_be_bytes());
+                    let length = i32::from_be_bytes(body[2..6].try_into().unwrap()) as usize;
+                    assert_eq!(&body[6..6 + length], expected_timezone.as_bytes());
+                    returned = true;
+                }
+                if tag == b'Z' {
+                    break;
+                }
+            }
+            assert!(returned);
+
             pg_send(&mut s, b'Q', b"SELECT id FROM app WHERE id=1\0").await;
             loop {
                 let (tag, _) = pg_read(&mut s).await;
@@ -2762,6 +2784,52 @@ async fn catalog_and_application_pages_share_aggregate_cache_admission() {
 mod accounting_network;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_queries_report_stage_and_fingerprint_without_sql_or_values() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    let sql = "SELECT private_probe('never_log_this_secret')";
+    let error = pg.query(sql, &[]).await.unwrap_err();
+    let error = error.as_db_error().unwrap();
+    assert_eq!(error.code().code(), "0A000");
+    assert!(error.message().contains("unsupported SQL feature"));
+    let detail = error.detail().unwrap();
+    assert!(detail.contains("phase=catalog planning"));
+    assert!(detail.contains(&hex::encode(Sha256::digest(sql.as_bytes()))));
+    for private in ["private_probe", "never_log_this_secret", "SELECT"] {
+        assert!(!detail.contains(private));
+        assert!(!error.message().contains(private));
+    }
+    let prepared_sql = "SELECT $1::int8";
+    let mut raw = raw_pg(&f).await;
+    pg_send(&mut raw, b'P', &parse("d", prepared_sql)).await;
+    assert_eq!(pg_sync(&mut raw).await[0].0, b'1');
+    pg_send(
+        &mut raw,
+        b'B',
+        &bind("p", "d", &[Some("private_bind_value")], false),
+    )
+    .await;
+    let frames = pg_sync(&mut raw).await;
+    assert!(has_code(&frames, "22P02"));
+    let body = frames.iter().find(|(t, _)| *t == b'E').unwrap().1.clone();
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("phase=bind"));
+    assert!(body.contains(&hex::encode(Sha256::digest(prepared_sql.as_bytes()))));
+    assert!(!body.contains("private_bind_value"));
+    // An unrelated missing statement must not inherit the preceding query id.
+    pg_send(&mut raw, b'B', &bind("p", "missing", &[], false)).await;
+    let frames = pg_sync(&mut raw).await;
+    assert!(has_code(&frames, "26000"));
+    let body =
+        String::from_utf8(frames.iter().find(|(t, _)| *t == b'E').unwrap().1.clone()).unwrap();
+    assert!(body.contains("query_id=none"));
+    drop(pg);
+    conn.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn datagrip_keepalive_table_free_select_simple_prepared_and_role_boundaries() {
     let f = Fixture::new().await;
     let (pg, conn) = f.pg(f.app.clone()).await;
@@ -2932,3 +3000,56 @@ async fn catalog_multiple_granted_tables_composite_key_order_and_empty_visible_s
 
 #[path = "lifecycle_network.inc"]
 mod lifecycle_network;
+
+#[tokio::test]
+async fn installed_datagrip_detection_and_startup_queries() {
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    for (sql, expected) in [("show DateStyle", "ISO"), ("SHOW TimeZone", "UTC")] {
+        assert_eq!(
+            pg.query_one(sql, &[]).await.unwrap().get::<_, String>(0),
+            expected
+        );
+        assert!(pg.simple_query(sql).await.unwrap().iter().any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some(expected))));
+    }
+
+    let lookup =
+        include_str!("../../giggles-pg-catalog/tests/fixtures/jdbc-column-type-lookup.sql");
+    let typed = pg
+        .prepare_typed(lookup, &[tokio_postgres::types::Type::INT8])
+        .await
+        .unwrap();
+    let row = pg.query_one(&typed, &[&28i64]).await.unwrap();
+    assert_eq!(row.get::<_, String>(2), "xid");
+    assert!(!row.get::<_, bool>(0));
+    for value in [-1i64, 4_294_967_296i64] {
+        assert_eq!(
+            code(pg.query(&typed, &[&value]).await.unwrap_err()),
+            "42804"
+        );
+    }
+    assert_eq!(pg.query(&typed, &[&28i64]).await.unwrap().len(), 1);
+
+    let version: String = pg.query_one("select version()", &[]).await.unwrap().get(0);
+    assert!(version.starts_with("GigglesDB "));
+    let sql = "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time";
+    let p = pg.prepare(sql).await.unwrap();
+    let first: i64 = pg.query_one(&p, &[]).await.unwrap().get(0);
+    assert!(first > 0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(first <= now);
+    let second: i64 = pg.query_one(&p, &[]).await.unwrap().get(0);
+    assert_eq!(first, second);
+    let messages = pg.simple_query(sql).await.unwrap();
+    assert!(messages.iter().any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some(first.to_string().as_str()))));
+    drop(pg);
+    conn.await.unwrap();
+    let (task, conn) = f.pg(f.task.clone()).await;
+    assert_eq!(code(task.query(sql, &[]).await.unwrap_err()), "42501");
+    drop(task);
+    conn.await.unwrap();
+    f.stop().await;
+}

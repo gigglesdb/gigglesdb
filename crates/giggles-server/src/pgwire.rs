@@ -99,8 +99,38 @@ pub fn error(code: &str, out: &mut Vec<u8>) {
     error_message(code, "request rejected; consult documented code", out);
 }
 fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
+    diagnostic_error(code, message, None, out);
+}
+#[derive(Default)]
+struct Diagnostic {
+    phase: &'static str,
+    query_id: Option<String>,
+}
+impl Diagnostic {
+    fn query(&mut self, sql: &str) {
+        use sha2::{Digest, Sha256};
+        self.query_id = Some(hex::encode(Sha256::digest(sql.as_bytes())));
+    }
+}
+fn diagnostic_error(
+    code: &str,
+    message: &'static str,
+    diagnostic: Option<&Diagnostic>,
+    out: &mut Vec<u8>,
+) {
     // Never log request text or values. Messages are fixed server diagnostics.
-    eprintln!("protocol=postgres sqlstate={code} reason={message}");
+    let detail = diagnostic.map(|d| {
+        format!(
+            "phase={}; query_id={}",
+            d.phase,
+            d.query_id.as_deref().unwrap_or("none")
+        )
+    });
+    if let Some(detail) = &detail {
+        eprintln!("protocol=postgres sqlstate={code} {detail} reason={message}");
+    } else {
+        eprintln!("protocol=postgres sqlstate={code} reason={message}");
+    }
     out.clear();
     let mut b = vec![b'S'];
     z("ERROR", &mut b);
@@ -108,6 +138,10 @@ fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
     z(code, &mut b);
     b.push(b'M');
     z(message, &mut b);
+    if let Some(detail) = detail {
+        b.push(b'D');
+        z(&detail, &mut b);
+    }
     b.push(0);
     let _ = frame(b'E', &b, out);
 }
@@ -293,7 +327,8 @@ fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
 }
-fn catalog_plan(sql: &str) -> R<Option<giggles_pg_catalog::Plan>> {
+fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_catalog::Plan>> {
+    diagnostic.phase = "catalog planning";
     match giggles_pg_catalog::plan(sql) {
         // Preserve the finite application grammar's own diagnostics (for
         // example COPY rejection). Core still parses and authorizes the entire
@@ -321,6 +356,7 @@ struct Statement {
     p: Plan,
     d: Description,
     parameter_oids: Vec<u32>,
+    query_id: Option<String>,
 }
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
@@ -378,6 +414,7 @@ fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
     frame(b'C', &b, out)
 }
 struct State {
+    diagnostic: Diagnostic,
     implicit: bool,
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
@@ -516,6 +553,7 @@ impl State {
             }
             b'Q' => {
                 let sql = r.text()?;
+                self.diagnostic.query(&sql);
                 r.end()?;
                 self.statements.remove("");
                 self.portals.remove("");
@@ -571,16 +609,17 @@ impl State {
                         self.settings.current.apply(setting);
                         frame(b'C', b"SET\0", out)?;
                     }
-                } else if let Some(plan) = catalog_plan(&sql)? {
+                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
+                    self.diagnostic.phase = "catalog execution";
                     let (_, tables) = core(session.catalog_snapshot())?;
-                    let result =
-                        giggles_pg_catalog::execute(&plan, &catalog_wire::snapshot(tables), &[])
-                            .map_err(catalog_wire::error)?;
+                    let result = catalog_wire::execute(&plan, &catalog_wire::snapshot(tables), &[])
+                        .map_err(catalog_wire::error)?;
                     catalog_wire::retained_bytes(&result)?;
                     catalog_wire::description(&result.fields, &[], out)?;
                     catalog_wire::rows(&result, &[], 0, result.rows.len(), out)?;
                     catalog_complete(result.rows.len(), out)?;
                 } else {
+                    self.diagnostic.phase = "application SQL";
                     let was_transaction = session.in_transaction();
                     // ROLLBACK must bypass normal prepare when already aborted.
                     if session.is_aborted()
@@ -620,6 +659,7 @@ impl State {
             b'P' => {
                 let name = r.text()?;
                 let sql = r.text()?;
+                self.diagnostic.query(&sql);
                 let n = r.u16()?;
                 if n > 256 {
                     return Err("54000");
@@ -683,7 +723,7 @@ impl State {
                     }
                     let task = crate::task_statement::TaskStatement::parse(&sql)?;
                     (Plan::Task(task), task.description())
-                } else if let Some(plan) = catalog_plan(&sql)? {
+                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
                     let (epoch, _) = core(session.catalog_snapshot())?;
                     let fields =
                         giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
@@ -701,6 +741,7 @@ impl State {
                     };
                     (Plan::Catalog(Box::new(plan), fields, epoch), d)
                 } else {
+                    self.diagnostic.phase = "application prepare";
                     let p = core(session.prepare(&sql))?;
                     let d = core(session.sql.describe(&p))?;
                     (Plan::Sql(Box::new(p)), d)
@@ -714,6 +755,7 @@ impl State {
                     }
                     _ => d.parameters.iter().map(oid).collect(),
                 };
+                self.diagnostic.phase = "parameter type declaration";
                 for (i, (o, t)) in oids.into_iter().zip(&mut d.parameters).enumerate() {
                     if matches!(p, Plan::Catalog(..)) {
                         if o != 0 {
@@ -723,7 +765,13 @@ impl State {
                             // change only ParameterDescription while leaving a
                             // projected parameter's output type unchanged.
                             if o != parameter_oids[i] {
-                                return Err("0A000");
+                                let safe_numeric = matches!(&p, Plan::Catalog(plan, _, _)
+                                    if plan.allows_numeric_input_override())
+                                    && matches!(o, 20 | 21 | 23 | 26)
+                                    && matches!(parameter_oids[i], 20 | 21 | 23 | 26);
+                                if !safe_numeric {
+                                    return Err("0A000");
+                                }
                             }
                             parameter_oids[i] = o;
                         }
@@ -760,6 +808,7 @@ impl State {
                         p,
                         d,
                         parameter_oids,
+                        query_id: self.diagnostic.query_id.clone(),
                     },
                 );
                 frame(b'1', &[], out)?;
@@ -768,6 +817,7 @@ impl State {
                 let name = r.text()?;
                 let stmt = r.text()?;
                 let s = self.statements.get(&stmt).ok_or("26000")?.clone();
+                self.diagnostic.query_id = s.query_id.clone();
                 s.describe(session)?;
                 let fmts = formats(&mut r, s.d.parameters.len())?;
                 let n = r.u16()?;
@@ -851,6 +901,7 @@ impl State {
                 match kind {
                     b'S' => {
                         let s = self.statements.get(&name).ok_or("26000")?;
+                        self.diagnostic.query_id = s.query_id.clone();
                         let d = s.describe(session)?;
                         let mut b = vec![];
                         b.extend((d.parameters.len() as u16).to_be_bytes());
@@ -866,6 +917,7 @@ impl State {
                     }
                     b'P' => {
                         let p = self.portals.get(&name).ok_or("34000")?;
+                        self.diagnostic.query_id = p.s.query_id.clone();
                         let d = p.s.describe(session)?;
                         if let Plan::Catalog(_, fields, _) = &p.s.p {
                             catalog_wire::description(fields, &p.formats, out)?;
@@ -888,15 +940,17 @@ impl State {
                     return Err("08P01");
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
+                self.diagnostic.query_id = p.s.query_id.clone();
                 p.s.describe(session)?;
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
+                    self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     let (current, tables) = core(session.catalog_snapshot())?;
                     if current != *epoch {
                         return Err("0A000");
                     }
                     if p.catalog_result.is_none() {
-                        let result = giggles_pg_catalog::execute(
+                        let result = catalog_wire::execute(
                             plan,
                             &catalog_wire::snapshot(tables),
                             &p.catalog_params,
@@ -1229,12 +1283,14 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     ready(&session, &mut out).map_err(io::Error::other)?;
     send(s, &out).await?;
     let mut state = State {
+        diagnostic: Diagnostic::default(),
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         portals: BTreeMap::new(),
         drain: false,
     };
+    startup_settings.timezone = timezone;
     state.settings.current = startup_settings;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
@@ -1290,6 +1346,18 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                 continue;
             }
         };
+        state.diagnostic = Diagnostic {
+            phase: match tag {
+                b'Q' => "simple query",
+                b'P' => "parse",
+                b'B' => "bind",
+                b'D' => "describe",
+                b'E' => "execute",
+                b'S' => "sync",
+                _ => "protocol message",
+            },
+            query_id: None,
+        };
         let (returned_session, returned_state, response, keep) = blocking
             .run_admitted(permit, move || {
                 let mut out = Vec::new();
@@ -1320,7 +1388,16 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                             state.implicit = false;
                             state.portals.clear();
                         }
-                        error(code, &mut out);
+                        let message = match code {
+                            "0A000" => {
+                                "unsupported SQL feature or parameter type in this server profile"
+                            }
+                            "42601" => {
+                                "statement syntax is not supported by this server SQL profile"
+                            }
+                            _ => "request rejected; consult documented code",
+                        };
+                        diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
                         if matches!(tag, b'Q' | b'S') {
                             state.drain = false;
                             ready(&session, &mut out)

@@ -1,0 +1,57 @@
+{
+  "creation_sql": "CREATE TABLE app (id BIGINT PRIMARY KEY, body TEXT, flag BOOLEAN, small SMALLINT, num INTEGER, data BYTEA)",
+  "source": "crates/giggles-server/tests/network.rs",
+  "visible_tables": [
+    "app"
+  ],
+  "hidden_table": "other",
+  "columns": [
+    {
+      "name": "id",
+      "postgresql_type": "int8",
+      "jdbc_type": -5,
+      "ordinal": 1,
+      "not_null": true
+    },
+    {
+      "name": "body",
+      "postgresql_type": "text",
+      "jdbc_type": 12,
+      "ordinal": 2,
+      "not_null": false
+    },
+    {
+      "name": "flag",
+      "postgresql_type": "bool",
+      "jdbc_type": -7,
+      "ordinal": 3,
+      "not_null": false
+    },
+    {
+      "name": "small",
+      "postgresql_type": "int2",
+      "jdbc_type": 5,
+      "ordinal": 4,
+      "not_null": false
+    },
+    {
+      "name": "num",
+      "postgresql_type": "int4",
+      "jdbc_type": 4,
+      "ordinal": 5,
+      "not_null": false
+    },
+    {
+      "name": "data",
+      "postgresql_type": "bytea",
+      "jdbc_type": -2,
+      "ordinal": 6,
+      "not_null": false
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "primary_key_name": "app_pkey",
+  "provenance": "Fixture database and rewritten server configuration SHA-256 identities are retained per isolated matrix profile; this contract supplies independent expected facts, never inferred expected columns from query output."
+}

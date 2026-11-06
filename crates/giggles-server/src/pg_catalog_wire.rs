@@ -72,11 +72,14 @@ pub(crate) fn snapshot(
     }
 }
 
+fn is_vector(ty: PgType) -> bool {
+    matches!(ty, PgType::Int2Vector | PgType::OidVector)
+}
 fn element(ty: PgType) -> Option<PgType> {
-    if ty == PgType::Int2Vector {
-        Some(PgType::Int2)
-    } else {
-        ty.array_element()
+    match ty {
+        PgType::Int2Vector => Some(PgType::Int2),
+        PgType::OidVector => Some(PgType::Oid),
+        _ => ty.array_element(),
     }
 }
 
@@ -99,6 +102,7 @@ pub(crate) fn parameter_type(oid: u32) -> Result<PgType> {
         1002 => PgType::CharArray,
         1003 => PgType::NameArray,
         22 => PgType::Int2Vector,
+        30 => PgType::OidVector,
         1028 => PgType::OidArray,
         1009 => PgType::TextArray,
         _ => return Err("0A000"),
@@ -146,14 +150,14 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         if count > 8192 {
             return Err("54000");
         }
-        if reader.u32()? != u32::from(ty != PgType::Int2Vector) {
+        if reader.u32()? != u32::from(!is_vector(ty)) {
             return Err("0A000");
         }
         let mut values = Vec::new();
         for _ in 0..count {
             let length = reader.u32()?;
             values.push(if length == u32::MAX {
-                if nulls == 0 || ty == PgType::Int2Vector {
+                if nulls == 0 || is_vector(ty) {
                     return Err("22P03");
                 }
                 Value::Null
@@ -164,6 +168,11 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         reader.end()?;
         return Ok(Value::Array(values));
     }
+    // PostgreSQL internal "char" uses a zero byte for its empty value.
+    // Text format renders that value as an empty string, not SQL NULL.
+    if ty == PgType::Char && format == 1 && bytes == [0] {
+        return Ok(Value::Text(String::new()));
+    }
     let data_type = match ty {
         PgType::Bool => T::Boolean,
         PgType::Int2 => T::SmallInt,
@@ -173,7 +182,9 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         PgType::Bytea => T::Bytes,
         _ => return Err("0A000"),
     };
-    if (ty == PgType::Char && bytes.len() != 1) || (ty == PgType::Name && bytes.len() > 63) {
+    if (ty == PgType::Char && (bytes.len() > 1 || (format == 1 && bytes.is_empty())))
+        || (ty == PgType::Name && bytes.len() > 63)
+    {
         return Err("22P03");
     }
     if matches!(data_type, T::Text) && bytes.contains(&0) {
@@ -267,7 +278,7 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
         }
         (Value::Text(v), PgType::Text | PgType::Name | PgType::Char) => {
             if v.contains('\0')
-                || (ty == PgType::Char && v.len() != 1)
+                || (ty == PgType::Char && v.len() > 1)
                 || (ty == PgType::Name && v.len() > 63)
             {
                 return Err("22021");
@@ -275,7 +286,11 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
             if v.len() > MAX_RESPONSE {
                 return Err("54000");
             }
-            v.as_bytes().to_vec()
+            if ty == PgType::Char && format == 1 && v.is_empty() {
+                vec![0]
+            } else {
+                v.as_bytes().to_vec()
+            }
         }
         (Value::Bytes(v), PgType::Bytea) => {
             if v.len() > MAX_RESPONSE / 2 {
@@ -291,22 +306,18 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
             if values.len() > 8192 {
                 return Err("54000");
             }
-            if array == PgType::Int2Vector && values.contains(&Value::Null) {
+            if is_vector(array) && values.contains(&Value::Null) {
                 return Err("42804");
             }
             let scalar = element(array).unwrap();
             let mut encoded = Vec::new();
             if format == 0 {
-                if array != PgType::Int2Vector {
+                if !is_vector(array) {
                     encoded.push(b'{');
                 }
                 for (i, value) in values.iter().enumerate() {
                     if i != 0 {
-                        encoded.push(if array == PgType::Int2Vector {
-                            b' '
-                        } else {
-                            b','
-                        });
+                        encoded.push(if is_vector(array) { b' ' } else { b',' });
                     }
                     match encode(value, scalar, 0)? {
                         None => encoded.extend(b"NULL"),
@@ -341,7 +352,7 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
                         return Err("54000");
                     }
                 }
-                if array != PgType::Int2Vector {
+                if !is_vector(array) {
                     encoded.push(b'}');
                 }
             } else {
@@ -350,7 +361,7 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
                 encoded.extend(scalar.oid().to_be_bytes());
                 if !values.is_empty() {
                     encoded.extend((values.len() as i32).to_be_bytes());
-                    encoded.extend(i32::from(array != PgType::Int2Vector).to_be_bytes());
+                    encoded.extend(i32::from(!is_vector(array)).to_be_bytes());
                 }
                 for value in values {
                     match encode(value, scalar, 1)? {
@@ -447,10 +458,76 @@ pub(crate) fn rows(
     Ok(())
 }
 
+// Initialized when the first Service is constructed, stable for this process.
+static STARTUP: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+pub(crate) fn initialize_startup() {
+    STARTUP.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+    });
+}
+pub(crate) fn execute(
+    plan: &giggles_pg_catalog::Plan,
+    snapshot: &giggles_pg_catalog::CatalogSnapshot,
+    parameters: &[Value],
+) -> std::result::Result<ResultSet, giggles_pg_catalog::Error> {
+    giggles_pg_catalog::execute_with_startup(
+        plan,
+        snapshot,
+        parameters,
+        STARTUP.get().copied().flatten(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio_postgres::types::{FromSql, Type};
+
+    #[test]
+    fn empty_internal_char_has_distinct_text_binary_and_null_encodings() {
+        let empty = Value::Text(String::new());
+        assert_eq!(encode(&empty, PgType::Char, 0).unwrap(), Some(vec![]));
+        assert_eq!(encode(&empty, PgType::Char, 1).unwrap(), Some(vec![0]));
+        assert_eq!(encode(&Value::Null, PgType::Char, 1).unwrap(), None);
+        assert_eq!(decode(&[], PgType::Char, 0).unwrap(), empty);
+        assert_eq!(decode(&[0], PgType::Char, 1).unwrap(), empty);
+        assert!(decode(&[], PgType::Char, 1).is_err());
+        assert!(decode(&[0], PgType::Char, 0).is_err());
+        assert!(encode(&Value::Text("ab".into()), PgType::Char, 0).is_err());
+        for format in [0, 1] {
+            let v = Value::Text("r".into());
+            let bytes = encode(&v, PgType::Char, format).unwrap().unwrap();
+            assert_eq!(decode(&bytes, PgType::Char, format).unwrap(), v);
+        }
+    }
+    #[test]
+    fn oidvector_preserves_unsigned_elements_zero_origin_and_vector_syntax() {
+        assert_eq!(parameter_type(30), Ok(PgType::OidVector));
+        let value = Value::Array(vec![Value::Int(0), Value::Int(u32::MAX.into())]);
+        assert_eq!(
+            encode(&value, PgType::OidVector, 0).unwrap().unwrap(),
+            b"0 4294967295"
+        );
+        let wire = encode(&value, PgType::OidVector, 1).unwrap().unwrap();
+        assert_eq!(&wire[8..12], &26u32.to_be_bytes());
+        assert_eq!(&wire[16..20], &0u32.to_be_bytes());
+        assert_eq!(decode(&wire, PgType::OidVector, 1).unwrap(), value);
+        let mut wrong = wire.clone();
+        wrong[16..20].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(decode(&wrong, PgType::OidVector, 1), Err("0A000"));
+        wrong = wire.clone();
+        wrong[8..12].copy_from_slice(&23u32.to_be_bytes());
+        assert_eq!(decode(&wrong, PgType::OidVector, 1), Err("22P03"));
+        for value in [Value::Null, Value::Int(-1), Value::Int(4_294_967_296)] {
+            assert!(encode(&Value::Array(vec![value]), PgType::OidVector, 1).is_err());
+        }
+        let empty = Value::Array(vec![]);
+        let bytes = encode(&empty, PgType::OidVector, 1).unwrap().unwrap();
+        assert_eq!(decode(&bytes, PgType::OidVector, 1).unwrap(), empty);
+    }
     #[test]
     fn vectors_use_zero_based_binary_bounds_and_names_escape_as_arrays() {
         let value = Value::Array(vec![Value::Int(2), Value::Int(1)]);
