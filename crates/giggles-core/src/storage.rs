@@ -2,6 +2,7 @@ use crate::*;
 mod catalog_inspection;
 pub(crate) mod native_once;
 pub mod replica;
+pub mod roles;
 use bincode::Options;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};

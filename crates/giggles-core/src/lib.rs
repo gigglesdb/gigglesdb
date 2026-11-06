@@ -8,6 +8,7 @@ mod scalar;
 mod storage;
 pub use storage::SqlSession;
 pub use storage::replica;
+pub use storage::roles;
 pub use storage::{Admin, CoreError, CrashPoint, DecisionPoint, Executor, Limits, RecoveryPoint};
 mod sql;
 pub use sql::parse_repair;
