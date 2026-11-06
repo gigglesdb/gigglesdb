@@ -13,3 +13,4 @@ mod cancel;
 pub mod task_statement;
 
 pub mod admission;
+mod pg_catalog_wire;

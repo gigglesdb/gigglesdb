@@ -90,7 +90,7 @@ SQL NULL/wasNull, repeated queries crossing prepare threshold, commit visibility
 rollback, failed transaction recovery, authorization, close, and actual metadata
 tables/columns/PK/type-info/hidden-column probes. Metadata assertions require
 the real visible fixture catalog; a fabricated empty catalog fails. Type mapping
-currently expects JDBC `BINARY` for BYTEA; an intentional alternate driver mapping
+expects pinned pgJDBC `BIT` for BOOL and `BINARY` for BYTEA; an intentional alternate driver mapping
 must be reviewed as a contract change, never silently accepted after a failure.
 The error recovery contract expects 23505 for duplicate PK and 25P02 until rollback.
 
@@ -108,3 +108,21 @@ these may differ from the source embedded in an older runner executable. They
 are not build provenance. Frozen executable identities are not proof
 that an arbitrary supplied server executable matches a repository revision.
 Keep its build command/source attribution beside the report when publishing it.
+
+The `datagrip-discovery` profile executes the captured DataGrip 2026.2.5
+`IsSuperUser`, `ListDatabases`, `ListSchemas`, `ListExistentLanguages`,
+`ListLanguages` and `RetrieveEventTriggers` SQL through pgJDBC 42.7.3, with exact expected
+identity, privilege, and database facts. The complete installed resource and its
+98-section inventory live in `probes/datagrip-2026.2.5`; frozen copies and hashes
+are retained in each report directory. Remaining templates are explicitly
+UNTESTED. This profile does not execute DataGrip's GUI or its template engine.
+
+JDBC also asserts current database/schema/user/session identity, getSchema,
+SERIALIZABLE isolation, filtered schema/catalog/table identities, column order
+and nullability, PK sequence, and named type mappings. Composite PK and multiple
+authorized table cases remain UNTESTED because the offline fixture grants only
+`app`; the real hidden `other` table remains an executed negative control.
+
+pgJDBC 42.7.3 intentionally reports NULL TABLE_CAT/TABLE_CATALOG in schemas,
+tables, columns and primary-key results; the probes require NULL plus wasNull.
+getCatalogs instead returns the actual `giggles` database name.

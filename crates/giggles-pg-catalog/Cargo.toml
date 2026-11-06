@@ -1,0 +1,8 @@
+[package]
+name = "giggles-pg-catalog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sqlparser = { version = "=0.53.0", features = ["visitor"] }
+regex = "=1.12.2"

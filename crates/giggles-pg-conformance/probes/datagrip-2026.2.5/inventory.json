@@ -1,0 +1,504 @@
+{
+  "client": "DataGrip",
+  "version": "2026.2.5",
+  "pgjdbc": "42.7.3",
+  "resource": "com/intellij/database/dialects/postgres/introspector/PgIntroQueries.sql",
+  "installed_jar": "I:\\Jetbrains\\DataGrip\\plugins\\DatabaseTools\\lib\\modules\\intellij.database.dialects.postgres.jar",
+  "installed_jar_sha256": "663be90cc7c992826b2e51afeb24c2eb8ca3ba882d288fe4a30f247fd456ce52",
+  "resource_sha256": "1c544ac583b89d17a43888c4a7ea31d84e817921777bddc78c0fedcf4149549b",
+  "retained_audit": "artifacts\\gd48-audit\\review-a940a974523641fe9e4c630011e9242e",
+  "blocks": [
+    {
+      "name": "ServerStartupTime",
+      "sha256": "b8a5bbfa4533ff26cacc8cca5962eef901df098237c45dc97a1c8df5aa36b918",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "IsSuperUser",
+      "sha256": "315a32fd0ef0f28c2330a026ba53e09f8a919a6594bb91d1355bfde7c40886fa",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListDatabases",
+      "sha256": "2680a6ecac2af357fc401a79aa3afd9cad185a315d3d1ab42852ee901a1789b2",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListExistentLanguages",
+      "sha256": "97f1cf4d8487edc239c436d90d835daf59b8d69fa7873d10fc8cea860b709060",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListLanguages",
+      "sha256": "5308bbf73e097b5d837055f62372486d4cf21efd429e4003f40f977822430732",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentEventTriggers",
+      "sha256": "6861c5ea6f035f81e36c43998c06767b6dd501bbaadfacb7664c056c6e7128f1",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveEventTriggers",
+      "sha256": "d6e48be5906568cfd857abc5ba0292a329346abbe4f5d2af1a276b2fda236fb0",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "ListSchemas",
+      "sha256": "52265c5d60cadefac6a896ed26de72741805c55f9843e079efa47fd65aab7670",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveRoles",
+      "sha256": "d2e57226dedf941b42cb24688318bc64e0c566fa393030ea1b6e08f094d21605",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentTablespaces",
+      "sha256": "f968abbd9ed08da1455a0a30f16e6f43985eda177ae9af5161b636cfba940d64",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveTablespaces",
+      "sha256": "f37f668070e7b607c95f515bc5821337f31804a63df8f607fddc25b6e03e4f1d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "StateNumber",
+      "sha256": "6da84e7be792ff057efefe131aae649dbdaa6a087ffa020089a326268ecb944c",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "CurrentXid",
+      "sha256": "43e35cdc7972aff50b3ffde177aa1e2140dfaced14eeb1a95b151841f139ba39",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListExistentSchemaComments",
+      "sha256": "1d152571b405f43b31d9c94a413c78b530b09da1643a2541eee9fe9ad3a67ef9",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "ListExistentServerComments",
+      "sha256": "dfd9a37e0268571d82cfee2d9edac1ea2fcbee551882cb13a0963f4154f0bd3b",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListExistentDatabaseComments",
+      "sha256": "bb4853b05ab47562994ecd6de68266e5b5de6e9d4c3c871602365b5b1c65da15",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaComments",
+      "sha256": "e68a4efedede692fe1dcbe87f244a43865253e7e9bc92fb9c50885bc3dc38818",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragPgClassRels",
+      "sha256": "edcaa43bf6824be36b926a5e347b738c997a82d76d25df4fc893221598ff203e",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragConstraints",
+      "sha256": "39b3a4635f81c1a94327899caca9bcbe481f943b7de3edadc542b40d3421f059",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragObjTypes",
+      "sha256": "4ff0f9a898c98d3fc6c7f844bbb7d697c13b7d38e7229fc3864fbd5ad20dc45a",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragTableTriggers",
+      "sha256": "a8d9a5cca872c0edc2fc766e0c1293f2477c6b1d6ad8eef389afa83babbae6f1",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragTableRules",
+      "sha256": "798d38ebdceaf2a5dcd1af5e3d9d8a491d96e29c546e72b0183f9e673fd56fa5",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragTableIndices",
+      "sha256": "50db66f1c0031bcaa4205c3196a20ba9101b13af8d924e6b5ac0a22bade2721d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragProcs",
+      "sha256": "bce5c84d4e9435068403638c99e7099682b47b742bdbace48163d8bd866b50b7",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragOperators",
+      "sha256": "df9b7358f14668270375d1be66664e86cc41c68f6edacd5a13a93f4206a44579",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragOpClasses",
+      "sha256": "ef48e761d3a59912e63069cbe712e163715e4bccbd3f8499eb4accacc302c2ca",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragOpFamilies",
+      "sha256": "fc5c65f4100689b978f72ad8689f4d2d2365147da20ba89577c83c565b96dc38",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragCollations",
+      "sha256": "184d430f21b9d8994a3bb63e0052fc367835f309a6d0931e254afdb0d24f2111",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSchemaCommentsFragSecPolicies",
+      "sha256": "4cdd6a4a2c476154b1682381c6315a1da646892f1fcf1b2654d9964cdb3be7c7",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveDatabaseComments",
+      "sha256": "bb99c980edc4adba9fc6abc5e34d6911896d602d19d734ffb7fbe18ed5d50b56",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveStates",
+      "sha256": "2a184ecbafc9c6f8b868ecc88bd09d923048830b4e3b3cac1e16a31bfc6e9af9",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentSequences",
+      "sha256": "b94c90fd27301d03a1513eb0357dfc5839e92f0882820bce93f78a4051a49faa",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSequences10",
+      "sha256": "c5633eed0af3e583c69fda572b47bea2c473ab2cd5228db4b832ff809cd46887",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSequences",
+      "sha256": "0e079160292baff0001788058e355a6cfd427f4e1312ef82cece5d4bf51ccfeb",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentDataTypes",
+      "sha256": "212f2f8943f5908aceea1b6dea6651c3720776a09256e47e8f6b6082bd5491b7",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveDataTypes",
+      "sha256": "9e9dd1d573a691ce24e556b3a124bd6cdf6a0f11fca6f68803e7bb3fa59703f9",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentDataTypeChecks",
+      "sha256": "5706cc23f91e68325ec35277de05b36cf063e30d28f50de00ff1bd155ee080d4",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveDataTypeChecks",
+      "sha256": "355e9fdd8c07f9fda881b9efbda19fb884c7d2036cde5a28471fc66b2ae53557",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentTables",
+      "sha256": "4701f50827f5f6f2d54eed818aedf17d0fc831d1ea46cf2328ee81a2a01b8417",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveTables",
+      "sha256": "2145787c4e3bf7c13974528aec0e0ab972f1d737041d839576cff128fc305332",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveForeignTables",
+      "sha256": "61d58e7c5702fb5473d0acd7f3782603ae12266ae4ab9a25c40065121b8cc472",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveStructAttributes",
+      "sha256": "92f19878621f7b661ad08f614c811cf224daf249ca56da82e3f5477b3c34f699",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveEnumLabels",
+      "sha256": "4c8d78db38a464b4b1dc6d9d8ef94d31bd39caf592070dfb109a835145892929",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveColumns",
+      "sha256": "0fd13795ef5b3a56b1f9e35666766d56b34b1f4627df77ed99351c8d2b3960ce",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentIndices",
+      "sha256": "ebc071dfbfae1e2376b383630a60f02a63f6cbd4a347217ac4d99930260fea49",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveIndices",
+      "sha256": "0803ceb921e8548c15eb5df835a8636d6bf355bfb0dd84dd813ccbe89b263144",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveIndexColumns",
+      "sha256": "6a2edac226391d82e282f16281e08a03412e0ae7c4f8cef0eefc6508d561238a",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentConstraints",
+      "sha256": "21519045d4f3c8c7bc20e3e17814f029765ae038370e14e66bad7599062223c7",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveConstraints",
+      "sha256": "c2bc152dda9e6eb2ecda8497663eb90d921c188decf7682f2e22deb1dd6995b9",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveUsedArgumentTypes",
+      "sha256": "91e1dea6ba909e91e61d0464a8e4a58c9bf989271c851e270799a0d8386d931d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentRoutines",
+      "sha256": "b6b93ed0f2cfa496242aea705362a3cb3b7d94b4a4a42a86ab7e416a0b7f3428",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveRoutines",
+      "sha256": "a6828dc7ac6fb67da0454c8f95cb7e72caa03877376687666ef16103b0ea2c57",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentAggregates",
+      "sha256": "4f0920cbcf06500ed5d81f679c127c9442a236bc8514ae4d2eb5230e6b9440b3",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveAggregates",
+      "sha256": "21e78db6b83b127b9dd86daa702162f972187923d1a5a599d8ff7009afa5ee66",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentExtensions",
+      "sha256": "bbb0785d27c226f9f8be893ba81c3651293b1f97393a22da77ed002cfc79fd4e",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveExtensions",
+      "sha256": "824a88540cbd1ead12651699fdaca881520a2aa38d33aeb972fcb0449ec34286",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExtensionMembers",
+      "sha256": "f2653ca235a0c54092dee39196ec51da858be731d1d3f6e69c61e36b55f74a59",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveExistentOperators",
+      "sha256": "ea3ba10d4a0825574fe09d57c0a302f7ef5d2f36c9cc013fb6c5379ac704e2ca",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveOperators",
+      "sha256": "7200796881e33c4df3155dc4e83b991ba280feff733991968c00fe5b2b0de35e",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentOperatorClasses",
+      "sha256": "f420daa1518b6e1822708e71f8e37789a7dede8a812a4ef4d79f67d00f95bcee",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveOperatorClasses",
+      "sha256": "73b8921862c428ed22d5e037345c297d1ef93efb27f3c69cd58c2e8ba67bcd6a",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentAmOps",
+      "sha256": "15d7d3966a7f639d236aabfcc58cfdad051ff4828beac89ee53c54b5862c42bb",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveAmOps",
+      "sha256": "866066c350f0bfd6b35b1c798175e3e4c68fdc3e9f5f69e92e214911f0076511",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentAmProcs",
+      "sha256": "d17c7d2a973476105a28e094b0f166dea614e844afcd2822cca0c79aba9ab5e6",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveAmProcs",
+      "sha256": "14d55e3e73bf90871dd0a89d98ec9bf5b1a4a655cd1d619fc8f85f90a5dfa4f9",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentOperatorFamilies",
+      "sha256": "9587ff082c1537a913d6619ca3408ba51d9525ae374db482b99fda353eb769f3",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveOperatorFamilies",
+      "sha256": "d25ff33a5f62de69f0b2171f76b72184fcf3e5b1fb07c0cf72a14cda87bee9e6",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentRules",
+      "sha256": "9fc0c3bf48f02e59b111c7febee1a8650828f262b03f9434cd2dc41c28954161",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveRules",
+      "sha256": "0ca28b98cc03e58b879e6596ef07b6f5fcb295548b620e99bb8242dbd58b4833",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentTriggers",
+      "sha256": "65a6614f56a410b48ab37dcc91e0e8f666332369dffc2bde8ca77a6eea7b1dc5",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveTriggers",
+      "sha256": "e6acd955e48073d86a378d31b023481f458ead8e3dd0c19d91d0737f0e81dcaf",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveViewSources",
+      "sha256": "8bbd6ca068efa1afd4f901ab476baa2acae908de60a169f50f70ba81762dc353",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveRuleSources",
+      "sha256": "938a6e5668ff1f9306f2de565852f9f65e41a99472ab2c496327fa25452a15d0",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveFunctionSources",
+      "sha256": "9eb28fc53204d11a129aa718393ce920b9856dc743649b7b68314fd092b73ab5",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentAccessMethods",
+      "sha256": "ddb536cf9de8885f4491d42ffe1473602733c2e32c559ef5471a68a6c7aece8f",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveAccessMethods",
+      "sha256": "abb00a35eee26ab01b776d37086da58729dd2af3ea032998d908fc74b09c7ddf",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "ListExistentCasts",
+      "sha256": "40935161b949d00827d0148a36a8b97a0138e0b616c80a2000cf2662a2609d75",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListCasts",
+      "sha256": "12bac9ee5fd6ed2d0c05cc76858d3a949b6d5995e1994bc0626546902f358e7d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentCollations",
+      "sha256": "abf32b8ef9e73aa6ca252b9b564961dfcc8962e9dc116c6898ef33b637b121e1",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveCollations",
+      "sha256": "67485d7310c668cdf9dced91c3de14057663247d24d5aaee16099ac383c0d720",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentForeignDataWrappers",
+      "sha256": "c6696234a85e35a8d7f37ba55ba79628eddefa6f43321190bd27ced61db6671e",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveForeignDataWrappers",
+      "sha256": "1cb442919f5a58b71884f09deea577ab7c50fc5cd512cb7873593bab24e78a2a",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentForeignServers",
+      "sha256": "47b0e3d3d9e29a204565dd0a5f35d6088391c8d67d5fb6f8fd122d3060c0fafa",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveForeignServers",
+      "sha256": "e7882ce3445d0c0e43ff893974f08d7d69bed03e5ff5bdd4c239d18d528135c2",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveExistentUserMappingsSuperUser",
+      "sha256": "8f25b681770cbb828becd29dc36188311fc0953ffa9fe043d0d7f72b78613e66",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveUserMappingsSuperUser",
+      "sha256": "d629339fa5e0bc1a152f81d9cbba33d5be671be44ef6c2fa73fb9ae34d9096ba",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveUserMappings",
+      "sha256": "2bd5746ef006e813519be3e3e7ec157da5d79eabc625c9d67a73046bde1fb067",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "ListReferencingSchemas",
+      "sha256": "6cd91794380266d19d96cb7694cc7d79d53379c5c298274913639d04288be2a0",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveRelations",
+      "sha256": "2d323da06ed25e3205e8d802b6b90829d5c37486561026ea54a92bf7c2520069",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveTimeZones",
+      "sha256": "4641d9eb2ce42275f44e72d9a6a3b0c6f08585b2a8caaff06b78750d6bc8adb5",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveDateStyle",
+      "sha256": "731df89409ee386abe45015a40c9acedf3b93fabf023411ea8ceaeee7161708b",
+      "requires_template_expansion": false
+    },
+    {
+      "name": "RetrieveExistentSecurityPolicies",
+      "sha256": "75583f097f4228b3bf3f12f6ff2663fbc50fee087ecfecd5d92fc3bf72e1544d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveSecurityPolicies",
+      "sha256": "10ee5be62ceeeaae2af5a8aa4968b5148e5436b5c6c11c7d39da0df05a2b5ff0",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "RetrieveDependentTableNames",
+      "sha256": "1e24851353be660cdd3f979cb55ae42ba1344ec0e6f0073d874fd6ddf0ec1c4d",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "L1_ListAllExistentObjects",
+      "sha256": "d89ae25c4344135e17e7c31ad501ca676df0870dfb727046b998cbb0a8d91baa",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "L1_ListAllMajorNames",
+      "sha256": "5a66f525ae6723d481b0df635b9026ac1f61d30ffdfda1469a9cfd3f0325bf68",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "L1_RetrieveColumnNames",
+      "sha256": "9e619d1659837fbfb08ce491f7d9791e92cf9fe7dd21e8c84247f144eea428eb",
+      "requires_template_expansion": true
+    },
+    {
+      "name": "L1_RetrieveRoutineArgNames",
+      "sha256": "87011d8aaab8a85dcd6a5b4d78548c3d1fe68493b12f0f7f47f2e4ec10ff6a7f",
+      "requires_template_expansion": true
+    }
+  ],
+  "build": "262.10315.132",
+  "product_info_sha256": "369b7c7d331464e26b1f6f8aaebedb829b6a7c692a5dac09c945f8d4fd4aa1ed"
+}

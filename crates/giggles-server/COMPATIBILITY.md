@@ -10,7 +10,7 @@ is no row-level tenant sharing or generic task table grant.
 | --- | --- | --- |
 | TLS/auth | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext, password fallback, unbound/wrong-CA/no certificate; CRL/CA/server-certificate hot rotation remain; trusted live binding reload supported |
 | Startup | SSLRequest then v3, fixed giggles user/database, UTF8, bounded application_name/DateStyle/TimeZone/extra_float_digits | Direct TLS, GSS, replication, options, alternate users/databases |
-| Simple query | One inherited statement; typed rows; empty/comment-only queries; bounded JDBC initialization SET batches | General multi-statements, COPY, arbitrary SET, catalog/system SQL |
+| Simple query | One inherited statement; typed rows; empty/comment-only queries; bounded JDBC initialization SET batches | General multi-statements, COPY, arbitrary SET, catalog SQL outside the bounded metadata profile |
 | Extended | Parse/Bind/Describe/Execute/Sync/Close/Flush; named and unnamed objects; pipeline error drain to Sync | COPY, arbitrary PostgreSQL syntax |
 | Binding | NULL; text/binary bool,int2,int4,int8,text,bytea; varchar for TEXT; integer wire widths with destination range checks; case-insensitive boolean text | Other OIDs, general implicit casts, text bytea escape format (only hex accepted); task OIDs remain exact |
 | Describe | Parsed metadata only, without executing any write; domain/schema/transaction fences | Types not inferable from supported columns/LIMIT |
@@ -19,12 +19,15 @@ is no row-level tenant sharing or generic task table grant.
 | Task wire | Simple GIGGLES JSON plus finite typed prepared KEY/RANGE preview/execute and STATUS; same native redaction | Generic deliveries/application SQL, task transactions and role rebinding |
 | Cancellation | Cooperative native/task Deadline and certificate-bound pg CancelRequest/BackendKeyData; pinned tokio-postgres0.7.15 with SSLRequest+mTLS | Before-decision57014 prevents this invocation publishing; after decision success/ambiguous IO is preserved. No plaintext cancel, no query-generation guarantee, no unsafe IO interruption |
 | Outcome | Original task operation ID status/retry; bounded stable decision digest/count | General application idempotent commits/status remain absent; no exactly-once claim |
-| Driver | Actual tokio-postgres0.7.15 with tokio-postgres-rustls0.13.0; actual pgJDBC42.7.3 basic initialization/query/validation/rollback probes | DataGrip browsing, JDBC catalog metadata/isolation APIs, libpq/psql, ODBC, ORMs and full PostgreSQL compatibility unqualified |
+| Driver | Actual tokio-postgres0.7.15 with tokio-postgres-rustls0.13.0; actual pgJDBC42.7.3 initialization/query/validation/rollback, identity/schema/isolation and catalog metadata probes | Full DataGrip GUI browsing, libpq/psql, ODBC, ORMs and full PostgreSQL compatibility unqualified |
 
-DataGrip 2026.2.5 discovery uses identity functions and PostgreSQL catalog queries
-that this server does not implement. Connecting and executing supported SQL does
-not imply that schema browsing works. Catalog requests fail instead of returning
-fabricated empty catalogs. See [the driver conformance runner](../giggles-pg-conformance/README.md)
+The read-only catalog adapter supplies actual application table/column/PK definitions
+filtered by the current certificate grant. Prepared metadata and cached pages recheck
+authority and schema epoch. JDBC metadata methods and a bounded set of captured
+DataGrip 2026.2.5 discovery queries are exercised; full GUI introspection remains
+unqualified. Unknown catalogs/functions fail explicitly. Empty catalogs are used
+only for explicitly modeled absent features, such as procedural languages and
+event triggers. See [catalog query limits](../giggles-pg-catalog/README.md). See [the driver conformance runner](../giggles-pg-conformance/README.md)
 for reproducible per-case results, including failed and untested cases.
 
 Stock pgJDBC cancellation sends plaintext CancelRequest and cannot cancel this
@@ -51,7 +54,7 @@ Frames: native request256KiB, response8MiB; pg startup8192bytes, post-startup fr
 allocation. Per listener1..128 connections, admitted before TLS; two configured
 listeners share at most128 total by default (configurable1..128). Per session32 statements and32portals;
 names63bytes, SQL64KiB. Parameter payloads retained by portals and materialized
-results each have an8MiB aggregate limit per session; results are admitted
+results share one8MiB aggregate limit per session; results are admitted
 before caching or emitting rows. A single bounded result can temporarily exceed retained
 capacity before rejection. Prepared SQL is at most32x64KiB per session. Core
 parameters256, row64KiB, result1024rows/1MiB raw values;8 staged transactions shared

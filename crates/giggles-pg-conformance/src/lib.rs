@@ -17,7 +17,54 @@ use tokio::{
 };
 
 pub const CAP: usize = 256 * 1024;
+pub const DISCOVERY_CASES: &[(&str, &str)] = &[
+    (
+        "dg_IsSuperUser",
+        "exact installed IsSuperUser SQL: one non-superuser row",
+    ),
+    (
+        "dg_ListDatabases",
+        "exact installed ListDatabases SQL: giggles, positive oid, null description, non-template, connectable, giggles owner",
+    ),
+    (
+        "dg_ListSchemas",
+        "captured ListSchemas SQL and exact modeled facts",
+    ),
+    (
+        "dg_ListExistentLanguages",
+        "captured ListExistentLanguages SQL and exact modeled facts",
+    ),
+    (
+        "dg_ListLanguages",
+        "captured ListLanguages SQL and exact modeled facts",
+    ),
+    (
+        "dg_RetrieveEventTriggers",
+        "captured RetrieveEventTriggers SQL and exact modeled facts",
+    ),
+    (
+        "dg_remaining_templates",
+        "remaining captured templates independently asserted",
+    ),
+];
 pub const JDBC_CASES: &[(&str, &str)] = &[
+    (
+        "identity",
+        "current database giggles, schema public, current/session user giggles",
+    ),
+    ("connection_schema", "Connection.getSchema public"),
+    (
+        "connection_isolation",
+        "Connection.getTransactionIsolation SERIALIZABLE",
+    ),
+    ("metadata_catalogs", "exact catalog giggles"),
+    ("metadata_schemas", "filtered public schema in giggles"),
+    (
+        "metadata_table_filter",
+        "exact app identity and absent hidden/nonexistent tables",
+    ),
+    ("composite_pk", "composite PK ordered by KEY_SEQ"),
+    ("multiple_tables", "multiple authorized table identities"),
     ("connect_init", "connected, initialized, autocommit true"),
     ("is_valid", "isValid(3) true"),
     ("simple_query", "zero rows for fixture id 8000"),
@@ -55,6 +102,10 @@ pub const JDBC_CASES: &[(&str, &str)] = &[
         "six actual app columns with correct JDBC types",
     ),
     ("metadata_pk", "exact primary key id"),
+    (
+        "metadata_type_names",
+        "exact int8/text/bool/int2/int4/bytea JDBC mapping",
+    ),
     ("metadata_types", "all six supported JDBC types advertised"),
     ("metadata_hidden", "no columns for unauthorized other table"),
     (

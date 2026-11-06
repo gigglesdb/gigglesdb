@@ -355,6 +355,50 @@ impl Session {
     pub fn is_aborted(&self) -> bool {
         self.sql.is_aborted()
     }
+    /// A coherent committed catalog restricted to this live application binding.
+    /// Active SQL snapshots must agree with every returned table definition;
+    /// metadata never falls back to an unrestricted owner query.
+    pub(crate) fn catalog_snapshot(
+        &mut self,
+    ) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.authority_scope(|session| {
+            if session.is_aborted() {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let Role::Application { domain, tables } = &session.role else {
+                return Err(CoreError::Policy(Error::Scope));
+            };
+            if session.service.admin.authority_metadata()?.0.to_string() != *domain {
+                return Err(CoreError::Policy(Error::Authentication));
+            }
+            let (epoch, catalog) = session.service.admin.catalog()?;
+            let visible = catalog
+                .into_iter()
+                .filter(|table| tables.contains(&table.name))
+                .collect::<Vec<_>>();
+            if visible.len() > relational::MAX_TABLES {
+                return Err(CoreError::Sql(relational::SqlError::Limit));
+            }
+            for table in &visible {
+                giggles_core::cancellation::check()?;
+                // Table names originate from the validated engine catalog, not
+                // client SQL. Prepare/Describe do not access application rows.
+                let prepared = session
+                    .sql
+                    .prepare(&format!("SELECT * FROM {} LIMIT 1", table.name))?;
+                let description = session.sql.describe(&prepared)?;
+                if description.columns != table.columns {
+                    return Err(CoreError::Sql(relational::SqlError::Conflict));
+                }
+            }
+            // A concurrent trusted DDL operation cannot splice two generations
+            // into this snapshot or make validation certify a different catalog.
+            if session.service.admin.catalog()?.0 != epoch {
+                return Err(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            Ok((epoch, visible))
+        })
+    }
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
         self.authority_scope(|session| {
             let p = if session.in_transaction() && !session.is_aborted() {
@@ -615,6 +659,96 @@ mod lifecycle_tests {
             Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
             bindings,
         )
+    }
+    #[test]
+    fn metadata_snapshot_filters_real_definitions_without_reading_or_mutating_rows() {
+        let (service, bindings) = fixture();
+        service.admin.sql_session().execute(
+            "CREATE TABLE hidden (tenant BIGINT, id INTEGER, body TEXT, PRIMARY KEY (tenant,id))",
+            &[], None,
+        ).unwrap();
+        let before = service.admin.catalog().unwrap();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let (epoch, visible) = session.catalog_snapshot().unwrap();
+        assert_eq!(epoch, before.0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            visible[0],
+            before.1.iter().find(|t| t.name == "app").unwrap().clone()
+        );
+        assert_eq!(service.admin.catalog().unwrap(), before);
+        assert!(!session.in_transaction());
+        session.execute_sql("BEGIN", &[]).unwrap();
+        assert_eq!(session.catalog_snapshot().unwrap().1, visible);
+        session.execute_sql("ROLLBACK", &[]).unwrap();
+    }
+    #[test]
+    fn metadata_snapshot_denies_task_roles_and_does_not_invent_missing_tables() {
+        let (service, mut bindings) = fixture();
+        let domain = service.admin.authority_metadata().unwrap().0.to_string();
+        bindings[0].role = Role::Task {
+            domain: domain.clone(),
+            task: TaskId(91),
+            principal: Principal(92),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut task = service.session(&bindings[0].fingerprint).unwrap();
+        assert!(matches!(
+            task.catalog_snapshot(),
+            Err(CoreError::Policy(Error::Scope))
+        ));
+        bindings[0].role = Role::Application {
+            domain,
+            tables: BTreeSet::from(["not_created".into()]),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut empty = service.session(&bindings[0].fingerprint).unwrap();
+        assert!(empty.catalog_snapshot().unwrap().1.is_empty());
+    }
+    #[test]
+    fn metadata_snapshot_fences_new_schema_during_transaction() {
+        let (service, mut bindings) = fixture();
+        let Role::Application { tables, .. } = &mut bindings[0].role else {
+            unreachable!()
+        };
+        tables.insert("future".into());
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        session.execute_sql("BEGIN", &[]).unwrap();
+        let before = session.catalog_snapshot().unwrap().1;
+        let mut owner = service.admin.sql_session();
+        owner
+            .execute("CREATE TABLE future (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert!(matches!(
+            session.catalog_snapshot(),
+            Err(CoreError::Sql(relational::SqlError::UnknownTable))
+        ));
+        session.sql.rollback();
+        let after = session.catalog_snapshot().unwrap().1;
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().any(|table| table.name == "future"));
+    }
+    #[test]
+    fn metadata_snapshot_rechecks_revocation_and_aborted_state() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        session.execute_sql("BEGIN", &[]).unwrap();
+        session.abort();
+        assert!(matches!(
+            session.catalog_snapshot(),
+            Err(CoreError::Sql(relational::SqlError::Aborted))
+        ));
+        session.sql.rollback();
+        assert!(session.catalog_snapshot().is_ok());
+        service.reload_bindings(vec![]).unwrap();
+        assert!(matches!(
+            session.catalog_snapshot(),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        service.reload_bindings(bindings).unwrap();
+        assert!(session.catalog_snapshot().is_err());
     }
     #[test]
     fn sentinel_bindings_and_legacy_multi_source_plans_cannot_expand_scope() {

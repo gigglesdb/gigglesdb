@@ -486,3 +486,155 @@ async fn process_nonzero_is_preserved() {
     assert_eq!(c.code, Some(7));
     assert!(!c.timed_out);
 }
+
+#[test]
+fn discovery_missing_output_fails_every_required_case() {
+    let c = Capture {
+        code: Some(0),
+        stdout: b"VERSION\t42.7.3\n".to_vec(),
+        ..Default::default()
+    };
+    let p = evaluate(
+        "pgJDBC",
+        "datagrip-discovery",
+        "42.7.3",
+        DISCOVERY_CASES,
+        &c,
+    );
+    assert_eq!(p.verdict, Status::Fail);
+    assert!(p.cases.iter().all(|c| c.status == Status::Fail));
+}
+#[test]
+fn discovery_incorrect_rows_cannot_pass() {
+    let mut c = capture();
+    c.stdout = format!(
+        "VERSION\t42.7.3\n{}{}{}{}{}{}{}",
+        record("dg_IsSuperUser", "FAIL", "wrong superuser row"),
+        record("dg_ListDatabases", "FAIL", "invented database"),
+        record("dg_ListSchemas", "PASS", "assertions satisfied"),
+        record("dg_ListExistentLanguages", "PASS", "assertions satisfied"),
+        record("dg_ListLanguages", "PASS", "assertions satisfied"),
+        record("dg_RetrieveEventTriggers", "PASS", "assertions satisfied"),
+        record("dg_remaining_templates", "UNTESTED", "templates pending")
+    )
+    .into_bytes();
+    let p = evaluate(
+        "pgJDBC",
+        "datagrip-discovery",
+        "42.7.3",
+        DISCOVERY_CASES,
+        &c,
+    );
+    assert_eq!(p.verdict, Status::Fail);
+    assert!(p.integrity.is_empty());
+}
+#[test]
+fn discovery_untested_templates_prevent_support() {
+    let mut c = capture();
+    c.stdout = format!(
+        "VERSION\t42.7.3\n{}{}{}{}{}{}{}",
+        record("dg_IsSuperUser", "PASS", "assertions satisfied"),
+        record("dg_ListDatabases", "PASS", "assertions satisfied"),
+        record("dg_ListSchemas", "PASS", "assertions satisfied"),
+        record("dg_ListExistentLanguages", "PASS", "assertions satisfied"),
+        record("dg_ListLanguages", "PASS", "assertions satisfied"),
+        record("dg_RetrieveEventTriggers", "PASS", "assertions satisfied"),
+        record("dg_remaining_templates", "UNTESTED", "templates pending")
+    )
+    .into_bytes();
+    assert_eq!(
+        evaluate(
+            "pgJDBC",
+            "datagrip-discovery",
+            "42.7.3",
+            DISCOVERY_CASES,
+            &c
+        )
+        .verdict,
+        Status::Untested
+    );
+    c.stdout
+        .extend(record("dg_IsSuperUser", "PASS", "assertions satisfied").bytes());
+    assert_eq!(
+        evaluate(
+            "pgJDBC",
+            "datagrip-discovery",
+            "42.7.3",
+            DISCOVERY_CASES,
+            &c
+        )
+        .verdict,
+        Status::Fail
+    );
+}
+#[test]
+fn discovery_cannot_substitute_for_main_required_cases() {
+    let c = Capture {
+        code: Some(0),
+        stdout: format!(
+            "VERSION\t42.7.3\n{}",
+            record("dg_IsSuperUser", "PASS", "assertions satisfied")
+        )
+        .into_bytes(),
+        ..Default::default()
+    };
+    let p = evaluate("pgJDBC", "default", "42.7.3", JDBC_CASES, &c);
+    assert_eq!(p.verdict, Status::Fail);
+    assert!(p.cases.iter().all(|c| c.status == Status::Fail));
+    assert!(!p.integrity.is_empty());
+}
+
+#[test]
+fn discovery_resource_identity_and_executable_queries_are_pinned() {
+    use sha2::{Digest, Sha256};
+    let resource = include_bytes!("../probes/datagrip-2026.2.5/PgIntroQueries.sql");
+    let inventory: serde_json::Value =
+        serde_json::from_str(include_str!("../probes/datagrip-2026.2.5/inventory.json")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(resource)),
+        inventory["resource_sha256"].as_str().unwrap()
+    );
+    assert_eq!(inventory["version"], "2026.2.5");
+    assert_eq!(inventory["build"], "262.10315.132");
+    assert_eq!(inventory["blocks"].as_array().unwrap().len(), 98);
+    let sql = std::str::from_utf8(resource).unwrap();
+    let java = include_str!("../probes/JdbcProbe.java");
+    for name in ["IsSuperUser", "ListDatabases"] {
+        let marker = format!("---- {name} ----");
+        let section = sql
+            .split_once(&marker)
+            .unwrap()
+            .1
+            .split("----")
+            .next()
+            .unwrap()
+            .trim();
+        assert!(
+            java.contains(&serde_json::to_string(section).unwrap()),
+            "captured executable SQL drift: {name}"
+        );
+    }
+}
+#[test]
+fn required_registries_have_unique_cases_and_preserve_main_contract() {
+    for cases in [JDBC_CASES, DISCOVERY_CASES] {
+        let ids = cases
+            .iter()
+            .map(|(id, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), cases.len());
+    }
+    for id in [
+        "metadata_tables",
+        "metadata_columns",
+        "metadata_pk",
+        "metadata_types",
+        "metadata_hidden",
+        "schema_fence",
+        "cancel",
+        "metadata_type_names",
+        "identity",
+    ] {
+        assert!(JDBC_CASES.iter().any(|(key, _)| *key == id));
+    }
+}

@@ -1,6 +1,6 @@
 //! Explicit protocol-v3 subset; not PostgreSQL server compatibility.
 use crate::{
-    Request, Role, Session,
+    Request, Role, Session, pg_catalog_wire as catalog_wire,
     transport::{IO_TIMEOUT, MAX_FRAME, MAX_RESPONSE},
 };
 use giggles_core::{
@@ -293,11 +293,26 @@ fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
 }
+fn catalog_plan(sql: &str) -> R<Option<giggles_pg_catalog::Plan>> {
+    match giggles_pg_catalog::plan(sql) {
+        // Preserve the finite application grammar's own diagnostics (for
+        // example COPY rejection). Core still parses and authorizes the entire
+        // original statement; no failed catalog plan is executed as metadata.
+        Err(giggles_pg_catalog::Error::Syntax) => Ok(None),
+        other => other.map_err(catalog_wire::error),
+    }
+}
 #[derive(Clone)]
 enum Plan {
     Empty,
     Control(&'static str),
     Settings(Vec<crate::pg_settings::Setting>),
+    Inspect(crate::pg_settings::Show),
+    Catalog(
+        Box<giggles_pg_catalog::Plan>,
+        Vec<giggles_pg_catalog::Field>,
+        u64,
+    ),
     Sql(Box<Prepared>),
     Task(crate::task_statement::TaskStatement),
 }
@@ -310,10 +325,19 @@ struct Statement {
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
-            Plan::Sql(p) => core(session.sql.describe(p)),
-            Plan::Task(_) | Plan::Empty | Plan::Settings(_) | Plan::Control(_) => {
+            Plan::Catalog(_, _, epoch) => {
+                let (current, _) = core(session.catalog_snapshot())?;
+                if current != *epoch {
+                    return Err("0A000");
+                }
                 Ok(self.d.clone())
             }
+            Plan::Sql(p) => core(session.sql.describe(p)),
+            Plan::Task(_)
+            | Plan::Empty
+            | Plan::Settings(_)
+            | Plan::Control(_)
+            | Plan::Inspect(_) => Ok(self.d.clone()),
         }
     }
 }
@@ -322,7 +346,36 @@ struct Portal {
     params: Vec<Value>,
     formats: Vec<u16>,
     result: Option<SqlResult>,
+    catalog_params: Vec<giggles_pg_catalog::Value>,
+    catalog_result: Option<giggles_pg_catalog::ResultSet>,
+    parameter_bytes: usize,
     at: usize,
+}
+impl Portal {
+    fn retained_bytes(&self) -> R<usize> {
+        let sql = self
+            .result
+            .as_ref()
+            .map(|r| serde_json::to_vec(r).map(|b| b.len()))
+            .transpose()
+            .map_err(|_| "54000")?
+            .unwrap_or(0);
+        let catalog = self
+            .catalog_result
+            .as_ref()
+            .map(catalog_wire::retained_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        self.parameter_bytes
+            .checked_add(sql)
+            .and_then(|n| n.checked_add(catalog))
+            .ok_or("54000")
+    }
+}
+fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
+    let mut b = Vec::new();
+    z(&format!("SELECT {count}"), &mut b);
+    frame(b'C', &b, out)
 }
 struct State {
     implicit: bool,
@@ -348,6 +401,38 @@ fn control(sql: &str) -> Option<&'static str> {
     ["BEGIN", "COMMIT", "ROLLBACK"]
         .into_iter()
         .find(|command| sql.eq_ignore_ascii_case(command))
+}
+fn inspect(
+    show: crate::pg_settings::Show,
+    settings: &crate::pg_settings::Settings,
+    session: &Session,
+) -> R<(Description, SqlResult)> {
+    if !matches!(session.role, Role::Application { .. }) {
+        return Err("42501");
+    }
+    if session.is_aborted() {
+        return Err("25P02");
+    }
+    let (name, value) = show.value(settings);
+    Ok((
+        Description {
+            parameters: vec![],
+            columns: vec![giggles_core::relational::ColumnDef {
+                id: 0,
+                name: name.into(),
+                data_type: DataType::Text,
+                not_null: true,
+            }],
+        },
+        SqlResult {
+            columns: vec![name.into()],
+            rows: vec![giggles_core::relational::SqlRow {
+                values: vec![Value::Text(value)],
+                version: 0,
+            }],
+            affected: 0,
+        },
+    ))
 }
 fn execute_control(
     command: &'static str,
@@ -470,6 +555,11 @@ impl State {
                     let actual =
                         execute_control(command, session, &mut self.implicit, &mut self.settings)?;
                     complete(actual, &SqlResult::default(), out)?;
+                } else if let Some(show) = crate::pg_settings::show(&sql)? {
+                    let (description, result) = inspect(show, &self.settings.current, session)?;
+                    row_description(&description, &[], out)?;
+                    rows(&result, &description, &[], 0, 1, out)?;
+                    complete("SHOW", &result, out)?;
                 } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
                     if !matches!(session.role, Role::Application { .. }) {
                         return Err("42501");
@@ -481,6 +571,15 @@ impl State {
                         self.settings.current.apply(setting);
                         frame(b'C', b"SET\0", out)?;
                     }
+                } else if let Some(plan) = catalog_plan(&sql)? {
+                    let (_, tables) = core(session.catalog_snapshot())?;
+                    let result =
+                        giggles_pg_catalog::execute(&plan, &catalog_wire::snapshot(tables), &[])
+                            .map_err(catalog_wire::error)?;
+                    catalog_wire::retained_bytes(&result)?;
+                    catalog_wire::description(&result.fields, &[], out)?;
+                    catalog_wire::rows(&result, &[], 0, result.rows.len(), out)?;
+                    catalog_complete(result.rows.len(), out)?;
                 } else {
                     let was_transaction = session.in_transaction();
                     // ROLLBACK must bypass normal prepare when already aborted.
@@ -558,6 +657,9 @@ impl State {
                             parameters: vec![],
                         },
                     )
+                } else if let Some(show) = crate::pg_settings::show(&sql)? {
+                    let (description, _) = inspect(show, &self.settings.current, session)?;
+                    (Plan::Inspect(show), description)
                 } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
                     if !matches!(session.role, Role::Application { .. }) {
                         return Err("42501");
@@ -581,6 +683,23 @@ impl State {
                     }
                     let task = crate::task_statement::TaskStatement::parse(&sql)?;
                     (Plan::Task(task), task.description())
+                } else if let Some(plan) = catalog_plan(&sql)? {
+                    let (epoch, _) = core(session.catalog_snapshot())?;
+                    let fields =
+                        giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
+                    let d = Description {
+                        parameters: vec![DataType::Text; plan.parameter_count()],
+                        columns: fields
+                            .iter()
+                            .map(|f| giggles_core::relational::ColumnDef {
+                                id: 0,
+                                name: f.name.clone(),
+                                data_type: DataType::Text,
+                                not_null: false,
+                            })
+                            .collect(),
+                    };
+                    (Plan::Catalog(Box::new(plan), fields, epoch), d)
                 } else {
                     let p = core(session.prepare(&sql))?;
                     let d = core(session.sql.describe(&p))?;
@@ -589,8 +708,27 @@ impl State {
                 if n > d.parameters.len() {
                     return Err("08P01");
                 }
-                let mut parameter_oids: Vec<u32> = d.parameters.iter().map(oid).collect();
+                let mut parameter_oids: Vec<u32> = match &p {
+                    Plan::Catalog(plan, _, _) => {
+                        plan.parameter_types().iter().map(|t| t.oid()).collect()
+                    }
+                    _ => d.parameters.iter().map(oid).collect(),
+                };
                 for (i, (o, t)) in oids.into_iter().zip(&mut d.parameters).enumerate() {
+                    if matches!(p, Plan::Catalog(..)) {
+                        if o != 0 {
+                            catalog_wire::parameter_type(o)?;
+                            // The catalog compiler fixes parameter and result
+                            // types together. A wire override must not silently
+                            // change only ParameterDescription while leaving a
+                            // projected parameter's output type unchanged.
+                            if o != parameter_oids[i] {
+                                return Err("0A000");
+                            }
+                            parameter_oids[i] = o;
+                        }
+                        continue;
+                    }
                     if o != 0 && o != oid(t) {
                         // Application integer parameters share Value::Int, but
                         // decode using the client's declared wire width. Core
@@ -637,8 +775,27 @@ impl State {
                     return Err("08P01");
                 }
                 let mut params = vec![];
+                let mut catalog_params = vec![];
+                let mut parameter_bytes = 0usize;
                 for (i, ty) in s.d.parameters.iter().enumerate() {
                     let n = r.u32()?;
+                    if matches!(s.p, Plan::Catalog(..)) {
+                        let value = if n == u32::MAX {
+                            giggles_pg_catalog::Value::Null
+                        } else {
+                            catalog_wire::decode(
+                                r.take(usize::try_from(n).map_err(|_| "54000")?)?,
+                                catalog_wire::parameter_type(s.parameter_oids[i])?,
+                                format_at(&fmts, i),
+                            )?
+                        };
+                        // Count decoded allocation, including array element overhead.
+                        parameter_bytes = parameter_bytes
+                            .checked_add(catalog_wire::value_bytes(&value)?)
+                            .ok_or("54000")?;
+                        catalog_params.push(value);
+                        continue;
+                    }
                     params.push(if n == u32::MAX {
                         Value::Null
                     } else {
@@ -663,18 +820,13 @@ impl State {
                 if !self.portals.contains_key(&name) && self.portals.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
-                let bound = self
-                    .portals
-                    .values()
-                    .try_fold(0usize, |sum, p| {
-                        sum.checked_add(serde_json::to_vec(&p.params).ok()?.len())
-                    })
-                    .ok_or("54000")?;
-                if bound
+                parameter_bytes = parameter_bytes
                     .checked_add(serde_json::to_vec(&params).map_err(|_| "54000")?.len())
-                    .ok_or("54000")?
-                    > MAX_RESPONSE
-                {
+                    .ok_or("54000")?;
+                let bound = self.portals.values().try_fold(0usize, |sum, p| {
+                    sum.checked_add(p.retained_bytes()?).ok_or("54000")
+                })?;
+                if bound.checked_add(parameter_bytes).ok_or("54000")? > MAX_RESPONSE {
                     return Err("54000");
                 }
                 self.portals.insert(
@@ -684,6 +836,9 @@ impl State {
                         params,
                         formats: output,
                         result: None,
+                        catalog_params,
+                        catalog_result: None,
+                        parameter_bytes,
                         at: 0,
                     },
                 );
@@ -703,25 +858,28 @@ impl State {
                             b.extend(oid.to_be_bytes());
                         }
                         frame(b't', &b, out)?;
-                        row_description(&d, &[], out)?;
+                        if let Plan::Catalog(_, fields, _) = &s.p {
+                            catalog_wire::description(fields, &[], out)?;
+                        } else {
+                            row_description(&d, &[], out)?;
+                        }
                     }
                     b'P' => {
                         let p = self.portals.get(&name).ok_or("34000")?;
                         let d = p.s.describe(session)?;
-                        row_description(&d, &p.formats, out)?;
+                        if let Plan::Catalog(_, fields, _) = &p.s.p {
+                            catalog_wire::description(fields, &p.formats, out)?;
+                        } else {
+                            row_description(&d, &p.formats, out)?;
+                        }
                     }
                     _ => return Err("08P01"),
                 }
             }
             b'E' => {
-                let retained = self
-                    .portals
-                    .values()
-                    .filter_map(|p| p.result.as_ref())
-                    .try_fold(0usize, |sum, result| {
-                        sum.checked_add(serde_json::to_vec(result).ok()?.len())
-                    })
-                    .ok_or("54000")?;
+                let retained = self.portals.values().try_fold(0usize, |sum, p| {
+                    sum.checked_add(p.retained_bytes()?).ok_or("54000")
+                })?;
                 let was_transaction = session.in_transaction();
                 let name = r.text()?;
                 let max = r.u32()?;
@@ -731,6 +889,46 @@ impl State {
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 p.s.describe(session)?;
+                if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
+                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    let (current, tables) = core(session.catalog_snapshot())?;
+                    if current != *epoch {
+                        return Err("0A000");
+                    }
+                    if p.catalog_result.is_none() {
+                        let result = giggles_pg_catalog::execute(
+                            plan,
+                            &catalog_wire::snapshot(tables),
+                            &p.catalog_params,
+                        )
+                        .map_err(catalog_wire::error)?;
+                        if result.fields != *fields {
+                            return Err("0A000");
+                        }
+                        if retained
+                            .checked_add(catalog_wire::retained_bytes(&result)?)
+                            .ok_or("54000")?
+                            > MAX_RESPONSE
+                        {
+                            return Err("54000");
+                        }
+                        p.catalog_result = Some(result);
+                    }
+                    let result = p.catalog_result.as_ref().unwrap();
+                    let end = if max == 0 {
+                        result.rows.len()
+                    } else {
+                        p.at.saturating_add(max as usize).min(result.rows.len())
+                    };
+                    catalog_wire::rows(result, &p.formats, p.at, end, out)?;
+                    p.at = end;
+                    if end < result.rows.len() {
+                        frame(b's', &[], out)?;
+                    } else {
+                        catalog_complete(result.rows.len(), out)?;
+                    }
+                    return Ok(true);
+                }
                 if matches!(p.s.p, Plan::Empty) {
                     frame(b'I', &[], out)?;
                     return Ok(true);
@@ -768,6 +966,22 @@ impl State {
                 }
                 // Task results are never retained in a portal. Each Execute is a
                 // fresh native invocation, including completed-portal replays.
+                if let Plan::Inspect(show) = p.s.p {
+                    // Recheck role/transaction even when releasing cached rows.
+                    let (_, current) = inspect(show, &self.settings.current, session)?;
+                    if p.result.is_none() {
+                        let bytes = serde_json::to_vec(&current).map_err(|_| "54000")?.len();
+                        if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
+                            return Err("54000");
+                        }
+                        p.result = Some(current);
+                    }
+                    let result = p.result.as_ref().unwrap();
+                    rows(result, &p.s.d, &p.formats, p.at, result.rows.len(), out)?;
+                    p.at = result.rows.len();
+                    complete("SHOW", result, out)?;
+                    return Ok(true);
+                }
                 if let Plan::Task(task) = p.s.p {
                     let request = task.bind(&p.params)?;
                     let response = session.handle_prepared_task(request, received);

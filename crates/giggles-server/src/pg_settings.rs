@@ -39,6 +39,67 @@ impl SessionSettings {
     }
 }
 type Result<T> = std::result::Result<T, &'static str>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Show {
+    ApplicationName,
+    ExtraFloatDigits,
+    TransactionIsolation,
+    SearchPath,
+    ClientEncoding,
+    ServerVersion,
+    StandardConformingStrings,
+}
+impl Show {
+    pub fn value(self, settings: &Settings) -> (&'static str, String) {
+        let (name, value) = match self {
+            Self::ApplicationName => ("application_name", settings.application_name.clone()),
+            Self::ExtraFloatDigits => (
+                "extra_float_digits",
+                settings.extra_float_digits.to_string(),
+            ),
+            Self::TransactionIsolation => ("transaction_isolation", "serializable".into()),
+            Self::SearchPath => ("search_path", "public".into()),
+            Self::ClientEncoding => ("client_encoding", "UTF8".into()),
+            Self::ServerVersion => ("server_version", "14.0".into()),
+            Self::StandardConformingStrings => ("standard_conforming_strings", "on".into()),
+        };
+        (name, value)
+    }
+}
+pub(crate) fn show(sql: &str) -> Result<Option<Show>> {
+    let mut p = Parser { source: sql, at: 0 };
+    if !p.word().eq_ignore_ascii_case("SHOW") {
+        return Ok(None);
+    }
+    let name = p.word().to_ascii_lowercase();
+    let show = match name.as_str() {
+        "application_name" => Show::ApplicationName,
+        "extra_float_digits" => Show::ExtraFloatDigits,
+        "transaction_isolation" | "default_transaction_isolation" => Show::TransactionIsolation,
+        "transaction" => {
+            if !p.word().eq_ignore_ascii_case("ISOLATION")
+                || !p.word().eq_ignore_ascii_case("LEVEL")
+            {
+                return Err("42601");
+            }
+            Show::TransactionIsolation
+        }
+        "search_path" => Show::SearchPath,
+        "client_encoding" => Show::ClientEncoding,
+        "server_version" => Show::ServerVersion,
+        "standard_conforming_strings" => Show::StandardConformingStrings,
+        _ => return Err("0A000"),
+    };
+    p.space();
+    if p.source.as_bytes().get(p.at) == Some(&b';') {
+        p.at += 1;
+        p.space();
+    }
+    if p.at != sql.len() {
+        return Err("42601");
+    }
+    Ok(Some(show))
+}
 pub(crate) fn empty_sql(sql: &str) -> Result<bool> {
     let bytes = sql.as_bytes();
     let mut at = 0;
@@ -197,6 +258,28 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Vec<Setting>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inspection_parser_rejects_suffixes_and_unknown_settings() {
+        for query in [
+            "SHOW TRANSACTION ISOLATION LEVEL",
+            " show transaction_isolation; ",
+        ] {
+            assert_eq!(show(query), Ok(Some(Show::TransactionIsolation)));
+        }
+        for query in [
+            "SHOW application_name; SET application_name='x'",
+            "SHOW transaction isolation",
+            "SHOW application_name FROM app",
+        ] {
+            assert_eq!(show(query), Err("42601"));
+        }
+        assert_eq!(show("SHOW secret"), Err("0A000"));
+        assert_eq!(show("SELECT id FROM app"), Ok(None));
+        assert_eq!(
+            Show::TransactionIsolation.value(&Settings::default()).1,
+            "serializable"
+        );
+    }
     #[test]
     fn empty_sql_scanner_never_hides_effectful_suffixes() {
         for sql in [

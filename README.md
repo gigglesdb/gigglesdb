@@ -118,12 +118,13 @@ quickstart. See the [network compatibility matrix](crates/giggles-server/COMPATI
 and [server guide](crates/giggles-server/README.md) for supported messages and
 driver examples.
 
-**DataGrip schema browsing is not supported yet:** identity and catalog queries
-remain unimplemented. To check capabilities before configuring a client, run
+**Bounded metadata support is implemented:** identity, schemas, tables, columns,
+primary keys and type information use the real authorized catalog. Full DataGrip
+GUI introspection is not yet qualified. To check capabilities before configuring a client, run
 **PostgreSQL client compatibility** in IntelliJ or
 `powershell -NoProfile -File scripts/check-pg-clients.ps1`. It uses isolated test
-databases and reports each passing, failing and untested case. Current catalog
-failures deliberately produce a nonzero exit code.
+databases and reports each passing, failing and untested case. Failed or untested
+cases deliberately produce a nonzero exit code.
 
 The JSON configuration specifies `database`, `native`, `postgres`, `certificate`,
 `private_key`, `client_ca`, `bindings`, `connections`, `skew_seconds` and

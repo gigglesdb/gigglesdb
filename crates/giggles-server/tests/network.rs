@@ -1707,6 +1707,76 @@ async fn idle_postgres_connection_survives_frame_deadline_and_boolean_text_is_ca
 }
 
 #[tokio::test]
+async fn jdbc_session_inspection_reports_actual_settings_and_transaction_rollback() {
+    let f = Fixture::new().await;
+    let (client, connection) = f.pg(f.app.clone()).await;
+    assert_eq!(
+        client
+            .query_one("SHOW TRANSACTION ISOLATION LEVEL", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "serializable"
+    );
+    client
+        .batch_execute("SET application_name='before'")
+        .await
+        .unwrap();
+    let prepared = client.prepare("SHOW application_name").await.unwrap();
+    assert_eq!(
+        client
+            .query_one(&prepared, &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "before"
+    );
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .batch_execute("SET application_name='during'")
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .query_one(&prepared, &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "during"
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        client
+            .query_one(&prepared, &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "before"
+    );
+    client.batch_execute("BEGIN").await.unwrap();
+    assert!(client.batch_execute("NOT SQL").await.is_err());
+    assert_eq!(
+        code(client.query_one(&prepared, &[]).await.unwrap_err()),
+        "25P02"
+    );
+    client.batch_execute("ROLLBACK").await.unwrap();
+    let messages = client.simple_query("SHOW search_path").await.unwrap();
+    assert!(messages.iter().any(
+        |m| matches!(m,tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0)==Some("public"))
+    ));
+    drop(client);
+    connection.await.unwrap();
+    let (task, connection) = f.pg(f.task.clone()).await;
+    assert_eq!(
+        code(task.query("SHOW application_name", &[]).await.unwrap_err()),
+        "42501"
+    );
+    drop(task);
+    connection.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn jdbc_initialization_settings_reject_sql_escapes_and_respect_aborted_transactions() {
     let f = Fixture::new().await;
     let mut s = raw_pg(&f).await;
@@ -2490,11 +2560,306 @@ async fn extended_rollback_recovers_an_aborted_transaction() {
 #[path = "cancellation_network.inc"]
 mod cancellation_network;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_driver_identity_typed_metadata_and_hidden_relations() {
+    let f = Fixture::new().await;
+    f.admin
+        .sql_session()
+        .execute(
+            "CREATE TABLE hidden_catalog_test (id BIGINT PRIMARY KEY, secret TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    let identity = pg
+        .query_one(
+            "SELECT current_database(), current_schema(), current_user",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(identity.get::<_, String>(0), "giggles");
+    assert_eq!(identity.get::<_, String>(1), "public");
+    assert_eq!(identity.get::<_, String>(2), "giggles");
+    let tables = pg.query("SELECT oid, relname FROM pg_catalog.pg_class WHERE relkind='r' AND relnamespace=2200 ORDER BY relname", &[]).await.unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].get::<_, String>(1), "app");
+    let oid: u32 = tables[0].get(0);
+    let statement = pg.prepare("SELECT attname, attnum, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE attrelid=$1 ORDER BY attnum").await.unwrap();
+    assert_eq!(statement.params(), &[tokio_postgres::types::Type::OID]);
+    let columns = pg.query(&statement, &[&oid]).await.unwrap();
+    assert_eq!(columns.len(), 6);
+    assert_eq!(columns[0].get::<_, String>(0), "id");
+    assert_eq!(columns[0].get::<_, i16>(1), 1);
+    assert_eq!(columns[0].get::<_, u32>(2), 20);
+    assert!(columns[0].get::<_, bool>(3));
+    assert_eq!(columns[1].get::<_, String>(0), "body");
+    pg.batch_execute("BEGIN").await.unwrap();
+    pg.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(pg.query(&statement, &[&oid]).await.unwrap().len(), 6);
+    let visible = pg
+        .simple_query(
+            "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace=2200 ORDER BY relname",
+        )
+        .await
+        .unwrap();
+    assert!(!format!("{visible:?}").contains("hidden_catalog_test"));
+    assert_eq!(code(pg.query("SELECT c.relname FROM pg_catalog.pg_class c JOIN hidden_catalog_test h ON h.id=c.oid", &[]).await.unwrap_err()), "42501");
+    drop(pg);
+    conn.await.unwrap();
+    let (task, conn) = f.pg(f.task.clone()).await;
+    assert_eq!(
+        code(
+            task.query("SELECT current_database()", &[])
+                .await
+                .unwrap_err()
+        ),
+        "42501"
+    );
+    drop(task);
+    conn.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_driver_schema_change_and_aborted_transaction_fence() {
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    let prepared = pg
+        .prepare("SELECT relname FROM pg_catalog.pg_class WHERE relnamespace=2200")
+        .await
+        .unwrap();
+    f.admin
+        .sql_session()
+        .execute(
+            "CREATE TABLE catalog_new (id BIGINT PRIMARY KEY)",
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(code(pg.query(&prepared, &[]).await.unwrap_err()), "0A000");
+    pg.batch_execute("BEGIN").await.unwrap();
+    assert!(
+        pg.batch_execute("SELECT no_such_column FROM app")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        code(pg.query("SELECT current_schema()", &[]).await.unwrap_err()),
+        "25P02"
+    );
+    pg.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        pg.query_one("SELECT current_schema()", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "public"
+    );
+    drop(pg);
+    conn.await.unwrap();
+    f.stop().await;
+}
+
 #[path = "prepared_network.inc"]
 mod prepared_network;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_cached_pages_reauthorize_before_release() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    pg_send(&mut s, b'Q', b"BEGIN\0").await;
+    while pg_read(&mut s).await.0 != b'Z' {}
+    pg_send(
+        &mut s,
+        b'P',
+        &parse(
+            "catalog",
+            "SELECT attname FROM pg_catalog.pg_attribute ORDER BY attname",
+        ),
+    )
+    .await;
+    assert_eq!(pg_sync(&mut s).await[0].0, b'1');
+    pg_send(&mut s, b'B', &bind("page", "catalog", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("page", 1)).await;
+    let frames = pg_sync(&mut s).await;
+    assert_eq!(frames.iter().filter(|(tag, _)| *tag == b'D').count(), 1);
+    assert!(frames.iter().any(|(tag, _)| *tag == b's'));
+    f.service.reload_bindings(vec![]).unwrap();
+    pg_send(&mut s, b'E', &execute("page", 1)).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.read_u8())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_and_application_pages_share_aggregate_cache_admission() {
+    let f = Fixture::new().await;
+    let mut owner = f.admin.sql_session();
+    for id in 0..60i64 {
+        owner
+            .execute(
+                "INSERT INTO app (id,body) VALUES ($1,$2)",
+                &[Value::Int(id), Value::Text("\u{0001}".repeat(16_000))],
+                None,
+            )
+            .unwrap();
+    }
+    let mut s = raw_pg(&f).await;
+    pg_send(&mut s, b'Q', b"BEGIN\0").await;
+    while pg_read(&mut s).await.0 != b'Z' {}
+    pg_send(&mut s, b'P', &parse("app", "SELECT body FROM app LIMIT 60")).await;
+    pg_send(&mut s, b'B', &bind("app_page", "app", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("app_page", 1)).await;
+    let first = pg_sync(&mut s).await;
+    assert!(first.iter().any(|(tag, _)| *tag == b'D'));
+    pg_send(
+        &mut s,
+        b'P',
+        &parse("app_more", "SELECT body FROM app LIMIT 10"),
+    )
+    .await;
+    pg_send(&mut s, b'B', &bind("more_page", "app_more", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("more_page", 1)).await;
+    let more = pg_sync(&mut s).await;
+    assert!(more.iter().any(|(tag, _)| *tag == b'D'));
+    let query = format!(
+        "SELECT '{}' AS payload FROM (SELECT oid FROM pg_catalog.pg_type LIMIT 12) a CROSS JOIN (SELECT oid FROM pg_catalog.pg_type LIMIT 10) b LIMIT 120",
+        "x".repeat(16_000)
+    );
+    let planned = giggles_pg_catalog::plan(&query).unwrap().unwrap();
+    let control = giggles_pg_catalog::execute(
+        &planned,
+        &giggles_pg_catalog::CatalogSnapshot::default(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(control.rows.len(), 120);
+    pg_send(&mut s, b'P', &parse("catalog", &query)).await;
+    pg_send(&mut s, b'B', &bind("catalog_page", "catalog", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("catalog_page", 1)).await;
+    let denied = pg_sync(&mut s).await;
+    assert!(has_code(&denied, "54000"), "{denied:?}");
+    assert!(!denied.iter().any(|(tag, _)| *tag == b'D'));
+    pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
+    while pg_read(&mut s).await.0 != b'Z' {}
+    // The same catalog alone fits: rejection above is the shared cache, not SQL syntax.
+    pg_send(&mut s, b'P', &parse("catalog_alone", &query)).await;
+    pg_send(&mut s, b'B', &bind("alone", "catalog_alone", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("alone", 1)).await;
+    let alone = pg_sync(&mut s).await;
+    assert!(alone.iter().any(|(tag, _)| *tag == b'D'), "{alone:?}");
+    assert!(!alone.iter().any(|(tag, _)| *tag == b'E'));
+    f.stop().await;
+}
+
 #[path = "accounting_network.inc"]
 mod accounting_network;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_declared_parameter_type_cannot_disagree_with_output_description() {
+    use tokio_postgres::types::Type;
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    assert_eq!(
+        code(
+            pg.prepare_typed("SELECT $1 FROM pg_catalog.pg_type LIMIT 1", &[Type::INT8])
+                .await
+                .unwrap_err()
+        ),
+        "0A000"
+    );
+    let typed = pg
+        .prepare_typed(
+            "SELECT $1::int8 AS value FROM pg_catalog.pg_type LIMIT 1",
+            &[Type::INT8],
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed.params(), &[Type::INT8]);
+    assert_eq!(typed.columns()[0].type_(), &Type::INT8);
+    assert_eq!(
+        pg.query_one(&typed, &[&7i64])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        7
+    );
+    assert_eq!(
+        pg.query_one(&typed, &[&Option::<i64>::None])
+            .await
+            .unwrap()
+            .get::<_, Option<i64>>(0),
+        None
+    );
+    let text = pg
+        .prepare_typed("SELECT $1 FROM pg_catalog.pg_type LIMIT 1", &[Type::TEXT])
+        .await
+        .unwrap();
+    assert_eq!(
+        pg.query_one(&text, &[&"seven"])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "seven"
+    );
+    drop(pg);
+    conn.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_multiple_granted_tables_composite_key_order_and_empty_visible_set() {
+    let f = Fixture::new().await;
+    f.admin.sql_session().execute("CREATE TABLE composite (tenant INTEGER, id BIGINT, body TEXT, PRIMARY KEY (id, tenant))", &[], None).unwrap();
+    let mut bindings: Vec<Binding> =
+        serde_json::from_slice(&std::fs::read(f.path.join("bindings.json")).unwrap()).unwrap();
+    let Role::Application { tables, .. } = &mut bindings[0].role else {
+        panic!("fixture role")
+    };
+    tables.insert("composite".into());
+    f.service.reload_bindings(bindings.clone()).unwrap();
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    let rows = pg.query("SELECT relname FROM pg_catalog.pg_class WHERE relnamespace=2200 AND relkind='r' ORDER BY relname", &[]).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>(),
+        ["app", "composite"]
+    );
+    let key = pg.query_one("SELECT conkey FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid WHERE t.relname='composite'", &[]).await.unwrap();
+    assert_eq!(key.get::<_, Vec<i16>>(0), [2, 1]);
+    let attrs = pg.query("SELECT attname, attnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid WHERE t.relname='composite' ORDER BY attnum", &[]).await.unwrap();
+    assert_eq!(attrs.len(), 3);
+    assert!(attrs[0].get::<_, bool>(1));
+    assert!(attrs[1].get::<_, bool>(1));
+    assert!(!attrs[2].get::<_, bool>(1));
+    drop(pg);
+    conn.await.unwrap();
+    let Role::Application { tables, .. } = &mut bindings[0].role else {
+        unreachable!()
+    };
+    *tables = BTreeSet::from(["not_created".into()]);
+    f.service.reload_bindings(bindings).unwrap();
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    assert!(
+        pg.query(
+            "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace=2200",
+            &[]
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    drop(pg);
+    conn.await.unwrap();
+    f.stop().await;
+}
 
 #[path = "lifecycle_network.inc"]
 mod lifecycle_network;

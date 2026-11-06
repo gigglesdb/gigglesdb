@@ -138,6 +138,21 @@ fn freeze(
 }
 async fn matrix(m: &Manifest, output: &Path, report: &mut Report) -> Result<(), Error> {
     report.identities.push(identity(&std::env::current_exe()?)?);
+    for (name, bytes) in [
+        (
+            "PgIntroQueries.sql",
+            include_bytes!("../probes/datagrip-2026.2.5/PgIntroQueries.sql").as_slice(),
+        ),
+        (
+            "datagrip-inventory.json",
+            include_bytes!("../probes/datagrip-2026.2.5/inventory.json").as_slice(),
+        ),
+    ] {
+        let path = output.join(name);
+        std::fs::write(&path, bytes)?;
+        report.identities.push(identity(&path)?);
+    }
+
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
     for file in [
         "Cargo.toml",
@@ -189,7 +204,12 @@ async fn matrix(m: &Manifest, output: &Path, report: &mut Report) -> Result<(), 
             return Err("JDBC probe compilation failed".into());
         }
         report.identities.extend(jdbc_class_identities(output)?);
-        for mode in ["default", "configured"] {
+        for mode in ["default", "configured", "datagrip-discovery"] {
+            let required = if mode == "datagrip-discovery" {
+                DISCOVERY_CASES
+            } else {
+                JDBC_CASES
+            };
             let dir = output.join(format!("jdbc-{mode}"));
             std::fs::create_dir(&dir)?;
             report.identities.extend(isolate(m, &dir)?);
@@ -216,7 +236,7 @@ async fn matrix(m: &Manifest, output: &Path, report: &mut Report) -> Result<(), 
                 )
                 .await?;
                 retain(&dir, "probe", &captured)?;
-                Ok::<_, Error>(evaluate("pgJDBC", mode, "42.7.3", JDBC_CASES, &captured))
+                Ok::<_, Error>(evaluate("pgJDBC", mode, "42.7.3", required, &captured))
             }
             .await;
             let shutdown = owned.finish(Duration::from_secs(10), true).await?;
@@ -232,17 +252,22 @@ async fn matrix(m: &Manifest, output: &Path, report: &mut Report) -> Result<(), 
                     let reason = format!("jdbc-{mode}: {e}");
                     report
                         .profiles
-                        .push(failed("pgJDBC", mode, JDBC_CASES, &reason));
+                        .push(failed("pgJDBC", mode, required, &reason));
                     report.errors.push(reason);
                 }
             }
         }
     } else {
-        for mode in ["default", "configured"] {
+        for mode in ["default", "configured", "datagrip-discovery"] {
+            let required = if mode == "datagrip-discovery" {
+                DISCOVERY_CASES
+            } else {
+                JDBC_CASES
+            };
             report.profiles.push(untested(
                 "pgJDBC",
                 mode,
-                JDBC_CASES,
+                required,
                 "supply explicit java, javac and jdbc_jar paths; runtime unavailable/unconfigured",
             ));
         }

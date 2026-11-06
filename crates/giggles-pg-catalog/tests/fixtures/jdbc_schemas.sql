@@ -1,0 +1,2 @@
+-- Extracted from jdbc_PgDatabaseMetaData.java sha256 59a6de6b6ba0ef66fa6b382717a398c8709e371b75343c1074049bba311e0ae5
+SELECT nspname AS TABLE_SCHEM, NULL AS TABLE_CATALOG FROM pg_catalog.pg_namespace  WHERE nspname <> 'pg_toast' AND (nspname !~ '^pg_temp_'  OR nspname = (pg_catalog.current_schemas(true))[1]) AND (nspname !~ '^pg_toast_temp_'  OR nspname = replace((pg_catalog.current_schemas(true))[1], 'pg_temp_', 'pg_toast_temp_'))  ORDER BY TABLE_SCHEM

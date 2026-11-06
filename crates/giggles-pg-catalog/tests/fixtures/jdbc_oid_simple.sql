@@ -1,0 +1,2 @@
+-- Extracted from jdbc_TypeInfoCache.java sha256 f6f0a8a04946925e8e95bc7c532df34ff06135913ea1616aedbf162f155a3edb
+SELECT pg_type.oid, typname   FROM pg_catalog.pg_type   LEFT   JOIN (select ns.oid as nspoid, ns.nspname, r.r           from pg_namespace as ns           join ( select s.r, (current_schemas(false))[s.r] as nspname                    from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r          using ( nspname )        ) as sp     ON sp.nspoid = typnamespace  WHERE typname = $1  ORDER BY sp.r, pg_type.oid DESC LIMIT 1;

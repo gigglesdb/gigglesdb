@@ -55,5 +55,5 @@ $manifestPath = Join-Path $output 'manifest.json'
 & cargo run --locked --manifest-path crates/giggles-pg-conformance/Cargo.toml --target-dir target-gd48-conformance -j1 -- $manifestPath
 $result = $LASTEXITCODE
 Write-Host "Client report: $(Join-Path $output 'matrix/report.json')"
-Write-Host 'FAIL and UNTESTED are capability results, not support claims. DataGrip catalogs remain unsupported.'
+Write-Host 'FAIL and UNTESTED are capability results, not support claims. Full DataGrip GUI introspection remains unqualified.'
 exit $result

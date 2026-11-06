@@ -96,8 +96,9 @@ parameter for driver negotiation, not a PostgreSQL implementation claim.
 For DataGrip, select PostgreSQL, host `localhost`, port `7433`, user `giggles`,
 database `giggles`, and no password. Check the effective URL as well:
 `jdbc:postgresql://localhost:7433/giggles`. Use full SSL verification with the
-fixture `ca.pem`, `app.pem`, and `app.key.TEST-ONLY`. **DataGrip schema browsing
-does not work yet:** its identity and PostgreSQL catalog queries are unsupported.
+fixture `ca.pem`, `app.pem`, and `app.key.TEST-ONLY`. Identity functions and bounded
+PostgreSQL catalog queries now expose real, authorized schemas/tables/columns,
+primary keys and types. Full DataGrip GUI introspection remains unqualified.
 Actual pgJDBC 42.7.3 probes exercise default initialization, prepared queries,
 `Connection.isValid()`, rollback, boolean bindings, statement reuse across commits,
 and queries after eleven seconds idle. This is a bounded query surface, not full
