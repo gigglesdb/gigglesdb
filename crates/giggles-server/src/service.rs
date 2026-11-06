@@ -22,6 +22,15 @@ pub enum Role {
         domain: String,
         tables: BTreeSet<String>,
     },
+    #[serde(skip)]
+    Database {
+        name: String,
+    },
+}
+impl Role {
+    pub fn is_sql(&self) -> bool {
+        matches!(self, Role::Application { .. } | Role::Database { .. })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +206,9 @@ impl Service {
         let mut map = BTreeMap::new();
         let mut owners: BTreeMap<String, Role> = BTreeMap::new();
         for b in bindings {
+            if matches!(&b.role, Role::Database { .. }) {
+                return Err(CoreError::Policy(Error::Authentication));
+            }
             if b.fingerprint.len() != 64
                 || !b
                     .fingerprint
@@ -207,6 +219,7 @@ impl Service {
             }
             let bound = match &b.role {
                 Role::Task { domain, .. } | Role::Application { domain, .. } => domain,
+                Role::Database { .. } => return Err(CoreError::Policy(Error::Authentication)),
             };
             if bound != &domain {
                 return Err(CoreError::Policy(Error::Authentication));
@@ -272,6 +285,24 @@ impl Service {
                 .cancel(&session.fingerprint, session.epoch, pid, secret);
         }
     }
+    pub fn role_session(self: &Arc<Self>, name: &str) -> Result<Session, CoreError> {
+        let role = self
+            .admin
+            .roles()
+            .get(name)
+            .map_err(|_| CoreError::Policy(Error::Authentication))?
+            .filter(|role| role.login)
+            .ok_or(CoreError::Policy(Error::Authentication))?;
+        Ok(Session {
+            service: self.clone(),
+            fingerprint: format!("pgrole:{}", role.name),
+            role: Role::Database { name: role.name },
+            epoch: role.generation,
+            scoped: false,
+            connection: None,
+            sql: self.admin.sql_session(),
+        })
+    }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
         let (role, epoch) = self
             .bindings
@@ -303,6 +334,17 @@ pub struct Session {
 }
 impl Session {
     pub(crate) fn check_binding(&self) -> Result<(), CoreError> {
+        if let Role::Database { name } = &self.role {
+            return self
+                .service
+                .admin
+                .roles()
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .map(|_| ())
+                .ok_or(CoreError::Policy(Error::Authentication));
+        }
         let credentials = self
             .service
             .bindings
@@ -356,7 +398,7 @@ impl Session {
     pub fn is_aborted(&self) -> bool {
         self.sql.is_aborted()
     }
-    /// A coherent committed catalog restricted to this live application binding.
+    /// A coherent committed catalog restricted to this live SQL session authority.
     /// Active SQL snapshots must agree with every returned table definition;
     /// metadata never falls back to an unrestricted owner query.
     pub(crate) fn catalog_snapshot(
@@ -366,43 +408,81 @@ impl Session {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            let Role::Application { domain, tables } = &session.role else {
-                return Err(CoreError::Policy(Error::Scope));
+            let tables = match &session.role {
+                Role::Application { domain, tables } => {
+                    if session.service.admin.authority_metadata()?.0.to_string() != *domain {
+                        return Err(CoreError::Policy(Error::Authentication));
+                    }
+                    Some(tables.clone())
+                }
+                Role::Database { name } => {
+                    let role = session
+                        .service
+                        .admin
+                        .roles()
+                        .get(name)
+                        .map_err(|_| CoreError::Policy(Error::Authentication))?
+                        .filter(|role| role.login && role.generation == session.epoch)
+                        .ok_or(CoreError::Policy(Error::Authentication))?;
+                    if role.superuser {
+                        None
+                    } else {
+                        Some(
+                            session
+                                .service
+                                .admin
+                                .roles()
+                                .visible_tables(name)
+                                .map_err(|_| CoreError::Policy(Error::Scope))?,
+                        )
+                    }
+                }
+                Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
             };
-            if session.service.admin.authority_metadata()?.0.to_string() != *domain {
-                return Err(CoreError::Policy(Error::Authentication));
-            }
             let (epoch, catalog) = session.service.admin.catalog()?;
             let visible = catalog
                 .into_iter()
-                .filter(|table| tables.contains(&table.name))
+                .filter(|table| {
+                    tables
+                        .as_ref()
+                        .is_none_or(|tables| tables.contains(&table.name))
+                })
                 .collect::<Vec<_>>();
-            if visible.len() > relational::MAX_TABLES {
-                return Err(CoreError::Sql(relational::SqlError::Limit));
-            }
-            for table in &visible {
-                giggles_core::cancellation::check()?;
-                // Table names originate from the validated engine catalog, not
-                // client SQL. Prepare/Describe do not access application rows.
-                let prepared = session
-                    .sql
-                    .prepare(&format!("SELECT * FROM {} LIMIT 1", table.name))?;
-                let description = session.sql.describe(&prepared)?;
-                if description.columns != table.columns {
-                    return Err(CoreError::Sql(relational::SqlError::Conflict));
-                }
-            }
-            // A concurrent trusted DDL operation cannot splice two generations
-            // into this snapshot or make validation certify a different catalog.
-            if session.service.admin.catalog()?.0 != epoch {
+            session.validate_catalog_snapshot(epoch, visible)
+        })
+    }
+    fn validate_catalog_snapshot(
+        &mut self,
+        epoch: u64,
+        visible: Vec<relational::TableDef>,
+    ) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        if visible.len() > relational::MAX_TABLES {
+            return Err(CoreError::Sql(relational::SqlError::Limit));
+        }
+        for table in &visible {
+            giggles_core::cancellation::check()?;
+            // Table names originate from the validated engine catalog, not
+            // client SQL. Prepare/Describe do not access application rows.
+            let prepared = self
+                .sql
+                .prepare(&format!("SELECT * FROM {} LIMIT 1", table.name))?;
+            let description = self.sql.describe(&prepared)?;
+            if description.columns != table.columns {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
-            Ok((epoch, visible))
-        })
+        }
+        // A concurrent trusted DDL operation cannot splice two generations
+        // into this snapshot or make validation certify a different catalog.
+        if self.service.admin.catalog()?.0 != epoch {
+            return Err(CoreError::Sql(relational::SqlError::Conflict));
+        }
+        Ok((epoch, visible))
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
         self.authority_scope(|session| {
-            let p = if session.in_transaction() && !session.is_aborted() {
+            let p = if matches!(&session.role, Role::Database { .. }) {
+                session.sql.prepare(sql)?
+            } else if session.in_transaction() && !session.is_aborted() {
                 // Gateway DDL is forbidden. Bind reusable plans against the
                 // committed catalog, then validate against the active snapshot.
                 // Core's staged-schema handles retain their lifetime fence.
@@ -419,6 +499,19 @@ impl Session {
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         let allowed = matches!(&self.role, Role::Application { tables,.. }
             if !p.is_ddl() && p.table().is_none_or(|t| t != "giggles_join" && tables.contains(t)));
+        let allowed = if let Role::Database { name } = &self.role {
+            let role = self
+                .service
+                .admin
+                .roles()
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            role.superuser || p.table().is_none()
+        } else {
+            allowed
+        };
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));
@@ -432,7 +525,18 @@ impl Session {
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
             session.authorize(p)?;
-            session.sql.execute_prepared(p, params, None)
+            let result = session.sql.execute_prepared(p, params, None)?;
+            if p.is_ddl() {
+                if let (Role::Database { name }, Some(table)) = (&session.role, p.table()) {
+                    session
+                        .service
+                        .admin
+                        .roles()
+                        .set_table_owner(table, name)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                }
+            }
+            Ok(result)
         })
     }
     pub fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<SqlResult, CoreError> {
@@ -660,6 +764,126 @@ mod lifecycle_tests {
             Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
             bindings,
         )
+    }
+    #[test]
+    fn database_role_cannot_be_installed_as_a_fingerprint_binding() {
+        let (service, mut bindings) = fixture();
+        bindings[0].role = Role::Database { name: "owner".into() };
+        assert!(matches!(
+            Service::validate(&service.admin, bindings.clone()),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        assert!(service.reload_bindings(bindings.clone()).is_err());
+        assert!(serde_json::to_value(&bindings[0]).is_err());
+        assert!(
+            serde_json::from_str::<Role>(r#"{"role":"Database","name":"owner"}"#).is_err()
+        );
+    }
+    #[test]
+    fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {
+        let (service, _) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("owner", true), ("reader", false)] {
+            roles
+                .create(roles::NewRole {
+                    name: name.into(),
+                    login: true,
+                    superuser,
+                    ..roles::NewRole::default()
+                })
+                .unwrap();
+        }
+        let mut owner = service.role_session("owner").unwrap();
+        owner
+            .execute_sql("CREATE TABLE owned (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        owner
+            .execute_sql("CREATE TABLE hidden (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        assert_eq!(
+            roles.table_owner("owned").unwrap().as_deref(),
+            Some("owner")
+        );
+        roles.set_table_owner("owned", "reader").unwrap();
+        roles
+            .grant_table("app", "reader", &[roles::TablePrivilege::Select])
+            .unwrap();
+        roles
+            .grant_table("missing", "reader", &[roles::TablePrivilege::Select])
+            .unwrap();
+        let catalog = service.admin.catalog().unwrap();
+        assert_eq!(owner.catalog_snapshot().unwrap(), catalog);
+        let mut reader = service.role_session("reader").unwrap();
+        assert_eq!(reader.fingerprint, "pgrole:reader");
+        let visible = reader.catalog_snapshot().unwrap().1;
+        assert_eq!(visible.len(), 2);
+        assert!(
+            visible
+                .iter()
+                .all(|table| table.name == "app" || table.name == "owned")
+        );
+        assert_eq!(reader.handle(Request::Ping).code, "ok");
+        assert_eq!(
+            reader.handle(Request::Status { operation: OperationId(1) }).code,
+            "42501"
+        );
+        assert!(reader.execute_sql("BEGIN", &[]).is_ok());
+        assert!(reader.execute_sql("ROLLBACK", &[]).is_ok());
+        assert!(matches!(
+            reader.prepare("SELECT id FROM owned LIMIT 1"),
+            Err(CoreError::Policy(Error::Scope))
+        ));
+        roles
+            .alter("reader", roles::RoleChanges {
+                login: Some(false),
+                ..roles::RoleChanges::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.catalog_snapshot(),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        assert!(matches!(
+            service.role_session("reader"),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+        assert!(matches!(
+            service.role_session("missing"),
+            Err(CoreError::Policy(Error::Authentication))
+        ));
+    }
+    #[test]
+    fn database_catalog_snapshot_checks_transaction_schema_and_aborted_state() {
+        let (service, _) = fixture();
+        service
+            .admin
+            .roles()
+            .create(roles::NewRole {
+                name: "owner".into(),
+                login: true,
+                superuser: true,
+                ..roles::NewRole::default()
+            })
+            .unwrap();
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("BEGIN", &[]).unwrap();
+        service
+            .admin
+            .sql_session()
+            .execute("CREATE TABLE future (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert!(matches!(
+            owner.catalog_snapshot(),
+            Err(CoreError::Sql(relational::SqlError::UnknownTable))
+        ));
+        owner.sql.rollback();
+        assert_eq!(owner.catalog_snapshot().unwrap().1.len(), 2);
+        owner.execute_sql("BEGIN", &[]).unwrap();
+        owner.abort();
+        assert!(matches!(
+            owner.catalog_snapshot(),
+            Err(CoreError::Sql(relational::SqlError::Aborted))
+        ));
     }
     #[test]
     fn metadata_snapshot_filters_real_definitions_without_reading_or_mutating_rows() {

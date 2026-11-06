@@ -444,7 +444,7 @@ fn inspect(
     settings: &crate::pg_settings::Settings,
     session: &Session,
 ) -> R<(Description, SqlResult)> {
-    if !matches!(session.role, Role::Application { .. }) {
+    if !session.role.is_sql() {
         return Err("42501");
     }
     if session.is_aborted() {
@@ -477,7 +477,7 @@ fn execute_control(
     implicit: &mut bool,
     settings: &mut crate::pg_settings::SessionSettings,
 ) -> R<&'static str> {
-    if !matches!(session.role, Role::Application { .. }) {
+    if !session.role.is_sql() {
         return Err("42501");
     }
     let was = session.in_transaction();
@@ -599,7 +599,7 @@ impl State {
                     rows(&result, &description, &[], 0, 1, out)?;
                     complete("SHOW", &result, out)?;
                 } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
-                    if !matches!(session.role, Role::Application { .. }) {
+                    if !session.role.is_sql() {
                         return Err("42501");
                     }
                     if session.is_aborted() {
@@ -687,7 +687,7 @@ impl State {
                         },
                     )
                 } else if let Some(command) = control(&sql) {
-                    if !matches!(session.role, Role::Application { .. }) {
+                    if !session.role.is_sql() {
                         return Err("42501");
                     }
                     (
@@ -701,7 +701,7 @@ impl State {
                     let (description, _) = inspect(show, &self.settings.current, session)?;
                     (Plan::Inspect(show), description)
                 } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
-                    if !matches!(session.role, Role::Application { .. }) {
+                    if !session.role.is_sql() {
                         return Err("42501");
                     }
                     if settings.len() != 1 {
@@ -1001,7 +1001,7 @@ impl State {
                     return Ok(true);
                 }
                 if let Plan::Settings(settings) = &p.s.p {
-                    if !matches!(session.role, Role::Application { .. }) {
+                    if !session.role.is_sql() {
                         return Err("42501");
                     }
                     if session.is_aborted() {
