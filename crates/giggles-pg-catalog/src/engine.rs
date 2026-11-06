@@ -207,6 +207,16 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
             ControlFlow::Continue(())
         }
         fn pre_visit_statement(&mut self, s: &a::Statement) -> ControlFlow<Error> {
+            // Clients validate connections with table-free SELECTs. Evaluate
+            // their expressions normally rather than matching a SQL prefix or
+            // manufacturing a successful response. Relation scanning below
+            // still rejects hidden application relations in subqueries.
+            if let a::Statement::Query(q) = s
+                && let a::SetExpr::Select(select) = q.body.as_ref()
+                && select.from.is_empty()
+            {
+                self.catalog = true;
+            }
             if !matches!(s, a::Statement::Query(_)) {
                 self.mutation = true
             }

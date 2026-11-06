@@ -49,6 +49,10 @@ pub const DISCOVERY_CASES: &[(&str, &str)] = &[
 ];
 pub const JDBC_CASES: &[(&str, &str)] = &[
     (
+        "keepalive",
+        "table-free SELECT 1 returns one non-null JDBC INTEGER in simple and prepared execution",
+    ),
+    (
         "identity",
         "current database giggles, schema public, current/session user giggles",
     ),

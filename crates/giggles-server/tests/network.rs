@@ -2762,6 +2762,75 @@ async fn catalog_and_application_pages_share_aggregate_cache_admission() {
 mod accounting_network;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn datagrip_keepalive_table_free_select_simple_prepared_and_role_boundaries() {
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    for sql in [
+        "SELECT 1",
+        "/* keep-alive */ select 1;",
+        "SELECT 1 AS alive",
+    ] {
+        let messages = pg.simple_query(sql).await.unwrap();
+        let values = messages
+            .iter()
+            .filter_map(|m| {
+                if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+                    Some(row.get(0))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [Some("1")]);
+        let statement = pg.prepare(sql).await.unwrap();
+        assert_eq!(
+            statement.columns()[0].type_(),
+            &tokio_postgres::types::Type::INT4
+        );
+        assert_eq!(
+            pg.query_one(&statement, &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            1
+        );
+    }
+    assert!(
+        pg.query("SELECT 1 WHERE false", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(pg.simple_query("SELECT 1; DELETE FROM app").await.is_err());
+    assert!(
+        pg.query("SELECT (SELECT id FROM other LIMIT 1)", &[])
+            .await
+            .is_err()
+    );
+    pg.batch_execute("BEGIN").await.unwrap();
+    assert!(pg.batch_execute("nonsense").await.is_err());
+    assert_eq!(code(pg.query("SELECT 1", &[]).await.unwrap_err()), "25P02");
+    pg.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        pg.query_one("SELECT 1", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        1
+    );
+    drop(pg);
+    conn.await.unwrap();
+    let (task, conn) = f.pg(f.task.clone()).await;
+    assert_eq!(
+        code(task.query("SELECT 1", &[]).await.unwrap_err()),
+        "42501"
+    );
+    drop(task);
+    conn.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_declared_parameter_type_cannot_disagree_with_output_description() {
     use tokio_postgres::types::Type;
     let f = Fixture::new().await;

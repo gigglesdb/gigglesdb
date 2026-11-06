@@ -86,6 +86,7 @@ Probe timeouts are 1..300 seconds. Processes launched here do not launch child
 process trees; kill-on-drop covers early returns.
 
 JDBC: connect/init, isValid, simple/prepared queries, all six supported types,
+and table-free `SELECT 1` keep-alive queries through Statement/PreparedStatement,
 SQL NULL/wasNull, repeated queries crossing prepare threshold, commit visibility,
 rollback, failed transaction recovery, authorization, close, and actual metadata
 tables/columns/PK/type-info/hidden-column probes. Metadata assertions require

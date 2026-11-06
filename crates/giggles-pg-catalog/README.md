@@ -7,6 +7,8 @@ It does not open a database or access application rows. Callers supply a coheren
 `plan(sql)` classifies and compiles a query; ordinary application statements
 return `None`. `describe(plan)` returns PostgreSQL field types and OIDs.
 `execute(plan, snapshot, parameters)` evaluates against the supplied definitions.
+Table-free SELECTs such as `SELECT 1` also use this evaluator, including normal
+expression typing, predicates and limits. They are not canned success responses.
 Plans contain no authorization or cached catalog data. Recheck authorization and
 schema consistency before execution and before releasing cached results.
 

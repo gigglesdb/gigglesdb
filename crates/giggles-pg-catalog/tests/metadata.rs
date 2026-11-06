@@ -419,7 +419,12 @@ fn captured_datagrip_discovery_and_absent_features() {
     ] {
         assert!(run(sql).rows.is_empty());
     }
-    assert!(plan("select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time").unwrap().is_none());
+    assert!(matches!(
+        plan(
+            "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time"
+        ),
+        Err(Error::Unsupported)
+    ));
 }
 #[test]
 fn types_rejected_before_empty_execution() {

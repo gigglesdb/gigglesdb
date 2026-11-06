@@ -83,6 +83,12 @@ public class JdbcProbe {
     String v=org.postgresql.util.DriverInfo.DRIVER_VERSION;System.out.println("VERSION\t"+v);
     if(!v.equals("42.7.3"))throw new IllegalStateException("expected pgJDBC 42.7.3, got "+v);
     if(profile.equals("datagrip-discovery")){discovery();return;}
+    test("keepalive",c->{
+      for(String sql:List.of("SELECT 1","/* keep-alive */ select 1;")){
+        try(var st=c.createStatement();var r=st.executeQuery(sql)){require(r.next(),"missing keepalive row");require(r.getMetaData().getColumnType(1)==Types.INTEGER,"keepalive type");require(r.getInt(1)==1&&!r.wasNull(),"keepalive value");require(!r.next(),"extra keepalive row");}
+        try(var st=c.prepareStatement(sql);var r=st.executeQuery()){require(r.next(),"missing prepared keepalive row");require(r.getInt(1)==1&&!r.wasNull(),"prepared keepalive value");require(!r.next(),"extra prepared keepalive row");}
+      }
+    });
     test("identity",c->{try(var st=c.createStatement();var r=st.executeQuery("SELECT current_database(), current_schema(), current_user, session_user")){
       require(r.next(),"identity row missing");require("giggles".equals(r.getString(1)),"database");require("public".equals(r.getString(2)),"schema");require("giggles".equals(r.getString(3)),"current user");require("giggles".equals(r.getString(4)),"session user");require(!r.next(),"extra identity row");}});
     test("connection_schema",c->require("public".equals(c.getSchema()),"getSchema must be public"));
