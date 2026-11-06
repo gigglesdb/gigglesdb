@@ -1,0 +1,20 @@
+{
+    "source":  "PostgreSQL REL_18_0",
+    "seed":  "0xdd68956218000001",
+    "testPlanRevision":  1,
+    "gaps":  [
+                 "v7-generation",
+                 "ambient-v4-generation",
+                 "big-endian-hash",
+                 "engine-storage-wire-integration"
+             ],
+    "sourceHashes":  {
+                         "COPYRIGHT":  "5ed3ce5c9373dff7f98b1fae7a6c7ccd98df7d734d46d24c1bcebf1240be8307",
+                         "hashfn.c":  "470424d9005be9029842ca89ee2250f91add611b594fb200e7cee635dd33d015",
+                         "uuid.c":  "4017a73947f9f1b76a7a4c04edd42e46d4d07eb57e41576987c90bceb58d123d"
+                     },
+    "oracle":  "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+    "oracleRows":  774,
+    "status":  "partial-foundation",
+    "serverVersionNum":  180000
+}

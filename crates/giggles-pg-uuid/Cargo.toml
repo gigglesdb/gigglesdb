@@ -1,0 +1,8 @@
+[package]
+name = "giggles-pg-uuid"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+[workspace]
+[dependencies]
+giggles-pg-types = { path = "../giggles-pg-types" }
