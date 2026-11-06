@@ -142,3 +142,44 @@ local host. No low-memory, physical I/O, CPU, latency or overload qualification 
 claimed. Idle sessions time out under existing10s IO timeout; their task caps do
 not reset. Detached workers retain both blocking and aggregate session admission
 until they actually finish, even after socket abort/shutdown.
+
+## Optional HTTP and gRPC interfaces
+
+Both API listeners share the aggregate physical-socket pool, rate bucket and
+blocking32 runner above with native and PostgreSQL. A further Service-owned pool
+admits at most128 API calls before buffering/decoding, including malformed routes.
+There is no reserved Close capacity. Logical API sessions are separate:32 by
+default, configurable1..128, with no socket held while idle. Their real SQL
+sessions still share the existing database-wide eight staged snapshots.
+
+Typed native operations and atomic blocks use these same call, worker and
+snapshot pools. Native and SQL work in one API session share one transaction;
+a block joining that transaction does not allocate an independent outer
+snapshot. Admission precedes AST decoding. Native requests additionally cap
+expression depth at24 edges, aggregate AST nodes at4096, bindings at256/64KiB,
+serialized core input and resolved value occurrences at64KiB each, per-field
+lists at64, insert/complete-input rows at1024, and block steps plus one item when
+emit is present at64; emitted values are separately capped at64. The core's1MiB
+local/emitted/mutation/result bounds count raw value bytes,
+not Rust object overhead; many empty strings or repeated emitted rows can still
+expand substantially. The existing8MiB encoded-reply guard applies to all native
+outcomes and prevents partial success output. These finite bounds add no claim
+of a measured process-memory or execution-time guarantee.
+
+At128 admitted API calls, bounded request payloads account for32MiB and encoded
+responses for1024MiB. One worker may transiently hold native, typed and serialized
+response representations. Each HTTP/2 connection has at most16 streams, a64KiB
+stream receive window,1MiB connection receive window,16KiB decoded header list,
+4KiB HPACK table and64KiB send-buffer target. Output is chunked at16KiB and carries
+its session/call/socket ownership through the protocol send queue. These values
+are conservative capacity dimensions; they do not establish a process RSS bound.
+The pinned HTTP/2 parser can retain112KiB of encoded partial-header frames and
+reserve approximately180KiB for Huffman expansion, plus allocator overhead,
+before rejecting a decoded header list over16KiB. Reset history is50entries for
+one second. The accepted header-size cap is not a peak parser-memory bound.
+
+API session idle/absolute/transaction expiry is60/3600/60seconds. PING-only HTTP/2
+traffic does not refresh the separate10second application I/O watchdog. Binding
+epochs fence handles across protocol changes and new TLS connections. Close,
+expiry and shutdown discard staging but cannot undo a sealed decision. See
+[API.md](API.md) for the exact wire contract, deadlines and unknown-outcome rules.

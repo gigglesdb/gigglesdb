@@ -4,7 +4,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, oneshot},
+    sync::{Semaphore, oneshot, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -49,10 +49,27 @@ pub struct Running {
     task: JoinHandle<io::Result<()>>,
 }
 impl Running {
-    pub async fn shutdown(mut self) -> io::Result<()> {
+    pub(crate) fn new(
+        address: SocketAddr,
+        stop: oneshot::Sender<()>,
+        task: JoinHandle<io::Result<()>>,
+    ) -> Self {
+        Self {
+            address,
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    /// Signal every listener before awaiting any shutdown work.
+    pub fn request_shutdown(&mut self) {
         if let Some(s) = self.stop.take() {
             let _ = s.send(());
         }
+    }
+
+    pub async fn shutdown(mut self) -> io::Result<()> {
+        self.request_shutdown();
         self.task.await.map_err(io::Error::other)?
     }
 }
@@ -85,9 +102,52 @@ async fn serve_mode(
         return Err(io::Error::other("connection limit"));
     }
     let listener = TcpListener::bind(address).await?;
+    let (_, start) = watch::channel(true);
+    serve_listener(listener, service, config, connections, pg, start).await
+}
+
+/// Starts a pre-bound native listener after the common startup gate opens.
+pub async fn serve_bound(
+    listener: TcpListener,
+    service: Arc<Service>,
+    config: Arc<ServerConfig>,
+    connections: usize,
+    start: watch::Receiver<bool>,
+) -> io::Result<Running> {
+    serve_listener(listener, service, config, connections, false, start).await
+}
+
+/// Starts a pre-bound PostgreSQL listener after the common startup gate opens.
+pub async fn serve_pg_bound(
+    listener: TcpListener,
+    service: Arc<Service>,
+    config: Arc<ServerConfig>,
+    connections: usize,
+    start: watch::Receiver<bool>,
+) -> io::Result<Running> {
+    serve_listener(listener, service, config, connections, true, start).await
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    service: Arc<Service>,
+    config: Arc<ServerConfig>,
+    connections: usize,
+    pg: bool,
+    mut start: watch::Receiver<bool>,
+) -> io::Result<Running> {
+    if connections == 0 || connections > 128 {
+        return Err(io::Error::other("connection limit"));
+    }
     let address = listener.local_addr()?;
     let (stop, mut rx) = oneshot::channel();
     let task = tokio::spawn(async move {
+        while !*start.borrow_and_update() {
+            tokio::select! {
+                _ = &mut rx => return Ok(()),
+                changed = start.changed() => if changed.is_err() { return Ok(()); },
+            }
+        }
         let sem = Arc::new(Semaphore::new(connections));
         let accept = TlsAcceptor::from(config);
         let mut tasks = tokio::task::JoinSet::new();
@@ -146,11 +206,7 @@ async fn serve_mode(
         while tasks.join_next().await.is_some() {}
         Ok(())
     });
-    Ok(Running {
-        address,
-        stop: Some(stop),
-        task,
-    })
+    Ok(Running::new(address, stop, task))
 }
 pub struct Client {
     stream: TlsStream<TcpStream>,

@@ -25,6 +25,7 @@ impl Default for ServiceLimits {
 }
 pub(crate) struct Admission {
     sessions: Arc<Semaphore>,
+    api_calls: Arc<Semaphore>,
     bucket: Mutex<Bucket>,
 }
 struct Bucket {
@@ -66,6 +67,7 @@ impl Admission {
         }
         Ok(Self {
             sessions: Arc::new(Semaphore::new(limits.sessions)),
+            api_calls: Arc::new(Semaphore::new(128)),
             bucket: Mutex::new(Bucket {
                 limits,
                 credit: u128::from(limits.burst) * 1_000_000_000,
@@ -75,6 +77,14 @@ impl Admission {
     }
     pub(crate) fn request(&self) -> bool {
         self.bucket.lock().is_ok_and(|mut b| b.take(Instant::now()))
+    }
+    /// Charge every API attempt, including malformed routes and capacity rejects.
+    /// One pool belongs to Service, so multiple listeners/runtimes cannot multiply it.
+    pub(crate) fn api_call(&self) -> Option<OwnedSemaphorePermit> {
+        if !self.request() {
+            return None;
+        }
+        self.api_calls.clone().try_acquire_owned().ok()
     }
     pub(crate) fn connect(&self) -> Option<Arc<OwnedSemaphorePermit>> {
         if !self.request() {
@@ -210,5 +220,33 @@ mod tests {
         assert!(a.connect().is_some());
         assert!(!a.request());
         assert_eq!(a.sessions.available_permits(), 1);
+    }
+
+    #[test]
+    fn api_attempts_and_capacity_rejections_spend_shared_rate() {
+        let admission = Admission::new(ServiceLimits {
+            sessions: 1,
+            burst: 132,
+            per_second: 1,
+        })
+        .unwrap();
+        // Freeze refill through this private test seam; assertions never depend
+        // on the host finishing in less than a wall-clock second.
+        admission.bucket.lock().unwrap().limits.per_second = 0;
+        let socket = admission.connect().unwrap();
+        // Admission happens before decoding, so even an immediately discarded
+        // malformed request consumes its token.
+        drop(admission.api_call().unwrap());
+        let calls: Vec<_> = (0..128).map(|_| admission.api_call().unwrap()).collect();
+        assert!(admission.api_call().is_none());
+        assert_eq!(admission.bucket.lock().unwrap().credit, 1_000_000_000);
+        drop(calls);
+        // Native/pgwire requests consume the same final token.
+        assert!(admission.request());
+        assert!(admission.api_call().is_none());
+        assert!(!admission.request());
+        assert_eq!(admission.api_calls.available_permits(), 128);
+        drop(socket);
+        assert_eq!(admission.sessions.available_permits(), 1);
     }
 }

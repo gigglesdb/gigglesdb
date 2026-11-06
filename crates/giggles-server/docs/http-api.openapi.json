@@ -1,0 +1,3334 @@
+{
+  "openapi": "3.1.1",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Giggles HTTP API",
+    "version": "1.0.0",
+    "description": "The strict JSON profile of giggles.v1.Giggles. HTTPS with verified client certificates is mandatory. Persistent sessions share transactions across HTTP and gRPC calls, including reconnects with the same certificate. One Execute owns a session through response completion. Session handles do not grant authority by themselves. Only documented lowerCamel field names are accepted. No compression, query parameters, automatic retries, DDL capability expansion, approval issuance or identity-selection fields. Close/expiry drops uncommitted state once active ownership permits; a lost response never proves rollback. Domain errors remain successful transport responses. Metadata/protocol errors may terminate a connection instead of yielding an envelope. Native operation, atomic transaction, and explicit begin/commit/rollback arms execute the typed core API directly. Bound handles, catalog mutation and once/idempotency APIs are not exposed."
+  },
+  "servers": [
+    {
+      "url": "https://{host}:{port}",
+      "description": "Illustrative address; use the operator-configured HTTPS listener.",
+      "variables": {
+        "host": {
+          "default": "localhost"
+        },
+        "port": {
+          "default": "8443"
+        }
+      }
+    }
+  ],
+  "security": [
+    {
+      "mutualTLS": []
+    }
+  ],
+  "x-max-request-body-bytes": 262144,
+  "x-max-response-body-bytes": 8388608,
+  "x-max-json-depth": 128,
+  "paths": {
+    "/v1/sessions": {
+      "post": {
+        "operationId": "openSession",
+        "summary": "Open a certificate-bound persistent session",
+        "description": "The request must not include x-giggles-session. Query strings are rejected. Client certificate verification failure ends the TLS handshake.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Empty"
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "New session. Treat sessionId as sensitive.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenSessionReply"
+                },
+                "example": {
+                  "sessionId": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                  "idleTimeoutSeconds": 60,
+                  "maxAgeSeconds": 3600,
+                  "transactionTimeoutSeconds": 60
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed message, metadata or query string; nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "invalid request"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unbound or stale connection identity. Invalidation at release can follow an already committed decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "authentication required"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, closed, expired or other-identity handle.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_NOT_FOUND",
+                    "message": "session not found"
+                  }
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Header/body receive deadline expired. The connection may close instead.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "DEADLINE_EXCEEDED",
+                    "message": "deadline exceeded"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another call owns this session. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_BUSY",
+                    "message": "session busy"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds 262144 bytes. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Content-Type or any Content-Encoding. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNSUPPORTED_MEDIA_TYPE",
+                    "message": "unsupported encoding"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate, API-call or logical-session capacity exhausted. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal worker failure. Session invalidated; an earlier decision may have committed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INTERNAL",
+                    "message": "internal error; outcome may be ambiguous"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server shutting down or admission closed. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAVAILABLE",
+                    "message": "service unavailable"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session/execute": {
+      "post": {
+        "operationId": "execute",
+        "summary": "Run SQL or an existing scoped task operation",
+        "security": [
+          {
+            "mutualTLS": [],
+            "sessionHandle": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionHeader"
+          }
+        ],
+        "description": "A valid admitted execution refreshes idle time after completion. SQL BEGIN/COMMIT/ROLLBACK retain the existing Session across calls. Core errors may abort a transaction; ROLLBACK recovers an aborted live session. Missing default scalar/repeated fields in replies retain their protobuf defaults. Output is bounded to 8388608 bytes. No response implies no certainty about whether a decision committed.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteRequest"
+              },
+              "examples": {
+                "ping": {
+                  "value": {
+                    "ping": {}
+                  }
+                },
+                "begin": {
+                  "value": {
+                    "sql": {
+                      "sql": "BEGIN"
+                    }
+                  }
+                },
+                "parameters": {
+                  "value": {
+                    "sql": {
+                      "sql": "INSERT INTO app (id,body) VALUES ($1,$2)",
+                      "params": [
+                        {
+                          "intValue": "1"
+                        },
+                        {
+                          "textValue": "hello"
+                        }
+                      ]
+                    },
+                    "budgetMs": 5000
+                  }
+                },
+                "select": {
+                  "value": {
+                    "sql": {
+                      "sql": "SELECT id,body FROM app WHERE id=$1",
+                      "params": [
+                        {
+                          "intValue": "1"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "commit": {
+                  "value": {
+                    "sql": {
+                      "sql": "COMMIT"
+                    }
+                  }
+                },
+                "rollback": {
+                  "value": {
+                    "sql": {
+                      "sql": "ROLLBACK"
+                    }
+                  }
+                },
+                "preview": {
+                  "value": {
+                    "preview": {
+                      "request": {
+                        "operation": "701",
+                        "selection": {
+                          "keys": {
+                            "items": [
+                              {
+                                "tenant": "42",
+                                "row": "7"
+                              }
+                            ]
+                          }
+                        },
+                        "column": "COLUMN_STATUS",
+                        "after": "DELIVERY_STATUS_QUEUED"
+                      }
+                    }
+                  }
+                },
+                "execute": {
+                  "value": {
+                    "execute": {
+                      "request": {
+                        "operation": "701",
+                        "selection": {
+                          "keys": {
+                            "items": [
+                              {
+                                "tenant": "42",
+                                "row": "7"
+                              }
+                            ]
+                          }
+                        },
+                        "column": "COLUMN_STATUS",
+                        "after": "DELIVERY_STATUS_QUEUED"
+                      },
+                      "approval": "12"
+                    }
+                  }
+                },
+                "predicate": {
+                  "value": {
+                    "preview": {
+                      "request": {
+                        "operation": "703",
+                        "selection": {
+                          "predicate": {
+                            "tenant": "42",
+                            "status": "DELIVERY_STATUS_FAILED",
+                            "from": "0",
+                            "until": "99"
+                          }
+                        },
+                        "column": "COLUMN_STATUS",
+                        "after": "DELIVERY_STATUS_QUEUED"
+                      }
+                    }
+                  }
+                },
+                "repair": {
+                  "value": {
+                    "repairSql": {
+                      "operation": "702",
+                      "sql": "UPDATE deliveries SET status = 'queued' WHERE tenant = 42 AND id = 7"
+                    }
+                  }
+                },
+                "status": {
+                  "value": {
+                    "status": {
+                      "operation": "701"
+                    }
+                  }
+                },
+                "values": {
+                  "value": {
+                    "sql": {
+                      "sql": "SELECT $1,$2,$3,$4,$5",
+                      "params": [
+                        {
+                          "intValue": "-9223372036854775808"
+                        },
+                        {
+                          "boolValue": false
+                        },
+                        {
+                          "nullValue": "SQL_NULL"
+                        },
+                        {
+                          "textValue": "\u0000é›ª"
+                        },
+                        {
+                          "bytesValue": "AP8="
+                        }
+                      ]
+                    }
+                  }
+                },
+                "nativeRead": {
+                  "value": {
+                    "operation": {
+                      "request": {
+                        "read": {
+                          "table": "app",
+                          "projection": [
+                            "id"
+                          ],
+                          "limit": {
+                            "literal": {
+                              "intValue": "10"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "nativeInsert": {
+                  "value": {
+                    "operation": {
+                      "request": {
+                        "insert": {
+                          "table": "app",
+                          "values": [
+                            {
+                              "column": "id",
+                              "value": {
+                                "parameter": "id"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "bindings": [
+                        {
+                          "name": "id",
+                          "value": {
+                            "intValue": "1"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                "nativeBegin": {
+                  "value": {
+                    "begin": {}
+                  }
+                },
+                "nativeCommit": {
+                  "value": {
+                    "commit": {}
+                  }
+                },
+                "nativeRollback": {
+                  "value": {
+                    "rollback": {}
+                  }
+                },
+                "nativeBlock": {
+                  "value": {
+                    "transaction": {
+                      "transaction": {
+                        "readOnly": true,
+                        "steps": [
+                          {
+                            "letBinding": {
+                              "name": "r",
+                              "request": {
+                                "read": {
+                                  "table": "app",
+                                  "projection": [
+                                    "id"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        ],
+                        "emit": {
+                          "values": [
+                            {
+                              "rows": "r"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "nativeUpsert": {
+                  "value": {
+                    "operation": {
+                      "request": {
+                        "returning": {
+                          "request": {
+                            "onConflict": {
+                              "request": {
+                                "insertMany": {
+                                  "table": "app",
+                                  "columns": [
+                                    "id"
+                                  ],
+                                  "rows": [
+                                    {
+                                      "values": [
+                                        {
+                                          "value": {
+                                            "literal": {
+                                              "intValue": "1"
+                                            }
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  ],
+                                  "cap": {
+                                    "literal": {
+                                      "intValue": "1"
+                                    }
+                                  }
+                                }
+                              },
+                              "target": [
+                                "id"
+                              ],
+                              "action": {
+                                "nothing": {}
+                              }
+                            }
+                          },
+                          "projection": [
+                            {
+                              "expression": {
+                                "field": "id"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Existing Service result, including domain errors.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteReply"
+                },
+                "example": {
+                  "version": 1,
+                  "code": "ok",
+                  "sql": {
+                    "columns": [
+                      "id",
+                      "body"
+                    ],
+                    "rows": [
+                      {
+                        "values": [
+                          {
+                            "intValue": "1"
+                          },
+                          {
+                            "textValue": "hello"
+                          }
+                        ],
+                        "version": "1"
+                      }
+                    ],
+                    "affected": "0"
+                  },
+                  "transactionState": "TRANSACTION_STATE_IN_TRANSACTION"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed message, metadata or query string; nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "invalid request"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unbound or stale connection identity. Invalidation at release can follow an already committed decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "authentication required"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, closed, expired or other-identity handle.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_NOT_FOUND",
+                    "message": "session not found"
+                  }
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Header/body receive deadline expired. The connection may close instead.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "DEADLINE_EXCEEDED",
+                    "message": "deadline exceeded"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another call owns this session. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_BUSY",
+                    "message": "session busy"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds 262144 bytes. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Content-Type or any Content-Encoding. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNSUPPORTED_MEDIA_TYPE",
+                    "message": "unsupported encoding"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate, API-call or logical-session capacity exhausted. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal worker failure. Session invalidated; an earlier decision may have committed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INTERNAL",
+                    "message": "internal error; outcome may be ambiguous"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server shutting down or admission closed. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAVAILABLE",
+                    "message": "service unavailable"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session": {
+      "delete": {
+        "operationId": "closeSession",
+        "summary": "Invalidate a session and discard uncommitted state",
+        "security": [
+          {
+            "mutualTLS": [],
+            "sessionHandle": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SessionHeader"
+          }
+        ],
+        "description": "No request body is allowed. Invalidates the handle immediately; active work retains its resources until it finishes. A sealed decision may already have committed. Repeated close returns SESSION_NOT_FOUND.",
+        "responses": {
+          "204": {
+            "description": "Session invalidated. Empty response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed message, metadata or query string; nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "invalid request"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unbound or stale connection identity. Invalidation at release can follow an already committed decision.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAUTHENTICATED",
+                    "message": "authentication required"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown, closed, expired or other-identity handle.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_NOT_FOUND",
+                    "message": "session not found"
+                  }
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Header/body receive deadline expired. The connection may close instead.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "DEADLINE_EXCEEDED",
+                    "message": "deadline exceeded"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another call owns this session. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "SESSION_BUSY",
+                    "message": "session busy"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds 262144 bytes. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Content-Type or any Content-Encoding. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNSUPPORTED_MEDIA_TYPE",
+                    "message": "unsupported encoding"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate, API-call or logical-session capacity exhausted. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "RESOURCE_EXHAUSTED",
+                    "message": "resource limit"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal worker failure. Session invalidated; an earlier decision may have committed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "INTERNAL",
+                    "message": "internal error; outcome may be ambiguous"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server shutting down or admission closed. Nothing dispatched.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": {
+                    "code": "UNAVAILABLE",
+                    "message": "service unavailable"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "mutualTLS": {
+        "type": "mutualTLS",
+        "description": "Certificate leaf fingerprint must have a current server binding. Identity cannot be selected in headers or message fields."
+      },
+      "sessionHandle": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-giggles-session",
+        "description": "Sensitive opaque handle additionally bound to the verified certificate and binding epoch. Not a standalone bearer authorization."
+      }
+    },
+    "parameters": {
+      "SessionHeader": {
+        "name": "x-giggles-session",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SessionId"
+        },
+        "x-sensitive": true,
+        "description": "Exactly one ASCII header. Duplicate, missing, comma-joined or malformed values are rejected. Keep out of logs."
+      }
+    },
+    "schemas": {
+      "Empty": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "UInt64": {
+        "type": "string",
+        "format": "uint64-decimal",
+        "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-4]|18446744073709551615)(?![\\s\\S])",
+        "description": "Canonical unsigned decimal string, 0 through 18446744073709551615 inclusive. Numeric JSON tokens, leading zeros, signs, whitespace, fractions and exponents are rejected.",
+        "x-minimum": "0",
+        "x-maximum": "18446744073709551615"
+      },
+      "Int64": {
+        "type": "string",
+        "format": "int64-decimal",
+        "pattern": "^(?:0|(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-6]|9223372036854775807)|-(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[0-1][0-9]{17}|92[0-1][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[0-1][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7]|9223372036854775808))(?![\\s\\S])",
+        "description": "Canonical signed decimal string, -9223372036854775808 through 9223372036854775807 inclusive. No leading plus, leading zeros or negative zero.",
+        "x-minimum": "-9223372036854775808",
+        "x-maximum": "9223372036854775807"
+      },
+      "Bytes": {
+        "type": "string",
+        "contentEncoding": "base64",
+        "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?(?![\\s\\S])",
+        "description": "Canonical standard padded base64, including empty bytes. URL-safe variants, omitted required padding, whitespace and nonzero unused bits are rejected."
+      },
+      "SessionId": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}(?![\\s\\S])",
+        "minLength": 64,
+        "maxLength": 64,
+        "x-sensitive": true,
+        "description": "Opaque secret bound to the exact authenticated leaf certificate and its current binding epoch. Never place it in logs, URLs or cookies."
+      },
+      "Column": {
+        "type": "string",
+        "enum": [
+          "COLUMN_STATUS",
+          "COLUMN_FAILED_AT",
+          "COLUMN_ATTEMPT_COUNT"
+        ]
+      },
+      "DeliveryStatus": {
+        "type": "string",
+        "enum": [
+          "DELIVERY_STATUS_FAILED",
+          "DELIVERY_STATUS_QUEUED",
+          "DELIVERY_STATUS_SUCCEEDED"
+        ]
+      },
+      "TransactionState": {
+        "type": "string",
+        "enum": [
+          "TRANSACTION_STATE_IDLE",
+          "TRANSACTION_STATE_IN_TRANSACTION",
+          "TRANSACTION_STATE_ABORTED"
+        ]
+      },
+      "Value": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "nullValue": {
+                "type": "string",
+                "const": "SQL_NULL"
+              }
+            },
+            "required": [
+              "nullValue"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "boolValue": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "boolValue"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "intValue": {
+                "$ref": "#/components/schemas/Int64"
+              }
+            },
+            "required": [
+              "intValue"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "textValue": {
+                "type": "string",
+                "description": "UTF-8 text, including empty strings and escaped NUL/control characters."
+              }
+            },
+            "required": [
+              "textValue"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "bytesValue": {
+                "$ref": "#/components/schemas/Bytes"
+              }
+            },
+            "required": [
+              "bytesValue"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "Exactly one typed value. JSON null and missing values are rejected."
+      },
+      "Key": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "row": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "tenant",
+          "row"
+        ],
+        "additionalProperties": false
+      },
+      "KeyList": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Key"
+            },
+            "description": "Order and duplicates are preserved. Existing core rules reject duplicate keys."
+          }
+        },
+        "additionalProperties": false
+      },
+      "Predicate": {
+        "type": "object",
+        "properties": {
+          "tenant": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeliveryStatus"
+          },
+          "from": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "until": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "tenant",
+          "status",
+          "from",
+          "until"
+        ],
+        "additionalProperties": false
+      },
+      "Selection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "keys": {
+                "$ref": "#/components/schemas/KeyList"
+              }
+            },
+            "required": [
+              "keys"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "predicate": {
+                "$ref": "#/components/schemas/Predicate"
+              }
+            },
+            "required": [
+              "predicate"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "Predicate bounds retain the existing half-open [from, until) interpretation."
+      },
+      "TaskRequest": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/Selection"
+          },
+          "column": {
+            "$ref": "#/components/schemas/Column"
+          },
+          "after": {
+            "$ref": "#/components/schemas/DeliveryStatus"
+          }
+        },
+        "required": [
+          "operation",
+          "selection",
+          "column",
+          "after"
+        ],
+        "additionalProperties": false
+      },
+      "SqlRequest": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "default": "",
+            "description": "SQL passed unchanged to Service. Existing core limits apply: 65536 UTF-8 bytes and 256 parameters; core failures are ExecuteReply domain results."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Value"
+            },
+            "default": []
+          }
+        },
+        "additionalProperties": false
+      },
+      "PreviewRequest": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/TaskRequest"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "TaskExecuteRequest": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/TaskRequest"
+          },
+          "approval": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false
+      },
+      "RepairSqlRequest": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "sql": {
+            "type": "string",
+            "default": ""
+          },
+          "approval": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "additionalProperties": false
+      },
+      "StatusRequest": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "additionalProperties": false
+      },
+      "OpenSessionReply": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "idleTimeoutSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "maxAgeSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "transactionTimeoutSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "additionalProperties": false
+      },
+      "SqlRow": {
+        "type": "object",
+        "properties": {
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Value"
+            }
+          },
+          "version": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SqlResult": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SqlRow"
+            }
+          },
+          "affected": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ExecuteReply": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "code": {
+            "type": "string",
+            "description": "Existing Service decision code, including success and domain errors. A domain error retains HTTP 200; never infer retry safety from it. Post-dispatch output encoding or size failure yields the fixed domain code 08007 and retains transaction state; this is an ambiguous outcome, not proof of rollback. Native success uses ok; fixed native domain error classes use native_error (Unknown remains 08007). Existing authority/aborted/cancellation classes retain their fixed SQLSTATE codes."
+          },
+          "operation": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "count": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "sql": {
+            "$ref": "#/components/schemas/SqlResult"
+          },
+          "transactionState": {
+            "$ref": "#/components/schemas/TransactionState"
+          },
+          "operationOutcome": {
+            "$ref": "#/components/schemas/NativeOutcome"
+          },
+          "transactionOutcome": {
+            "$ref": "#/components/schemas/NativeTransactionOutcome"
+          },
+          "nativeError": {
+            "$ref": "#/components/schemas/NativeError"
+          }
+        },
+        "required": [
+          "version",
+          "code",
+          "transactionState"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "operationOutcome",
+                    "transactionOutcome"
+                  ]
+                },
+                {
+                  "required": [
+                    "operationOutcome",
+                    "nativeError"
+                  ]
+                },
+                {
+                  "required": [
+                    "transactionOutcome",
+                    "nativeError"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ExecuteRequest": {
+        "type": "object",
+        "properties": {
+          "ping": {
+            "$ref": "#/components/schemas/Empty"
+          },
+          "sql": {
+            "$ref": "#/components/schemas/SqlRequest"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/PreviewRequest"
+          },
+          "execute": {
+            "$ref": "#/components/schemas/TaskExecuteRequest"
+          },
+          "repairSql": {
+            "$ref": "#/components/schemas/RepairSqlRequest"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusRequest"
+          },
+          "budgetMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 10000,
+            "description": "Decision budget in milliseconds. Zero never starts a decision. Must be a JSON integer token; 1.0 and 1e0 are rejected even if a JSON Schema validator treats them as integers."
+          },
+          "operation": {
+            "$ref": "#/components/schemas/NativeOperationRequest"
+          },
+          "transaction": {
+            "$ref": "#/components/schemas/NativeTransactionRequest"
+          },
+          "begin": {
+            "$ref": "#/components/schemas/BeginRequest"
+          },
+          "commit": {
+            "$ref": "#/components/schemas/CommitRequest"
+          },
+          "rollback": {
+            "$ref": "#/components/schemas/RollbackRequest"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "ping"
+            ]
+          },
+          {
+            "required": [
+              "sql"
+            ]
+          },
+          {
+            "required": [
+              "preview"
+            ]
+          },
+          {
+            "required": [
+              "execute"
+            ]
+          },
+          {
+            "required": [
+              "repairSql"
+            ]
+          },
+          {
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "required": [
+              "operation"
+            ]
+          },
+          {
+            "required": [
+              "transaction"
+            ]
+          },
+          {
+            "required": [
+              "begin"
+            ]
+          },
+          {
+            "required": [
+              "commit"
+            ]
+          },
+          {
+            "required": [
+              "rollback"
+            ]
+          }
+        ],
+        "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "INVALID_ARGUMENT",
+                  "UNAUTHENTICATED",
+                  "SESSION_NOT_FOUND",
+                  "SESSION_BUSY",
+                  "RESOURCE_EXHAUSTED",
+                  "UNSUPPORTED_MEDIA_TYPE",
+                  "DEADLINE_EXCEEDED",
+                  "UNAVAILABLE",
+                  "INTERNAL"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "enum": [
+                  "invalid request",
+                  "authentication required",
+                  "session not found",
+                  "session busy",
+                  "resource limit",
+                  "unsupported encoding",
+                  "deadline exceeded",
+                  "service unavailable",
+                  "internal error; outcome may be ambiguous"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false
+      },
+      "NativeComparison": {
+        "type": "string",
+        "enum": [
+          "NATIVE_COMPARISON_EQ",
+          "NATIVE_COMPARISON_NE",
+          "NATIVE_COMPARISON_LT",
+          "NATIVE_COMPARISON_LE",
+          "NATIVE_COMPARISON_GT",
+          "NATIVE_COMPARISON_GE"
+        ]
+      },
+      "NativeArithmeticOperator": {
+        "type": "string",
+        "enum": [
+          "NATIVE_ARITHMETIC_OPERATOR_ADD",
+          "NATIVE_ARITHMETIC_OPERATOR_SUBTRACT",
+          "NATIVE_ARITHMETIC_OPERATOR_MULTIPLY",
+          "NATIVE_ARITHMETIC_OPERATOR_DIVIDE",
+          "NATIVE_ARITHMETIC_OPERATOR_REMAINDER"
+        ]
+      },
+      "NativeFunction": {
+        "type": "string",
+        "enum": [
+          "NATIVE_FUNCTION_COALESCE",
+          "NATIVE_FUNCTION_ABS",
+          "NATIVE_FUNCTION_LENGTH"
+        ]
+      },
+      "NativeConflictSource": {
+        "type": "string",
+        "enum": [
+          "NATIVE_CONFLICT_SOURCE_EXISTING",
+          "NATIVE_CONFLICT_SOURCE_INCOMING"
+        ]
+      },
+      "NativeConflictStatus": {
+        "type": "string",
+        "enum": [
+          "NATIVE_CONFLICT_STATUS_SUCCESS",
+          "NATIVE_CONFLICT_STATUS_SKIPPED"
+        ]
+      },
+      "NativeDataType": {
+        "type": "string",
+        "enum": [
+          "NATIVE_DATA_TYPE_BOOLEAN",
+          "NATIVE_DATA_TYPE_SMALL_INT",
+          "NATIVE_DATA_TYPE_INTEGER",
+          "NATIVE_DATA_TYPE_BIG_INT",
+          "NATIVE_DATA_TYPE_TEXT",
+          "NATIVE_DATA_TYPE_BYTES"
+        ]
+      },
+      "NativeErrorClass": {
+        "type": "string",
+        "enum": [
+          "NATIVE_ERROR_CLASS_SYNTAX",
+          "NATIVE_ERROR_CLASS_UNSUPPORTED",
+          "NATIVE_ERROR_CLASS_LIMIT",
+          "NATIVE_ERROR_CLASS_BIND",
+          "NATIVE_ERROR_CLASS_TYPE",
+          "NATIVE_ERROR_CLASS_NOT_FOUND",
+          "NATIVE_ERROR_CLASS_AMBIGUOUS_MATCH",
+          "NATIVE_ERROR_CLASS_CONDITION_FAILED",
+          "NATIVE_ERROR_CLASS_TOO_MANY_MATCHES",
+          "NATIVE_ERROR_CLASS_CLAIM_NOT_CONSUMED",
+          "NATIVE_ERROR_CLASS_CONFLICT",
+          "NATIVE_ERROR_CLASS_CORE",
+          "NATIVE_ERROR_CLASS_UNKNOWN",
+          "NATIVE_ERROR_CLASS_OVERFLOW",
+          "NATIVE_ERROR_CLASS_DIVISION_BY_ZERO",
+          "NATIVE_ERROR_CLASS_REQUIREMENT_FAILED",
+          "NATIVE_ERROR_CLASS_DUPLICATE_TARGET",
+          "NATIVE_ERROR_CLASS_PLAN_REQUIRED"
+        ]
+      },
+      "BeginRequest": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "CommitRequest": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "RollbackRequest": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "NativeEmpty": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "NativeOperationRequest": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/NativeRequest"
+          },
+          "bindings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeBinding"
+            },
+            "maxItems": 256,
+            "description": "At most 256 unique case-sensitive names. Duplicate names rejected before map conversion. Combined value payload at most 65536 bytes: UTF-8 text/bytes length; nine bytes per scalar. Logical presence of names and values required."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "request"
+        ],
+        "x-max-binding-value-bytes": 65536
+      },
+      "NativeTransactionRequest": {
+        "type": "object",
+        "properties": {
+          "transaction": {
+            "$ref": "#/components/schemas/NativeTransaction"
+          },
+          "bindings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeBinding"
+            },
+            "maxItems": 256,
+            "description": "At most 256 unique case-sensitive names. Duplicate names rejected before map conversion. Combined value payload at most 65536 bytes: UTF-8 text/bytes length; nine bytes per scalar. Logical presence of names and values required."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "transaction"
+        ],
+        "x-max-binding-value-bytes": 65536
+      },
+      "NativeBinding": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/Value"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "value"
+        ]
+      },
+      "NativeRequest": {
+        "type": "object",
+        "properties": {
+          "read": {
+            "$ref": "#/components/schemas/NativeRead"
+          },
+          "insert": {
+            "$ref": "#/components/schemas/NativeInsert"
+          },
+          "update": {
+            "$ref": "#/components/schemas/NativeUpdate"
+          },
+          "delete": {
+            "$ref": "#/components/schemas/NativeDelete"
+          },
+          "updateExpressions": {
+            "$ref": "#/components/schemas/NativeUpdateExpressions"
+          },
+          "readExpressions": {
+            "$ref": "#/components/schemas/NativeReadExpressions"
+          },
+          "returning": {
+            "$ref": "#/components/schemas/NativeReturning"
+          },
+          "insertExpressions": {
+            "$ref": "#/components/schemas/NativeInsertExpressions"
+          },
+          "insertMany": {
+            "$ref": "#/components/schemas/NativeInsertMany"
+          },
+          "onConflict": {
+            "$ref": "#/components/schemas/NativeOnConflict"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "read"
+            ]
+          },
+          {
+            "required": [
+              "insert"
+            ]
+          },
+          {
+            "required": [
+              "update"
+            ]
+          },
+          {
+            "required": [
+              "delete"
+            ]
+          },
+          {
+            "required": [
+              "updateExpressions"
+            ]
+          },
+          {
+            "required": [
+              "readExpressions"
+            ]
+          },
+          {
+            "required": [
+              "returning"
+            ]
+          },
+          {
+            "required": [
+              "insertExpressions"
+            ]
+          },
+          {
+            "required": [
+              "insertMany"
+            ]
+          },
+          {
+            "required": [
+              "onConflict"
+            ]
+          }
+        ],
+        "description": "Exactly one of the ten typed core operations. Wrapper nesting is limited to Returning -> OnConflict -> direct insertion, or one eligible wrapper. Native execution never generates SQL. Core serialized input and resolved value limits remain 65536 bytes each."
+      },
+      "NativeRead": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "order": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeSort"
+            },
+            "maxItems": 64
+          },
+          "limit": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table"
+        ]
+      },
+      "NativeInsert": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeValueAssignment"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table"
+        ]
+      },
+      "NativeUpdate": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "guard": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeValueAssignment"
+            },
+            "maxItems": 64
+          },
+          "intent": {
+            "$ref": "#/components/schemas/NativeIntent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table",
+          "filter",
+          "intent"
+        ]
+      },
+      "NativeDelete": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "guard": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "cap": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table",
+          "filter"
+        ]
+      },
+      "NativeUpdateExpressions": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "guard": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeAssignment"
+            },
+            "maxItems": 64
+          },
+          "intent": {
+            "$ref": "#/components/schemas/NativeIntent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table",
+          "filter",
+          "intent"
+        ]
+      },
+      "NativeReadExpressions": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "order": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeSort"
+            },
+            "maxItems": 64
+          },
+          "limit": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeProjection"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table"
+        ]
+      },
+      "NativeReturning": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "insert": {
+                "$ref": "#/components/schemas/NativeInsert"
+              },
+              "update": {
+                "$ref": "#/components/schemas/NativeUpdate"
+              },
+              "delete": {
+                "$ref": "#/components/schemas/NativeDelete"
+              },
+              "updateExpressions": {
+                "$ref": "#/components/schemas/NativeUpdateExpressions"
+              },
+              "insertExpressions": {
+                "$ref": "#/components/schemas/NativeInsertExpressions"
+              },
+              "insertMany": {
+                "$ref": "#/components/schemas/NativeInsertMany"
+              },
+              "onConflict": {
+                "$ref": "#/components/schemas/NativeOnConflict"
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "insert"
+                ]
+              },
+              {
+                "required": [
+                  "update"
+                ]
+              },
+              {
+                "required": [
+                  "delete"
+                ]
+              },
+              {
+                "required": [
+                  "updateExpressions"
+                ]
+              },
+              {
+                "required": [
+                  "insertExpressions"
+                ]
+              },
+              {
+                "required": [
+                  "insertMany"
+                ]
+              },
+              {
+                "required": [
+                  "onConflict"
+                ]
+              }
+            ]
+          },
+          "projection": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeProjection"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "request"
+        ]
+      },
+      "NativeInsertExpressions": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeAssignment"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table"
+        ]
+      },
+      "NativeInsertMany": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeExpressionRow"
+            },
+            "maxItems": 1024
+          },
+          "cap": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "table",
+          "cap"
+        ],
+        "description": "At most 1024 explicit rows; every row width must equal columns length (at most 64). cap is logically required. Core binding and mutation bounds apply."
+      },
+      "NativeOnConflict": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {
+              "insert": {
+                "$ref": "#/components/schemas/NativeInsert"
+              },
+              "insertExpressions": {
+                "$ref": "#/components/schemas/NativeInsertExpressions"
+              },
+              "insertMany": {
+                "$ref": "#/components/schemas/NativeInsertMany"
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "insert"
+                ]
+              },
+              {
+                "required": [
+                  "insertExpressions"
+                ]
+              },
+              {
+                "required": [
+                  "insertMany"
+                ]
+              }
+            ]
+          },
+          "target": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64
+          },
+          "action": {
+            "$ref": "#/components/schemas/NativeConflictAction"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "request",
+          "action"
+        ]
+      },
+      "NativeValueAssignment": {
+        "type": "object",
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "column",
+          "value"
+        ]
+      },
+      "NativeAssignment": {
+        "type": "object",
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "expression": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "column",
+          "expression"
+        ]
+      },
+      "NativeProjection": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "alias": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "expression"
+        ]
+      },
+      "NativeExpressionRow": {
+        "type": "object",
+        "properties": {
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeExpr"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false
+      },
+      "NativeSort": {
+        "type": "object",
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "descending": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "field",
+          "descending"
+        ]
+      },
+      "NativeValueExpr": {
+        "type": "object",
+        "properties": {
+          "literal": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "parameter": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "literal"
+            ]
+          },
+          {
+            "required": [
+              "parameter"
+            ]
+          }
+        ]
+      },
+      "NativeIntent": {
+        "type": "object",
+        "properties": {
+          "one": {
+            "$ref": "#/components/schemas/NativeEmpty"
+          },
+          "many": {
+            "$ref": "#/components/schemas/NativeMany"
+          },
+          "claim": {
+            "$ref": "#/components/schemas/NativeClaim"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "one"
+            ]
+          },
+          {
+            "required": [
+              "many"
+            ]
+          },
+          {
+            "required": [
+              "claim"
+            ]
+          }
+        ]
+      },
+      "NativeMany": {
+        "type": "object",
+        "properties": {
+          "cap": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cap"
+        ]
+      },
+      "NativeClaim": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeSort"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false
+      },
+      "NativeConflictAction": {
+        "type": "object",
+        "properties": {
+          "nothing": {
+            "$ref": "#/components/schemas/NativeEmpty"
+          },
+          "update": {
+            "$ref": "#/components/schemas/NativeConflictUpdate"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "nothing"
+            ]
+          },
+          {
+            "required": [
+              "update"
+            ]
+          }
+        ]
+      },
+      "NativeConflictUpdate": {
+        "type": "object",
+        "properties": {
+          "guard": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeAssignment"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false
+      },
+      "NativeExpr": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/NativeValueExpr"
+          },
+          "field": {
+            "type": "string"
+          },
+          "compare": {
+            "$ref": "#/components/schemas/NativeCompare"
+          },
+          "isNull": {
+            "$ref": "#/components/schemas/NativeIsNull"
+          },
+          "notExpr": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "andExpr": {
+            "$ref": "#/components/schemas/NativeBinary"
+          },
+          "orExpr": {
+            "$ref": "#/components/schemas/NativeBinary"
+          },
+          "negate": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "arithmetic": {
+            "$ref": "#/components/schemas/NativeArithmetic"
+          },
+          "local": {
+            "$ref": "#/components/schemas/NativeLocalRef"
+          },
+          "call": {
+            "$ref": "#/components/schemas/NativeCall"
+          },
+          "caseExpr": {
+            "$ref": "#/components/schemas/NativeCase"
+          },
+          "conflictField": {
+            "$ref": "#/components/schemas/NativeConflictField"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "value"
+            ]
+          },
+          {
+            "required": [
+              "field"
+            ]
+          },
+          {
+            "required": [
+              "compare"
+            ]
+          },
+          {
+            "required": [
+              "isNull"
+            ]
+          },
+          {
+            "required": [
+              "notExpr"
+            ]
+          },
+          {
+            "required": [
+              "andExpr"
+            ]
+          },
+          {
+            "required": [
+              "orExpr"
+            ]
+          },
+          {
+            "required": [
+              "negate"
+            ]
+          },
+          {
+            "required": [
+              "arithmetic"
+            ]
+          },
+          {
+            "required": [
+              "local"
+            ]
+          },
+          {
+            "required": [
+              "call"
+            ]
+          },
+          {
+            "required": [
+              "caseExpr"
+            ]
+          },
+          {
+            "required": [
+              "conflictField"
+            ]
+          }
+        ],
+        "description": "Recursive typed expression, maximum 24 child edges from root (root depth 0), intentionally stricter than embedded core depth 32. Maximum 4096 expression nodes across the whole operation or atomic block, including guards, returning, conflict updates, requirements and scalar emits. CASE operand/WHEN/THEN/ELSE each adds one expression edge. No implicit simplification.",
+        "x-max-expression-depth": 24,
+        "x-max-expression-nodes-per-invocation": 4096
+      },
+      "NativeCompare": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "comparison": {
+            "$ref": "#/components/schemas/NativeComparison"
+          },
+          "right": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "left",
+          "comparison",
+          "right"
+        ]
+      },
+      "NativeIsNull": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "negated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "expression",
+          "negated"
+        ]
+      },
+      "NativeBinary": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "right": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "left",
+          "right"
+        ]
+      },
+      "NativeArithmetic": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/NativeArithmeticOperator"
+          },
+          "right": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "left",
+          "operator",
+          "right"
+        ]
+      },
+      "NativeCall": {
+        "type": "object",
+        "properties": {
+          "function": {
+            "$ref": "#/components/schemas/NativeFunction"
+          },
+          "arguments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeExpr"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "function"
+        ]
+      },
+      "NativeCase": {
+        "type": "object",
+        "properties": {
+          "operand": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "arms": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeCaseArm"
+            },
+            "maxItems": 64
+          },
+          "elseExpr": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false
+      },
+      "NativeCaseArm": {
+        "type": "object",
+        "properties": {
+          "when": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "then": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "when",
+          "then"
+        ]
+      },
+      "NativeConflictField": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/NativeConflictSource"
+          },
+          "field": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "field"
+        ]
+      },
+      "NativeLocalRef": {
+        "type": "object",
+        "properties": {
+          "field": {
+            "$ref": "#/components/schemas/NativeLocalField"
+          },
+          "status": {
+            "type": "string"
+          },
+          "changed": {
+            "type": "string"
+          },
+          "count": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "field"
+            ]
+          },
+          {
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "required": [
+              "changed"
+            ]
+          },
+          {
+            "required": [
+              "count"
+            ]
+          }
+        ]
+      },
+      "NativeLocalField": {
+        "type": "object",
+        "properties": {
+          "local": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "local",
+          "field"
+        ]
+      },
+      "NativeTransaction": {
+        "type": "object",
+        "properties": {
+          "readOnly": {
+            "type": "boolean"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeTransactionStep"
+            },
+            "maxItems": 64
+          },
+          "emit": {
+            "$ref": "#/components/schemas/NativeEmit"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "readOnly"
+        ],
+        "description": "Atomic typed block within the retained session. readOnly is logically required, including false. At most 64 steps plus a present emit; at most 64 local names. Claim cannot appear in a block. Steps may refer only to earlier locals. A present empty emit remains distinct from an absent emit and is rejected by the core. Requirements produce no step summary. A block stages into an existing explicit transaction; otherwise it owns and commits one transaction.",
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "emit"
+              ]
+            },
+            "then": {
+              "properties": {
+                "steps": {
+                  "maxItems": 63
+                }
+              }
+            }
+          }
+        ],
+        "x-max-items-including-emit": 64
+      },
+      "NativeTransactionStep": {
+        "type": "object",
+        "properties": {
+          "execute": {
+            "$ref": "#/components/schemas/NativeRequest"
+          },
+          "letBinding": {
+            "$ref": "#/components/schemas/NativeLet"
+          },
+          "require": {
+            "$ref": "#/components/schemas/NativeExpr"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "execute"
+            ]
+          },
+          {
+            "required": [
+              "letBinding"
+            ]
+          },
+          {
+            "required": [
+              "require"
+            ]
+          }
+        ]
+      },
+      "NativeLet": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/NativeRequest"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "request"
+        ]
+      },
+      "NativeEmit": {
+        "type": "object",
+        "properties": {
+          "values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeEmitExpr"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false
+      },
+      "NativeEmitExpr": {
+        "type": "object",
+        "properties": {
+          "scalar": {
+            "$ref": "#/components/schemas/NativeExpr"
+          },
+          "row": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "scalar"
+            ]
+          },
+          {
+            "required": [
+              "row"
+            ]
+          },
+          {
+            "required": [
+              "rows"
+            ]
+          }
+        ]
+      },
+      "NativeOutcome": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SqlRow"
+            }
+          },
+          "matched": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "affected": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "changed": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "conflictResults": {
+            "$ref": "#/components/schemas/NativeConflictResults"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "columns",
+          "rows",
+          "matched",
+          "affected",
+          "changed",
+          "complete"
+        ],
+        "description": "Counts refer to native matched, affected and changed semantics. Row versions are decimal uint64 strings. conflictResults absence differs from a present empty items list; returnedRow points into this outcome's rows."
+      },
+      "NativeConflictResults": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeConflictTupleOutcome"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "items"
+        ]
+      },
+      "NativeConflictTupleOutcome": {
+        "type": "object",
+        "properties": {
+          "inputIndex": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/NativeConflictStatus"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "returnedRow": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "inputIndex",
+          "status",
+          "changed"
+        ]
+      },
+      "NativeStepSummary": {
+        "type": "object",
+        "properties": {
+          "itemIndex": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "matched": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "affected": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "changed": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "conflictResults": {
+            "$ref": "#/components/schemas/NativeConflictResults"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "itemIndex",
+          "matched",
+          "affected",
+          "changed",
+          "complete"
+        ],
+        "description": "itemIndex counts original block steps; requirements have no summary. Conflict returnedRow indices remain relative to the operation's return rows."
+      },
+      "NativeTransactionOutcome": {
+        "type": "object",
+        "properties": {
+          "summaries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeStepSummary"
+            }
+          },
+          "emitted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeEmittedValue"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "summaries",
+          "emitted"
+        ]
+      },
+      "NativeEmittedValue": {
+        "type": "object",
+        "properties": {
+          "scalar": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "row": {
+            "$ref": "#/components/schemas/NativeEmittedRow"
+          },
+          "rows": {
+            "$ref": "#/components/schemas/NativeEmittedRows"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "scalar"
+            ]
+          },
+          {
+            "required": [
+              "row"
+            ]
+          },
+          {
+            "required": [
+              "rows"
+            ]
+          }
+        ]
+      },
+      "NativeEmittedRow": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeColumn"
+            }
+          },
+          "row": {
+            "$ref": "#/components/schemas/SqlRow"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "columns",
+          "row"
+        ]
+      },
+      "NativeEmittedRows": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NativeColumn"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SqlRow"
+            }
+          },
+          "complete": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "columns",
+          "rows",
+          "complete"
+        ],
+        "description": "Typed emitted relation. Empty rows retain their columns and completeness metadata."
+      },
+      "NativeColumn": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "dataType": {
+            "$ref": "#/components/schemas/NativeDataType"
+          },
+          "notNull": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "dataType",
+          "notNull"
+        ]
+      },
+      "NativeError": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/NativeErrorClass"
+          },
+          "syntaxOffset": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind"
+        ],
+        "description": "Fixed redacted domain class; never exposes Bind/Core strings. Syntax supplies a decimal-string offset. Unknown (ambiguous commit) uses top-level code 08007. These classes do not authorize automatic retry.",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "NATIVE_ERROR_CLASS_SYNTAX"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "syntaxOffset"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "syntaxOffset"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "x-max-native-expression-depth": 24,
+  "x-max-native-expression-nodes": 4096
+}

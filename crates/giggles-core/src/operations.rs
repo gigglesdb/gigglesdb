@@ -14,6 +14,7 @@ mod catalog;
 pub mod once;
 #[cfg(test)]
 mod scalar_tests;
+mod session;
 mod transaction;
 mod upsert;
 #[cfg(test)]

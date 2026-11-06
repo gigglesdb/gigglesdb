@@ -1,0 +1,536 @@
+syntax = "proto3";
+package giggles.v1;
+
+service Giggles {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionReply);
+  rpc Execute(ExecuteRequest) returns (ExecuteReply);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionReply);
+}
+
+message OpenSessionRequest {}
+message OpenSessionReply {
+  string session_id = 1;
+  uint32 idle_timeout_seconds = 2;
+  uint32 max_age_seconds = 3;
+  uint32 transaction_timeout_seconds = 4;
+}
+message CloseSessionRequest {}
+message CloseSessionReply {}
+
+message ExecuteRequest {
+  oneof request {
+    PingRequest ping = 1;
+    SqlRequest sql = 2;
+    PreviewRequest preview = 3;
+    TaskExecuteRequest execute = 4;
+    RepairSqlRequest repair_sql = 5;
+    StatusRequest status = 6;
+    NativeOperationRequest operation = 7;
+    NativeTransactionRequest transaction = 8;
+    BeginRequest begin = 9;
+    CommitRequest commit = 10;
+    RollbackRequest rollback = 11;
+  }
+  optional uint32 budget_ms = 20;
+}
+message PingRequest {}
+message SqlRequest {
+  string sql = 1;
+  repeated Value params = 2;
+}
+enum SqlNull { SQL_NULL = 0; }
+message Value {
+  oneof value {
+    SqlNull null_value = 1;
+    bool bool_value = 2;
+    sint64 int_value = 3;
+    string text_value = 4;
+    bytes bytes_value = 5;
+  }
+}
+message PreviewRequest { TaskRequest request = 1; }
+message TaskExecuteRequest {
+  TaskRequest request = 1;
+  optional uint64 approval = 2;
+}
+message RepairSqlRequest {
+  optional uint64 operation = 1;
+  string sql = 2;
+  optional uint64 approval = 3;
+}
+message StatusRequest { optional uint64 operation = 1; }
+message TaskRequest {
+  optional uint64 operation = 1;
+  Selection selection = 2;
+  Column column = 3;
+  DeliveryStatus after = 4;
+}
+message Selection {
+  oneof selection {
+    KeyList keys = 1;
+    Predicate predicate = 2;
+  }
+}
+message KeyList { repeated Key items = 1; }
+message Key {
+  optional uint64 tenant = 1;
+  optional uint64 row = 2;
+}
+message Predicate {
+  optional uint64 tenant = 1;
+  DeliveryStatus status = 2;
+  optional uint64 from = 3;
+  optional uint64 until = 4;
+}
+enum Column {
+  COLUMN_UNSPECIFIED = 0;
+  COLUMN_STATUS = 1;
+  COLUMN_FAILED_AT = 2;
+  COLUMN_ATTEMPT_COUNT = 3;
+}
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_FAILED = 1;
+  DELIVERY_STATUS_QUEUED = 2;
+  DELIVERY_STATUS_SUCCEEDED = 3;
+}
+enum TransactionState {
+  TRANSACTION_STATE_UNSPECIFIED = 0;
+  TRANSACTION_STATE_IDLE = 1;
+  TRANSACTION_STATE_IN_TRANSACTION = 2;
+  TRANSACTION_STATE_ABORTED = 3;
+}
+message ExecuteReply {
+  uint32 version = 1;
+  string code = 2;
+  optional uint64 operation = 3;
+  optional uint64 count = 4;
+  optional string digest = 5;
+  SqlResult sql = 6;
+  TransactionState transaction_state = 7;
+  oneof native_result {
+    NativeOutcome operation_outcome = 8;
+    NativeTransactionOutcome transaction_outcome = 9;
+    NativeError native_error = 10;
+  }
+}
+message SqlResult {
+  repeated string columns = 1;
+  repeated SqlRow rows = 2;
+  uint64 affected = 3;
+}
+message SqlRow {
+  repeated Value values = 1;
+  uint64 version = 2;
+}
+
+// Typed native data operations. All logical presence rules are part of v1.
+message BeginRequest {
+}
+
+message CommitRequest {
+}
+
+message RollbackRequest {
+}
+
+message NativeEmpty {
+}
+
+message NativeOperationRequest {
+  NativeRequest request = 1;
+  repeated NativeBinding bindings = 2;
+}
+
+message NativeTransactionRequest {
+  NativeTransaction transaction = 1;
+  repeated NativeBinding bindings = 2;
+}
+
+message NativeBinding {
+  optional string name = 1;
+  Value value = 2;
+}
+
+message NativeRequest {
+  oneof request {
+    NativeRead read = 1;
+    NativeInsert insert = 2;
+    NativeUpdate update = 3;
+    NativeDelete delete = 4;
+    NativeUpdateExpressions update_expressions = 5;
+    NativeReadExpressions read_expressions = 6;
+    NativeReturning returning = 7;
+    NativeInsertExpressions insert_expressions = 8;
+    NativeInsertMany insert_many = 9;
+    NativeOnConflict on_conflict = 10;
+  }
+}
+
+message NativeRead {
+  optional string table = 1;
+  NativeExpr filter = 2;
+  repeated NativeSort order = 3;
+  NativeValueExpr limit = 4;
+  repeated string projection = 5;
+}
+
+message NativeInsert {
+  optional string table = 1;
+  repeated NativeValueAssignment values = 2;
+}
+
+message NativeUpdate {
+  optional string table = 1;
+  NativeExpr filter = 2;
+  NativeExpr guard = 3;
+  repeated NativeValueAssignment values = 4;
+  NativeIntent intent = 5;
+}
+
+message NativeDelete {
+  optional string table = 1;
+  NativeExpr filter = 2;
+  NativeExpr guard = 3;
+  NativeValueExpr cap = 4;
+}
+
+message NativeUpdateExpressions {
+  optional string table = 1;
+  NativeExpr filter = 2;
+  NativeExpr guard = 3;
+  repeated NativeAssignment values = 4;
+  NativeIntent intent = 5;
+}
+
+message NativeReadExpressions {
+  optional string table = 1;
+  NativeExpr filter = 2;
+  repeated NativeSort order = 3;
+  NativeValueExpr limit = 4;
+  repeated NativeProjection projection = 5;
+}
+
+message NativeReturning {
+  NativeRequest request = 1;
+  repeated NativeProjection projection = 2;
+}
+
+message NativeInsertExpressions {
+  optional string table = 1;
+  repeated NativeAssignment values = 2;
+}
+
+message NativeInsertMany {
+  optional string table = 1;
+  repeated string columns = 2;
+  repeated NativeExpressionRow rows = 3;
+  NativeValueExpr cap = 4;
+}
+
+message NativeOnConflict {
+  NativeRequest request = 1;
+  repeated string target = 2;
+  NativeConflictAction action = 3;
+}
+
+message NativeValueAssignment {
+  optional string column = 1;
+  NativeValueExpr value = 2;
+}
+
+message NativeAssignment {
+  optional string column = 1;
+  NativeExpr expression = 2;
+}
+
+message NativeProjection {
+  NativeExpr expression = 1;
+  optional string alias = 2;
+}
+
+message NativeExpressionRow {
+  repeated NativeExpr values = 1;
+}
+
+message NativeSort {
+  optional string field = 1;
+  optional bool descending = 2;
+}
+
+message NativeValueExpr {
+  oneof value {
+    Value literal = 1;
+    string parameter = 2;
+  }
+}
+
+message NativeIntent {
+  oneof intent {
+    NativeEmpty one = 1;
+    NativeMany many = 2;
+    NativeClaim claim = 3;
+  }
+}
+
+message NativeMany {
+  NativeValueExpr cap = 1;
+}
+
+message NativeClaim {
+  repeated NativeSort order = 1;
+}
+
+message NativeConflictAction {
+  oneof action {
+    NativeEmpty nothing = 1;
+    NativeConflictUpdate update = 2;
+  }
+}
+
+message NativeConflictUpdate {
+  NativeExpr guard = 1;
+  repeated NativeAssignment values = 2;
+}
+
+message NativeExpr {
+  oneof expression {
+    NativeValueExpr value = 1;
+    string field = 2;
+    NativeCompare compare = 3;
+    NativeIsNull is_null = 4;
+    NativeExpr not_expr = 5;
+    NativeBinary and_expr = 6;
+    NativeBinary or_expr = 7;
+    NativeExpr negate = 8;
+    NativeArithmetic arithmetic = 9;
+    NativeLocalRef local = 10;
+    NativeCall call = 11;
+    NativeCase case_expr = 12;
+    NativeConflictField conflict_field = 13;
+  }
+}
+
+message NativeCompare {
+  NativeExpr left = 1;
+  NativeComparison comparison = 2;
+  NativeExpr right = 3;
+}
+
+message NativeIsNull {
+  NativeExpr expression = 1;
+  optional bool negated = 2;
+}
+
+message NativeBinary {
+  NativeExpr left = 1;
+  NativeExpr right = 2;
+}
+
+message NativeArithmetic {
+  NativeExpr left = 1;
+  NativeArithmeticOperator operator = 2;
+  NativeExpr right = 3;
+}
+
+message NativeCall {
+  NativeFunction function = 1;
+  repeated NativeExpr arguments = 2;
+}
+
+message NativeCase {
+  NativeExpr operand = 1;
+  repeated NativeCaseArm arms = 2;
+  NativeExpr else_expr = 3;
+}
+
+message NativeCaseArm {
+  NativeExpr when = 1;
+  NativeExpr then = 2;
+}
+
+message NativeConflictField {
+  NativeConflictSource source = 1;
+  optional string field = 2;
+}
+
+message NativeLocalRef {
+  oneof reference {
+    NativeLocalField field = 1;
+    string status = 2;
+    string changed = 3;
+    string count = 4;
+  }
+}
+
+message NativeLocalField {
+  optional string local = 1;
+  optional string field = 2;
+}
+
+enum NativeComparison {
+  NATIVE_COMPARISON_UNSPECIFIED = 0;
+  NATIVE_COMPARISON_EQ = 1;
+  NATIVE_COMPARISON_NE = 2;
+  NATIVE_COMPARISON_LT = 3;
+  NATIVE_COMPARISON_LE = 4;
+  NATIVE_COMPARISON_GT = 5;
+  NATIVE_COMPARISON_GE = 6;
+}
+
+enum NativeArithmeticOperator {
+  NATIVE_ARITHMETIC_OPERATOR_UNSPECIFIED = 0;
+  NATIVE_ARITHMETIC_OPERATOR_ADD = 1;
+  NATIVE_ARITHMETIC_OPERATOR_SUBTRACT = 2;
+  NATIVE_ARITHMETIC_OPERATOR_MULTIPLY = 3;
+  NATIVE_ARITHMETIC_OPERATOR_DIVIDE = 4;
+  NATIVE_ARITHMETIC_OPERATOR_REMAINDER = 5;
+}
+
+enum NativeFunction {
+  NATIVE_FUNCTION_UNSPECIFIED = 0;
+  NATIVE_FUNCTION_COALESCE = 1;
+  NATIVE_FUNCTION_ABS = 2;
+  NATIVE_FUNCTION_LENGTH = 3;
+}
+
+enum NativeConflictSource {
+  NATIVE_CONFLICT_SOURCE_UNSPECIFIED = 0;
+  NATIVE_CONFLICT_SOURCE_EXISTING = 1;
+  NATIVE_CONFLICT_SOURCE_INCOMING = 2;
+}
+
+message NativeTransaction {
+  optional bool read_only = 1;
+  repeated NativeTransactionStep steps = 2;
+  NativeEmit emit = 3;
+}
+
+message NativeTransactionStep {
+  oneof step {
+    NativeRequest execute = 1;
+    NativeLet let_binding = 2;
+    NativeExpr require = 3;
+  }
+}
+
+message NativeLet {
+  optional string name = 1;
+  NativeRequest request = 2;
+}
+
+message NativeEmit {
+  repeated NativeEmitExpr values = 1;
+}
+
+message NativeEmitExpr {
+  oneof value {
+    NativeExpr scalar = 1;
+    string row = 2;
+    string rows = 3;
+  }
+}
+
+message NativeOutcome {
+  repeated string columns = 1;
+  repeated SqlRow rows = 2;
+  uint64 matched = 3;
+  uint64 affected = 4;
+  uint64 changed = 5;
+  bool complete = 6;
+  NativeConflictResults conflict_results = 7;
+}
+
+message NativeConflictResults {
+  repeated NativeConflictTupleOutcome items = 1;
+}
+
+message NativeConflictTupleOutcome {
+  uint64 input_index = 1;
+  NativeConflictStatus status = 2;
+  bool changed = 3;
+  optional uint64 returned_row = 4;
+}
+
+enum NativeConflictStatus {
+  NATIVE_CONFLICT_STATUS_UNSPECIFIED = 0;
+  NATIVE_CONFLICT_STATUS_SUCCESS = 1;
+  NATIVE_CONFLICT_STATUS_SKIPPED = 2;
+}
+
+message NativeStepSummary {
+  uint64 item_index = 1;
+  uint64 matched = 2;
+  uint64 affected = 3;
+  uint64 changed = 4;
+  bool complete = 5;
+  NativeConflictResults conflict_results = 6;
+}
+
+message NativeTransactionOutcome {
+  repeated NativeStepSummary summaries = 1;
+  repeated NativeEmittedValue emitted = 2;
+}
+
+message NativeEmittedValue {
+  oneof value {
+    Value scalar = 1;
+    NativeEmittedRow row = 2;
+    NativeEmittedRows rows = 3;
+  }
+}
+
+message NativeEmittedRow {
+  repeated NativeColumn columns = 1;
+  SqlRow row = 2;
+}
+
+message NativeEmittedRows {
+  repeated NativeColumn columns = 1;
+  repeated SqlRow rows = 2;
+  bool complete = 3;
+}
+
+message NativeColumn {
+  uint64 id = 1;
+  string name = 2;
+  NativeDataType data_type = 3;
+  bool not_null = 4;
+}
+
+enum NativeDataType {
+  NATIVE_DATA_TYPE_UNSPECIFIED = 0;
+  NATIVE_DATA_TYPE_BOOLEAN = 1;
+  NATIVE_DATA_TYPE_SMALL_INT = 2;
+  NATIVE_DATA_TYPE_INTEGER = 3;
+  NATIVE_DATA_TYPE_BIG_INT = 4;
+  NATIVE_DATA_TYPE_TEXT = 5;
+  NATIVE_DATA_TYPE_BYTES = 6;
+}
+
+message NativeError {
+  NativeErrorClass kind = 1;
+  optional uint64 syntax_offset = 2;
+}
+
+enum NativeErrorClass {
+  NATIVE_ERROR_CLASS_UNSPECIFIED = 0;
+  NATIVE_ERROR_CLASS_SYNTAX = 1;
+  NATIVE_ERROR_CLASS_UNSUPPORTED = 2;
+  NATIVE_ERROR_CLASS_LIMIT = 3;
+  NATIVE_ERROR_CLASS_BIND = 4;
+  NATIVE_ERROR_CLASS_TYPE = 5;
+  NATIVE_ERROR_CLASS_NOT_FOUND = 6;
+  NATIVE_ERROR_CLASS_AMBIGUOUS_MATCH = 7;
+  NATIVE_ERROR_CLASS_CONDITION_FAILED = 8;
+  NATIVE_ERROR_CLASS_TOO_MANY_MATCHES = 9;
+  NATIVE_ERROR_CLASS_CLAIM_NOT_CONSUMED = 10;
+  NATIVE_ERROR_CLASS_CONFLICT = 11;
+  NATIVE_ERROR_CLASS_CORE = 12;
+  NATIVE_ERROR_CLASS_UNKNOWN = 13;
+  NATIVE_ERROR_CLASS_OVERFLOW = 14;
+  NATIVE_ERROR_CLASS_DIVISION_BY_ZERO = 15;
+  NATIVE_ERROR_CLASS_REQUIREMENT_FAILED = 16;
+  NATIVE_ERROR_CLASS_DUPLICATE_TARGET = 17;
+  NATIVE_ERROR_CLASS_PLAN_REQUIRED = 18;
+}

@@ -167,4 +167,12 @@ See [CREDENTIALS_ADMISSION.md](CREDENTIALS_ADMISSION.md) for the bounded trusted
 stdin `reload`/`shutdown` workflow, binding epochs, identical-authority certificate
 overlap, restart-required CA/certificate changes, aggregate session/rate defaults,
 cancellation saturation behavior and capacity worksheet.
+
+Optional HTTP/1.1, HTTP/2 and typed gRPC interfaces expose native reads, guarded
+writes, claims and atomic blocks as structured requests. Native and SQL calls
+share persistent transactions; typed controls let native clients begin, commit
+and roll back without SQL strings. Existing scoped task operations remain
+available. See [API.md](API.md) for configuration, schemas, limits and runnable
+clients. Both listeners are disabled unless configured and reuse the existing
+mTLS bindings and shared service admission.
 See [Design documentation](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000) for the actual parent P2 row.

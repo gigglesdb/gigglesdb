@@ -22,6 +22,12 @@ one existing embedded database and exposes a JSON protocol and a bounded
 PostgreSQL wire interface. Both require mutual TLS: the server and client each
 present a certificate. There is no password-only or plaintext mode.
 
+Optional HTTPS/JSON and typed gRPC listeners expose structured native reads,
+guarded writes, claims and atomic blocks, alongside parameterized SQL and scoped
+task operations. Native and SQL calls share persistent transactions, mTLS
+bindings and service limits. See the
+[HTTP/gRPC guide](crates/giggles-server/API.md) for configuration and runnable clients.
+
 The quickest working setup uses the existing fixture generator, which creates
 the database, application table, certificates and matching authorization bindings.
 The following commands use **PowerShell**, starting at the repository root.
