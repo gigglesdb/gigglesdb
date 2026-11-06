@@ -108,14 +108,22 @@ embedded language frontend.
 
 ### PostgreSQL clients and configuration
 
-Port **7433** implements a bounded PostgreSQL wire subset. The tested driver is
-`tokio-postgres 0.7.15` with `tokio-postgres-rustls 0.13`, TLS required, hostname
+Port **7433** implements a bounded PostgreSQL wire subset. Tested clients include
+`tokio-postgres 0.7.15` with `tokio-postgres-rustls 0.13` and bounded pgJDBC 42.7.3
+query/transaction cases. TLS is required, hostname
 `localhost`, user/database `giggles`, and the same application certificate/key/CA.
 The certificate binding determines authority. General `psql`, JDBC and ORM
 compatibility has not been qualified; use the bundled JSON client above for the
 quickstart. See the [network compatibility matrix](crates/giggles-server/COMPATIBILITY.md)
 and [server guide](crates/giggles-server/README.md) for supported messages and
 driver examples.
+
+**DataGrip schema browsing is not supported yet:** identity and catalog queries
+remain unimplemented. To check capabilities before configuring a client, run
+**PostgreSQL client compatibility** in IntelliJ or
+`powershell -NoProfile -File scripts/check-pg-clients.ps1`. It uses isolated test
+databases and reports each passing, failing and untested case. Current catalog
+failures deliberately produce a nonzero exit code.
 
 The JSON configuration specifies `database`, `native`, `postgres`, `certificate`,
 `private_key`, `client_ca`, `bindings`, `connections`, `skew_seconds` and

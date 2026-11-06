@@ -102,13 +102,27 @@ async fn serve_mode(
                     let accept=accept.clone();let service=service.clone();
                     tasks.spawn(async move {
                         let _permit=permit;
-                        if pg && crate::pgwire::ssl_request(&mut socket).await.is_err() {return;}
-                        let Ok(Ok(mut stream))=timeout(IO_TIMEOUT,accept.accept(socket)).await else {return};
-                        let Some(cert)=stream.get_ref().1.peer_certificates().and_then(|c|c.first()) else {return};
-                        let Ok(mut session)=service.session(&tls::fingerprint(cert.as_ref())) else {return};
+                        let protocol=if pg {"postgres"} else {"native"};
+                        if pg && crate::pgwire::ssl_request(&mut socket).await.is_err() {
+                            eprintln!("protocol={protocol} rejected stage=ssl_request reason=TLS_SSLRequest_required");return;
+                        }
+                        let Ok(Ok(mut stream))=timeout(IO_TIMEOUT,accept.accept(socket)).await else {
+                            eprintln!("protocol={protocol} rejected stage=tls reason=handshake_failed_or_timed_out");return;
+                        };
+                        let Some(cert)=stream.get_ref().1.peer_certificates().and_then(|c|c.first()) else {
+                            eprintln!("protocol={protocol} rejected stage=tls reason=client_certificate_required");return;
+                        };
+                        let Ok(mut session)=service.session(&tls::fingerprint(cert.as_ref())) else {
+                            eprintln!("protocol={protocol} rejected stage=binding reason=client_certificate_not_authorized");return;
+                        };
                         session.connection=Some(shared);
                         let blocking=service.blocking.clone();
-                        if pg {let _=crate::pgwire::run(&mut stream,session).await;return;}
+                        if pg {
+                            if let Err(error)=crate::pgwire::run(&mut stream,session).await {
+                                eprintln!("protocol={protocol} closed stage=wire io_kind={:?}",error.kind());
+                            }
+                            return;
+                        }
                         while let Ok(b)=read_frame(&mut stream,MAX_FRAME).await {
                             if !service.admission.request() { return; }
                             let received=std::time::Instant::now();

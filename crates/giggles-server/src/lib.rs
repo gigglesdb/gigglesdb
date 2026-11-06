@@ -1,6 +1,7 @@
 //! Single-host service preview. Filesystem/provisioning and host time are trusted.
 mod blocking;
 pub mod clock;
+mod pg_settings;
 pub mod pgwire;
 pub mod service;
 pub mod tls;

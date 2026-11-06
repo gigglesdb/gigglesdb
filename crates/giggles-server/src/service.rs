@@ -215,6 +215,11 @@ impl Service {
                     return Err(CoreError::Policy(Error::Scope));
                 }
                 for table in tables {
+                    // Core currently represents multi-source plans with this
+                    // reserved sentinel, never an authorizable table identity.
+                    if table == "giggles_join" {
+                        return Err(CoreError::Policy(Error::Scope));
+                    }
                     if table.is_empty() || table.len() > 128 {
                         return Err(CoreError::Limit);
                     }
@@ -352,14 +357,23 @@ impl Session {
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
         self.authority_scope(|session| {
-            let p = session.sql.prepare(sql)?;
+            let p = if session.in_transaction() && !session.is_aborted() {
+                // Gateway DDL is forbidden. Bind reusable plans against the
+                // committed catalog, then validate against the active snapshot.
+                // Core's staged-schema handles retain their lifetime fence.
+                let p = session.service.admin.sql_session().prepare(sql)?;
+                session.sql.describe(&p)?;
+                p
+            } else {
+                session.sql.prepare(sql)?
+            };
             session.authorize(&p)?;
             Ok(p)
         })
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         let allowed = matches!(&self.role, Role::Application { tables,.. }
-            if !p.is_ddl() && p.table().is_none_or(|t| tables.contains(t)));
+            if !p.is_ddl() && p.table().is_none_or(|t| t != "giggles_join" && tables.contains(t)));
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));
@@ -601,6 +615,49 @@ mod lifecycle_tests {
             Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
             bindings,
         )
+    }
+    #[test]
+    fn sentinel_bindings_and_legacy_multi_source_plans_cannot_expand_scope() {
+        let (service, mut bindings) = fixture();
+        let mut admin = service.admin.sql_session();
+        admin
+            .execute(
+                "CREATE TABLE secret (id BIGINT PRIMARY KEY, body TEXT)",
+                &[],
+                None,
+            )
+            .unwrap();
+        admin
+            .execute("INSERT INTO app VALUES (1)", &[], None)
+            .unwrap();
+        admin
+            .execute("INSERT INTO secret VALUES (1,'hidden')", &[], None)
+            .unwrap();
+        let Role::Application { tables, .. } = &mut bindings[0].role else {
+            unreachable!()
+        };
+        tables.insert("giggles_join".into());
+        assert!(matches!(
+            Service::validate(&service.admin, bindings.clone()),
+            Err(CoreError::Policy(Error::Scope))
+        ));
+        assert!(service.reload_bindings(bindings.clone()).is_err());
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        assert!(
+            session
+                .prepare("SELECT body FROM secret WHERE id=1")
+                .is_err()
+        );
+        // Defense in depth even if an older trusted binding existed in memory.
+        session.role = bindings[0].role.clone();
+        let plan = admin
+            .prepare("SELECT s.body FROM app a JOIN secret s ON s.id=a.id WHERE a.id=1")
+            .unwrap();
+        assert_eq!(plan.table(), Some("giggles_join"));
+        assert!(matches!(
+            session.authorize(&plan),
+            Err(CoreError::Policy(Error::Scope))
+        ));
     }
     #[test]
     fn removal_readdition_never_resurrects_session_prepared_transaction_or_cancel_key() {

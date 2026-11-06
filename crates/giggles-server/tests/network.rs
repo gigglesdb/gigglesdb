@@ -1001,7 +1001,9 @@ async fn disconnect_reconnect_pool_isolation_and_statement_fences() {
     let p = c.prepare("SELECT body FROM app WHERE id=$1").await.unwrap();
     c.batch_execute("ROLLBACK").await.unwrap();
     c.batch_execute("BEGIN").await.unwrap();
-    assert_eq!(code(c.query(&p, &[&1i64]).await.unwrap_err()), "0A000");
+    // Ordinary prepared statements survive transaction boundaries, while
+    // rolled-back effects must remain absent from their later results.
+    assert!(c.query(&p, &[&1i64]).await.unwrap().is_empty());
     c.batch_execute("ROLLBACK").await.unwrap();
     c.batch_execute("BEGIN").await.unwrap();
     c.execute("INSERT INTO app (id) VALUES ($1)", &[&2i64])
@@ -1082,6 +1084,125 @@ async fn raw_pg(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
     while pg_read(&mut s).await.0 != b'Z' {}
     s
 }
+#[tokio::test]
+async fn startup_rejections_explain_fixed_requirements_without_echoing_input() {
+    let f = Fixture::new().await;
+    for (fields, code, message) in [
+        (
+            "user\0private-user\0database\0giggles\0\0",
+            "28000",
+            "startup user must be giggles",
+        ),
+        (
+            "user\0giggles\0database\0private-db\0\0",
+            "28000",
+            "startup database must be giggles",
+        ),
+        (
+            "database\0giggles\0\0",
+            "28000",
+            "startup user must be giggles",
+        ),
+        (
+            "user\0giggles\0\0",
+            "28000",
+            "startup database must be giggles",
+        ),
+        (
+            "user\0giggles\0database\0giggles\0options\0private-options\0\0",
+            "0A000",
+            "unsupported startup parameter",
+        ),
+        (
+            "user\0giggles\0database\0giggles\0client_encoding\0private-encoding\0\0",
+            "0A000",
+            "startup client_encoding must be UTF8",
+        ),
+        (
+            "user\0giggles\0user\0private-duplicate\0\0",
+            "08P01",
+            "malformed PostgreSQL startup packet",
+        ),
+    ] {
+        let mut s = raw_tls(&f, f.app.clone(), true).await;
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend(fields.as_bytes());
+        s.write_u32((startup.len() + 4) as u32).await.unwrap();
+        s.write_all(&startup).await.unwrap();
+        let (tag, body) = pg_read(&mut s).await;
+        assert_eq!(tag, b'E');
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(code), "{text:?}");
+        assert!(text.contains(message), "{text:?}");
+        assert!(!text.contains("private-"), "input leaked: {text:?}");
+        assert!(s.read_u8().await.is_err());
+    }
+    // Failed startup must not poison valid authenticated connections.
+    let mut valid = raw_pg(&f).await;
+    pg_send(&mut valid, b'X', &[]).await;
+    f.stop().await;
+}
+#[tokio::test]
+async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority() {
+    let f = Fixture::new().await;
+    for (hints, accepted) in [
+        (
+            "DateStyle\0ISO\0TimeZone\0America/Chicago\0extra_float_digits\x003\0",
+            true,
+        ),
+        (
+            "DateStyle\0iso\0TimeZone\0GMT-05:00\0extra_float_digits\x002\0",
+            true,
+        ),
+        ("TimeZone\0UTC\0extra_float_digits\0-15\0", true),
+        ("DateStyle\0SQL\0", false),
+        ("TimeZone\0\0", false),
+        ("TimeZone\0UTC\nforged-log\0", false),
+        ("extra_float_digits\x004\0", false),
+        ("extra_float_digits\0-16\0", false),
+        ("extra_float_digits\0NaN\0", false),
+        ("search_path\0public\0", false),
+        ("replication\0true\0", false),
+        ("options\0-c role=admin\0", false),
+    ] {
+        let mut s = raw_tls(&f, f.app.clone(), true).await;
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend(b"user\0giggles\0database\0giggles\0");
+        startup.extend(hints.as_bytes());
+        startup.push(0);
+        s.write_u32((startup.len() + 4) as u32).await.unwrap();
+        s.write_all(&startup).await.unwrap();
+        let (tag, body) = pg_read(&mut s).await;
+        if accepted {
+            assert_eq!(tag, b'R');
+            let mut statuses = Vec::new();
+            loop {
+                let (tag, body) = pg_read(&mut s).await;
+                if tag == b'S' {
+                    statuses.push(String::from_utf8(body).unwrap());
+                }
+                if tag == b'Z' {
+                    break;
+                }
+            }
+            assert!(statuses.iter().any(|v| v == "DateStyle\0ISO\0"));
+            pg_send(&mut s, b'Q', b"SELECT id FROM app WHERE id=1\0").await;
+            loop {
+                let (tag, _) = pg_read(&mut s).await;
+                assert_ne!(tag, b'E');
+                if tag == b'Z' {
+                    break;
+                }
+            }
+            pg_send(&mut s, b'Q', b"SELECT id FROM forbidden WHERE id=1\0").await;
+            assert_eq!(pg_read(&mut s).await.0, b'E');
+        } else {
+            assert_eq!(tag, b'E');
+            assert!(String::from_utf8(body).unwrap().contains("0A000"));
+        }
+    }
+    f.stop().await;
+}
 async fn pg_send<S: tokio::io::AsyncWrite + Unpin>(s: &mut S, tag: u8, b: &[u8]) {
     s.write_u8(tag).await.unwrap();
     s.write_u32((b.len() + 4) as u32).await.unwrap();
@@ -1143,6 +1264,98 @@ fn bind(portal: &str, stmt: &str, params: &[Option<&str>], binary_result: bool) 
     b.extend(u16::from(binary_result).to_be_bytes());
     b
 }
+fn parse_oids(name: &str, sql: &str, oids: &[u32]) -> Vec<u8> {
+    let mut b = Vec::new();
+    cstr(name, &mut b);
+    cstr(sql, &mut b);
+    b.extend((oids.len() as u16).to_be_bytes());
+    for oid in oids {
+        b.extend(oid.to_be_bytes());
+    }
+    b
+}
+#[tokio::test]
+async fn jdbc_varchar_and_integer_wire_widths_preserve_core_range_checks() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    pg_send(
+        &mut s,
+        b'P',
+        &parse_oids(
+            "jdbc",
+            "INSERT INTO app (id,body) VALUES ($1,$2)",
+            &[23, 1043],
+        ),
+    )
+    .await;
+    pg_send(&mut s, b'D', b"Sjdbc\0").await;
+    let frames = pg_sync(&mut s).await;
+    assert_eq!(
+        frames[1],
+        (
+            b't',
+            [
+                2u16.to_be_bytes().as_slice(),
+                23u32.to_be_bytes().as_slice(),
+                1043u32.to_be_bytes().as_slice()
+            ]
+            .concat()
+        )
+    );
+    let mut bound = b"\0jdbc\0".to_vec();
+    bound.extend(1u16.to_be_bytes());
+    bound.extend(1u16.to_be_bytes());
+    bound.extend(2u16.to_be_bytes());
+    bound.extend(4u32.to_be_bytes());
+    bound.extend(77i32.to_be_bytes());
+    bound.extend(3u32.to_be_bytes());
+    bound.extend(b"abc");
+    bound.extend(0u16.to_be_bytes());
+    pg_send(&mut s, b'B', &bound).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut s).await;
+    assert!(!frames.iter().any(|f| f.0 == b'E'));
+    pg_send(
+        &mut s,
+        b'P',
+        &parse_oids(
+            "range",
+            "INSERT INTO app (id,small) VALUES ($1,$2)",
+            &[20, 20],
+        ),
+    )
+    .await;
+    pg_send(
+        &mut s,
+        b'B',
+        &bind(
+            "",
+            "range",
+            &[Some("78"), Some("9223372036854775807")],
+            false,
+        ),
+    )
+    .await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    assert!(pg_sync(&mut s).await.iter().any(|f| f.0 == b'E'));
+    drop(s);
+    let (client, connection) = f.pg(f.app.clone()).await;
+    let rows = client
+        .query("SELECT body FROM app WHERE id=77", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "abc");
+    assert!(
+        client
+            .query("SELECT id FROM app WHERE id=78", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(client);
+    connection.await.unwrap();
+    f.stop().await;
+}
 fn execute(portal: &str, max: u32) -> Vec<u8> {
     let mut b = vec![];
     cstr(portal, &mut b);
@@ -1153,6 +1366,421 @@ fn has_code(frames: &[(u8, Vec<u8>)], code: &str) -> bool {
     frames
         .iter()
         .any(|(t, b)| *t == b'E' && b.windows(code.len()).any(|w| w == code.as_bytes()))
+}
+
+#[tokio::test]
+async fn empty_extended_query_validates_connections_without_sql_or_transaction_effects() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    for sql in [
+        "",
+        " \t\r\n",
+        ";;",
+        "-- empty\n",
+        "/* nested /* empty */ */;",
+    ] {
+        pg_send(&mut s, b'P', &parse("", sql)).await;
+        pg_send(&mut s, b'B', &bind("", "", &[], false)).await;
+        pg_send(&mut s, b'D', b"S\0").await;
+        pg_send(&mut s, b'D', b"P\0").await;
+        pg_send(&mut s, b'E', &execute("", 0)).await;
+        let frames = pg_sync(&mut s).await;
+        assert_eq!(frames.iter().map(|f| f.0).collect::<Vec<_>>(), b"12tnnIZ");
+        assert_eq!(frames.last().unwrap().1, b"I");
+    }
+    pg_send(&mut s, b'P', &parse("", "")).await;
+    pg_send(&mut s, b'B', &bind("", "", &[Some("1")], false)).await;
+    assert!(has_code(&pg_sync(&mut s).await, "08P01"));
+    pg_send(&mut s, b'Q', b"BEGIN\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert_eq!(pg_read(&mut s).await, (b'Z', b"T".to_vec()));
+    pg_send(&mut s, b'P', &parse("", "")).await;
+    pg_send(&mut s, b'B', &bind("", "", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    let frames = pg_sync(&mut s).await;
+    assert_eq!(frames.iter().map(|f| f.0).collect::<Vec<_>>(), b"12IZ");
+    assert_eq!(frames.last().unwrap().1, b"T");
+    pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert_eq!(pg_read(&mut s).await, (b'Z', b"I".to_vec()));
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn extended_cycle_rolls_back_prior_effects_on_parse_failure_and_disconnect() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    pg_send(
+        &mut s,
+        b'P',
+        &parse("write", "INSERT INTO app (id) VALUES ($1)"),
+    )
+    .await;
+    pg_send(&mut s, b'B', &bind("", "write", &[Some("101")], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    pg_send(&mut s, b'P', &parse("bad", "NOT SQL")).await;
+    let frames = pg_sync(&mut s).await;
+    assert!(frames.iter().any(|f| f.0 == b'E'));
+    assert_eq!(frames.last().unwrap(), &(b'Z', b"I".to_vec()));
+    let mut native = f.native(f.app.clone()).await;
+    assert!(
+        native
+            .call(&sql("SELECT id FROM app WHERE id=101", vec![]))
+            .await
+            .unwrap()
+            .sql
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    for id in [102, 103] {
+        pg_send(
+            &mut s,
+            b'B',
+            &bind("", "write", &[Some(&id.to_string())], false),
+        )
+        .await;
+        pg_send(&mut s, b'E', &execute("", 0)).await;
+    }
+    assert!(!pg_sync(&mut s).await.iter().any(|f| f.0 == b'E'));
+    for id in [102, 103] {
+        assert_eq!(
+            native
+                .call(&sql("SELECT id FROM app WHERE id=$1", vec![Value::Int(id)]))
+                .await
+                .unwrap()
+                .sql
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+    pg_send(&mut s, b'B', &bind("", "write", &[Some("104")], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    pg_send(&mut s, b'H', &[]).await;
+    assert_eq!(pg_read(&mut s).await.0, b'2');
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert!(
+        native
+            .call(&sql("SELECT id FROM app WHERE id=104", vec![]))
+            .await
+            .unwrap()
+            .sql
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    pg_send(&mut s, b'X', &[]).await;
+    assert!(s.read_u8().await.is_err());
+    assert!(
+        native
+            .call(&sql("SELECT id FROM app WHERE id=104", vec![]))
+            .await
+            .unwrap()
+            .sql
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    drop(native);
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn implicit_sync_conflict_returns_error_and_idle_without_partial_effects() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    pg_send(
+        &mut s,
+        b'P',
+        &parse("write", "INSERT INTO app (id) VALUES (301)"),
+    )
+    .await;
+    pg_send(&mut s, b'B', &bind("", "write", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    pg_send(&mut s, b'H', &[]).await;
+    for tag in *b"12C" {
+        assert_eq!(pg_read(&mut s).await.0, tag);
+    }
+    f.admin
+        .sql_session()
+        .execute("INSERT INTO app (id) VALUES (302)", &[], None)
+        .unwrap();
+    let frames = pg_sync(&mut s).await;
+    assert!(has_code(&frames, "40001"));
+    assert_eq!(frames.last(), Some(&(b'Z', vec![b'I'])));
+    let rows = f
+        .admin
+        .sql_session()
+        .execute("SELECT id FROM app LIMIT 10", &[], None)
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+    // The same named statement remains usable after the failed cycle.
+    pg_send(&mut s, b'B', &bind("", "write", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    assert!(!pg_sync(&mut s).await.iter().any(|f| f.0 == b'E'));
+    assert_eq!(
+        f.admin
+            .sql_session()
+            .execute("SELECT id FROM app LIMIT 10", &[], None)
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn started_postgres_frame_still_has_a_completion_deadline() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    s.write_u8(b'Q').await.unwrap();
+    s.flush().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            giggles_server::IO_TIMEOUT + std::time::Duration::from_secs(3),
+            s.read_u8()
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn completed_utility_and_write_portals_reject_reexecution() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    for query in [
+        "SET application_name='once'",
+        "BEGIN",
+        "INSERT INTO app (id) VALUES (401)",
+    ] {
+        pg_send(&mut s, b'Q', b"BEGIN\0").await;
+        assert_eq!(pg_read(&mut s).await.0, b'C');
+        assert_eq!(pg_read(&mut s).await, (b'Z', vec![b'T']));
+        pg_send(&mut s, b'P', &parse("once", query)).await;
+        pg_send(&mut s, b'B', &bind("once", "once", &[], false)).await;
+        pg_send(&mut s, b'E', &execute("once", 0)).await;
+        assert!(!pg_sync(&mut s).await.iter().any(|f| f.0 == b'E'));
+        pg_send(&mut s, b'E', &execute("once", 0)).await;
+        let frames = pg_sync(&mut s).await;
+        assert!(has_code(&frames, "55000"), "{query}: {frames:?}");
+        assert_eq!(frames.last(), Some(&(b'Z', vec![b'E'])));
+        pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
+        assert_eq!(pg_read(&mut s).await.0, b'C');
+        assert_eq!(pg_read(&mut s).await, (b'Z', vec![b'I']));
+        pg_send(&mut s, b'C', b"Sonce\0").await;
+        assert_eq!(pg_sync(&mut s).await[0].0, b'3');
+    }
+    assert!(
+        f.admin
+            .sql_session()
+            .execute("SELECT id FROM app LIMIT 10", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn failed_simple_commit_discards_cached_portals() {
+    let f = Fixture::new().await;
+    for id in [501, 502] {
+        f.admin
+            .sql_session()
+            .execute("INSERT INTO app (id) VALUES ($1)", &[Value::Int(id)], None)
+            .unwrap();
+    }
+    let mut s = raw_pg(&f).await;
+    pg_send(&mut s, b'Q', b"BEGIN\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert_eq!(pg_read(&mut s).await, (b'Z', vec![b'T']));
+    pg_send(&mut s, b'P', &parse("read", "SELECT id FROM app LIMIT 10")).await;
+    pg_send(&mut s, b'B', &bind("page", "read", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("page", 1)).await;
+    let frames = pg_sync(&mut s).await;
+    assert!(frames.iter().any(|f| f.0 == b's'));
+    f.admin
+        .sql_session()
+        .execute("INSERT INTO app (id) VALUES (503)", &[], None)
+        .unwrap();
+    pg_send(&mut s, b'Q', b"COMMIT\0").await;
+    let failure = pg_read(&mut s).await;
+    assert!(has_code(&[failure], "40001"));
+    assert_eq!(pg_read(&mut s).await, (b'Z', vec![b'I']));
+    pg_send(&mut s, b'E', &execute("page", 0)).await;
+    let frames = pg_sync(&mut s).await;
+    assert!(has_code(&frames, "34000"));
+    assert!(!frames.iter().any(|f| f.0 == b'D'));
+    drop(s);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn failed_explicit_commit_rolls_back_and_named_statements_survive_commit() {
+    let f = Fixture::new().await;
+    let (mut client, connection) = f.pg(f.app.clone()).await;
+    let tx = client.transaction().await.unwrap();
+    let prepared = tx.prepare("SELECT id FROM app WHERE id=$1").await.unwrap();
+    tx.query(&prepared, &[&1i64]).await.unwrap();
+    tx.commit().await.unwrap();
+    client.query(&prepared, &[&1i64]).await.unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute("INSERT INTO app (id) VALUES (201)", &[])
+        .await
+        .unwrap();
+    assert!(client.batch_execute("NOT SQL").await.is_err());
+    client.batch_execute("COMMIT").await.unwrap();
+    assert!(
+        client
+            .query("SELECT id FROM app WHERE id=201", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    client.batch_execute("COMMIT").await.unwrap();
+    drop(client);
+    connection.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn idle_postgres_connection_survives_frame_deadline_and_boolean_text_is_case_insensitive() {
+    let f = Fixture::new().await;
+    let (client, connection) = f.pg(f.app.clone()).await;
+    tokio::time::sleep(giggles_server::IO_TIMEOUT + std::time::Duration::from_millis(200)).await;
+    client
+        .query("SELECT id FROM app WHERE id=1", &[])
+        .await
+        .unwrap();
+    for value in ["TRUE", "True", "Tr", "YES", "ON", "1", " true "] {
+        assert_eq!(
+            giggles_server::pgwire::decode(
+                value.as_bytes(),
+                &giggles_core::relational::DataType::Boolean,
+                0
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+    }
+    for value in ["FALSE", "False", "Fa", "NO", "OFF", "0"] {
+        assert_eq!(
+            giggles_server::pgwire::decode(
+                value.as_bytes(),
+                &giggles_core::relational::DataType::Boolean,
+                0
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+    }
+    for value in ["", "o", "truefalse", "2", "🦀"] {
+        assert!(
+            giggles_server::pgwire::decode(
+                value.as_bytes(),
+                &giggles_core::relational::DataType::Boolean,
+                0
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        giggles_server::pgwire::decode(&[2], &giggles_core::relational::DataType::Boolean, 1)
+            .is_err()
+    );
+    drop(client);
+    connection.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn jdbc_initialization_settings_reject_sql_escapes_and_respect_aborted_transactions() {
+    let f = Fixture::new().await;
+    let mut s = raw_pg(&f).await;
+    pg_send(
+        &mut s,
+        b'Q',
+        b"SET extra_float_digits = 3; SET application_name = 'PostgreSQL JDBC Driver'\0",
+    )
+    .await;
+    assert_eq!(pg_read(&mut s).await, (b'C', b"SET\0".to_vec()));
+    assert_eq!(pg_read(&mut s).await, (b'C', b"SET\0".to_vec()));
+    assert_eq!(pg_read(&mut s).await, (b'Z', b"I".to_vec()));
+    pg_send(
+        &mut s,
+        b'P',
+        &parse("setting", "SET application_name = 'prepared'"),
+    )
+    .await;
+    pg_send(&mut s, b'B', &bind("", "setting", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    assert_eq!(
+        pg_sync(&mut s)
+            .await
+            .iter()
+            .map(|f| f.0)
+            .collect::<Vec<_>>(),
+        b"12CZ"
+    );
+    for sql in [
+        "SET application_name='x'; INSERT INTO app (id) VALUES (77)",
+        "SET application_name='x'; SET role=admin",
+        "SET application_name='x'; SET extra_float_digits=99",
+    ] {
+        let mut query = sql.as_bytes().to_vec();
+        query.push(0);
+        pg_send(&mut s, b'Q', &query).await;
+        assert_eq!(pg_read(&mut s).await.0, b'E');
+        assert_eq!(pg_read(&mut s).await, (b'Z', b"I".to_vec()));
+    }
+    pg_send(&mut s, b'Q', b"BEGIN\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert_eq!(pg_read(&mut s).await.1, b"T");
+    pg_send(&mut s, b'Q', b"unsupported\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'E');
+    assert_eq!(pg_read(&mut s).await.1, b"E");
+    pg_send(&mut s, b'B', &bind("", "setting", &[], false)).await;
+    pg_send(&mut s, b'E', &execute("", 0)).await;
+    assert!(has_code(&pg_sync(&mut s).await, "25P02"));
+    pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
+    assert_eq!(pg_read(&mut s).await.0, b'C');
+    assert_eq!(pg_read(&mut s).await.1, b"I");
+    drop(s);
+    let (task, connection) = f.pg(f.task.clone()).await;
+    assert_eq!(
+        task.batch_execute("SET application_name='task'")
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "42501"
+    );
+    drop(task);
+    connection.await.unwrap();
+    let (app, connection) = f.pg(f.app.clone()).await;
+    assert!(
+        app.query("SELECT id FROM app WHERE id=77", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(app);
+    connection.await.unwrap();
+    f.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1425,9 +2053,52 @@ async fn executable_server_starts_and_native_client_connects() {
         tls::certs(path.join("ca.pem")).unwrap(),
     )
     .unwrap();
-    let mut c = Client::connect(addr, "localhost", cfg).await.unwrap();
+    let mut c = Client::connect(addr, "localhost", cfg.clone())
+        .await
+        .unwrap();
     assert_eq!(c.call(&Request::Ping).await.unwrap().code, "ok");
     drop(c);
+    let pg_addr = line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("postgres=")
+        .unwrap();
+    let mut socket = TcpStream::connect(pg_addr).await.unwrap();
+    socket
+        .write_all(&[0, 0, 0, 8, 4, 210, 22, 47])
+        .await
+        .unwrap();
+    assert_eq!(socket.read_u8().await.unwrap(), b'S');
+    let mut pg = tokio_rustls::TlsConnector::from(cfg)
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    let mut startup = 196608u32.to_be_bytes().to_vec();
+    startup.extend(b"user\0private-user\0database\0giggles\0\0");
+    pg.write_u32((startup.len() + 4) as u32).await.unwrap();
+    pg.write_all(&startup).await.unwrap();
+    let (tag, body) = pg_read(&mut pg).await;
+    assert_eq!(tag, b'E');
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("startup user must be giggles")
+    );
+    let mut errors = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    let diagnostic = tokio::time::timeout(std::time::Duration::from_secs(5), errors.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(diagnostic.contains("protocol=postgres sqlstate=28000"));
+    assert!(diagnostic.contains("startup user must be giggles"));
+    assert!(!diagnostic.contains("private-user"));
+    std::fs::write(path.join("server-rejection.log"), diagnostic).unwrap();
+    drop(pg);
     child.start_kill().unwrap();
     let status = child.wait().await.unwrap();
     std::fs::write(path.join("server-killed-status.txt"), format!("{status:?}")).unwrap();

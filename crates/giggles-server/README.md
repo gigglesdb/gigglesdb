@@ -93,6 +93,47 @@ leaf fingerprint does. An executable integration example is in `tests/network.rs
 (`Fixture::pg`). No password is needed or accepted. Server version14.0 is a wire
 parameter for driver negotiation, not a PostgreSQL implementation claim.
 
+For DataGrip, select PostgreSQL, host `localhost`, port `7433`, user `giggles`,
+database `giggles`, and no password. Check the effective URL as well:
+`jdbc:postgresql://localhost:7433/giggles`. Use full SSL verification with the
+fixture `ca.pem`, `app.pem`, and `app.key.TEST-ONLY`. **DataGrip schema browsing
+does not work yet:** its identity and PostgreSQL catalog queries are unsupported.
+Actual pgJDBC 42.7.3 probes exercise default initialization, prepared queries,
+`Connection.isValid()`, rollback, boolean bindings, statement reuse across commits,
+and queries after eleven seconds idle. This is a bounded query surface, not full
+DataGrip support. See [the compatibility matrix](COMPATIBILITY.md) before choosing
+a client, including JDBC cancellation and statement-cache limits.
+
+The startup profile admits bounded `DateStyle=ISO`, timezone labels (128 bytes),
+and `extra_float_digits` from -15 through 3. These presentation hints do not affect
+the trusted clock or authorization, and the current SQL type set has no temporal
+or floating-point types. `application_name` is capped at 128 UTF-8 bytes.
+`options`, `replication`, and `search_path` remain unsupported.
+
+JDBC initialization supports exactly `SET application_name` and
+`SET extra_float_digits`, using `=` or `TO`; simple-query batches may contain up
+to 16 of these statements. Prepared SET accepts one statement and no parameters.
+Quoted application names use doubled single quotes. Settings follow transaction
+commit/rollback, reject in aborted transactions, and are unavailable to task
+roles. This is not a generic SET implementation. Empty extended queries support
+driver validation. Application parameters accept varchar wire values for TEXT
+and integer wire widths with engine destination-range checks; task parameter OIDs
+remain exact.
+
+Ordinary extended application SQL is staged until Sync; an error in the cycle
+rolls it back. Flush does not commit. Explicit transactions remain open across
+Sync, and COMMIT of an aborted transaction performs a rollback. Named statements
+survive transaction boundaries, while portals close at transaction end. Task
+operations retain their own durable decision/status contract.
+
+Startup rejection messages distinguish an incorrect/missing user or database
+(`28000`), unsupported startup fields or encoding (`0A000`), and malformed startup
+packets (`08P01`). The console writes fixed rejection reasons to stderr, plus
+transport stages for SSL negotiation, TLS handshake, certificate binding, and
+wire I/O errors. PostgreSQL query rejections include their SQLSTATE. Diagnostics
+never include submitted startup values, SQL, certificate bytes, or key material.
+After updating the binary, restart the server to get these diagnostics.
+
 Task wire uses simple-query `GIGGLES ` followed by exactly one native JSON request
 for preview/execute/repair/status (optionally Deadline). It returns one TEXT JSON
 column named `decision`. The same structured code/count/digest/operation response

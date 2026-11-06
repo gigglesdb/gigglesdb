@@ -96,13 +96,18 @@ fn ready(session: &Session, out: &mut Vec<u8>) -> R<()> {
     )
 }
 pub fn error(code: &str, out: &mut Vec<u8>) {
+    error_message(code, "request rejected; consult documented code", out);
+}
+fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
+    // Never log request text or values. Messages are fixed server diagnostics.
+    eprintln!("protocol=postgres sqlstate={code} reason={message}");
     out.clear();
     let mut b = vec![b'S'];
     z("ERROR", &mut b);
     b.push(b'C');
     z(code, &mut b);
     b.push(b'M');
-    z("request rejected; consult documented code", &mut b);
+    z(message, &mut b);
     b.push(0);
     let _ = frame(b'E', &b, out);
 }
@@ -168,11 +173,22 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
-            DataType::Boolean => match s {
-                "t" | "true" => Ok(Value::Bool(true)),
-                "f" | "false" => Ok(Value::Bool(false)),
-                _ => Err("22P02"),
-            },
+            DataType::Boolean => {
+                let s = s.trim_ascii();
+                let prefix = |word: &str| {
+                    !s.is_empty()
+                        && word
+                            .get(..s.len())
+                            .is_some_and(|p| p.eq_ignore_ascii_case(s))
+                };
+                let yes = s == "1" || ["true", "yes", "on"].into_iter().any(prefix);
+                let no = s == "0" || ["false", "no", "off"].into_iter().any(prefix);
+                match (yes, no) {
+                    (true, false) => Ok(Value::Bool(true)),
+                    (false, true) => Ok(Value::Bool(false)),
+                    _ => Err("22P02"),
+                }
+            }
             DataType::SmallInt => s
                 .parse::<i16>()
                 .map(|v| Value::Int(v.into()))
@@ -279,19 +295,25 @@ fn core<T>(r: Result<T, CoreError>) -> R<T> {
 }
 #[derive(Clone)]
 enum Plan {
-    Sql(Prepared),
+    Empty,
+    Control(&'static str),
+    Settings(Vec<crate::pg_settings::Setting>),
+    Sql(Box<Prepared>),
     Task(crate::task_statement::TaskStatement),
 }
 #[derive(Clone)]
 struct Statement {
     p: Plan,
     d: Description,
+    parameter_oids: Vec<u32>,
 }
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
             Plan::Sql(p) => core(session.sql.describe(p)),
-            Plan::Task(_) => Ok(self.d.clone()),
+            Plan::Task(_) | Plan::Empty | Plan::Settings(_) | Plan::Control(_) => {
+                Ok(self.d.clone())
+            }
         }
     }
 }
@@ -303,9 +325,61 @@ struct Portal {
     at: usize,
 }
 struct State {
+    implicit: bool,
+    settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
     portals: BTreeMap<String, Portal>,
     drain: bool,
+}
+fn begin_implicit(
+    session: &mut Session,
+    implicit: &mut bool,
+    settings: &mut crate::pg_settings::SessionSettings,
+) -> R<()> {
+    if !session.in_transaction() {
+        core(session.execute_sql("BEGIN", &[]))?;
+        settings.transaction(false, true, "BEGIN");
+        *implicit = true;
+    }
+    Ok(())
+}
+fn control(sql: &str) -> Option<&'static str> {
+    let sql = sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim();
+    ["BEGIN", "COMMIT", "ROLLBACK"]
+        .into_iter()
+        .find(|command| sql.eq_ignore_ascii_case(command))
+}
+fn execute_control(
+    command: &'static str,
+    session: &mut Session,
+    implicit: &mut bool,
+    settings: &mut crate::pg_settings::SessionSettings,
+) -> R<&'static str> {
+    if !matches!(session.role, Role::Application { .. }) {
+        return Err("42501");
+    }
+    let was = session.in_transaction();
+    let actual = if command == "COMMIT" && session.is_aborted() {
+        "ROLLBACK"
+    } else {
+        command
+    };
+    if actual == "BEGIN" {
+        if session.is_aborted() {
+            return Err("25P02");
+        }
+        if !was {
+            core(session.execute_sql("BEGIN", &[]))?;
+        }
+    } else if was && let Err(error) = session.execute_sql(actual, &[]) {
+        session.sql.rollback();
+        settings.transaction(true, false, "ROLLBACK");
+        *implicit = false;
+        return Err(crate::service::sqlstate(&error));
+    }
+    *implicit = false;
+    settings.transaction(was, session.in_transaction(), actual);
+    Ok(actual)
 }
 impl State {
     fn handle(
@@ -320,6 +394,9 @@ impl State {
         if self.drain && tag != b'S' && tag != b'X' {
             return Ok(true);
         }
+        if self.implicit && tag == b'Q' {
+            return Err("08P01");
+        }
         match tag {
             b'X' => {
                 r.end()?;
@@ -328,6 +405,22 @@ impl State {
             b'S' => {
                 r.end()?;
                 self.drain = false;
+                if self.implicit {
+                    self.implicit = false;
+                    if session.is_aborted() {
+                        session.sql.rollback();
+                        self.settings.transaction(true, false, "ROLLBACK");
+                    } else {
+                        let commit = session.execute_sql("COMMIT", &[]);
+                        if let Err(error) = commit {
+                            session.sql.rollback();
+                            self.settings.transaction(true, false, "ROLLBACK");
+                            self.portals.clear();
+                            return Err(crate::service::sqlstate(&error));
+                        }
+                        self.settings.transaction(true, false, "COMMIT");
+                    }
+                }
                 if !session.in_transaction() {
                     self.portals.clear();
                 }
@@ -371,9 +464,25 @@ impl State {
                     row_description(&d, &[], out)?;
                     rows(&result, &d, &[], 0, 1, out)?;
                     complete("SELECT", &result, out)?;
-                } else if sql.trim().is_empty() {
+                } else if crate::pg_settings::empty_sql(&sql)? {
                     frame(b'I', &[], out)?;
+                } else if let Some(command) = control(&sql) {
+                    let actual =
+                        execute_control(command, session, &mut self.implicit, &mut self.settings)?;
+                    complete(actual, &SqlResult::default(), out)?;
+                } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
+                    if !matches!(session.role, Role::Application { .. }) {
+                        return Err("42501");
+                    }
+                    if session.is_aborted() {
+                        return Err("25P02");
+                    }
+                    for setting in &settings {
+                        self.settings.current.apply(setting);
+                        frame(b'C', b"SET\0", out)?;
+                    }
                 } else {
+                    let was_transaction = session.in_transaction();
                     // ROLLBACK must bypass normal prepare when already aborted.
                     if session.is_aborted()
                         && sql
@@ -382,11 +491,21 @@ impl State {
                             .eq_ignore_ascii_case("rollback")
                     {
                         let result = core(session.execute_sql(&sql, &[]))?;
+                        self.settings.transaction(
+                            was_transaction,
+                            session.in_transaction(),
+                            "ROLLBACK",
+                        );
                         complete("ROLLBACK", &result, out)?;
                     } else {
                         let p = core(session.prepare(&sql))?;
                         let d = core(session.sql.describe(&p))?;
                         let result = core(session.execute_prepared(&p, &[]))?;
+                        self.settings.transaction(
+                            was_transaction,
+                            session.in_transaction(),
+                            p.command(),
+                        );
                         if !d.columns.is_empty() {
                             row_description(&d, &[], out)?;
                             rows(&result, &d, &[], 0, result.rows.len(), out)?;
@@ -420,7 +539,40 @@ impl State {
                 if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
-                let (p, d) = if sql
+                let (p, mut d) = if crate::pg_settings::empty_sql(&sql)? {
+                    (
+                        Plan::Empty,
+                        Description {
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if let Some(command) = control(&sql) {
+                    if !matches!(session.role, Role::Application { .. }) {
+                        return Err("42501");
+                    }
+                    (
+                        Plan::Control(command),
+                        Description {
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
+                    if !matches!(session.role, Role::Application { .. }) {
+                        return Err("42501");
+                    }
+                    if settings.len() != 1 {
+                        return Err("42601");
+                    }
+                    (
+                        Plan::Settings(settings),
+                        Description {
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if sql
                     .trim_start_matches(|c: char| c.is_ascii_whitespace())
                     .starts_with("GIGGLES")
                 {
@@ -432,17 +584,46 @@ impl State {
                 } else {
                     let p = core(session.prepare(&sql))?;
                     let d = core(session.sql.describe(&p))?;
-                    (Plan::Sql(p), d)
+                    (Plan::Sql(Box::new(p)), d)
                 };
                 if n > d.parameters.len() {
                     return Err("08P01");
                 }
-                for (o, t) in oids.into_iter().zip(&d.parameters) {
+                let mut parameter_oids: Vec<u32> = d.parameters.iter().map(oid).collect();
+                for (i, (o, t)) in oids.into_iter().zip(&mut d.parameters).enumerate() {
                     if o != 0 && o != oid(t) {
-                        return Err("0A000");
+                        // Application integer parameters share Value::Int, but
+                        // decode using the client's declared wire width. Core
+                        // still enforces the destination range at execution.
+                        if !matches!(p, Plan::Sql(_)) {
+                            return Err("0A000");
+                        }
+                        *t = match (&*t, o) {
+                            (DataType::Text, 1043) => DataType::Text,
+                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 21) => {
+                                DataType::SmallInt
+                            }
+                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 23) => {
+                                DataType::Integer
+                            }
+                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 20) => {
+                                DataType::BigInt
+                            }
+                            _ => return Err("0A000"),
+                        };
+                    }
+                    if o != 0 {
+                        parameter_oids[i] = o;
                     }
                 }
-                self.statements.insert(name, Statement { p, d });
+                self.statements.insert(
+                    name,
+                    Statement {
+                        p,
+                        d,
+                        parameter_oids,
+                    },
+                );
                 frame(b'1', &[], out)?;
             }
             b'B' => {
@@ -518,8 +699,8 @@ impl State {
                         let d = s.describe(session)?;
                         let mut b = vec![];
                         b.extend((d.parameters.len() as u16).to_be_bytes());
-                        for t in &d.parameters {
-                            b.extend(oid(t).to_be_bytes());
+                        for oid in &s.parameter_oids {
+                            b.extend(oid.to_be_bytes());
                         }
                         frame(b't', &b, out)?;
                         row_description(&d, &[], out)?;
@@ -550,6 +731,41 @@ impl State {
                 }
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 p.s.describe(session)?;
+                if matches!(p.s.p, Plan::Empty) {
+                    frame(b'I', &[], out)?;
+                    return Ok(true);
+                }
+                if let Plan::Control(command) = p.s.p {
+                    if p.result.is_some() {
+                        return Err("55000");
+                    }
+                    let actual =
+                        execute_control(command, session, &mut self.implicit, &mut self.settings)?;
+                    p.result = Some(SqlResult::default());
+                    complete(actual, &SqlResult::default(), out)?;
+                    if !session.in_transaction() {
+                        self.portals.clear();
+                    }
+                    return Ok(true);
+                }
+                if let Plan::Settings(settings) = &p.s.p {
+                    if !matches!(session.role, Role::Application { .. }) {
+                        return Err("42501");
+                    }
+                    if session.is_aborted() {
+                        return Err("25P02");
+                    }
+                    if p.result.is_some() {
+                        return Err("55000");
+                    }
+                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    for setting in settings {
+                        self.settings.current.apply(setting);
+                    }
+                    p.result = Some(SqlResult::default());
+                    frame(b'C', b"SET\0", out)?;
+                    return Ok(true);
+                }
                 // Task results are never retained in a portal. Each Execute is a
                 // fresh native invocation, including completed-portal replays.
                 if let Plan::Task(task) = p.s.p {
@@ -571,8 +787,28 @@ impl State {
                 let Plan::Sql(prepared) = &p.s.p else {
                     unreachable!()
                 };
+                if p.result.is_some() && p.s.d.columns.is_empty() {
+                    return Err("55000");
+                }
                 if p.result.is_none() {
-                    let result = core(session.execute_prepared(prepared, &p.params))?;
+                    let command = prepared.command();
+                    if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    }
+                    let result = if command == "BEGIN" && self.implicit {
+                        self.implicit = false;
+                        SqlResult::default()
+                    } else {
+                        core(session.execute_prepared(prepared, &p.params))?
+                    };
+                    if !session.in_transaction() {
+                        self.implicit = false;
+                    }
+                    self.settings.transaction(
+                        was_transaction,
+                        session.in_transaction(),
+                        prepared.command(),
+                    );
                     let bytes = serde_json::to_vec(&result).map_err(|_| "54000")?.len();
                     if retained.checked_add(bytes).ok_or("54000")? > MAX_RESPONSE {
                         return Err("54000");
@@ -651,9 +887,13 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         session.service.cancel_bound(&session, pid, secret);
         return Ok(());
     }
+    let mut reason = "malformed PostgreSQL startup packet";
+    let mut timezone = String::from("UTC");
+    let mut startup_settings = crate::pg_settings::Settings::default();
     let validate = (|| -> R<()> {
         let mut r = Reader { b: &startup, at: 0 };
         if r.u32()? != 196608 {
+            reason = "only PostgreSQL protocol version 3 is supported";
             return Err("0A000");
         }
         let mut fields = BTreeMap::new();
@@ -668,30 +908,79 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         r.end()?;
-        if fields.get("user").map(String::as_str) != Some("giggles")
-            || fields.get("database").map(String::as_str) != Some("giggles")
-        {
+        if fields.get("user").map(String::as_str) != Some("giggles") {
+            reason = "startup user must be giggles; authentication uses the client certificate";
+            return Err("28000");
+        }
+        if fields.get("database").map(String::as_str) != Some("giggles") {
+            reason = "startup database must be giggles";
             return Err("28000");
         }
         if fields.keys().any(|k| {
             !matches!(
                 k.as_str(),
-                "user" | "database" | "client_encoding" | "application_name"
+                "user"
+                    | "database"
+                    | "client_encoding"
+                    | "application_name"
+                    | "DateStyle"
+                    | "TimeZone"
+                    | "extra_float_digits"
             )
         }) {
+            reason = "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits";
             return Err("0A000");
         }
         if fields
             .get("client_encoding")
             .is_some_and(|v| !v.eq_ignore_ascii_case("UTF8"))
         {
+            reason = "startup client_encoding must be UTF8";
             return Err("0A000");
+        }
+        // Driver presentation hints have no effect on the current integer/text/
+        // boolean/bytes type set. They never change clock or task authority.
+        if fields
+            .get("DateStyle")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("ISO"))
+        {
+            reason = "startup DateStyle must be ISO";
+            return Err("0A000");
+        }
+        if let Some(value) = fields.get("TimeZone") {
+            if value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/_+-:.".contains(&b))
+            {
+                reason = "startup TimeZone must be a bounded timezone label";
+                return Err("0A000");
+            }
+            timezone = value.clone();
+        }
+        if fields
+            .get("extra_float_digits")
+            .is_some_and(|v| v.parse::<i32>().map_or(true, |n| !(-15..=3).contains(&n)))
+        {
+            reason = "startup extra_float_digits must be an integer from -15 to 3";
+            return Err("0A000");
+        }
+        if let Some(name) = fields.get("application_name") {
+            if name.len() > 128 {
+                reason = "startup application_name exceeds 128 bytes";
+                return Err("54000");
+            }
+            startup_settings.application_name = name.clone();
+        }
+        if let Some(digits) = fields.get("extra_float_digits") {
+            startup_settings.extra_float_digits = digits.parse().map_err(|_| "22023")?;
         }
         Ok(())
     })();
     let mut out = vec![];
     if let Err(code) = validate {
-        error(code, &mut out);
+        error_message(code, reason, &mut out);
         send(s, &out).await?;
         return Ok(());
     }
@@ -715,6 +1004,8 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         ("server_encoding", "UTF8"),
         ("standard_conforming_strings", "on"),
         ("integer_datetimes", "on"),
+        ("DateStyle", "ISO"),
+        ("TimeZone", timezone.as_str()),
     ] {
         let mut b = vec![];
         z(key, &mut b);
@@ -724,13 +1015,21 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     ready(&session, &mut out).map_err(io::Error::other)?;
     send(s, &out).await?;
     let mut state = State {
+        implicit: false,
+        settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         portals: BTreeMap::new(),
         drain: false,
     };
+    state.settings.current = startup_settings;
     loop {
+        // Idle connections hold a bounded admission slot, not an active frame.
+        // Once a frame starts, its remaining header and body have a deadline.
+        let tag = match s.read_u8().await {
+            Ok(tag) => tag,
+            Err(_) => return Ok(()),
+        };
         let incoming = timeout(IO_TIMEOUT, async {
-            let tag = s.read_u8().await?;
             let n = s.read_u32().await?;
             if n < 4 || n as u64 > MAX_FRAME as u64 {
                 return Err(io::Error::other("wire frame limit"));
@@ -748,15 +1047,26 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
         let received = std::time::Instant::now();
-        // Sync/Close/Terminate must remain usable for protocol recovery.
-        let active = backend.begin(matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E'));
+        // A successful implicit cycle publishes at Sync and must be cancellable
+        // at that decision boundary. Recovery-only Sync remains uncancellable.
+        let active = backend.begin(
+            matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E')
+                || (tag == b'S' && state.implicit && !session.is_aborted()),
+        );
         let permit = match blocking.admit(&active.context).await {
             Ok(permit) => permit,
             Err(e) => {
                 session.abort();
                 let mut out = Vec::new();
                 error(crate::service::sqlstate(&e), &mut out);
-                if tag == b'Q' {
+                if tag == b'S' && state.implicit {
+                    session.sql.rollback();
+                    state.settings.transaction(true, false, "ROLLBACK");
+                    state.implicit = false;
+                    state.portals.clear();
+                }
+                if matches!(tag, b'Q' | b'S') {
+                    state.drain = false;
                     ready(&session, &mut out).map_err(io::Error::other)?;
                 } else {
                     state.drain = true;
@@ -785,8 +1095,20 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(keep) => Ok(keep),
                     Err(code) => {
                         session.abort();
+                        // COMMIT may fail and finish rollback before returning
+                        // its error. No portal can outlive that transaction.
+                        if tag == b'Q' && !session.in_transaction() {
+                            state.portals.clear();
+                        }
+                        if tag == b'S' && state.implicit {
+                            session.sql.rollback();
+                            state.settings.transaction(true, false, "ROLLBACK");
+                            state.implicit = false;
+                            state.portals.clear();
+                        }
                         error(code, &mut out);
-                        if tag == b'Q' {
+                        if matches!(tag, b'Q' | b'S') {
+                            state.drain = false;
                             ready(&session, &mut out)
                                 .map(|()| true)
                                 .map_err(io::Error::other)

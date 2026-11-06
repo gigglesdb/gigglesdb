@@ -141,15 +141,7 @@ async fn pinned_driver_cancel_autocommit_and_commit_at_each_decision_boundary() 
             if wins {
                 assert_eq!(result.unwrap_err().code().unwrap().code(), "57014");
                 if explicit {
-                    assert_eq!(
-                        pg.batch_execute("COMMIT")
-                            .await
-                            .unwrap_err()
-                            .code()
-                            .unwrap()
-                            .code(),
-                        "25P02"
-                    );
+                    pg.batch_execute("COMMIT").await.unwrap();
                     pg.batch_execute("ROLLBACK").await.unwrap();
                 }
             } else {
@@ -375,8 +367,10 @@ async fn cancel_commit_and_pipelined_rollback_obey_one_session_order() {
             assert!(!rolled.iter().any(|(t, _)| *t == b'E'));
         } else {
             assert!(!committed.iter().any(|(t, _)| *t == b'E'));
-            assert!(has_error(&rolled, "25000"));
+            assert!(!rolled.iter().any(|(t, _)| *t == b'E'));
         }
+        assert!(rolled.iter().any(|(t, b)| *t == b'C' && b == b"ROLLBACK\0"));
+        assert_eq!(rolled.last(), Some(&(b'Z', vec![b'I'])));
         assert_eq!(
             f.admin
                 .sql_session()

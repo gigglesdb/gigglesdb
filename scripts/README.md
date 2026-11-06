@@ -34,6 +34,14 @@ does not support network DDL. See the root README for request examples.
 
 ## Other useful runs
 
+**PostgreSQL client compatibility** creates a fresh isolated test database and
+runs actual pgJDBC 42.7.3 and the pinned Rust driver. It does not use the live demo.
+It prints a JSON report with PASS/FAIL/UNTESTED for each case; known catalog gaps
+currently make the overall run fail. It discovers a JDK from `JAVA_HOME` or
+Eclipse Adoptium and the pinned JAR from JetBrains' driver cache. Override with
+`powershell -NoProfile -File scripts/check-pg-clients.ps1 -JavaHome PATH -JdbcJar PATH`.
+Missing drivers remain UNTESTED. Build targets are separate from the live IDE server.
+
 | Group | Runs |
 | --- | --- |
 | Daily | Interactive SQL shell, example SQL/native queries, native capability inventory |
