@@ -687,3 +687,43 @@ whitespace or leading zeroes (except `"0"`). Other numeric fields retain their
 usual serialization. Reopen preserves catalog/domain identity; restore reports
 the restored database's new domain with the preserved catalog descriptors.
 Inspection adds no persisted schema, value, storage or export format.
+
+## Finite trusted read explain
+
+`Engine::explain_read(&Request, &Bindings) -> Result<ReadExplainOutcome>` accepts
+only `Request::Read`, the existing simple field projection read. Other variants
+return `Unsupported` before catalog acquisition or binding. Actual supplied
+values, parameter membership, expression types, column names, order and limit
+are validated with the existing binder against one current committed catalog
+snapshot. No prepared or bound handle acts as a credential.
+
+The serde outcome reports contract version, canonical decimal text database
+domain, catalog epoch, table ID/name, projected column IDs, ordered column IDs
+and directions, filter presence, typed execution stages and limits. Cardinality
+and cost estimates are `None` (unknown). Literal and parameter values are absent.
+The stages describe `execute_operation`: whole-state transaction snapshot,
+bounded complete-table materialization and reverse-primary-key completeness
+certification, then in-memory filter/order/field projection/output page. There
+is no claimed indexed optimization. The logical input ceiling is 1024 even for
+selective filters or a small output limit; output defaults to 100 and accepts
+0 through 1024. Limits also report the actual Admin admission/selected-key
+configuration and engine byte/expression/binding ceilings.
+
+Explain itself borrows committed catalog metadata and does not call `run`,
+`complete_table_engine`, a SQL parser/routine, mutation or commit. Storage still
+acquires, decodes and validates whole bounded state including stored rows; this
+is not metadata-only physical I/O. There is no extra transaction-state clone,
+logical business-row scan, relation materialization or publication for explain.
+It sees committed catalog changes on every call, not staged DDL in another
+session. Trusted Admin access is not generic task authorization.
+
+Before binder/output clones, metadata admission charges `280 + table_name.len()
++ 8 * projection_count + 9 * order_count` logical bytes, bounded by
+`MAX_EXPLAIN_METADATA_BYTES = 65_536`. The fixed charge reserves the header,
+limits, stage tags and collection prefixes. Counts use resolved all-column
+projection width when the request projection is empty. Checked arithmetic fails
+closed. These units are not JSON size or total heap accounting. Exact-bound and
+one-over admission are tested. No text renderer is supplied in this core slice.
+This prerequisite does not claim the full local-core/reference explain bundle,
+analyze, expression projections, writes, blocks, once or remote authorization.
+Index creation remains separate; no persisted format changes are introduced.

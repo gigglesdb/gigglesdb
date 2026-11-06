@@ -199,7 +199,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         CapabilityInterface::RustTree,
         CapabilityInterface::Cli,
     ] {
-        if version == LanguageVersion::Embedded012 {
+        if version.supports_inspection() {
             add(
                 interface,
                 "local_discovery",
@@ -234,6 +234,33 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
                 ],
                 vec![],
             );
+        }
+        if version.supports_explain() {
+            add(
+                interface,
+                "bounded_simple_read_static_explain",
+                CapabilityState::Implemented,
+                "Explicit 0.13 trusted simple-read static explain using actual bindings and fresh catalog IDs. Whole-state storage read/validation still occurs; no logical business read, mutation or commit. Describes complete materialization (1024 ceiling), conditional reverse-PK certification, in-memory filter/order/projection/page; estimates unknown. No indexed optimization or task authorization.",
+                vec![evidence(
+                    "crates/giggles-language/tests/explain.rs",
+                    "explain_text_tree_bindings_and_fresh_catalog",
+                )],
+                vec![],
+            );
+            for feature in [
+                "full_reference_explain",
+                "local_core_bundle",
+                "index_creation",
+            ] {
+                add(
+                    interface,
+                    feature,
+                    CapabilityState::Unverified,
+                    "Not qualified by bounded simple-read explain.",
+                    vec![],
+                    vec![],
+                );
+            }
         }
         if version != LanguageVersion::Embedded01 {
             add(
@@ -965,6 +992,26 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         vec![],
     );
 
+    if version.supports_explain() {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::Cli] {
+            add(
+                interface,
+                "bounded_explain_scope",
+                CapabilityState::Rejected,
+                "Static simple-read explanation only; writes, expression projections, analyze, nested explain, blocks and retry wrappers reject before effects.",
+                vec![rejection_evidence(version)],
+                vec![
+                    "explain update items where id=1 set n=2",
+                    "explain items select id+1 as n",
+                    "explain analyze items",
+                    "explain explain items",
+                    "explain transaction { items; }",
+                    "explain items once \"key\" for 1h",
+                ],
+            );
+        }
+    }
+
     // These are complete rejection fixtures, not proposed grammar fragments.
     for interface in [CapabilityInterface::RustText, CapabilityInterface::Cli] {
         if version == LanguageVersion::Embedded012 {
@@ -1603,7 +1650,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             once_min_retention_seconds: version.supports_once().then_some(1),
             once_max_retention_seconds: version.supports_once().then_some(core_once::MAX_ONCE_RETENTION_SECONDS),
             once_max_clock_lease_seconds: version.supports_once().then_some(core_once::MAX_ONCE_CLOCK_LEASE_SECONDS),
-            inspection_metadata_bytes: (version == LanguageVersion::Embedded012)
+            inspection_metadata_bytes: version.supports_inspection()
                 .then_some(giggles_core::operations::MAX_INSPECTION_METADATA_BYTES),
             columns_per_table: relational::MAX_COLUMNS,
             catalog_tables: relational::MAX_TABLES,
@@ -1662,6 +1709,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded013 => (
+            "crates/giggles-language/tests/explain.rs",
+            "explain_selected_manifest_rejections_use_selected_version",
         ),
         LanguageVersion::Embedded012 => (
             "crates/giggles-language/tests/inspection_capabilities.rs",

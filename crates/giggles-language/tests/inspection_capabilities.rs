@@ -416,6 +416,7 @@ fn inspection_selected_manifest_rejections_use_selected_version() {
                         engine.outcome(&query, &Bindings::new(), &scope).is_err()
                     }
                     Ok(ParsedInput::Inspection(inspection)) => engine.inspect(&inspection).is_err(),
+                    Ok(ParsedInput::Explain(_)) => panic!("explain is unavailable before 0.13"),
                     Err(_) => true,
                 });
             assert!(rejected, "{}: {source}", capability.feature);

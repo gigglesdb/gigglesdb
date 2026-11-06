@@ -4,6 +4,9 @@ use crate::relational::TableDef;
 use std::collections::BTreeMap;
 
 impl Admin {
+    pub(crate) fn explain_limits_engine(&self) -> super::Limits {
+        self.inner.limits
+    }
     /// The callback borrows one committed snapshot. No transaction, publication
     /// or extra State clone is involved. The underlying bounded state read still
     /// performs the storage kernel's ordinary decoding and validation.

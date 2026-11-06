@@ -923,7 +923,12 @@ fn case_cli_and_selected_manifest_match_version_nine() {
                     );
                     assert!(engine.execute_catalog(&tree).is_err());
                 }
-                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
+                Ok(
+                    ParsedInput::Once(_)
+                    | ParsedInput::Outcome(_)
+                    | ParsedInput::Inspection(_)
+                    | ParsedInput::Explain(_),
+                ) => {
                     panic!("earlier profile admitted a retry envelope: {source}")
                 }
                 Err(_) => {}

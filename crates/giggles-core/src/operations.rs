@@ -11,6 +11,8 @@ pub use crate::relational::{SqlRow, Value};
 #[cfg(test)]
 mod case_tests;
 mod catalog;
+mod explain;
+pub use explain::*;
 mod inspection;
 pub mod once;
 #[cfg(test)]

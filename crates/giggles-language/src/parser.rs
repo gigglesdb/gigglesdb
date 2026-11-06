@@ -391,7 +391,8 @@ impl Parser {
             | LanguageVersion::Embedded09
             | LanguageVersion::Embedded010
             | LanguageVersion::Embedded011
-            | LanguageVersion::Embedded012 => self.sum(d),
+            | LanguageVersion::Embedded012
+            | LanguageVersion::Embedded013 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1382,7 +1383,17 @@ pub fn parse_input_with_version(s: &str, version: LanguageVersion) -> Result<Par
         end: s.len(),
         version,
     };
-    let input = if version.supports_inspection() && p.inspection_prefix() {
+    let input = if version.supports_explain() && p.word("explain") {
+        if matches!(p.peek(), Some(Token::Word(word)) if matches!(word.as_str(), "explain" | "analyze" | "show" | "describe" | "transaction" | "once"))
+        {
+            return Err(Error::Unsupported);
+        }
+        let statement = ExplainStatement {
+            read: p.statement()?,
+        };
+        explain::lower(&statement, version)?;
+        ParsedInput::Explain(statement)
+    } else if version.supports_inspection() && p.inspection_prefix() {
         let statement = p.inspection()?;
         inspection::validate(&statement, version)?;
         ParsedInput::Inspection(statement)
@@ -1402,4 +1413,15 @@ pub fn parse_input_with_version(s: &str, version: LanguageVersion) -> Result<Par
         return Err(p.error());
     }
     Ok(input)
+}
+
+/// Parse one standalone bounded static explanation in explicit 0.13.
+pub fn parse_explain_with_version(s: &str, version: LanguageVersion) -> Result<ExplainStatement> {
+    if !version.supports_explain() {
+        return Err(Error::Unsupported);
+    }
+    match parse_input_with_version(s, version)? {
+        ParsedInput::Explain(statement) => Ok(statement),
+        _ => Err(Error::Unsupported),
+    }
 }

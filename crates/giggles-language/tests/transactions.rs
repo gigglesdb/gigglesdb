@@ -871,7 +871,12 @@ fn transaction_cli_and_selected_manifest_match_version_five() {
                 Ok(ParsedInput::Catalog(_)) => {
                     panic!("profile 0.5 accepted catalog syntax: {source}");
                 }
-                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
+                Ok(
+                    ParsedInput::Once(_)
+                    | ParsedInput::Outcome(_)
+                    | ParsedInput::Inspection(_)
+                    | ParsedInput::Explain(_),
+                ) => {
                     panic!("earlier profile admitted a retry envelope: {source}")
                 }
                 Err(_) => {}

@@ -31,6 +31,8 @@ commands remain usable.
 Explicit version 0.12 selects `embedded-trusted-native-0.12`, adding local
 capability/limit discovery and trusted committed catalog inspection. It inherits
 0.11 once support in Rust; CLI once/outcome still require unavailable context.
+Explicit version 0.13 selects `embedded-trusted-native-0.13`, adding bounded
+trusted static explain for simple reads.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:
@@ -866,3 +868,37 @@ The script runs formatting, Clippy, debug/release tests and rustdoc tests with
 one build job, records output and tool versions, and compares input hashes
 before and after the run. Choose a fresh artifact directory; the script keeps
 its evidence and test databases for review.
+
+
+## Explicit trusted native 0.13 static explain
+
+Select `LanguageVersion::Embedded013` (CLI `--language-version 0.13`) to use
+`explain SIMPLE_READ`. Defaults and profiles 0.1 through 0.12 retain their behavior,
+including table/column identifiers such as `explain` and `analyze`.
+`parse_explain_with_version` produces a separate `ExplainStatement { read }`;
+`Engine::explain_text(text, &bindings)` and `Engine::explain(&tree, &bindings)`
+return core's typed `ReadExplainOutcome`. Only `Statement::Read` with field
+projections is accepted. Computed projections, writes, blocks, once, analyze,
+inspection and nested explain are rejected; explain is not a block item or a
+prepared credential. Each call validates actual supplied parameters against a
+fresh committed catalog, including missing/extra/type errors.
+
+```text
+giggles-language run --language-version 0.13 PATH 'explain items where id=$id order by id desc limit $page select id' '{"id":{"Int":1},"page":{"Int":10}}'
+```
+
+CLI JSON directly contains contract version, canonical decimal-string database
+domain, catalog epoch, table ID/name, projection column IDs, order column IDs and
+directions, filter presence, typed stages and limits. Estimates are unknown
+(`null`). Malformed explain syntax and unsupported trees reject before CLI
+database open. JSON output has an exact 65,536-byte preflight before output copies;
+this is separate from core's logical metadata budget. No human renderer is added.
+
+Explain performs an actual whole-state physical storage read and validation.
+It performs no logical business-row read, mutation or commit. The described read
+path completely materializes the table within the 1024-row ceiling, conditionally
+certifies completeness with a reverse-primary-key probe when that page is full,
+then filters, orders, projects and pages in memory. It does not imply indexed
+optimization, task authorization or an access credential. The manifest separately
+advertises `bounded_simple_read_static_explain`; full reference explain,
+`local_core_bundle` and `index_creation` remain unqualified.

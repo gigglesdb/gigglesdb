@@ -359,7 +359,7 @@ fn once_selected_manifest_rejections_use_selected_version() {
                     Ok(ParsedInput::Outcome(query)) => {
                         engine.outcome(&query, &Bindings::new(), &scope).is_err()
                     }
-                    Ok(ParsedInput::Inspection(_)) => {
+                    Ok(ParsedInput::Inspection(_) | ParsedInput::Explain(_)) => {
                         panic!("inspection accepted by profile 0.11: {source}")
                     }
                     Err(_) => true,

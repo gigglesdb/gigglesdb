@@ -707,7 +707,12 @@ fn upsert_scope_caps_and_atomic_refusals_match_common_engine() {
                 );
             }
             Ok(ParsedInput::Catalog(_)) => panic!("unexpected catalog input: {source}"),
-            Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
+            Ok(
+                ParsedInput::Once(_)
+                | ParsedInput::Outcome(_)
+                | ParsedInput::Inspection(_)
+                | ParsedInput::Explain(_),
+            ) => {
                 panic!("version 0.10 admitted a retry envelope: {source}")
             }
             Err(_) => {}
@@ -836,7 +841,12 @@ fn upsert_cli_and_selected_manifest_match_version_ten() {
                     );
                     assert!(engine.execute_catalog(&tree).is_err());
                 }
-                Ok(ParsedInput::Once(_) | ParsedInput::Outcome(_) | ParsedInput::Inspection(_)) => {
+                Ok(
+                    ParsedInput::Once(_)
+                    | ParsedInput::Outcome(_)
+                    | ParsedInput::Inspection(_)
+                    | ParsedInput::Explain(_),
+                ) => {
                     panic!("version 0.10 admitted a retry envelope: {source}")
                 }
                 Err(_) => {}

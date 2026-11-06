@@ -81,6 +81,7 @@ fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error
         "0.10" => Ok(LanguageVersion::Embedded010),
         "0.11" => Ok(LanguageVersion::Embedded011),
         "0.12" => Ok(LanguageVersion::Embedded012),
+        "0.13" => Ok(LanguageVersion::Embedded013),
         _ => Err(Error::Unsupported),
     }
 }
@@ -131,6 +132,9 @@ fn execute(
         }
         ParsedInput::Once(_) | ParsedInput::Outcome(_) => return Err(Error::Unsupported),
         ParsedInput::Inspection(statement) => serde_json::to_value(engine.inspect(&statement)?),
+        ParsedInput::Explain(statement) => {
+            return explain_json(&engine.explain(&statement, bindings)?, MAX_INPUT);
+        }
     }
     .map_err(|_| Error::Type)
 }
@@ -141,5 +145,55 @@ fn main() {
             eprintln!("{}", serde_json::json!({"error":error}));
             std::process::exit(1)
         }
+    }
+}
+
+// Measure the exact JSON encoding without copying output before allocating it.
+// This transport bound is distinct from core's logical metadata admission.
+fn explain_json(
+    outcome: &giggles_language::ReadExplainOutcome,
+    budget: usize,
+) -> Result<serde_json::Value, Error> {
+    struct Meter {
+        bytes: usize,
+        budget: usize,
+    }
+    impl std::io::Write for Meter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.budget)
+                .ok_or_else(|| std::io::Error::other("explain JSON limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Meter { bytes: 0, budget }, outcome).map_err(|_| Error::Limit)?;
+    serde_json::to_value(outcome).map_err(|_| Error::Type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explain_json_exact_bound() {
+        let outcome: giggles_language::ReadExplainOutcome = serde_json::from_value(serde_json::json!({
+            "contract_version":1,"database_domain":"340282366920938463463374607431768211455",
+            "catalog_epoch":1,"table_id":1,"table_name":"a\"\n", "projection_column_ids":[1],
+            "order":[],"has_filter":false,"stages":[],"estimated_rows":null,"estimated_cost":null,
+            "limits":{"input_rows":1024,"output_rows":100,"row_bytes":1,"result_bytes":1,
+                "request_bytes":1,"binding_count":1,"binding_bytes":1,"bound_value_bytes":1,
+                "expression_depth":1,"expression_nodes":1,"admitted":1,"selected_keys":1}
+        })).unwrap();
+        let bytes = serde_json::to_vec(&outcome).unwrap();
+        assert_eq!(
+            explain_json(&outcome, bytes.len()).unwrap(),
+            serde_json::to_value(&outcome).unwrap()
+        );
+        assert_eq!(explain_json(&outcome, bytes.len() - 1), Err(Error::Limit));
+        assert_eq!(explain_json(&outcome, 0), Err(Error::Limit));
     }
 }
