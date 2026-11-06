@@ -1,0 +1,16 @@
+{
+  "cases": 26420,
+  "version": [
+    "PostgreSQL 18.0 (Debian 18.0-1.pgdg13+3) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+  ],
+  "collation": [
+    "C"
+  ],
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "sha256": {
+    "tests\\fixtures\\mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "tests\\fixtures\\mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "tests\\generate_mutation.py": "c1a6d156c4418da0b7f55cbf0e89f0bd0d07323e563e11d42e6ecdcebb49b3ac",
+    "upstream\\jsonfuncs.c": "c088d99c688a2594f3499dd82f7eac851cdb98308e7ce6e0818bb1b971ae32fc"
+  }
+}

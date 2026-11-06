@@ -1,0 +1,228 @@
+{
+  "cases": 37600,
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "container": "compassionate_varahamihira",
+  "version": "PostgreSQL18.0 Debian18.0-1.pgdg13+3 x86_64",
+  "database": "postgres",
+  "collation": "C",
+  "comparator": "Exact ordered UTF8 JSON text including duplicate results; query aggregate empty NULL; exact SQLSTATE, no normalization",
+  "checks": [
+    {
+      "argv": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath\\predicates.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\continuations.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\jsonpath.rs"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\final-0.log"
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\final-1.log"
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\final-2.log"
+    }
+  ],
+  "source_stable": true,
+  "original_fixtures_stable": true,
+  "sha256": {
+    "src/jsonpath.rs": "e4f4e4064603bfa2380a05c011aec0d8a113c4b369d1019ddfbc9b0133ea207c",
+    "src/jsonpath/predicates.rs": "aab6dc361caef0f3e2938a2833545890ba91f40d8fadd8a8c45665144b1c88c3",
+    "tests/continuations.rs": "903d864778a6c9c5965d7a138f462acdd01979ada4d959ceaf9266af1a7456a5",
+    "tests/fixtures/continuations.sql": "7ab609bca8dc6ed26278c86e175b55a92e8dfe16834e303aa6586a7003a96322",
+    "tests/fixtures/continuations.tsv": "dd6845a60292f2845b46ee23fbeac865dcf5da4b42380979daab24716d141adc",
+    "tests/fixtures/jsonpath-manifest.json": "4f3f25c00d5a42e416c31774c2a55b9b8fcfc5d796ef4c7bf9807c5e763c3ce0",
+    "tests/fixtures/jsonpath.sql": "f3accf86ef3baf8bd0f0b394707e1deba022645e5e67c686f3646af0e457a039",
+    "tests/fixtures/jsonpath.tsv": "3338c2f8f1595072d5036051f16dcd32c0d62b83a797295590f918ba17998c7c",
+    "tests/fixtures/manifest.json": "2a1f847a7a3fd015cbb1025e90a76d5d32ee5ff17d4fbc05a7baddd7e57b6944",
+    "tests/fixtures/mutation-manifest.json": "b21fd4be7a5239f565b3c9bf81bc9ac4c48a7331c7ecc63a8c77ed7c3a5a0f8d",
+    "tests/fixtures/mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "tests/fixtures/mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "tests/fixtures/operators-manifest.json": "b9cc9126d92eda888724df59200736b22135e076d3b7d30514eb259f6321f78c",
+    "tests/fixtures/operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "tests/fixtures/operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "tests/fixtures/oracle.sql": "3833801ba8b45dad6ce71f1c63992b63b6a4e019da4a3a873c2f64cf99f391b9",
+    "tests/fixtures/oracle.tsv": "70b780c4dfd90274fddbd2d49590006ff0c757125c0299ec1a987e8e9dc39dc8",
+    "tests/fixtures/predicates-manifest.json": "9ef2f2e84ee7a43256f2f940c70fe3c4231bb0de972b49f4d2107591ed0d3cc8",
+    "tests/fixtures/predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "tests/fixtures/predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869",
+    "tests/generate_continuations.py": "632d8bccec369e949935d6d6d1e0c5c5094e78fe61ffdccf21e27e0430b088d0",
+    "upstream/COPYRIGHT": "3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd",
+    "upstream/json.c": "9d0ed0ee9d5bac07990f2b413b48ba7dac2bff3b24797233fd887926a704c102",
+    "upstream/jsonapi.c": "a27e23323af2f32a487e76723b4a4d02e96d25d155b5cc09529e7a8587c97c62",
+    "upstream/jsonb.c": "b137e223a73a8a4287e9b3a4d7dedcb3a3a40bdd9d08c6e5c5fd998d4139ba3f",
+    "upstream/jsonb_util.c": "444230d5187605ae276d3197fab41033e530e2dcbd94721d900005c7a52eb7b0",
+    "upstream/jsonfuncs.c": "c088d99c688a2594f3499dd82f7eac851cdb98308e7ce6e0818bb1b971ae32fc",
+    "upstream/jsonpath.c": "8b41d6f0b2a988ff474d3e51b13640488887a73e23b05f263a2b17d6e0db1779",
+    "upstream/jsonpath_exec.c": "96c687dc9b049212ab27230b9aaf63c58b337f40f4da585731103dc441aad80b",
+    "upstream/jsonpath_gram.y": "a06c261d419216065a6325a94d6af9f9a19389921cd245dc8ee1ad12a38ef22a",
+    "upstream/provenance.json": "52f93ffb8b3f6d246903d42c4c3ba183c58dc624f8da873c5756f512f6c2b85c"
+  },
+  "limitations": [
+    "Standalone crate only, not engine integrated; not full JSONPath or DD68 completion",
+    "Conservative resource admission includes all descent candidates and all query_first results",
+    "Original live corpus not rerun; preserved independent original offline oracle observations executed",
+    "No whole workspace hermeticity or buildscript/toolchain provenance claim",
+    "Preexecution hash guards for final test executables are captured separately after initial build; first builds necessarily lack such guard",
+    "Final verification source hashes precede output manifest creation; manifest is result metadata, not a compiled input."
+  ],
+  "prior_failures": [
+    {
+      "log": "failing-before.log",
+      "native_exit": 101,
+      "reason": "Unsupported continuation"
+    },
+    {
+      "log": "first-after.log",
+      "native_exit": 101,
+      "reason": "lax exists eagerly evaluates later missing variable"
+    }
+  ],
+  "guarded_execution": {
+    "argv": [
+      "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\target\\debug\\deps\\continuations-d9aebd7c3802b40a.exe"
+    ],
+    "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+    "native_exit": 0,
+    "exe_before": "2089887f00a8eeb132054b79a52b0199bc60acdc720b38eaa6bf894dfd9ef02e",
+    "exe_after": "2089887f00a8eeb132054b79a52b0199bc60acdc720b38eaa6bf894dfd9ef02e",
+    "log": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\guarded-continuations.log"
+  },
+  "evidence_hashes": {
+    "before-hashes.json": "9743d15ce38f1ed22d4825ede7cf03c03fe7a508c71ceab01560bb0dca103ade",
+    "cargo-identity.json": "9061091a3b5edd4c56549cbc2cabca434c3215630a37af8da903a3532dd88ba0",
+    "container-identity.json": "66551c739ed6fd4cb7a2a5eae2ab9f3adde8e2a3dee487af351788d09cf9afbe",
+    "continuations.sql": "7ab609bca8dc6ed26278c86e175b55a92e8dfe16834e303aa6586a7003a96322",
+    "continuations.tsv": "dd6845a60292f2845b46ee23fbeac865dcf5da4b42380979daab24716d141adc",
+    "durable.py": "6c2ab180dc0d4ac73bf309ef5f138c02ffd7938d2e32a604f05abbfbf3efd202",
+    "edit.py": "022f04f5400539909236301d7884f0588e17e0e56d8a3b7adae94932bb1e7008",
+    "edit2.py": "24fc35f15fa32e9831bb68a078f06a29a72f80f3aedcf4a6042fd5ae07b19106",
+    "failing-before.log": "3e3cea95c70f299de5c16b1e8430c3ef3a68ee2bcc63236f191a603c2ad88f69",
+    "final-0.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "final-1.log": "1c4bf3886fc97288336a3bf16fa909d5a38933dc76e74212b765d870dea636d4",
+    "final-2.log": "e1961651ec406850a82d410119d792c5f4adc8c60d4b74ca18641f1564442724",
+    "first-after.log": "3ec7326ca6a16fc4631eac3a402c711ba91f3841b9b73633b11af5266fb59c1d",
+    "first-full-test.log": "7390ee7ec47762373da7eb817e98cd1895abe1b6b3e90b86fbe9ee03e28e39f7",
+    "first-full-verification.json": "0f5bc12b0f40f13109aed8fc1d15efdae89117e8daa7da42ad00ca3693f2e096",
+    "focused.log": "7f28bd922f8f9be845ca1f8a220d5a5e7f550f53c161ac83a1e6d20769589e39",
+    "generate.py": "35a91dcc48559798e9c265954729ca97bccdebb3acd906fc52a225b6f65de7ee",
+    "guarded-continuations.log": "12a67e6490213a7b9974478d611f887043166de1507c8d28ac9b9246cd8c2ae9",
+    "migrate.py": "78d5e83ff6f9491c2dd6246f53829e04c33250ce80c3d9589965837fd7ef544b",
+    "migration-oracle.json": "905a6ba7214d22d3ab8304f36ec4392bc08152cda516ea645c3b53daed3d5343",
+    "oracle-stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "prepare.py": "d190c4e908716c6e8fcc745d406fde210362d23a24b69f42f91d24b755770e65",
+    "python-identity.json": "060d8459a0afdeb769ee417128cb264cfb2b1f164e234b3d2927a7aa38b30dd6",
+    "rustc-identity.json": "d1f44f749af520aa8cee78b591663e02ae4f23d1993ef94f3a05bb2222de477a",
+    "seal.py": "aab871604bbde2bc9ee2b65faf283cb113f63ef33629fb71b826ab3f2707a8f4",
+    "second-after.log": "54827b862816b6a4b8348c019326f012cede15dd6e5bb00ec4535dcaf0769e30",
+    "tests-doc.py": "a540eda8145a90765c96546e12c5f2f3a362da434c5523b7007803b0ed75f8b2",
+    "verify.py": "bb0e1f67de2cf433553e2cbb2049a236afdbe3f452b5cba85b6fde2da3a4af29"
+  },
+  "test_totals": {
+    "passed": 17,
+    "failed": 0,
+    "ignored": 3,
+    "observations": 161976
+  },
+  "test_migration": "Only two $.**.a Unsupported assertions in tests/jsonpath.rs replaced with concrete PostgreSQL-observed sequence/strict empty output; all unrelated assertions preserved.",
+  "source_guard_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\verification.json",
+  "before_hashes_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\before-hashes.json",
+  "observations": {
+    "original": 124376,
+    "new": 37600,
+    "total": 161976
+  },
+  "qualification": "Standalone only; full DD68 remains unfinished",
+  "oracle_capture": {
+    "argv": [
+      "docker",
+      "exec",
+      "-i",
+      "compassionate_varahamihira",
+      "psql",
+      "-XAtq",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-U",
+      "postgres",
+      "-d",
+      "postgres"
+    ],
+    "native_exit": 0,
+    "sql_sha256": "7ab609bca8dc6ed26278c86e175b55a92e8dfe16834e303aa6586a7003a96322",
+    "observations": 37600
+  },
+  "test_migration_guards": {
+    "original_sha256": "28958c1164240652e899ea18d3af3ee3dfd75d93ccfdf1bca100cdfd391994f5",
+    "reconstructed_original_matches": [
+      "CRLF"
+    ],
+    "after_sha256": "bb60713fdc9b9f4aead14c70d6d2edea88734150ae3dfcd53e1234b8f0736841"
+  },
+  "test_migration_patch": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\test-migration.patch",
+  "scope_guard": "J:\\gigglesdb-work\\dd68-jsonpath-continuations-20261106\\scope-guards.json",
+  "original_fixture_hashes": {
+    "tests/fixtures/jsonpath-manifest.json": "4f3f25c00d5a42e416c31774c2a55b9b8fcfc5d796ef4c7bf9807c5e763c3ce0",
+    "tests/fixtures/jsonpath.sql": "f3accf86ef3baf8bd0f0b394707e1deba022645e5e67c686f3646af0e457a039",
+    "tests/fixtures/jsonpath.tsv": "3338c2f8f1595072d5036051f16dcd32c0d62b83a797295590f918ba17998c7c",
+    "tests/fixtures/manifest.json": "2a1f847a7a3fd015cbb1025e90a76d5d32ee5ff17d4fbc05a7baddd7e57b6944",
+    "tests/fixtures/mutation-manifest.json": "b21fd4be7a5239f565b3c9bf81bc9ac4c48a7331c7ecc63a8c77ed7c3a5a0f8d",
+    "tests/fixtures/mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "tests/fixtures/mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "tests/fixtures/operators-manifest.json": "b9cc9126d92eda888724df59200736b22135e076d3b7d30514eb259f6321f78c",
+    "tests/fixtures/operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "tests/fixtures/operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "tests/fixtures/oracle.sql": "3833801ba8b45dad6ce71f1c63992b63b6a4e019da4a3a873c2f64cf99f391b9",
+    "tests/fixtures/oracle.tsv": "70b780c4dfd90274fddbd2d49590006ff0c757125c0299ec1a987e8e9dc39dc8",
+    "tests/fixtures/predicates-manifest.json": "9ef2f2e84ee7a43256f2f940c70fe3c4231bb0de972b49f4d2107591ed0d3cc8",
+    "tests/fixtures/predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "tests/fixtures/predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869"
+  },
+  "metadata_revision": 2,
+  "metadata_correction": "Windows relative paths used backslashes; slash-prefixed filters returned empty metadata hash maps. Explicit normalized nonempty mandatory identities now checked against immutable original tested source_after snapshot. Test results unchanged; metadata-only revision, no test rerun or stronger original guard claim."
+}

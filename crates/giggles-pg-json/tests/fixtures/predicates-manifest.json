@@ -1,0 +1,18 @@
+{
+  "cases": 65280,
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "version": [
+    "PostgreSQL 18.0 (Debian 18.0-1.pgdg13+3) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+  ],
+  "collation": [
+    "C"
+  ],
+  "sha256": {
+    "tests\\fixtures\\predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "tests\\fixtures\\predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869",
+    "tests\\generate_predicates.py": "417fb20979916eb2e89220190239defc9b2b7dd34a84607820fca8fc0c4efef6",
+    "upstream\\jsonpath.c": "8b41d6f0b2a988ff474d3e51b13640488887a73e23b05f263a2b17d6e0db1779",
+    "upstream\\jsonpath_gram.y": "a06c261d419216065a6325a94d6af9f9a19389921cd245dc8ee1ad12a38ef22a",
+    "upstream\\jsonpath_exec.c": "96c687dc9b049212ab27230b9aaf63c58b337f40f4da585731103dc441aad80b"
+  }
+}

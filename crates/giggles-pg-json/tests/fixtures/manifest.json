@@ -1,0 +1,39 @@
+{
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "version": [
+    "PostgreSQL 18.0 (Debian 18.0-1.pgdg13+3) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+    "UTF8",
+    "en_US.utf8"
+  ],
+  "cases": 3546,
+  "sha256": {
+    "conformance.rs": "a5ff7bf1329a010e9783c7f9b0f551e9efcca10738b6de2e49b48fac0ac4f53d",
+    "fixtures\\jsonpath-manifest.json": "4f3f25c00d5a42e416c31774c2a55b9b8fcfc5d796ef4c7bf9807c5e763c3ce0",
+    "fixtures\\jsonpath.sql": "f3accf86ef3baf8bd0f0b394707e1deba022645e5e67c686f3646af0e457a039",
+    "fixtures\\jsonpath.tsv": "3338c2f8f1595072d5036051f16dcd32c0d62b83a797295590f918ba17998c7c",
+    "fixtures\\mutation-manifest.json": "b21fd4be7a5239f565b3c9bf81bc9ac4c48a7331c7ecc63a8c77ed7c3a5a0f8d",
+    "fixtures\\mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "fixtures\\mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "fixtures\\operators-manifest.json": "b9cc9126d92eda888724df59200736b22135e076d3b7d30514eb259f6321f78c",
+    "fixtures\\operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "fixtures\\operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "fixtures\\oracle.sql": "3833801ba8b45dad6ce71f1c63992b63b6a4e019da4a3a873c2f64cf99f391b9",
+    "fixtures\\oracle.tsv": "70b780c4dfd90274fddbd2d49590006ff0c757125c0299ec1a987e8e9dc39dc8",
+    "fixtures\\predicates-manifest.json": "9ef2f2e84ee7a43256f2f940c70fe3c4231bb0de972b49f4d2107591ed0d3cc8",
+    "fixtures\\predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "fixtures\\predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869",
+    "generate_jsonpath.py": "3ebf1dc459dd7d8bf474622ebe13cdf9446a590810d5ffd18f6e1bd4f0d58ff8",
+    "generate_mutation.py": "c1a6d156c4418da0b7f55cbf0e89f0bd0d07323e563e11d42e6ecdcebb49b3ac",
+    "generate_operators.py": "b09b00fb39cb6566bed127ecdb86af687ba445664d3b2e11ec4054f239256aa4",
+    "generate_oracle.py": "94dff2acbd367405bc5a842dcbdb2e6dc77900a4dfe67c5ccffeadcd17862415",
+    "generate_predicates.py": "417fb20979916eb2e89220190239defc9b2b7dd34a84607820fca8fc0c4efef6",
+    "jsonpath.rs": "28958c1164240652e899ea18d3af3ee3dfd75d93ccfdf1bca100cdfd391994f5",
+    "mutation.rs": "01a1a94aa0a9e6b3e49df8cfcb50e2a6f218ad071f55842f1c967ecd57cac4ad",
+    "operators.rs": "def31741cdf811c09132f6693fad9d5948f017abe8db2c8c2b1110581f989478",
+    "verify.py": "bab29ec05edd6c488d797a131187ac8f8e142f1f91a685e764ca95ec39fc729d",
+    "verify_functions.py": "1e3c473352fa6b885570361b03d9908794d278c14915e81cff630c7d335397c2",
+    "verify_jsonpath.py": "b223ece80863efa8194c1ad3a0c39d4a4d6c63c34f01bb1487d74aee27b5c7c2",
+    "verify_mutation.py": "297222d7ed329b4157a5de07b94399edf9ed5404d61d361b955105a00d3d8a7c",
+    "verify_predicates.py": "99f0ed6038071b36bff778efd948574a3e07d8bb0ecc152c824c1939a3b67bcc"
+  }
+}

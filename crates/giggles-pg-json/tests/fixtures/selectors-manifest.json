@@ -1,0 +1,388 @@
+{
+  "checks": [
+    {
+      "label": "fmt",
+      "argv": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\src\\jsonpath\\predicates.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\selectors.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\jsonpath.rs",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\tests\\continuations.rs"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\fmt.log"
+    },
+    {
+      "label": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\clippy.log"
+    },
+    {
+      "label": "artifacts",
+      "argv": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--manifest-path",
+        "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json\\Cargo.toml",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\artifacts.log"
+    },
+    {
+      "label": "guarded-0",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\giggles_pg_json-c53488b3ea73b1bd.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-0.log"
+    },
+    {
+      "label": "guarded-1",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\selectors-1acf8671b77750c6.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-1.log"
+    },
+    {
+      "label": "guarded-2",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\continuations-d9aebd7c3802b40a.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-2.log"
+    },
+    {
+      "label": "guarded-3",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\methods-7a3afc538c6f7533.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-3.log"
+    },
+    {
+      "label": "guarded-4",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\conformance-66bd26e88610b7c2.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-4.log"
+    },
+    {
+      "label": "guarded-5",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\operators-de8c7fc9cde2c113.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-5.log"
+    },
+    {
+      "label": "guarded-6",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\mutation-85facfd44a503b72.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-6.log"
+    },
+    {
+      "label": "guarded-7",
+      "argv": [
+        "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target\\debug\\deps\\jsonpath-b59e082a467d996f.exe"
+      ],
+      "cwd": "K:\\Projects\\gigglesdb\\crates\\giggles-pg-json",
+      "env": {
+        "TEMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "TMP": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\tmp",
+        "CARGO_TARGET_DIR": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\target"
+      },
+      "native_exit": 0,
+      "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\guarded-7.log"
+    }
+  ],
+  "source_stable": true,
+  "binaries_stable": true,
+  "original_fixture_hashes": {
+    "tests/fixtures/continuations-manifest.json": "e6302bb912b3d58e3af0075da2357022b41213f19d75eb6609f0c581589b01b5",
+    "tests/fixtures/continuations.sql": "7ab609bca8dc6ed26278c86e175b55a92e8dfe16834e303aa6586a7003a96322",
+    "tests/fixtures/continuations.tsv": "dd6845a60292f2845b46ee23fbeac865dcf5da4b42380979daab24716d141adc",
+    "tests/fixtures/jsonpath-manifest.json": "4f3f25c00d5a42e416c31774c2a55b9b8fcfc5d796ef4c7bf9807c5e763c3ce0",
+    "tests/fixtures/jsonpath.sql": "f3accf86ef3baf8bd0f0b394707e1deba022645e5e67c686f3646af0e457a039",
+    "tests/fixtures/jsonpath.tsv": "3338c2f8f1595072d5036051f16dcd32c0d62b83a797295590f918ba17998c7c",
+    "tests/fixtures/manifest.json": "2a1f847a7a3fd015cbb1025e90a76d5d32ee5ff17d4fbc05a7baddd7e57b6944",
+    "tests/fixtures/methods-manifest.json": "0f3b83157119139ee054ce8a25c110b715ac5fedf9ec56f86b204f0496846aab",
+    "tests/fixtures/methods.sql": "338905fc9bea1d897609c3b9d0b19ba735313a983eae78ae9366f99fe3628b0d",
+    "tests/fixtures/methods.tsv": "440702eccdca1ed508751e0d303163ba8c19ce0df7a99e4d7a083d16a9413dd5",
+    "tests/fixtures/mutation-manifest.json": "b21fd4be7a5239f565b3c9bf81bc9ac4c48a7331c7ecc63a8c77ed7c3a5a0f8d",
+    "tests/fixtures/mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "tests/fixtures/mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "tests/fixtures/operators-manifest.json": "b9cc9126d92eda888724df59200736b22135e076d3b7d30514eb259f6321f78c",
+    "tests/fixtures/operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "tests/fixtures/operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "tests/fixtures/oracle.sql": "3833801ba8b45dad6ce71f1c63992b63b6a4e019da4a3a873c2f64cf99f391b9",
+    "tests/fixtures/oracle.tsv": "70b780c4dfd90274fddbd2d49590006ff0c757125c0299ec1a987e8e9dc39dc8",
+    "tests/fixtures/predicates-manifest.json": "9ef2f2e84ee7a43256f2f940c70fe3c4231bb0de972b49f4d2107591ed0d3cc8",
+    "tests/fixtures/predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "tests/fixtures/predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869"
+  },
+  "original_fixtures_stable": true,
+  "sha256": {
+    "src/jsonpath.rs": "37a7db756377076800938525d45d8acffeb8d2ad7de231eca42efa51d168b034",
+    "src/jsonpath/predicates.rs": "9869b2a0ddb355ef9d7c08a5625f1bfcf529f7acc0fa8a3108b39cf654111630",
+    "tests/continuations.rs": "c838f5fd8bb9d422dfdc0f39d07c5a332ecc861e9b3959aef8e062c5ec7807d2",
+    "tests/fixtures/continuations-manifest.json": "e6302bb912b3d58e3af0075da2357022b41213f19d75eb6609f0c581589b01b5",
+    "tests/fixtures/continuations.sql": "7ab609bca8dc6ed26278c86e175b55a92e8dfe16834e303aa6586a7003a96322",
+    "tests/fixtures/continuations.tsv": "dd6845a60292f2845b46ee23fbeac865dcf5da4b42380979daab24716d141adc",
+    "tests/fixtures/jsonpath-manifest.json": "4f3f25c00d5a42e416c31774c2a55b9b8fcfc5d796ef4c7bf9807c5e763c3ce0",
+    "tests/fixtures/jsonpath.sql": "f3accf86ef3baf8bd0f0b394707e1deba022645e5e67c686f3646af0e457a039",
+    "tests/fixtures/jsonpath.tsv": "3338c2f8f1595072d5036051f16dcd32c0d62b83a797295590f918ba17998c7c",
+    "tests/fixtures/manifest.json": "2a1f847a7a3fd015cbb1025e90a76d5d32ee5ff17d4fbc05a7baddd7e57b6944",
+    "tests/fixtures/methods-manifest.json": "0f3b83157119139ee054ce8a25c110b715ac5fedf9ec56f86b204f0496846aab",
+    "tests/fixtures/methods.sql": "338905fc9bea1d897609c3b9d0b19ba735313a983eae78ae9366f99fe3628b0d",
+    "tests/fixtures/methods.tsv": "440702eccdca1ed508751e0d303163ba8c19ce0df7a99e4d7a083d16a9413dd5",
+    "tests/fixtures/mutation-manifest.json": "b21fd4be7a5239f565b3c9bf81bc9ac4c48a7331c7ecc63a8c77ed7c3a5a0f8d",
+    "tests/fixtures/mutation.sql": "628d198d67861d539a387f638a965dc03424cc3ba4ce492b6408441d73bab57e",
+    "tests/fixtures/mutation.tsv": "262bd5ccb8600928809ed3dc6c7809ad1a01ec311fa212f426c7bfbeceabc02c",
+    "tests/fixtures/operators-manifest.json": "b9cc9126d92eda888724df59200736b22135e076d3b7d30514eb259f6321f78c",
+    "tests/fixtures/operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "tests/fixtures/operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "tests/fixtures/oracle.sql": "3833801ba8b45dad6ce71f1c63992b63b6a4e019da4a3a873c2f64cf99f391b9",
+    "tests/fixtures/oracle.tsv": "70b780c4dfd90274fddbd2d49590006ff0c757125c0299ec1a987e8e9dc39dc8",
+    "tests/fixtures/predicates-manifest.json": "9ef2f2e84ee7a43256f2f940c70fe3c4231bb0de972b49f4d2107591ed0d3cc8",
+    "tests/fixtures/predicates.sql": "984bc90962ee2a114200fd9b29a788b8fc1611afcdb76988db7970f39c3c0e88",
+    "tests/fixtures/predicates.tsv": "64987848eaa6cbbd4ceba2c1fb910bfbb6cc550efc7a374ab0b552922396f869",
+    "tests/fixtures/selector-contexts.sql": "dd714e5a8cb2d2b0626a184b4492e8e5bc71d71b7a7b626fbeb1bf065f81a428",
+    "tests/fixtures/selector-contexts.tsv": "f316b01202f1ef8b6faee6f9222eb4fbe5cdb97077eeff8f4345b0c18a298d71",
+    "tests/fixtures/selectors.sql": "fe5c6800474da412cc23cca017423c34334bcb9f78f76bdd0acfeffc72e5d1e9",
+    "tests/fixtures/selectors.tsv": "ea97f3c5b6c789462022d681c35bd815e65a9d8fdfc2efdd5ca5ca8c81b90906",
+    "tests/generate_selector_contexts.py": "f1a35eeb83896ff16cd0023adbe8ea67f1b3a808ebe70254ed4ce8248b699ed3",
+    "tests/generate_selectors.py": "baf7b425e7be0baaf6da127e3c77a4bdde303c32772587b024405eb817147105",
+    "tests/jsonpath.rs": "0cccfd00681c17afdf276dd720867c47c57fbbc52bffb8c919c25e3fa4b6878d",
+    "tests/selectors.rs": "4c22330938032d740779b17d70fd262eb06003aeeb53928fbd022034e0ce912a",
+    "upstream/COPYRIGHT": "3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd",
+    "upstream/json.c": "9d0ed0ee9d5bac07990f2b413b48ba7dac2bff3b24797233fd887926a704c102",
+    "upstream/jsonapi.c": "a27e23323af2f32a487e76723b4a4d02e96d25d155b5cc09529e7a8587c97c62",
+    "upstream/jsonb.c": "b137e223a73a8a4287e9b3a4d7dedcb3a3a40bdd9d08c6e5c5fd998d4139ba3f",
+    "upstream/jsonb_util.c": "444230d5187605ae276d3197fab41033e530e2dcbd94721d900005c7a52eb7b0",
+    "upstream/jsonfuncs.c": "c088d99c688a2594f3499dd82f7eac851cdb98308e7ce6e0818bb1b971ae32fc",
+    "upstream/jsonpath.c": "8b41d6f0b2a988ff474d3e51b13640488887a73e23b05f263a2b17d6e0db1779",
+    "upstream/jsonpath_exec.c": "96c687dc9b049212ab27230b9aaf63c58b337f40f4da585731103dc441aad80b",
+    "upstream/jsonpath_gram.y": "a06c261d419216065a6325a94d6af9f9a19389921cd245dc8ee1ad12a38ef22a",
+    "upstream/provenance.json": "52f93ffb8b3f6d246903d42c4c3ba183c58dc624f8da873c5756f512f6c2b85c"
+  },
+  "totals": {
+    "passed": 24,
+    "failed": 0,
+    "ignored": 3
+  },
+  "observations": {
+    "original": 182376,
+    "new": 31600,
+    "total": 213976
+  },
+  "limitations": [
+    "Standalone only, not engine integrated; full JSONPath/DD68 unfinished",
+    "Bounded signed-i64 literals and last +/-u64 offsets only; no general selector expressions or calls; exact existing methods unchanged",
+    "Owned small method scalars admitted against output_bytes even when later methods/filters reduce output",
+    "Conservative query_first/full descent admission preserved",
+    "Original live corpus not rerun; original independent offline observations executed",
+    "Frozen test executable and crate sources guarded only for final replay interval; no prebuild/toolchain/global hermeticity claim"
+  ],
+  "prior_failures": [
+    {
+      "log": "failing-before.log",
+      "native_exit": 101,
+      "reason": "Unsupported selector list"
+    },
+    {
+      "log": "first-after.log",
+      "native_exit": 101,
+      "reason": "shared vector lifetime compile"
+    },
+    {
+      "log": "second-after.log",
+      "native_exit": 101,
+      "reason": "shared vector lifetime compile"
+    },
+    {
+      "log": "third-after.log",
+      "native_exit": 101,
+      "reason": "PG descent no-throw root status replacement mismatch"
+    },
+    {
+      "log": "full-first.log",
+      "native_exit": 101,
+      "reason": "obsolete list Unsupported assertion"
+    },
+    {
+      "log": "clippy-first.log",
+      "native_exit": 101,
+      "reason": "explicit auto deref lint"
+    }
+  ],
+  "successful_full_test": {
+    "argv": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "--manifest-path",
+      "crates/giggles-pg-json/Cargo.toml"
+    ],
+    "cwd": "K:/Projects/gigglesdb",
+    "native_exit": 0,
+    "log": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\full-second.log"
+  },
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "container": "compassionate_varahamihira",
+  "server": "PostgreSQL18.0 Debian18.0-1.pgdg13+3 x86_64",
+  "database": "postgres",
+  "collation": "C",
+  "comparator": "Exact ordered UTF8 JSON text retaining duplicates; aggregate empty query SQLNULL; exact SQLSTATE. No normalization.",
+  "identity_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\identities.json",
+  "verification_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\verification.json",
+  "scope_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\scope-guards.json",
+  "minimal_patch": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\minimal-source.patch",
+  "test_migration_patch": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\test-migration.patch",
+  "test_migration_guards": {
+    "tests/jsonpath.rs": {
+      "before_sha256": "bb60713fdc9b9f4aead14c70d6d2edea88734150ae3dfcd53e1234b8f0736841",
+      "after_sha256": "0cccfd00681c17afdf276dd720867c47c57fbbc52bffb8c919c25e3fa4b6878d",
+      "before_snapshot": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\before-tests-jsonpath.rs"
+    },
+    "tests/continuations.rs": {
+      "before_sha256": "903d864778a6c9c5965d7a138f462acdd01979ada4d959ceaf9266af1a7456a5",
+      "after_sha256": "c838f5fd8bb9d422dfdc0f39d07c5a332ecc861e9b3959aef8e062c5ec7807d2",
+      "before_snapshot": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\before-tests-continuations.rs"
+    }
+  },
+  "test_migration": "Only two coordinator-authorized obsolete Unsupported entries migrated: tests/jsonpath.rs last-1 -> observed strict[1,2,3] [2], tests/continuations.rs list -> observed strictdescent[1,2] [1,2]. Other assertions retained.",
+  "qualification": "Bounded standalone selector lists/signed indexes/last offsets; no full PostgreSQL/JSONPath/DD68 completion",
+  "source_guard_scope": "Whole standalone crate before/after final frozen test executable replay; result manifest created afterward, excluded from self hash.",
+  "context_source_evidence": "J:\\gigglesdb-work\\dd68-jsonpath-selectors-20261106\\pg-context-source.json",
+  "oracle_captures": [
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "-i",
+        "compassionate_varahamihira",
+        "psql",
+        "-XAtq",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "native_exit": 0,
+      "rows": 28000,
+      "sql_sha256": "fe5c6800474da412cc23cca017423c34334bcb9f78f76bdd0acfeffc72e5d1e9",
+      "tsv_sha256": "ea97f3c5b6c789462022d681c35bd815e65a9d8fdfc2efdd5ca5ca8c81b90906",
+      "generator_sha256": "fe0488fd9a8389ed7cf8e3279a0a5aae3383f4bccb5830ca03162fde16c17e73",
+      "durable_generator_sha256": "baf7b425e7be0baaf6da127e3c77a4bdde303c32772587b024405eb817147105"
+    },
+    {
+      "argv": [
+        "docker",
+        "exec",
+        "-i",
+        "compassionate_varahamihira",
+        "psql",
+        "-XAtq",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "native_exit": 0,
+      "rows": 3600,
+      "sql_sha256": "dd714e5a8cb2d2b0626a184b4492e8e5bc71d71b7a7b626fbeb1bf065f81a428",
+      "tsv_sha256": "f316b01202f1ef8b6faee6f9222eb4fbe5cdb97077eeff8f4345b0c18a298d71",
+      "generator_sha256": "6876e6405de6ec955b040aa34876f761104c48d8cf9123761f898e31dfea0e27",
+      "durable_generator_sha256": "f1a35eeb83896ff16cd0023adbe8ea67f1b3a808ebe70254ed4ce8248b699ed3"
+    }
+  ]
+}

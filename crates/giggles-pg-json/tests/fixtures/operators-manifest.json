@@ -1,0 +1,12 @@
+{
+  "cases": 11130,
+  "version": [
+    "PostgreSQL 18.0 (Debian 18.0-1.pgdg13+3) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+  ],
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "sha256": {
+    "operators.sql": "8f54bfc8a45acbd00de1ef6b51f360bb4ca6989e9760971e0c727f0049b71409",
+    "operators.tsv": "6c0f02e575ce15f468803537c710eaf0f3b703c50f682ee13beaaacd5d8e1100",
+    "generate_operators.py": "b09b00fb39cb6566bed127ecdb86af687ba445664d3b2e11ec4054f239256aa4"
+  }
+}

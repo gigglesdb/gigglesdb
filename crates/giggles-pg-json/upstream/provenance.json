@@ -1,0 +1,52 @@
+{
+  "commit": "c7656ac9e652534d2ec7603bfe0947eec6c7fc22",
+  "license": "PostgreSQL License; see COPYRIGHT",
+  "treatment": "Reference study; Rust parser independently written, no LGPL adaptation",
+  "sources": [
+    {
+      "path": "src/backend/utils/adt/json.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/json.c",
+      "sha256": "9d0ed0ee9d5bac07990f2b413b48ba7dac2bff3b24797233fd887926a704c102"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonb.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonb.c",
+      "sha256": "b137e223a73a8a4287e9b3a4d7dedcb3a3a40bdd9d08c6e5c5fd998d4139ba3f"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonfuncs.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonfuncs.c",
+      "sha256": "c088d99c688a2594f3499dd82f7eac851cdb98308e7ce6e0818bb1b971ae32fc"
+    },
+    {
+      "path": "src/common/jsonapi.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/common/jsonapi.c",
+      "sha256": "a27e23323af2f32a487e76723b4a4d02e96d25d155b5cc09529e7a8587c97c62"
+    },
+    {
+      "path": "COPYRIGHT",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/COPYRIGHT",
+      "sha256": "3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonb_util.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonb_util.c",
+      "sha256": "444230d5187605ae276d3197fab41033e530e2dcbd94721d900005c7a52eb7b0"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonpath_gram.y",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonpath_gram.y",
+      "sha256": "a06c261d419216065a6325a94d6af9f9a19389921cd245dc8ee1ad12a38ef22a"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonpath_exec.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonpath_exec.c",
+      "sha256": "96c687dc9b049212ab27230b9aaf63c58b337f40f4da585731103dc441aad80b"
+    },
+    {
+      "path": "src/backend/utils/adt/jsonpath.c",
+      "url": "https://raw.githubusercontent.com/postgres/postgres/c7656ac9e652534d2ec7603bfe0947eec6c7fc22/src/backend/utils/adt/jsonpath.c",
+      "sha256": "8b41d6f0b2a988ff474d3e51b13640488887a73e23b05f263a2b17d6e0db1779"
+    }
+  ]
+}
