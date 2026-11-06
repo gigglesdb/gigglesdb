@@ -4,6 +4,7 @@ mod types;
 pub use accounting::{TaskAccounting, TaskResources};
 pub use types::*;
 mod policy;
+mod scalar;
 mod storage;
 pub use storage::SqlSession;
 pub use storage::replica;
@@ -12,6 +13,7 @@ mod sql;
 pub use sql::parse_repair;
 
 pub mod local;
+pub mod operations;
 pub mod relational;
 
 pub mod cancellation;

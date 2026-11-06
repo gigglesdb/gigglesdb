@@ -11,7 +11,60 @@ pub const MAX_PARAMS: usize = 256;
 pub const MAX_TABLES: usize = 128;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_TRANSACTIONS: usize = 8;
-fn value_bytes(v: &Value) -> usize {
+
+#[cfg(any(test, feature = "test-sql-parser-trap"))]
+thread_local! {
+    static SQL_PARSER_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test instrumentation for synchronous native-to-engine execution checks.
+/// Forbids SQL parsing and public SQL session entry points, including execution
+/// of handles prepared before this scope. Typed engine calls remain available.
+/// Nested scopes and panics restore the thread's previous setting.
+#[cfg(any(test, feature = "test-sql-parser-trap"))]
+pub fn with_sql_parser_forbidden<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SQL_PARSER_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
+        }
+    }
+    let _restore = Restore(SQL_PARSER_FORBIDDEN.with(|forbidden| forbidden.replace(true)));
+    work()
+}
+
+#[inline]
+pub(crate) fn assert_sql_frontend_allowed() {
+    #[cfg(any(test, feature = "test-sql-parser-trap"))]
+    SQL_PARSER_FORBIDDEN.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "native execution entered the SQL frontend"
+        );
+    });
+}
+
+#[cfg(test)]
+mod parser_trap_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_parser_trap_catches_sql_and_restores_after_nested_panics() {
+        let parse = || Prepared::parse("BEGIN", 1, 0).unwrap();
+        let trapped = std::panic::catch_unwind(|| {
+            with_sql_parser_forbidden(|| {
+                assert!(std::thread::spawn(parse).join().is_ok());
+                assert!(std::panic::catch_unwind(|| with_sql_parser_forbidden(parse)).is_err());
+                // Leaving the inner scope must not disable the outer guard.
+                parse();
+            });
+        });
+        assert!(trapped.is_err());
+        parse();
+    }
+}
+
+pub(crate) fn value_bytes(v: &Value) -> usize {
     match v {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
@@ -674,7 +727,201 @@ pub struct Scan {
     pub reverse: bool,
     pub limit: usize,
 }
+/// Shared CREATE definition checks. SQL keeps its own nullability policy;
+/// engine catalog intents additionally reject explicitly nullable key fields.
+pub(crate) fn validate_create_definition(
+    name: &str,
+    columns: &[ColumnDef],
+    keys: &[String],
+) -> R<()> {
+    ident(name)?;
+    if columns.is_empty() || columns.len() > MAX_COLUMNS {
+        return Err(SqlError::Limit);
+    }
+    if keys.is_empty() {
+        return Err(SqlError::Unbounded);
+    }
+    unique(columns.iter().map(|column| &column.name))?;
+    unique(keys)?;
+    for column in columns {
+        ident(&column.name)?;
+    }
+    for key in keys {
+        ident(key)?;
+        if !columns.iter().any(|column| column.name == *key) {
+            return Err(SqlError::UnknownColumn);
+        }
+    }
+    Ok(())
+}
 impl Prepared {
+    fn engine(statement: Statement, domain: u128, epoch: u64) -> Self {
+        Self {
+            domain,
+            epoch,
+            transaction: None,
+            statement,
+            params: 0,
+        }
+    }
+    pub(crate) fn create_engine(
+        name: String,
+        columns: Vec<ColumnDef>,
+        keys: Vec<String>,
+        domain: u128,
+        state: &Relational,
+    ) -> R<Self> {
+        // These names did not pass through a text parser. Require canonical
+        // spelling before applying the shared reserved/definition checks.
+        if name.bytes().any(|byte| byte.is_ascii_uppercase())
+            || columns
+                .iter()
+                .any(|column| column.name.bytes().any(|byte| byte.is_ascii_uppercase()))
+            || keys
+                .iter()
+                .any(|key| key.bytes().any(|byte| byte.is_ascii_uppercase()))
+        {
+            return Err(SqlError::Syntax);
+        }
+        if columns.iter().any(|column| column.id != 0) {
+            return Err(SqlError::Type);
+        }
+        if keys.len() > MAX_COLUMNS {
+            return Err(SqlError::Limit);
+        }
+        validate_create_definition(&name, &columns, &keys)?;
+        for key in &keys {
+            if !columns
+                .iter()
+                .any(|column| column.name == *key && column.not_null)
+            {
+                return Err(SqlError::Null);
+            }
+        }
+        if state.tables.contains_key(&name) {
+            return Err(SqlError::Duplicate);
+        }
+        if state.tables.len() >= MAX_TABLES {
+            return Err(SqlError::Limit);
+        }
+        Ok(Self::engine(
+            Statement::Create {
+                name,
+                columns,
+                keys,
+            },
+            domain,
+            state.epoch,
+        ))
+    }
+    pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
+        Self::engine(Statement::Begin, domain, epoch)
+    }
+    pub(crate) fn commit_engine(domain: u128, epoch: u64) -> Self {
+        Self::engine(Statement::Commit, domain, epoch)
+    }
+    fn engine_table(table: &TableDef, state: &Relational) -> R<()> {
+        // Callers cannot smuggle stale IDs, column types or unchecked key indexes
+        // into the executor through a hand-built descriptor.
+        if state.tables.get(&table.name) != Some(table) {
+            return Err(SqlError::StaleSchema);
+        }
+        Ok(())
+    }
+    fn engine_key(table: &TableDef, key: Vec<Value>) -> R<Vec<Predicate>> {
+        if key.len() != table.primary_key.len() {
+            return Err(SqlError::Unbounded);
+        }
+        payload_bound(key.iter())?;
+        key.into_iter()
+            .zip(&table.primary_key)
+            .map(|(value, index)| {
+                let column = &table.columns[*index];
+                check(&value, column)?;
+                Ok(Predicate {
+                    column: column.name.clone(),
+                    op: "=".into(),
+                    value: Expr::Literal(value),
+                })
+            })
+            .collect()
+    }
+    pub(crate) fn insert_engine(
+        table: &TableDef,
+        values: Vec<Value>,
+        domain: u128,
+        state: &Relational,
+    ) -> R<Self> {
+        Self::engine_table(table, state)?;
+        row_check(table, &values)?;
+        Ok(Self::engine(
+            Statement::Insert {
+                name: table.name.clone(),
+                columns: vec![],
+                values: values.into_iter().map(Expr::Literal).collect(),
+            },
+            domain,
+            state.epoch,
+        ))
+    }
+    pub(crate) fn update_engine(
+        table: &TableDef,
+        key: Vec<Value>,
+        sets: Vec<(usize, Value)>,
+        domain: u128,
+        state: &Relational,
+    ) -> R<Self> {
+        Self::engine_table(table, state)?;
+        if sets.is_empty() {
+            return Err(SqlError::Unsupported);
+        }
+        if sets.len() > MAX_COLUMNS {
+            return Err(SqlError::Limit);
+        }
+        if key.len() != table.primary_key.len() {
+            return Err(SqlError::Unbounded);
+        }
+        payload_bound(key.iter().chain(sets.iter().map(|(_, value)| value)))?;
+        let predicates = Self::engine_key(table, key)?;
+        unique(sets.iter().map(|(index, _)| index))?;
+        let sets = sets
+            .into_iter()
+            .map(|(index, value)| {
+                let column = table.columns.get(index).ok_or(SqlError::UnknownColumn)?;
+                if table.primary_key.contains(&index) {
+                    return Err(SqlError::Unsupported);
+                }
+                check(&value, column)?;
+                Ok((column.name.clone(), Expr::Literal(value)))
+            })
+            .collect::<R<Vec<_>>>()?;
+        Ok(Self::engine(
+            Statement::Update {
+                name: table.name.clone(),
+                sets,
+                predicates,
+            },
+            domain,
+            state.epoch,
+        ))
+    }
+    pub(crate) fn delete_engine(
+        table: &TableDef,
+        key: Vec<Value>,
+        domain: u128,
+        state: &Relational,
+    ) -> R<Self> {
+        Self::engine_table(table, state)?;
+        let predicates = Self::engine_key(table, key)?;
+        Ok(Self::engine(
+            Statement::Delete {
+                name: table.name.clone(),
+                predicates,
+            },
+            domain,
+            state.epoch,
+        ))
+    }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
@@ -863,6 +1110,7 @@ impl Prepared {
         self.params
     }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
+        assert_sql_frontend_allowed();
         let mut p = Parser {
             tokens: lex(sql)?,
             at: 0,
@@ -1025,6 +1273,27 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
     })
 }
 impl Relational {
+    /// Check all relation row maps without scanning or cloning their values.
+    pub(crate) fn rows_empty_engine(&self) -> bool {
+        self.rows.values().all(BTreeMap::is_empty)
+    }
+    /// Read only the version of one exact primary key from the staged relation.
+    pub(crate) fn row_version_engine(&self, table: &TableDef, key: &[Value]) -> R<u64> {
+        Prepared::engine_table(table, self)?;
+        if key.len() != table.primary_key.len() {
+            return Err(SqlError::Unbounded);
+        }
+        payload_bound(key.iter())?;
+        for (value, index) in key.iter().zip(&table.primary_key) {
+            check(value, &table.columns[*index])?;
+        }
+        let encoded = encode_key(key)?;
+        self.rows
+            .get(&table.id)
+            .and_then(|rows| rows.get(&encoded))
+            .map(|row| row.version)
+            .ok_or(SqlError::Conflict)
+    }
     pub(crate) fn validate(&self) -> R<()> {
         if self.format != 1 {
             return Err(SqlError::Unsupported);
@@ -1111,11 +1380,7 @@ impl Relational {
                 {
                     return Err(SqlError::Limit);
                 }
-                if keys.is_empty() {
-                    return Err(SqlError::Unbounded);
-                }
-                unique(columns.iter().map(|c| &c.name))?;
-                unique(keys)?;
+                validate_create_definition(name, columns, keys)?;
                 let mut t = TableDef {
                     id: allocate(&mut self.next_id)?,
                     name: name.clone(),

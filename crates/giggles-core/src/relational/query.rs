@@ -697,9 +697,8 @@ impl BoundQuery<'_> {
                                     return Err(SqlError::Type);
                                 };
                                 value = Value::Int(match value {
-                                    Value::Int(old) => {
-                                        old.checked_add(*n).ok_or(SqlError::Overflow)?
-                                    }
+                                    Value::Int(old) => crate::scalar::add(old, *n)
+                                        .map_err(|_| SqlError::Overflow)?,
                                     _ => *n,
                                 });
                             }

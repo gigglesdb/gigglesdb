@@ -1,4 +1,5 @@
 use crate::*;
+pub(crate) mod native_once;
 pub mod replica;
 use bincode::Options;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
@@ -16,6 +17,7 @@ use std::{
 };
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_v1");
 const FORMAT: u32 = 3;
+const NATIVE_FORMAT: u32 = 4;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"GDEXP001";
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,7 @@ fn recovery(
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
     pub accounting: BTreeMap<TaskId, TaskAccounting>,
+    pub native_outcomes: Option<native_once::NativeOutcomes>,
     pub sql: relational::Relational,
     pub view: Snapshot,
     pub last_time: u64,
@@ -131,6 +134,7 @@ struct Metadata {
 fn empty(domain: u128) -> State {
     State {
         accounting: BTreeMap::new(),
+        native_outcomes: None,
         sql: Default::default(),
         view: Snapshot {
             domain,
@@ -154,6 +158,9 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
 }
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let mut out = BTreeMap::new();
+    if let Some(ledger) = &s.native_outcomes {
+        out.insert(vec![7], ledger.to_bytes()?);
+    }
     for (task, account) in &s.accounting {
         out.insert(key(6, &[task.0]), encode(account)?);
     }
@@ -161,7 +168,7 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     out.insert(
         vec![0],
         encode(&Metadata {
-            format: FORMAT,
+            format: state_format(s),
             domain: s.view.domain,
             schema: s.view.schema,
             last_time: s.last_time,
@@ -183,6 +190,13 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     }
     envelope_bound(&out)?;
     Ok(out)
+}
+fn state_format(s: &State) -> u32 {
+    if s.native_outcomes.is_some() {
+        NATIVE_FORMAT
+    } else {
+        FORMAT
+    }
 }
 fn envelope_bound(values: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), CoreError> {
     // Fixed-int map encoding: 8-byte count and two 8-byte lengths per entry.
@@ -207,10 +221,21 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    if ![1, 2, FORMAT].contains(&m.format) {
+    if ![1, 2, FORMAT, NATIVE_FORMAT].contains(&m.format) {
         return Err(CoreError::Unsupported);
     }
     let mut s = empty(m.domain);
+    match records.get(&vec![7]) {
+        Some(v) if m.format == NATIVE_FORMAT => {
+            s.native_outcomes = Some(native_once::NativeOutcomes::from_bytes(v)?);
+        }
+        None if m.format != NATIVE_FORMAT => {}
+        _ => {
+            return Err(CoreError::Corrupt(
+                "native format/namespace mismatch".into(),
+            ));
+        }
+    }
     match records.get(&vec![5]) {
         Some(v) if m.format >= 2 => s.sql = decode(v)?,
         None if m.format == 1 => {}
@@ -232,11 +257,12 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             Ok(u64::from_be_bytes(b.try_into().expect("length")))
         };
         match k.first() {
-            Some(6) if k.len() == 9 && m.format == FORMAT => {
+            Some(6) if k.len() == 9 && m.format >= FORMAT => {
                 s.accounting.insert(TaskId(num(1)?), decode(&v)?);
             }
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
+            Some(7) if k.len() == 1 && m.format == NATIVE_FORMAT => {}
             Some(1) if k.len() == 17 => {
                 s.view.rows.insert(
                     Key {
@@ -268,6 +294,9 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
     Ok(s)
 }
 fn validate(s: &State) -> Result<(), CoreError> {
+    if let Some(ledger) = &s.native_outcomes {
+        ledger.validate()?;
+    }
     for (task, account) in &s.accounting {
         if !s.view.tasks.contains_key(task) || !account.used.fits(account.limits) {
             return Err(CoreError::Corrupt("task accounting invariant".into()));
@@ -327,6 +356,16 @@ struct Inner {
     limits: Limits,
     crash: Mutex<CrashPoint>,
     decision_hook: Mutex<Option<DecisionHook>>,
+    native_once_owners: Mutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
+}
+enum GuardedPersistError {
+    Core(CoreError),
+    ClockExpired,
+}
+impl From<CoreError> for GuardedPersistError {
+    fn from(error: CoreError) -> Self {
+        Self::Core(error)
+    }
 }
 struct Ticket<'a>(&'a AtomicUsize);
 impl Drop for Ticket<'_> {
@@ -454,6 +493,20 @@ impl Inner {
         result
     }
     fn persist(&self, s: &mut State, decision: bool) -> Result<(), CoreError> {
+        self.persist_checked(s, decision, &mut || true)
+            .map_err(|error| match error {
+                GuardedPersistError::Core(error) => error,
+                GuardedPersistError::ClockExpired => {
+                    unreachable!("ordinary persistence has no clock lease")
+                }
+            })
+    }
+    fn persist_checked(
+        &self,
+        s: &mut State,
+        decision: bool,
+        valid_lease: &mut dyn FnMut() -> bool,
+    ) -> Result<(), GuardedPersistError> {
         s.sql.generation = s
             .sql
             .generation
@@ -474,11 +527,17 @@ impl Inner {
                 crash_now();
             }
             if point == CrashPoint::ErrorBeforeCommit {
-                return Err(CoreError::Storage("injected before commit".into()));
+                return Err(CoreError::Storage("injected before commit".into()).into());
             }
             if decision {
                 self.decision_point(DecisionPoint::BeforeDecision);
+                if !valid_lease() {
+                    return Err(GuardedPersistError::ClockExpired);
+                }
                 crate::cancellation::decide()?;
+                if !valid_lease() {
+                    return Err(GuardedPersistError::ClockExpired);
+                }
                 self.decision_point(DecisionPoint::Decided);
             } else {
                 crate::cancellation::check()?;
@@ -493,7 +552,7 @@ impl Inner {
             if point == CrashPoint::ErrorAfterCommit
                 || (decision && point == CrashPoint::ErrorAfterDecisionCommit)
             {
-                return Err(CoreError::Storage("injected lost commit response".into()));
+                return Err(CoreError::Storage("injected lost commit response".into()).into());
             }
             if point == CrashPoint::BeforeAck {
                 crash_now();
@@ -501,10 +560,9 @@ impl Inner {
             Ok(())
         })();
         if let Err(e) = persisted {
-            if e == CoreError::Cancelled {
-                return Err(e);
+            if matches!(&e, GuardedPersistError::Core(error) if *error != CoreError::Cancelled) {
+                self.fenced.store(true, Ordering::Release);
             }
-            self.fenced.store(true, Ordering::Release);
             return Err(e);
         }
         Ok(())
@@ -615,6 +673,7 @@ impl Admin {
                 limits,
                 crash: Mutex::new(CrashPoint::None),
                 decision_hook: Mutex::new(None),
+                native_once_owners: Mutex::new(BTreeMap::new()),
             }),
         };
         a.inner.read()?;
@@ -848,7 +907,9 @@ impl Admin {
         point: RecoveryPoint,
     ) -> Result<[u8; 32], CoreError> {
         let path = path.as_ref();
-        let payload = self.inner.inspect(|s| encode(&records(s)?))?;
+        let (format, payload) = self
+            .inner
+            .inspect(|s| Ok((state_format(s), encode(&records(s)?)?)))?;
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(io)?;
@@ -865,7 +926,7 @@ impl Admin {
             .map_err(io)?;
         f.write_all(MAGIC).map_err(io)?;
         recovery(point, RecoveryPoint::ExportWrite, RecoveryPoint::None)?;
-        f.write_all(&FORMAT.to_be_bytes()).map_err(io)?;
+        f.write_all(&format.to_be_bytes()).map_err(io)?;
         f.write_all(&(payload.len() as u64).to_be_bytes())
             .map_err(io)?;
         f.write_all(&digest).map_err(io)?;
@@ -892,7 +953,7 @@ impl Admin {
         let mut header = [0u8; 52];
         f.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC
-            || ![1, 2, FORMAT].contains(&u32::from_be_bytes(
+            || ![1, 2, FORMAT, NATIVE_FORMAT].contains(&u32::from_be_bytes(
                 header[8..12].try_into().expect("length"),
             ))
         {
@@ -1214,7 +1275,11 @@ pub struct SqlSession {
     staged: Option<State>,
     aborted: bool,
     transaction_id: Option<u128>,
+    staged_revision: u64,
 }
+mod complete_relation;
+pub(crate) use complete_relation::CompleteRelation;
+
 impl Admin {
     pub fn sql_session(&self) -> SqlSession {
         SqlSession {
@@ -1222,6 +1287,7 @@ impl Admin {
             staged: None,
             aborted: false,
             transaction_id: None,
+            staged_revision: 0,
         }
     }
     pub fn catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
@@ -1235,6 +1301,7 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
+        relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && p.control() != Some("rollback") {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1266,24 +1333,188 @@ impl SqlSession {
         }
     }
     pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
+        self.execute_engine(
+            |domain, state| relational::Prepared::scan(scan, domain, state),
+            None,
+        )
+    }
+    /// Typed engine operations share the SQL admission and transaction path.
+    fn execute_engine(
+        &mut self,
+        make: impl FnOnce(
+            u128,
+            &relational::Relational,
+        ) -> Result<relational::Prepared, relational::SqlError>,
+        expected_version: Option<u64>,
+    ) -> Result<relational::SqlResult, CoreError> {
         if self.aborted {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
         let result = (|| {
             let mut prepared = if let Some(s) = &self.staged {
-                relational::Prepared::scan(scan, s.view.domain, &s.sql).map_err(CoreError::Sql)?
+                make(s.view.domain, &s.sql).map_err(CoreError::Sql)?
             } else {
-                self.admin.inner.inspect(|s| {
-                    relational::Prepared::scan(scan, s.view.domain, &s.sql).map_err(CoreError::Sql)
-                })?
+                self.admin
+                    .inner
+                    .inspect(|s| make(s.view.domain, &s.sql).map_err(CoreError::Sql))?
             };
             prepared.transaction = self.transaction_id;
-            self.execute_prepared(&prepared, &[], None)
+            self.execute_bound_engine(&prepared, &[], expected_version)
         })();
-        if result.is_err() && self.staged.is_some() {
-            self.aborted = true;
+        if result.is_err() {
+            self.abort();
         }
         result
+    }
+    pub(crate) fn begin_engine(&mut self) -> Result<(), CoreError> {
+        self.execute_engine(
+            |domain, state| Ok(relational::Prepared::begin_engine(domain, state.epoch)),
+            None,
+        )
+        .map(|_| ())
+    }
+    pub(crate) fn commit_engine(&mut self) -> Result<(), CoreError> {
+        self.execute_engine(
+            |domain, state| Ok(relational::Prepared::commit_engine(domain, state.epoch)),
+            None,
+        )
+        .map(|_| ())
+    }
+    /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
+    pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            crate::cancellation::check()?;
+            let catalog = |s: &State| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()));
+            if let Some(s) = &self.staged {
+                catalog(s)
+            } else {
+                self.admin.inner.inspect(catalog)
+            }
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    /// Eligibility for synchronous safe catalog creates, from the exact active
+    /// snapshot that will stage the definition. Empty existing tables are fine;
+    /// business and retained task/decision state require the migration path.
+    pub(crate) fn catalog_empty_engine(&mut self) -> Result<bool, CoreError> {
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let staged = self
+                .staged
+                .as_ref()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            crate::cancellation::check()?;
+            Ok(staged.sql.rows_empty_engine()
+                && staged.native_outcomes.is_none()
+                && staged.view.rows.is_empty()
+                && staged.view.tasks.is_empty()
+                && staged.view.operations.is_empty()
+                && staged.view.approvals.is_empty()
+                && staged.accounting.is_empty())
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    pub(crate) fn create_table_engine(
+        &mut self,
+        name: String,
+        columns: Vec<relational::ColumnDef>,
+        keys: Vec<String>,
+    ) -> Result<(), CoreError> {
+        // Do not permit this entry to accidentally autocommit outside the
+        // caller's eligibility/definition snapshot and final decision fence.
+        self.snapshot_identity_engine()?;
+        self.execute_engine(
+            |domain, state| relational::Prepared::create_engine(name, columns, keys, domain, state),
+            None,
+        )
+        .map(|_| ())
+    }
+    /// Identity for binding against an active transaction's catalog snapshot.
+    pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let staged = self
+                .staged
+                .as_ref()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            crate::cancellation::check()?;
+            Ok((staged.view.domain, staged.sql.epoch))
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    /// Fetch an actual staged version without cloning the row or transaction state.
+    pub(crate) fn row_version_engine(
+        &mut self,
+        table: &relational::TableDef,
+        key: &[relational::Value],
+    ) -> Result<u64, CoreError> {
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let staged = self
+                .staged
+                .as_ref()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            crate::cancellation::check()?;
+            staged
+                .sql
+                .row_version_engine(table, key)
+                .map_err(CoreError::Sql)
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    pub(crate) fn insert_engine(
+        &mut self,
+        table: &relational::TableDef,
+        values: Vec<relational::Value>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.execute_engine(
+            |domain, state| relational::Prepared::insert_engine(table, values, domain, state),
+            None,
+        )
+    }
+    pub(crate) fn update_engine(
+        &mut self,
+        table: &relational::TableDef,
+        key: Vec<relational::Value>,
+        sets: Vec<(usize, relational::Value)>,
+        expected_version: u64,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.execute_engine(
+            |domain, state| relational::Prepared::update_engine(table, key, sets, domain, state),
+            Some(expected_version),
+        )
+    }
+    pub(crate) fn delete_engine(
+        &mut self,
+        table: &relational::TableDef,
+        key: Vec<relational::Value>,
+        expected_version: u64,
+    ) -> Result<relational::SqlResult, CoreError> {
+        self.execute_engine(
+            |domain, state| relational::Prepared::delete_engine(table, key, domain, state),
+            Some(expected_version),
+        )
     }
     pub fn in_transaction(&self) -> bool {
         self.staged.is_some()
@@ -1292,6 +1523,7 @@ impl SqlSession {
         self.aborted
     }
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        relational::assert_sql_frontend_allowed();
         let mut result = if let Some(s) = &self.staged {
             if self.aborted {
                 let p = relational::Prepared::parse(sql, s.view.domain, s.sql.epoch)
@@ -1322,6 +1554,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        relational::assert_sql_frontend_allowed();
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
             let p = relational::Prepared::parse(sql, 0, 0).map_err(CoreError::Sql)?;
@@ -1338,6 +1571,18 @@ impl SqlSession {
         self.execute_prepared(&p, params, expected_version)
     }
     pub fn execute_prepared(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        relational::assert_sql_frontend_allowed();
+        self.execute_bound_engine(p, params, expected_version)
+    }
+    // Both frontends enter this kernel after constructing typed operations.
+    // Keep SQL's public prepared-call boundary separate so native execution
+    // cannot acquire a dependency on SQL routine dispatch or frontend policy.
+    fn execute_bound_engine(
         &mut self,
         p: &relational::Prepared,
         params: &[relational::Value],
@@ -1409,6 +1654,7 @@ impl SqlSession {
                         Ok(s) => {
                             self.staged = Some(s);
                             self.transaction_id = Some(u128::from_be_bytes(token));
+                            self.staged_revision = 0;
                         }
                         Err(e) => {
                             self.admin
@@ -1453,6 +1699,12 @@ impl SqlSession {
         records(&s)?;
         if self.staged.is_some() {
             crate::cancellation::check()?;
+            if !p.is_read() {
+                self.staged_revision = self
+                    .staged_revision
+                    .checked_add(1)
+                    .ok_or(CoreError::Sql(E::Overflow))?;
+            }
             self.staged = Some(s);
         } else if !p.is_read() {
             self.publish(s)?;
@@ -1477,11 +1729,438 @@ impl SqlSession {
         }
         self.aborted = false;
         self.transaction_id = None;
+        self.staged_revision = 0;
     }
 }
 impl Drop for SqlSession {
     fn drop(&mut self) {
         self.rollback();
+    }
+}
+#[cfg(test)]
+mod typed_session_tests {
+    use super::*;
+    use relational::{Scan, SqlError as E, TableDef, Value as V, with_sql_parser_forbidden};
+
+    fn fixture() -> (Admin, SqlSession, TableDef) {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+        fs::create_dir_all(&root).unwrap();
+        let mut token = [0u8; 16];
+        getrandom::fill(&mut token).unwrap();
+        let path = root.join(format!("typed-session-{:032x}", u128::from_be_bytes(token)));
+        let admin = Admin::create(
+            path,
+            Limits {
+                admitted: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let mut session = admin.sql_session();
+        session
+            .execute(
+                "CREATE TABLE native_items (tenant BIGINT, id BIGINT, title TEXT, count INTEGER NOT NULL, PRIMARY KEY (tenant,id))",
+                &[],
+                None,
+            )
+            .unwrap();
+        let table = admin.catalog().unwrap().1.remove(0);
+        (admin, session, table)
+    }
+    fn row(id: i64) -> Vec<V> {
+        vec![V::Int(7), V::Int(id), V::Text("before".into()), V::Int(0)]
+    }
+    fn scan(session: &mut SqlSession) -> relational::SqlResult {
+        session
+            .scan(Scan {
+                table: "native_items".into(),
+                projection: vec![],
+                prefix: vec![],
+                lower: None,
+                upper: None,
+                reverse: false,
+                limit: relational::MAX_ROWS,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn typed_crud_and_controls_never_parse_sql_and_publish_to_sql_readers() {
+        let (admin, mut session, table) = fixture();
+        with_sql_parser_forbidden(|| {
+            session.begin_engine().unwrap();
+            assert_eq!(session.catalog_engine().unwrap().1, vec![table.clone()]);
+            assert_eq!(session.insert_engine(&table, row(1)).unwrap().affected, 1);
+            let initial = scan(&mut session).rows.remove(0);
+            assert_eq!(
+                session
+                    .update_engine(
+                        &table,
+                        vec![V::Int(7), V::Int(1)],
+                        vec![(2, V::Text("after".into()))],
+                        initial.version,
+                    )
+                    .unwrap()
+                    .affected,
+                1
+            );
+            let updated = scan(&mut session).rows.remove(0);
+            assert!(updated.version > initial.version);
+            session.insert_engine(&table, row(2)).unwrap();
+            let second = scan(&mut session).rows.remove(1);
+            assert_eq!(
+                session
+                    .delete_engine(&table, vec![V::Int(7), V::Int(2)], second.version)
+                    .unwrap()
+                    .affected,
+                1
+            );
+            // No intermediate mutation is externally visible before commit.
+            assert!(scan(&mut admin.sql_session()).rows.is_empty());
+            session.commit_engine().unwrap();
+            assert!(!session.in_transaction());
+        });
+        let rows = admin
+            .sql_session()
+            .execute("SELECT title FROM native_items LIMIT 10", &[], None)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![V::Text("after".into())]);
+    }
+
+    #[test]
+    fn typed_descriptor_key_and_version_errors_abort_the_whole_transaction() {
+        let (admin, mut session, table) = fixture();
+        with_sql_parser_forbidden(|| {
+            for case in 0..7 {
+                session.begin_engine().unwrap();
+                session.insert_engine(&table, row(1)).unwrap();
+                let version = scan(&mut session).rows[0].version;
+                let (result, expected) = match case {
+                    0 => {
+                        let mut malformed = table.clone();
+                        malformed.primary_key = vec![usize::MAX];
+                        (session.insert_engine(&malformed, row(2)), E::StaleSchema)
+                    }
+                    1 => (
+                        session.delete_engine(&table, vec![V::Int(7)], version),
+                        E::Unbounded,
+                    ),
+                    2 => (
+                        session.update_engine(
+                            &table,
+                            vec![V::Int(7), V::Int(1)],
+                            vec![(usize::MAX, V::Int(2))],
+                            version,
+                        ),
+                        E::UnknownColumn,
+                    ),
+                    3 => (
+                        session.update_engine(
+                            &table,
+                            vec![V::Int(7), V::Int(1)],
+                            vec![(1, V::Int(2))],
+                            version,
+                        ),
+                        E::Unsupported,
+                    ),
+                    4 => (
+                        session.update_engine(
+                            &table,
+                            vec![V::Int(7), V::Int(1)],
+                            vec![(3, V::Int(1)), (3, V::Int(2))],
+                            version,
+                        ),
+                        E::Duplicate,
+                    ),
+                    5 => (
+                        session.update_engine(
+                            &table,
+                            vec![V::Int(7), V::Int(1)],
+                            vec![(3, V::Int(1))],
+                            version + 1,
+                        ),
+                        E::Version,
+                    ),
+                    _ => (
+                        // Validate the complete input even if no row matches.
+                        session.update_engine(
+                            &table,
+                            vec![V::Int(7), V::Int(99)],
+                            vec![(2, V::Text("x".repeat(relational::MAX_ROW_BYTES)))],
+                            version,
+                        ),
+                        E::Limit,
+                    ),
+                };
+                assert_eq!(result, Err(CoreError::Sql(expected)), "case {case}");
+                assert!(session.is_aborted());
+                assert_eq!(session.commit_engine(), Err(CoreError::Sql(E::Aborted)));
+                session.rollback();
+                assert!(scan(&mut admin.sql_session()).rows.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn typed_catalog_tracks_staged_schema_and_commit_rejects_concurrent_changes() {
+        let (admin, mut session, table) = fixture();
+        session.begin_engine().unwrap();
+        let original_epoch = session.catalog_engine().unwrap().0;
+        admin
+            .sql_session()
+            .execute("CREATE TABLE outside (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert_eq!(
+            session.catalog_engine().unwrap(),
+            (original_epoch, vec![table.clone()])
+        );
+        session
+            .execute("CREATE TABLE inside (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        with_sql_parser_forbidden(|| {
+            let (epoch, tables) = session.catalog_engine().unwrap();
+            assert_eq!(epoch, original_epoch + 1);
+            assert!(tables.iter().any(|t| t.name == "inside"));
+            assert!(!tables.iter().any(|t| t.name == "outside"));
+            session.insert_engine(&table, row(1)).unwrap();
+            assert_eq!(session.commit_engine(), Err(CoreError::Sql(E::Conflict)));
+            assert!(session.is_aborted());
+            session.rollback();
+        });
+        assert!(
+            !admin
+                .catalog()
+                .unwrap()
+                .1
+                .iter()
+                .any(|t| t.name == "inside")
+        );
+        assert!(scan(&mut session).rows.is_empty());
+    }
+
+    #[test]
+    fn staged_row_versions_match_stored_rows_without_mutating_the_snapshot() {
+        let (admin, mut session, table) = fixture();
+        with_sql_parser_forbidden(|| {
+            let key = [V::Int(7), V::Int(1)];
+            assert_eq!(
+                session.row_version_engine(&table, &key),
+                Err(CoreError::Sql(E::Transaction))
+            );
+            session.begin_engine().unwrap();
+            session.insert_engine(&table, row(1)).unwrap();
+            let inserted = session.row_version_engine(&table, &key).unwrap();
+            assert_eq!(inserted, scan(&mut session).rows[0].version);
+            // An intervening allocation means the next version cannot be guessed
+            // by incrementing this row's previous version.
+            session.insert_engine(&table, row(2)).unwrap();
+            session
+                .update_engine(&table, key.to_vec(), vec![(3, V::Int(1))], inserted)
+                .unwrap();
+            let snapshot = session.staged.as_ref().unwrap().sql.clone();
+            let updated = session.row_version_engine(&table, &key).unwrap();
+            assert!(updated > inserted + 1);
+            assert_eq!(session.staged.as_ref().unwrap().sql, snapshot);
+            assert_eq!(updated, scan(&mut session).rows[0].version);
+            assert!(scan(&mut admin.sql_session()).rows.is_empty());
+            session.commit_engine().unwrap();
+            assert_eq!(updated, scan(&mut admin.sql_session()).rows[0].version);
+            assert_eq!(
+                session.row_version_engine(&table, &key),
+                Err(CoreError::Sql(E::Transaction))
+            );
+        });
+    }
+
+    #[test]
+    fn staged_row_version_errors_abort_and_discard_all_pending_changes() {
+        let (admin, mut session, table) = fixture();
+        let before = admin.inner.inspect(|state| Ok(state.sql.clone())).unwrap();
+        with_sql_parser_forbidden(|| {
+            for case in 0..8 {
+                session.begin_engine().unwrap();
+                session.insert_engine(&table, row(1)).unwrap();
+                let mut descriptor = table.clone();
+                let mut key = vec![V::Int(7), V::Int(1)];
+                let expected = match case {
+                    0 => {
+                        descriptor.primary_key = vec![usize::MAX];
+                        CoreError::Sql(E::StaleSchema)
+                    }
+                    1 => {
+                        key.pop();
+                        CoreError::Sql(E::Unbounded)
+                    }
+                    2 => {
+                        key[1] = V::Text("wrong".into());
+                        CoreError::Sql(E::Type)
+                    }
+                    3 => {
+                        key[1] = V::Null;
+                        CoreError::Sql(E::Null)
+                    }
+                    4 => {
+                        key[1] = V::Text("x".repeat(relational::MAX_ROW_BYTES + 1));
+                        CoreError::Sql(E::Limit)
+                    }
+                    5 => {
+                        key[1] = V::Int(99);
+                        CoreError::Sql(E::Conflict)
+                    }
+                    6 => {
+                        session.abort();
+                        CoreError::Sql(E::Aborted)
+                    }
+                    _ => CoreError::Cancelled,
+                };
+                let result = if case == 7 {
+                    let cancelled = crate::Cancellation::default();
+                    assert!(cancelled.cancel());
+                    cancelled.scope(|| session.row_version_engine(&descriptor, &key))
+                } else {
+                    session.row_version_engine(&descriptor, &key)
+                };
+                assert_eq!(result, Err(expected), "case {case}");
+                assert!(session.is_aborted());
+                assert_eq!(session.commit_engine(), Err(CoreError::Sql(E::Aborted)));
+                session.rollback();
+                assert_eq!(
+                    admin.inner.inspect(|state| Ok(state.sql.clone())).unwrap(),
+                    before
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn snapshot_identity_requires_active_nonaborted_transaction_and_checks_cancellation() {
+        let (admin, mut session, table) = fixture();
+        let before = admin.inner.inspect(|state| Ok(state.sql.clone())).unwrap();
+        with_sql_parser_forbidden(|| {
+            assert_eq!(
+                session.snapshot_identity_engine(),
+                Err(CoreError::Sql(E::Transaction))
+            );
+            assert!(!session.is_aborted());
+
+            session.begin_engine().unwrap();
+            session.abort();
+            assert_eq!(
+                session.snapshot_identity_engine(),
+                Err(CoreError::Sql(E::Aborted))
+            );
+            session.rollback();
+
+            session.begin_engine().unwrap();
+            session.insert_engine(&table, row(1)).unwrap();
+            let cancelled = crate::Cancellation::default();
+            assert!(cancelled.cancel());
+            assert_eq!(
+                cancelled.scope(|| session.snapshot_identity_engine()),
+                Err(CoreError::Cancelled)
+            );
+            assert!(session.is_aborted());
+            assert_eq!(session.commit_engine(), Err(CoreError::Sql(E::Aborted)));
+            session.rollback();
+        });
+        assert_eq!(
+            admin.inner.inspect(|state| Ok(state.sql.clone())).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn snapshot_identity_uses_staged_domain_and_epoch_despite_external_ddl() {
+        let (admin, mut session, _) = fixture();
+        let identity = admin
+            .inner
+            .inspect(|state| Ok((state.view.domain, state.sql.epoch)))
+            .unwrap();
+        session.begin_engine().unwrap();
+        assert_eq!(session.snapshot_identity_engine().unwrap(), identity);
+        let mut outside = admin.sql_session();
+        for statement in [
+            "CREATE TABLE outside_one (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE outside_two (id BIGINT PRIMARY KEY)",
+        ] {
+            outside.execute(statement, &[], None).unwrap();
+        }
+        with_sql_parser_forbidden(|| {
+            assert_eq!(session.snapshot_identity_engine().unwrap(), identity);
+        });
+        session
+            .execute("CREATE TABLE inside (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        with_sql_parser_forbidden(|| {
+            let staged_identity = session.snapshot_identity_engine().unwrap();
+            assert_eq!(staged_identity, (identity.0, identity.1 + 1));
+            assert_eq!(staged_identity.1, session.catalog_engine().unwrap().0);
+            assert_eq!(admin.catalog().unwrap().0, identity.1 + 2);
+            session.rollback();
+            session.begin_engine().unwrap();
+            assert_eq!(
+                session.snapshot_identity_engine().unwrap(),
+                (identity.0, identity.1 + 2)
+            );
+            session.rollback();
+        });
+    }
+
+    #[test]
+    fn typed_statements_preserve_admission_cancellation_and_transaction_limits() {
+        let (admin, mut session, table) = fixture();
+        with_sql_parser_forbidden(|| {
+            session.begin_engine().unwrap();
+            let ticket = admin.inner.enter_sql().unwrap();
+            assert_eq!(session.insert_engine(&table, row(1)), Err(CoreError::Busy));
+            assert!(session.is_aborted());
+            drop(ticket);
+            session.rollback();
+
+            session.begin_engine().unwrap();
+            session.insert_engine(&table, row(1)).unwrap();
+            let cancelled = crate::Cancellation::default();
+            assert!(cancelled.cancel());
+            assert_eq!(
+                cancelled.scope(|| session.commit_engine()),
+                Err(CoreError::Cancelled)
+            );
+            assert!(session.is_aborted());
+            session.rollback();
+            assert!(scan(&mut session).rows.is_empty());
+
+            let mut sessions: Vec<_> = (0..relational::MAX_TRANSACTIONS)
+                .map(|_| admin.sql_session())
+                .collect();
+            for active in &mut sessions {
+                active.begin_engine().unwrap();
+            }
+            assert_eq!(session.begin_engine(), Err(CoreError::Busy));
+            assert!(!session.in_transaction());
+            sessions[0].rollback();
+            session.begin_engine().unwrap();
+            session.rollback();
+        });
+    }
+
+    #[test]
+    fn typed_controls_preserve_sql_prepared_transaction_lifetimes() {
+        let (_, mut session, table) = fixture();
+        session.begin_engine().unwrap();
+        let prepared = session
+            .prepare("INSERT INTO native_items VALUES (7,1,'old',0)")
+            .unwrap();
+        session.commit_engine().unwrap();
+        session.begin_engine().unwrap();
+        assert_eq!(
+            session.execute_prepared(&prepared, &[], None),
+            Err(CoreError::Sql(E::StaleSchema))
+        );
+        assert!(session.is_aborted());
+        session.rollback();
+        with_sql_parser_forbidden(|| session.insert_engine(&table, row(1))).unwrap();
     }
 }
 #[cfg(windows)]
@@ -1591,6 +2270,11 @@ mod tests {
                 fs::write(&mismatch, bytes).unwrap();
                 assert!(matches!(
                     Admin::verify_export(mismatch),
+                    Err(CoreError::Corrupt(_))
+                ));
+            } else if version == NATIVE_FORMAT {
+                assert!(matches!(
+                    from_records(r.clone()),
                     Err(CoreError::Corrupt(_))
                 ));
             } else {

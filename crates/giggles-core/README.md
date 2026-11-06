@@ -1,8 +1,10 @@
-Current P2 continuation: storage writes format 3 and remote task disclosure requires
+Current P2 continuation: storage writes format 3 until the first native once
+receipt adopts format 4 and namespace 7. Remote task disclosure requires
 explicit trusted cumulative accounting provisioning. See
 [task accounting](../giggles-server/TASK_ACCOUNTING.md). The original embedded
 repair interfaces below retain their trusted P0 model; historical format-1 details
-are superseded by format-2 relational and format-3 accounting extensions.
+are superseded by format-2 relational, format-3 accounting and optional format-4
+native outcome extensions. Replica/protected paths reject native outcome state.
 
 # GigglesDB durable embedded core (P1 safety slice)
 
@@ -25,6 +27,17 @@ All destination directories/files must be new. No cleanup is performed. An error
 can leave an artifact; retain it and choose another path. No daemon or listener.
 
 ## Integration interface
+
+The [typed operation engine](OPERATIONS.md) accepts language-independent requests
+for bounded reads and guarded, capped and claim mutations. Native syntax lowers
+directly into this layer; SQL retains its frontend and shares the catalog,
+mutation primitives and transaction publication path.
+
+The separate Rust `operations::once` V1 API atomically stores typed write/block
+outcomes for replay and lookup under an original caller-persisted database
+identity. It requires a trusted certified clock and explicit receipt capacity;
+see [retention, restore and retry semantics](OPERATIONS.md). Native text profiles
+and remote adapters have separate capability contracts.
 
 The trusted consensus prerequisite
 [`replica::protected`](src/storage/replica/protected.rs) stages typed repairs with

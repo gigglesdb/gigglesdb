@@ -1,4 +1,5 @@
-//! Trusted consensus integration. Images contain every kernel namespace.
+//! Trusted consensus integration for the qualified repair/relational namespaces.
+//! Embedded native once outcomes are deliberately unsupported in these images.
 //! Evaluation has no filesystem, network, clock or random identity inputs.
 //! The caller MUST atomically persist the returned image with its applied index.
 use super::*;
@@ -9,6 +10,19 @@ pub mod protected;
 /// Opaque, validated canonical kernel image; not an export that revokes authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Image(Vec<u8>);
+
+// Image derives Deserialize for existing integrations, so every decoding entry
+// must check namespace support even when callers bypass Image::from_bytes.
+fn replica_state(bytes: &[u8]) -> Result<State, CoreError> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(CoreError::Limit);
+    }
+    let state = from_records(decode(bytes)?)?;
+    if state.native_outcomes.is_some() {
+        return Err(CoreError::Unsupported);
+    }
+    Ok(state)
+}
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub enum TaskAction {
@@ -72,7 +86,7 @@ impl Image {
         if bytes.len() as u64 > MAX_BYTES {
             return Err(CoreError::Limit);
         }
-        let s = from_records(decode(&bytes)?)?;
+        let s = replica_state(&bytes)?;
         if encode(&records(&s)?)? != bytes {
             return Err(CoreError::Corrupt("noncanonical image".into()));
         }
@@ -82,10 +96,10 @@ impl Image {
         &self.0
     }
     pub fn domain(&self) -> Result<u128, CoreError> {
-        Ok(from_records(decode(&self.0)?)?.view.domain)
+        Ok(replica_state(&self.0)?.view.domain)
     }
     pub fn snapshot(&self) -> Result<Snapshot, CoreError> {
-        Ok(from_records(decode(&self.0)?)?.view)
+        Ok(replica_state(&self.0)?.view)
     }
     /// Trusted data-range projection. Builds a fresh kernel containing only
     /// typed repair rows, preserving their versions. No grant, approval, receipt,
@@ -96,7 +110,7 @@ impl Image {
         if end.is_some_and(|end| start >= end) {
             return Err(CoreError::Unsupported);
         }
-        let source = from_records(decode(&self.0)?)?;
+        let source = replica_state(&self.0)?;
         let mut target = empty(source.view.domain);
         // This logical storage generation is not task authority. Retaining it
         // lets a data-only image remain canonical after ordinary row commits.
@@ -110,10 +124,7 @@ impl Image {
         Ok(Self(encode(&records(&target)?)?))
     }
     pub fn accounting(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
-        Ok(from_records(decode(&self.0)?)?
-            .accounting
-            .get(&task)
-            .copied())
+        Ok(replica_state(&self.0)?.accounting.get(&task).copied())
     }
     /// The Admin handle is constructed and destroyed here; it never escapes.
     pub fn evaluate(&self, command: &Command) -> Result<(Self, Reply), CoreError> {
@@ -127,7 +138,7 @@ impl Image {
         work: impl FnOnce(&Admin) -> Result<T, CoreError>,
     ) -> Result<(Self, T), CoreError> {
         let values: BTreeMap<Vec<u8>, Vec<u8>> = decode(&self.0)?;
-        from_records(values.clone())?;
+        replica_state(&self.0)?;
         let db = Database::builder()
             .set_cache_size(1024 * 1024)
             .create_with_backend(redb::backends::InMemoryBackend::new())
