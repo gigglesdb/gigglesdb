@@ -8,6 +8,9 @@ use std::{
 };
 
 const WAIT: Duration = Duration::from_secs(8);
+// Leave scheduling room before each mandatory hook; expiry is still exercised
+// by holding the real request at that hook for its original wire budget.
+const WIRE_DEADLINE_MS: u64 = 2_000;
 fn pause(
     a: &Admin,
     at: DecisionPoint,
@@ -214,22 +217,34 @@ async fn actual_native_deadline_predecision_and_postdecision_preserve_outcomes()
         let f = Fixture::new().await;
         let mut client = f.native(f.app.clone()).await;
         let (rx, release) = pause(&f.admin, point);
-        let job = tokio::spawn(async move {
+        let mut job = tokio::spawn(async move {
             let r = client
                 .call(&Request::Deadline {
-                    budget_ms: 100,
+                    budget_ms: WIRE_DEADLINE_MS,
                     request: Box::new(sql("INSERT INTO app (id) VALUES (1)", vec![])),
                 })
                 .await
                 .unwrap();
             (client, r)
         });
-        let c = entered(rx).await;
+        let c = tokio::select! {
+            c = entered(rx) => c,
+            completed = &mut job => {
+                let (_, response) = completed.unwrap();
+                panic!("native deadline completed before required {point:?} hook: {response:?}");
+            }
+        };
+        // Every boundary is mandatory: an early expiry is a diagnostic failure.
         // Hold the real storage decision until the original wire deadline expires.
         if point == DecisionPoint::BeforeDecision {
             cancelled(&c).await;
         } else {
-            c.deadline(Instant::now());
+            let held = Instant::now();
+            let budget = Duration::from_millis(WIRE_DEADLINE_MS);
+            tokio::time::sleep(budget).await;
+            // Receipt preceded hook entry, so this independently proves the
+            // original wire deadline elapsed even after decision won the race.
+            assert!(held.elapsed() >= budget);
             assert!(c.check().is_ok());
             assert!(!c.cancel());
         }
@@ -400,10 +415,10 @@ async fn actual_native_task_deadline_preserves_operation_approval_budget_and_sta
     let mut native = f.native(f.task.clone()).await;
     let (rx, release) = pause(&f.admin, DecisionPoint::BeforeDecision);
     let r = request.clone();
-    let job = tokio::spawn(async move {
+    let mut job = tokio::spawn(async move {
         let result = native
             .call(&Request::Deadline {
-                budget_ms: 100,
+                budget_ms: WIRE_DEADLINE_MS,
                 request: Box::new(Request::Execute {
                     request: r,
                     approval: Some(approval),
@@ -413,7 +428,13 @@ async fn actual_native_task_deadline_preserves_operation_approval_budget_and_sta
             .unwrap();
         (native, result)
     });
-    let c = entered(rx).await;
+    let c = tokio::select! {
+        c = entered(rx) => c,
+        completed = &mut job => {
+            let (_, response) = completed.unwrap();
+            panic!("native task deadline completed before required BeforeDecision hook: {response:?}");
+        }
+    };
     cancelled(&c).await;
     release.send(()).unwrap();
     let (mut native, response) = job.await.unwrap();
