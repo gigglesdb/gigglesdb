@@ -159,6 +159,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
             "typisdefined",
             "typispreferred",
             "typacl",
+            "typreceive",
         ]
     );
     assert_eq!(result.fields[20].data_type, PgType::AclItemArray);
@@ -167,7 +168,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
         result
             .rows
             .iter()
-            .all(|r| r.len() == 21 && r[20] == Value::Null)
+            .all(|r| r.len() == 22 && r[20] == Value::Null)
     );
     // Scalar, array, nominal, nominal array, virtual composite and application
     // composite paths must all be represented with NULL, never invented grants.
@@ -177,6 +178,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
         assert_eq!(rows[0][20], Value::Null);
     }
     assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typacl'", &snapshot(), &[]).rows,vec![vec![i(1034),i(-1),i(21)]]);
+    assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typreceive'", &snapshot(), &[]).rows,vec![vec![i(26),i(4),i(22)]]);
     assert_eq!(run("select oid, typname, typtype, typcategory, typelem, typarray, typacl from pg_catalog.pg_type where oid in (24,194,1008,65567) order by oid", &snapshot(), &[]).rows,vec![
         vec![i(24),s("regproc"),s("b"),s("N"),i(0),i(1008),Value::Null],
         vec![i(194),s("pg_node_tree"),s("b"),s("Z"),i(0),i(0),Value::Null],

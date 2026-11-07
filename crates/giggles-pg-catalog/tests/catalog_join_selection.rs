@@ -163,9 +163,9 @@ fn excluded_filters_and_join_shapes_keep_materialization() {
         &[],
     )
     .unwrap();
-    assert_eq!(lateral.rows.len(), 87);
+    assert_eq!(lateral.rows.len(), 89);
     let correlated = run("SELECT t.oid FROM pg_type t WHERE t.oid=(SELECT e.oid FROM pg_type e,pg_namespace n WHERE e.oid=t.oid AND n.oid=11) ORDER BY t.oid", &[]).unwrap();
-    assert_eq!(correlated.rows.len(), 87);
+    assert_eq!(correlated.rows.len(), 89);
 }
 
 #[test]

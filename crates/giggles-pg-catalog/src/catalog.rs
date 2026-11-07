@@ -100,6 +100,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("typisdefined", T::Bool),
             ("typispreferred", T::Bool),
             ("typacl", T::AclItemArray),
+            ("typreceive", T::Oid),
         ],
         "pg_index" => &[
             ("indexrelid", T::Oid),
@@ -438,6 +439,21 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("ev_qual", T::PgNodeTree),
             ("ev_action", T::PgNodeTree),
         ],
+        "pg_range" => &[
+            ("rngtypid", T::Oid),
+            ("rngsubtype", T::Oid),
+            ("rngmultitypid", T::Oid),
+            ("rngcollation", T::Oid),
+            ("rngsubopc", T::Oid),
+            ("rngcanonical", T::Regproc),
+            ("rngsubdiff", T::Regproc),
+        ],
+        "pg_enum" => &[
+            ("oid", T::Oid),
+            ("enumtypid", T::Oid),
+            ("enumsortorder", T::Float4),
+            ("enumlabel", T::Name),
+        ],
         "pg_sequence" => &[
             ("seqrelid", T::Oid),
             ("seqtypid", T::Oid),
@@ -524,6 +540,8 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_policy",
         "pg_rewrite",
         "pg_sequence",
+        "pg_range",
+        "pg_enum",
         "pg_trigger",
     ]
 }
@@ -567,6 +585,8 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_policy" => 3256,
         "pg_rewrite" => 2618,
         "pg_sequence" => 2224,
+        "pg_range" => 3541,
+        "pg_enum" => 3501,
         "pg_trigger" => 2620,
         _ => return None,
     })
@@ -819,6 +839,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 B(true),
                 B(false),
                 N,
+                I(type_receive(oid as u32, oid == 1008)),
             ],
         );
     }
@@ -1014,6 +1035,7 @@ fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64) -> Vec<Val
         B(true),
         B(false),
         N,
+        I(2403),
     ]
 }
 fn type_is_preferred(oid: u32) -> bool {
@@ -1060,5 +1082,39 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
         B(true),
         B(type_is_preferred(oid)),
         N,
+        I(type_receive(oid, is_array)),
     ]
+}
+
+fn type_receive(oid: u32, is_array: bool) -> i64 {
+    if is_array {
+        return 2400;
+    }
+    match oid {
+        16 => 2436,
+        17 => 2412,
+        18 => 2434,
+        19 => 2422,
+        20 => 2408,
+        21 => 2404,
+        22 => 2410,
+        23 => 2406,
+        24 => 2444,
+        25 => 2414,
+        26 => 2418,
+        28 => 2440,
+        30 => 2420,
+        194 => 197,
+        700 => 2424,
+        701 => 2426,
+        1033 => 0,
+        1082 => 2468,
+        1083 => 2470,
+        1114 => 2474,
+        1184 => 2476,
+        1186 => 2478,
+        1266 => 2472,
+        1700 => 2460,
+        _ => 0,
+    }
 }
