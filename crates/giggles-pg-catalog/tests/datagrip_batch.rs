@@ -21,6 +21,7 @@ fn snapshot() -> CatalogSnapshot {
             ],
             primary_key: vec![0],
         }],
+        ..CatalogSnapshot::default()
     }
 }
 fn run(sql: &str, args: &[Value]) -> ResultSet {

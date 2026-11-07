@@ -183,6 +183,7 @@ async fn connection(
         Err(_) => return fatal(&mut stream, "28P01", "password authentication failed").await,
     };
     session.connection = Some(shared);
+    session.database = Some(startup.database.clone());
     if !service.admission.request() {
         return Ok(());
     }

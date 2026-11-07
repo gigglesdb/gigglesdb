@@ -235,6 +235,16 @@ impl Visitor for Scan {
         if self.nodes > 4096 || self.depth > 48 {
             return ControlFlow::Break(Error::Limit);
         }
+        if let A::Identifier(n) = e
+            && n.quote_style.is_none()
+            && matches!(
+                ident(n).as_str(),
+                "user" | "current_role" | "current_catalog"
+            )
+        {
+            self.catalog = true;
+            self.explicit_catalog = true;
+        }
         if let A::Function(f) = e
             && let Ok(n) = function(&f.name)
             && matches!(
@@ -245,6 +255,9 @@ impl Visitor for Scan {
                     | "current_schema"
                     | "current_user"
                     | "session_user"
+                    | "user"
+                    | "current_role"
+                    | "current_catalog"
                     | "current_schemas"
             )
         {
@@ -458,6 +471,7 @@ pub fn execute_with_startup(
     let catalogs = catalog::build(snapshot)?;
     let mut rt = Runtime {
         catalogs: &catalogs,
+        snapshot,
         startup,
         parameters: &parameters,
         work: 0,
@@ -1140,6 +1154,15 @@ impl Compiler {
             });
         }
         let (kind, ty) = match e {
+            A::Identifier(n)
+                if n.quote_style.is_none()
+                    && matches!(
+                        ident(n).as_str(),
+                        "user" | "current_role" | "current_catalog"
+                    ) =>
+            {
+                (K::Call(ident(n), vec![]), PgType::Name)
+            }
             A::Identifier(n) => {
                 let i = lookup(schema, &[ident(n)])?;
                 return Ok(column(i, schema[i].field.data_type));
@@ -1957,9 +1980,11 @@ fn check_expr(e: &mut E) -> R<()> {
 }
 fn call_type(n: &str, a: &[E]) -> R<PgType> {
     Ok(match (n, a.len()) {
-        ("current_database" | "current_schema" | "current_user" | "session_user", 0) => {
-            PgType::Name
-        }
+        (
+            "current_database" | "current_schema" | "current_user" | "session_user" | "user"
+            | "current_role" | "current_catalog",
+            0,
+        ) => PgType::Name,
         ("version", 0) => PgType::Text,
         ("current_schemas", 1) => PgType::NameArray,
         ("replace" | "translate", 3)
@@ -2126,6 +2151,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
 }
 
 struct Runtime<'a> {
+    snapshot: &'a CatalogSnapshot,
     startup: Option<i64>,
     catalogs: &'a BTreeMap<String, catalog::Relation>,
     parameters: &'a [Value],
@@ -2972,7 +2998,10 @@ impl Runtime<'_> {
             "_service_start_epoch" => {
                 I(self.startup.filter(|v| *v >= 0).ok_or(Error::Unsupported)?)
             }
-            "current_database" | "current_user" | "session_user" => S("giggles".into()),
+            "current_database" | "current_catalog" => S(self.snapshot.database.clone()),
+            "current_user" | "session_user" | "current_role" | "user" => {
+                S(self.snapshot.user.clone())
+            }
             "current_schema" => S("public".into()),
             "current_schemas" => {
                 let b = boolean(v[0].clone())?.ok_or(Error::Type)?;

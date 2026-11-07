@@ -1075,7 +1075,7 @@ impl State {
                     if p.catalog_result.is_none() {
                         let result = catalog_wire::execute(
                             plan,
-                            &catalog_wire::snapshot(tables),
+                            &catalog_wire::snapshot(session, tables),
                             &p.catalog_params,
                         )
                         .map_err(catalog_wire::error)?;

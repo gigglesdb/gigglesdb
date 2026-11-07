@@ -297,6 +297,7 @@ where true
             }],
             primary_key: vec![0],
         }],
+        ..CatalogSnapshot::default()
     };
     for snapshot in [CatalogSnapshot::default(), snapshot] {
         assert_eq!(

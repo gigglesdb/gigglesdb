@@ -40,11 +40,17 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
 }
 
 pub(crate) fn snapshot(
+    session: &crate::Session,
     tables: Vec<giggles_core::relational::TableDef>,
 ) -> giggles_pg_catalog::CatalogSnapshot {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
     giggles_pg_catalog::CatalogSnapshot {
+        user: match &session.role {
+            crate::Role::Database { name } => name.clone(),
+            _ => "giggles".into(),
+        },
+        database: session.database.as_deref().unwrap_or("giggles").into(),
         tables: tables
             .into_iter()
             .map(|table| giggles_pg_catalog::TableDef {

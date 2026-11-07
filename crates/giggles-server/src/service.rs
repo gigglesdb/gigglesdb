@@ -312,6 +312,7 @@ impl Service {
             epoch: role.generation,
             scoped: false,
             connection: None,
+            database: None,
             sql: self.admin.sql_session(),
         })
     }
@@ -330,6 +331,7 @@ impl Service {
             epoch,
             scoped: false,
             connection: None,
+            database: None,
             fingerprint: fingerprint.to_owned(),
             sql: self.admin.sql_session(),
         })
@@ -338,6 +340,7 @@ impl Service {
 pub struct Session {
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
+    pub(crate) database: Option<String>,
     pub(crate) fingerprint: String,
     pub(crate) epoch: u64,
     scoped: bool,

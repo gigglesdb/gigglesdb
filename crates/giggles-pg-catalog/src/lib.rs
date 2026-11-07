@@ -62,9 +62,20 @@ pub struct TableDef {
     pub primary_key: Vec<usize>,
 }
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     pub tables: Vec<TableDef>,
+    pub user: String,
+    pub database: String,
+}
+impl Default for CatalogSnapshot {
+    fn default() -> Self {
+        Self {
+            tables: Vec::new(),
+            user: "giggles".into(),
+            database: "giggles".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

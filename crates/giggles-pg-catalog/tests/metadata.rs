@@ -44,6 +44,7 @@ fn snapshot() -> CatalogSnapshot {
             ],
             primary_key: vec![1, 0],
         }],
+        ..CatalogSnapshot::default()
     }
 }
 fn run(sql: &str) -> ResultSet {
@@ -182,6 +183,39 @@ fn identity() {
         run("SELECT current_database(), current_schema(), current_user, session_user").rows,
         vec![vec![s("giggles"), s("public"), s("giggles"), s("giggles")]]
     );
+}
+#[test]
+fn snapshot_identity_is_read_on_each_execution() {
+    let sql = "SELECT current_user, session_user, current_role, user, current_database(), current_catalog";
+    let plan = plan_gateway(sql).unwrap().expect("catalog identity");
+    let mut snapshot = CatalogSnapshot::default();
+    assert_eq!(
+        execute(&plan, &snapshot, &[]).unwrap().rows,
+        vec![vec![s("giggles"); 6]]
+    );
+    for (user, database) in [("alice", "appdb"), ("bob", "postgres")] {
+        snapshot.user = user.into();
+        snapshot.database = database.into();
+        assert_eq!(
+            execute(&plan, &snapshot, &[]).unwrap().rows,
+            vec![vec![
+                s(user),
+                s(user),
+                s(user),
+                s(user),
+                s(database),
+                s(database)
+            ]]
+        );
+    }
+    for keyword in ["current_role", "user", "current_catalog"] {
+        assert!(
+            plan_gateway(&format!("SELECT {keyword}"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(plan_gateway(&format!("SELECT \"{keyword}\" FROM pg_database")).is_err());
+    }
 }
 #[test]
 fn datagrip_list_schemas() {

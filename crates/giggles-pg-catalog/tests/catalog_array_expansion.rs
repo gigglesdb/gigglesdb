@@ -268,6 +268,7 @@ fn nonempty_metadata_oidvector_and_int2vector_lengths() {
             ],
             primary_key: vec![1, 0],
         }],
+        ..CatalogSnapshot::default()
     };
     let p=plan("SELECT unnest(indcollation) AS element,array_length(indclass,1),array_length(indkey,1) FROM pg_index").unwrap().unwrap();
     let r = execute(&p, &snapshot, &[]).unwrap();

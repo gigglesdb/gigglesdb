@@ -29,9 +29,7 @@ pub(crate) enum StartupPolicy<'a> {
 
 pub(crate) struct Startup {
     pub(crate) user: String,
-    /// Validated against the listener's configured databases. Kept for
-    /// current_database() and catalog presentation, which do not read it yet.
-    #[allow(dead_code)]
+    /// Validated against the listener's configured databases.
     pub(crate) database: String,
     pub(crate) settings: crate::pg_settings::Settings,
     pub(crate) timezone: String,

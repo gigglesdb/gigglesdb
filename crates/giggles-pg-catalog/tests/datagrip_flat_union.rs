@@ -14,6 +14,7 @@ fn snapshot() -> CatalogSnapshot {
             }],
             primary_key: vec![0],
         }],
+        ..CatalogSnapshot::default()
     }
 }
 fn arm(expr: &str) -> String {

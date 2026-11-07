@@ -174,7 +174,7 @@ impl State {
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic)? {
             self.diagnostic.phase = "catalog execution";
             let (_, tables) = core(session.catalog_snapshot())?;
-            let result = catalog_wire::execute(&plan, &catalog_wire::snapshot(tables), &[])
+            let result = catalog_wire::execute(&plan, &catalog_wire::snapshot(session, tables), &[])
                 .map_err(catalog_wire::error)?;
             catalog_wire::retained_bytes(&result)?;
             catalog_wire::description(&result.fields, &[], out)?;
