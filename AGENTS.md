@@ -48,6 +48,26 @@ the old content staged, and anyone's plain `git commit` reverts your work. Never
 reset or stage another owner's paths. End every commit message with the
 required Co-Authored-By trailer, and never push.
 
+## Shared compile cache (sccache)
+
+Every cargo command sets these environment variables:
+
+```
+RUSTC_WRAPPER=J:/gigglesdb-work/tools/bin/sccache.exe
+SCCACHE_DIR=J:/gigglesdb-work/sccache-cache
+SCCACHE_CACHE_SIZE=100G
+CARGO_INCREMENTAL=0
+```
+
+sccache 0.8.2 is installed from the official release, with its checksum
+verified. It returns cache hits only when the source path and the target
+directory are both the same as in the earlier build. So each track works from
+one stable source location (a git worktree under J:/gigglesdb-work/wt/<track>)
+and keeps one stable CARGO_TARGET_DIR. Reuse both across proofs rather than
+creating a new archive or target directory per proof. A target directory can
+then be deleted at any time to free disk, because rebuilding it comes from the
+cache. Two concurrent builds must never share one CARGO_TARGET_DIR.
+
 ## Cleaning up J:/gigglesdb-work
 
 Agents must clean up after themselves in J:/gigglesdb-work. When a work item
