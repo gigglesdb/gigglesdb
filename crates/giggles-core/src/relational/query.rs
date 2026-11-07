@@ -292,6 +292,36 @@ impl Filter {
             }
         }
     }
+    // Mutation declarations are authoritative only for plain column/parameter
+    // comparisons. Other expressions keep their existing inference constraints.
+    fn infer_mutation(
+        &self,
+        params: &mut [Option<DataType>],
+        declared: &[Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<()> {
+        match self {
+            Self::Compare(Scalar::Column(column), _, Scalar::Param(n))
+                if declared.get(n - 1).is_some_and(Option::is_some) =>
+            {
+                let column = resolve(column, 0)?;
+                infer_mutation_parameter(
+                    &Expr::Param(*n),
+                    &tables[column.source].columns[column.column].data_type,
+                    params,
+                    declared,
+                    false,
+                )
+            }
+            Self::Logic(a, _, b) => {
+                a.infer_mutation(params, declared, resolve, tables)?;
+                b.infer_mutation(params, declared, resolve, tables)
+            }
+            Self::Not(a) => a.infer_mutation(params, declared, resolve, tables),
+            _ => self.infer(params, resolve, tables),
+        }
+    }
     fn bind(
         &self,
         params: &[Option<DataType>],
@@ -553,6 +583,7 @@ impl Query {
         &self,
         state: &Relational,
         parameters: &mut [Option<DataType>],
+        declared: &[Option<DataType>],
     ) -> R<()> {
         if self.sources.len() != 1 || !self.joins.is_empty() {
             return Err(SqlError::Unsupported);
@@ -577,11 +608,10 @@ impl Query {
             Ok(BoundColumn { source: 0, column })
         };
         if let Some(filter) = &self.filter {
-            // WHERE owns its column constraints independently of SET. Comparing
-            // already seeded numeric parameters would otherwise permit a width
-            // mismatch that the frozen mutation grammar rejects.
+            // Infer independently of SET to retain undeclared column conflicts.
+            // Plain comparisons preserve explicit declarations, including widths.
             let mut inferred = vec![None; parameters.len()];
-            let inference = filter.infer(&mut inferred, &resolve, &[table]);
+            let inference = filter.infer_mutation(&mut inferred, declared, &resolve, &[table]);
             for (parameter, inferred) in parameters.iter_mut().zip(inferred) {
                 if let Some(inferred) = inferred {
                     if parameter.as_ref().is_some_and(|old| old != &inferred) {

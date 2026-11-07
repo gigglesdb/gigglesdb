@@ -147,19 +147,16 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
     }
     parameters[..prepared.parameter_types.len()].clone_from_slice(&prepared.parameter_types);
     let infer = |value: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<()> {
-        if let Expr::Param(n) = value {
-            let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
-            if slot.as_ref().is_some_and(|old| old != ty) {
-                return Err(SqlError::Type);
-            }
-            *slot = Some(ty.clone());
-        }
-        Ok(())
+        infer_mutation_parameter(value, ty, parameters, &prepared.parameter_types, true)
     };
     match &prepared.statement {
         Statement::Update { sets, .. } => {
             for (name, value) in sets {
-                infer(value, &table.columns[col(table, name)?].data_type, &mut parameters)?;
+                infer(
+                    value,
+                    &table.columns[col(table, name)?].data_type,
+                    &mut parameters,
+                )?;
             }
         }
         Statement::UpdateExpressions { sets, .. } => {
@@ -190,7 +187,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
         _ => {}
     }
     let target = target(prepared).ok_or(SqlError::Unbounded)?;
-    target.infer_mutation_parameters(state, &mut parameters)?;
+    target.infer_mutation_parameters(state, &mut parameters, &prepared.parameter_types)?;
     if let Some(returning) = prepared.returning() {
         let (columns, parameters, typmods) = returning.describe(state, parameters)?;
         let seed = parameters.iter().cloned().map(Some).collect::<Vec<_>>();

@@ -337,6 +337,45 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
     };
     if yes { Ok(()) } else { Err(SqlError::Type) }
 }
+fn integer_type(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::SmallInt | DataType::Integer | DataType::BigInt
+    )
+}
+
+// Only explicit declarations admit assignment conversion or cross-width comparison.
+fn infer_mutation_parameter(
+    value: &Expr,
+    target: &DataType,
+    parameters: &mut [Option<DataType>],
+    declared: &[Option<DataType>],
+    assignment: bool,
+) -> R<()> {
+    let Expr::Param(n) = value else { return Ok(()) };
+    let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+    if let Some(Some(ty)) = declared.get(n - 1) {
+        let compatible = ty == target
+            || (integer_type(ty) && integer_type(target))
+            || (assignment
+                && *target == DataType::Text
+                && (integer_type(ty) || *ty == DataType::Bytes));
+        if !compatible {
+            return Err(if assignment {
+                SqlError::Type
+            } else {
+                SqlError::UndefinedFunction
+            });
+        }
+        *slot = Some(ty.clone());
+    } else {
+        if slot.as_ref().is_some_and(|old| old != target) {
+            return Err(SqlError::Type);
+        }
+        *slot = Some(target.clone());
+    }
+    Ok(())
+}
 pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     if values.len() != t.columns.len() {
         return Err(SqlError::Type);
@@ -1329,15 +1368,33 @@ impl Prepared {
                     sets, predicates, ..
                 } => {
                     for (n, e) in sets {
-                        bind(e, &t.columns[col(t, n)?].data_type)?;
+                        infer_mutation_parameter(
+                            e,
+                            &t.columns[col(t, n)?].data_type,
+                            &mut params,
+                            &self.parameter_types,
+                            true,
+                        )?;
                     }
                     for p in predicates {
-                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                        infer_mutation_parameter(
+                            &p.value,
+                            &t.columns[col(t, &p.column)?].data_type,
+                            &mut params,
+                            &self.parameter_types,
+                            false,
+                        )?;
                     }
                 }
                 Statement::Delete { predicates, .. } => {
                     for p in predicates {
-                        bind(&p.value, &t.columns[col(t, &p.column)?].data_type)?;
+                        infer_mutation_parameter(
+                            &p.value,
+                            &t.columns[col(t, &p.column)?].data_type,
+                            &mut params,
+                            &self.parameter_types,
+                            false,
+                        )?;
                     }
                 }
                 _ => {}
@@ -1478,7 +1535,7 @@ impl Prepared {
             },
         })
     }
-    /// Declare input types for SELECT and UPDATE parameters before type inference.
+    /// Declare input types for SELECT, UPDATE and DELETE before type inference.
     /// A shorter slice or `None` entries leave the corresponding inputs inferred.
     /// Other statement kinds retain their existing parameter inference.
     pub fn with_parameter_types(mut self, types: &[Option<DataType>]) -> R<Self> {
@@ -1491,7 +1548,10 @@ impl Prepared {
         }
         if matches!(
             self.statement,
-            Statement::Query(_) | Statement::Update { .. } | Statement::UpdateExpressions { .. }
+            Statement::Query(_)
+                | Statement::Update { .. }
+                | Statement::UpdateExpressions { .. }
+                | Statement::Delete { .. }
         ) {
             self.parameter_types = types.to_vec();
         }
@@ -1599,6 +1659,15 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
             return Err(SqlError::Unbounded);
         }
         let v = p.value.value(params)?;
+        if let Value::Int(n) = &v
+            && match t.columns[i].data_type {
+                DataType::SmallInt => i16::try_from(*n).is_err(),
+                DataType::Integer => i32::try_from(*n).is_err(),
+                _ => false,
+            }
+        {
+            return Err(SqlError::Unbounded);
+        }
         check(&v, &t.columns[i])?;
         by.entry(i).or_default().push((&p.op, v));
     }
@@ -1917,6 +1986,16 @@ impl Relational {
         }
         // Bound parameters even if a statement affects no rows.
         payload_bound(params.iter())?;
+        if prepared.parameter_types.iter().any(Option::is_some)
+            && matches!(
+                prepared.statement,
+                Statement::Update { .. }
+                    | Statement::UpdateExpressions { .. }
+                    | Statement::Delete { .. }
+            )
+        {
+            prepared.describe(self)?;
+        }
         let returning = returning::Plan::new(prepared, self, params, clock)?;
         let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.

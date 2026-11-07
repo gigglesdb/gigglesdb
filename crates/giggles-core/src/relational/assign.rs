@@ -44,15 +44,48 @@ fn indexes(sets: &[(String, Value)], table: &TableDef) -> R<Vec<usize>> {
     Ok(indexes)
 }
 
-fn infer_plain(value: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]) -> R<()> {
-    if let Expr::Param(n) = value {
-        let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
-        if slot.as_ref().is_some_and(|old| old != ty) {
-            return Err(SqlError::Type);
+fn plain_value(
+    value: &Expr,
+    column: &ColumnDef,
+    prepared: &Prepared,
+    params: &[super::Value],
+) -> R<super::Value> {
+    let mut bound = value.value(params)?;
+    if let Expr::Param(n) = value
+        && let Some(Some(declared)) = prepared.parameter_types.get(n - 1)
+    {
+        check(
+            &bound,
+            &ColumnDef {
+                id: 0,
+                name: String::new(),
+                data_type: declared.clone(),
+                not_null: false,
+            },
+        )?;
+        if declared != &column.data_type {
+            match (&column.data_type, &bound) {
+                (DataType::SmallInt, super::Value::Int(n)) if i16::try_from(*n).is_err() => {
+                    return Err(SqlError::Overflow);
+                }
+                (DataType::Integer, super::Value::Int(n)) if i32::try_from(*n).is_err() => {
+                    return Err(SqlError::Overflow);
+                }
+                (DataType::Text, super::Value::Int(n)) => bound = super::Value::Text(n.to_string()),
+                (DataType::Text, super::Value::Bytes(bytes)) => {
+                    use std::fmt::Write;
+                    let mut text = String::from("\\x");
+                    for byte in bytes {
+                        write!(&mut text, "{byte:02x}").expect("writing into a String cannot fail");
+                    }
+                    bound = super::Value::Text(text);
+                }
+                _ => {}
+            }
         }
-        *slot = Some(ty.clone());
     }
-    Ok(())
+    check(&bound, column)?;
+    Ok(bound)
 }
 
 pub(super) fn describe(
@@ -74,15 +107,19 @@ pub(super) fn describe(
     for ((_, value), index) in sets.iter().zip(indexes) {
         let target = &table.columns[index].data_type;
         match value {
-            Value::Plain(value) => infer_plain(value, target, &mut parameters)?,
+            Value::Plain(value) => {
+                infer_mutation_parameter(value, target, &mut parameters, declared, true)?
+            }
             Value::Scalar(value) => value.infer_assignment(table, target, &mut parameters)?,
         }
     }
     for predicate in predicates {
-        infer_plain(
+        infer_mutation_parameter(
             &predicate.value,
             &table.columns[col(table, &predicate.column)?].data_type,
             &mut parameters,
+            declared,
+            false,
         )?;
     }
     let (columns, parameters, _typmods) = if let Some(returning) = returning {
@@ -153,8 +190,7 @@ impl<'a> Plan<'a> {
                     if table.primary_key.contains(&index) {
                         return Err(SqlError::Unsupported);
                     }
-                    let value = value.value(params)?;
-                    check(&value, &table.columns[index])?;
+                    let value = plain_value(value, &table.columns[index], prepared, params)?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
@@ -189,8 +225,7 @@ impl<'a> Plan<'a> {
             .map(|((_, value), index)| {
                 let value = match value {
                     Value::Plain(value) => {
-                        let value = value.value(params)?;
-                        check(&value, &table.columns[index])?;
+                        let value = plain_value(value, &table.columns[index], prepared, params)?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(

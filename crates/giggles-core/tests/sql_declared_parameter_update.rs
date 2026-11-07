@@ -259,40 +259,51 @@ fn plain_update_declarations_keep_column_conflicts_and_length_checks() {
             .values,
         vec![Value::Bytes(vec![0, 255])]
     );
-    for (sql, types, values) in [
-        (
-            "UPDATE t SET s=$1 WHERE id=1",
-            vec![Some(DataType::Bytes)],
-            vec![Value::Bytes(vec![0])],
-        ),
-        (
-            "UPDATE t SET s=$1 WHERE id=$2",
-            vec![Some(DataType::Text), Some(DataType::Bytes)],
-            vec![Value::Text("changed".into()), Value::Bytes(vec![0])],
-        ),
-    ] {
-        let conflict = session
-            .prepare(sql)
+    let converted = session
+        .prepare("UPDATE t SET s=$1 WHERE id=1")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Bytes)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&converted).unwrap().parameters,
+        vec![DataType::Bytes]
+    );
+    session
+        .execute_prepared(&converted, &[Value::Bytes(vec![0])], None)
+        .unwrap();
+    assert_eq!(
+        session
+            .execute("SELECT s FROM t WHERE id=1", &[], None)
             .unwrap()
-            .with_parameter_types(&types)
-            .unwrap();
-        assert!(matches!(
-            session.describe(&conflict),
-            Err(CoreError::Sql(SqlError::Type))
-        ));
-        assert!(matches!(
-            session.execute_prepared(&conflict, &values, None),
-            Err(CoreError::Sql(SqlError::Type))
-        ));
-        assert_eq!(
-            session
-                .execute("SELECT s FROM t WHERE id=1", &[], None)
-                .unwrap()
-                .rows[0]
-                .values,
-            vec![Value::Text("unchanged".into())]
-        );
-    }
+            .rows[0]
+            .values,
+        vec![Value::Text("\\x00".into())]
+    );
+    let conflict = session
+        .prepare("UPDATE t SET s=$1 WHERE id=$2")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Text), Some(DataType::Bytes)])
+        .unwrap();
+    assert!(matches!(
+        session.describe(&conflict),
+        Err(CoreError::Sql(SqlError::UndefinedFunction))
+    ));
+    assert!(matches!(
+        session.execute_prepared(
+            &conflict,
+            &[Value::Text("changed".into()), Value::Bytes(vec![0])],
+            None
+        ),
+        Err(CoreError::Sql(SqlError::UndefinedFunction))
+    ));
+    assert_eq!(
+        session
+            .execute("SELECT s FROM t WHERE id=1", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("\\x00".into())]
+    );
     assert!(matches!(
         session
             .prepare("UPDATE t SET n=position($1 in $2) WHERE id=1")
@@ -304,4 +315,299 @@ fn plain_update_declarations_keep_column_conflicts_and_length_checks() {
             ]),
         Err(SqlError::Parameters)
     ));
+}
+
+#[test]
+fn declared_plain_assignments_convert_and_check_destination_ranges() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT,sm SMALLINT,big BIGINT,b BYTEA,s TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO t(id,n,sm,big) VALUES(1,0,0,0),(2,0,0,0)",
+            &[],
+            None,
+        )
+        .unwrap();
+    for (column, declared, input, expected) in [
+        ("n", DataType::BigInt, Value::Int(42), Value::Int(42)),
+        ("big", DataType::SmallInt, Value::Int(12), Value::Int(12)),
+        (
+            "s",
+            DataType::Integer,
+            Value::Int(42),
+            Value::Text("42".into()),
+        ),
+        (
+            "s",
+            DataType::Bytes,
+            Value::Bytes(vec![0, 255]),
+            Value::Text("\\x00ff".into()),
+        ),
+        ("s", DataType::Bytes, Value::Null, Value::Null),
+        ("s", DataType::Integer, Value::Null, Value::Null),
+    ] {
+        let sql = format!("UPDATE t SET {column}=$1 WHERE id=1 RETURNING {column}");
+        let prepared = session
+            .prepare(&sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared],
+            "{sql}"
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&prepared, &[input], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![expected],
+            "{sql}"
+        );
+    }
+    for (sql, declared, input) in [
+        (
+            "UPDATE t SET n=$1 WHERE id=1",
+            DataType::BigInt,
+            Value::Int(3_000_000_000),
+        ),
+        (
+            "UPDATE t SET sm=$1 WHERE id=1",
+            DataType::Integer,
+            Value::Int(40_000),
+        ),
+        (
+            "UPDATE t SET n=$1 WHERE n IS NOT NULL OR id>0",
+            DataType::BigInt,
+            Value::Int(3_000_000_000),
+        ),
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared]
+        );
+        let before = session
+            .execute("SELECT * FROM t ORDER BY id", &[], None)
+            .unwrap();
+        assert!(
+            matches!(
+                session.execute_prepared(&prepared, &[input], None),
+                Err(CoreError::Sql(SqlError::Overflow))
+            ),
+            "{sql}"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT * FROM t ORDER BY id", &[], None)
+                .unwrap(),
+            before
+        );
+    }
+    // Mixing a scalar assignment selects UpdateExpressions; its plain SET value
+    // uses the same declared assignment conversion as the plain UPDATE path.
+    let mixed = session
+        .prepare("UPDATE t SET s=$1,n=n+1 WHERE id=1 RETURNING s,n")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Bytes)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&mixed).unwrap().parameters,
+        vec![DataType::Bytes]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&mixed, &[Value::Bytes(vec![0, 255])], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("\\x00ff".into()), Value::Int(43)]
+    );
+}
+
+#[test]
+fn declared_plain_assignment_and_comparison_errors_are_distinct_and_atomic() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT,sm SMALLINT,big BIGINT,b BYTEA,s TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO t(id,n,sm,big) VALUES(1,1,1,1),(2,2,2,2)",
+            &[],
+            None,
+        )
+        .unwrap();
+    for (sql, declared, value, error) in [
+        (
+            "UPDATE t SET n=$1 WHERE id=1",
+            DataType::Bytes,
+            Value::Bytes(vec![0]),
+            SqlError::Type,
+        ),
+        (
+            "UPDATE t SET n=$1 WHERE id=1",
+            DataType::Text,
+            Value::Text("1".into()),
+            SqlError::Type,
+        ),
+        (
+            "UPDATE t SET b=$1 WHERE id=1",
+            DataType::Text,
+            Value::Text("x".into()),
+            SqlError::Type,
+        ),
+        (
+            "UPDATE t SET b=$1 WHERE id=1",
+            DataType::Integer,
+            Value::Int(1),
+            SqlError::Type,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE n=$1",
+            DataType::Bytes,
+            Value::Bytes(vec![0]),
+            SqlError::UndefinedFunction,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE n=$1",
+            DataType::Text,
+            Value::Text("1".into()),
+            SqlError::UndefinedFunction,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE s=$1",
+            DataType::Integer,
+            Value::Int(1),
+            SqlError::UndefinedFunction,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE s=$1",
+            DataType::Bytes,
+            Value::Bytes(vec![0]),
+            SqlError::UndefinedFunction,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE b=$1",
+            DataType::Text,
+            Value::Text("x".into()),
+            SqlError::UndefinedFunction,
+        ),
+        (
+            "UPDATE t SET n=9 WHERE n=$1 OR id>0",
+            DataType::Bytes,
+            Value::Bytes(vec![0]),
+            SqlError::UndefinedFunction,
+        ),
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared)])
+            .unwrap();
+        let before = session
+            .execute("SELECT * FROM t ORDER BY id", &[], None)
+            .unwrap();
+        assert!(
+            matches!(session.describe(&prepared), Err(CoreError::Sql(actual)) if actual == error),
+            "describe {sql}"
+        );
+        assert!(
+            matches!(session.execute_prepared(&prepared, &[value], None), Err(CoreError::Sql(actual)) if actual == error),
+            "execute {sql}"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT * FROM t ORDER BY id", &[], None)
+                .unwrap(),
+            before,
+            "{sql}"
+        );
+    }
+    let comparison = session
+        .prepare("UPDATE t SET n=9 WHERE big=$1 RETURNING id")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Integer)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&comparison).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&comparison, &[Value::Int(1)], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Int(1)]
+    );
+}
+
+#[test]
+fn undeclared_mutation_column_conflicts_and_integer_key_fallback() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT,big BIGINT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO t VALUES(1,1,1),(2,2,2)", &[], None)
+        .unwrap();
+    let conflict = session.prepare("UPDATE t SET big=$1 WHERE n=$1").unwrap();
+    assert!(matches!(
+        session.describe(&conflict),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
+    assert!(matches!(
+        session.execute_prepared(&conflict, &[Value::Int(1)], None),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
+    let point = session.prepare("UPDATE t SET n=9 WHERE id=$1").unwrap();
+    assert_eq!(
+        session.describe(&point).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+    // Routing reaches the searched parameter check rather than rejecting the key.
+    assert!(matches!(
+        session.execute_prepared(&point, &[Value::Int(3_000_000_000)], None),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
+    let before = session
+        .execute("SELECT * FROM t ORDER BY id", &[], None)
+        .unwrap();
+    let literal = session
+        .prepare("UPDATE t SET n=9 WHERE id=3000000000")
+        .unwrap();
+    assert!(matches!(
+        session.execute_prepared(&literal, &[], None),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
+    assert_eq!(
+        session
+            .execute("SELECT * FROM t ORDER BY id", &[], None)
+            .unwrap(),
+        before
+    );
 }
