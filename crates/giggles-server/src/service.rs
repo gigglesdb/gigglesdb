@@ -587,21 +587,56 @@ impl Session {
             };
             p.with_parameter_types(types).map_err(CoreError::Sql)
         }
+        fn parse_error(session: &mut Session, error: CoreError) -> CoreError {
+            // DD-0068 E939: sessions without SQL authority get 42501 before core's parse-time routine classification can answer.
+            if !session.role.is_sql()
+                && matches!(
+                    error,
+                    CoreError::Sql(
+                        relational::SqlError::Unsupported
+                            | relational::SqlError::UndefinedFunction
+                            | relational::SqlError::AmbiguousFunction
+                    )
+                )
+            {
+                session.sql.abort();
+                CoreError::Policy(Error::Scope)
+            } else {
+                error
+            }
+        }
         self.authority_scope(|session| {
             let p = if matches!(&session.role, Role::Database { .. }) {
-                declared(session.sql.prepare(sql)?, declared_types)?
+                declared(
+                    session
+                        .sql
+                        .prepare(sql)
+                        .map_err(|error| parse_error(session, error))?,
+                    declared_types,
+                )?
             } else if session.in_transaction() && !session.is_aborted() {
                 // Gateway DDL is forbidden. Bind reusable plans against the
                 // committed catalog, then validate against the active snapshot.
                 // Core's staged-schema handles retain their lifetime fence.
                 let p = declared(
-                    session.service.admin.sql_session().prepare(sql)?,
+                    session
+                        .service
+                        .admin
+                        .sql_session()
+                        .prepare(sql)
+                        .map_err(|error| parse_error(session, error))?,
                     declared_types,
                 )?;
                 session.sql.describe(&p)?;
                 p
             } else {
-                declared(session.sql.prepare(sql)?, declared_types)?
+                declared(
+                    session
+                        .sql
+                        .prepare(sql)
+                        .map_err(|error| parse_error(session, error))?,
+                    declared_types,
+                )?
             };
             session.authorize(&p)?;
             Ok(p)

@@ -200,3 +200,148 @@ async fn dd68_table_free_keepalive_unchanged_by_role() {
     }
     f.stop().await;
 }
+
+#[tokio::test]
+async fn dd68_quoted_routine_authority_precedes_classification() {
+    let f = Fixture::new().await;
+    let probes = [
+        "SELECT \"POSITION\"('abc','b')",
+        "SELECT \"position\"('abc','b')",
+        "SELECT \"COALESCE\"(1, 2)",
+        "SELECT \"LOWER\"('A')",
+        "SELECT pg_catalog.\"POSITION\"('abc','b')",
+        "SELECT \"coalesce\"(1, 2)",
+        "SELECT pg_catalog.\"coalesce\"(1, 2)",
+        "SELECT lower(\"coalesce\"(1, 2))",
+        "/* routine probe */ SELECT \"coalesce\"(1, 2)",
+        "SELECT \"coalesce\"(body,'x') FROM app",
+        "SELECT public.unknown_x(\"coalesce\"(1,2))",
+        "SELECT pg_catalog.coalesce(1, 2)",
+        "SELECT public.coalesce(1, 2)",
+    ];
+    let mut failures = vec![];
+    for (role, config) in [
+        ("task", f.task.clone()),
+        ("other", f.other.clone()),
+        ("app", f.app.clone()),
+    ] {
+        let (pg, conn) = f.pg(config.clone()).await;
+        for (probe, sql) in probes.iter().enumerate() {
+            // Measured on unmodified HEAD: lowercase quoted position succeeds;
+            // public.coalesce returns 42501; all other probes return 0A000.
+            if role == "app" && probe == 1 {
+                continue;
+            }
+            let expected = if role == "app" && probe != 12 {
+                "0A000"
+            } else {
+                "42501"
+            };
+            let simple = pg.simple_query(sql).await.map(|_| ());
+            let extended = pg.prepare(sql).await.map(|_| ());
+            for (method, result) in [("simple_query", simple), ("prepare", extended)] {
+                let (actual, redacted) = match result {
+                    Ok(()) => ("SUCCESS".to_owned(), true),
+                    Err(error) => {
+                        let db = error.as_db_error().unwrap();
+                        (
+                            db.code().code().to_owned(),
+                            [
+                                "SELECT",
+                                "POSITION",
+                                "position",
+                                "COALESCE",
+                                "coalesce",
+                                "LOWER",
+                                "pg_catalog",
+                                "unknown_x",
+                                "body",
+                                "'x'",
+                                "1,2",
+                                "abc",
+                                "'A'",
+                                "'b'",
+                                "1, 2",
+                            ]
+                            .iter()
+                            .all(|secret| {
+                                !db.message().contains(secret)
+                                    && !db.detail().unwrap_or("").contains(secret)
+                            }),
+                        )
+                    }
+                };
+                println!(
+                    "quoted role={role} method={method} probe={probe} code={actual} redacted={redacted}"
+                );
+                if actual != expected || !redacted {
+                    failures.push(format!("role={role} method={method} probe={probe}: {actual} expected={expected} redacted={redacted}"));
+                }
+            }
+        }
+        for (control, sql) in [
+            ("plain_syntax", "SELECT ("),
+            ("syntax", "SELECT \"POSITION\"("),
+            ("string_syntax", "SELECT '\"coalesce\"(1, 2)' +"),
+            ("comment_syntax", "SELECT 1 /* \"coalesce\"( */ +"),
+            ("string", "SELECT '\"coalesce\"(1, 2)'"),
+            ("comment", "SELECT 1 /* \"coalesce\"(1, 2) */"),
+        ] {
+            let expected = if control.ends_with("syntax") {
+                "42601"
+            } else if role == "app" {
+                "SUCCESS"
+            } else {
+                "42501"
+            };
+            let simple = pg.simple_query(sql).await.map(|_| ());
+            let extended = pg.prepare(sql).await.map(|_| ());
+            for (method, result) in [("simple_query", simple), ("prepare", extended)] {
+                let actual = result.map(|_| "SUCCESS".to_owned()).unwrap_or_else(code);
+                println!("quoted role={role} method={method} control={control} code={actual}");
+                if actual != expected {
+                    failures.push(format!("role={role} method={method} control={control}: {actual} expected={expected}"));
+                }
+            }
+        }
+        drop(pg);
+        conn.await.unwrap();
+        if role == "app" {
+            continue;
+        }
+        let mut s = dd68_raw_role_pg(&f, config).await;
+        for (probe, sql) in probes.iter().enumerate() {
+            for statement_describe in [false, true] {
+                pg_send(&mut s, b'P', &parse("", sql)).await;
+                if statement_describe {
+                    pg_send(&mut s, b'D', b"S\0").await;
+                } else {
+                    pg_send(&mut s, b'B', &bind("", "", &[], false)).await;
+                    pg_send(&mut s, b'D', b"P\0").await;
+                    pg_send(&mut s, b'E', &execute("", 0)).await;
+                }
+                let frames = pg_sync(&mut s).await;
+                let actual = frames
+                    .iter()
+                    .filter(|(tag, _)| *tag == b'E')
+                    .flat_map(|(_, body)| body.split(|b| *b == 0))
+                    .find_map(|field| field.strip_prefix(b"C"))
+                    .map(|code| String::from_utf8_lossy(code).into_owned())
+                    .unwrap_or_else(|| "SUCCESS".to_owned());
+                let valid = has_code(&frames, "42501")
+                    && !has_code(&frames, "0A000")
+                    && frames.iter().filter(|(tag, _)| *tag == b'E').count() == 1
+                    && frames.last().map(|(tag, _)| *tag) == Some(b'Z');
+                println!(
+                    "quoted role={role} method=raw statement_describe={statement_describe} probe={probe} code={actual} valid={valid}"
+                );
+                if !valid {
+                    failures.push(format!("role={role} raw statement_describe={statement_describe} probe={probe}: {actual}"));
+                }
+            }
+        }
+        drop(s);
+    }
+    f.stop().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
