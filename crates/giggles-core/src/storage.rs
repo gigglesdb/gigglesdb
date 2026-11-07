@@ -638,9 +638,32 @@ impl Inner {
         let mut s = self.read().inspect_err(|_| {
             self.fenced.store(true, Ordering::Release);
         })?;
+        let previous_tables: BTreeMap<_, _> = s
+            .sql
+            .tables
+            .values()
+            .map(|table| (table.id, table.name.clone()))
+            .collect();
         // Logical errors can still advance the trusted monotonic decision clock.
         let result = f(&mut s);
-        self.persist(&mut s, decision)?;
+        let renames: Vec<_> = s
+            .sql
+            .tables
+            .values()
+            .filter_map(|table| {
+                previous_tables
+                    .get(&table.id)
+                    .filter(|old| **old != table.name)
+                    .map(|old| (old.clone(), table.name.clone()))
+            })
+            .collect();
+        self.persist_checked_mode(&mut s, decision, true, &mut || true, &renames)
+            .map_err(|error| match error {
+                GuardedPersistError::Core(error) => error,
+                GuardedPersistError::ClockExpired => {
+                    unreachable!("ordinary persistence has no clock lease")
+                }
+            })?;
         result
     }
     /// Hold authority serialization across durable read admission and evaluation.
@@ -682,12 +705,12 @@ impl Inner {
         decision: bool,
         valid_lease: &mut dyn FnMut() -> bool,
     ) -> Result<(), GuardedPersistError> {
-        self.persist_checked_mode(s, decision, true, valid_lease)
+        self.persist_checked_mode(s, decision, true, valid_lease, &[])
     }
     // Caller holds gate; counter reservations share crash/cancellation handling
     // with SQL publication without advancing the SQL conflict generation.
     fn persist_counters(&self, s: &mut State) -> Result<(), CoreError> {
-        self.persist_checked_mode(s, false, false, &mut || true)
+        self.persist_checked_mode(s, false, false, &mut || true, &[])
             .map_err(|error| match error {
                 GuardedPersistError::Core(error) => error,
                 GuardedPersistError::ClockExpired => unreachable!("counter write has no lease"),
@@ -699,6 +722,7 @@ impl Inner {
         decision: bool,
         bump_generation: bool,
         valid_lease: &mut dyn FnMut() -> bool,
+        table_renames: &[(String, String)],
     ) -> Result<(), GuardedPersistError> {
         self.merge_live_sequences(s)?;
         if bump_generation {
@@ -736,6 +760,7 @@ impl Inner {
                     t.insert(k.as_slice(), v.as_slice()).map_err(io)?;
                 }
             }
+            roles::rename_tables(&tx, table_renames)?;
             if point == CrashPoint::BeforeCommit {
                 crash_now();
             }
@@ -2256,6 +2281,20 @@ impl SqlSession {
             self.publish(s)?;
         }
         Ok(result)
+    }
+    /// Resolve a staged table name to its durable owner key by stable table id.
+    pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
+        let Some(table) = self.staged.as_ref().and_then(|s| s.sql.tables.get(name)) else {
+            return Ok(name.to_owned());
+        };
+        self.admin.inner.inspect(|s| {
+            Ok(s.sql
+                .tables
+                .values()
+                .find(|candidate| candidate.id == table.id)
+                .map(|candidate| candidate.name.clone())
+                .unwrap_or_else(|| name.to_owned()))
+        })
     }
     fn publish(&self, staged: State) -> Result<(), CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;

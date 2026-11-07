@@ -168,6 +168,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidSchema) => "3F000",
         CoreError::Sql(S::DivisionByZero) => "22012",
         CoreError::Sql(S::InvalidEscapeSequence) => "22025",
+        CoreError::Sql(S::InvalidTableDefinition) => "42P16",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
@@ -611,6 +612,17 @@ impl Session {
             }
         }
         self.authority_scope(|session| {
+            // Parse the complete ALTER before checking authority, but do not bind
+            // its table, columns, or defaults until ownership has been checked.
+            let alter_target = Prepared::alter_table_target(sql).map_err(|error| {
+                // Match SqlSession::prepare's failed-statement transaction
+                // semantics even though ALTER parsing precedes core binding.
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })?;
+            if let Some(table) = alter_target {
+                session.authorize_alter_table(&table)?;
+            }
             session.authorize_sequence_sql(sql)?;
             let p = if matches!(&session.role, Role::Database { .. }) {
                 declared(
@@ -664,9 +676,15 @@ impl Session {
         let allowed_table = |table: &str| -> bool {
             match &self.role {
                 Role::Application { tables, .. } => tables.contains(table),
-                Role::Database { name } => roles
-                    .table_owner(table)
-                    .is_ok_and(|owner| owner.as_deref() == Some(name.as_str())),
+                Role::Database { name } => {
+                    self.sql
+                        .table_authority_name(table)
+                        .is_ok_and(|durable_name| {
+                            roles
+                                .table_owner(&durable_name)
+                                .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
+                        })
+                }
                 _ => false,
             }
         };
@@ -685,11 +703,6 @@ impl Session {
             .filter_map(|(_, table)| table.as_ref().filter(|table| allowed_table(table)).cloned())
             .collect();
         let live_context = superuser || !allowed_tables.is_empty();
-        self.sql
-            .set_sequence_tables((!superuser).then_some(allowed_tables));
-        if dependencies.is_empty() {
-            return Ok(());
-        }
         let allowed = live_context
             && dependencies.iter().all(|dependency| {
                 if superuser {
@@ -708,6 +721,40 @@ impl Session {
                     .find(|(sequence, _)| sequence == &name)
                     .is_none_or(|(_, table)| table.as_deref().is_some_and(allowed_table))
             });
+        self.sql
+            .set_sequence_tables((!superuser).then_some(allowed_tables));
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        if !allowed {
+            self.sql.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        Ok(())
+    }
+    fn authorize_alter_table(&mut self, table: &str) -> Result<(), CoreError> {
+        let allowed = if let Role::Database { name } = &self.role {
+            let roles = self.service.admin.roles();
+            let role = roles
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            if role.superuser {
+                true
+            } else {
+                // The durable key follows staged renames; missing names remain
+                // ordinary absent ownership records and cannot leak 42P01.
+                let name_at_commit = self.sql.table_authority_name(table)?;
+                roles
+                    .table_owner(&name_at_commit)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?
+                    .as_deref()
+                    == Some(name.as_str())
+            }
+        } else {
+            false
+        };
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));
@@ -732,6 +779,16 @@ impl Session {
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 true
+            } else if p.is_alter_table() {
+                let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
+                let name_at_commit = self.sql.table_authority_name(table)?;
+                self.service
+                    .admin
+                    .roles()
+                    .table_owner(&name_at_commit)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?
+                    .as_deref()
+                    == Some(name.as_str())
             } else if p.is_ddl() {
                 self.service
                     .admin
@@ -744,8 +801,9 @@ impl Session {
                     false
                 } else {
                     let roles = self.service.admin.roles();
+                    let name_at_commit = self.sql.table_authority_name(table)?;
                     let owner = roles
-                        .table_owner(table)
+                        .table_owner(&name_at_commit)
                         .map_err(|_| CoreError::Policy(Error::Scope))?;
                     let privilege = match p.command() {
                         "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
@@ -757,7 +815,7 @@ impl Session {
                     owner.as_deref() == Some(name.as_str())
                         || privilege.is_some_and(|privilege| {
                             roles
-                                .table_privileges(table, name)
+                                .table_privileges(&name_at_commit, name)
                                 .is_ok_and(|privileges| privileges.contains(&privilege))
                         })
                 }
@@ -817,6 +875,7 @@ impl Session {
             }
             let result = result?;
             if p.is_ddl()
+                && !p.is_alter_table()
                 && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
             {
                 session

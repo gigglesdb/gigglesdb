@@ -412,7 +412,7 @@ fn constant_text(sql: &str, ty: &DataType) -> R<String> {
         Value::Interval(v) => format!("{}::{}", quoted(&v.to_string()), type_name(ty)),
     })
 }
-fn cast_type(p: &mut Parser) -> R<DataType> {
+pub(super) fn cast_type(p: &mut Parser) -> R<DataType> {
     let Some(Token::Word(word)) = p.tokens.get(p.at).cloned() else {
         return Err(SqlError::Unsupported);
     };
@@ -567,10 +567,57 @@ pub(super) fn evaluate(
     column: &ColumnDef,
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
-    match default_sql(state, column) {
-        Some(sql) => evaluate_sql(&sql, &column.data_type, clock),
-        None => Ok(Value::Null),
+    let value = match default_sql(state, column) {
+        Some(sql) => evaluate_sql(&sql, &column.data_type, clock)?,
+        None => Value::Null,
+    };
+    apply_typmod(value, state.column_typmod(column.id))
+}
+fn apply_typmod(value: Value, modifier: i32) -> R<Value> {
+    if modifier == -1 {
+        return Ok(value);
     }
+    let temporal = |_| SqlError::DatetimeFieldOverflow;
+    Ok(match value {
+        Value::Numeric(v) => Value::Numeric(
+            v.apply_typmod(
+                giggles_pg_types::typmod::NumericTypmod::from_typmod(modifier)
+                    .ok_or(SqlError::Type)?,
+            )
+            .map_err(|_| SqlError::Overflow)?,
+        ),
+        Value::Time(v) => Value::Time(v.with_precision(modifier as u32).map_err(temporal)?),
+        Value::TimeTz(v) => Value::TimeTz(v.with_precision(modifier as u32).map_err(temporal)?),
+        Value::Timestamp(v) => {
+            Value::Timestamp(v.with_precision(modifier as u32).map_err(temporal)?)
+        }
+        Value::TimestampTz(v) => {
+            Value::TimestampTz(v.with_precision(modifier as u32).map_err(temporal)?)
+        }
+        Value::Interval(v) => {
+            use giggles_pg_types::temporal::IntervalField;
+            let mask = modifier >> 16;
+            let last = if mask & 4096 != 0 {
+                IntervalField::Second
+            } else if mask & 2048 != 0 {
+                IntervalField::Minute
+            } else if mask & 1024 != 0 {
+                IntervalField::Hour
+            } else if mask & 8 != 0 {
+                IntervalField::Day
+            } else if mask & 2 != 0 {
+                IntervalField::Month
+            } else {
+                IntervalField::Year
+            };
+            let digits = modifier & 0xffff;
+            Value::Interval(
+                v.with_fields(last, if digits == 65535 { 6 } else { digits as u32 })
+                    .map_err(temporal)?,
+            )
+        }
+        v => v,
+    })
 }
 pub(super) fn row(
     state: &Relational,
@@ -590,6 +637,32 @@ pub(super) fn row(
             }
         })
         .collect()
+}
+
+pub(super) fn install_alter(
+    state: &mut Relational,
+    column: &ColumnDef,
+    sql: Option<&str>,
+) -> R<()> {
+    let value = if let Some(sql) = sql {
+        let mut parser = Parser {
+            tokens: lex(&format!("{sql},"))?,
+            at: 0,
+            params: BTreeSet::new(),
+        };
+        let mut value = expression(&mut parser, 0)?;
+        value.resolve(state)?;
+        let sql = value.canonical(&column.data_type)?;
+        query::InsertExpressions::default_value(&value.sql(), &column.data_type, None, false)?;
+        Some(sql)
+    } else {
+        None
+    };
+    state.set_column_default(column.id, value)
+}
+
+pub(super) fn parse_alter_untyped(p: &mut Parser) -> R<String> {
+    Ok(expression(p, 0)?.sql())
 }
 
 #[cfg(test)]

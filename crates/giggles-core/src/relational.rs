@@ -1,6 +1,7 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+mod alter_table;
 mod assign;
 pub(crate) mod clock;
 mod defaults;
@@ -173,6 +174,7 @@ pub enum SqlError {
     InvalidSchema,
     DivisionByZero,
     InvalidEscapeSequence,
+    InvalidTableDefinition,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +659,7 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    AlterTable(alter_table::AlterTable),
     CreateIndex(sql_index::CreateIndex),
     InsertMulti(sql_insert::Insert),
     Query(query::Query),
@@ -806,6 +809,9 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "alter") {
+            return alter_table::parse(self).map(Statement::AlterTable);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if word == "insert")
             && sql_insert::claims(&self.tokens)
         {
@@ -1308,6 +1314,15 @@ impl Prepared {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
+        if let Statement::AlterTable(alter) = &self.statement {
+            if let Some(error) = &alter.resolution_error {
+                return Err(error.clone());
+            }
+            state
+                .tables
+                .get(&alter.table)
+                .ok_or(SqlError::UnknownTable)?;
+        }
         if let Statement::InsertMulti(insert) = &self.statement {
             return insert.describe(state, self.params, &self.parameter_types);
         }
@@ -1476,6 +1491,7 @@ impl Prepared {
                 }
             }
             Statement::InsertExpressions(values) => Some(&values.name),
+            Statement::AlterTable(alter) => Some(&alter.table),
             Statement::CreateIndex(index) => Some(&index.table),
             Statement::InsertMulti(insert) => Some(&insert.table),
             Statement::Create { name, .. }
@@ -1490,8 +1506,23 @@ impl Prepared {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Create { .. } | Statement::CreateIndex(_)
+            Statement::Create { .. } | Statement::CreateIndex(_) | Statement::AlterTable(_)
         )
+    }
+    pub fn is_alter_table(&self) -> bool {
+        matches!(self.statement, Statement::AlterTable(_))
+    }
+    pub fn table_rename(&self) -> Option<(&str, &str)> {
+        if let Statement::AlterTable(alter) = &self.statement {
+            alter.actions.iter().rev().find_map(|action| match action {
+                alter_table::Action::RenameTable(name) => {
+                    Some((alter.table.as_str(), name.as_str()))
+                }
+                _ => None,
+            })
+        } else {
+            None
+        }
     }
     pub fn command(&self) -> &'static str {
         match self.statement {
@@ -1502,6 +1533,7 @@ impl Prepared {
                     "SELECT"
                 }
             }
+            Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::Insert { .. }
@@ -1617,6 +1649,7 @@ impl Prepared {
         let mut dependencies = match &self.statement {
             Statement::Query(query) => query.sequence_dependencies(),
             Statement::InsertExpressions(values) => values.sequence_dependencies(),
+            Statement::AlterTable(alter) => alter.sequence_dependencies(),
             Statement::Create { defaults, .. } => defaults
                 .iter()
                 .flatten()
@@ -1690,6 +1723,38 @@ impl Prepared {
     pub fn sequence_only(&self) -> bool {
         matches!(&self.statement, Statement::Query(query) if query.sequence_only())
     }
+    /// Return the ALTER target only after parsing the complete statement.
+    pub fn alter_table_target(sql: &str) -> R<Option<String>> {
+        let tokens = match lex(sql) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                // Lexing the body can fail after a leading comment. Inspect a complete
+                // leading token without changing non-ALTER error routing.
+                for (end, ch) in sql.char_indices() {
+                    if (ch.is_whitespace() || matches!(ch, ';' | '('))
+                        && let Ok(prefix) = lex(&sql[..end])
+                        && let Some(Token::Word(word)) = prefix.first()
+                    {
+                        return if word == "alter" {
+                            Err(error)
+                        } else {
+                            Ok(None)
+                        };
+                    }
+                }
+                return Ok(None);
+            }
+        };
+        if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
+            return Ok(None);
+        }
+        let mut parser = Parser {
+            tokens,
+            at: 0,
+            params: BTreeSet::new(),
+        };
+        Ok(Some(alter_table::parse(&mut parser)?.table))
+    }
     /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
     /// Parse failures and dependency-bearing queries keep their existing gateway path.
     pub fn rejects_unsupported_table_free_scalar(sql: &str) -> bool {
@@ -1722,6 +1787,11 @@ impl Prepared {
                 Err(error) => return Err(error),
             }
         };
+        if let Statement::AlterTable(alter) = &statement
+            && let Some(error) = &alter.resolution_error
+        {
+            return Err(error.clone());
+        }
         let params = p.params.last().copied().unwrap_or(0);
         if p.params.len() != params {
             return Err(SqlError::Parameters);
@@ -2188,6 +2258,12 @@ impl Relational {
                     &mut cancel,
                     &prepared.parameter_types,
                 );
+            }
+            Statement::AlterTable(alter) => {
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                alter_table::execute(self, alter, clock, &mut cancel)?;
             }
             Statement::CreateIndex(index) => {
                 if expected.is_some() {

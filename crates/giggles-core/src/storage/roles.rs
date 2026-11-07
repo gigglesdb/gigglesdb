@@ -536,6 +536,61 @@ impl RoleCatalog {
     }
 }
 
+/// Move name-keyed table authority in the same transaction as schema publication.
+/// Collect all values before removing keys so swaps cannot overwrite one another.
+pub(super) fn rename_tables(
+    tx: &redb::WriteTransaction,
+    renames: &[(String, String)],
+) -> Result<(), CoreError> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let mut table = tx.open_table(ROLES).map_err(io)?;
+    let mut moves = Vec::new();
+    for (old, new) in renames {
+        let owner_key = key(b"owner/", old);
+        if let Some(value) = raw_get(&table, &owner_key).map_err(|e| match e {
+            RoleError::Core(e) => e,
+            _ => CoreError::Corrupt("invalid table owner metadata".into()),
+        })? {
+            moves.push((owner_key, key(b"owner/", new), value));
+        }
+        let old_prefix = grant_key(b"tgrant/", old, "");
+        let new_prefix = grant_key(b"tgrant/", new, "");
+        for entry in table.iter().map_err(io)? {
+            let (key, value) = entry.map_err(io)?;
+            if let Some(suffix) = key.value().strip_prefix(old_prefix.as_slice()) {
+                let mut renamed = new_prefix.clone();
+                renamed.extend_from_slice(suffix);
+                moves.push((key.value().to_vec(), renamed, value.value().to_vec()));
+            }
+        }
+    }
+    // Source values are captured above, so clearing all destinations also handles
+    // swaps while preventing stale grants for a free catalog name from leaking.
+    let mut destination_keys = Vec::new();
+    for (_, new) in renames {
+        destination_keys.push(key(b"owner/", new));
+        let prefix = grant_key(b"tgrant/", new, "");
+        for entry in table.iter().map_err(io)? {
+            let (key, _) = entry.map_err(io)?;
+            if key.value().starts_with(&prefix) {
+                destination_keys.push(key.value().to_vec());
+            }
+        }
+    }
+    for key in destination_keys {
+        table.remove(key.as_slice()).map_err(io)?;
+    }
+    for (old, _, _) in &moves {
+        table.remove(old.as_slice()).map_err(io)?;
+    }
+    for (_, new, value) in &moves {
+        table.insert(new.as_slice(), value.as_slice()).map_err(io)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

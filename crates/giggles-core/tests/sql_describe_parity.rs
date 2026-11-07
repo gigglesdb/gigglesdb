@@ -17,13 +17,15 @@ fn matches(data_type: &DataType, value: &Value) -> bool {
 
 #[test]
 fn describe_matches_execution_columns_and_value_types() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "giggles-describe-parity-{}-{}",
+        "giggles-describe-parity-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let admin = Admin::create(&path, Limits::default()).unwrap();
     let mut session = admin.sql_session();

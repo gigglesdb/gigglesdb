@@ -122,6 +122,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidSchema => 42,
                 relational::SqlError::DivisionByZero => 43,
                 relational::SqlError::InvalidEscapeSequence => 44,
+                relational::SqlError::InvalidTableDefinition => 45,
             }
         }
     };

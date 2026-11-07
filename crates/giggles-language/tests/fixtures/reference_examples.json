@@ -1103,11 +1103,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             },
             {
               "id": "schemas-fence06-example02",
@@ -1117,11 +1117,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             },
             {
               "id": "schemas-fence06-example03",
@@ -1145,7 +1145,7 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
               "features": [
                 "sql_online_schema_changes"
               ],
@@ -1173,7 +1173,7 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
               "features": [
                 "sql_online_schema_changes"
               ],
@@ -1187,11 +1187,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             },
             {
               "id": "schemas-fence06-example08",
@@ -1201,7 +1201,7 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
               "features": [
                 "sql_online_schema_changes"
               ],
