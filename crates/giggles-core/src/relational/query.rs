@@ -433,22 +433,13 @@ impl BoundFilter {
 
 impl Parser {
     fn column_ref(&mut self) -> R<ColumnRef> {
-        let first = self.name()?;
-        if self.sym('.') {
-            Ok(ColumnRef {
-                qualifier: Some(first),
-                name: self.name()?,
-            })
-        } else {
-            Ok(ColumnRef {
-                qualifier: None,
-                name: first,
-            })
-        }
+        let (qualifier, name) = self.qualified_name()?;
+        Ok(ColumnRef { qualifier, name })
     }
     fn source(&mut self) -> R<Source> {
-        let name = self.name()?;
+        let name = self.table_name()?;
         let alias = if self.word("as")
+            || matches!(self.tokens.get(self.at), Some(Token::QuotedIdent(_)))
             || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()))
         {
             self.name()?
@@ -460,15 +451,7 @@ impl Parser {
 }
 
 impl Query {
-    pub(super) fn parse(p: &mut Parser) -> R<Self> {
-        let explain = p.word("explain");
-        p.need("select")?;
-        // Subqueries remain outside this bounded relational grammar.
-        if p.tokens[p.at..].windows(2).any(
-            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
-        ) {
-            return Err(SqlError::Unsupported);
-        }
+    fn parse_items(p: &mut Parser) -> R<Vec<(Item, Option<String>)>> {
         let mut items = Vec::new();
         loop {
             let item = if p.sym('*') {
@@ -512,6 +495,41 @@ impl Query {
                 break;
             }
         }
+        Ok(items)
+    }
+    pub(super) fn returning(p: &mut Parser, table: &str) -> R<Self> {
+        let items = Self::parse_items(p)?;
+        for (item, _) in &items {
+            match item {
+                Item::Aggregate(..) => return Err(SqlError::GroupingError),
+                Item::Scalar(value) => value.reject_nested_aggregate()?,
+                Item::Star => {}
+            }
+        }
+        Ok(Self {
+            explain: false,
+            sources: vec![Source {
+                name: table.into(),
+                alias: table.into(),
+            }],
+            joins: vec![],
+            items,
+            predicates: vec![],
+            filter: None,
+            order: vec![],
+            limit: None,
+        })
+    }
+    pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        let explain = p.word("explain");
+        p.need("select")?;
+        // Subqueries remain outside this bounded relational grammar.
+        if p.tokens[p.at..].windows(2).any(
+            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
+        ) {
+            return Err(SqlError::Unsupported);
+        }
+        let items = Self::parse_items(p)?;
         let mut sources = vec![];
         if p.word("from") {
             sources.push(p.source()?);
@@ -827,6 +845,16 @@ impl Query {
         }
     }
     pub(super) fn bind<'a>(&'a self, state: &'a Relational, count: usize) -> R<BoundQuery<'a>> {
+        self.bind_seeded(state, vec![None; count])
+    }
+    pub(super) fn bind_seeded<'a>(
+        &'a self,
+        state: &'a Relational,
+        mut parameters: Vec<Option<DataType>>,
+    ) -> R<BoundQuery<'a>> {
+        if parameters.len() > MAX_PARAMS {
+            return Err(SqlError::Limit);
+        }
         unique(self.sources.iter().map(|s| &s.alias))?;
         let tables = self
             .sources
@@ -834,9 +862,17 @@ impl Query {
             .map(|s| state.tables.get(&s.name).ok_or(SqlError::UnknownTable))
             .collect::<R<Vec<_>>>()?;
         let resolve = |c: &ColumnRef, scope: usize| -> R<BoundColumn> {
+            if c.qualifier.as_ref().is_some_and(|q| {
+                !self.sources.iter().take(scope).any(|s| q == &s.alias)
+            }) {
+                return Err(SqlError::UnknownTable);
+            }
             let mut found = None;
             for (source, (s, t)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
-                if c.qualifier.as_ref().is_some_and(|q| q != &s.alias) {
+                if c.qualifier
+                    .as_ref()
+                    .is_some_and(|q| q != &s.alias)
+                {
                     continue;
                 }
                 if let Some(column) = t.columns.iter().position(|v| v.name == c.name) {
@@ -887,7 +923,6 @@ impl Query {
             });
         }
         let mut items = vec![];
-        let mut parameters = vec![None; count];
         let mut unresolved_count_parameters = Vec::new();
         for (item, _) in &self.items {
             match item {
@@ -1213,6 +1248,56 @@ fn charge(bytes: &mut usize, value: &Value) -> R<()> {
     Ok(())
 }
 impl BoundQuery<'_> {
+    fn project_tuple(
+        &self,
+        row: &Tuple,
+        params: &[Value],
+        work: &mut usize,
+        bytes: &mut usize,
+    ) -> R<SqlRow> {
+        let values = self
+            .items
+            .iter()
+            .map(|item| match item {
+                BoundItem::Scalar(value) => {
+                    let value = value.eval(row, params, work)?;
+                    charge(bytes, &value)?;
+                    Ok(value)
+                }
+                BoundItem::Column(column) => {
+                    let value = row.get(*column);
+                    charge(bytes, value)?;
+                    Ok(value.clone())
+                }
+                BoundItem::Aggregate(..) => Err(SqlError::GroupingError),
+            })
+            .collect::<R<Vec<_>>>()?;
+        Ok(SqlRow {
+            values,
+            version: row.version,
+        })
+    }
+    pub(super) fn project_row(
+        &self,
+        values: &[Value],
+        version: u64,
+        params: &[Value],
+        work: &mut usize,
+        bytes: &mut usize,
+    ) -> R<Vec<Value>> {
+        payload_bound(values.iter())?;
+        Ok(self
+            .project_tuple(
+                &Tuple {
+                    values: vec![values.to_vec()],
+                    version,
+                },
+                params,
+                work,
+                bytes,
+            )?
+            .values)
+    }
     pub(super) fn validate_immutable_constants(&self) -> R<()> {
         let mut budget = 0;
         for item in &self.items {
@@ -1618,28 +1703,12 @@ impl BoundQuery<'_> {
                 if result.rows.len() >= scan::MAX_QUERY_ROWS {
                     return Err(SqlError::Limit);
                 }
-                let values = self
-                    .items
-                    .iter()
-                    .map(|i| {
-                        if let BoundItem::Scalar(e) = i {
-                            let value = e.eval(&row, params, &mut scalar_work_bytes)?;
-                            charge(&mut result_bytes, &value)?;
-                            return Ok(value);
-                        }
-                        let BoundItem::Column(c) = i else {
-                            unreachable!()
-                        };
-                        let value = row.get(*c);
-                        // Reserve raw output bytes before cloning repeated projections.
-                        charge(&mut result_bytes, value)?;
-                        Ok(value.clone())
-                    })
-                    .collect::<R<Vec<_>>>()?;
-                result.rows.push(SqlRow {
-                    values,
-                    version: row.version,
-                });
+                result.rows.push(self.project_tuple(
+                    &row,
+                    params,
+                    &mut scalar_work_bytes,
+                    &mut result_bytes,
+                )?);
             }
         }
         if self.aggregate && cancel() {

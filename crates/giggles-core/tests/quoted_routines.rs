@@ -57,20 +57,29 @@ fn quoted_routines_preserve_case_and_do_not_enable_special_forms() {
     );
 }
 #[test]
-fn quoted_identifiers_remain_forbidden_for_objects_and_are_bounded() {
+fn quoted_identifiers_are_accepted_for_objects_and_are_bounded() {
     let a = Admin::create(common::fresh("quoted-object-rejection"), Limits::default()).unwrap();
     let mut s = a.sql_session();
     s.execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();
-    let before = a.catalog().unwrap();
     for sql in [
         "CREATE TABLE \"q\"(id BIGINT PRIMARY KEY)",
         "CREATE TABLE q(\"id\" BIGINT PRIMARY KEY)",
         "SELECT \"id\" FROM items",
         "SELECT id FROM \"items\"",
     ] {
-        assert!(s.prepare(sql).is_err(), "{sql}");
-        assert_eq!(a.catalog().unwrap(), before);
+        let a = Admin::create(common::fresh("quoted-object-acceptance"), Limits::default()).unwrap();
+        let mut s = a.sql_session();
+        s.execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert!(s.execute(sql, &[], None).is_ok(), "{sql}");
+        if sql.starts_with("CREATE") {
+            let (_, tables) = a.catalog().unwrap();
+            let q = tables.iter().find(|table| table.name == "q").unwrap();
+            assert_eq!(q.name, "q");
+            assert_eq!(q.columns.len(), 1);
+            assert_eq!(q.columns[0].name, "id");
+        }
     }
     for sql in [
         "CREATE INDEX \"ix\" ON items(id)",

@@ -70,6 +70,7 @@ impl ResolvedArbiter<'_> {
 /// One physical change; skips and no-op updates never appear here.
 pub(super) struct PlannedChange<'s> {
     pub(super) table: u64,
+    input_index: usize,
     pub(super) old: Option<(&'s [u8], &'s SqlRow)>,
     pub(super) new: (Vec<u8>, SqlRow),
 }
@@ -625,6 +626,7 @@ pub(super) fn plan_unique_conflict<'s>(
             })
             .collect();
         changes.push(PlannedChange {
+            input_index: index,
             table: table.id,
             old: resolved[index].winner,
             new: (
@@ -666,6 +668,9 @@ fn into_sql(error: PlanError) -> SqlError {
     }
 }
 
+type SqlPostimageProjection<'a> =
+    dyn FnMut(&Relational, &[&SqlRow]) -> std::result::Result<Vec<SqlRow>, SqlError> + 'a;
+
 impl Relational {
     /// SQL-only binding and publication; native planner semantics stay unchanged.
     pub(crate) fn sql_conflict_engine(
@@ -674,6 +679,18 @@ impl Relational {
         target: (Option<&[String]>, Option<&str>),
         incoming: &[Vec<Value>],
         action: &ConflictAction,
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
+        self.sql_conflict_engine_projected(table, target, incoming, action, None, cancel)
+    }
+
+    pub(crate) fn sql_conflict_engine_projected(
+        &mut self,
+        table: &TableDef,
+        target: (Option<&[String]>, Option<&str>),
+        incoming: &[Vec<Value>],
+        action: &ConflictAction,
+        project: Option<&mut SqlPostimageProjection<'_>>,
         cancel: &mut dyn FnMut() -> bool,
     ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
         if cancel() {
@@ -769,6 +786,24 @@ impl Relational {
             cancel,
         )
         .map_err(into_sql)?;
+        // SQL semantics mark every accepted postimage changed.
+        if plan.changes.len() != plan.outcome.affected {
+            return Err(SqlError::Unsupported);
+        }
+        // Borrow planner postimages in VALUES order without copying full rows.
+        let returned = if let Some(project) = project {
+            let mut changes = plan.changes.iter().collect::<Vec<_>>();
+            changes.sort_by_key(|change| change.input_index);
+            project(
+                &src,
+                &changes
+                    .iter()
+                    .map(|change| &change.new.1)
+                    .collect::<Vec<_>>(),
+            )?
+        } else {
+            vec![]
+        };
         #[cfg(test)]
         Self::sql_insert_test_event(4);
         let mut result = self.secondary_apply_batch_engine(
@@ -778,6 +813,7 @@ impl Relational {
             cancel,
         )?;
         result.affected = plan.outcome.affected as u64;
+        result.rows = returned;
         Ok(result)
     }
 }

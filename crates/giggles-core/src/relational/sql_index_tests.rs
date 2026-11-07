@@ -73,6 +73,17 @@ fn sql_index_grammar_accept_matrix() {
     ident(&p.name).unwrap();
 }
 #[test]
+fn sql_index_quoted_names_preserve_case() {
+    let p = parsed(r#"CREATE INDEX "Ix" ON "Items" ("Email")"#);
+    assert_eq!(p.name, "Ix");
+    assert_eq!(p.table, "Items");
+    assert_eq!(p.columns, ["Email"]);
+    assert_eq!(
+        Prepared::parse(r#"CREATE INDEX "pg_ix" ON items (email)"#, 1, 0).unwrap_err(),
+        SqlError::Reserved
+    );
+}
+#[test]
 fn sql_index_grammar_reject_matrix() {
     for text in [
         "CREATE INDEX CONCURRENTLY ix ON items (email)",
@@ -88,10 +99,6 @@ fn sql_index_grammar_reject_matrix() {
         "CREATE INDEX ix ON items (email) TABLESPACE foo",
         "CREATE INDEX ix ON items USING hash (email)",
         "CREATE INDEX ix ON items ()",
-        "CREATE INDEX \"Ix\" ON items (email)",
-        "CREATE INDEX ix ON \"Items\" (email)",
-        "CREATE INDEX ix ON items (\"Email\")",
-        "CREATE INDEX \"pg_ix\" ON items (email)",
     ] {
         assert_eq!(
             Prepared::parse(text, 1, 0).unwrap_err(),

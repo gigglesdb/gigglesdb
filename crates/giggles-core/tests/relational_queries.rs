@@ -65,6 +65,12 @@ fn qualified_alias_resolution_and_keywords() {
 fn invalid_scope_duplicate_and_ambiguous_names() {
     let (_, mut s) = db();
     schema(&mut s);
+    run(&mut s, "INSERT INTO people VALUES (1,NULL,'one')");
+    err(
+        &mut s,
+        "SELECT people.id FROM people p LIMIT 1",
+        E::UnknownTable,
+    );
     for (q, e) in [
         (
             "SELECT id FROM people p JOIN jobs j ON j.id=p.id",
@@ -74,12 +80,11 @@ fn invalid_scope_duplicate_and_ambiguous_names() {
             "SELECT p.id FROM people p JOIN jobs p ON p.id=p.id",
             E::Duplicate,
         ),
-        ("SELECT people.id FROM people p LIMIT 1", E::UnknownColumn),
         ("SELECT p.missing FROM people p LIMIT 1", E::UnknownColumn),
         ("SELECT z.id FROM absent z LIMIT 1", E::UnknownTable),
         (
             "SELECT p.id FROM people p JOIN jobs j ON j.id=z.id",
-            E::UnknownColumn,
+            E::UnknownTable,
         ),
         (
             "SELECT p.id AS x,p.manager AS x FROM people p LIMIT 1",
@@ -629,7 +634,7 @@ fn future_join_scope_and_conflicting_parameter_types_reject_empty_tables() {
     err(
         &mut s,
         "SELECT p.id FROM people p JOIN jobs j ON j.id=x.id JOIN people x ON x.id=p.id",
-        E::UnknownColumn,
+        E::UnknownTable,
     );
     let p = s
         .prepare("SELECT COUNT(*) FROM people p WHERE p.id=$1 AND p.label=$1")

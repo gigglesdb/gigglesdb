@@ -117,6 +117,7 @@ fn sql_insert_single_row_trailing_garbage_error_unchanged() {
 #[test]
 fn sql_insert_grammar_accept_matrix() {
     for text in [
+        "INSERT INTO items VALUES (1,'a','x',10),(2,'b','y',20) RETURNING id",
         "INSERT INTO items VALUES (1,'a',NULL,10),(2,'b','z',-20);",
         "insert into ITEMS (ID,n) values ($1,$2),($3,$4)",
         "INSERT INTO \"items\" (\"id\",\"n\") VALUES (1,10),(2,20)",
@@ -131,18 +132,21 @@ fn sql_insert_grammar_accept_matrix() {
 }
 
 #[test]
+fn sql_insert_quoted_names_preserve_case() {
+    let p = Prepared::parse(r#"INSERT INTO "Items" ("Id",n) VALUES (1,10),(2,20)"#, 1, 0).unwrap();
+    assert_eq!(p.table(), Some("Items"));
+    assert!(matches!(p.statement, Statement::InsertMulti(_)));
+}
+#[test]
 fn sql_insert_grammar_unsupported_matrix() {
     for text in [
         "INSERT INTO items VALUES (DEFAULT,'a','x',10),(2,'b','y',20)",
         "INSERT INTO items DEFAULT VALUES ON CONFLICT DO NOTHING",
         "INSERT INTO items SELECT 1,'a','x',10 ON CONFLICT DO NOTHING",
-        "INSERT INTO items VALUES (1,'a','x',10),(2,'b','y',20) RETURNING id",
         "INSERT INTO items OVERRIDING SYSTEM VALUE VALUES (1,'a','x',10),(2,'b','y',20)",
         "INSERT INTO items VALUES (abs(1),'a','x',10),(2,'b','y',20)",
         "INSERT INTO items VALUES (1+1,'a','x',10),(2,'b','y',20)",
         "INSERT INTO items AS t VALUES (1,'a','x',10),(2,'b','y',20)",
-        "INSERT INTO \"Items\" VALUES (1,'a','x',10),(2,'b','y',20)",
-        "INSERT INTO items (\"Id\",n) VALUES (1,10),(2,20)",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=abs(n)",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=n+1",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=10 WHERE n != 0",
@@ -303,6 +307,25 @@ fn sql_insert_primary_do_nothing_affected_counts() {
         .affected,
         0
     );
+}
+
+#[test]
+fn sql_insert_conflict_unchanged_update_returns_accepted_postimage() {
+    let (_, mut s, _) = fixture();
+    run(&mut s, "INSERT INTO items VALUES (1,'a','x',10)");
+    let before = rows(&mut s)[0].clone();
+    let result = run(
+        &mut s,
+        "INSERT INTO items VALUES (1,'b','y',99) ON CONFLICT (id) DO UPDATE SET n=items.n RETURNING *",
+    );
+    assert_eq!(result.affected, 1);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values, before.values);
+    let stored = rows(&mut s);
+    assert_eq!(result.rows, stored);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].values, before.values);
+    assert!(stored[0].version > before.version);
 }
 
 #[test]
@@ -650,7 +673,7 @@ fn sql_insert_parser_row_cap_1024_and_1025() {
     let (_, mut session, _) = fixture();
     let mut state = snapshot(&mut session);
     assert_eq!(
-        execute(&mut state, &insert, &[], None, &mut || false)
+        execute(&mut state, &insert, &[], None, &None, &mut || false)
             .unwrap()
             .affected,
         MAX_ROWS as u64
@@ -701,6 +724,7 @@ fn admission_insert() -> Insert {
             ],
         ],
         conflict: None,
+        returning: None,
     }
 }
 fn create_wide_numeric_table(session: &mut SqlSession) {
@@ -736,7 +760,7 @@ fn assert_admission_rejected_without_copy(
     let mut ticks = 0;
     Relational::sql_insert_test_reset();
     assert_eq!(
-        execute(state, insert, params, None, &mut || {
+        execute(state, insert, params, None, &None, &mut || {
             ticks += 1;
             false
         }),
@@ -814,6 +838,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
             ],
         ],
         conflict: None,
+        returning: None,
     };
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Limit);
     // Fifty individually admitted numerics exceed the row's raw byte budget
@@ -833,6 +858,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
                 .collect(),
         ],
         conflict: None,
+        returning: None,
     };
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Limit);
 }
@@ -918,7 +944,7 @@ fn sql_insert_admission_cancel_at_entry_before_any_copy() {
         let mut ticks = 0;
         Relational::sql_insert_test_reset();
         assert_eq!(
-            execute(&mut state, &insert, &[], None, &mut || {
+            execute(&mut state, &insert, &[], None, &None, &mut || {
                 ticks += 1;
                 true
             }),
@@ -1056,7 +1082,7 @@ fn sql_insert_admission_witness_counters_observe_successful_boundaries() {
     });
     Relational::sql_insert_test_reset();
     assert_eq!(
-        execute(&mut state, &insert, &[], None, &mut || false)
+        execute(&mut state, &insert, &[], None, &None, &mut || false)
             .unwrap()
             .affected,
         2

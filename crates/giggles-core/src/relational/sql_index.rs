@@ -10,20 +10,6 @@ pub(super) struct CreateIndex {
     pub if_not_exists: bool,
 }
 
-fn name(p: &mut Parser) -> R<String> {
-    match p.tokens.get(p.at) {
-        Some(Token::QuotedIdent(value)) => {
-            if value.bytes().any(|b| b.is_ascii_uppercase()) || ident(value).is_err() {
-                return Err(SqlError::Unsupported);
-            }
-            let value = value.clone();
-            p.at += 1;
-            Ok(value)
-        }
-        _ => p.name(),
-    }
-}
-
 pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     p.need("create")?;
     let unique = p.word("unique");
@@ -39,12 +25,12 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     let explicit_name = if p.word("on") {
         None
     } else {
-        let value = name(p)?;
+        let value = p.name()?;
         p.need("on")?;
         Some(value)
     };
     p.word("only");
-    let table = name(p)?;
+    let table = p.table_name()?;
     if p.word("using") && !p.word("btree") {
         return Err(SqlError::Unsupported);
     }
@@ -60,7 +46,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         ) {
             return Err(SqlError::Unsupported);
         }
-        columns.push(name(p)?);
+        columns.push(p.name()?);
         p.word("asc");
         if p.word("nulls") {
             if p.word("first") {
@@ -90,11 +76,12 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     let name = match explicit_name {
         Some(value) => value,
         None => {
-            let mut column_part = columns.join("_");
-            let available = 63usize.saturating_sub(table.len() + 5);
-            column_part.truncate(available);
-            let value = format!("{table}_{column_part}_idx");
-            ident(&value).map_err(|_| SqlError::Unsupported)?;
+            let table_part = ident::truncate(&table, 58);
+            let available = 63usize.saturating_sub(table_part.len() + 5);
+            let column_part = columns.join("_");
+            let column_part = ident::truncate(&column_part, available);
+            let value = format!("{table_part}_{column_part}_idx");
+            ident(&value)?;
             value
         }
     };

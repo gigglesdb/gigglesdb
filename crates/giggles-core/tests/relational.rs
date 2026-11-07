@@ -422,12 +422,16 @@ fn strict_rejection_matrix_and_resource_bounds() {
     ] {
         err(&mut s, q, E::Reserved);
     }
+    assert!(
+        run(&mut s, "SELECT * FROM public.safe LIMIT 1")
+            .rows
+            .is_empty()
+    );
     run(&mut s, "CREATE TABLE decimals (id DECIMAL PRIMARY KEY)");
     for q in [
         "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
-        "SELECT * FROM public.safe LIMIT 1",
         "SELECT * FROM safe -- hi",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
         "UPDATE safe SET n=n+1 WHERE id=1",
@@ -435,8 +439,12 @@ fn strict_rejection_matrix_and_resource_bounds() {
     ] {
         err(&mut s, q, E::Unsupported);
     }
-    for q in [
+    err(
+        &mut s,
         "CREATE TABLE dup (id BIGINT, id TEXT, PRIMARY KEY(id))",
+        E::DuplicateColumn,
+    );
+    for q in [
         "CREATE TABLE dup (id BIGINT, PRIMARY KEY(id,id))",
         "INSERT INTO safe (id,id) VALUES(1,2)",
     ] {

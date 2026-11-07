@@ -455,7 +455,7 @@ async fn configuration_functions_literals_aliases_null_missing_and_transaction_l
 #[tokio::test]
 async fn public_qualified_names_are_core_gap_until_e1_a3() {
     // Flip to true when E1 WO-A3 (public./"public". qualifiers, GD-0059) lands.
-    const PUBLIC_QUALIFIED_SUPPORTED: bool = false;
+    const PUBLIC_QUALIFIED_SUPPORTED: bool = true;
     let f = Fixture::new().await;
     let c = f.client().await;
     c.simple_query(PREAMBLE).await.unwrap();

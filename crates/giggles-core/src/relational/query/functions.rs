@@ -86,22 +86,17 @@ impl Scalar {
         }
         Ok(value)
     }
-    // Routine names alone admit quoted identifiers; object names still use Parser::name.
+    // Preserve quotedness for SQL construct dispatch and truncate names without
+    // applying the stored-object reservation policy to builtin routines.
     fn routine_name(p: &mut Parser) -> R<(String, bool)> {
-        let result = match p.tokens.get(p.at) {
-            Some(Token::Word(n)) => (n.clone(), false),
-            Some(Token::QuotedIdent(n)) => (n.clone(), true),
-            Some(
-                Token::String(_)
-                | Token::Number(_)
-                | Token::Param(_)
-                | Token::Symbol(_)
-                | Token::Op(_),
-            )
-            | None => return Err(SqlError::Syntax),
+        let (name, quoted) = match p.tokens.get(p.at) {
+            Some(Token::Word(name)) => (name, false),
+            Some(Token::QuotedIdent(name)) => (name, true),
+            _ => return Err(SqlError::Syntax),
         };
+        let name = super::super::ident::truncate(name, 63).to_owned();
         p.at += 1;
-        Ok(result)
+        Ok((name, quoted))
     }
     fn primary_context(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         if depth > 32 {
@@ -157,12 +152,18 @@ impl Scalar {
                 }
                 p.punct('(')?;
                 if name == "position" && !qualified_call && !quoted {
-                    if matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',' | '*'))) {
+                    if matches!(
+                        p.tokens.get(p.at),
+                        None | Some(Token::Symbol(')' | ',' | '*'))
+                    ) {
                         return Err(SqlError::Syntax);
                     }
                     let needle = Self::parse_context(p, depth + 1, aggregate_argument)?;
                     p.need("in")?;
-                    if matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',' | '*'))) {
+                    if matches!(
+                        p.tokens.get(p.at),
+                        None | Some(Token::Symbol(')' | ',' | '*'))
+                    ) {
                         return Err(SqlError::Syntax);
                     }
                     let source = Self::parse_context(p, depth + 1, aggregate_argument)?;
@@ -183,7 +184,10 @@ impl Scalar {
                 let mut args = vec![];
                 if name == "extract" && !qualified_call && !quoted {
                     let field = match p.tokens.get(p.at).cloned() {
-                        Some(Token::Word(f) | Token::String(f)) => f,
+                        Some(Token::Word(f) | Token::QuotedIdent(f)) => {
+                            super::super::ident::truncate(&f, 63).to_owned()
+                        }
+                        Some(Token::String(f)) => f,
                         _ => return Err(SqlError::Syntax),
                     };
                     p.at += 1;

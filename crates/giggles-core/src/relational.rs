@@ -1,11 +1,15 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+mod ident;
+use ident::ident;
 mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
+mod returning;
 mod scan;
+use returning::Returning;
 // Candidate codec/read APIs await later internal release.
 #[allow(dead_code)]
 pub(crate) mod secondary_index;
@@ -143,6 +147,20 @@ pub enum SqlError {
     InvalidTextRepresentation,
     SubstringError,
     CharacterNotInRepertoire,
+    DuplicateTable,
+    DuplicateColumn,
+    DuplicateObject,
+    UndefinedObject,
+    CheckViolation,
+    ForeignKeyViolation,
+    DependentObjects,
+    GeneratedAlways,
+    ObjectNotInPrerequisiteState,
+    SequenceLimit,
+    NoActiveTransaction,
+    InvalidSavepoint,
+    InvalidForeignKey,
+    InvalidSchema,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,38 +297,6 @@ fn allocate(n: &mut u64) -> R<u64> {
     let id = *n;
     *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
     Ok(id)
-}
-fn ident(s: &str) -> R<()> {
-    if s.is_empty()
-        || s.len() > 63
-        || !s.as_bytes()[0].is_ascii_alphabetic()
-        || !s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-    {
-        return Err(SqlError::Syntax);
-    }
-    if [
-        "deliveries",
-        "giggles",
-        "system",
-        "information_schema",
-        "pg_catalog",
-        "repair",
-        "internal",
-        "tasks",
-        "operations",
-        "approvals",
-        "receipts",
-    ]
-    .contains(&s)
-        || s.starts_with("giggles_")
-        || s.starts_with("system_")
-        || s.starts_with("pg_")
-        || s.starts_with("repair_")
-        || s.starts_with("internal_")
-    {
-        return Err(SqlError::Reserved);
-    }
-    Ok(())
 }
 fn check(v: &Value, c: &ColumnDef) -> R<()> {
     if *v == Value::Null {
@@ -501,10 +487,12 @@ fn lex(s: &str) -> R<Vec<Token>> {
             out.push(Token::QuotedIdent(
                 String::from_utf8(v).map_err(|_| SqlError::Syntax)?,
             ));
-        } else if c.is_ascii_alphabetic() || c == b'_' {
+        } else if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
             let start = i;
             i += 1;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80)
+            {
                 i += 1;
             }
             out.push(Token::Word(s[start..i].to_ascii_lowercase()));
@@ -600,6 +588,7 @@ enum Statement {
         name: String,
         columns: Vec<String>,
         values: Vec<Expr>,
+        returning: Option<Returning>,
     },
     Select {
         name: String,
@@ -612,10 +601,12 @@ enum Statement {
         name: String,
         sets: Vec<(String, Expr)>,
         predicates: Vec<Predicate>,
+        returning: Option<Returning>,
     },
     Delete {
         name: String,
         predicates: Vec<Predicate>,
+        returning: Option<Returning>,
     },
     Begin,
     Commit,
@@ -657,16 +648,6 @@ impl Parser {
             Err(SqlError::Syntax)
         }
     }
-    fn name(&mut self) -> R<String> {
-        if let Some(Token::Word(s)) = self.tokens.get(self.at) {
-            let s = s.clone();
-            ident(&s)?;
-            self.at += 1;
-            Ok(s)
-        } else {
-            Err(SqlError::Syntax)
-        }
-    }
     fn expr(&mut self) -> R<Expr> {
         let t = self.tokens.get(self.at).cloned().ok_or(SqlError::Syntax)?;
         self.at += 1;
@@ -696,13 +677,16 @@ impl Parser {
         self.punct(')')?;
         Ok(v)
     }
-    fn predicates(&mut self) -> R<Vec<Predicate>> {
+    fn predicates(&mut self, table: &str) -> R<Vec<Predicate>> {
         let mut out = vec![];
         if !self.word("where") {
             return Ok(out);
         }
         loop {
-            let column = self.name()?;
+            let (relation, column) = self.qualified_name()?;
+            if relation.as_deref().is_some_and(|name| name != table) {
+                return Err(SqlError::UnknownTable);
+            }
             let Some(Token::Op(op)) = self.tokens.get(self.at).cloned() else {
                 return Err(SqlError::Syntax);
             };
@@ -731,7 +715,7 @@ impl Parser {
         }
         let st = if self.word("create") {
             self.need("table")?;
-            let name = self.name()?;
+            let name = self.create_table_name()?;
             self.punct('(')?;
             let mut columns = vec![];
             let mut keys = vec![];
@@ -813,7 +797,7 @@ impl Parser {
             }
         } else if self.word("insert") {
             self.need("into")?;
-            let name = self.name()?;
+            let name = self.table_name()?;
             let columns = if self.tokens.get(self.at) == Some(&Token::Symbol('(')) {
                 self.names()?
             } else {
@@ -826,13 +810,15 @@ impl Parser {
                 values.push(self.expr()?);
             }
             self.punct(')')?;
+            let returning = Returning::parse(self, &name)?;
             Statement::Insert {
                 name,
                 columns,
                 values,
+                returning,
             }
         } else if self.word("update") {
-            let name = self.name()?;
+            let name = self.table_name()?;
             self.need("set")?;
             let mut sets = vec![];
             loop {
@@ -846,17 +832,24 @@ impl Parser {
                     break;
                 }
             }
-            let predicates = self.predicates()?;
+            let predicates = self.predicates(&name)?;
+            let returning = Returning::parse(self, &name)?;
             Statement::Update {
                 name,
                 sets,
                 predicates,
+                returning,
             }
         } else if self.word("delete") {
             self.need("from")?;
-            let name = self.name()?;
-            let predicates = self.predicates()?;
-            Statement::Delete { name, predicates }
+            let name = self.table_name()?;
+            let predicates = self.predicates(&name)?;
+            let returning = Returning::parse(self, &name)?;
+            Statement::Delete {
+                name,
+                predicates,
+                returning,
+            }
         } else if self.word("begin") {
             Statement::Begin
         } else if self.word("start") {
@@ -952,13 +945,18 @@ impl Prepared {
     ) -> R<Self> {
         // These names did not pass through a text parser. Require canonical
         // spelling before applying the shared reserved/definition checks.
-        if name.bytes().any(|byte| byte.is_ascii_uppercase())
-            || columns
-                .iter()
-                .any(|column| column.name.bytes().any(|byte| byte.is_ascii_uppercase()))
-            || keys
-                .iter()
-                .any(|key| key.bytes().any(|byte| byte.is_ascii_uppercase()))
+        let native_name = |value: &str| {
+            value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        };
+        if !native_name(&name)
+            || columns.iter().any(|column| !native_name(&column.name))
+            || keys.iter().any(|key| !native_name(key))
         {
             return Err(SqlError::Syntax);
         }
@@ -1050,6 +1048,7 @@ impl Prepared {
                 name: table.name.clone(),
                 columns: vec![],
                 values: values.into_iter().map(Expr::Literal).collect(),
+                returning: None,
             },
             domain,
             state.epoch,
@@ -1095,6 +1094,7 @@ impl Prepared {
                 name: table.name.clone(),
                 sets,
                 predicates,
+                returning: None,
             },
             domain,
             state.epoch,
@@ -1115,6 +1115,7 @@ impl Prepared {
             Statement::Delete {
                 name: table.name.clone(),
                 predicates,
+                returning: None,
             },
             domain,
             state.epoch,
@@ -1125,7 +1126,7 @@ impl Prepared {
             return Err(SqlError::StaleSchema);
         }
         if let Statement::InsertExpressions(values) = &self.statement {
-            return values.validate_constants(state, self.params);
+            return returning::validate_insert_constants(values, state, self.params);
         }
         if let Statement::Query(q) = &self.statement {
             return q.bind(state, self.params)?.validate_immutable_constants();
@@ -1140,7 +1141,7 @@ impl Prepared {
             return insert.describe(state, self.params);
         }
         if let Statement::InsertExpressions(values) = &self.statement {
-            return values.describe(state, self.params);
+            return returning::describe_insert(values, state, self.params);
         }
         if let Statement::Query(q) = &self.statement {
             return q.bind(state, self.params).map(|b| b.description());
@@ -1221,6 +1222,13 @@ impl Prepared {
                 }
                 _ => {}
             }
+        }
+        if let Some(returning) = self.returning() {
+            let (columns, parameters) = returning.describe(state, params)?;
+            return Ok(Description {
+                columns,
+                parameters,
+            });
         }
         Ok(Description {
             parameters: params
@@ -1727,6 +1735,8 @@ impl Relational {
         }
         // Bound parameters even if a statement affects no rows.
         payload_bound(params.iter())?;
+        let returning = returning::Plan::new(prepared, self, params)?;
+        let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.
         let normalized;
         let prepared = if let Statement::InsertExpressions(values) = &prepared.statement {
@@ -1736,7 +1746,8 @@ impl Relational {
             if cancel() {
                 return Err(SqlError::Aborted);
             }
-            let output = values.evaluate(self, prepared.params, params, &mut cancel)?;
+            let output =
+                returning::evaluate_insert(values, self, prepared.params, params, &mut cancel)?;
             normalized = Prepared {
                 domain: prepared.domain,
                 epoch: prepared.epoch,
@@ -1746,6 +1757,7 @@ impl Relational {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
                     values: output,
+                    returning: values.returning.clone(),
                 },
             };
             &normalized
@@ -1758,11 +1770,20 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                return q.bind(self, prepared.params)?.execute(self, params, &mut cancel);
+                return q
+                    .bind(self, prepared.params)?
+                    .execute(self, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
             Statement::InsertMulti(insert) => {
-                return sql_insert::execute(self, insert, params, expected, &mut cancel);
+                return sql_insert::execute(
+                    self,
+                    insert,
+                    params,
+                    expected,
+                    &returning,
+                    &mut cancel,
+                );
             }
             Statement::CreateIndex(index) => {
                 if expected.is_some() {
@@ -1804,13 +1825,19 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 if self.tables.contains_key(name) {
-                    return Err(SqlError::Duplicate);
+                    return Err(SqlError::DuplicateTable);
                 }
                 if self.tables.len() >= MAX_TABLES
                     || columns.is_empty()
                     || columns.len() > MAX_COLUMNS
                 {
                     return Err(SqlError::Limit);
+                }
+                let mut column_names = BTreeSet::new();
+                for column in columns {
+                    if !column_names.insert(&column.name) {
+                        return Err(SqlError::DuplicateColumn);
+                    }
                 }
                 validate_create_definition(name, columns, keys)?;
                 let mut next_id = self.next_id;
@@ -1847,6 +1874,7 @@ impl Relational {
                 name,
                 columns,
                 values,
+                ..
             } => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
@@ -1899,6 +1927,7 @@ impl Relational {
                     values: row,
                     version,
                 };
+                returned_rows = returning::project(&returning, self, params, &[&row])?;
                 result = self.secondary_apply_statement(
                     table_id,
                     None,
@@ -2000,6 +2029,7 @@ impl Relational {
                 name,
                 sets,
                 predicates,
+                ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let b = bounds(t, predicates, params)?;
@@ -2035,6 +2065,7 @@ impl Relational {
                     row_check(t, &row.values)?;
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
+                    returned_rows = returning::project(&returning, self, params, &[&row])?;
                     // Witness cloning is admitted by secondary_admit_mutation before
                     // expression/row construction; stage checks its exact raw value.
                     let old = old.clone();
@@ -2055,7 +2086,9 @@ impl Relational {
                     )?;
                 }
             }
-            Statement::Delete { name, predicates } => {
+            Statement::Delete {
+                name, predicates, ..
+            } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let b = bounds(t, predicates, params)?;
                 if !b.point {
@@ -2069,6 +2102,12 @@ impl Relational {
                 {
                     return Err(SqlError::Version);
                 }
+                returned_rows = returning::project(
+                    &returning,
+                    self,
+                    params,
+                    &old.into_iter().collect::<Vec<_>>(),
+                )?;
                 let old = old.cloned();
                 result = self.secondary_apply_statement(
                     table_id,
@@ -2080,6 +2119,7 @@ impl Relational {
             }
             _ => return Err(SqlError::Transaction),
         }
+        returning::attach(&returning, &mut result, returned_rows);
         Ok(result)
     }
 }

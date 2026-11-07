@@ -5,6 +5,8 @@ use super::*;
 pub(in super::super) struct InsertExpressions {
     pub(in super::super) name: String,
     pub(in super::super) columns: Vec<String>,
+    pub(in super::super) returning: Option<Returning>,
+    pub(in super::super) parameter_map: Option<Vec<usize>>,
     values: Vec<Scalar>,
 }
 struct BoundValues {
@@ -84,7 +86,7 @@ impl InsertExpressions {
     pub(in super::super) fn parse(p: &mut Parser) -> R<Self> {
         p.need("insert")?;
         p.need("into")?;
-        let name = p.name()?;
+        let name = p.table_name()?;
         let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
             p.names()?
         } else {
@@ -92,6 +94,7 @@ impl InsertExpressions {
         };
         p.need("values")?;
         p.punct('(')?;
+        let values_start = p.at;
         let mut values = vec![];
         loop {
             if values.len() == MAX_COLUMNS {
@@ -106,6 +109,38 @@ impl InsertExpressions {
             }
         }
         p.punct(')')?;
+        let values_end = p.at;
+        let returning = Returning::parse(p, &name)?;
+        // The established VALUES binder takes dense input slots. Carry the
+        // original slot IDs so RETURNING can add independently typed inputs.
+        let parameter_map = if returning.is_some() {
+            let map = p.tokens[values_start..values_end]
+                .iter()
+                .filter_map(|token| {
+                    if let Token::Param(n) = token {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            fn remap(value: &mut Scalar, map: &[usize]) {
+                match value {
+                    Scalar::Param(n) => *n = map.binary_search(n).unwrap() + 1,
+                    Scalar::Cast(value, _) => remap(value, map),
+                    Scalar::Call(_, args) => args.iter_mut().for_each(|arg| remap(arg, map)),
+                    Scalar::SubstringOrder(args) => args.iter_mut().for_each(|arg| remap(arg, map)),
+                    _ => {}
+                }
+            }
+            values.iter_mut().for_each(|value| remap(value, &map));
+            Some(map)
+        } else {
+            None
+        };
+
         p.sym(';');
         if p.at != p.tokens.len() {
             return Err(SqlError::Unsupported);
@@ -114,6 +149,8 @@ impl InsertExpressions {
             name,
             columns,
             values,
+            returning,
+            parameter_map,
         })
     }
     fn literals(&self) -> Literals<'_> {

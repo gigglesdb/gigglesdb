@@ -106,6 +106,20 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidTextRepresentation => 26,
                 relational::SqlError::SubstringError => 27,
                 relational::SqlError::CharacterNotInRepertoire => 28,
+                relational::SqlError::DuplicateTable => 29,
+                relational::SqlError::DuplicateColumn => 30,
+                relational::SqlError::DuplicateObject => 31,
+                relational::SqlError::UndefinedObject => 32,
+                relational::SqlError::CheckViolation => 33,
+                relational::SqlError::ForeignKeyViolation => 34,
+                relational::SqlError::DependentObjects => 35,
+                relational::SqlError::GeneratedAlways => 36,
+                relational::SqlError::ObjectNotInPrerequisiteState => 37,
+                relational::SqlError::SequenceLimit => 38,
+                relational::SqlError::NoActiveTransaction => 39,
+                relational::SqlError::InvalidSavepoint => 40,
+                relational::SqlError::InvalidForeignKey => 41,
+                relational::SqlError::InvalidSchema => 42,
             }
         }
     };

@@ -8,6 +8,7 @@ pub(super) struct Insert {
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
     conflict: Option<Conflict>,
+    pub(super) returning: Option<returning::Returning>,
 }
 #[derive(Debug, Clone)]
 struct Conflict {
@@ -84,24 +85,12 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
     }
     false
 }
-fn name(p: &mut Parser) -> R<String> {
-    match p.tokens.get(p.at) {
-        Some(Token::QuotedIdent(value)) => {
-            if value.bytes().any(|byte| byte.is_ascii_uppercase()) || ident(value).is_err() {
-                return Err(SqlError::Unsupported);
-            }
-            let value = value.clone();
-            p.at += 1;
-            Ok(value)
-        }
-        _ => p.name(),
-    }
-}
+
 fn names(p: &mut Parser) -> R<Vec<String>> {
     p.punct('(')?;
-    let mut names = vec![name(p)?];
+    let mut names = vec![p.name()?];
     while p.sym(',') {
-        names.push(name(p)?);
+        names.push(p.name()?);
     }
     p.punct(')')?;
     Ok(names)
@@ -125,7 +114,7 @@ fn unsupported_or_syntax(p: &Parser) -> SqlError {
 pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     p.need("insert")?;
     p.need("into")?;
-    let table = name(p)?;
+    let table = p.table_name()?;
     let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
         names(p)?
     } else {
@@ -160,7 +149,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             columns = Some(names(p)?);
         } else if p.word("on") {
             p.need("constraint")?;
-            constraint = Some(name(p)?);
+            constraint = Some(p.name()?);
         }
         p.need("do")?;
         let update = if p.word("nothing") {
@@ -173,7 +162,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             p.need("set")?;
             let mut sets = Vec::new();
             loop {
-                let column = name(p)?;
+                let column = p.name()?;
                 if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
                     return Err(SqlError::Syntax);
                 }
@@ -198,6 +187,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     } else {
         None
     };
+    let returning = returning::Returning::parse(p, &table)?;
     p.sym(';');
     if p.at != p.tokens.len() {
         return Err(unsupported_or_syntax(p));
@@ -207,6 +197,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         columns,
         rows,
         conflict,
+        returning,
     })
 }
 fn operand(p: &mut Parser, table: &str) -> R<Operand> {
@@ -218,21 +209,15 @@ fn operand(p: &mut Parser, table: &str) -> R<Operand> {
     {
         return value(p).map(Operand::Value);
     }
-    let first = name(p)?;
-    let (source, field) = if p.sym('.') {
-        let source = if first == "excluded" {
-            ConflictSource::Incoming
-        } else if first == table {
-            ConflictSource::Existing
-        } else {
-            return Err(SqlError::Unsupported);
-        };
-        (source, name(p)?)
-    } else {
-        if first == "default" {
-            return Err(SqlError::Unsupported);
-        }
-        (ConflictSource::Existing, first)
+    if p.word("default") {
+        return Err(SqlError::Unsupported);
+    }
+    let (relation, field) = p.qualified_name()?;
+    let source = match relation.as_deref() {
+        Some("excluded") => ConflictSource::Incoming,
+        Some(name) if name == table => ConflictSource::Existing,
+        Some(_) => return Err(SqlError::Unsupported),
+        None => ConflictSource::Existing,
     };
     Ok(Operand::Field(source, field))
 }
@@ -415,6 +400,13 @@ impl Insert {
             if let Some(guard) = &update.guard {
                 infer_condition(guard, table, &mut parameters)?;
             }
+        }
+        if let Some(returning) = &self.returning {
+            let (columns, parameters) = returning.describe(state, parameters)?;
+            return Ok(Description {
+                columns,
+                parameters,
+            });
         }
         Ok(Description {
             parameters: parameters
@@ -715,6 +707,7 @@ pub(super) fn execute(
     insert: &Insert,
     params: &[Value],
     expected: Option<u64>,
+    returning: &Option<returning::Plan<'_>>,
     cancel: &mut dyn FnMut() -> bool,
 ) -> R<SqlResult> {
     if cancel() {
@@ -813,41 +806,72 @@ pub(super) fn execute(
                     .collect::<R<Vec<_>>>()?,
             },
         };
-        return state.sql_conflict_engine(
-            &table,
-            (conflict.columns.as_deref(), conflict.constraint.as_deref()),
-            &incoming,
-            &action,
-            cancel,
-        );
+        let mut result = if returning.is_some() {
+            state.sql_conflict_engine_projected(
+                &table,
+                (conflict.columns.as_deref(), conflict.constraint.as_deref()),
+                &incoming,
+                &action,
+                Some(&mut |source, rows| returning::project(returning, source, params, rows)),
+                cancel,
+            )?
+        } else {
+            state.sql_conflict_engine(
+                &table,
+                (conflict.columns.as_deref(), conflict.constraint.as_deref()),
+                &incoming,
+                &action,
+                cancel,
+            )?
+        };
+        let rows = std::mem::take(&mut result.rows);
+        returning::attach(returning, &mut result, rows);
+        return Ok(result);
     }
     let mut next_version = state.next_version_engine();
+    // Heap tables take their hidden row id from a version allocated in VALUES order.
     let mut proposed = if let Some(hidden) = hidden_rowid {
         incoming
             .into_iter()
-            .map(|mut values| {
+            .enumerate()
+            .map(|(input, mut values)| {
                 let version = allocate(&mut next_version)?;
                 values[hidden] = Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
-                Ok((pk(&table, &values)?, SqlRow { values, version }))
+                Ok((pk(&table, &values)?, SqlRow { values, version }, input))
             })
             .collect::<R<Vec<_>>>()?
     } else {
-        let mut proposed = incoming
+        incoming
             .into_iter()
-            .map(|values| Ok((pk(&table, &values)?, SqlRow { values, version: 0 })))
-            .collect::<R<Vec<_>>>()?;
-        proposed.sort_by(|left, right| left.0.cmp(&right.0));
-        for (_, row) in &mut proposed {
+            .enumerate()
+            .map(|(input, values)| Ok((pk(&table, &values)?, SqlRow { values, version: 0 }, input)))
+            .collect::<R<Vec<_>>>()?
+    };
+    // Project RETURNING in VALUES order, after hidden row ids exist and before the key sort.
+    let mut returned = if returning.is_some() {
+        returning::project(
+            returning,
+            state,
+            params,
+            &proposed.iter().map(|(_, row, _)| row).collect::<Vec<_>>(),
+        )?
+    } else {
+        vec![]
+    };
+    proposed.sort_by(|left, right| left.0.cmp(&right.0));
+    if hidden_rowid.is_none() {
+        for (_, row, _) in &mut proposed {
             row.version = allocate(&mut next_version)?;
         }
-        proposed
-    };
-    if hidden_rowid.is_some() {
-        proposed.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    for (_, row, input) in &proposed {
+        if let Some(projected) = returned.get_mut(*input) {
+            projected.version = row.version;
+        }
     }
     let changes = proposed
         .iter()
-        .map(|(key, row)| BatchRowChange {
+        .map(|(key, row, _)| BatchRowChange {
             table: table.id,
             old: None,
             new: Some((key, row)),
@@ -855,7 +879,10 @@ pub(super) fn execute(
         .collect::<Vec<_>>();
     #[cfg(test)]
     Relational::sql_insert_test_event(4);
-    state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)
+    let mut result =
+        state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)?;
+    returning::attach(returning, &mut result, returned);
+    Ok(result)
 }
 
 #[cfg(test)]

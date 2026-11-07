@@ -306,22 +306,81 @@ async fn sql_upsert_plain_duplicate_sqlstate_and_atomicity() {
 }
 
 #[tokio::test]
-async fn sql_upsert_returning_unsupported_sqlstate() {
+async fn sql_upsert_returning_rows() {
     let f = SqlUpsertFixture::new().await;
     let (client, connection) = f.client().await;
-    for query in [
-        "INSERT INTO app (id, body) VALUES (1, 'one'), (2, 'two') RETURNING id",
-        "INSERT INTO app (id, body) VALUES (1, 'one') ON CONFLICT DO NOTHING RETURNING id",
-    ] {
-        assert_eq!(code(client.simple_query(query).await.unwrap_err()), "0A000");
-        assert!(
-            client
-                .query("SELECT id FROM app LIMIT 10", &[])
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
+    let insert = "INSERT INTO app (id, body) VALUES (2, 'two'), (1, 'one') RETURNING id, body";
+    client.batch_execute("BEGIN").await.unwrap();
+    let messages = client.simple_query(insert).await.unwrap();
+    let rows: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0).unwrap(), row.get(1).unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec![("2", "two"), ("1", "one")]);
+    let counts: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::CommandComplete(count) => Some(*count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, vec![2]);
+    client.batch_execute("ROLLBACK").await.unwrap();
+
+    let rows = client.query(insert, &[]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>(),
+        vec![(2, "two".to_owned()), (1, "one".to_owned())]
+    );
+
+    let rows = client
+        .query(
+            "INSERT INTO app (id, body) VALUES (1, 'uno'), (3, 'three') ON CONFLICT DO NOTHING RETURNING id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.get::<_, i64>(0)).collect::<Vec<_>>(),
+        vec![3]
+    );
+
+    let rows = client
+        .query(
+            "INSERT INTO app (id, body) VALUES (1, 'uno') ON CONFLICT (id) DO UPDATE SET body = excluded.body RETURNING id, body",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>(),
+        vec![(1, "uno".to_owned())]
+    );
+
+    let rows = client
+        .query("SELECT id, body FROM app ORDER BY id LIMIT 10", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "uno".to_owned()),
+            (2, "two".to_owned()),
+            (3, "three".to_owned()),
+        ]
+    );
     drop(client);
     connection.await.unwrap();
     f.stop().await;

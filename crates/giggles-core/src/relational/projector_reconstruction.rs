@@ -545,7 +545,7 @@ mod tests {
                 3 => bad_table.primary_key = vec![usize::MAX],
                 4 => bad_table.primary_key = vec![0, 0],
                 5 => bad_table.columns[0].not_null = false,
-                6 => bad_table.name = "bad-name".into(),
+                6 => bad_table.name = "bad\0name".into(),
                 7 => {
                     let (mut key, row) = bad_rows.pop_first().unwrap();
                     key.push(0);
