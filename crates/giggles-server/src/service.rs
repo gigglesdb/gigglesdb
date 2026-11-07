@@ -526,15 +526,15 @@ impl Session {
         self.authority_scope(|session| {
             session.authorize(p)?;
             let result = session.sql.execute_prepared(p, params, None)?;
-            if p.is_ddl() {
-                if let (Role::Database { name }, Some(table)) = (&session.role, p.table()) {
-                    session
-                        .service
-                        .admin
-                        .roles()
-                        .set_table_owner(table, name)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?;
-                }
+            if p.is_ddl()
+                && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
+            {
+                session
+                    .service
+                    .admin
+                    .roles()
+                    .set_table_owner(table, name)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?;
             }
             Ok(result)
         })
