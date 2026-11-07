@@ -70,6 +70,11 @@ or strip CR first. Before the compare-and-swap, check
 `git diff --cached --numstat <expected-old>`: a small edit that shows as a
 whole-file rewrite means CRLF blobs, so stop and fix them.
 
+Before reporting a landing, and before any index reset or K: sync, confirm
+that `git -C K:/Projects/gigglesdb rev-parse refs/heads/main` equals your new
+commit. A failed step earlier in the chain (for example an index.lock error)
+can skip the update-ref without stopping the script.
+
 After a successful compare-and-swap, run `git reset -q -- <committed paths>` so
 the shared index matches HEAD for those paths. Otherwise the shared index keeps
 the old content staged, and anyone's plain `git commit` reverts your work. Never
