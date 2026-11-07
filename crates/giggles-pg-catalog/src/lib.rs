@@ -70,13 +70,38 @@ pub struct IndexDef {
     pub columns: Vec<u64>,
     pub unique: bool,
 }
+/// Presentation metadata only; these flags do not implement role privileges or policies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDef {
+    pub oid: u32,
+    pub name: String,
+    pub superuser: bool,
+    pub login: bool,
+    pub createrole: bool,
+    pub createdb: bool,
+    pub inherit: bool,
+    pub replication: bool,
+    pub bypassrls: bool,
+    pub connlimit: i32,
+}
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
+/// Roles include exactly one bootstrap role (OID 10); predefined PostgreSQL roles
+/// are supplied by the catalog. Ownership references snapshot roles, with omitted
+/// table owners defaulting to OID 10. `user` independently controls current_user;
+/// none of this metadata establishes authentication, membership, or privileges.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     pub tables: Vec<TableDef>,
     pub indexes: Vec<IndexDef>,
     pub user: String,
     pub database: String,
+    /// All snapshot login and nonlogin roles, including exactly one OID 10.
+    /// Defaults to `giggles` (OID 10), all flags true and connlimit -1.
+    pub roles: Vec<RoleDef>,
+    /// Table ID to snapshot role OID; missing entries use OID 10. Empty by default.
+    pub table_owners: std::collections::BTreeMap<u64, u32>,
+    /// Owner of the current pg_database row (`datdba`); defaults to OID 10.
+    pub database_owner: u32,
 }
 impl Default for CatalogSnapshot {
     fn default() -> Self {
@@ -85,6 +110,20 @@ impl Default for CatalogSnapshot {
             indexes: Vec::new(),
             user: "giggles".into(),
             database: "giggles".into(),
+            roles: vec![RoleDef {
+                oid: 10,
+                name: "giggles".into(),
+                superuser: true,
+                login: true,
+                createrole: true,
+                createdb: true,
+                inherit: true,
+                replication: true,
+                bypassrls: true,
+                connlimit: -1,
+            }],
+            table_owners: std::collections::BTreeMap::new(),
+            database_owner: 10,
         }
     }
 }

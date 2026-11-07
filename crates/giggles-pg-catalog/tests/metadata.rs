@@ -224,7 +224,13 @@ fn datagrip_list_schemas() {
     );
     assert_eq!(
         r.rows[0],
-        vec![i(2200), Value::Null, s("public"), Value::Null, s("giggles")]
+        vec![
+            i(2200),
+            Value::Null,
+            s("public"),
+            Value::Null,
+            s("pg_database_owner")
+        ]
     );
 }
 #[test]
@@ -446,7 +452,7 @@ fn captured_datagrip_discovery_and_absent_features() {
     );
     assert_eq!(
         run(include_str!("fixtures/datagrip_superuser.sql")).rows,
-        vec![vec![Value::Bool(false)]]
+        vec![vec![Value::Bool(true)]]
     );
     for sql in [
         include_str!("fixtures/datagrip_existent_languages.sql"),

@@ -540,6 +540,12 @@ const ORACLE: &[OracleResult] = &[
 
 fn snapshot() -> CatalogSnapshot {
     CatalogSnapshot {
+        user: "postgres".into(),
+        database: "postgres".into(),
+        roles: vec![RoleDef {
+            name: "postgres".into(),
+            ..CatalogSnapshot::default().roles.remove(0)
+        }],
         tables: vec![TableDef {
             id: 7,
             name: "r0g_t".into(),
@@ -606,22 +612,7 @@ fn every_psql18_describe_query_matches_raw_postgres_results() {
             if names != *columns {
                 return Err(format!("columns {names:?}, expected {columns:?}"));
             }
-            // Role semantics are deferred to G1-d; execute and check all columns.
-            if tag.contains("\\du") {
-                return Ok(());
-            }
-            let keep: Vec<_> = columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, name)| {
-                    // Owner/rolname presentation identity is deferred to WO11/G1-d.
-                    // Single-database divergence: compare only the current database,
-                    // skipping its Name and Owner presentation cells.
-                    (!matches!(*name, "Owner" | "rolname")
-                        && !(tag.contains("\\l") && *name == "Name"))
-                        .then_some(i)
-                })
-                .collect();
+            let keep: Vec<_> = (0..columns.len()).collect();
             let actual: Vec<Vec<_>> = result
                 .rows
                 .iter()
@@ -644,6 +635,32 @@ fn every_psql18_describe_query_matches_raw_postgres_results() {
                         .collect()
                 })
                 .collect();
+            if tag.contains("\\du") {
+                let row = &result.rows[0];
+                let mut attributes = Vec::new();
+                for (column, label) in [
+                    (1, "Superuser"),
+                    (3, "Create role"),
+                    (4, "Create DB"),
+                    (8, "Replication"),
+                    (9, "Bypass RLS"),
+                ] {
+                    if row[column] == Value::Bool(true) {
+                        attributes.push(label);
+                    }
+                }
+                // Single rendered psql 18 row captured in g1b-psql-d/pg.out.
+                if text_value(&row[0]).as_deref() != Some("postgres")
+                    || attributes.join(", ")
+                        != "Superuser, Create role, Create DB, Replication, Bypass RLS"
+                {
+                    return Err(format!(
+                        "rendered role {:?}: {}",
+                        row[0],
+                        attributes.join(", ")
+                    ));
+                }
+            }
             if actual != expected {
                 return Err(format!("rows {actual:?}, expected {expected:?}"));
             }

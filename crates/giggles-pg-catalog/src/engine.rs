@@ -3458,11 +3458,11 @@ impl Runtime<'_> {
                 n == "ilike",
             )?),
             "pg_get_userbyid" => {
-                if integer(v[0].clone())? == 10 {
-                    S("giggles".into())
-                } else {
-                    N
-                }
+                let oid = integer(v[0].clone())?;
+                self.charge(self.snapshot.roles.len() + 16)?;
+                S(catalog::role_name(self.snapshot, oid)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("unknown (OID={oid})")))
             }
             "quote_ident" => {
                 let name = text(v[0].clone())?;

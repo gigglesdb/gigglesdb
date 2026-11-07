@@ -50,7 +50,7 @@ fn captured_expanded_global_discovery() {
     for (i, sql) in cases.iter().enumerate() {
         let r = run(sql, &[]);
         let expected = match i + 1 {
-            2 => 1,
+            2 => 17,
             5 => 1,
             11 => 2,
             _ => 0,

@@ -17,6 +17,37 @@ use Value::{Bool as B, Int as I, Null as N};
 fn s(v: &str) -> Value {
     Value::Text(v.into())
 }
+const PREDEFINED_ROLES: &[(u32, &str)] = &[
+    (3373, "pg_monitor"),
+    (3374, "pg_read_all_settings"),
+    (3375, "pg_read_all_stats"),
+    (3377, "pg_stat_scan_tables"),
+    (4200, "pg_signal_backend"),
+    (4544, "pg_checkpoint"),
+    (4550, "pg_use_reserved_connections"),
+    (4569, "pg_read_server_files"),
+    (4570, "pg_write_server_files"),
+    (4571, "pg_execute_server_program"),
+    (6171, "pg_database_owner"),
+    (6181, "pg_read_all_data"),
+    (6182, "pg_write_all_data"),
+    (6304, "pg_create_subscription"),
+    (6337, "pg_maintain"),
+    (6392, "pg_signal_autovacuum_worker"),
+];
+pub(crate) fn role_name(snapshot: &CatalogSnapshot, oid: i64) -> Option<&str> {
+    snapshot
+        .roles
+        .iter()
+        .find(|r| i64::from(r.oid) == oid)
+        .map(|r| r.name.as_str())
+        .or_else(|| {
+            PREDEFINED_ROLES
+                .iter()
+                .find(|(id, _)| i64::from(*id) == oid)
+                .map(|(_, name)| *name)
+        })
+}
 /// Injective OIDs in disjoint slots; oversized IDs fail instead of hashing/colliding.
 pub fn table_oid(id: u64) -> R<u32> {
     u32::try_from(
@@ -198,10 +229,17 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("datlocale", T::Text),
             ("daticurules", T::Text),
         ],
-        "pg_user" => &[
+        "pg_user" | "pg_shadow" => &[
             ("usename", T::Name),
             ("usesysid", T::Oid),
+            ("usecreatedb", T::Bool),
             ("usesuper", T::Bool),
+            ("userepl", T::Bool),
+            ("usebypassrls", T::Bool),
+            ("passwd", T::Text),
+            // No timestamptz descriptor exists; expiration is always NULL.
+            ("valuntil", T::Text),
+            ("useconfig", T::TextArray),
         ],
         // These engine features are absent. Their schemas are explicit, never catch-all empty tables.
         "pg_language" => &[
@@ -215,7 +253,6 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("lanacl", T::AclItemArray),
         ],
         "pg_roles" => &[
-            ("oid", T::Oid),
             ("rolname", T::Name),
             ("rolsuper", T::Bool),
             ("rolinherit", T::Bool),
@@ -224,15 +261,34 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("rolcanlogin", T::Bool),
             ("rolreplication", T::Bool),
             ("rolconnlimit", T::Int4),
+            ("rolpassword", T::Text),
             ("rolvaliduntil", T::Text),
             ("rolbypassrls", T::Bool),
             ("rolconfig", T::TextArray),
+            ("oid", T::Oid),
+        ],
+        "pg_authid" => &[
+            ("oid", T::Oid),
+            ("rolname", T::Name),
+            ("rolsuper", T::Bool),
+            ("rolinherit", T::Bool),
+            ("rolcreaterole", T::Bool),
+            ("rolcreatedb", T::Bool),
+            ("rolcanlogin", T::Bool),
+            ("rolreplication", T::Bool),
+            ("rolbypassrls", T::Bool),
+            ("rolconnlimit", T::Int4),
+            ("rolpassword", T::Text),
+            ("rolvaliduntil", T::Text),
         ],
         "pg_auth_members" => &[
+            ("oid", T::Oid),
             ("roleid", T::Oid),
             ("member", T::Oid),
             ("grantor", T::Oid),
             ("admin_option", T::Bool),
+            ("inherit_option", T::Bool),
+            ("set_option", T::Bool),
         ],
         "pg_timezone_names" => &[("name", T::Text), ("is_dst", T::Bool)],
         "pg_timezone_abbrevs" => &[("abbrev", T::Text), ("is_dst", T::Bool)],
@@ -572,6 +628,8 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_proc",
         "pg_event_trigger",
         "pg_roles",
+        "pg_authid",
+        "pg_shadow",
         "pg_auth_members",
         "pg_timezone_names",
         "pg_timezone_abbrevs",
@@ -616,15 +674,17 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_language" => 2612,
         "pg_proc" => 1255,
         "pg_event_trigger" => 3466,
-        "pg_user" => 12001,
-        "pg_roles" => 12002,
+        "pg_user" => 12014,
+        "pg_roles" => 12000,
+        "pg_authid" => 1260,
+        "pg_shadow" => 12005,
         "pg_auth_members" => 1261,
         "pg_timezone_names" => 12003,
         "pg_timezone_abbrevs" => 12004,
         "pg_tablespace" => 1213,
         "pg_foreign_data_wrapper" => 2328,
         "pg_foreign_server" => 1417,
-        "pg_user_mappings" => 12005,
+        "pg_user_mappings" => 12338,
         "pg_am" => 2601,
         "pg_extension" => 3079,
         "pg_depend" => 2608,
@@ -667,12 +727,33 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
     }
 }
 pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>> {
-    if snapshot.tables.len() > 128 {
+    if snapshot.tables.len() > 128 || snapshot.roles.len() > MAX_ROWS - PREDEFINED_ROLES.len() {
         return Err(Error::Limit);
     }
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
-    let mut input_bytes = 0;
+    let mut input_bytes = 0usize;
+    let mut role_ids = BTreeSet::new();
+    let mut role_names = BTreeSet::new();
+    for role in &snapshot.roles {
+        if role.name.is_empty()
+            || role.name.starts_with("pg_")
+            || PREDEFINED_ROLES.iter().any(|(oid, _)| *oid == role.oid)
+            || !role_ids.insert(role.oid)
+            || !role_names.insert(&role.name)
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        input_bytes = input_bytes
+            .checked_add(role.name.len())
+            .ok_or(Error::Limit)?;
+        if input_bytes > 65536 {
+            return Err(Error::Limit);
+        }
+    }
+    if !role_ids.contains(&10) || !role_ids.contains(&snapshot.database_owner) {
+        return Err(Error::InvalidSnapshot);
+    }
     for t in &snapshot.tables {
         if !ids.insert(t.id)
             || !names.insert(&t.name)
@@ -731,6 +812,13 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             return Err(Error::Limit);
         }
     }
+    if snapshot
+        .table_owners
+        .iter()
+        .any(|(table, owner)| !ids.contains(table) || !role_ids.contains(owner))
+    {
+        return Err(Error::InvalidSnapshot);
+    }
     let mut occupied = snapshot
         .tables
         .iter()
@@ -784,36 +872,95 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
-    for (id, name) in [(11, "pg_catalog"), (2200, "public")] {
+    for (id, name, owner) in [(11, "pg_catalog", 10), (2200, "public", 6171)] {
         // No PostgreSQL MVCC tuple exists: xmin is NULL, never a made-up transaction ID.
-        add("pg_namespace", vec![I(id), s(name), I(10), N, N]);
+        add("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
     }
     add(
         "pg_database",
-        vec![I(16384), s("giggles"), I(10), B(false), B(true), N],
-    );
-    add("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
-    add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
-    add("pg_user", vec![s("giggles"), I(10), B(false)]);
-    // One certificate-bound presentation identity; PostgreSQL role management,
-    // inheritance, expiration and role connection-limit policies do not exist.
-    add(
-        "pg_roles",
         vec![
-            I(10),
-            s("giggles"),
-            B(false),
-            B(false),
-            B(false),
+            I(16384),
+            s(&snapshot.database),
+            I(i64::from(snapshot.database_owner)),
             B(false),
             B(true),
-            B(false),
-            N,
-            N,
-            B(false),
             N,
         ],
     );
+    add("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
+    add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
+    // Snapshot flags and predefined identities are presentation metadata, not
+    // authentication, privileges, memberships, or enforced role policies.
+    let predefined = PREDEFINED_ROLES
+        .iter()
+        .map(|(oid, name)| RoleDef {
+            oid: *oid,
+            name: (*name).into(),
+            superuser: false,
+            login: false,
+            createrole: false,
+            createdb: false,
+            inherit: true,
+            replication: false,
+            bypassrls: false,
+            connlimit: -1,
+        })
+        .collect::<Vec<_>>();
+    for role in snapshot.roles.iter().chain(&predefined) {
+        add(
+            "pg_roles",
+            vec![
+                s(&role.name),
+                B(role.superuser),
+                B(role.inherit),
+                B(role.createrole),
+                B(role.createdb),
+                B(role.login),
+                B(role.replication),
+                I(i64::from(role.connlimit)),
+                s("********"),
+                N,
+                B(role.bypassrls),
+                N,
+                I(i64::from(role.oid)),
+            ],
+        );
+        // This finite catalog has no privilege model. Expose structural authid
+        // metadata to callers, but never accept, store, or expose password hashes.
+        add(
+            "pg_authid",
+            vec![
+                I(i64::from(role.oid)),
+                s(&role.name),
+                B(role.superuser),
+                B(role.inherit),
+                B(role.createrole),
+                B(role.createdb),
+                B(role.login),
+                B(role.replication),
+                B(role.bypassrls),
+                I(i64::from(role.connlimit)),
+                N,
+                N,
+            ],
+        );
+        if role.login {
+            let mut row = vec![
+                s(&role.name),
+                I(i64::from(role.oid)),
+                B(role.createdb),
+                B(role.superuser),
+                B(role.replication),
+                B(role.bypassrls),
+                s("********"),
+                N,
+                N,
+            ];
+            add("pg_user", row.clone());
+            row[6] = N;
+            add("pg_shadow", row);
+        }
+    }
     // No timezone conversion database exists. Startup timezone presentation
     // labels do not establish a PostgreSQL timezone catalog.
     // Catalog relations are genuine virtual tables, with their actual columns below.
@@ -843,7 +990,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         );
         add(
             "pg_type",
-            composite_row((32768 + oid) as u32, name, 11, oid),
+            composite_row((32768 + oid) as u32, name, 11, oid, 10),
         );
         for (i, f) in fs.iter().enumerate() {
             add(
@@ -952,6 +1099,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     for t in ordered_tables {
         let oid = table_oid(t.id)? as i64;
         let has_pk = !t.primary_key.is_empty();
+        let owner = i64::from(*snapshot.table_owners.get(&t.id).unwrap_or(&10));
         add(
             "pg_class",
             vec![
@@ -959,7 +1107,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 s(&t.name),
                 I(2200),
                 s("r"),
-                I(10),
+                I(owner),
                 I(t.columns.len() as i64),
                 B(has_pk || visible_indexes.iter().any(|i| i.table == t.id)),
                 s("p"),
@@ -975,7 +1123,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         );
         add(
             "pg_type",
-            composite_row((oid + 3) as u32, &t.name, 2200, oid),
+            composite_row((oid + 3) as u32, &t.name, 2200, oid, owner),
         );
         for (i, c) in t.columns.iter().enumerate() {
             let (ty, _, len, _) = scalar(c.data_type);
@@ -1021,7 +1169,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(n),
                     I(2200),
                     s("i"),
-                    I(10),
+                    I(owner),
                     I(t.primary_key.len() as i64),
                     B(false),
                     s("p"),
@@ -1133,7 +1281,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s(n),
                     I(2200),
                     s("i"),
-                    I(10),
+                    I(owner),
                     I(keys.len() as i64),
                     B(false),
                     s("p"),
@@ -1280,7 +1428,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
 fn type_len(t: PgType) -> i64 {
     t.type_size() as i64
 }
-fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64) -> Vec<Value> {
+fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64, owner: i64) -> Vec<Value> {
     vec![
         I(oid as i64),
         s(name),
@@ -1296,7 +1444,7 @@ fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64) -> Vec<Val
         I(0),
         I(0),
         s(","),
-        I(10),
+        I(owner),
         N,
         I(0),
         N,
