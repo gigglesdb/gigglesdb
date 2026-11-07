@@ -219,6 +219,14 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
     }
     frame(b'T', &b, out)
 }
+fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> &'static str {
+    match error {
+        giggles_pg_types::integer::IntegerError::Syntax => "22P02",
+        giggles_pg_types::integer::IntegerError::Range => "22003",
+        giggles_pg_types::integer::IntegerError::Limit => "54000",
+    }
+}
+
 pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
@@ -239,15 +247,20 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
                     _ => Err("22P02"),
                 }
             }
-            DataType::SmallInt => s
-                .parse::<i16>()
+            DataType::SmallInt | DataType::Integer | DataType::BigInt
+                if s.as_bytes().contains(&0) =>
+            {
+                Err("22P02")
+            }
+            DataType::SmallInt => giggles_pg_types::integer::parse_i16(s)
                 .map(|v| Value::Int(v.into()))
-                .map_err(|_| "22P02"),
-            DataType::Integer => s
-                .parse::<i32>()
+                .map_err(integer_input_error),
+            DataType::Integer => giggles_pg_types::integer::parse_i32(s)
                 .map(|v| Value::Int(v.into()))
-                .map_err(|_| "22P02"),
-            DataType::BigInt => s.parse::<i64>().map(Value::Int).map_err(|_| "22P02"),
+                .map_err(integer_input_error),
+            DataType::BigInt => giggles_pg_types::integer::parse_i64(s)
+                .map(Value::Int)
+                .map_err(integer_input_error),
             DataType::Numeric => giggles_pg_types::Numeric::parse(s)
                 .map(Value::Numeric)
                 .map_err(numeric_error),
@@ -299,10 +312,22 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
             DataType::Interval => giggles_core::relational::Interval::parse(s)
                 .map(Value::Interval)
                 .map_err(temporal_error),
+            DataType::Text if s.as_bytes().contains(&0) => Err("22021"),
             DataType::Text => Ok(Value::Text(s.into())),
-            DataType::Bytes => hex::decode(s.strip_prefix("\\x").ok_or("22P02")?)
-                .map(Value::Bytes)
-                .map_err(|_| "22P02"),
+            DataType::Bytes => {
+                use giggles_pg_types::bytea::{ByteaInputError as E, prepare_bytea_text};
+                let map_error = |error| match error {
+                    E::HexInvalidDigit | E::HexOddDigits => "22023",
+                    E::EscapeSyntax => "22P02",
+                    E::NulInput => "22021",
+                    E::OutputLimit | E::Allocation => "54000",
+                };
+                prepare_bytea_text(s, b.len())
+                    .map_err(map_error)?
+                    .decode()
+                    .map(Value::Bytes)
+                    .map_err(map_error)
+            }
         };
     }
     let temporal_size = match ty {
@@ -1618,3 +1643,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+
+#[cfg(test)]
+#[path = "pgwire_input_contract_tests.rs"]
+mod wire_input_contract_tests;

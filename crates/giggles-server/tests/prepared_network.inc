@@ -185,9 +185,9 @@ async fn prepared_task_range_signed_maximum_and_binary_malformed_widths() {
     let before = f.admin.snapshot().unwrap();
     let clock = f.admin.authority_metadata().unwrap();
     for (from, until, expected) in [
-        ("9223372036854775808", "9223372036854775809", "22P02"),
+        ("9223372036854775808", "9223372036854775809", "22003"),
         ("-9223372036854775808", "107", "22003"),
-        ("100", "18446744073709551615", "22P02"),
+        ("100", "18446744073709551615", "22003"),
     ] {
         pg_send(
             &mut s,
