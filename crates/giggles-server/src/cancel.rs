@@ -25,6 +25,22 @@ pub(crate) struct Backend {
     active: Mutex<Option<Cancellation>>,
 }
 impl Registry {
+    pub(crate) fn cancel_key(&self, prefix: &str, pid: u32, secret: u32) {
+        let Ok(entries) = self.0.lock() else { return };
+        let Some(backend) = entries.live.get(&pid).and_then(Weak::upgrade) else {
+            return;
+        };
+        if backend.secret != secret || !backend.fingerprint.starts_with(prefix) {
+            return;
+        }
+        if let Ok(active) = backend.active.lock()
+            && backend.open.load(Ordering::Acquire)
+            && let Some(context) = active.as_ref()
+        {
+            context.cancel();
+        }
+    }
+
     pub(crate) fn register(&self, fingerprint: &str, epoch: u64) -> io::Result<Arc<Backend>> {
         let mut entries = self
             .0
@@ -98,6 +114,36 @@ impl Drop for Active {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn key_cancellation_requires_namespace_secret_and_open_backend() {
+        let registry = Registry::default();
+        let backend = registry.register("pgrole:owner", 1).unwrap();
+        let agent = registry.register("agent-certificate-A", 1).unwrap();
+        let agent_active = agent.begin(true);
+        registry.cancel_key("pgrole:", agent.pid, agent.secret);
+        assert!(agent_active.context.check().is_ok());
+        registry.cancel_key("pgrole:", backend.pid, backend.secret); // idle
+        let active = backend.begin(true);
+        registry.cancel_key("native:", backend.pid, backend.secret);
+        registry.cancel_key("pgrole:", backend.pid, backend.secret ^ 1);
+        assert!(active.context.check().is_ok());
+        registry.cancel_key("pgrole:", backend.pid, backend.secret);
+        assert_eq!(
+            active.context.check(),
+            Err(giggles_core::CoreError::Cancelled)
+        );
+        drop(active);
+        let next = backend.begin(true);
+        backend.close();
+        registry.cancel_key("pgrole:", backend.pid, backend.secret);
+        assert!(next.context.check().is_ok());
+        drop(next);
+        let pid = backend.pid;
+        let secret = backend.secret;
+        drop(backend);
+        registry.cancel_key("pgrole:", pid, secret); // dead registration
+    }
+
     #[test]
     fn key_lifecycle_idle_wrong_binding_closed_and_fresh_context() {
         let registry = Registry::default();

@@ -52,3 +52,23 @@ pub fn client(
             .map_err(io::Error::other)?,
     ))
 }
+
+pub fn server_optional_client(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    ca: Option<Vec<CertificateDer<'static>>>,
+) -> io::Result<Arc<ServerConfig>> {
+    let builder = ServerConfig::builder();
+    let builder = match ca {
+        Some(ca) => builder.with_client_cert_verifier(
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(ca)?))
+                .allow_unauthenticated()
+                .build()
+                .map_err(io::Error::other)?,
+        ),
+        None => builder.with_no_client_auth(),
+    };
+    Ok(Arc::new(
+        builder.with_single_cert(chain, key).map_err(io::Error::other)?,
+    ))
+}

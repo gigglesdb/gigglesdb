@@ -398,6 +398,17 @@ impl Session {
     pub fn is_aborted(&self) -> bool {
         self.sql.is_aborted()
     }
+    /// Wire description of a prepared statement. DDL returns no rows and takes
+    /// no parameters; core does not describe it, so report an empty shape.
+    pub fn describe(&mut self, p: &Prepared) -> Result<relational::Description, CoreError> {
+        if p.is_ddl() {
+            return Ok(relational::Description {
+                parameters: vec![],
+                columns: vec![],
+            });
+        }
+        self.sql.describe(p)
+    }
     /// A coherent committed catalog restricted to this live SQL session authority.
     /// Active SQL snapshots must agree with every returned table definition;
     /// metadata never falls back to an unrestricted owner query.

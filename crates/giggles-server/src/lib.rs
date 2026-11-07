@@ -4,6 +4,7 @@ pub mod clock;
 mod pg_catalog_wire;
 mod pg_settings;
 pub mod pgwire;
+pub(crate) mod pgwire_startup;
 pub mod service;
 pub mod tls;
 pub mod transport;

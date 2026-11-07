@@ -98,7 +98,7 @@ fn ready(session: &Session, out: &mut Vec<u8>) -> R<()> {
 pub fn error(code: &str, out: &mut Vec<u8>) {
     error_message(code, "request rejected; consult documented code", out);
 }
-fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
+pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>) {
     diagnostic_error(code, message, None, out);
 }
 #[derive(Default)]
@@ -368,7 +368,7 @@ impl Statement {
                 }
                 Ok(self.d.clone())
             }
-            Plan::Sql(p) => core(session.sql.describe(p)),
+            Plan::Sql(p) => core(session.describe(p)),
             Plan::Task(_)
             | Plan::Empty
             | Plan::Settings(_)
@@ -637,7 +637,7 @@ impl State {
                         complete("ROLLBACK", &result, out)?;
                     } else {
                         let p = core(session.prepare(&sql))?;
-                        let d = core(session.sql.describe(&p))?;
+                        let d = core(session.describe(&p))?;
                         let result = core(session.execute_prepared(&p, &[]))?;
                         self.settings.transaction(
                             was_transaction,
@@ -743,7 +743,7 @@ impl State {
                 } else {
                     self.diagnostic.phase = "application prepare";
                     let p = core(session.prepare(&sql))?;
-                    let d = core(session.sql.describe(&p))?;
+                    let d = core(session.describe(&p))?;
                     (Plan::Sql(Box::new(p)), d)
                 };
                 if n > d.parameters.len() {
@@ -1131,23 +1131,13 @@ async fn send<S: AsyncWrite + Unpin>(s: &mut S, b: &[u8]) -> io::Result<()> {
 }
 pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-    mut session: Session,
+    session: Session,
 ) -> io::Result<()> {
-    let blocking = session.service.blocking.clone();
+    use crate::pgwire_startup::{StartupPolicy, parse_startup, read_startup_packet, reject_startup};
     if !session.service.admission.request() {
         return Ok(());
     }
-    let startup = timeout(IO_TIMEOUT, async {
-        let n = s.read_u32().await?;
-        if !(8..=8192).contains(&n) {
-            return Err(io::Error::other("startup limit"));
-        }
-        let mut b = vec![0; n as usize - 4];
-        s.read_exact(&mut b).await?;
-        Ok(b)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let startup = read_startup_packet(s).await?;
     // SSLRequest and mandatory mTLS already completed, including role binding.
     if startup.len() == 12 && startup[..4] == 80877102u32.to_be_bytes() {
         let pid = u32::from_be_bytes(startup[4..8].try_into().unwrap());
@@ -1155,103 +1145,27 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         session.service.cancel_bound(&session, pid, secret);
         return Ok(());
     }
-    let mut reason = "malformed PostgreSQL startup packet";
-    let mut timezone = String::from("UTC");
-    let mut startup_settings = crate::pg_settings::Settings::default();
-    let validate = (|| -> R<()> {
-        let mut r = Reader { b: &startup, at: 0 };
-        if r.u32()? != 196608 {
-            reason = "only PostgreSQL protocol version 3 is supported";
-            return Err("0A000");
+    let startup = match parse_startup(&startup, &StartupPolicy::Agent) {
+        Ok(startup) => startup,
+        Err((code, reason)) => {
+            reject_startup(s, code, reason).await?;
+            return Ok(());
         }
-        let mut fields = BTreeMap::new();
-        loop {
-            let k = r.text()?;
-            if k.is_empty() {
-                break;
-            }
-            let v = r.text()?;
-            if fields.insert(k, v).is_some() {
-                return Err("08P01");
-            }
-        }
-        r.end()?;
-        if fields.get("user").map(String::as_str) != Some("giggles") {
-            reason = "startup user must be giggles; authentication uses the client certificate";
-            return Err("28000");
-        }
-        if fields.get("database").map(String::as_str) != Some("giggles") {
-            reason = "startup database must be giggles";
-            return Err("28000");
-        }
-        if fields.keys().any(|k| {
-            !matches!(
-                k.as_str(),
-                "user"
-                    | "database"
-                    | "client_encoding"
-                    | "application_name"
-                    | "DateStyle"
-                    | "TimeZone"
-                    | "extra_float_digits"
-            )
-        }) {
-            reason = "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits";
-            return Err("0A000");
-        }
-        if fields
-            .get("client_encoding")
-            .is_some_and(|v| !v.eq_ignore_ascii_case("UTF8"))
-        {
-            reason = "startup client_encoding must be UTF8";
-            return Err("0A000");
-        }
-        // Driver presentation hints have no effect on the current integer/text/
-        // boolean/bytes type set. They never change clock or task authority.
-        if fields
-            .get("DateStyle")
-            .is_some_and(|v| !v.eq_ignore_ascii_case("ISO"))
-        {
-            reason = "startup DateStyle must be ISO";
-            return Err("0A000");
-        }
-        if let Some(value) = fields.get("TimeZone") {
-            if value.is_empty()
-                || value.len() > 128
-                || !value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/_+-:.".contains(&b))
-            {
-                reason = "startup TimeZone must be a bounded timezone label";
-                return Err("0A000");
-            }
-            timezone = value.clone();
-        }
-        if fields
-            .get("extra_float_digits")
-            .is_some_and(|v| v.parse::<i32>().map_or(true, |n| !(-15..=3).contains(&n)))
-        {
-            reason = "startup extra_float_digits must be an integer from -15 to 3";
-            return Err("0A000");
-        }
-        if let Some(name) = fields.get("application_name") {
-            if name.len() > 128 {
-                reason = "startup application_name exceeds 128 bytes";
-                return Err("54000");
-            }
-            startup_settings.application_name = name.clone();
-        }
-        if let Some(digits) = fields.get("extra_float_digits") {
-            startup_settings.extra_float_digits = digits.parse().map_err(|_| "22023")?;
-        }
-        Ok(())
-    })();
+    };
+    serve_session(s, session, startup, false, &[]).await
+}
+
+pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    mut session: Session,
+    startup: crate::pgwire_startup::Startup,
+    authenticated_already: bool,
+    extra_status: &[(&str, String)],
+) -> io::Result<()> {
+    let blocking = session.service.blocking.clone();
+    let mut startup_settings = startup.settings;
+    let timezone = startup.timezone;
     let mut out = vec![];
-    if let Err(code) = validate {
-        error_message(code, reason, &mut out);
-        send(s, &out).await?;
-        return Ok(());
-    }
     let backend = session
         .service
         .cancellations
@@ -1263,7 +1177,9 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let _close = Close(backend.clone());
-    frame(b'R', &0u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
+    if !authenticated_already {
+        frame(b'R', &0u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
+    }
     let key = [backend.pid.to_be_bytes(), backend.secret.to_be_bytes()].concat();
     frame(b'K', &key, &mut out).map_err(io::Error::other)?;
     for (key, value) in [
@@ -1275,6 +1191,12 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         ("DateStyle", "ISO"),
         ("TimeZone", timezone.as_str()),
     ] {
+        let mut b = vec![];
+        z(key, &mut b);
+        z(value, &mut b);
+        frame(b'S', &b, &mut out).map_err(io::Error::other)?;
+    }
+    for (key, value) in extra_status {
         let mut b = vec![];
         z(key, &mut b);
         z(value, &mut b);
@@ -1424,3 +1346,4 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         send(s, &response).await?;
     }
 }
+
