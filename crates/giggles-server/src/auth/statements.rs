@@ -1,7 +1,8 @@
-//! Narrow role/ACL SQL surface. Password-bearing syntax deliberately has no Debug.
+//! Narrow role/ACL and DROP TABLE SQL surface. Password-bearing syntax has no Debug.
 use super::scram;
 use giggles_core::{
-    Admin,
+    Admin, CoreError,
+    relational::SqlError,
     roles::{CatalogRole, NewRole, RoleChanges, RoleError, SchemaPrivilege, TablePrivilege},
 };
 
@@ -11,6 +12,9 @@ pub(crate) enum AdminStatement {
     Create(String, RoleChanges),
     Alter(String, RoleChanges),
     Drop(bool, Vec<String>),
+    /// Existence and authorization are validated for all names before dropping.
+    /// Multi-name drops are not atomic: a later conflict can leave earlier names dropped.
+    DropTable(bool, Vec<String>),
     Grant {
         grant: bool,
         schema: bool,
@@ -204,7 +208,8 @@ impl Parser {
             });
         }
         if self.kw("drop") {
-            if !self.kw("role") {
+            let table = self.kw("table");
+            if !table && !self.kw("role") {
                 self.need("user")?;
             }
             let exists = if self.kw("if") {
@@ -213,11 +218,21 @@ impl Parser {
             } else {
                 false
             };
-            let names = self.names(false)?;
+            let names = self
+                .names(table)
+                .map_err(|e| if table && e == "fallback" { "42601" } else { e })?;
             if self.pos != self.tokens.len() {
-                return Err("0A000");
+                return Err(if !table || self.kw("cascade") || self.kw("restrict") {
+                    "0A000"
+                } else {
+                    "42601"
+                });
             }
-            return Ok(AdminStatement::Drop(exists, names));
+            return Ok(if table {
+                AdminStatement::DropTable(exists, names)
+            } else {
+                AdminStatement::Drop(exists, names)
+            });
         }
         let grant = self.kw("grant");
         if !grant {
@@ -301,7 +316,9 @@ pub(crate) fn parse(sql: &str) -> Option<AdminStatement> {
         || (matches!(
             head.first().map(String::as_str),
             Some("create" | "alter" | "drop")
-        ) && matches!(head.get(1).map(String::as_str), Some("role" | "user")));
+        ) && matches!(head.get(1).map(String::as_str), Some("role" | "user")))
+        || (head.first().map(String::as_str) == Some("drop")
+            && head.get(1).map(String::as_str) == Some("table"));
     if !recognized {
         return None;
     }
@@ -414,6 +431,34 @@ pub(crate) fn execute(
             }
             Ok("DROP ROLE")
         }
+        AdminStatement::DropTable(if_exists, names) => {
+            let tables = admin.catalog().map_err(|e| crate::service::sqlstate(&e))?.1;
+            for name in names {
+                if !tables.iter().any(|table| &table.name == name) {
+                    if *if_exists {
+                        continue;
+                    }
+                    return Err("42P01");
+                }
+                if !actor.superuser
+                    && catalog.table_owner(name).map_err(|_| "XX000")?.as_deref()
+                        != Some(&actor.name)
+                {
+                    return Err("42501");
+                }
+            }
+            for name in names {
+                let dropped = admin.drop_table(name, *if_exists).map_err(|e| match e {
+                    CoreError::Sql(SqlError::Conflict) => "55P03",
+                    CoreError::Sql(SqlError::UnknownTable) => "42P01",
+                    _ => crate::service::sqlstate(&e),
+                })?;
+                if dropped {
+                    catalog.forget_table(name).map_err(|_| "XX000")?;
+                }
+            }
+            Ok("DROP TABLE")
+        }
         AdminStatement::Grant {
             grant,
             schema,
@@ -491,7 +536,7 @@ mod tests {
             "SELECT 1",
             "GRANTED",
             "ALTER TABLE t ADD x int",
-            "DROP TABLE t",
+            "DROP VIEW t",
         ] {
             assert!(parse(sql).is_none());
         }
@@ -574,6 +619,70 @@ mod tests {
             parse("GRANT SELECT ON other.t TO a"),
             Some(AdminStatement::Error("3F000"))
         ));
+    }
+    #[test]
+    fn drop_table_identifiers() {
+        for (sql, expected_exists, expected_names) in [
+            ("DROP TABLE t", false, vec!["t"]),
+            (
+                "  DrOp TaBlE IF EXISTS PUBLIC.Mixed, \"public\".\"A\"\"B\", _t$1; ",
+                true,
+                vec!["mixed", "A\"B", "_t$1"],
+            ),
+            ("DROP TABLE\"Case\";", false, vec!["Case"]),
+        ] {
+            let Some(AdminStatement::DropTable(if_exists, names)) = parse(sql) else {
+                panic!("{sql}");
+            };
+            assert_eq!(if_exists, expected_exists, "{sql}");
+            assert_eq!(names, expected_names, "{sql}");
+        }
+    }
+    #[test]
+    fn drop_table_errors() {
+        for sql in [
+            "DROP TABLE",
+            "DROP TABLE IF t",
+            "DROP TABLE IF EXISTS",
+            "DROP TABLE t,",
+            "DROP TABLE ,t",
+            "DROP TABLE t u",
+            "DROP TABLE t; SELECT 1",
+            "DROP TABLE t;;",
+            "DROP TABLE 123",
+            "DROP TABLE ''",
+            "DROP TABLE \"\"",
+            "DROP TABLE \"unterminated",
+            "DROP TABLE public.",
+            "DROP TABLE public.public.t",
+            "DROP TABLE \"nul\0name\"",
+        ] {
+            assert!(
+                matches!(parse(sql), Some(AdminStatement::Error("42601"))),
+                "{sql}"
+            );
+        }
+        for name in ["x".repeat(64), format!("\"{}\"", "é".repeat(32))] {
+            assert!(matches!(
+                parse(&format!("DROP TABLE {name}")),
+                Some(AdminStatement::Error("42601"))
+            ));
+        }
+        for sql in [
+            "DROP TABLE t CASCADE",
+            "DROP TABLE IF EXISTS public.t, u RESTRICT;",
+        ] {
+            assert!(
+                matches!(parse(sql), Some(AdminStatement::Error("0A000"))),
+                "{sql}"
+            );
+        }
+        for sql in ["DROP TABLE other.t", "DROP TABLE \"Public\".t"] {
+            assert!(
+                matches!(parse(sql), Some(AdminStatement::Error("3F000"))),
+                "{sql}"
+            );
+        }
     }
     #[test]
     fn name_byte_limit_and_quoting() {
