@@ -14,6 +14,7 @@ pub(crate) use secondary_index_adapter::BatchRowChange;
 mod secondary_index_catalog;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
+mod sql_index;
 pub(crate) use giggles_pg_types::temporal::Time;
 pub use giggles_pg_types::temporal::{
     Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
@@ -534,6 +535,7 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    CreateIndex(sql_index::CreateIndex),
     Query(query::Query),
     Create {
         name: String,
@@ -664,6 +666,11 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "create")
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index" || w == "unique")
+        {
+            return sql_index::parse(self).map(Statement::CreateIndex);
+        }
         let st = if self.word("create") {
             self.need("table")?;
             let name = self.name()?;
@@ -1193,6 +1200,7 @@ impl Prepared {
                 }
             }
             Statement::InsertExpressions(values) => Some(&values.name),
+            Statement::CreateIndex(index) => Some(&index.table),
             Statement::Create { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
@@ -1202,7 +1210,10 @@ impl Prepared {
         }
     }
     pub fn is_ddl(&self) -> bool {
-        matches!(self.statement, Statement::Create { .. })
+        matches!(
+            self.statement,
+            Statement::Create { .. } | Statement::CreateIndex(_)
+        )
     }
     pub fn command(&self) -> &'static str {
         match self.statement {
@@ -1214,6 +1225,7 @@ impl Prepared {
                 }
             }
             Statement::Create { .. } => "CREATE TABLE",
+            Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::Insert { .. } | Statement::InsertExpressions(_) => "INSERT",
             Statement::Select { .. } => "SELECT",
             Statement::Update { .. } => "UPDATE",
@@ -1686,6 +1698,37 @@ impl Relational {
                 return q.bind(self, prepared.params)?.execute(self, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
+            Statement::CreateIndex(index) => {
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                if index.if_not_exists
+                    && self
+                        .secondary_descriptors_engine()
+                        .iter()
+                        .any(|d| d.name == index.name)
+                {
+                    return Ok(result);
+                }
+                let table = self
+                    .tables
+                    .get(&index.table)
+                    .ok_or(SqlError::UnknownTable)?
+                    .clone();
+                let ids = index
+                    .columns
+                    .iter()
+                    .map(|name| col(&table, name).map(|i| table.columns[i].id))
+                    .collect::<R<Vec<_>>>()?;
+                self.create_secondary_index_populated_engine(
+                    &table,
+                    self.epoch,
+                    &index.name,
+                    &ids,
+                    index.unique,
+                    &mut cancel,
+                )?;
+            }
             Statement::Create {
                 name,
                 columns,

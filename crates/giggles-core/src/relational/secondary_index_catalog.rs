@@ -1,4 +1,4 @@
-//! Empty-catalog index publication. The storage caller owns business eligibility.
+//! Index publication. The storage caller owns business eligibility.
 use super::secondary_index::{self as si, Catalog, Descriptor, Kind, Sidecar};
 use super::*;
 
@@ -50,6 +50,30 @@ impl Relational {
         name: &str,
         columns: &[u64],
         unique: bool,
+        cancel: impl FnMut() -> bool,
+    ) -> R<u64> {
+        self.create_secondary_index_body(table, epoch, name, columns, unique, true, cancel)
+    }
+    pub(crate) fn create_secondary_index_populated_engine(
+        &mut self,
+        table: &TableDef,
+        epoch: u64,
+        name: &str,
+        columns: &[u64],
+        unique: bool,
+        cancel: impl FnMut() -> bool,
+    ) -> R<u64> {
+        self.create_secondary_index_body(table, epoch, name, columns, unique, false, cancel)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_secondary_index_body(
+        &mut self,
+        table: &TableDef,
+        epoch: u64,
+        name: &str,
+        columns: &[u64],
+        unique: bool,
+        require_empty: bool,
         mut cancel: impl FnMut() -> bool,
     ) -> R<u64> {
         if cancel() {
@@ -93,8 +117,9 @@ impl Relational {
                 return Err(SqlError::Unsupported);
             }
         }
-        // Never rebuild a descriptor over a truncated page, even for unrelated tables.
-        if !self.rows_empty_engine() {
+        // Typed creation retains its empty-database requirement. Relational holds
+        // complete in-memory rows, so populated SQL creation builds the whole table.
+        if require_empty && !self.rows_empty_engine() {
             return Err(SqlError::Unsupported);
         }
         self.secondary_validate_engine(&mut cancel)?;
@@ -121,14 +146,19 @@ impl Relational {
             proof.consume_for(self, &descriptor, self.epoch, self.generation)?;
         }
         descriptors.push(descriptor);
-        let mut staged = Sidecar::default();
-        staged
-            .build(&descriptors, &[], &View(self), &mut cancel)
-            .map_err(|e| match e {
-                si::Error::Cancelled => SqlError::Aborted,
-                si::Error::Limit => SqlError::Limit,
-                _ => SqlError::Type,
-            })?;
+        let staged = if require_empty {
+            let mut staged = Sidecar::default();
+            staged
+                .build(&descriptors, &[], &View(self), &mut cancel)
+                .map_err(|e| match e {
+                    si::Error::Cancelled => SqlError::Aborted,
+                    si::Error::Limit => SqlError::Limit,
+                    _ => SqlError::Type,
+                })?;
+            staged
+        } else {
+            self.secondary_build_complete_engine(&descriptors, &mut cancel)?
+        };
         if cancel() {
             return Err(SqlError::Aborted);
         }

@@ -988,6 +988,20 @@ impl Relational {
             .map_err(error)?;
         Ok(())
     }
+    /// Complete-row sidecar build for `ds` over this exact state; self is unchanged.
+    pub(super) fn secondary_build_complete_engine(
+        &self,
+        ds: &[Descriptor],
+        mut cancel: impl FnMut() -> bool,
+    ) -> R<Sidecar> {
+        let snap = snapshot(self, ds, NONE, &mut cancel)?;
+        let tuples = snap.tuples();
+        let mut staged = Sidecar::default();
+        staged
+            .build(ds, &snap.rows(&tuples), &CatalogView(self), &mut cancel)
+            .map_err(error)?;
+        Ok(staged)
+    }
     pub(super) fn secondary_admit_values<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
         let mut bytes = 0;
         let mut work = 0;

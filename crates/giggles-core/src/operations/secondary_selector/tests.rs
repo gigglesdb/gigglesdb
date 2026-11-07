@@ -181,7 +181,7 @@ fn secondary_selector_raw_options_reject_before_any_catalog_effect() {
     assert!(
         admin
             .sql_session()
-            .execute("CREATE INDEX bad ON items(tag)", &[], None)
+            .execute("CREATE INDEX CONCURRENTLY bad ON items(tag)", &[], None)
             .is_err()
     );
     assert_eq!(admin.catalog().unwrap(), before);
