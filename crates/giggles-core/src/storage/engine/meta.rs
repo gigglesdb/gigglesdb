@@ -49,7 +49,7 @@ impl std::error::Error for FormatError {}
 fn corrupt(error: impl std::fmt::Display) -> FormatError {
     FormatError::Corrupt(error.to_string())
 }
-fn rocks_file(name: &str) -> bool {
+pub(crate) fn rocks_file(name: &str) -> bool {
     matches!(name, "CURRENT" | "LOCK" | "IDENTITY" | "LOG")
         || name.starts_with("MANIFEST-")
         || name.starts_with("OPTIONS-")

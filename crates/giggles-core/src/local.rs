@@ -69,7 +69,7 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::Policy(e) => policy_code(*e),
         CoreError::Storage(_) => 10,
         CoreError::Corrupt(_) => 11,
-        CoreError::Unsupported => 12,
+        CoreError::Unsupported | CoreError::EngineUnsupported { .. } => 12,
         CoreError::Exists => 13,
         CoreError::Busy => 14,
         CoreError::Fenced => 15,

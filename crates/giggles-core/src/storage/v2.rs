@@ -1,0 +1,80 @@
+//! Minimal v2 lifecycle. Public legacy operations fail before admission or mutation.
+#[cfg(feature = "engine-rocksdb")]
+use super::io;
+use super::{CoreError, engine};
+#[cfg(feature = "engine-rocksdb")]
+use std::sync::Arc;
+use std::{fs, path::Path};
+
+// F8 reads kv/meta; until then only open/create and tests touch them.
+#[allow(dead_code)]
+pub(crate) struct V2Db {
+    pub(crate) kv: engine::kv::Kv,
+    pub(crate) meta: engine::meta::MetaInfo,
+}
+pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
+    match error {
+        engine::meta::FormatError::Corrupt(message)
+        | engine::meta::FormatError::Incomplete(message) => CoreError::Corrupt(message),
+        engine::meta::FormatError::Unsupported(_) => CoreError::Unsupported,
+    }
+}
+pub(super) fn has_traces(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str()
+            && (matches!(name, "GIGGLES_FORMAT" | "GIGGLES_FORMAT.tmp")
+                || engine::meta::rocks_file(name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+impl V2Db {
+    #[cfg(feature = "engine-rocksdb")]
+    pub(crate) fn create(path: &Path) -> Result<Self, CoreError> {
+        let mut domain = [0u8; 16];
+        getrandom::fill(&mut domain).map_err(io)?;
+        let backend = engine::meta::create(path, domain, |path| {
+            Ok(Arc::new(engine::kv_rocksdb::RocksKv::open(
+                path,
+                64 * 1024 * 1024,
+            )?))
+        })
+        .map_err(format_error)?;
+        let kv = engine::kv::Kv::new(backend);
+        let meta = engine::meta::validate_meta(&kv).map_err(format_error)?;
+        Ok(Self { kv, meta })
+    }
+    pub(crate) fn open(path: &Path) -> Result<Self, CoreError> {
+        if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
+            return Err(CoreError::Corrupt("not a v2 directory".into()));
+        }
+        #[cfg(not(feature = "engine-rocksdb"))]
+        {
+            Err(CoreError::EngineUnsupported {
+                engine: "v2",
+                feature: super::ROCKSDB_NOT_COMPILED,
+            })
+        }
+        #[cfg(feature = "engine-rocksdb")]
+        {
+            let kv = engine::kv::Kv::new(Arc::new(engine::kv_rocksdb::RocksKv::open(
+                path,
+                64 * 1024 * 1024,
+            )?));
+            let meta = engine::meta::validate_meta(&kv).map_err(format_error)?;
+            Ok(Self { kv, meta })
+        }
+    }
+}
+#[cfg(test)]
+#[path = "v2_tests.rs"]
+mod tests;

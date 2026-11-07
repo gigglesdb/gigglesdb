@@ -11,7 +11,7 @@ pub use storage::SqlSession;
 pub use storage::replica;
 pub use storage::roles;
 pub use storage::{
-    Admin, CoreError, CrashPoint, DecisionPoint, Executor, IndexInfo, Limits, RecoveryPoint,
+    Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, RecoveryPoint,
 };
 mod sql;
 pub use sql::parse_repair;

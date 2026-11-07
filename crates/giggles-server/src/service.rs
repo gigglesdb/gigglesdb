@@ -125,7 +125,9 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         ) => "GD001",
         CoreError::Policy(Error::IdConflict) => "GD002",
         CoreError::Policy(_) => "22023",
-        CoreError::Sql(S::Unsupported | S::Reserved) | CoreError::Unsupported => "0A000",
+        CoreError::Sql(S::Unsupported | S::Reserved)
+        | CoreError::Unsupported
+        | CoreError::EngineUnsupported { .. } => "0A000",
         CoreError::Sql(S::Syntax) => "42601",
         CoreError::Sql(S::UnknownTable) => "42P01",
         CoreError::Sql(S::UnknownColumn) => "42703",

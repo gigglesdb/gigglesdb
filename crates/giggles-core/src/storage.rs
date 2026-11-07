@@ -13,6 +13,7 @@ mod secondary_index_catalog;
 mod secondary_index_public;
 mod sequence_counters;
 pub(crate) mod sequences;
+mod v2;
 pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
 use bincode::Options;
@@ -40,6 +41,10 @@ pub enum CoreError {
     Storage(String),
     Corrupt(String),
     Unsupported,
+    EngineUnsupported {
+        engine: &'static str,
+        feature: &'static str,
+    },
     Exists,
     Busy,
     Fenced,
@@ -481,8 +486,29 @@ pub enum DecisionPoint {
     Committed,
 }
 type DecisionHook = Arc<dyn Fn(DecisionPoint) + Send + Sync>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Legacy,
+    V2,
+}
+const TASK_EXECUTORS: &str = "task executors";
+const PROTECTED_OPERATIONS: &str = "protected operations";
+const KERNEL_RECORDS: &str = "kernel records";
+const SQL_SESSIONS: &str = "SQL sessions";
+const LOGICAL_EXPORT: &str = "logical export";
+const ROLES: &str = "roles";
+#[allow(dead_code)]
+const REPLICA: &str = "replica";
+const LEGACY_STORAGE: &str = "legacy storage";
+#[cfg(not(feature = "engine-rocksdb"))]
+const ROCKSDB_NOT_COMPILED: &str = "engine-rocksdb not compiled in";
+enum Backend {
+    Legacy(Database),
+    // F8 executes SQL through this handle; until then only tests read it.
+    V2(#[allow(dead_code)] Arc<v2::V2Db>),
+}
 struct Inner {
-    db: Database,
+    backend: Backend,
     gate: Mutex<()>,
     admitted: AtomicUsize,
     sql_transactions: AtomicUsize,
@@ -510,6 +536,16 @@ impl Drop for Ticket<'_> {
     }
 }
 impl Inner {
+    fn db(&self, feature: &'static str) -> Result<&Database, CoreError> {
+        match &self.backend {
+            Backend::Legacy(db) => Ok(db),
+            Backend::V2(_) => Err(CoreError::EngineUnsupported {
+                engine: "v2",
+                feature,
+            }),
+        }
+    }
+
     fn decision_point(&self, point: DecisionPoint) {
         let hook = self
             .decision_hook
@@ -545,7 +581,7 @@ impl Inner {
         Ok(Ticket(&self.admitted))
     }
     fn read(&self) -> Result<State, CoreError> {
-        let tx = self.db.begin_read().map_err(io)?;
+        let tx = self.db(LEGACY_STORAGE)?.begin_read().map_err(io)?;
         let t = tx.open_table(RECORDS).map_err(io)?;
         let mut out = BTreeMap::new();
         let mut total = 0u64;
@@ -675,7 +711,7 @@ impl Inner {
         let values = records(s)?;
         let point = *self.crash.lock().map_err(|_| CoreError::Fenced)?;
         let persisted = (|| {
-            let mut tx = self.db.begin_write().map_err(io)?;
+            let mut tx = self.db(LEGACY_STORAGE)?.begin_write().map_err(io)?;
             tx.set_durability(Durability::Immediate).map_err(io)?;
             {
                 let mut t = tx.open_table(RECORDS).map_err(io)?;
@@ -801,6 +837,7 @@ impl Admin {
         task: TaskId,
         limits: TaskResources,
     ) -> Result<(), CoreError> {
+        self.inner.db(TASK_EXECUTORS)?;
         self.inner.change(|s| {
             if !s.view.tasks.contains_key(&task) {
                 return Err(CoreError::Policy(Error::UnknownTask));
@@ -819,6 +856,7 @@ impl Admin {
         })
     }
     pub fn task_resources(&self, task: TaskId) -> Result<Option<TaskAccounting>, CoreError> {
+        self.inner.db(TASK_EXECUTORS)?;
         self.inner.inspect(|s| Ok(s.accounting.get(&task).copied()))
     }
     /// Trusted test seam for deterministic local race verification. Not a wire API.
@@ -837,12 +875,17 @@ impl Admin {
         })
     }
     fn attach(db: Database, limits: Limits) -> Result<Self, CoreError> {
+        let a = Self::attach_backend(Backend::Legacy(db), limits)?;
+        a.inner.read()?;
+        Ok(a)
+    }
+    fn attach_backend(backend: Backend, limits: Limits) -> Result<Self, CoreError> {
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
         }
-        let a = Self {
+        Ok(Self {
             inner: Arc::new(Inner {
-                db,
+                backend,
                 gate: Mutex::new(()),
                 admitted: AtomicUsize::new(0),
                 sql_transactions: AtomicUsize::new(0),
@@ -854,9 +897,37 @@ impl Admin {
                 sequences: Mutex::new(sequences::Live::default()),
                 native_once_owners: Mutex::new(BTreeMap::new()),
             }),
-        };
-        a.inner.read()?;
-        Ok(a)
+        })
+    }
+    /// Explicit create-new directory for the chosen engine. Legacy delegates to `create`.
+    pub fn create_engine(
+        path: impl AsRef<Path>,
+        limits: Limits,
+        engine: Engine,
+    ) -> Result<Self, CoreError> {
+        match engine {
+            Engine::Legacy => Self::create(path, limits),
+            Engine::V2 => {
+                #[cfg(not(feature = "engine-rocksdb"))]
+                {
+                    let _ = (path, limits);
+                    Err(CoreError::EngineUnsupported {
+                        engine: "v2",
+                        feature: ROCKSDB_NOT_COMPILED,
+                    })
+                }
+                #[cfg(feature = "engine-rocksdb")]
+                {
+                    if limits.admitted == 0 || limits.selected_keys == 0 {
+                        return Err(CoreError::Limit);
+                    }
+                    Self::attach_backend(
+                        Backend::V2(Arc::new(v2::V2Db::create(path.as_ref())?)),
+                        limits,
+                    )
+                }
+            }
+        }
     }
     /// Explicit create-new directory. Existing paths, including empty ones, reject.
     pub fn create(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
@@ -927,6 +998,17 @@ impl Admin {
     }
     /// Existing database only: no initialization or replacement on damage.
     pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
+        if v2::has_traces(path.as_ref()) {
+            match engine::meta::classify_dir(path.as_ref()).map_err(v2::format_error)? {
+                engine::meta::DirClass::V2 => {
+                    return Self::attach_backend(
+                        Backend::V2(Arc::new(v2::V2Db::open(path.as_ref())?)),
+                        limits,
+                    );
+                }
+                _ => return Err(CoreError::Corrupt("incomplete v2 directory".into())),
+            }
+        }
         Self::attach(
             Database::builder()
                 .set_cache_size(8 * 1024 * 1024)
@@ -936,6 +1018,7 @@ impl Admin {
         )
     }
     pub fn snapshot(&self) -> Result<Snapshot, CoreError> {
+        self.inner.db(KERNEL_RECORDS)?;
         self.inner.inspect(|s| Ok(s.view.clone()))
     }
     pub fn authority_metadata(&self) -> Result<(u128, u64, u64, Option<u128>), CoreError> {
@@ -943,6 +1026,7 @@ impl Admin {
             .inspect(|s| Ok((s.view.domain, s.last_time, s.next_approval, s.origin)))
     }
     pub fn put(&self, k: Key, mut v: Row) -> Result<(), CoreError> {
+        self.inner.db(KERNEL_RECORDS)?;
         self.inner.change(|s| {
             v.version = s.view.rows.get(&k).map_or(Ok(0), |old| {
                 old.version
@@ -954,6 +1038,7 @@ impl Admin {
         })
     }
     pub fn grant(&self, g: Grant) -> Result<Executor, CoreError> {
+        self.inner.db(TASK_EXECUTORS)?;
         let credential = self.inner.change(|s| {
             if s.view.tasks.contains_key(&g.task) {
                 return Err(CoreError::Policy(Error::TaskExists));
@@ -984,6 +1069,7 @@ impl Admin {
     }
     /// Trusted rebind after restart; grants no task-broadening authority.
     pub fn executor(&self, task: TaskId, principal: Principal) -> Result<Executor, CoreError> {
+        self.inner.db(TASK_EXECUTORS)?;
         self.inner.inspect(|s| {
             let t = s
                 .view
@@ -1004,6 +1090,7 @@ impl Admin {
         })
     }
     pub fn revoke(&self, task: TaskId) -> Result<(), CoreError> {
+        self.inner.db(TASK_EXECUTORS)?;
         self.inner.change(|s| {
             s.view
                 .tasks
@@ -1014,6 +1101,7 @@ impl Admin {
         })
     }
     pub fn bump_schema(&self) -> Result<(), CoreError> {
+        self.inner.db(KERNEL_RECORDS)?;
         self.inner.change(|s| {
             s.view.schema = s
                 .view
@@ -1024,6 +1112,7 @@ impl Admin {
         })
     }
     pub fn approve(&self, who: Principal, p: Preview, time: Time) -> Result<ApprovalId, CoreError> {
+        self.inner.db(PROTECTED_OPERATIONS)?;
         self.inner.request(&p.request)?;
         self.inner.change(|s| {
             let t = s
@@ -1060,6 +1149,7 @@ impl Admin {
         })
     }
     pub fn revoke_approval(&self, id: ApprovalId) -> Result<(), CoreError> {
+        self.inner.db(PROTECTED_OPERATIONS)?;
         self.inner.change(|s| {
             s.view
                 .approvals
@@ -1075,6 +1165,7 @@ impl Admin {
         Ok(())
     }
     pub fn export(&self, path: impl AsRef<Path>) -> Result<[u8; 32], CoreError> {
+        self.inner.db(LOGICAL_EXPORT)?;
         self.export_with_fault(path, RecoveryPoint::None)
     }
     /// Retains a unique sibling staging file even after successful publication.
@@ -1085,6 +1176,7 @@ impl Admin {
         path: impl AsRef<Path>,
         point: RecoveryPoint,
     ) -> Result<[u8; 32], CoreError> {
+        self.inner.db(LOGICAL_EXPORT)?;
         let path = path.as_ref();
         let (format, payload) = self.inner.inspect(|s| {
             feature_envelope::export_allowed(feature_envelope::feature_bits_present(s)?)?;
@@ -1487,6 +1579,7 @@ impl Admin {
     }
     /// Catalog preflight for logical archives which cannot preserve secondary indexes.
     pub fn logical_export_catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.inner.db(LOGICAL_EXPORT)?;
         self.inner.inspect(|s| {
             if s.sql.has_secondary_indexes_engine() {
                 return Err(CoreError::Unsupported);
@@ -1518,7 +1611,8 @@ impl SqlSession {
         &self,
         p: &relational::Prepared,
     ) -> Result<Vec<Option<String>>, CoreError> {
-        let dependencies = |s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
+        self.admin.inner.db(SQL_SESSIONS)?;
+        let dependencies =|s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
             Some(s) => dependencies(s),
             None => self.admin.inner.inspect(dependencies),
@@ -1532,7 +1626,8 @@ impl SqlSession {
     }
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
-        let owners = |s: &State| {
+        self.admin.inner.db(SQL_SESSIONS)?;
+        let owners =|s: &State| {
             Ok(s.sql
                 .catalog_ext()
                 .sequences
@@ -1559,6 +1654,7 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && p.control() != Some("rollback") {
@@ -1589,6 +1685,7 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && p.control() != Some("rollback") {
@@ -1622,6 +1719,7 @@ impl SqlSession {
         }
     }
     pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::scan(scan, domain, state),
             None,
@@ -1636,6 +1734,7 @@ impl SqlSession {
         ) -> Result<relational::Prepared, relational::SqlError>,
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         if self.aborted {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
@@ -1656,6 +1755,7 @@ impl SqlSession {
         result
     }
     pub(crate) fn begin_engine(&mut self) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| Ok(relational::Prepared::begin_engine(domain, state.epoch)),
             None,
@@ -1663,6 +1763,7 @@ impl SqlSession {
         .map(|_| ())
     }
     pub(crate) fn commit_engine(&mut self) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| Ok(relational::Prepared::commit_engine(domain, state.epoch)),
             None,
@@ -1671,6 +1772,7 @@ impl SqlSession {
     }
     /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
     pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1692,6 +1794,7 @@ impl SqlSession {
     /// snapshot that will stage the definition. Empty existing tables are fine;
     /// business and retained task/decision state require the migration path.
     pub(crate) fn catalog_empty_engine(&mut self) -> Result<bool, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1720,6 +1823,7 @@ impl SqlSession {
         columns: Vec<relational::ColumnDef>,
         keys: Vec<String>,
     ) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         // Do not permit this entry to accidentally autocommit outside the
         // caller's eligibility/definition snapshot and final decision fence.
         self.snapshot_identity_engine()?;
@@ -1731,6 +1835,7 @@ impl SqlSession {
     }
     /// Identity for binding against an active transaction's catalog snapshot.
     pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1753,6 +1858,7 @@ impl SqlSession {
         table: &relational::TableDef,
         key: &[relational::Value],
     ) -> Result<u64, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -1777,6 +1883,7 @@ impl SqlSession {
         table: &relational::TableDef,
         values: Vec<relational::Value>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::insert_engine(table, values, domain, state),
             None,
@@ -1789,6 +1896,7 @@ impl SqlSession {
         sets: Vec<(usize, relational::Value)>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::update_engine(table, key, sets, domain, state),
             Some(expected_version),
@@ -1800,6 +1908,7 @@ impl SqlSession {
         key: Vec<relational::Value>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::delete_engine(table, key, domain, state),
             Some(expected_version),
@@ -1812,6 +1921,7 @@ impl SqlSession {
         self.aborted
     }
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let mut result = if let Some(s) = &self.staged {
             if self.aborted {
@@ -1843,6 +1953,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
@@ -1867,6 +1978,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let p = self.prepare(sql)?;
@@ -1879,6 +1991,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let context = relational::clock::ExecutionClock::new(clock);
@@ -1891,6 +2004,7 @@ impl SqlSession {
         result
     }
     fn guard_clock(&mut self, clock: &relational::StatementClock) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         // Unavailable instants cannot be validated or establish a transaction pin.
         if clock.unavailable.is_some() {
             return Ok(());
@@ -1927,6 +2041,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.execute_bound_engine(p, params, expected_version)
     }
@@ -1939,6 +2054,7 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_bound_clocked(p, params, expected_version, None)
     }
     fn execute_bound_clocked(
@@ -1948,6 +2064,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         if self.aborted && p.control() != Some("rollback") {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
@@ -1980,6 +2097,7 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         use relational::SqlError as E;
         if p.transaction.is_some() && p.transaction != self.transaction_id {
             return Err(CoreError::Sql(E::StaleSchema));
@@ -2140,6 +2258,7 @@ impl SqlSession {
         Ok(result)
     }
     fn publish(&self, staged: State) -> Result<(), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
         self.admin.inner.change_decision(|s| {
             if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
@@ -2639,7 +2758,12 @@ mod tests {
                 admin.sql_session().execute(ddl, &[], None).unwrap();
             }
             let admin = Admin::open(&path, Limits::default()).unwrap();
-            let tx = admin.inner.db.begin_read().unwrap();
+            let tx = admin
+                .inner
+                .db(LEGACY_STORAGE)
+                .unwrap()
+                .begin_read()
+                .unwrap();
             let table = tx.open_table(RECORDS).unwrap();
             let metadata: Metadata =
                 decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
@@ -2849,7 +2973,7 @@ mod tests {
         assert_eq!(a.snapshot().unwrap(), state.view);
         assert_eq!(a.catalog().unwrap(), (0, vec![]));
         // Read-only attach has not changed any logical record; raw redb open may maintain its own header.
-        let t = a.inner.db.begin_read().unwrap();
+        let t = a.inner.db(LEGACY_STORAGE).unwrap().begin_read().unwrap();
         let table = t.open_table(RECORDS).unwrap();
         let m: Metadata = decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
         assert_eq!(m.format, 1);
@@ -2866,7 +2990,7 @@ mod tests {
         .unwrap();
         s.execute("INSERT INTO application VALUES(-1)", &[], None)
             .unwrap();
-        let t = a.inner.db.begin_read().unwrap();
+        let t = a.inner.db(LEGACY_STORAGE).unwrap().begin_read().unwrap();
         let table = t.open_table(RECORDS).unwrap();
         let m: Metadata = decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
         assert_eq!(m.format, 3);
@@ -3071,7 +3195,7 @@ mod tests {
     fn record_corruption_fences_live_handle_and_open_rejects() {
         let path = fresh("corrupt-record");
         let a = Admin::create(&path, Limits::default()).unwrap();
-        let tx = a.inner.db.begin_write().unwrap();
+        let tx = a.inner.db(LEGACY_STORAGE).unwrap().begin_write().unwrap();
         {
             let mut table = tx.open_table(RECORDS).unwrap();
             table.insert(&[0u8][..], &[0u8][..]).unwrap();

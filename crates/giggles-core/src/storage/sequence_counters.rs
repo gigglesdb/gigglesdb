@@ -90,7 +90,7 @@ mod tests {
         (s, id)
     }
     fn disk(admin: &Admin) -> State {
-        let tx = admin.inner.db.begin_read().unwrap();
+        let tx = admin.inner.db(LEGACY_STORAGE).unwrap().begin_read().unwrap();
         let table = tx.open_table(RECORDS).unwrap();
         let records = table
             .iter()

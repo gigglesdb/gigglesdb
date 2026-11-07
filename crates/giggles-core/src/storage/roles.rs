@@ -187,7 +187,7 @@ impl RoleCatalog {
         inspect: impl FnOnce(Option<&ReadTable>) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
-        let tx = self.inner.db.begin_read().map_err(io)?;
+        let tx = self.inner.db(super::ROLES)?.begin_read().map_err(io)?;
         self.check_fenced()?;
         match tx.open_table(ROLES) {
             Ok(table) => inspect(Some(&table)),
@@ -201,7 +201,7 @@ impl RoleCatalog {
         change: impl FnOnce(&mut WriteTable<'_>) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
-        let mut tx = self.inner.db.begin_write().map_err(io)?;
+        let mut tx = self.inner.db(super::ROLES)?.begin_write().map_err(io)?;
         self.check_fenced()?;
         tx.set_durability(Durability::Immediate).map_err(io)?;
         let result = {
@@ -568,7 +568,7 @@ mod tests {
     }
 
     fn main_records(admin: &Admin) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let tx = admin.inner.db.begin_read().unwrap();
+        let tx = admin.inner.db(super::super::ROLES).unwrap().begin_read().unwrap();
         let table = tx.open_table(super::super::RECORDS).unwrap();
         table
             .iter()
@@ -591,7 +591,7 @@ mod tests {
             assert!(roles.table_privileges("t", "absent").unwrap().is_empty());
             assert!(roles.schema_privileges("s", "absent").unwrap().is_empty());
             assert!(roles.visible_tables("absent").unwrap().is_empty());
-            let tx = admin.inner.db.begin_read().unwrap();
+            let tx = admin.inner.db(super::super::ROLES).unwrap().begin_read().unwrap();
             assert!(matches!(
                 tx.open_table(ROLES),
                 Err(redb::TableError::TableDoesNotExist(_))
