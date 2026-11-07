@@ -1605,7 +1605,7 @@ impl Scalar {
                     if slot.as_ref().is_some_and(|old| old != ty) {
                         return Err(SqlError::Type);
                     }
-                    *slot = Some(ty.clone());
+                    slot.get_or_insert_with(|| ty.clone());
                 }
             }
             Self::Cast(a, ty) => {

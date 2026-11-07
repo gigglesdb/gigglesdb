@@ -943,6 +943,7 @@ pub struct Prepared {
     pub(crate) transaction: Option<u128>,
     statement: Statement,
     params: usize,
+    parameter_types: Vec<Option<DataType>>,
 }
 #[derive(Debug, Clone)]
 pub struct Description {
@@ -1001,6 +1002,7 @@ impl Prepared {
             transaction: None,
             statement,
             params: 0,
+            parameter_types: vec![],
         }
     }
     pub(crate) fn create_engine(
@@ -1196,7 +1198,9 @@ impl Prepared {
             return returning::validate_insert_constants(values, state, self.params);
         }
         if let Statement::Query(q) = &self.statement {
-            return q.bind(state, self.params)?.validate_immutable_constants();
+            return q
+                .bind(state, self.params, &self.parameter_types)?
+                .validate_immutable_constants();
         }
         Ok(())
     }
@@ -1211,7 +1215,9 @@ impl Prepared {
             return returning::describe_insert(values, state, self.params);
         }
         if let Statement::Query(q) = &self.statement {
-            return q.bind(state, self.params).map(|b| b.description());
+            return q
+                .bind(state, self.params, &self.parameter_types)
+                .map(|b| b.description());
         }
         if let Statement::UpdateExpressions {
             name,
@@ -1422,6 +1428,7 @@ impl Prepared {
             epoch: state.epoch,
             transaction: None,
             params: 0,
+            parameter_types: vec![],
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -1434,6 +1441,22 @@ impl Prepared {
                 limit: Some(Expr::Literal(Value::Int(scan.limit as i64))),
             },
         })
+    }
+    /// Declare input types for SELECT parameters before query type inference.
+    /// A shorter slice or `None` entries leave the corresponding inputs inferred.
+    /// Other statement kinds retain their existing parameter inference.
+    pub fn with_parameter_types(mut self, types: &[Option<DataType>]) -> R<Self> {
+        assert_sql_frontend_allowed();
+        if types.len() > MAX_PARAMS {
+            return Err(SqlError::Limit);
+        }
+        if types.len() > self.params {
+            return Err(SqlError::Parameters);
+        }
+        if matches!(self.statement, Statement::Query(_)) {
+            self.parameter_types = types.to_vec();
+        }
+        Ok(self)
     }
     pub fn parameter_count(&self) -> usize {
         self.params
@@ -1479,6 +1502,7 @@ impl Prepared {
             transaction: None,
             statement,
             params,
+            parameter_types: vec![],
         })
     }
     pub(crate) fn control(&self) -> Option<&'static str> {
@@ -1849,6 +1873,7 @@ impl Relational {
                 epoch: prepared.epoch,
                 transaction: prepared.transaction,
                 params: prepared.params,
+                parameter_types: vec![],
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
@@ -1867,7 +1892,7 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 return q
-                    .bind(self, prepared.params)?
+                    .bind(self, prepared.params, &prepared.parameter_types)?
                     .execute(self, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),

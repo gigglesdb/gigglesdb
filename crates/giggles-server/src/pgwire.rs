@@ -890,7 +890,11 @@ impl State {
                     (Plan::Catalog(Box::new(plan), fields, epoch), d)
                 } else {
                     self.diagnostic.phase = "application prepare";
-                    let p = core(session.prepare(&sql))?;
+                    let declared_types = oids
+                        .iter()
+                        .map(|oid| (*oid == 17).then_some(DataType::Bytes))
+                        .collect::<Vec<_>>();
+                    let p = core(session.prepare_with_parameter_types(&sql, &declared_types))?;
                     let d = core(session.describe(&p))?;
                     (Plan::Sql(Box::new(p)), d)
                 };

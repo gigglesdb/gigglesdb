@@ -549,18 +549,40 @@ impl Session {
         Ok((epoch, visible))
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Prepared, CoreError> {
+        self.prepare_with_parameter_types(sql, &[])
+    }
+    pub(crate) fn prepare_with_parameter_types(
+        &mut self,
+        sql: &str,
+        declared_types: &[Option<relational::DataType>],
+    ) -> Result<Prepared, CoreError> {
+        fn declared(
+            p: Prepared,
+            types: &[Option<relational::DataType>],
+        ) -> Result<Prepared, CoreError> {
+            // Leave excess wire declarations to pgwire's protocol count check.
+            let types = if types.len() > p.parameter_count() {
+                &[]
+            } else {
+                types
+            };
+            p.with_parameter_types(types).map_err(CoreError::Sql)
+        }
         self.authority_scope(|session| {
             let p = if matches!(&session.role, Role::Database { .. }) {
-                session.sql.prepare(sql)?
+                declared(session.sql.prepare(sql)?, declared_types)?
             } else if session.in_transaction() && !session.is_aborted() {
                 // Gateway DDL is forbidden. Bind reusable plans against the
                 // committed catalog, then validate against the active snapshot.
                 // Core's staged-schema handles retain their lifetime fence.
-                let p = session.service.admin.sql_session().prepare(sql)?;
+                let p = declared(
+                    session.service.admin.sql_session().prepare(sql)?,
+                    declared_types,
+                )?;
                 session.sql.describe(&p)?;
                 p
             } else {
-                session.sql.prepare(sql)?
+                declared(session.sql.prepare(sql)?, declared_types)?
             };
             session.authorize(&p)?;
             Ok(p)

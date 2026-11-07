@@ -867,8 +867,21 @@ impl Query {
             "giggles_join"
         }
     }
-    pub(super) fn bind<'a>(&'a self, state: &'a Relational, count: usize) -> R<BoundQuery<'a>> {
-        self.bind_seeded(state, vec![None; count])
+    pub(super) fn bind<'a>(
+        &'a self,
+        state: &'a Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<BoundQuery<'a>> {
+        if count > MAX_PARAMS {
+            return Err(SqlError::Limit);
+        }
+        if declared.len() > count {
+            return Err(SqlError::Parameters);
+        }
+        let mut parameters = vec![None; count];
+        parameters[..declared.len()].clone_from_slice(declared);
+        self.bind_seeded(state, parameters)
     }
     pub(super) fn bind_seeded<'a>(
         &'a self,
@@ -990,7 +1003,7 @@ impl Query {
                     }
                     return Err(SqlError::Type);
                 }
-                *slot = Some(ty.clone());
+                slot.get_or_insert_with(|| ty.clone());
             } else if let Expr::Literal(v) = e {
                 check(
                     v,
