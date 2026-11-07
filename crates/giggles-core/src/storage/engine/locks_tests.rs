@@ -530,19 +530,50 @@ fn acyclic_wait_chain_does_not_report_deadlock() {
 
 #[test]
 fn timeout_removes_front_waiter_and_unblocks_compatible_follower() {
-    let lm = manager();
-    acquire(&lm, 1, row(1), LockMode::Shared);
-    let front = spawn_waiter_with(
-        &lm,
-        2,
-        row(1),
-        LockMode::Exclusive,
-        Instant::now() + Duration::from_millis(250),
-        Arc::new(AtomicBool::new(false)),
-    );
-    until(|| lm.waiting_count() == 1);
-    let back = spawn_waiter(&lm, 3, row(1), LockMode::Shared);
-    until(|| lm.waiting_count() == 2);
+    // The front deadline is fixed when it starts waiting. Under heavy load the
+    // follower may not be queued before it expires, so retry the scenario until
+    // the follower is observed queued behind a still-pending front waiter.
+    for attempt in 0.. {
+        assert!(attempt < 20, "follower never queued before the front deadline");
+        let lm = manager();
+        acquire(&lm, 1, row(1), LockMode::Shared);
+        let front = spawn_waiter_with(
+            &lm,
+            2,
+            row(1),
+            LockMode::Exclusive,
+            Instant::now() + Duration::from_millis(250),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut expired = false;
+        until(|| {
+            expired = front.result.try_recv().is_ok();
+            expired || lm.waiting_count() == 1
+        });
+        if expired {
+            front.finish();
+            lm.release_all(TxnId(1));
+            continue;
+        }
+        let back = spawn_waiter(&lm, 3, row(1), LockMode::Shared);
+        // FIFO: the follower can only be granted after the front has timed out.
+        let mut overtaken = false;
+        until(|| {
+            overtaken = back.result.try_recv().is_ok();
+            overtaken || lm.waiting_count() == 2
+        });
+        if overtaken {
+            front.finish();
+            back.finish();
+            lm.release_all(TxnId(1));
+            continue;
+        }
+        check_timeout_unblocks_follower(&lm, front, back);
+        return;
+    }
+}
+
+fn check_timeout_unblocks_follower(lm: &Arc<LockManager>, front: Waiter, back: Waiter) {
     back.pending();
     assert!(matches!(
         front.result.recv_timeout(BOUND).unwrap(),
