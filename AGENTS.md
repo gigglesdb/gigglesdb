@@ -145,7 +145,11 @@ parallel links fail with LNK1171 or OOM, and that wastes a whole gate run. So:
   cargo build or test at a time. Hold a per-coordinator lock file under
   J:/gigglesdb-work/<track>/ while it runs;
 - a gate that fails with LNK1171, an OOM or a lost connection in a timing test
-  is rerun alone before anyone treats it as a code failure.
+  is rerun alone before anyone treats it as a code failure;
+- stopping a task or wrapper does not stop its children. Kill the whole
+  process tree (`taskkill /T /F /PID <pid>`), and confirm that no cargo,
+  rustc, codex or test process is still using that worktree or target dir
+  before you start another run there.
 
 The shared repository sets core.autocrlf=true, so a plain worktree checkout
 gives files CRLF line endings, and LF-sensitive fixtures (tzdata, typmod
