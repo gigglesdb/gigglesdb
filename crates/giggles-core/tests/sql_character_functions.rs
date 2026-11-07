@@ -1,19 +1,21 @@
 use giggles_core::{Admin, CoreError, Limits, relational::*};
 
 fn session() -> (Admin, giggles_core::SqlSession) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("dd68")
         .join("dd68-character-functions-20261106")
         .join("fixtures");
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join(format!(
-        "character-{}-{:?}-{}",
+        "character-{}-{:?}-{}-{}",
         std::process::id(),
         std::thread::current().id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let admin = Admin::create(path, Limits::default()).unwrap();
     let session = admin.sql_session();

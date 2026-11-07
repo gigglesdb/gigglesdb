@@ -2,19 +2,21 @@ use giggles_core::{Admin, CoreError, Limits, relational::*};
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 fn unique_path(kind: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("dd68")
         .join("dd68-quoting-functions-20261106")
         .join(kind);
     std::fs::create_dir_all(&root).unwrap();
     root.join(format!(
-        "{}-{:?}-{}",
+        "{}-{:?}-{}-{}",
         std::process::id(),
         std::thread::current().id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 #[test]
