@@ -3,7 +3,7 @@
 -- owner: E1
 -- expect: compatible
 
-CREATE TABLE r0c_identity_always_t (id integer GENERATED ALWAYS AS IDENTITY, name text);
+CREATE TABLE r0c_identity_always_t (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text);
 INSERT INTO r0c_identity_always_t (name) VALUES ('generated');
 -- @error
 -- expect-sqlstate: 428C9

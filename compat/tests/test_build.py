@@ -8,7 +8,7 @@ import tempfile
 import tarfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,6 +29,23 @@ def tearDownModule():
     _STORAGE.finish()
 
 class BuildTests(unittest.TestCase):
+    def test_successful_build_removes_only_owned_source_and_tmp(self):
+        with tempfile.TemporaryDirectory(dir=TASK) as directory:
+            root = Path(directory)
+            target = root/'target'
+            (target/'debug').mkdir(parents=True)
+            (target/'debug'/('giggles-server.exe' if os.name == 'nt' else 'giggles-server')).write_bytes(b'executable')
+            process = Mock()
+            process.wait.return_value = 0
+            with patch.object(gigglesdb, 'resolve_commit', return_value=SHA), patch.object(gigglesdb, '_extract_archive'), patch.object(gigglesdb.subprocess, 'Popen', return_value=process), patch.object(gigglesdb, 'command', return_value=dict(exit=0, stdout='version')):
+                binary, meta = gigglesdb.prepare_build('repo', 'HEAD', root/'builds', target, {})
+            self.assertTrue(binary.is_file())
+            self.assertTrue((binary.parent/'build.json').is_file())
+            self.assertTrue((binary.parent/'build.log').is_file())
+            self.assertFalse((binary.parent/'src').exists())
+            self.assertFalse((binary.parent/'tmp').exists())
+            self.assertEqual(meta['build_scratch_cleanup']['scratch_removed'], ['src','tmp'])
+
     def test_archive_drains_large_trailing_padding(self):
         with tempfile.TemporaryDirectory(dir=TASK) as directory:
             root = Path(directory)

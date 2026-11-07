@@ -13,6 +13,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 from .util import redact, command, output_root, utc
+from . import scratch
 
 
 class BuildError(RuntimeError):
@@ -164,6 +165,7 @@ def prepare_build(repo, ref, build_root, cargo_target, env):
             return build_dir/'giggles-server.exe', dict(cached, build_cache='hit', build_duration_s=0, **{k:v for k,v in metadata.items() if k == 'stale_build_locks'})
         build_dir.mkdir(parents=True, exist_ok=True)
         tmp = build_dir/'tmp'
+        scratch.remove_children(build_dir, ('tmp',), keep=True)
         tmp.mkdir(exist_ok=True)
         build_env = dict(env, CARGO_TARGET_DIR=str(target), TEMP=str(tmp), TMP=str(tmp))
         log_path = build_dir/'build.log'
@@ -194,6 +196,10 @@ def prepare_build(repo, ref, build_root, cargo_target, env):
             metadata.update(versions, binary_sha256=_digest(binary), binary_size=binary.stat().st_size,
                             built_at=utc(), profile='debug', build_duration_s=round(time.monotonic()-start, 3))
             metadata.update(sha256=metadata['binary_sha256'], size=metadata['binary_size'], duration_s=metadata['build_duration_s'])
+            marker = build_dir/'.gd-source-owner'
+            if marker.is_symlink() or not marker.is_file() or marker.read_text() != str(build_dir.resolve()):
+                raise ValueError('refusing to remove unowned build scratch')
+            metadata['build_scratch_cleanup'] = scratch.remove_children(build_dir, ('src', 'tmp'), _allowed=('src', 'tmp'))
             temporary = build_dir/('build.json.' + uuid.uuid4().hex)
             temporary.write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
             temporary.replace(build_dir/'build.json')

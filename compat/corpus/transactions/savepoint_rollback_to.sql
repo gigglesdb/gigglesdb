@@ -3,7 +3,7 @@
 -- owner: D
 -- expect: compatible
 
-CREATE TABLE r0c_savepoint_rollback_to_t (id integer);
+CREATE TABLE r0c_savepoint_rollback_to_t (id integer PRIMARY KEY);
 BEGIN;
 INSERT INTO r0c_savepoint_rollback_to_t VALUES (1);
 SAVEPOINT first_row;

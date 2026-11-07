@@ -1,0 +1,110 @@
+[
+    {
+        "id":  "connect",
+        "title":  "Connect and report session identity",
+        "owner":  "A",
+        "expect_error":  false
+    },
+    {
+        "id":  "keepalive",
+        "title":  "Statement and prepared keepalive",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "ddl_create",
+        "title":  "Create typed items table",
+        "owner":  "E1",
+        "expect_error":  false
+    },
+    {
+        "id":  "prepared_insert",
+        "title":  "Insert typed and nullable parameters",
+        "owner":  "E1",
+        "expect_error":  false
+    },
+    {
+        "id":  "prepared_point_select",
+        "title":  "Read typed and nullable rows",
+        "owner":  "E3",
+        "expect_error":  false
+    },
+    {
+        "id":  "prepared_repeat",
+        "title":  "Repeat across prepare threshold",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "select_ordered",
+        "title":  "Select ordered item rows",
+        "owner":  "E3",
+        "expect_error":  false
+    },
+    {
+        "id":  "update_delete_params",
+        "title":  "Update and delete with parameters",
+        "owner":  "E1",
+        "expect_error":  false
+    },
+    {
+        "id":  "tx_commit",
+        "title":  "Commit visible to another connection",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "tx_rollback",
+        "title":  "Rollback removes inserted row",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "tx_error_recovery",
+        "title":  "Recover from duplicate and aborted transaction",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "savepoint",
+        "title":  "Rollback to savepoint and commit",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "id":  "types_roundtrip",
+        "title":  "Roundtrip independent typed and nullable parameters",
+        "owner":  "E2",
+        "expect_error":  false
+    },
+    {
+        "id":  "param_bytea_position",
+        "title":  "Bytea position with and without casts",
+        "owner":  "E2",
+        "expect_error":  false
+    },
+    {
+        "id":  "param_no_from_aggregate",
+        "title":  "Count and parameter max without FROM",
+        "owner":  "E3",
+        "expect_error":  false
+    },
+    {
+        "title":  "Simple query messages",
+        "id":  "simple_query",
+        "owner":  "D",
+        "expect_error":  false
+    },
+    {
+        "title":  "Prepared statement types",
+        "id":  "statement_types",
+        "owner":  "G",
+        "expect_error":  false
+    },
+    {
+        "title":  "Explicit INT8 prepared parameter",
+        "id":  "typed_prepare",
+        "owner":  "E2",
+        "expect_error":  false
+    }
+]

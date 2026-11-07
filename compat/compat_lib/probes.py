@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 
 from . import checks
 from .util import command, redact
@@ -179,7 +180,7 @@ def probe_image_tag(driver, probe_dir):
 
 def prepare_image(engine, driver, probe_dir, run, expected_version='42.7.3'):
     tag = probe_image_tag(driver, probe_dir)
-    metadata = dict(available=False, tag=tag, reason='', image_id=None, digest=None, repo_digests=[], expected_version=expected_version)
+    metadata = dict(available=False, tag=tag, reason='', image_id=None, digest=None, repo_digests=[], expected_version=expected_version, image_build_cache='unknown', image_build_duration_s=0)
     try:
         return _prepare_image(engine, driver, probe_dir, run, metadata)
     except OSError:
@@ -190,8 +191,14 @@ def prepare_image(engine, driver, probe_dir, run, expected_version='42.7.3'):
 def _prepare_image(engine, driver, probe_dir, run, metadata):
     tag = metadata['tag']
     inspect = engine.call('image', 'inspect', tag)
+    metadata['image_build_cache'] = 'hit'
     if inspect['exit'] != 0 or inspect['timed_out']:
-        build = engine.call('build', '--tag', tag, str(Path(probe_dir).resolve()), timeout=600)
+        metadata['image_build_cache'] = 'miss'
+        started = time.monotonic()
+        try:
+            build = engine.call('build', '--tag', tag, str(Path(probe_dir).resolve()), timeout=600)
+        finally:
+            metadata['image_build_duration_s'] = round(time.monotonic() - started, 3)
         logs = Path(run) / 'checks' / driver
         logs.mkdir(parents=True, exist_ok=True)
         for stream in ('stdout', 'stderr'):
@@ -210,13 +217,18 @@ def _prepare_image(engine, driver, probe_dir, run, metadata):
     return metadata
 
 
-def run_probe_side(engine, driver, image, network, name, host, port, manifest, expected_version='42.7.3', timeout=180, r0_prefix=None, version_fields=()):
+def run_probe_side(engine, driver, image, network, name, host, port, manifest, expected_version='42.7.3', timeout=180, r0_prefix=None, version_fields=(), client_env=None):
     if not name.startswith(engine.prefix) or name == engine.prefix:
         raise ValueError('refusing unrelated client name')
     env = dict(engine.env, PGHOST=host, PGPORT=str(port), PGUSER='postgres', PGDATABASE='postgres', R0_PREFIX=r0_prefix or 'r0d_' + driver)
+    client_env = client_env or {}
+    for key, value in client_env.items():
+        if key not in {'PGAPPNAME', 'R0_NPGSQL_PROFILE'} or not isinstance(value, str) or any(c in value for c in '\r\n\0'):
+            raise ValueError('invalid probe client environment: '+str(key))
+    env.update(client_env)
     args = ['docker', 'run', '--rm', '--name', name, '--network', network,
             '--add-host', 'host.docker.internal:host-gateway']
-    for key in ('PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE', 'PGPASSWORD', 'R0_PREFIX'):
+    for key in ('PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE', 'PGPASSWORD', 'R0_PREFIX', *client_env):
         args.extend(['-e', key])
     args.append(image['tag'] if isinstance(image, dict) else image)
     engine.containers.append(name)

@@ -3,8 +3,8 @@
 -- owner: E1
 -- expect: compatible
 
-CREATE TABLE r0c_insert_select_src (id integer, score integer);
-CREATE TABLE r0c_insert_select_dst (id integer, score integer);
+CREATE TABLE r0c_insert_select_src (id integer PRIMARY KEY, score integer);
+CREATE TABLE r0c_insert_select_dst (id integer PRIMARY KEY, score integer);
 INSERT INTO r0c_insert_select_src VALUES (2, 20);
 INSERT INTO r0c_insert_select_src VALUES (1, 10);
 INSERT INTO r0c_insert_select_src VALUES (3, 30);

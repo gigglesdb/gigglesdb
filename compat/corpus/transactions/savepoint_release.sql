@@ -3,7 +3,7 @@
 -- owner: D
 -- expect: compatible
 
-CREATE TABLE r0c_savepoint_release_t (id integer);
+CREATE TABLE r0c_savepoint_release_t (id integer PRIMARY KEY);
 BEGIN;
 SAVEPOINT pending_rows;
 INSERT INTO r0c_savepoint_release_t VALUES (1);

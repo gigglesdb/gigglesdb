@@ -10,7 +10,7 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, corpus, docker, gigglesdb, oracle, pins, probes, psql_client, report, util
+from compat_lib import checks, corpus, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -23,10 +23,12 @@ def parser():
     run.add_argument('--out-root', default='J:/gigglesdb-work/r0-harness/runs')
     run.add_argument('--clients', default=','.join(psql_client.REGISTRY))
     run.add_argument('--checks', default='*')
+    run.add_argument('--owners', default=','.join(sorted(checks.OWNERS)))
     run.add_argument('--corpus', default='*')
     run.add_argument('--no-corpus', action='store_true')
     run.add_argument('--no-checks', action='store_true')
     run.add_argument('--client-timeout', type=float, default=60)
+    run.add_argument('--keep-scratch', action='store_true')
     for flag in ('pull','keep','strict'):
         run.add_argument('--'+flag, action='store_true')
     return p
@@ -59,7 +61,7 @@ def run_check(engine, client, client_pin, check, available, unavailable_reason, 
         outputs = {}
         for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
             name = engine.prefix+'c-'+str(len(engine.containers))
-            result = psql_client.REGISTRY[client]['run'](engine,client_pin,network,name,host,dest_port,check['sql'],args.client_timeout, client_env=check['env'])
+            result = psql_client.REGISTRY[client]['run'](engine,client_pin,network,name,host,dest_port,check['sql'],args.client_timeout, client_env=dict(check.get('env', {}), PGAPPNAME='r0:psql:'+check['id']))
             outputs[side] = result
             item[side] = {k:result[k] for k in ('exit','duration_ms','timed_out')}
             for stream in ('stdout','stderr'):
@@ -93,7 +95,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
         outputs = {}
         for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
             name = engine.prefix+'c-'+str(len(engine.containers))
-            result = runner(engine,client_pin,network,name,host,dest_port,script,120)
+            result = runner(engine,client_pin,network,name,host,dest_port,script,120,client_env={'PGAPPNAME':'r0:corpus:'+case['area']+'/'+case['id']})
             outputs[side] = result
             for stream in ('stdout','stderr'):
                 (directory/f'{side}.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
@@ -123,7 +125,8 @@ def run_probe_client(engine, client, registration, args, data, run, network, pg_
     probe_dir = Path(__file__).parent/registration['probe_dir']
     manifest = probes.load_manifest(probe_dir/'cases.json')
     directory = run/'checks'/client
-    directory.mkdir(parents=True, exist_ok=False)
+    # A shared driver's earlier alias may already have written image build logs.
+    directory.mkdir(parents=True, exist_ok=True)
     image = probes.prepare_image(engine, registration['driver'], probe_dir, run,
                                  expected_version=registration['version_expected'])
     data['clients'][client] = dict(image, image=image.get('tag'), version=None)
@@ -134,7 +137,8 @@ def run_probe_client(engine, client, registration, args, data, run, network, pg_
             outputs[side] = probes.run_probe_side(
                 engine, registration['driver'], image, network, engine.prefix+'c-'+str(base+index),
                 host, dest_port, manifest, expected_version=registration['version_expected'], timeout=180,
-                r0_prefix=registration.get('r0_prefix'), version_fields=registration.get('version_fields', ()))
+                r0_prefix=registration.get('r0_prefix'), version_fields=registration.get('version_fields', ()),
+                client_env=dict(registration.get('client_env', {}), PGAPPNAME='r0:'+client))
             for stream in ('stdout','stderr'):
                 (directory/f'{side}.{stream}.txt').write_text(util.redact(outputs[side][stream],[password]),encoding='utf-8')
         data['clients'][client]['version'] = outputs['pg'].get('version')
@@ -144,6 +148,8 @@ def run_probe_client(engine, client, registration, args, data, run, network, pg_
     else:
         rows = [dict(case, outcome='UNTESTED', reason=image.get('reason','probe image unavailable')) for case in manifest]
     for row in rows:
+        if not owner_matches(row, args.owners):
+            continue
         if not (fnmatch.fnmatch(row['id'], args.checks) or fnmatch.fnmatch(row['id']+'.json',args.checks)):
             continue
         item = dict(row, client=client, artifact_dir=str(directory/row['id']))
@@ -165,6 +171,17 @@ def run_probe_client(engine, client, registration, args, data, run, network, pg_
         data['checks'].append(item)
 
 
+def parse_owners(value):
+    owners = {part.strip() for part in value.split(',') if part.strip()}
+    if not owners or not owners <= checks.OWNERS:
+        raise ValueError('--owners must contain owners from: '+', '.join(sorted(checks.OWNERS)))
+    return owners
+
+
+def owner_matches(case, owners):
+    return case['owner'] in parse_owners(owners)
+
+
 def corpus_matches(case, pattern):
     path = Path(case['path'])
     values = (case['id'], case['area'], case['area']+'/'+case['id'],
@@ -174,6 +191,10 @@ def corpus_matches(case, pattern):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    try:
+        parse_owners(args.owners)
+    except ValueError as exc:
+        parser().error(str(exc))
     if not math.isfinite(args.client_timeout) or args.client_timeout <= 0:
         parser().error('--client-timeout must be positive')
     try:
@@ -193,6 +214,7 @@ def main(argv=None):
     engine = docker.Docker(run_id, env)
     server = None
     infra = False
+    stopped = True
     try:
         if not selected or any(name not in psql_client.REGISTRY for name in selected):
             raise ValueError('--clients must contain registered client names: '+', '.join(psql_client.REGISTRY))
@@ -200,7 +222,7 @@ def main(argv=None):
             result = util.command(['git','-C',str(Path(__file__).resolve().parent.parent),*command[1:]], env)
             data['harness'][key] = result['stdout'].strip() if key == 'commit' else bool(result['stdout'].strip())
         cases = corpus.discover_cases(Path(__file__).parent/'corpus') if not args.no_corpus else []
-        cases = [case for case in cases if corpus_matches(case, args.corpus)]
+        cases = [case for case in cases if corpus_matches(case, args.corpus) and owner_matches(case, args.owners)]
         pinned = pins.load()
         env.update(POSTGRES_INITDB_ARGS=pinned['postgres']['initdb_args'], TZ=pinned['postgres']['tz'], PGTZ=pinned['postgres']['tz'])
         binary = args.server_bin
@@ -232,6 +254,8 @@ def main(argv=None):
                 if check['id'] in seen:
                     raise ValueError('duplicate check id: '+check['id'])
                 seen.add(check['id'])
+                if not owner_matches(check, args.owners):
+                    continue
                 if not (fnmatch.fnmatch(check['id'], args.checks) or fnmatch.fnmatch(path.name,args.checks)):
                     continue
                 run_check(engine, client, client_pin, check, available, unavailable_reason, args, data, run, network, pg_host, port, password)
@@ -248,9 +272,20 @@ def main(argv=None):
         if server:
             try:
                 server.stop()
+                if server.process is not None and server.process.poll() is None:
+                    raise RuntimeError('server remains running after shutdown')
                 data['build'].update(server.meta)
             except Exception as exc:
+                stopped = False
                 infra = True; data['shutdown_error'] = util.redact(str(exc),[password])
+        if engine.prefix+'pg' in engine.containers:
+            try:
+                oracle.capture_log(engine, run/'oracle.log', [password])
+                data['oracle_log'] = 'oracle.log'
+                data['oracle']['oracle_log'] = 'oracle.log'
+            except Exception as exc:
+                infra = True
+                data['oracle_log_error'] = util.redact(str(exc), [password])
         if args.keep:
             retained = []
             for name in engine.containers:
@@ -269,6 +304,17 @@ def main(argv=None):
         data['finished_at'] = util.utc()
         data['summary'], data['failures_by_owner'] = report.summarize(data['checks'], selected)
         data['differential']['summary'] = corpus.summarize(data['differential']['cases'])
+        report.write(run,data,[password])
+        data.update(scratch_removed=[], scratch_bytes_freed=0)
+        data['scratch_kept'] = args.keep_scratch
+        if stopped:
+            try:
+                data.update(scratch.remove_children(run, keep=args.keep_scratch))
+            except Exception as exc:
+                infra = True
+                data['scratch_cleanup_error'] = util.redact(str(exc), [password])
+        else:
+            data['scratch_cleanup_error'] = 'server shutdown failed; scratch retained'
         report.write(run,data,[password])
         print(run/'report.md')
         print(report.client_table(data['summary']['clients']))

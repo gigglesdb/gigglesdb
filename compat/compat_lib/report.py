@@ -94,6 +94,11 @@ def markdown(report):
         lines += differential_markdown(report['differential'])
     if report.get('error'):
         lines += ['', 'Harness error: '+report['error']]
+    if 'scratch_removed' in report:
+        lines += ['', 'Scratch removed: '+(', '.join(report['scratch_removed']) or 'none'),
+                  'Scratch bytes freed: '+str(report['scratch_bytes_freed'])]
+        if report.get('scratch_cleanup_error'):
+            lines += ['Scratch cleanup error: '+report['scratch_cleanup_error']]
     if build.get('build_log_tail'):
         tail = build['build_log_tail']
         lines += ['', 'Build log: '+str(build.get('build_log', 'unavailable')), 'Build log (last 30 lines):', '```text', '\n'.join(tail) if isinstance(tail,list) else str(tail), '```']

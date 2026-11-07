@@ -8,7 +8,7 @@ const canonical = v => Buffer.isBuffer(v) ? v.toString('hex') : v instanceof Dat
 const typeNames = {16:'bool',17:'bytea',20:'int8',21:'int2',23:'int4',25:'text',700:'float4',701:'float8',1043:'varchar',1184:'timestamptz',1700:'numeric',2950:'uuid'};
 const error = e => ({sqlstate: typeof e.code === 'string' && /^[A-Z0-9]{5}$/.test(e.code) ? e.code : null, exception_class: e instanceof ProbeAssertion ? 'ProbeAssertion' : e instanceof TypeError ? 'TypeError' : 'Error', ...(e instanceof ProbeAssertion ? {reason:e.reason} : {})});
 async function observe(fn) { try { return {status:'OK',data:canonical(await fn())}; } catch(e) { return {status:'ERR',...error(e)}; } }
-function client() { const c = new Client({host:process.env.PGHOST||'localhost',port:Number(process.env.PGPORT||5432),user:process.env.PGUSER||'postgres',database:process.env.PGDATABASE||'postgres',password:process.env.PGPASSWORD||'',ssl:false,connectionTimeoutMillis:10000,query_timeout:30000}); c.on('error',()=>{}); return c; }
+function client() { const c = new Client({host:process.env.PGHOST||'localhost',port:Number(process.env.PGPORT||5432),user:process.env.PGUSER||'postgres',database:process.env.PGDATABASE||'postgres',password:process.env.PGPASSWORD||'',application_name:process.env.PGAPPNAME||'',ssl:false,connectionTimeoutMillis:10000,query_timeout:30000}); c.on('error',()=>{}); return c; }
 async function connected(fn) { const c=client(); try { await c.connect(); return await fn(c); } finally { await c.end().catch(()=>{}); } }
 const prefix=process.env.R0_PREFIX||'r0d_nodepg';
 requireValue(/^[a-z][a-z0-9_]*$/.test(prefix),'invalid_prefix');

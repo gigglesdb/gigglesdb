@@ -2,6 +2,7 @@
 -- title: Composite primary key
 -- owner: E1
 -- expect: compatible
+-- primary-key exception: The composite key is the feature under test; retain its two columns.
 CREATE TABLE r0c_composite_primary_key_t (a int, b int, PRIMARY KEY (a, b));
 INSERT INTO r0c_composite_primary_key_t VALUES (1, 1);
 INSERT INTO r0c_composite_primary_key_t VALUES (1, 2);

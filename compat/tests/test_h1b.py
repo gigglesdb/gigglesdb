@@ -75,7 +75,7 @@ class H1bTests(unittest.TestCase):
                 del psql_client.REGISTRY['other']
         self.assertEqual(runner.call_count,2)
         self.assertEqual([c.args[4] for c in runner.call_args_list],['pg-host','host.docker.internal'])
-        self.assertTrue(all(c.kwargs['client_env'] == {'PGTZ':'UTC'} for c in runner.call_args_list))
+        self.assertTrue(all(c.kwargs['client_env'] == {'PGTZ':'UTC', 'PGAPPNAME':'r0:psql:'+check['id']} for c in runner.call_args_list))
         self.assertEqual(data['checks'][0]['outcome'],'PASS')
         self.assertEqual(data['checks'][0]['env'], {'PGTZ':'UTC'})
         self.assertEqual(data['checks'][0]['compare'], 'stdout')

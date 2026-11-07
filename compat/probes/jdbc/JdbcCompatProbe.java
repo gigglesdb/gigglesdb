@@ -23,6 +23,7 @@ public final class JdbcCompatProbe {
   static String env(String name,String fallback) { return System.getenv().getOrDefault(name,fallback); }
   static Connection connect() throws SQLException {
     Properties p=new Properties();
+    p.setProperty("ApplicationName",env("PGAPPNAME",""));
     p.setProperty("user",env("PGUSER","postgres"));p.setProperty("password",env("PGPASSWORD",""));
     p.setProperty("sslmode","disable");p.setProperty("connectTimeout","10");
     p.setProperty("socketTimeout","30");p.setProperty("prepareThreshold","5");

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -78,6 +79,30 @@ class CorpusTests(unittest.TestCase):
                 self.assertTrue(case['statements'])
                 for statement in case['statements']:
                     self.assertTrue(statement['sql'].rstrip().endswith(';'))
+
+    def test_repository_setup_tables_have_primary_keys(self):
+        root = Path(__file__).resolve().parents[1] / 'corpus'
+        exceptions = {
+            'create_table_without_primary_key':
+                '-- primary-key exception: Absence of a primary key is the feature under test.',
+        }
+        seen_exceptions = set()
+        for path in sorted(root.glob('*/*.sql')):
+            case = corpus.parse_case(path)
+            for statement in case['statements']:
+                sql = statement['sql']
+                if not re.match(r'CREATE\s+TABLE\b', sql, re.IGNORECASE):
+                    continue
+                with self.subTest(path=path, sql=sql):
+                    if re.search(r'\bPRIMARY\s+KEY\b', sql, re.IGNORECASE):
+                        continue
+                    self.assertIn(case['id'], exceptions)
+                    self.assertIn(exceptions[case['id']], path.read_text(encoding='utf-8').splitlines())
+                    seen_exceptions.add(case['id'])
+        self.assertEqual(seen_exceptions, set(exceptions))
+        composite = root / 'constraints' / 'composite_primary_key.sql'
+        self.assertIn('-- primary-key exception: The composite key is the feature under test; retain its two columns.',
+                      composite.read_text(encoding='utf-8').splitlines())
 
     def transcript(self, case, states=None, outputs=None, **extra):
         states = states or ['00000'] * len(case['statements'])

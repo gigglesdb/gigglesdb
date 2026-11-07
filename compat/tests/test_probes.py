@@ -141,11 +141,16 @@ class ProbeTests(unittest.TestCase):
             engine.call.side_effect = [bad, bad]
             result = probes.prepare_image(engine, 'jdbc', root, root / 'run')
             self.assertFalse(result['available'])
+            self.assertEqual(result['image_build_cache'], 'miss')
+            self.assertGreaterEqual(result['image_build_duration_s'], 0)
             self.assertNotIn('secret', (root / 'run/checks/jdbc/build.stderr.txt').read_text())
             self.assertEqual(engine.call.call_args_list[1].args[:3], ('build', '--tag', result['tag']))
             engine.call.reset_mock(side_effect=True)
             engine.call.return_value = ok
-            self.assertTrue(probes.prepare_image(engine, 'jdbc', root, root / 'run')['available'])
+            cached = probes.prepare_image(engine, 'jdbc', root, root / 'run')
+            self.assertTrue(cached['available'])
+            self.assertEqual(cached['image_build_cache'], 'hit')
+            self.assertEqual(cached['image_build_duration_s'], 0)
             self.assertEqual(engine.call.call_count, 1)
             engine.call.side_effect = OSError('Docker unavailable')
             self.assertFalse(probes.prepare_image(engine, 'jdbc', root, root / 'run')['available'])

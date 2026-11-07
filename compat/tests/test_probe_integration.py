@@ -14,7 +14,7 @@ def setUpModule(): _STORAGE.start()
 def tearDownModule(): _STORAGE.finish()
 
 class ProbeIntegrationTests(unittest.TestCase):
-    def invoke(self, image=None, pg=None, gg=None, pattern='*', client='jdbc'):
+    def invoke(self, image=None, pg=None, gg=None, pattern='*', client='jdbc', owners='H,E1'):
         manifest = [dict(id='one', title='First', owner='H', expect_error=False),
                     dict(id='two', title='Second', owner='E1', expect_error=False)]
         image = image or dict(available=True, tag='gd-r0-probe-jdbc:abc', image_id='sha256:abc', digest='sha256:abc', version=None)
@@ -25,7 +25,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TASK) as temp:
             run = Path(temp)
             with patch.object(probes,'load_manifest',return_value=manifest), patch.object(probes,'prepare_image',return_value=image), patch.object(probes,'run_probe_side',side_effect=[dict(good, **(pg or {})),dict(good, **(gg or {}))]) as runner:
-                harness.run_probe_client(engine,client,psql_client.REGISTRY[client],SimpleNamespace(checks=pattern),data,run,'network','pg',1234,'password')
+                harness.run_probe_client(engine,client,psql_client.REGISTRY[client],SimpleNamespace(checks=pattern, owners=owners),data,run,'network','pg',1234,'password')
                 artifacts = {path.relative_to(run).as_posix():path.read_text() for path in run.rglob('*') if path.is_file()}
                 calls = runner.call_args_list
         return data, artifacts, calls
@@ -93,3 +93,12 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertIn('checks/jdbc/one/diff.txt',artifacts)
 
 
+
+    def test_owner_filter_is_anded_and_manifest_stays_full(self):
+        data, _, calls = self.invoke(pattern='one', owners='E1')
+        self.assertEqual(data['checks'], [])
+        self.assertEqual(len(calls[0].args[7]), 2)
+        data, _, calls = self.invoke(pattern='*', owners='E1', client='npgsql-notypes')
+        self.assertEqual([row['id'] for row in data['checks']], ['two'])
+        self.assertEqual(calls[0].kwargs['client_env'],
+                         {'PGAPPNAME':'r0:npgsql-notypes', 'R0_NPGSQL_PROFILE':'notypes'})

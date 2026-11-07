@@ -64,6 +64,7 @@ def connect():
                            user=os.getenv("PGUSER", "postgres"),
                            dbname=os.getenv("PGDATABASE", "postgres"),
                            password=os.getenv("PGPASSWORD", ""),
+                           application_name=os.getenv("PGAPPNAME", ""),
                            sslmode="disable", connect_timeout=10, autocommit=True)
 
 

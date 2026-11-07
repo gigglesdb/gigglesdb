@@ -143,6 +143,17 @@ command; multiple top-level commands or trailing SQL after a semicolon are rejec
 and semicolons inside single quotes, double quotes, or dollar quotes are handled;
 trailing line comments are recognized.
 psql metacommands in corpus source are forbidden. Tables persist between cases; use case-prefixed names to avoid interference.
+
+Give corpus setup tables a primary key so setup succeeds before the intended
+feature is exercised. Preserve feature-specific key definitions: the
+`constraints/composite_primary_key.sql` case retains its two-column primary key
+and its explanatory `primary-key exception` comment. The dedicated
+`defaults/create_table_without_primary_key.sql` case belongs to owner F and
+intentionally omits the key because that absence is the feature under test; its
+`primary-key exception` comment records the approved exception. The corpus
+primary-key lint rejects setup tables without a primary key unless they have an
+approved exception.
+
 Table names without the case ID warn.
 
 Generated scripts disable ON_ERROR_STOP, use SQLSTATE diagnostics and CSV output,
@@ -205,7 +216,7 @@ parameters requires the H3 extended-protocol client lane. This simple-query SQL
 corpus cannot exercise Parse-declared parameter types; `explicit_bytea_cast`
 covers only literal casts and must not be cited as closing that gap.
 
-Measurement is pending: **DOCKER LANE HELD**. No new PostgreSQL/GigglesDB
+At the H2 inventory checkpoint, measurement was pending (**DOCKER LANE HELD**). No new PostgreSQL/GigglesDB
 classifications, pass rates, or compatibility claims are established by this
 inventory or the Docker-free unit suite. The known_gaps directory names source
 candidates, not measured failures. Every case is intended for later differential
@@ -273,7 +284,7 @@ survive ordinary cleanup and `--keep`; remove a specific unused image explicitly
 docker image rm gd-r0-probe-jdbc:<first12-sha256>
 ```
 
-Docker end-to-end qualification is pending while **DOCKER LANE HELD**. Neither
+At the H3a implementation checkpoint, Docker qualification was pending (**DOCKER LANE HELD**). Neither
 host Java/javac nor probe image builds were run for the Docker-free unit checks;
 these checks establish harness behavior, not measured JDBC compatibility.
 
@@ -329,3 +340,61 @@ comparison. SQL prefixes are `r0d_jdbc`, `r0d_psycopg`, and `r0d_nodepg`.
 Docker-free tests validate framing, metadata propagation, assertion reasons and
 report classification. They do not establish PostgreSQL/GigglesDB compatibility;
 end-to-end results must come from a separately recorded Docker run.
+
+## Scratch retention
+
+Runs write their reports before deleting only their own `bin`, `data`, `tmp`,
+`target`, and `cwd` directories, then update the reports with `scratch_removed`
+and `scratch_bytes_freed`. `--keep-scratch` retains those directories for debugging;
+`--keep` independently retains Docker objects. A failed server shutdown retains
+scratch. Cleanup refuses redirected parents, symlinks, junctions, and nested
+reparse points. Successful commit builds retain the executable, `build.json`, and
+`build.log`, while deleting their owned source export and temporary directory.
+Probe client metadata records `image_build_cache` and `image_build_duration_s`.
+
+## H3c compiled driver probes
+
+`tokio-postgres` uses exact driver 0.7.15, Tokio 1.47.1 and postgres-types
+0.2.11. Its standalone Cargo workspace builds with `rust:1.90.0-slim-bookworm`
+and runs on `debian:bookworm-slim`. Cargo.lock is generated in that builder,
+committed, and required by `cargo build --locked`; the Docker build also checks
+the locked tokio-postgres version. Chrono 0.4.42, UUID 1.18.1 and rust_decimal
+1.39.0 provide native timestamp, UUID and numeric conversions.
+
+The 18 tokio-postgres cases include the shared 15 core cases plus `simple_query`
+(message kinds and values), `statement_types` (prepared parameter and column
+types), and `typed_prepare` (explicit INT8 parameter against an integer key).
+Its application table is `r0d_tokio_items`. Each case owns a NoTls connection,
+with a 30 second case deadline, and emits only VERSION, CASE and DONE records.
+The no-FROM `max($1)` observation uses a typed INT4 parameter; type round trips
+use independent primary-key tables with non-NULL and NULL point observations.
+The other compiled H3c probes pin pgx 5.7.6 (19 cases), built with
+`golang:1.23-bookworm` and run on `debian:bookworm-slim`, and Npgsql 9.0.4
+(19 cases), built with `mcr.microsoft.com/dotnet/sdk:9.0.203` and run on
+`mcr.microsoft.com/dotnet/runtime:9.0.4`. Go and Rust use committed `go.sum` and `Cargo.lock` files. Npgsql references
+an exact NuGet package version. All compiled probes build from their own
+probe directory without a host language toolchain.
+
+
+## H3d selection and oracle diagnostics
+
+`--owners E1,H` selects owners from A, B, C, D, E1, E2, E3, F, G, H.
+The owner filter is ANDed with `--checks` and `--corpus`; invalid or empty
+owner selections fail before starting infrastructure. Corpus filtering happens
+before sessions run. Driver probes still execute and validate their full manifest,
+including setup dependencies, while only matching cases enter the report.
+
+The `npgsql-notypes` client uses the same Npgsql 9.0.4 image and manifest as
+`npgsql`, with `R0_NPGSQL_PROFILE=notypes` and separate `r0d_npgsqlnt` tables.
+Its profile skips startup type loading for diagnostics; the normal profile
+retains the ordinary driver startup behavior. Both clients reuse the same
+content-addressed image.
+
+The PostgreSQL oracle enables all statement logging, error statement logging,
+and `%m [%p] %a ` prefixes. Before container cleanup, even after readiness
+failure, its merged Docker stdout/stderr is captured as `oracle.log` and linked
+by top-level `oracle_log` in report JSON (also mirrored in `oracle.oracle_log`). Capture reads a bounded prefix, redacts
+passwords and PostgreSQL URLs, and caps final stored bytes at 20 MiB, including
+a truncation marker. Required application attribution overrides any check
+`PGAPPNAME` header: `r0:psql:<check-id>`, `r0:corpus:<area>/<case-id>`, and
+`r0:<registered-client>` for probes, including `r0:npgsql-notypes`.

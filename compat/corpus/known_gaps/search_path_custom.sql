@@ -3,7 +3,7 @@
 -- owner: D
 -- expect: compatible
 CREATE SCHEMA r0c_sp;
-CREATE TABLE r0c_sp.r0c_search_path_custom_t (id int);
+CREATE TABLE r0c_sp.r0c_search_path_custom_t (id int PRIMARY KEY);
 SET search_path TO r0c_sp, public;
 INSERT INTO r0c_search_path_custom_t VALUES (1);
 SELECT id FROM r0c_search_path_custom_t;
