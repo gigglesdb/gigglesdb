@@ -68,6 +68,14 @@ creating a new archive or target directory per proof. A target directory can
 then be deleted at any time to free disk, because rebuilding it comes from the
 cache. Two concurrent builds must never share one CARGO_TARGET_DIR.
 
+The shared repository sets core.autocrlf=true, so a plain worktree checkout
+gives files CRLF line endings, and LF-sensitive fixtures (tzdata, typmod
+oracles) then show as modified or fail. Create and move worktrees with
+`git -c core.autocrlf=false worktree add --detach <path> <ref>` and
+`git -c core.autocrlf=false -C <path> checkout --detach <ref>`, and compute
+proof hashes from committed blobs (`git hash-object` / `git rev-parse <ref>:<path>`),
+never from CRLF working copies.
+
 ## Cleaning up J:/gigglesdb-work
 
 Agents must clean up after themselves in J:/gigglesdb-work. When a work item
