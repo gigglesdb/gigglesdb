@@ -3,6 +3,7 @@ mod catalog_inspection;
 mod drop_table;
 mod engine;
 mod format_policy;
+mod feature_envelope;
 pub(crate) mod native_once;
 pub(crate) mod operation_adapter;
 pub mod replica;
@@ -173,6 +174,10 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     let format = state_format(s)?;
     let mut out = BTreeMap::new();
+    let bits = feature_envelope::feature_bits_present(s)?;
+    if format == 53 {
+        out.insert(vec![10], bits.to_be_bytes().to_vec());
+    }
     if let Some(ledger) = &s.applications {
         out.insert(vec![9], ledger.bytes()?);
     }
@@ -216,26 +221,13 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     Ok(out)
 }
 fn state_format(s: &State) -> Result<u32, CoreError> {
-    let indexed = s.sql.has_secondary_indexes_engine();
-    if indexed && s.applications.is_some() {
-        return Err(CoreError::Unsupported);
-    }
-    let features = format_policy::Features {
-        typed_scalars: s.sql.contains_typed()
-            || s.applications.as_ref().is_some_and(|a| a.contains_typed())
-            || s.native_outcomes
-                .as_ref()
-                .is_some_and(|n| n.contains_typed().unwrap_or(true)),
-        native_outcomes: s.native_outcomes.is_some(),
-    };
-    let base = if s.applications.is_some() {
-        features.version_application(true)
+    let bits = feature_envelope::feature_bits_present(s)?;
+    let legacy = format_policy::bits_to_legacy_version(bits & 63).ok_or(CoreError::Unsupported)?;
+    Ok(if bits & feature_envelope::NEW_BITS != 0 {
+        53
     } else {
-        features.version_with(indexed)
-    };
-    let temporal = format_policy::temporal_version(base, contains_temporal(s)?)
-        .ok_or(CoreError::Unsupported)?;
-    format_policy::heap_version(temporal, s.sql.contains_heap()).ok_or(CoreError::Unsupported)
+        legacy
+    })
 }
 fn contains_temporal(s: &State) -> Result<bool, CoreError> {
     Ok(s.sql.contains_temporal()
@@ -248,6 +240,7 @@ fn contains_temporal(s: &State) -> Result<bool, CoreError> {
         })
 }
 fn envelope_family(version: u32) -> Result<(format_policy::Features, bool, bool, bool, bool), CoreError> {
+    format_policy::legacy_version_to_bits(version).ok_or(CoreError::Unsupported)?;
     let (base, heap) = format_policy::heap_base(version).ok_or(CoreError::Unsupported)?;
     let (base, temporal) = format_policy::temporal_base(base).ok_or(CoreError::Unsupported)?;
     let (features, indexed, applications) = secondary_index::family(base)?;
@@ -278,14 +271,28 @@ fn from_records_with_cancel(
     records: BTreeMap<Vec<u8>, Vec<u8>>,
     cancel: &mut impl FnMut() -> bool,
 ) -> Result<State, CoreError> {
+    from_records_mode(records, cancel, true)
+}
+fn from_records_mode(
+    records: BTreeMap<Vec<u8>, Vec<u8>>,
+    cancel: &mut impl FnMut() -> bool,
+    import: bool,
+) -> Result<State, CoreError> {
     envelope_bound(&records)?;
     let m: Metadata = decode(
         records
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    let (features, indexed, applications, temporal, heap) = envelope_family(m.format)?;
-    let (base_version, _) = format_policy::heap_base(m.format).ok_or(CoreError::Unsupported)?;
+    let bits = feature_envelope::decode_bits(&records, m.format, import)?;
+    let legacy = match bits {
+        Some(bits) => {
+            format_policy::bits_to_legacy_version(bits & 63).ok_or(CoreError::Unsupported)?
+        }
+        None => m.format,
+    };
+    let (features, indexed, applications, temporal, heap) = envelope_family(legacy)?;
+    let (base_version, _) = format_policy::heap_base(legacy).ok_or(CoreError::Unsupported)?;
     secondary_index::gate(&records, indexed, applications)?;
     let mut s = empty(m.domain);
     match records.get(&vec![9]) {
@@ -350,6 +357,14 @@ fn from_records_with_cancel(
             Some(6) if k.len() == 9 && base_version >= FORMAT => {
                 s.accounting.insert(TaskId(num(1)?), decode(&v)?);
             }
+            Some(10) if k.len() == 1 && m.format == 53 => {}
+            // TODO(E1): decode counters when State owns sequence counters. Until
+            // then their presence cannot agree with the content predicate.
+            Some(11) if k.len() == 17 && bits.is_some_and(|b| b & 256 != 0) => {
+                return Err(CoreError::Corrupt(
+                    "sequence counters not implemented".into(),
+                ));
+            }
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
             Some(7) if k.len() == 1 && features.native_outcomes => {}
@@ -388,6 +403,11 @@ fn from_records_with_cancel(
         s.sql
             .secondary_restore_engine(pending, &mut *cancel)
             .map_err(|error| secondary_index::sql_error_with_cancel(error, cancel))?;
+    }
+    if let Some(bits) = bits
+        && feature_envelope::feature_bits_present(&s)? != bits
+    {
+        return Err(CoreError::Corrupt("feature content mismatch".into()));
     }
     if cancel() {
         return Err(CoreError::Cancelled);
@@ -526,7 +546,7 @@ impl Inner {
             }
             out.insert(k.value().to_vec(), v.value().to_vec());
         }
-        from_records(out)
+        from_records_mode(out, &mut || crate::cancellation::check().is_err(), false)
     }
     fn inspect<T>(&self, f: impl FnOnce(&State) -> Result<T, CoreError>) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
@@ -1015,9 +1035,10 @@ impl Admin {
         point: RecoveryPoint,
     ) -> Result<[u8; 32], CoreError> {
         let path = path.as_ref();
-        let (format, payload) = self
-            .inner
-            .inspect(|s| Ok((state_format(s)?, encode(&records(s)?)?)))?;
+        let (format, payload) = self.inner.inspect(|s| {
+            feature_envelope::export_allowed(feature_envelope::feature_bits_present(s)?)?;
+            Ok((state_format(s)?, encode(&records(s)?)?))
+        })?;
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(io)?;
@@ -1061,10 +1082,11 @@ impl Admin {
         let mut header = [0u8; 52];
         f.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC
-            || envelope_family(u32::from_be_bytes(
-                header[8..12].try_into().expect("length"),
-            ))
-            .is_err()
+            || (u32::from_be_bytes(header[8..12].try_into().expect("length")) != 53
+                && envelope_family(u32::from_be_bytes(
+                    header[8..12].try_into().expect("length"),
+                ))
+                .is_err())
         {
             return Err(CoreError::Unsupported);
         }

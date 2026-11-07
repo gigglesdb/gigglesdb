@@ -130,6 +130,32 @@ pub(super) fn heap_base(version: u32) -> Option<(u32, bool)> {
     }
 }
 
+/// Translate through the existing family and wrapper policies; 1/2 are aliases of 3.
+pub(super) fn legacy_version_to_bits(version: u32) -> Option<u64> {
+    let (base, heap) = heap_base(version)?;
+    let (base, temporal) = temporal_base(base)?;
+    let (f, indexed, applications) = super::secondary_index::family(base).ok()?;
+    Some(u64::from(f.typed_scalars) | (u64::from(f.native_outcomes) << 1)
+        | (u64::from(indexed) << 2) | (u64::from(applications) << 3)
+        | (u64::from(temporal) << 4) | (u64::from(heap) << 5))
+}
+
+pub(super) fn bits_to_legacy_version(bits: u64) -> Option<u32> {
+    if bits & !63 != 0 || bits & 12 == 12 {
+        return None;
+    }
+    let f = Features {
+        typed_scalars: bits & 1 != 0,
+        native_outcomes: bits & 2 != 0,
+    };
+    let base = if bits & 8 != 0 {
+        f.version_application(true)
+    } else {
+        f.version_with(bits & 4 != 0)
+    };
+    heap_version(temporal_version(base, bits & 16 != 0)?, bits & 32 != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +289,12 @@ mod tests {
             m.format = version;
             r.insert(vec![0], encode(&m).unwrap());
             r.insert(vec![5], vec![255]);
-            assert!(matches!(from_records(r), Err(CoreError::Unsupported)));
+            assert!(matches!(old_reader(&r), Err(CoreError::Unsupported)));
+            if version == 53 {
+                assert!(matches!(from_records(r), Err(CoreError::Corrupt(_))));
+            } else {
+                assert!(matches!(from_records(r), Err(CoreError::Unsupported)));
+            }
         }
     }
 

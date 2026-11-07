@@ -31,6 +31,7 @@ fn replica_state_with_cancel(
     if state.native_outcomes.is_some()
         || state.sql.has_secondary_indexes_engine()
         || state.sql.contains_heap()
+            || crate::storage::feature_envelope::feature_bits_present(&state)? & crate::storage::feature_envelope::NEW_BITS != 0
     {
         return Err(CoreError::Unsupported);
     }
@@ -194,7 +195,8 @@ impl Image {
         let a = Admin::attach(db, Limits::default())?;
         let reply = work(&a)?;
         let state = a.inner.read()?;
-        if state.sql.contains_heap() {
+        if state.sql.contains_heap()
+            || crate::storage::feature_envelope::feature_bits_present(&state)? & crate::storage::feature_envelope::NEW_BITS != 0 {
             return Err(CoreError::Unsupported);
         }
         let image = Self(encode(&records(&state)?)?);

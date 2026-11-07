@@ -219,3 +219,54 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
         }
     });
 }
+
+#[test]
+fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
+    database(|s| {
+        let old = row(s);
+        // Each assignment is validated in order; duplicate targets are checked last.
+        for (sql, expected) in [
+            ("UPDATE items SET id=2 WHERE id=1", E::Unsupported),
+            ("UPDATE items SET n=1,n=2 WHERE id=1", E::Duplicate),
+            ("UPDATE items SET n='x' WHERE id=1", E::Type),
+            ("UPDATE items SET id='x',n='x' WHERE id=1", E::Unsupported),
+            ("UPDATE items SET n='x',id=2 WHERE id=1", E::Type),
+            ("UPDATE items SET n=1,n=2,m='x' WHERE id=1", E::Type),
+            ("UPDATE items SET m='x',n=1,n=2 WHERE id=1", E::Type),
+            ("UPDATE items SET n=1,n='x' WHERE id=1", E::Type),
+            ("UPDATE items SET n='x',n=2 WHERE id=1", E::Type),
+        ] {
+            error(s, sql, expected);
+            assert_eq!(row(s), old, "{sql}");
+        }
+        for (sql, expected) in [
+            ("UPDATE items SET n=$1 WHERE id=1", E::Type),
+            ("UPDATE items SET id=2,n=$1 WHERE id=1", E::Unsupported),
+            ("UPDATE items SET n=$1,id=2 WHERE id=1", E::Type),
+            ("UPDATE items SET n=1,n=2,m=$1 WHERE id=1", E::Type),
+            ("UPDATE items SET m=$1,n=1,n=2 WHERE id=1", E::Type),
+        ] {
+            assert_eq!(
+                s.execute(sql, &[V::Text("x".into())], None),
+                Err(CoreError::Sql(expected)),
+                "{sql}"
+            );
+            assert_eq!(row(s), old, "{sql}");
+        }
+
+        run(
+            s,
+            "CREATE TABLE required (id BIGINT PRIMARY KEY, n INTEGER NOT NULL)",
+        );
+        run(s, "INSERT INTO required VALUES(1,10)");
+        let select = "SELECT id,n FROM required WHERE id=1";
+        let required_old = run(s, select).rows.remove(0);
+        for sql in [
+            "UPDATE required SET n=NULL WHERE id=1",
+            "UPDATE required SET n=1,n=NULL WHERE id=1",
+        ] {
+            error(s, sql, E::Null);
+            assert_eq!(run(s, select).rows.remove(0), required_old, "{sql}");
+        }
+    });
+}

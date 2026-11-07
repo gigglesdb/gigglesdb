@@ -384,6 +384,7 @@ fn classify_source(state: &crate::storage::State) -> Result<Metadata, CoreError>
             .is_some_and(|ledger| !ledger.is_empty_readonly())
         || state.sql.tables.len() != 1
         || state.sql.contains_heap()
+            || crate::storage::feature_envelope::feature_bits_present(state)? & crate::storage::feature_envelope::NEW_BITS != 0
     {
         return Err(CoreError::Unsupported);
     }

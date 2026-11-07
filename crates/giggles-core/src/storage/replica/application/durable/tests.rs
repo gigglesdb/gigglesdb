@@ -369,7 +369,7 @@ fn corrupt_noncanonical_and_old_format_namespace_mismatch_reject() {
                 records.insert(vec![9], vec![255]);
             }
             3 => {
-                records.insert(vec![10], vec![]);
+                records.insert(vec![255], vec![]);
             }
             4 => {
                 let mut ledger = state(&image).applications.unwrap();

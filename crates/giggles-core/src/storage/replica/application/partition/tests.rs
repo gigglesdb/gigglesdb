@@ -278,7 +278,7 @@ fn classification_retains_all_metadata_and_rejects_unrelated_catalog() {
 fn unknown_empty_namespace_and_nonempty_application_authority_fail_closed() {
     let state = source();
     let mut records = storage::records(&state).unwrap();
-    records.insert(vec![10], vec![]);
+    records.insert(vec![255], vec![]);
     assert!(Image::from_bytes(storage::encode(&records).unwrap()).is_err());
     let table = &state.sql.tables["items"];
     let authority = super::super::Authority {
