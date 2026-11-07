@@ -1650,3 +1650,5 @@ pub(super) fn coerce(v: Value, t: &DataType) -> R<Value> {
     functions::cast_value(v, t, &mut 0)
 }
 
+#[cfg(test)]
+mod aggregate_tests;
