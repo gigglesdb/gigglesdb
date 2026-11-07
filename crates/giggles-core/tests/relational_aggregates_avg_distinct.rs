@@ -357,48 +357,41 @@ fn unknown_and_known_unsupported_aggregates_keep_error_split() {
 fn table_free_aggregates_keep_describe_and_execute_boundaries() {
     database(|s| {
         fixture(s);
-        for sql in [
-            "SELECT avg(1)",
-            "SELECT count(DISTINCT 1)",
-            "SELECT avg(DISTINCT 1)",
-            "SELECT max(position('b' IN 'abc'))",
+        // PG18.6: aggregates evaluate the implicit row without table authority (DD-0068 F11).
+        for (sql, data_type, expected) in [
+            ("SELECT avg(1)", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT count(DISTINCT 1)", T::BigInt, V::Int(1)),
+            ("SELECT avg(DISTINCT 1)", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT max(position('b' IN 'abc'))", T::Integer, V::Int(2)),
+            ("SELECT position(max('b') IN 'abc')", T::Integer, V::Int(2)),
+            ("SELECT abs(avg(1))", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT abs(abs(avg(DISTINCT 1)))", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT CAST(avg(DISTINCT 1) AS numeric)", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT 1 HAVING avg(DISTINCT 1)>0", T::Integer, V::Int(1)),
+            ("SELECT 1 ORDER BY avg(DISTINCT 1)", T::Integer, V::Int(1)),
+            ("SELECT avg(DISTINCT 1) ORDER BY 1", T::Numeric, n("1.00000000000000000000")),
+            ("SELECT avg(1) HAVING true", T::Numeric, n("1.00000000000000000000")),
         ] {
             let p = s.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-            assert!(p.table().is_some(), "{sql}");
+            assert!(p.table().is_none(), "{sql}");
             assert!(
                 !giggles_core::relational::Prepared::rejects_unsupported_table_free_scalar(sql),
                 "{sql}"
             );
-            s.describe(&p).unwrap();
-            assert_eq!(
-                s.execute_prepared(&p, &[], None),
-                Err(CoreError::Sql(E::Unsupported)),
-                "{sql}"
-            );
+            assert_eq!(s.describe(&p).unwrap().columns[0].data_type, data_type, "{sql}");
+            let result = s.execute_prepared(&p, &[], None).unwrap();
+            if let V::Numeric(value) = &result.rows[0].values[0] {
+                assert_eq!(value.to_string(), "1.00000000000000000000", "{sql}");
+            }
+            assert_eq!(result.rows[0].values, vec![expected], "{sql}");
         }
-        for sql in [
-            "SELECT position(max('b') IN 'abc')",
-            "SELECT abs(avg(1))",
-            "SELECT abs(abs(avg(DISTINCT 1)))",
-            "SELECT CAST(avg(DISTINCT 1) AS numeric)",
-            "SELECT 1 HAVING avg(DISTINCT 1)>0",
-            "SELECT 1 ORDER BY avg(DISTINCT 1)",
-            "SELECT avg(DISTINCT 1) ORDER BY 1",
-            "SELECT avg(1) HAVING true",
-            "SELECT avg(1) GROUP BY 1",
-        ] {
-            let p = s.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-            assert!(p.table().is_some(), "{sql}");
-            assert!(
-                !giggles_core::relational::Prepared::rejects_unsupported_table_free_scalar(sql),
-                "{sql}"
-            );
-            assert_eq!(
-                s.describe(&p).unwrap_err(),
-                CoreError::Sql(E::Unsupported),
-                "{sql}"
-            );
-        }
+        // PG18.6: GROUP BY cannot name an aggregate output (DD-0068 F11).
+        let p = s.prepare("SELECT avg(1) GROUP BY 1").unwrap();
+        assert_eq!(s.describe(&p).unwrap_err(), CoreError::Sql(E::GroupingError));
+        assert_eq!(
+            s.execute_prepared(&p, &[], None).unwrap_err(),
+            CoreError::Sql(E::GroupingError)
+        );
         assert_eq!(
             rows(s, "SELECT abs(abs(avg(DISTINCT v))) FROM t"),
             vec![vec![n("2.3333333333333333")]]

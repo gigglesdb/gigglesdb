@@ -31,8 +31,6 @@ async fn dd68_negative_scalar_routing_tls_redaction_and_authority() {
         "abc"
     );
     for sql in [
-        "SELECT SUM(abs(-1))",
-        "SELECT COUNT(lower('x'))",
         "SELECT lower(body)",
         "SELECT lower(body) FROM other",
         "SELECT lower(app.body) FROM app JOIN other ON app.id=other.id",
@@ -42,6 +40,12 @@ async fn dd68_negative_scalar_routing_tls_redaction_and_authority() {
             "42501",
             "{sql}"
         );
+    }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    for sql in ["SELECT SUM(abs(-1))", "SELECT COUNT(lower('x'))"] {
+        let rows = pg.query(sql, &[]).await.unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].get::<_, i64>(0), 1, "{sql}");
     }
     drop(pg);
     conn.await.unwrap();

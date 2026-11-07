@@ -27,18 +27,7 @@ const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
         "parse",
         "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
-    (
-        71,
-        Some("42501"),
-        "parse",
-        "GD-0001 Q8 (open): application-session authority rejects table-free aggregates. PG18 returns 2.",
-    ),
-    (
-        72,
-        Some("42501"),
-        "parse",
-        "GD-0001 Q8 (open): application-session authority rejects table-free aggregates. PG18 returns 2.",
-    ),
+    // PG18.6: cases 71 and 72 return integer 2 on the implicit row (DD-0068 F11).
     (
         76,
         Some("0A000"),
@@ -53,9 +42,9 @@ const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
     ),
     (
         89,
-        Some("42501"),
+        Some("42803"),
         "parse",
-        "GD-0001 Q8 (open): outer aggregate authority rejects before nested aggregate analysis. PG18: 42883.",
+        "DD-0068 F11: nested aggregate analysis returns 42803 at parse after table-free admission; fixtures/dd68/position-wire-cases.json records PG18 42883.",
     ),
 ];
 
@@ -372,8 +361,26 @@ async fn position_controls_match_contract() {
             None,
         )
         .unwrap();
-    let policy: serde_json::Value =
+    let mut policy: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/dd68/position-controls.json")).unwrap();
+    // PG18.6 returns 2: the old fixture's no-FROM aggregate gap is closed (DD-0068 F11).
+    let aggregate_control = &mut policy["cases"][3];
+    assert_eq!(aggregate_control["index"], 3);
+    assert_eq!(
+        aggregate_control["query"],
+        "SELECT max(position('b' IN 'abc'))"
+    );
+    aggregate_control["expected_actual"] = serde_json::json!({
+        "data_rows": 1,
+        "error_responses": 0,
+        "ready": "I",
+        "sqlstate": null,
+        "stage": "execute",
+        "tags": ["2", "D", "C", "Z"]
+    });
+    aggregate_control["expected_rows"] = serde_json::json!(["00010000000132"]);
+    aggregate_control["expected_parameter_oids"] = serde_json::json!([]);
+    aggregate_control["expected_result_oids"] = serde_json::json!([23]);
     let cases = policy["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 35);
     let mut report = Vec::new();

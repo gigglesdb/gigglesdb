@@ -108,20 +108,7 @@ fn position_curated_pg18_core_results_metadata_and_exact_error_contracts() {
                 "parse",
                 SqlError::UndefinedFunction,
             )),
-            71 => Some((
-                "SELECT max(position('b' IN 'abc'))",
-                "ok",
-                None,
-                "execute",
-                SqlError::Unsupported,
-            )),
-            72 => Some((
-                "SELECT position(max('b') IN 'abc')",
-                "ok",
-                None,
-                "execute",
-                SqlError::Unsupported,
-            )),
+            // PG18.6: cases 71 and 72 return integer 2 on the implicit row (DD-0068 F11).
             89 => Some((
                 "SELECT max(position(count(*) IN 'abc'))",
                 "error",
@@ -225,7 +212,8 @@ fn position_curated_pg18_core_results_metadata_and_exact_error_contracts() {
             assert_eq!(actual, expected, "case {id}: {query}");
         }
     }
-    assert_eq!((strict_matches, profile_gaps, excluded), (72, 6, 14));
+    // PG18.6: cases 71 and 72 now count as strict matches (DD-0068 F11).
+    assert_eq!((strict_matches, profile_gaps, excluded), (74, 4, 14));
 }
 
 #[test]
@@ -301,18 +289,15 @@ fn position_columns_nested_insert_and_aggregate_authority_controls() {
         "SELECT position(max('b') IN 'abc')",
     ] {
         let p = session.prepare(q).unwrap();
-        if q.starts_with("SELECT max(") {
-            session.describe(&p).unwrap();
-            assert_eq!(
-                session.execute_prepared(&p, &[], None).unwrap_err(),
-                CoreError::Sql(SqlError::Unsupported)
-            );
-        } else {
-            assert_eq!(
-                session.describe(&p).unwrap_err(),
-                CoreError::Sql(SqlError::Unsupported)
-            );
-        }
+        // PG18.6: both aggregate/scalar orders return integer 2 (DD-0068 F11).
+        assert_eq!(
+            session.describe(&p).unwrap().columns[0].data_type,
+            DataType::Integer
+        );
+        assert_eq!(
+            session.execute_prepared(&p, &[], None).unwrap().rows[0].values,
+            vec![Value::Int(2)]
+        );
     }
 }
 
@@ -463,13 +448,14 @@ fn position_pg18_source_first_error_and_strict_null_precedence() {
             "pure explicit-input call: {q}"
         );
     }
+    // PG18.6: explicit-input aggregates need no table authority (DD-0068 F11).
     assert!(
         session
             .prepare("SELECT max(position('x' IN 'xyz'))")
             .unwrap()
             .table()
-            .is_some(),
-        "aggregate authority unchanged"
+            .is_none(),
+        "implicit-row aggregate needs no table authority"
     );
     assert!(
         session

@@ -158,7 +158,6 @@ async fn quoting_application_rows_aggregates_and_task_authority() {
         "SELECT quote_ident(body) FROM other",
         "SELECT quote_nullable(NULL) FROM other",
         "SELECT quote_literal('x') FROM other",
-        "SELECT sum(length(quote_nullable(NULL)))",
     ] {
         assert_eq!(
             code_from_character_error(pg.prepare(query).await.unwrap_err()),
@@ -166,6 +165,14 @@ async fn quoting_application_rows_aggregates_and_task_authority() {
             "{query}"
         );
     }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    let statement = pg
+        .prepare("SELECT sum(length(quote_nullable(NULL)))")
+        .await
+        .unwrap();
+    let rows = pg.query(&statement, &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 4);
     assert_eq!(f.admin.snapshot().unwrap(), before);
     drop(pg);
     conn.await.unwrap();

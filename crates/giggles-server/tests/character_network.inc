@@ -147,7 +147,6 @@ async fn character_constant_bind_errors_and_authority_controls() {
         "SELECT ascii(body) FROM other",
         "SELECT initcap(body) FROM other",
         "SELECT chr(0) FROM other",
-        "SELECT sum(ascii('a'))",
     ] {
         assert_eq!(
             code_from_character_error(app.prepare(query).await.unwrap_err()),
@@ -155,6 +154,10 @@ async fn character_constant_bind_errors_and_authority_controls() {
             "{query}"
         );
     }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    let rows = app.query("SELECT sum(ascii('a'))", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 97);
     // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(
         code_from_character_error(app.prepare("SELECT public.ascii('a')").await.unwrap_err()),

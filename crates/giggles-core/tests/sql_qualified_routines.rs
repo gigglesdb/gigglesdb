@@ -88,9 +88,16 @@ fn targeted_public_calls_reach_analysis_without_catalog_rejection() {
         );
         error(&mut s, sql, E::UndefinedFunction);
     }
-    for sql in ["SELECT count(1)", "SELECT sum(1)", "SELECT nosuchfn(1)"] {
-        assert!(s.prepare(sql).unwrap().table().is_some(), "{sql}");
+    // PG18.6: built-in aggregates evaluate the implicit row (DD-0068 F11).
+    for sql in ["SELECT count(1)", "SELECT sum(1)"] {
+        assert!(s.prepare(sql).unwrap().table().is_none(), "{sql}");
     }
+    assert!(
+        s.prepare("SELECT nosuchfn(1)")
+            .unwrap()
+            .table()
+            .is_some()
+    );
     assert!(!Prepared::rejects_unsupported_table_free_scalar(
         "SELECT nosuchfn(1)"
     ));

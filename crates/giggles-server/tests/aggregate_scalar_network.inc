@@ -51,9 +51,40 @@ async fn aggregate_scalar_pg18_immutable_error_stage_and_authority() {
         assert_eq!(r["sqlstate"], "22003", "{q}: {r}");
     }
     let r = temporal_state_extended(&mut s, "SELECT count(*)").await;
-    assert_eq!(r["sqlstate"], "42501");
+    // PG18.6: application count(*) counts the implicit row (DD-0068 F11).
+    assert!(r["sqlstate"].is_null(), "{r}");
+    assert_eq!(r["data_rows"], 1);
     pg_send(&mut s, b'X', &[]).await;
     drop(s);
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    // PG18.6: no-FROM aggregates evaluate one implicit row (DD-0068 F11).
+    let p = pg
+        .prepare("SELECT count(*), sum(1), max('b')")
+        .await
+        .unwrap();
+    assert_eq!(
+        p.columns().iter().map(|c| c.type_().oid()).collect::<Vec<_>>(),
+        vec![20, 20, 25]
+    );
+    let rows = pg.query(&p, &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(1), 1);
+    assert_eq!(rows[0].get::<_, String>(2), "b");
+    drop(p);
+    drop(pg);
+    conn.await.unwrap();
+    let (task, conn) = f.pg(f.task.clone()).await;
+    assert_eq!(
+        code(task.simple_query("SELECT count(*)").await.unwrap_err()),
+        "42501"
+    );
+    assert_eq!(
+        code(task.prepare("SELECT count(*)").await.unwrap_err()),
+        "42501"
+    );
+    drop(task);
+    conn.await.unwrap();
     f.stop().await;
 }
 #[tokio::test]

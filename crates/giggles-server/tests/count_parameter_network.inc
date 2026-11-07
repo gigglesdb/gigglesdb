@@ -19,11 +19,14 @@ async fn count_parameter_pg18_parse0_error_order_and_typed_bind() {
     for (query, code) in [
         ("SELECT count($1),count($1) FROM app", "42P18"),
         ("SELECT count($1),sum($2::integer) FROM app", "42P18"),
-        ("SELECT count(*)", "42501"),
     ] {
         let result = temporal_state_extended(&mut raw, query).await;
         assert_eq!(result["sqlstate"], code, "{query}: {result}");
     }
+    // PG18.6: count(*) counts the implicit row (DD-0068 F11).
+    let result = temporal_state_extended(&mut raw, "SELECT count(*)").await;
+    assert!(result["sqlstate"].is_null(), "{result}");
+    assert_eq!(result["data_rows"], 1);
     pg_send(&mut raw, b'X', &[]).await;
     drop(raw);
     let (pg, connection) = f.pg(f.app.clone()).await;
@@ -85,16 +88,22 @@ async fn count_parameter_pg18_limit_parse0_and_typed_bind() {
 async fn count_parameter_authority_and_transaction_precede_new_class() {
     let f = Fixture::new().await;
     let (app, app_connection) = f.pg(f.app.clone()).await;
-    for query in [
-        "SELECT count($1),sum($1::integer) FROM other",
-        "SELECT count($1),sum($1::integer)",
-    ] {
+    for query in ["SELECT count($1),sum($1::integer) FROM other"] {
         assert_eq!(
             code(app.prepare(query).await.unwrap_err()),
             "42501",
             "{query}"
         );
     }
+    // PG18.6: implicit-row parameter resolution reports the conflict (DD-0068 F11).
+    assert_eq!(
+        code(
+            app.prepare("SELECT count($1),sum($1::integer)")
+                .await
+                .unwrap_err()
+        ),
+        "42P08"
+    );
     // E1a (799adca) accepts the public. qualifier, so table authority denies `other`.
     assert_eq!(
         code(

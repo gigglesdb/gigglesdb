@@ -104,13 +104,17 @@ async fn integer_formats_parse_ambiguity_child_priority_and_authority() {
             "{query}"
         );
     }
-    for query in ["SELECT to_hex(id) FROM other", "SELECT min(to_hex(1))"] {
+    for query in ["SELECT to_hex(id) FROM other"] {
         assert_eq!(
             code(app.prepare(query).await.unwrap_err()),
             "42501",
             "{query}"
         );
     }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    let rows = app.query("SELECT min(to_hex(1))", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "1");
     // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(
         code(app.prepare("SELECT public.to_hex(1)").await.unwrap_err()),

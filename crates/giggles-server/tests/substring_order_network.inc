@@ -48,16 +48,20 @@ async fn substring_order_numeric_parse0_binary_metadata_rows_and_authority() {
         .get::<_, String>(0),
         "cd"
     );
-    for query in [
-        "SELECT SUBSTRING(body FOR 2 FROM 3) FROM other",
-        "SELECT min(SUBSTRING('abc' FOR 1 FROM 1))",
-    ] {
+    for query in ["SELECT SUBSTRING(body FOR 2 FROM 3) FROM other"] {
         assert_eq!(
             code(pg.prepare(query).await.unwrap_err()),
             "42501",
             "{query}"
         );
     }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    let rows = pg
+        .query("SELECT min(SUBSTRING('abc' FOR 1 FROM 1))", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "a");
     // PG supports this regex overload; current bounded profile explicitly does not.
     assert_eq!(
         code(

@@ -1298,6 +1298,7 @@ impl Query {
                             | "justify_hours"
                             | "justify_interval"
                     ) && args.iter().all(scalar)
+                        || (Aggregate::from_name(name).is_some() && args.iter().all(scalar))
                 }
             }
         }
@@ -1337,7 +1338,8 @@ impl Query {
             && predicates.is_empty()
             && items.iter().all(|(item, _)| match item {
                 Item::Scalar(s) => scalar(s),
-                Item::Aggregate(_, _) | Item::Star => false,
+                Item::Aggregate(_, arg) => arg.as_ref().is_none_or(scalar),
+                Item::Star => false,
             })
             && predicate.as_ref().is_none_or(filter)
             && order.iter().all(|(s, _, _)| scalar(s))
@@ -1671,20 +1673,6 @@ impl Query {
             }
             found.ok_or(SqlError::UnknownColumn)
         };
-        // Aggregate expressions without a FROM source retain the scalar
-        // rejection boundary; grouping must not turn them into a one-row input.
-        // Plain aggregate items still describe normally and reject at execution.
-        if self.sources.is_empty()
-            && !self.has_undefined_routine()
-            && (self.items.iter().any(|(item, _)| {
-                matches!(item, Item::Scalar(s) if grouping::contains_aggregate(s))
-            }) || self.where_filter().is_some_and(filter_contains_aggregate)
-                || self.group().iter().any(grouping::contains_aggregate)
-                || self.having().is_some_and(filter_contains_aggregate)
-                || self.order.iter().any(|(s, _, _)| grouping::contains_aggregate(s)))
-        {
-            return Err(SqlError::Unsupported);
-        }
         if self.where_filter().is_some_and(filter_contains_aggregate) {
             return Err(SqlError::GroupingError);
         }
@@ -1706,7 +1694,9 @@ impl Query {
                     || self
                         .items
                         .iter()
-                        .any(|(i, _)| !matches!(i, Item::Aggregate(..)))));
+                        .any(|(i, _)| !matches!(i, Item::Aggregate(..)))))
+            || (self.sources.is_empty()
+                && self.items.iter().any(|(i, _)| matches!(i, Item::Aggregate(..))));
         let mut joins = vec![];
         for (j, join) in self.joins.iter().enumerate() {
             let right = j + 1;
@@ -1752,12 +1742,6 @@ impl Query {
             });
         }
         if grouped {
-            if self.sources.is_empty()
-                && !self.has_undefined_routine()
-                && self.items.iter().any(|(item, _)| matches!(item, Item::Aggregate(..)))
-            {
-                return Err(SqlError::Unsupported);
-            }
             return grouping::bind(self, &tables, joins, parameters, &resolve);
         }
         let mut items = vec![];

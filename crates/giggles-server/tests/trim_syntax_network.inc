@@ -118,16 +118,17 @@ async fn trim_construct_parse_errors_routine_nonactivation_and_authority() {
             "{query}"
         );
     }
-    for query in [
-        "SELECT TRIM(body) FROM other",
-        "SELECT min(TRIM(' x '))",
-    ] {
+    for query in ["SELECT TRIM(body) FROM other"] {
         assert_eq!(
             code(pg.prepare(query).await.unwrap_err()),
             "42501",
             "{query}"
         );
     }
+    // PG18.6: no-FROM aggregate evaluates the implicit row (DD-0068 F11)
+    let rows = pg.query("SELECT min(TRIM(' x '))", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "x");
     for query in [
         "SELECT \"trim\"(' x ') FROM app",
         "SELECT pg_catalog.trim(' x ') FROM app",
