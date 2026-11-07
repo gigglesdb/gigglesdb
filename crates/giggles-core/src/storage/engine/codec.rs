@@ -85,7 +85,7 @@ pub(crate) fn index_key(index_id: u64, tuple: &[u8], pk: &[u8], ts: Ts) -> Vec<u
 }
 
 pub(crate) fn split_versioned(key: &[u8]) -> Result<(&[u8], Ts), CodecError> {
-    if key.len() < 16 {
+    if key.len() < 9 {
         return Err(CodecError::Corrupt("short versioned key"));
     }
     let split = key.len() - 8;
@@ -199,4 +199,20 @@ pub(crate) fn decode_row(key: &[u8], record: &[u8]) -> Result<RowRecord, CodecEr
         tombstone,
         values,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodecError, Ts, split_versioned, user_key_seek_at};
+
+    #[test]
+    fn versioned_key_requires_a_user_byte_and_timestamp() {
+        let key = user_key_seek_at(b"x", Ts(42));
+        assert_eq!(key.len(), 9);
+        assert_eq!(split_versioned(&key), Ok((&b"x"[..], Ts(42))));
+        assert!(matches!(
+            split_versioned(&[0; 8]),
+            Err(CodecError::Corrupt(_))
+        ));
+    }
 }

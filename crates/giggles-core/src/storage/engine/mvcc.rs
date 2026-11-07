@@ -29,8 +29,15 @@ pub(crate) fn decode(value: &[u8]) -> Result<Option<&[u8]>, KvError> {
     }
 }
 
-fn validate_key(key: &[u8]) -> Result<(), TxnError> {
-    if key.len() < 8 {
+fn validate_key(ks: Keyspace, key: &[u8]) -> Result<(), TxnError> {
+    // Generic MVCC keys need one user byte. Rows and indexes additionally
+    // carry an eight-byte table/index ID before their remaining key bytes.
+    let minimum = if matches!(ks, Keyspace::Rows | Keyspace::Index) {
+        8
+    } else {
+        1
+    };
+    if key.len() < minimum {
         return Err(CodecError::Corrupt("short MVCC user key").into());
     }
     Ok(())
@@ -59,12 +66,13 @@ fn version_at(
     user_key: &[u8],
     snapshot: Ts,
 ) -> Result<Option<Version>, TxnError> {
-    validate_key(user_key)?;
+    validate_key(ks, user_key)?;
     let seek = codec::user_key_seek_at(user_key, snapshot);
     let Some((key, value)) = kv.seek_ge(ks, &seek)? else {
         return Ok(None);
     };
     let (found, ts) = codec::split_versioned(&key)?;
+    validate_key(ks, found)?;
     if found != user_key {
         return Ok(None);
     }
@@ -73,6 +81,7 @@ fn version_at(
 
 pub(crate) struct VersionedRange<'a> {
     iter: KvIter<'a>,
+    ks: Keyspace,
     dir: Direction,
     snapshot: Ts,
     // Forward needs only the last emitted/hidden user key. Reverse retains one
@@ -93,7 +102,7 @@ impl<'a> VersionedRange<'a> {
     ) -> Result<Self, TxnError> {
         for bound in [start, end] {
             if let Bound::Included(key) | Bound::Excluded(key) = bound {
-                validate_key(key)?;
+                validate_key(ks, key)?;
             }
         }
         let empty = match (start, end) {
@@ -130,6 +139,7 @@ impl<'a> VersionedRange<'a> {
         };
         Ok(Self {
             iter,
+            ks,
             dir,
             snapshot,
             previous: None,
@@ -142,6 +152,7 @@ impl<'a> VersionedRange<'a> {
         for item in self.iter.by_ref() {
             let (key, value) = item?;
             let (user, ts) = codec::split_versioned(&key)?;
+            validate_key(self.ks, user)?;
             if self.previous.as_deref() == Some(user) || ts > self.snapshot {
                 continue;
             }
@@ -163,6 +174,7 @@ impl<'a> VersionedRange<'a> {
                 return Ok(None);
             };
             let (user, ts) = codec::split_versioned(&key)?;
+            validate_key(self.ks, user)?;
             let user = user.to_vec();
             let mut selected = (ts <= self.snapshot).then_some(value);
             // Reverse visits oldest first. Replace the candidate until this
@@ -170,6 +182,7 @@ impl<'a> VersionedRange<'a> {
             for item in self.iter.by_ref() {
                 let (key, value) = item?;
                 let (next_user, ts) = codec::split_versioned(&key)?;
+                validate_key(self.ks, next_user)?;
                 if next_user != user {
                     self.pending = Some((key, value));
                     break;

@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// `Unique { index: CATALOG_NAME_INDEX, tuple: name }` in `Exclusive` mode
+/// serializes concurrent DDL on the same relation name.
+pub(crate) const CATALOG_NAME_INDEX: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TxnId(pub u64);
 

@@ -18,6 +18,9 @@ pub(crate) mod commit;
 pub(crate) mod mvcc;
 pub(crate) mod txn;
 
+pub(crate) mod catalog;
+pub(crate) mod seq;
+pub(crate) mod rows;
 pub(crate) mod ssi_validate;
 
 #[cfg(test)]

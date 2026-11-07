@@ -232,7 +232,7 @@ fn versioned_keys_sort_seek_and_bound_all_versions() {
     assert_eq!(user_key_upper_bound(user), expected);
     assert!(key < expected);
     assert!(expected < row_key(7, &b, Ts(u64::MAX)));
-    for len in 0..16 {
+    for len in 0..9 {
         assert!(split_versioned(&vec![0; len]).is_err());
     }
 

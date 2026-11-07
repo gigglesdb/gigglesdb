@@ -152,7 +152,7 @@ impl Transaction {
             self.snapshot = Some(self.seq.snapshot());
         }
     }
-    fn snapshot_ts(&mut self) -> Ts {
+    pub(crate) fn snapshot_ts(&mut self) -> Ts {
         if self.snapshot.is_none() {
             self.snapshot = Some(self.seq.snapshot());
         }
@@ -167,6 +167,39 @@ impl Transaction {
     }
     pub(crate) fn read_set(&self) -> &ReadSet {
         &self.reads
+    }
+    pub(crate) fn isolation(&self) -> Isolation {
+        self.isolation
+    }
+    pub(crate) fn id(&self) -> TxnId {
+        self.id
+    }
+    pub(crate) fn catalog_own(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
+        self.writes.get(&(Keyspace::Catalog, key.to_vec()))
+    }
+    pub(crate) fn catalog_latest_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
+        Ok(mvcc::latest_version(self.seq.kv(), Keyspace::Catalog, key)?
+            .and_then(|(_, value)| value))
+    }
+    pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
+        self.writes
+            .iter()
+            .filter_map(|((ks, key), value)| (*ks == Keyspace::Catalog).then_some((key, value)))
+    }
+    pub(crate) fn acquire_lock(
+        &self,
+        key: LockKey,
+        mode: LockMode,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        if !matches!(key, LockKey::Table(_))
+            && !matches!(key, LockKey::Unique { index, .. } if index == super::locks::CATALOG_NAME_INDEX)
+        {
+            return Err(TxnError::Misuse);
+        }
+        self.locks.acquire(self.id, key, mode, deadline, cancel)?;
+        Ok(())
     }
     pub(crate) fn get(&mut self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
         let ts = self.snapshot_ts();
@@ -241,7 +274,11 @@ impl Transaction {
         value: Option<Vec<u8>>,
     ) -> Result<(), TxnError> {
         self.snapshot_ts();
-        if key.len() < 8 {
+        if if ks == Keyspace::Catalog {
+            key.is_empty()
+        } else {
+            key.len() < 8
+        } {
             return Err(TxnError::Misuse);
         }
         if matches!(ks, Keyspace::Rows | Keyspace::Index)
@@ -320,9 +357,27 @@ impl Transaction {
             done: empty,
         })
     }
-    pub(crate) fn commit(mut self) -> Result<Ts, TxnError> {
+    pub(crate) fn writes_keyspace(&self, ks: Keyspace) -> bool {
+        self.writes.keys().any(|(space, _)| *space == ks)
+    }
+    pub(crate) fn commit(self) -> Result<Ts, TxnError> {
+        if self.writes_keyspace(Keyspace::Catalog) {
+            return Err(TxnError::Misuse);
+        }
+        self.commit_then(|_| Ok(()))
+    }
+    /// Runs publication after sequencer success, while this transaction still
+    /// owns its locks and snapshot. Catalog writes are allowed on this path.
+    /// A callback error occurs after a successful durable commit: do not retry
+    /// the transaction. Drop releases locks on every return path.
+    pub(crate) fn commit_then<F: FnOnce(Ts) -> Result<(), TxnError>>(
+        mut self,
+        publish: F,
+    ) -> Result<Ts, TxnError> {
         if self.writes.is_empty() && self.isolation != Isolation::Serializable {
-            return Ok(self.seq.visible_ts());
+            let ts = self.seq.visible_ts();
+            publish(ts)?;
+            return Ok(ts);
         }
         let snapshot = self.snapshot_ts();
         let validator = (self.isolation == Isolation::Serializable).then(|| {
@@ -333,7 +388,7 @@ impl Transaction {
         });
         // The owned validator reads only the worker's supplied log and KV handle.
         // Drop releases locks and unregisters the snapshot on success or error.
-        self.seq.submit(CommitRequest {
+        let ts = self.seq.submit(CommitRequest {
             snapshot,
             writes: std::mem::take(&mut self.writes),
             validation: validator.map(|validator| {
@@ -344,7 +399,9 @@ impl Transaction {
                           _commit| { validator.validate(log, kv, snapshot) },
                 ) as _
             }),
-        })
+        })?;
+        publish(ts)?;
+        Ok(ts)
     }
     pub(crate) fn rollback(self) {}
 }

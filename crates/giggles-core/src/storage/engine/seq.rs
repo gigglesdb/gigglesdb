@@ -1,0 +1,130 @@
+//! Durable, non-transactional sequence reservations. Gaps after restart are expected.
+use super::{
+    kv::{Durability, Keyspace, Kv, KvError, WriteBatch},
+    txn::TxnError,
+};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+const DEFAULT_BLOCK: u64 = 1024;
+type SequenceKey = [u8; 9];
+
+#[derive(Default)]
+struct Block {
+    cur: u64,
+    end: u64,
+}
+
+/// Share one allocator for a KV handle: its per-sequence locks serialize reservation
+/// reads and writes. The map lock is released before waiting on a sequence or KV I/O.
+/// Kind 0 / id 0 allocates object IDs, kind 1 / table ID allocates row IDs, and
+/// kind 2 is reserved. Kind 3 / id 0 allocates global row-version IDs.
+/// Keys use `kind || id_be`; values are the exclusive durable
+/// highwater, initially 1, rather than the last value handed to a caller.
+pub(crate) struct SequenceAllocator {
+    kv: Arc<Kv>,
+    block: u64,
+    blocks: Mutex<BTreeMap<SequenceKey, Arc<Mutex<Block>>>>,
+}
+
+impl SequenceAllocator {
+    /// A zero block size selects the default of 1024. Values start at 1.
+    pub(crate) fn new(kv: Arc<Kv>, block: u64) -> Self {
+        Self {
+            kv,
+            block: if block == 0 { DEFAULT_BLOCK } else { block },
+            blocks: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Reserves a full block synchronously before returning any value from it.
+    /// Exhaustion (including a block that would overflow its exclusive highwater)
+    /// returns `Misuse` without changing the sequence. Thus `u64::MAX` cannot be
+    /// issued: its exclusive highwater is not representable.
+    pub(crate) fn next(&self, kind: u8, id: u64) -> Result<u64, TxnError> {
+        let key = sequence_key(kind, id);
+        let slot = self.slot(key)?;
+        let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
+        self.check_live()?;
+        if block.cur == block.end {
+            let start = self.highwater(&key)?;
+            let end = start.checked_add(self.block).ok_or(TxnError::Misuse)?;
+            self.persist_highwater(key, end)?;
+            // Do not publish the reservation until Sync succeeds. An ambiguous
+            // write error is propagated; Kv fences the shared handle itself.
+            block.cur = start;
+            block.end = end;
+        }
+        let value = block.cur;
+        block.cur += 1; // cur < end, so this cannot overflow.
+        Ok(value)
+    }
+
+    /// Makes every subsequent allocation at least `floor`, without rewinding.
+    /// Any cached block containing values below the floor is discarded. Raising
+    /// the persisted highwater uses Sync before the cached state is changed.
+    pub(crate) fn ensure_at_least(&self, kind: u8, id: u64, floor: u64) -> Result<(), TxnError> {
+        let key = sequence_key(kind, id);
+        let slot = self.slot(key)?;
+        let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
+        self.check_live()?;
+        let highwater = self.highwater(&key)?;
+        if floor > highwater {
+            self.persist_highwater(key, floor)?;
+        }
+        if floor > block.cur {
+            // Refill from the durable highwater on next(), abandoning the old
+            // reservation even when the floor falls inside it.
+            block.cur = 0;
+            block.end = 0;
+        }
+        Ok(())
+    }
+
+    fn slot(&self, key: SequenceKey) -> Result<Arc<Mutex<Block>>, TxnError> {
+        let mut blocks = self.blocks.lock().map_err(|_| TxnError::Misuse)?;
+        Ok(blocks.entry(key).or_default().clone())
+    }
+
+    fn check_live(&self) -> Result<(), TxnError> {
+        if self.kv.is_fenced() {
+            Err(KvError::Fenced.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn highwater(&self, key: &SequenceKey) -> Result<u64, TxnError> {
+        let Some(value) = self.kv.get(Keyspace::Seq, key)? else {
+            return Ok(1);
+        };
+        let bytes: [u8; 8] = value.try_into().map_err(|_| {
+            KvError::Corrupt("sequence highwater must contain exactly eight bytes".into())
+        })?;
+        let highwater = u64::from_be_bytes(bytes);
+        if highwater == 0 {
+            return Err(KvError::Corrupt("sequence highwater must be positive".into()).into());
+        }
+        Ok(highwater)
+    }
+
+    fn persist_highwater(&self, key: SequenceKey, highwater: u64) -> Result<(), TxnError> {
+        let mut batch = WriteBatch::default();
+        batch.put(
+            Keyspace::Seq,
+            key.to_vec(),
+            highwater.to_be_bytes().to_vec(),
+        );
+        self.kv.write(batch, Durability::Sync)?;
+        Ok(())
+    }
+}
+
+fn sequence_key(kind: u8, id: u64) -> SequenceKey {
+    let mut key = [0; 9];
+    key[0] = kind;
+    key[1..].copy_from_slice(&id.to_be_bytes());
+    key
+}

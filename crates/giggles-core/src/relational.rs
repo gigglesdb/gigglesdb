@@ -309,7 +309,7 @@ fn allocate(n: &mut u64) -> R<u64> {
     *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
     Ok(id)
 }
-fn check(v: &Value, c: &ColumnDef) -> R<()> {
+pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
     if *v == Value::Null {
         return if c.not_null {
             Err(SqlError::Null)
@@ -337,7 +337,7 @@ fn check(v: &Value, c: &ColumnDef) -> R<()> {
     };
     if yes { Ok(()) } else { Err(SqlError::Type) }
 }
-fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
+pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     if values.len() != t.columns.len() {
         return Err(SqlError::Type);
     }
