@@ -3073,6 +3073,23 @@ async fn installed_datagrip_detection_and_startup_queries() {
     f.stop().await;
 }
 
+include!("sqlstate_network.inc");
+include!("immutable_planning_network.inc");
+include!("filter_planning_network.inc");
+include!("aggregate_scalar_network.inc");
+include!("count_parameter_network.inc");
+include!("character_network.inc");
+include!("integer_formats_network.inc");
+include!("trim_syntax_network.inc");
+include!("substring_order_network.inc");
+include!("degree_math_network.inc");
+include!("md5_functions_network.inc");
+include!("quoting_functions_network.inc");
+include!("integer_input_network.inc");
+include!("integer_cast_network.inc");
+include!("insert_functions_network.inc");
+include!("bytea_input_network.inc");
+
 include!("routing_planning_network.inc");
 
 mod text_nul_network {

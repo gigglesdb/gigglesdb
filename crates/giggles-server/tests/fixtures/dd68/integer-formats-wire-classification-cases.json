@@ -1,0 +1,462 @@
+{
+  "cases": [
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "32768",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "-32769",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "+32768",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "999999999999999999999x",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "-999999999999999999999x",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "++999999",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": " ",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "\t",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "+",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "-",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "12x",
+      "oid": 21,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "0x10",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "0b10",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "1_000",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": " 1",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "1 ",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "32768 ",
+      "oid": 21,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::smallint",
+      "parameter": "65",
+      "oid": 21,
+      "pg_sqlstate": null,
+      "expected_wire": null,
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "2147483648",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "-2147483649",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "+2147483648",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "999999999999999999999x",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "-999999999999999999999x",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "++999999",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": " ",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "\t",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "+",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "-",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "12x",
+      "oid": 23,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "0x10",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "0b10",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "1_000",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": " 1",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "1 ",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "2147483648 ",
+      "oid": 23,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::integer",
+      "parameter": "65",
+      "oid": 23,
+      "pg_sqlstate": null,
+      "expected_wire": null,
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "9223372036854775808",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "-9223372036854775809",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "+9223372036854775808",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22003",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "999999999999999999999x",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "-999999999999999999999x",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "++999999",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": " ",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "\t",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "+",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "-",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "12x",
+      "oid": 20,
+      "pg_sqlstate": "22P02",
+      "expected_wire": "22P02",
+      "known_gap": false
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "0x10",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "0b10",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "1_000",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": " 1",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "1 ",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "9223372036854775808 ",
+      "oid": 20,
+      "pg_sqlstate": "22003",
+      "expected_wire": "22P02",
+      "known_gap": true
+    },
+    {
+      "query": "SELECT $1::bigint",
+      "parameter": "65",
+      "oid": 20,
+      "pg_sqlstate": null,
+      "expected_wire": null,
+      "known_gap": false
+    }
+  ],
+  "eligible": 33,
+  "known_gaps": 24
+}

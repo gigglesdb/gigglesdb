@@ -1,0 +1,4355 @@
+[
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": " ",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "\t\n\u000b\f\r 1 \t\n\u000b\f\r",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "++1",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+ 1",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "01",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "00009",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "9"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "_1",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1__0",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1_0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "10"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x_1",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0X_Ff",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "255"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o_7",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "7"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b_1",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x__1",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b2",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o8",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0xg",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x1_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x1__2",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1 2",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1.0",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1e0",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "\u00a01",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1\u00a0",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "\u0661",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32767",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32767x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32767_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32767 ",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32767_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32767",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32767x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32767_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32767 ",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32767_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x7fff",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x7fffx",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x7fff",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x7fffx",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o77777",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o77777x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o77777",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o77777x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b111111111111111",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b111111111111111x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b111111111111111",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32767"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b111111111111111x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32768",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32768"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32768x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32768_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32768 ",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32768"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32768_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8000",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32768"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100000",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32768"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000000",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-32768"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000000x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32769",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32769x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32769_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32769 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32769_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769_",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000001",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000001x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32770",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32770x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32770_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32770 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32770_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32770",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32770x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32770_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32770 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32770_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8002",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x8002x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8002",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x8002x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100002",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o100002x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100002",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o100002x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000010",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1000000000000010x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000010",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1000000000000010x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327680",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327680x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327680_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327680 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327680_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327680",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327680x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327680_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327680 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327680_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x50000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x50000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x50000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x50000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o1200000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o1200000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o1200000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o1200000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1010000000000000000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1010000000000000000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1010000000000000000",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1010000000000000000x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327690",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327690x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327690_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327690 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "327690_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327690",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327690x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327690_",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327690 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-327690_0x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x5000a",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x5000ax",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x5000a",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0x5000ax",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o1200012",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0o1200012x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o1200012",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0o1200012x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1010000000000001010",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b1010000000000001010x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1010000000000001010",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-0b1010000000000001010x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-1_2_3_3_7",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-12337"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+1_0_0_0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1000"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+2_7_2_2_8",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "27228"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+2_8_2_3_5",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "28235"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+2_6_5_5_9",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "26559"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-1_9_9_6_8",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-19968"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-2_8_4_9_8",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-28498"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-1_8_9_5_2",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-18952"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+1_6_0_4_5",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "16045"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+1_9_1_7",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1917"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+1_4_2_0_8",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "14208"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-2_6_2_5_3",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-26253"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+2_9_7_9_8",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "29798"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-1_0_8_3_0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-10830"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-2_7_4_4_0",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-27440"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-4_9_5_4",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-4954"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+5_4_1",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "541"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-1_0_5_0_6",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-10506"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-2_4_2_6_7",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "-24267"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+4_6_6_3",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "4663"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": " ",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "\t\n\u000b\f\r 1 \t\n\u000b\f\r",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "++1",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+ 1",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "01",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "00009",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "9"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+0",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "_1",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1__0",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1_0",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "10"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x_1",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0X_Ff",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "255"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o_7",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "7"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b_1",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x__1",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b2",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o8",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0xg",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x1_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x1__2",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1 2",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1.0",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1e0",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "\u00a01",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1\u00a0",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "\u0661",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483647",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483647x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483647_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483647 ",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483647_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483647",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483647x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483647_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483647 ",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483647_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x7fffffff",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x7fffffffx",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x7fffffff",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x7fffffffx",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o17777777777",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o17777777777x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o17777777777",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o17777777777x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b1111111111111111111111111111111",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b1111111111111111111111111111111x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b1111111111111111111111111111111",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483647"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b1111111111111111111111111111111x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483648",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483648"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483648x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483648_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483648 ",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483648"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483648_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000000",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483648"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000000",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483648"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000000",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2147483648"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000000x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483649",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483649x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483649_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483649 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483649_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649_",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000001",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000001x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483650",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483650x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483650_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483650 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483650_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483650",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483650x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483650_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483650 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483650_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000002",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x80000002x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000002",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x80000002x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000002",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o20000000002x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000002",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o20000000002x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000010",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10000000000000000000000000000010x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000010",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10000000000000000000000000000010x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836480",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836480x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836480_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836480 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836480_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836480",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836480x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836480_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836480 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836480_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x500000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x500000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x500000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x500000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o240000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o240000000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o240000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o240000000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10100000000000000000000000000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10100000000000000000000000000000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10100000000000000000000000000000000",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10100000000000000000000000000000000x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836490",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836490x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836490_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836490 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "21474836490_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836490",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836490x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836490_",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836490 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-21474836490_0x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x50000000a",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x50000000ax",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x50000000a",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0x50000000ax",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o240000000012",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0o240000000012x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o240000000012",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0o240000000012x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10100000000000000000000000000001010",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10100000000000000000000000000001010x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10100000000000000000000000000001010",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-0b10100000000000000000000000000001010x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-8_4_6_0_3_7_1_8_3",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-846037183"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+1_5_3_6_0_8_6_6_9_1",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1536086691"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_5_2_7_0_3_9_8_6_3",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1527039863"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-9_0_2_5_1_5_0_3_8",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-902515038"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2_0_2_5_6_8_8_4_8_6",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-2025688486"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+1_6_7_3_5_1_4_1_1_7",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1673514117"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2_4_5_2_6_2_4_4_9",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-245262449"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-7_3_7_9_6_3_1_0_1",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-737963101"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_3_7_8_2_4_2_8_6",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-137824286"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+3_5_8_7_4_3_4_4_4",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "358743444"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+1_0_5_6_6_9_9_7_6_9",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1056699769"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+2_0_2_1_4_7_7_9_4_6",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2021477946"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_5_4_3_8_3_6_1_0_7",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1543836107"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-5_0_1_9_6_1_8_7_4",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-501961874"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_8_4_0_8_7_7_5_8_6",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1840877586"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_4_8_8_9_3_4_1_1_4",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1488934114"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_8_7_7_6_7_1_1_7_0",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1877671170"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_5_7_8_0_8_1_2_8_2",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1578081282"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_0_9_0_5_3_7_4_5_5",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1090537455"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-1_0_8_9_5_0_1_7_9_4",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "-1089501794"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": " ",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "\t\n\u000b\f\r 1 \t\n\u000b\f\r",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "++1",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+ 1",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "01",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "00009",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "0"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "_1",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1__0",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1_0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "10"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x_1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0X_Ff",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "255"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o_7",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "7"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b_1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x__1",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b2",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o8",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0xg",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x1_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x1__2",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1 2",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1.0",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1e0",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "\u00a01",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1\u00a0",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "\u0661",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775807",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775807x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775807_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775807 ",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775807_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775807",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775807x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775807_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775807 ",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775807_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x7fffffffffffffff",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x7fffffffffffffffx",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x7fffffffffffffff",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x7fffffffffffffffx",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o777777777777777777777",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o777777777777777777777x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o777777777777777777777",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o777777777777777777777x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b111111111111111111111111111111111111111111111111111111111111111",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b111111111111111111111111111111111111111111111111111111111111111x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b111111111111111111111111111111111111111111111111111111111111111",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775807"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b111111111111111111111111111111111111111111111111111111111111111x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775808",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775808"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775808x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775808_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775808 ",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775808"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775808_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000000",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775808"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000000",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775808"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000000",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-9223372036854775808"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775809",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775809x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775809_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775809 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775809_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809_",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000001",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000001x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775810",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775810x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775810_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775810 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775810_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775810",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775810x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775810_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775810 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775810_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000002",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x8000000000000002x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000002",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x8000000000000002x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000002",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o1000000000000000000002x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000002",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o1000000000000000000002x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000010",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1000000000000000000000000000000000000000000000000000000000000010x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000010",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1000000000000000000000000000000000000000000000000000000000000010x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758080",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758080x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758080_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758080 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758080_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758080",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758080x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758080_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758080 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758080_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x50000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x50000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x50000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x50000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o12000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o12000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o12000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o12000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1010000000000000000000000000000000000000000000000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1010000000000000000000000000000000000000000000000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1010000000000000000000000000000000000000000000000000000000000000000",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1010000000000000000000000000000000000000000000000000000000000000000x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758090",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758090x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758090_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758090 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "92233720368547758090_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758090",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758090x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758090_",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758090 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-92233720368547758090_0x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x5000000000000000a",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x5000000000000000ax",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x5000000000000000a",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0x5000000000000000ax",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o12000000000000000000012",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0o12000000000000000000012x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o12000000000000000000012",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0o12000000000000000000012x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1010000000000000000000000000000000000000000000000000000000000001010",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b1010000000000000000000000000000000000000000000000000000000000001010x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1010000000000000000000000000000000000000000000000000000000000001010",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-0b1010000000000000000000000000000000000000000000000000000000000001010x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-8_0_7_1_3_5_6_3_2_2_3_7_7_5_5_0_5_0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-807135632237755050"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+2_0_3_3_2_5_4_2_9_5_5_4_5_7_0_4_1_8_6",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "2033254295545704186"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-1_8_9_9_7_4_1_6_3_2_8_3_3_7_4_8_5_5_9",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-1899741632833748559"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-7_3_3_9_0_1_6_7_1_9_5_1_3_1_1_2_8_8_9",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-7339016719513112889"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-4_4_7_4_3_7_4_9_2_2_7_2_1_1_6_9_6_9_7",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-4474374922721169697"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-1_4_1_6_8_6_6_5_8_9_0_4_9_4_1_8_9_2_2",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-1416866589049418922"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+8_7_2_2_3_9_6_7_1_2_3_7_3_3_3_4_9_9_1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "8722396712373334991"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-1_1_0_9_2_9_2_9_1_2_2_2_2_1_0_3_9_1_0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-1109292912222103910"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-4_5_7_5_2_8_1_2_2_2_9_0_9_1_2_8_6_0_1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-4575281222909128601"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-4_9_4_0_4_2_7_3_5_8_6_5_5_8_9_6_9_7_2",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-4940427358655896972"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-1_7_2_9_9_1_4_9_6_0_4_7_1_5_5_6_6_0_2",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-1729914960471556602"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-5_4_0_4_6_8_7_5_6_0_3_6_5_0_8_8_7_6_8",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-5404687560365088768"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+6_2_6_8_4_5_0_7_4_9_0_4_2_7_9_0_6_8_9",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "6268450749042790689"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+1_2_9_9_3_9_5_2_5_1_5_1_4_7_7_7_6_5_3",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1299395251514777653"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-2_3_2_8_2_5_3_7_8_4_1_4_7_9_1_8_7_3_7",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-2328253784147918737"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+8_6_5_2_8_8_6_6_4_1_0_0_0_3_5_2_3_0_6",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "8652886641000352306"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-8_3_3_7_0_9_6_3_2_6_4_8_2_8_0_7_6_4_1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-8337096326482807641"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-8_6_9_3_5_4_1_9_8_8_4_4_1_3_9_1_8_8_0",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "-8693541988441391880"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+7_1_9_4_8_7_4_5_4_0_3_1_5_4_1_7_9_4_8",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "7194874540315417948"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+1_7_9_3_7_7_3_4_7_3_4_9_1_4_0_2_4",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "17937734734914024"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-32769",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+32768",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "999999999999999999999x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-999999999999999999999x",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "++999999",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": " ",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "\t",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "+",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "-",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "12x",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0x10",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "16"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "0b10",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "2"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1_000",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1000"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": " 1",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1 ",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "32768 ",
+    "oid": 21,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "65",
+    "oid": 21,
+    "sqlstate": null,
+    "value": "65"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-2147483649",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+2147483648",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "999999999999999999999x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-999999999999999999999x",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "++999999",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": " ",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "\t",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "+",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "-",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "12x",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0x10",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "16"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "0b10",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "2"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1_000",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1000"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": " 1",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1 ",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "2147483648 ",
+    "oid": 23,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "65",
+    "oid": 23,
+    "sqlstate": null,
+    "value": "65"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-9223372036854775809",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+9223372036854775808",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "999999999999999999999x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-999999999999999999999x",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "++999999",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": " ",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "\t",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "+",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "-",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "12x",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0x10",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "16"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "0b10",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "2"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1_000",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1000"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": " 1",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1 ",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "1"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "9223372036854775808 ",
+    "oid": 20,
+    "sqlstate": "22003",
+    "value": null
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "65",
+    "oid": 20,
+    "sqlstate": null,
+    "value": "65"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "1\u0000",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  },
+  {
+    "query": "SELECT $1::smallint",
+    "parameter": "99999999999999999999999999999999999999\u0000",
+    "oid": 21,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "1\u0000",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  },
+  {
+    "query": "SELECT $1::integer",
+    "parameter": "99999999999999999999999999999999999999\u0000",
+    "oid": 23,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "1\u0000",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  },
+  {
+    "query": "SELECT $1::bigint",
+    "parameter": "99999999999999999999999999999999999999\u0000",
+    "oid": 20,
+    "sqlstate": "22P02",
+    "value": null,
+    "exclusion": "NUL PG admission domain"
+  }
+]
