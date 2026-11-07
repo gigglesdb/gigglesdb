@@ -1,5 +1,6 @@
 //! Strict migration definitions and declarative capability reports.
 
+pub mod buffer;
 pub mod capability;
 pub mod coordinator;
 pub mod definition;
