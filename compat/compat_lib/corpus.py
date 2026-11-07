@@ -126,8 +126,129 @@ def discover_cases(root, glob='**/*.sql'):
     return cases
 
 
+_SCRIPT_PREAMBLE = ['\\set ON_ERROR_STOP 0', '\\set VERBOSITY sqlstate', '\\pset format csv', '\\pset pager off']
+
+
+def _cleanup_tokens(sql):
+    """Tokenize identifiers while hiding comments and SQL literal contents."""
+    tokens, i = [], 0
+    while i < len(sql):
+        if sql[i].isspace():
+            i += 1
+        elif sql.startswith('--', i):
+            end = sql.find('\n', i)
+            i = len(sql) if end < 0 else end + 1
+        elif sql.startswith('/*', i):
+            depth, i = 1, i + 2
+            while i < len(sql) and depth:
+                if sql.startswith('/*', i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith('*/', i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif sql[i] in ('"', "'"):
+            quote, start = sql[i], i
+            i += 1
+            while i < len(sql):
+                if sql[i] == quote:
+                    i += 1
+                    if i < len(sql) and sql[i] == quote:
+                        i += 1
+                        continue
+                    break
+                if quote == "'" and sql[i] == '\\':
+                    i += 1
+                i += 1
+            tokens.append(sql[start:i] if quote == '"' else '<literal>')
+        else:
+            dollar = re.match(r'\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$', sql[i:])
+            word = re.match(r'[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*', sql[i:])
+            if dollar:
+                end = sql.find(dollar[0], i + len(dollar[0]))
+                i = len(sql) if end < 0 else end + len(dollar[0])
+                tokens.append('<literal>')
+            elif word:
+                tokens.append(word[0])
+                i += len(word[0])
+            else:
+                tokens.append(sql[i])
+                i += 1
+    return tokens
+
+
+def cleanup_tables(case):
+    """Return only corpus-owned table names, newest creation/rename first."""
+    def identifier(token):
+        return token.startswith('"') or bool(re.fullmatch(r'[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*', token))
+
+    def name_at(tokens, index):
+        parts = []
+        if index < len(tokens) and identifier(tokens[index]):
+            parts.append(tokens[index])
+            index += 1
+            while index + 1 < len(tokens) and tokens[index] == '.' and identifier(tokens[index + 1]):
+                parts.append(tokens[index + 1])
+                index += 2
+        return parts, index
+
+    events = []
+    for statement in case['statements']:
+        tokens = _cleanup_tokens(statement['sql'])
+        upper = [token.upper() for token in tokens]
+        if not tokens:
+            continue
+        index = 1
+        if upper[0] == 'CREATE':
+            if index < len(tokens) and upper[index] in ('TEMP', 'TEMPORARY', 'UNLOGGED'):
+                index += 1
+            if upper[index:index + 1] != ['TABLE']:
+                continue
+            index += 1
+            if upper[index:index + 3] == ['IF', 'NOT', 'EXISTS']:
+                index += 3
+            parts, _ = name_at(tokens, index)
+        elif upper[:2] == ['ALTER', 'TABLE']:
+            index = 2
+            if upper[index:index + 2] == ['IF', 'EXISTS']:
+                index += 2
+            if upper[index:index + 1] == ['ONLY']:
+                index += 1
+            old, index = name_at(tokens, index)
+            if not old or upper[index:index + 2] != ['RENAME', 'TO']:
+                continue
+            old_basename = old[-1]
+            old_content = old_basename[1:-1].replace('""', '"') if old_basename.startswith('"') else old_basename.lower()
+            if old_content.startswith('r0c_'):
+                events.append(old)
+            parts, _ = name_at(tokens, index + 2)
+            if len(parts) == 1:
+                parts = old[:-1] + parts
+        else:
+            continue
+        if parts:
+            basename = parts[-1]
+            content = basename[1:-1].replace('""', '"') if basename.startswith('"') else basename.lower()
+            if content.startswith('r0c_'):
+                events.append(parts)
+    result, seen = [], set()
+    for parts in reversed(events):
+        key = tuple(part[1:-1].replace('""', '"') if part.startswith('"') else part.lower() for part in parts)
+        if key not in seen:
+            seen.add(key)
+            result.append('.'.join(parts))
+    return result
+
+
+def generate_cleanup_script(case):
+    names = cleanup_tables(case)
+    if not names:
+        return None
+    return '\n'.join(_SCRIPT_PREAMBLE + ['DROP TABLE ' + name + ';' for name in names]) + '\n'
+
+
 def generate_script(case):
-    lines = ['\\set ON_ERROR_STOP 0', '\\set VERBOSITY sqlstate', '\\pset format csv', '\\pset pager off']
+    lines = list(_SCRIPT_PREAMBLE)
     for stmt in case['statements']:
         lines += [f"\\echo @@R0 BEGIN {stmt['index']}", stmt['sql'], f"\\echo @@R0 END {stmt['index']} :SQLSTATE :ROW_COUNT"]
     return '\n'.join(lines) + '\n'

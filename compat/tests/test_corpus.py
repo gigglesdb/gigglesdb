@@ -26,6 +26,37 @@ class CorpusTests(unittest.TestCase):
             path.write_text('-- case: case1\n-- title: Example\n-- owner: A\n' + headers + sql, encoding='utf-8')
             return corpus.parse_case(path)
 
+    def test_cleanup_tables_and_script(self):
+        case = self.parse('CREATE TABLE r0c_first (id int);\n'
+                          'cReAtE tAbLe IF NOT EXISTS "Mixed Schema"."r0c_Quoted ""Name" (id int);\n'
+                          'ALTER TABLE "Mixed Schema"."r0c_Quoted ""Name" RENAME TO "r0c_New Name";\n'
+                          'CREATE TABLE r0c_first (id int);')
+        names = ['r0c_first', '"Mixed Schema"."r0c_New Name"', '"Mixed Schema"."r0c_Quoted ""Name"']
+        self.assertEqual(corpus.cleanup_tables(case), names)
+        self.assertEqual(corpus.generate_cleanup_script(case),
+                         '\\set ON_ERROR_STOP 0\n\\set VERBOSITY sqlstate\n\\pset format csv\n\\pset pager off\n'
+                         + ''.join('DROP TABLE ' + name + ';\n' for name in names))
+        qualified = self.parse('CREATE TABLE MySchema.R0C_old (id int);\n'
+                               'ALTER TABLE MySchema.R0C_old RENAME TO r0c_new;')
+        self.assertEqual(corpus.cleanup_tables(qualified), ['MySchema.r0c_new', 'MySchema.R0C_old'])
+
+    def test_cleanup_standalone_rename(self):
+        self.assertEqual(corpus.cleanup_tables(self.parse('ALTER TABLE r0c_old RENAME TO r0c_new;')),
+                         ['r0c_new', 'r0c_old'])
+        self.assertEqual(corpus.cleanup_tables(self.parse('ALTER TABLE r0c_old RENAME TO unsafe;')), ['r0c_old'])
+
+    def test_cleanup_ignores_unsafe_and_false_matches(self):
+        case = self.parse("SELECT 'CREATE TABLE r0c_literal (id int)';\n"
+                          'SELECT $$ALTER TABLE r0c_a RENAME TO r0c_dollar$$;\n'
+                          '/* CREATE TABLE r0c_comment (id int); /* nested */ */ SELECT 1;\n'
+                          '-- CREATE TABLE r0c_line (id int);\n'
+                          'CREATE TABLE r0c_schema.unsafe (id int);\n'
+                          'CREATE TABLE "R0C_unsafe" (id int);\n'
+                          'ALTER TABLE r0c_old RENAME COLUMN x TO r0c_column;\n'
+                          'ALTER TABLE unsafe RENAME TO unsafe_too;')
+        self.assertEqual(corpus.cleanup_tables(case), [])
+        self.assertIsNone(corpus.generate_cleanup_script(case))
+
     def test_split_and_comments(self):
         case = self.parse("-- @error\n-- explanatory\nSELECT\n ';--literal' ; -- trailing\nSELECT 'a\\b';\n")
         self.assertEqual(len(case['statements']), 2)

@@ -112,6 +112,26 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
             outputs[side] = result
             for stream in ('stdout','stderr'):
                 (directory/f'{side}.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
+        cleanup = {}
+        try:
+            cleanup_script = corpus.generate_cleanup_script(case)
+            if cleanup_script is not None:
+                (directory/'cleanup.sql').write_text(cleanup_script, encoding='utf-8')
+        except Exception as exc:
+            cleanup_script = None
+            cleanup = {side: {'error': str(exc)} for side in ('pg', 'giggles')}
+        if cleanup_script is not None:
+            for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
+                try:
+                    name = engine.prefix+'c-'+str(len(engine.containers))
+                    result = runner(engine,client_pin,network,name,host,dest_port,cleanup_script,120,
+                                    client_env={'PGAPPNAME':'r0:cleanup:'+case['area']+'/'+case['id']})
+                    cleanup[side] = dict(exit=result['exit'] if result['exit'] is not None else -1,
+                                         timed_out=bool(result['timed_out']))
+                    for stream in ('stdout','stderr'):
+                        (directory/f'{side}.cleanup.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
+                except Exception as exc:
+                    cleanup[side] = {'error': str(exc)}
         transcripts = {}
         for side, output in outputs.items():
             transcript = corpus.parse_transcript(output['stdout'], case['statements'], side, output['stderr'])
@@ -120,6 +140,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
                 transcript.update(valid=False, reason='PostgreSQL session failed')
             transcripts[side] = transcript
         item = corpus.compare_case(case, transcripts['pg'], transcripts['giggles'])
+        item['cleanup'] = cleanup
         reached = outputs['giggles']['exit'] == 0 or any(
             len(record.get('sqlstate', '')) == 5 and record['sqlstate'].isalnum()
             for record in transcripts['giggles']['records'])
@@ -129,7 +150,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     item = util.redact(item,[password])
     (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
     summary_keys = ('area','id','title','owner','expect','reason','outcome','compare','source',
-                    'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors')
+                    'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors','cleanup')
     data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
 
 

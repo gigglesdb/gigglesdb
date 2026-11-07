@@ -156,7 +156,9 @@ the end of its own line. Each line-terminated chunk must contain exactly one SQL
 command; multiple top-level commands or trailing SQL after a semicolon are rejected. Comments
 and semicolons inside single quotes, double quotes, or dollar quotes are handled;
 trailing line comments are recognized.
-psql metacommands in corpus source are forbidden. Tables persist between cases; use case-prefixed names to avoid interference.
+psql metacommands in corpus source are forbidden.
+
+Corpus `r0c_*` tables are dropped on both sides after each case. Cleanup output and status are recorded as artifacts and metadata, but are not compared.
 
 Give corpus setup tables a primary key so setup succeeds before the intended
 feature is exercised. Preserve feature-specific key definitions: the
