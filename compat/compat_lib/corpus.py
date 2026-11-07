@@ -1,0 +1,225 @@
+"""Pure parsing and differential comparison for the statement corpus."""
+import re
+import copy
+from pathlib import Path
+
+from .checks import OWNERS, normalize
+
+UNSUPPORTED_STATES = frozenset({'0A000', '42601', '42883', '42704'})
+OUTCOMES = ('COMPATIBLE', 'UNSUPPORTED', 'DIVERGENT', 'INTENTIONAL', 'UNTESTED', 'HARNESS_ERROR')
+
+
+def _scan(line, quote=None, terminators=None):
+    """Return SQL before its line comment and the continuing quote state."""
+    i = 0
+    while i < len(line):
+        if quote:
+            if line.startswith(quote, i):
+                if quote in ("'", '"') and line.startswith(quote * 2, i):
+                    i += 2
+                    continue
+                i += len(quote)
+                quote = None
+                continue
+            # Backslashes inside SQL literals cannot become psql commands.
+            i += 1
+            continue
+        if line.startswith('--', i):
+            return line[:i], quote
+        if line[i] == '\\':
+            raise ValueError('psql backslash commands are forbidden')
+        if line[i] == ';' and terminators is not None:
+            terminators.append(i)
+        if line[i] in ("'", '"'):
+            quote = line[i]
+        elif line[i] == '$':
+            m = re.match(r'\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$', line[i:])
+            if m:
+                quote = m[0]
+                i += len(quote)
+                continue
+        i += 1
+    return line, quote
+
+
+def parse_case(path, area=None):
+    path = Path(path)
+    headers, statements, pending, parts = {}, [], False, []
+    quote = None
+    for line in path.read_text(encoding='utf-8-sig').splitlines():
+        if not quote and line.lstrip().startswith('--'):
+            if re.fullmatch(r'\s*--\s*@error\s*', line):
+                if parts or pending:
+                    raise ValueError(f'{path}: misplaced @error')
+                pending = True
+            else:
+                m = re.fullmatch(r'\s*--\s*(case|title|owner|expect):\s*(.*?)\s*', line)
+                if m:
+                    if statements or parts or m[1] in headers:
+                        raise ValueError(f'{path}: misplaced or duplicate header')
+                    headers[m[1]] = m[2]
+            continue
+        terminators = []
+        code, quote = _scan(line, quote, terminators)
+        if terminators and (len(terminators) != 1 or code[terminators[0] + 1:].strip()):
+            raise ValueError(f'{path}: one SQL command per line-terminated chunk is required')
+        if code.strip():
+            parts.append(code.rstrip())
+        if not quote and code.rstrip().endswith(';'):
+            statements.append(dict(index=len(statements) + 1, sql='\n'.join(parts), expected_error=pending))
+            parts, pending = [], False
+    if parts or quote or pending:
+        raise ValueError(f'{path}: unterminated SQL or dangling @error')
+    if not statements:
+        raise ValueError(f'{path}: empty case')
+    if not all(headers.get(k) for k in ('case', 'title', 'owner')):
+        raise ValueError(f'{path}: case/title/owner headers required')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', headers['case']) or headers['owner'] not in OWNERS:
+        raise ValueError(f'{path}: invalid case id or owner')
+    expectation = headers.get('expect', 'compatible').split(None, 1)
+    if not expectation or expectation[0] not in ('compatible', 'intentional', 'untested') or (expectation[0] == 'compatible' and len(expectation) != 1) or (expectation[0] != 'compatible' and len(expectation) != 2):
+        raise ValueError(f'{path}: invalid expectation (reason required)')
+    warnings = []
+    for statement in statements:
+        for m in re.finditer(r'\bCREATE\s+(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)', statement['sql'], re.I):
+            if headers['case'].lower() not in m[1].lower():
+                warnings.append(f"statement {statement['index']}: CREATE TABLE {m[1]} does not contain case id")
+    return dict(id=headers['case'], title=headers['title'], owner=headers['owner'], expect=expectation[0], reason=expectation[1] if len(expectation) > 1 else '', area=area or path.parent.name, path=str(path), statements=statements, warnings=warnings)
+
+
+def discover_cases(root, glob='**/*.sql'):
+    root = Path(root)
+    cases = [parse_case(p, p.relative_to(root).parts[0] if len(p.relative_to(root).parts) > 1 else root.name) for p in sorted(root.glob(glob)) if p.is_file()]
+    seen = set()
+    for case in cases:
+        if case['id'] in seen:
+            raise ValueError('duplicate corpus case id: ' + case['id'])
+        seen.add(case['id'])
+    return cases
+
+
+def generate_script(case):
+    lines = ['\\set ON_ERROR_STOP 0', '\\set VERBOSITY sqlstate', '\\pset format csv', '\\pset pager off']
+    for stmt in case['statements']:
+        lines += [f"\\echo @@R0 BEGIN {stmt['index']}", stmt['sql'], f"\\echo @@R0 END {stmt['index']} :SQLSTATE :ROW_COUNT"]
+    return '\n'.join(lines) + '\n'
+
+
+def parse_transcript(stdout, statements, server='giggles', stderr=''):
+    records, active, output, invalid = [], None, [], None
+    csv_quote = False
+    for line in stdout.splitlines():
+        begin = None if csv_quote else re.fullmatch(r'@@R0 BEGIN (\d+)', line)
+        end = None if csv_quote else re.fullmatch(r'@@R0 END (\d+) ([A-Z0-9]{5}) (\d+)', line)
+        if begin:
+            index = int(begin[1])
+            if active is not None or index != len(records) + 1 or index > len(statements):
+                invalid = 'missing or misordered BEGIN/END marker'
+                break
+            active, output = index, []
+        elif end:
+            if active is None or int(end[1]) != active:
+                invalid = 'missing or misordered END marker'
+                break
+            # CSV mode omits SELECT command tags. Preserve the actual server's
+            # ROW_COUNT alongside its unmodified CSV and DDL/DML command tags.
+            output.append('@@R0 ROW_COUNT ' + end[3])
+            records.append(dict(index=active, sql=statements[active - 1]['sql'], sqlstate=end[2], row_count=int(end[3]), output_lines=output, stderr_first_line=''))
+            active = None
+        elif active is not None:
+            output.append(line)
+            # RFC 4180 double quotes escape each other; paired quotes do not
+            # change whether the next physical line is inside a CSV field.
+            csv_quote ^= bool(line.count('"') % 2)
+    if active is not None or len(records) != len(statements):
+        invalid = invalid or 'missing END marker'
+    # psql -f - reports the final SQL line number. Reconstruct generated lines.
+    sql_lines, cursor = {}, 4
+    for stmt in statements:
+        cursor += 1 + len(stmt['sql'].splitlines())
+        sql_lines[cursor] = stmt['index']
+        cursor += 1
+    for stmt in statements[len(records):]:
+        records.append(dict(index=stmt['index'], sql=stmt['sql'], sqlstate='CONNECTION_LOST', row_count=None, output_lines=[], stderr_first_line=''))
+    if invalid and records and all(r['sqlstate'] != 'CONNECTION_LOST' for r in records):
+        # A malformed suffix must not make a broken protocol look compatible.
+        records[-1]['sqlstate'] = 'CONNECTION_LOST'
+    current = None
+    for line in stderr.splitlines():
+        m = re.search(r'psql:(?:<stdin>|-):([0-9]+):\s*(?:ERROR|FATAL):', line)
+        if m:
+            current = sql_lines.get(int(m[1]))
+        elif re.search(r'(?:psql:.*(?:error|fatal)|connection.*(?:closed|lost)|server closed)', line, re.I):
+            current = next((r['index'] for r in records if r['sqlstate'] == 'CONNECTION_LOST'), None)
+        if current is not None and 0 < current <= len(records):
+            rec = records[current - 1]
+            rec['stderr_first_line'] = rec['stderr_first_line'] or line
+            rec['stderr'] = rec.get('stderr', '') + line + '\n'
+    return dict(records=records, valid=invalid is None, reason=invalid, server=server)
+
+
+def statement_difference(pg, giggles):
+    p, g = pg['sqlstate'], giggles['sqlstate']
+    if 'CONNECTION_LOST' in (p, g):
+        if p == '00000':
+            return 'giggles_error'
+        if g == '00000':
+            return 'pg_error_only'
+        return 'sqlstate_differs'
+    if p == g:
+        return None if p != '00000' or normalize('\n'.join(pg['output_lines'])) == normalize('\n'.join(giggles['output_lines'])) else 'result_differs'
+    if p == '00000':
+        return 'giggles_error'
+    if g == '00000':
+        return 'pg_error_only'
+    return 'sqlstate_differs'
+
+
+def compare_case(case, pg, giggles):
+    if giggles.get('timed_out') and giggles.get('records'):
+        giggles = copy.deepcopy(giggles)
+        giggles['records'][-1]['sqlstate'] = 'CONNECTION_LOST'
+        giggles['valid'] = False
+        giggles['reason'] = 'client timed out'
+    result = {k: case.get(k) for k in ('id', 'area', 'title', 'owner', 'expect', 'reason', 'warnings')}
+    result.update(outcome='COMPATIBLE', first_divergence=None, stale_expectation=False, pg=pg, giggles=giggles, differences=[], harness_errors=[])
+    if case['expect'] == 'untested':
+        result['outcome'] = 'UNTESTED'
+        return result
+    harness = not pg.get('valid', True) or pg.get('timed_out', False) or pg.get('exit', 0) != 0
+    if harness:
+        result['harness_errors'].append(dict(reason=pg.get('reason') or 'PostgreSQL invocation failed or timed out', index=None, sql=None))
+    for stmt, p, g in zip(case['statements'], pg['records'], giggles['records']):
+        if (p['sqlstate'] != '00000') != stmt['expected_error'] or p['sqlstate'] == 'CONNECTION_LOST':
+            harness = True
+            result['harness_errors'].append(dict(reason='PostgreSQL connection lost' if p['sqlstate'] == 'CONNECTION_LOST' else ('expected PostgreSQL error did not occur' if stmt['expected_error'] else 'unexpected PostgreSQL error: ' + p['sqlstate']), index=stmt['index'], sql=stmt['sql']))
+        kind = statement_difference(p, g)
+        if kind:
+            detail = dict(index=stmt['index'], kind=kind, sql=stmt['sql'], pg=dict(sqlstate=p['sqlstate'], output_excerpt='\n'.join(p['output_lines'])[:2000]), giggles=dict(sqlstate=g['sqlstate'], output_excerpt='\n'.join(g['output_lines'])[:2000], stderr_first_line=g.get('stderr_first_line', '')))
+            result['differences'].append(detail)
+    if len(pg['records']) != len(case['statements']) or len(giggles['records']) != len(case['statements']):
+        harness = True
+        result['harness_errors'].append(dict(reason='transcript statement count mismatch', index=None, sql=None))
+    result['first_divergence'] = next(iter(result['differences']), None)
+    if harness:
+        result['outcome'] = 'HARNESS_ERROR'
+    elif result['first_divergence']:
+        first = result['first_divergence']
+        g = next(record for record in giggles['records'] if record['index'] == first['index'])
+        unsupported = first['kind'] == 'giggles_error' and (g['sqlstate'] in UNSUPPORTED_STATES or (g['sqlstate'] == 'XX000' and re.search(r'unsupported|not supported', g.get('stderr', g.get('stderr_first_line', '')), re.I)))
+        result['outcome'] = 'UNSUPPORTED' if unsupported else 'DIVERGENT'
+        if case['expect'] == 'intentional':
+            result['outcome'] = 'INTENTIONAL'
+    elif case['expect'] == 'intentional':
+        result['stale_expectation'] = True
+    return result
+
+
+def summarize(results):
+    def counts(items):
+        total = {key: 0 for key in OUTCOMES}
+        for item in items:
+            total[item['outcome']] += 1
+        denominator = sum(total[k] for k in ('COMPATIBLE', 'UNSUPPORTED', 'DIVERGENT'))
+        return dict(total, pass_rate=total['COMPATIBLE'] / denominator if denominator else None)
+    return dict(overall=counts(results), by_area={v: counts([r for r in results if r['area'] == v]) for v in sorted({r['area'] for r in results})}, by_owner={v: counts([r for r in results if r['owner'] == v]) for v in sorted({r['owner'] for r in results})})

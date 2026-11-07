@@ -5,8 +5,18 @@ from unittest.mock import Mock
 from types import SimpleNamespace
 import harness
 from compat_lib import checks, pins, psql_client, report
-from tests.test_harness import TASK
 
+
+from tests.task_storage import ModuleStorage
+
+_STORAGE = ModuleStorage()
+TASK = _STORAGE.root
+
+def setUpModule():
+    _STORAGE.start()
+
+def tearDownModule():
+    _STORAGE.finish()
 
 class H1bTests(unittest.TestCase):
     def parse(self, headers):

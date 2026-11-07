@@ -10,7 +10,7 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, docker, gigglesdb, oracle, pins, psql_client, report, util
+from compat_lib import checks, corpus, docker, gigglesdb, oracle, pins, probes, psql_client, report, util
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -23,6 +23,9 @@ def parser():
     run.add_argument('--out-root', default='J:/gigglesdb-work/r0-harness/runs')
     run.add_argument('--clients', default=','.join(psql_client.REGISTRY))
     run.add_argument('--checks', default='*')
+    run.add_argument('--corpus', default='*')
+    run.add_argument('--no-corpus', action='store_true')
+    run.add_argument('--no-checks', action='store_true')
     run.add_argument('--client-timeout', type=float, default=60)
     for flag in ('pull','keep','strict'):
         run.add_argument('--'+flag, action='store_true')
@@ -73,6 +76,102 @@ def run_check(engine, client, client_pin, check, available, unavailable_reason, 
     (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
     data['checks'].append(item)
 
+def run_corpus_case(engine, client, client_pin, case, available, reason, data, run,
+                    network, pg_host, port, password):
+    directory = run/'corpus'/case['area']/case['id']
+    directory.mkdir(parents=True, exist_ok=False)
+    script = corpus.generate_script(case)
+    (directory/'script.sql').write_text(script, encoding='utf-8')
+    runner = psql_client.REGISTRY[client].get('run_session')
+    if case['expect'] == 'untested' or not available or runner is None:
+        item = {key:case.get(key) for key in ('area','id','title','owner','expect','reason')}
+        item.update(outcome='UNTESTED', pg=None, giggles=None, first_divergence=None,
+                    warnings=case.get('warnings', []), stale_expectation=False)
+        if case['expect'] != 'untested':
+            item['reason'] = reason if not available else 'client has no session runner'
+    else:
+        outputs = {}
+        for side, host, dest_port in [('pg',pg_host,5432), ('giggles','host.docker.internal',port)]:
+            name = engine.prefix+'c-'+str(len(engine.containers))
+            result = runner(engine,client_pin,network,name,host,dest_port,script,120)
+            outputs[side] = result
+            for stream in ('stdout','stderr'):
+                (directory/f'{side}.{stream}.txt').write_text(util.redact(result[stream],[password]),encoding='utf-8')
+        transcripts = {}
+        for side, output in outputs.items():
+            transcript = corpus.parse_transcript(output['stdout'], case['statements'], side, output['stderr'])
+            transcript.update({key:output[key] for key in ('exit','duration_ms','timed_out')})
+            if side == 'pg' and output['exit'] != 0:
+                transcript.update(valid=False, reason='PostgreSQL session failed')
+            transcripts[side] = transcript
+        item = corpus.compare_case(case, transcripts['pg'], transcripts['giggles'])
+        reached = outputs['giggles']['exit'] == 0 or any(
+            len(record.get('sqlstate', '')) == 5 and record['sqlstate'].isalnum()
+            for record in transcripts['giggles']['records'])
+        if reached:
+            data['networking']['status'] = 'reached-server'
+    item['artifact_dir'] = str(directory)
+    item = util.redact(item,[password])
+    (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
+    summary_keys = ('area','id','title','owner','expect','reason','outcome',
+                    'first_divergence','warnings','stale_expectation','artifact_dir','harness_errors')
+    data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
+
+
+def run_probe_client(engine, client, registration, args, data, run, network, pg_host, port, password):
+    """Execute a registered driver once per server; filter only its reported cases."""
+    probe_dir = Path(__file__).parent/registration['probe_dir']
+    manifest = probes.load_manifest(probe_dir/'cases.json')
+    directory = run/'checks'/client
+    directory.mkdir(parents=True, exist_ok=False)
+    image = probes.prepare_image(engine, registration['driver'], probe_dir, run,
+                                 expected_version=registration['version_expected'])
+    data['clients'][client] = dict(image, image=image.get('tag'), version=None)
+    outputs = {}
+    if image['available']:
+        base = len(engine.containers)
+        for index, (side, host, dest_port) in enumerate([('pg',pg_host,5432), ('giggles','host.docker.internal',port)]):
+            outputs[side] = probes.run_probe_side(
+                engine, registration['driver'], image, network, engine.prefix+'c-'+str(base+index),
+                host, dest_port, manifest, expected_version=registration['version_expected'], timeout=180,
+                r0_prefix=registration.get('r0_prefix'), version_fields=registration.get('version_fields', ()))
+            for stream in ('stdout','stderr'):
+                (directory/f'{side}.{stream}.txt').write_text(util.redact(outputs[side][stream],[password]),encoding='utf-8')
+        data['clients'][client]['version'] = outputs['pg'].get('version')
+        for field in registration.get('version_fields', ()):
+            data['clients'][client][field] = outputs['pg'].get(field)
+        rows = probes.classify_cases(manifest, outputs['pg'], outputs['giggles'])
+    else:
+        rows = [dict(case, outcome='UNTESTED', reason=image.get('reason','probe image unavailable')) for case in manifest]
+    for row in rows:
+        if not (fnmatch.fnmatch(row['id'], args.checks) or fnmatch.fnmatch(row['id']+'.json',args.checks)):
+            continue
+        item = dict(row, client=client, artifact_dir=str(directory/row['id']))
+        item['outcome'] = item.pop('status', item.get('outcome', 'UNTESTED'))
+        item.setdefault('pg', None)
+        item.setdefault('giggles', None)
+        difference = item.pop('diff', '')
+        item['diff_excerpt'] = difference.splitlines()[:40]
+        record = item['giggles'] or {}
+        item['first_error'] = record.get('observation',{}).get('sqlstate') if record.get('status') == 'ERR' else None
+        if record.get('status') in ('OK','ERR'):
+            data['networking']['status'] = 'reached-server'
+        item = util.redact(item,[password])
+        artifact = directory/row['id']
+        artifact.mkdir()
+        if difference:
+            (artifact/'diff.txt').write_text(util.redact(difference,[password]),encoding='utf-8')
+        (artifact/'result.json').write_text(json.dumps(item,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+        data['checks'].append(item)
+
+
+def corpus_matches(case, pattern):
+    path = Path(case['path'])
+    values = (case['id'], case['area'], case['area']+'/'+case['id'],
+              case['area']+'/'+path.name, str(path), path.as_posix())
+    return any(fnmatch.fnmatch(value, pattern) for value in values)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if not math.isfinite(args.client_timeout) or args.client_timeout <= 0:
@@ -90,7 +189,7 @@ def main(argv=None):
     password = secrets.token_urlsafe(30)
     env.update(POSTGRES_PASSWORD=password, PGPASSWORD=password, POSTGRES_INITDB_ARGS='--locale=C.UTF-8 --encoding=UTF8', TZ='UTC', PGTZ='UTC')
     selected = list(dict.fromkeys(x.strip() for x in args.clients.split(',') if x.strip()))
-    data = dict(schema=1, run_id=run_id, started_at=util.utc(), finished_at=None, harness={}, build=dict(commit=args.commit, build_identity='labelled-by-operator' if args.commit else 'unverified-binary'), oracle={}, clients={}, networking=dict(hostname='host.docker.internal', add_host='host.docker.internal:host-gateway', listener='127.0.0.1', status='unverified'), normalization_rules=checks.NORMALIZATION_RULES, checks=[])
+    data = dict(schema=1, run_id=run_id, started_at=util.utc(), finished_at=None, harness={}, build=dict(commit=args.commit, build_identity='labelled-by-operator' if args.commit else 'unverified-binary'), oracle={}, clients={}, networking=dict(hostname='host.docker.internal', add_host='host.docker.internal:host-gateway', listener='127.0.0.1', status='unverified'), normalization_rules=checks.NORMALIZATION_RULES, checks=[], differential=dict(unsupported_sqlstates=sorted(corpus.UNSUPPORTED_STATES), cases=[]))
     engine = docker.Docker(run_id, env)
     server = None
     infra = False
@@ -100,6 +199,8 @@ def main(argv=None):
         for key, command in [('commit',['git','rev-parse','HEAD']), ('dirty',['git','status','--porcelain','--','compat','scripts/compat.ps1'])]:
             result = util.command(['git','-C',str(Path(__file__).resolve().parent.parent),*command[1:]], env)
             data['harness'][key] = result['stdout'].strip() if key == 'commit' else bool(result['stdout'].strip())
+        cases = corpus.discover_cases(Path(__file__).parent/'corpus') if not args.no_corpus else []
+        cases = [case for case in cases if corpus_matches(case, args.corpus)]
         pinned = pins.load()
         env.update(POSTGRES_INITDB_ARGS=pinned['postgres']['initdb_args'], TZ=pinned['postgres']['tz'], PGTZ=pinned['postgres']['tz'])
         binary = args.server_bin
@@ -115,9 +216,16 @@ def main(argv=None):
         port = server.start()
         data['build'].update(server.meta)
         for client in selected:
+            registration = psql_client.REGISTRY[client]
+            if registration.get('kind') == 'probe':
+                if args.no_checks:
+                    data['clients'][client] = dict(available=False, version=None, reason='checks disabled')
+                else:
+                    run_probe_client(engine,client,registration,args,data,run,network,pg_host,port,password)
+                continue
             client_pin = pinned['clients'].get(client)
             available, unavailable_reason = setup_client(engine, client, client_pin, args, data, password)
-            paths = sorted((Path(__file__).parent/'checks'/client).glob('*.sql'))
+            paths = [] if args.no_checks else sorted((Path(__file__).parent/'checks'/client).glob('*.sql'))
             seen = set()
             for path in paths:
                 check = checks.parse_check(path)
@@ -127,6 +235,10 @@ def main(argv=None):
                 if not (fnmatch.fnmatch(check['id'], args.checks) or fnmatch.fnmatch(path.name,args.checks)):
                     continue
                 run_check(engine, client, client_pin, check, available, unavailable_reason, args, data, run, network, pg_host, port, password)
+        if cases:
+            client = next((name for name in selected if psql_client.REGISTRY[name].get('run_session')), selected[0])
+            for case in cases:
+                run_corpus_case(engine, client, pinned['clients'].get(client), case, data['clients'][client]['available'], 'client unavailable', data, run, network, pg_host, port, password)
     except (Exception, KeyboardInterrupt) as exc:
         infra = True
         if isinstance(exc, gigglesdb.BuildError):
@@ -156,12 +268,16 @@ def main(argv=None):
                 infra = True; data['cleanup_error'] = util.redact(str(exc),[password])
         data['finished_at'] = util.utc()
         data['summary'], data['failures_by_owner'] = report.summarize(data['checks'], selected)
+        data['differential']['summary'] = corpus.summarize(data['differential']['cases'])
         report.write(run,data,[password])
         print(run/'report.md')
         print(report.client_table(data['summary']['clients']))
+        print(report.differential_table(data['differential']['summary']))
     if infra:
         return 2
-    return 1 if args.strict and any(c['outcome'] in ('FAIL','HARNESS_ERROR') for c in data['checks']) else 0
+    failed_checks = any(c['outcome'] in ('FAIL','HARNESS_ERROR') for c in data['checks'])
+    failed_corpus = any(c['outcome'] in ('UNSUPPORTED','DIVERGENT','HARNESS_ERROR') for c in data['differential']['cases'])
+    return 1 if args.strict and (failed_checks or failed_corpus) else 0
 
 if __name__ == '__main__':
     raise SystemExit(main())

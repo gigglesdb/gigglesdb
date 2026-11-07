@@ -9,17 +9,24 @@ import tarfile
 import time
 import unittest
 from unittest.mock import patch
-import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from compat_lib import gigglesdb
 
-TASK = Path('J:/gigglesdb-work')/('h1b-build-tests-' + uuid.uuid4().hex)
-TASK.mkdir(parents=True, exist_ok=True)
-os.environ.update(TEMP=str(TASK), TMP=str(TASK), CARGO_TARGET_DIR=str(TASK/'target'))
 SHA = 'a'*40
 
+
+from tests.task_storage import ModuleStorage
+
+_STORAGE = ModuleStorage()
+TASK = _STORAGE.root
+
+def setUpModule():
+    _STORAGE.start()
+
+def tearDownModule():
+    _STORAGE.finish()
 
 class BuildTests(unittest.TestCase):
     def test_archive_drains_large_trailing_padding(self):

@@ -4,15 +4,22 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from compat_lib import checks, docker, gigglesdb, pins, psql_client, report, util
 
-TASK = Path('J:/gigglesdb-work')/('h1a-unit-'+uuid.uuid4().hex)
-TASK.mkdir(parents=True,exist_ok=True)
-os.environ.update(TEMP=str(TASK),TMP=str(TASK),CARGO_TARGET_DIR=str(TASK/'target'))
+
+from tests.task_storage import ModuleStorage
+
+_STORAGE = ModuleStorage()
+TASK = _STORAGE.root
+
+def setUpModule():
+    _STORAGE.start()
+
+def tearDownModule():
+    _STORAGE.finish()
 
 class HarnessTests(unittest.TestCase):
     def test_normalization(self):

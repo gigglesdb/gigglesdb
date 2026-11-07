@@ -1,0 +1,116 @@
+[
+  {
+    "id": "connect",
+    "title": "Connect",
+    "owner": "A",
+    "expect_error": false
+  },
+  {
+    "id": "keepalive",
+    "title": "Keepalive",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "ddl_create",
+    "title": "Ddl create",
+    "owner": "E1",
+    "expect_error": false
+  },
+  {
+    "id": "prepared_insert",
+    "title": "Prepared insert",
+    "owner": "E1",
+    "expect_error": false
+  },
+  {
+    "id": "prepared_point_select",
+    "title": "Prepared point select",
+    "owner": "E3",
+    "expect_error": false
+  },
+  {
+    "id": "prepared_repeat",
+    "title": "Prepared repeat",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "select_ordered",
+    "title": "Select ordered",
+    "owner": "E3",
+    "expect_error": false
+  },
+  {
+    "id": "update_delete_params",
+    "title": "Update delete params",
+    "owner": "E1",
+    "expect_error": false
+  },
+  {
+    "id": "tx_commit",
+    "title": "Tx commit",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "tx_rollback",
+    "title": "Tx rollback",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "tx_error_recovery",
+    "title": "Tx error recovery",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "savepoint",
+    "title": "Savepoint",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "types_roundtrip",
+    "title": "Types roundtrip",
+    "owner": "E2",
+    "expect_error": false
+  },
+  {
+    "id": "param_bytea_position",
+    "title": "Param bytea position",
+    "owner": "E2",
+    "expect_error": false
+  },
+  {
+    "id": "param_no_from_aggregate",
+    "title": "Param no from aggregate",
+    "owner": "E3",
+    "expect_error": false
+  },
+  {
+    "id": "copy_from_stdin",
+    "title": "Copy from stdin",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "client_cursor_simple_protocol",
+    "title": "Client cursor simple protocol",
+    "owner": "D",
+    "expect_error": false
+  },
+  {
+    "id": "introspection_information_schema",
+    "title": "Introspection information schema",
+    "owner": "G",
+    "expect_error": false
+  },
+  {
+    "id": "server_side_cursor",
+    "title": "Server side cursor",
+    "owner": "D",
+    "expect_error": false
+  }
+]
