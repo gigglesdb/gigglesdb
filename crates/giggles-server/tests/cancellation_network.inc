@@ -519,7 +519,7 @@ async fn late_cancel_and_lost_task_ack_reconcile_same_operation_after_restart() 
     f.admin.set_decision_hook(None);
     drop(native);
     f.stop().await;
-    let admin = Admin::open(path.join("db.redb"), Limits::default()).unwrap();
+    let admin = reopen_after_shutdown(path.join("db.redb")).await.unwrap();
     let service = Service::new(admin.clone(), bindings, Clock::new(0, 3600).unwrap()).unwrap();
     let running = serve("127.0.0.1:0".parse().unwrap(), service, server_config, 8)
         .await

@@ -49,6 +49,17 @@ pub(super) fn task_service(f: &Fixture, task: u64, skew: u64) -> Arc<Service> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_task_expired_after_commit_withholds_output_but_preserves_original_decision() {
     let f = Fixture::new().await;
+    let running = serve_pg(
+        "127.0.0.1:0".parse().unwrap(),
+        task_service(&f, 3, 0),
+        f.server_config.clone(),
+        8,
+    )
+    .await
+    .unwrap();
+    let (c, conn) = connect_at(running.address, f.task.clone()).await;
+    let s = c.prepare(KEY).await.unwrap();
+    // Start the expiry window only after server and connection setup.
     let mut g = grant(3, 42, 1, 1);
     g.policy.expires = now() + 3;
     let expiry = g.policy.expires;
@@ -63,16 +74,6 @@ async fn prepared_task_expired_after_commit_withholds_output_but_preserves_origi
             },
         )
         .unwrap();
-    let running = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        task_service(&f, 3, 0),
-        f.server_config.clone(),
-        8,
-    )
-    .await
-    .unwrap();
-    let (c, conn) = connect_at(running.address, f.task.clone()).await;
-    let s = c.prepare(KEY).await.unwrap();
     let (rx, release) = paused(&f.admin, giggles_core::DecisionPoint::Committed);
     let job = tokio::spawn(async move {
         let r = key(&c, &s, 4850, 0, None).await;
@@ -119,8 +120,19 @@ async fn prepared_task_expired_after_commit_withholds_output_but_preserves_origi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_task_expired_approval_at_execute_is_not_consumed() {
     let f = Fixture::new().await;
+    let running = serve_pg(
+        "127.0.0.1:0".parse().unwrap(),
+        task_service(&f, 3, 0),
+        f.server_config.clone(),
+        8,
+    )
+    .await
+    .unwrap();
+    let (c, conn) = connect_at(running.address, f.task.clone()).await;
+    let s = c.prepare(KEY).await.unwrap();
+    // Start the expiry window only after server and connection setup.
     let mut g = grant(3, 42, 1, 0);
-    g.policy.expires = now() + 2;
+    g.policy.expires = now() + 3;
     let expiry = g.policy.expires;
     f.admin.grant(g).unwrap();
     f.admin
@@ -142,16 +154,6 @@ async fn prepared_task_expired_approval_at_execute_is_not_consumed() {
         .admin
         .approve(Principal(3), preview, Time::Certified(now()))
         .unwrap();
-    let running = serve_pg(
-        "127.0.0.1:0".parse().unwrap(),
-        task_service(&f, 3, 0),
-        f.server_config.clone(),
-        8,
-    )
-    .await
-    .unwrap();
-    let (c, conn) = connect_at(running.address, f.task.clone()).await;
-    let s = c.prepare(KEY).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         while now() < expiry {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -434,7 +436,7 @@ async fn prepared_task_lost_ack_late_cancel_reconnect_and_restart_original_statu
     drop(c);
     conn.await.unwrap();
     f.stop().await;
-    let admin = Admin::open(path.join("db.redb"), Default::default()).unwrap();
+    let admin = reopen_after_shutdown(path.join("db.redb")).await.unwrap();
     let service = Service::new(admin.clone(), bindings, Clock::new(0, 3600).unwrap()).unwrap();
     let running = serve_pg("127.0.0.1:0".parse().unwrap(), service, server, 8)
         .await
@@ -457,20 +459,6 @@ async fn prepared_task_lost_ack_late_cancel_reconnect_and_restart_original_statu
 async fn prepared_task_expiry_between_metadata_execute_and_cached_replay() {
     for committed_first in [false, true] {
         let f = Fixture::new().await;
-        let mut g = grant(3, 42, 3, 3);
-        g.policy.expires = now() + 2;
-        let expiry = g.policy.expires;
-        f.admin.grant(g).unwrap();
-        f.admin
-            .provision_task_resources(
-                TaskId(3),
-                giggles_core::TaskResources {
-                    read_rows: 1_000_000,
-                    disclosed_rows: 1_000_000,
-                    encoded_bytes: 1_000_000_000,
-                },
-            )
-            .unwrap();
         let running = serve_pg(
             "127.0.0.1:0".parse().unwrap(),
             task_service(&f, 3, 0),
@@ -486,6 +474,21 @@ async fn prepared_task_expiry_between_metadata_execute_and_cached_replay() {
         pg_send(&mut raw, b'H', &[]).await;
         assert_eq!(pg_read(&mut raw).await.0, b'1');
         assert_eq!(pg_read(&mut raw).await.0, b'2');
+        // Start the expiry window only after server and connection setup.
+        let mut g = grant(3, 42, 3, 3);
+        g.policy.expires = now() + 3;
+        let expiry = g.policy.expires;
+        f.admin.grant(g).unwrap();
+        f.admin
+            .provision_task_resources(
+                TaskId(3),
+                giggles_core::TaskResources {
+                    read_rows: 1_000_000,
+                    disclosed_rows: 1_000_000,
+                    encoded_bytes: 1_000_000_000,
+                },
+            )
+            .unwrap();
         if committed_first {
             assert_eq!(
                 row_response(&raw_execute(&mut raw, "p", 0).await).code,

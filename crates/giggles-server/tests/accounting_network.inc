@@ -348,14 +348,29 @@ async fn accounting_socket_loss_after_reservation_consumes_without_refund() {
 async fn accounting_native_and_simple_expiry_after_commit_withhold_original_outcome() {
     for native in [true, false] {
         let f = Fixture::new().await;
+        let (n, p) = servers(&f, super::prepared_network::task_service(&f, 3, 0)).await;
+        let native_client = if native {
+            Some(
+                Client::connect(n.address, "localhost", f.task.clone())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let pg_client = if native {
+            None
+        } else {
+            Some(super::prepared_network::connect_at(p.address, f.task.clone()).await)
+        };
+        // Start the expiry window only after server and connection setup.
         let mut g = grant(3, 42, 1, 1);
-        g.policy.expires = now() + 2;
+        g.policy.expires = now() + 3;
         let expiry = g.policy.expires;
         f.admin.grant(g).unwrap();
         f.admin
             .provision_task_resources(TaskId(3), resources(1, 10000))
             .unwrap();
-        let (n, p) = servers(&f, super::prepared_network::task_service(&f, 3, 0)).await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = std::sync::Mutex::new(Some(tx));
         let (release, wait) = std::sync::mpsc::channel();
@@ -371,19 +386,15 @@ async fn accounting_native_and_simple_expiry_after_commit_withhold_original_outc
                     .unwrap();
             }
         })));
-        let config = f.task.clone();
-        let na = n.address;
-        let pa = p.address;
         let job = tokio::spawn(async move {
             let request = Request::Execute {
                 request: repair(123, 0..1),
                 approval: None,
             };
-            if native {
-                let mut c = Client::connect(na, "localhost", config).await.unwrap();
+            if let Some(mut c) = native_client {
                 c.call(&request).await.unwrap()
             } else {
-                let (c, conn) = super::prepared_network::connect_at(pa, config).await;
+                let (c, conn) = pg_client.unwrap();
                 let r = pg_response(&c, &request).await;
                 drop(c);
                 conn.await.unwrap();

@@ -333,6 +333,25 @@ impl Fixture {
         self.pg.shutdown().await.unwrap();
     }
 }
+async fn reopen_after_shutdown(
+    path: impl AsRef<std::path::Path>,
+) -> Result<Admin, giggles_core::CoreError> {
+    use tokio::time::{Duration, Instant, sleep_until};
+    // Socket tasks are joined by shutdown, but detached spawn_blocking work can
+    // still own a Session (and its Service/Admin clones) until it finishes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Admin::open(path.as_ref(), Limits::default()) {
+            Err(giggles_core::CoreError::Storage(message))
+                if message == "Database already open. Cannot acquire lock."
+                    && Instant::now() < deadline =>
+            {
+                sleep_until((Instant::now() + Duration::from_millis(25)).min(deadline)).await;
+            }
+            result => return result,
+        }
+    }
+}
 fn grant(task: u64, tenant: u64, limit: u64, approval: u64) -> Grant {
     Grant {
         task: TaskId(task),
@@ -2054,7 +2073,7 @@ async fn lost_response_restart_original_operation_and_native_executable() {
     let bindings: Vec<Binding> =
         serde_json::from_slice(&std::fs::read(path.join("bindings.json")).unwrap()).unwrap();
     f.stop().await;
-    let admin = Admin::open(path.join("db.redb"), Limits::default()).unwrap();
+    let admin = reopen_after_shutdown(path.join("db.redb")).await.unwrap();
     let service = Service::new(admin.clone(), bindings, Clock::new(0, 3600).unwrap()).unwrap();
     let running = serve("127.0.0.1:0".parse().unwrap(), service, server_config, 8)
         .await
