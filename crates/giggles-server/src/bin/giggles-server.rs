@@ -5,18 +5,25 @@ use giggles_server::{
         ApiLimits, ApiRuntime,
         net::{serve_grpc_bound, serve_http_bound},
     },
+    auth::{PostgresqlConfig, serve_postgresql_bound},
     clock::Clock,
     serve_bound, serve_pg_bound, tls,
 };
 use serde::Deserialize;
-use std::{io, io::Read, net::SocketAddr};
-use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch};
+use std::{
+    io,
+    io::{Read, Write},
+    net::SocketAddr,
+};
+use tokio::{net::TcpListener, sync::watch};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     database: String,
     native: SocketAddr,
     postgres: SocketAddr,
+    #[serde(default)]
+    postgresql: Option<PostgresqlConfig>,
     #[serde(default)]
     http: Option<SocketAddr>,
     #[serde(default)]
@@ -37,15 +44,34 @@ struct Config {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or("usage: giggles-server CONFIG.json")?;
+    let mut args = std::env::args().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("{}", giggles_server::dev::USAGE);
+        std::process::exit(2);
+    };
+    if path == "--dev" {
+        let options = giggles_server::dev::Options::parse(args).unwrap_or_else(|usage| {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        });
+        return giggles_server::dev::run(options).await;
+    }
+    if path.starts_with('-') || args.next().is_some() {
+        eprintln!("{}", giggles_server::dev::USAGE);
+        std::process::exit(2);
+    }
     let bytes = bounded_file(&path)?;
     let c: Config = serde_json::from_slice(&bytes)?;
     if c.connections == 0 || c.connections > 128 {
         return Err("connection limit".into());
     }
     c.api_limits.validate()?;
+    let postgresql = c
+        .postgresql
+        .as_ref()
+        .map(PostgresqlConfig::build)
+        .transpose()?
+        .map(std::sync::Arc::new);
     let admin = Admin::open(c.database, Limits::default())?;
     let bindings = match &c.bindings_file {
         Some(path) => serde_json::from_slice(&bounded_file(path)?)?,
@@ -66,6 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dropping these listeners rolls back a partial bind failure automatically.
     let native_socket = TcpListener::bind(c.native).await?;
     let pg_socket = TcpListener::bind(c.postgres).await?;
+    let postgresql_socket = match &c.postgresql {
+        Some(config) => Some(TcpListener::bind(config.listen).await?),
+        None => None,
+    };
     let http_socket = match c.http {
         Some(address) => Some(TcpListener::bind(address).await?),
         None => None,
@@ -99,6 +129,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         addresses.push(format!("postgres={}", pg.address));
         listeners.push(pg);
+        if let (Some(socket), Some(config)) = (postgresql_socket, postgresql) {
+            let postgresql =
+                serve_postgresql_bound(socket, service.clone(), config, gate.clone()).await?;
+            addresses.push(format!("postgresql={}", postgresql.address));
+            listeners.push(postgresql);
+        }
         if let Some(socket) = http_socket {
             let http = serve_http_bound(
                 socket,
@@ -133,51 +169,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     start.send_replace(true);
     println!("{} preview=single-host", addresses.join(" "));
+    io::stdout().flush()?;
     // Trusted local stdin only; bounded command reader, one reload at a time.
     // CA/server key material is immutable for this process and requires restart.
-    let mut input = tokio::io::stdin();
-    let mut command = Vec::new();
-    let mut overflow = false;
-    loop {
-        let byte = tokio::select! {
-            result = tokio::signal::ctrl_c() => { result?; break; }
-            result = input.read_u8() => match result { Ok(byte) => byte, Err(_) => { tokio::signal::ctrl_c().await?; break; } }
-        };
-        if byte == b'\n' {
-            if !overflow && command.as_slice() == b"shutdown" {
-                break;
-            }
-            if !overflow && command.as_slice() == b"reload" {
-                if let Some(path) = c.bindings_file.clone() {
-                    let service = service.clone();
-                    let result = tokio::task::spawn_blocking(
-                        move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-                            let bindings = serde_json::from_slice(&bounded_file(&path)?)?;
-                            Ok(service.reload_bindings(bindings)?)
-                        },
-                    )
-                    .await?;
-                    match result {
-                        Ok(epoch) => {
-                            api.invalidate_bindings();
-                            println!("bindings reloaded epoch={epoch}");
-                        }
-                        Err(_) => eprintln!("reload rejected; prior bindings retained"),
+    let mut reader = giggles_server::dev::ControlReader::default();
+    while let Some(command) = reader.next().await? {
+        if command.as_slice() == b"shutdown" {
+            break;
+        }
+        if command.as_slice() == b"reload" {
+            if let Some(path) = c.bindings_file.clone() {
+                let service = service.clone();
+                let result = tokio::task::spawn_blocking(
+                    move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                        let bindings = serde_json::from_slice(&bounded_file(&path)?)?;
+                        Ok(service.reload_bindings(bindings)?)
+                    },
+                )
+                .await?;
+                match result {
+                    Ok(epoch) => {
+                        api.invalidate_bindings();
+                        println!("bindings reloaded epoch={epoch}");
                     }
-                } else {
-                    eprintln!("reload rejected; bindings_file is not configured");
+                    Err(_) => eprintln!("reload rejected; prior bindings retained"),
                 }
             } else {
-                eprintln!("control rejected; expected reload");
+                eprintln!("reload rejected; bindings_file is not configured");
             }
-            command.clear();
-            overflow = false;
-        } else if byte != b'\r' {
-            if command.len() < 16 {
-                command.push(byte);
-            } else {
-                overflow = true;
-            }
+        } else {
+            eprintln!("control rejected; expected reload");
         }
     }
     stop_all(listeners, &api).await?;
@@ -218,4 +239,33 @@ fn bounded_file(path: &str) -> io::Result<Vec<u8>> {
         return Err(io::Error::other("config limit"));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_listener_is_optional_and_explicit() {
+        let mut json = serde_json::json!({
+            "database": "db", "native": "127.0.0.1:0", "postgres": "127.0.0.1:0",
+            "certificate": "server.pem", "private_key": "server.key", "client_ca": "ca.pem",
+            "bindings": [], "connections": 32, "skew_seconds": 0, "max_pause_seconds": 3600
+        });
+        assert!(
+            serde_json::from_value::<Config>(json.clone())
+                .unwrap()
+                .postgresql
+                .is_none()
+        );
+        json["postgresql"] = serde_json::json!({"listen": "127.0.0.1:0", "tls": "disabled"});
+        let config = serde_json::from_value::<Config>(json.clone())
+            .unwrap()
+            .postgresql
+            .unwrap();
+        assert_eq!(config.listen.port(), 0);
+        assert!(config.build().is_ok());
+        json["postgresql"]["typo"] = true.into();
+        assert!(serde_json::from_value::<Config>(json).is_err());
+    }
 }

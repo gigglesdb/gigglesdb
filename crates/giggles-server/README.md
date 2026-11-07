@@ -1,3 +1,51 @@
+## Quick start (PostgreSQL clients)
+
+From the repository root, start a local development server:
+
+```powershell
+./scripts/dev.ps1 -Task dev-server -Port 5432
+```
+
+The script stores the database and build outputs under `J:/gigglesdb-work/ide`;
+use `-Work J:/gigglesdb-work/MY-SESSION` for a separate instance and `-Port` to
+choose its port. Connect your PostgreSQL client to `127.0.0.1:5432`, user
+`postgres`, database `postgres`, with TLS disabled. Development mode binds to
+`127.0.0.1` and defaults to SCRAM-SHA-256 password authentication.
+
+On first start, the server generates a random 24-character owner password and
+prints it once in a connection URL. Save that password: restarting with the same
+data directory keeps it unchanged and does not print it again. Set
+`GIGGLES_OWNER_PASSWORD` to a nonempty value before first start to choose the
+password instead. Only the SCRAM verifier is stored, not the plaintext password.
+
+For Docker's PostgreSQL client, replace `PASSWORD` with the owner password:
+
+```powershell
+docker run --rm postgres:18.6 psql "postgres://postgres:PASSWORD@host.docker.internal:5432/postgres"
+```
+
+The binary also accepts `giggles-server --dev --data DIR --port 5432` (default
+data directory `giggles-data`). `DIR` is the containing data directory; the
+database is at `DIR/db`. Development mode disables TLS. The agent mTLS listener
+is available only through the `giggles-server CONFIG.json` configuration
+workflow below, which also supports TLS and scoped identities.
+
+To reset the owner password offline, stop the server first, then run:
+
+```powershell
+giggles-server --dev --data DIR --reset-owner-password
+```
+
+Use the same `DIR` as the stopped server, and add `--owner NAME` if its owner is
+not `postgres`. Reset requires an existing database and owner. It uses a nonempty
+`GIGGLES_OWNER_PASSWORD` if set, otherwise generates a new random 24-character
+password, and prints the new password in a connection URL. Restart the server
+afterward.
+
+`--trust-local` explicitly opts into connections without password authentication.
+
+WARNING: --trust-local lets any local process connect as any role without a password, including Docker containers (they arrive via 127.0.0.1) and port-forwarded peers. Use only on a single-user machine.
+
 # Single-host service preview (P2)
 
 Rust server and native client over the existing giggles-core/redb database. This

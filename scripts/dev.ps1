@@ -1,23 +1,35 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('setup','fresh-setup','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','distributed','faultlab','range-history','check','build','test','clippy','fmt','docs')]
+    [ValidateSet('setup','fresh-setup','dev-server','server','ping','server-query','sql','sql-query','native-query','capabilities','backup','export','topology','outbox-example','failover','distributed','faultlab','range-history','check','build','test','clippy','fmt','docs')]
     [string]$Task = 'setup',
     [string]$Crate = 'all',
-    [switch]$Release
+    [switch]$Release,
+    [string]$Work = 'J:/gigglesdb-work/ide',
+    [int]$Port = 5432
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
-$env:CARGO_TARGET_DIR = Join-Path $root 'target-ide'
+$Work = [IO.Path]::GetFullPath($Work)
+$workRoot = [IO.Path]::GetFullPath('J:/gigglesdb-work').TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+if (!$Work.StartsWith($workRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Work must be a task subdirectory of J:/gigglesdb-work.'
+}
+$env:CARGO_TARGET_DIR = Join-Path $Work 'target'
+$env:TEMP = Join-Path $Work 'tmp'
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force -Path $Work,$env:CARGO_TARGET_DIR,$env:TEMP | Out-Null
 $env:CARGO_BUILD_JOBS = '1'
 $profile = 'debug'
 if ($Release) { $profile = 'release' }
-$statePath = Join-Path $root 'artifacts/ide/current.json'
+$statePath = Join-Path $Work 'current.json'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 function Write-Json($Path, $Value) {
     [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 30), $utf8)
 }
 function Invoke-Cargo([string]$Name, [string[]]$Arguments) {
+    # Cargo test/clippy still run from each crate; some existing tests write
+    # relative fixtures there. Moving those tests is a separate known gap.
     $directory = Join-Path $root "crates/$Name"
     if (!(Test-Path (Join-Path $directory 'Cargo.toml'))) { throw "Unknown crate: $Name" }
     Push-Location $directory
@@ -38,7 +50,7 @@ function Read-State {
     Get-Content -Raw $statePath | ConvertFrom-Json
 }
 function New-OutputDirectory {
-    $path = Join-Path $root ('artifacts/ide/output-' + [Guid]::NewGuid().ToString('N'))
+    $path = Join-Path $Work ('output-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $path | Out-Null
     $path
 }
@@ -52,15 +64,29 @@ try {
             Write-Host "Reusing local demo: $($state.directory)"
             exit 0
         }
-        $output = @(Invoke-Cargo 'giggles-server' @('test','--locked','--test','network','executable_server_starts_and_native_client_connects','--','--exact','--nocapture'))
+        $build = @('test','--locked','--no-run','--message-format=json','--test','network')
+        if ($Release) { $build += '--release' }
+        $messages = @(Invoke-Cargo 'giggles-server' $build)
+        $executables = @($messages | ForEach-Object {
+            $message = $_ | ConvertFrom-Json
+            if ($message.reason -eq 'compiler-artifact' -and $message.target.name -eq 'network' -and $message.executable) { $message.executable }
+        })
+        if ($executables.Count -ne 1) { throw 'Expected exactly one network test executable.' }
+        $fixtureRoot = Join-Path $Work ('fixtures/' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
+        Push-Location $fixtureRoot
+        try {
+            $output = @(& $executables[0] '--exact' 'executable_server_starts_and_native_client_connects' '--nocapture')
+            if ($LASTEXITCODE -ne 0) { throw "Network fixture test failed (exit $LASTEXITCODE)" }
+        } finally { Pop-Location }
         $output | Out-Host
         $fixtureLine = @($output | Where-Object { "$_" -match '^retained_fixture=' })
         if ($fixtureLine.Count -ne 1) { throw 'Expected exactly one retained server fixture.' }
-        $fixture = [IO.Path]::GetFullPath((Join-Path "$root/crates/giggles-server" ($fixtureLine[0] -replace '^retained_fixture=','')))
+        $fixture = [IO.Path]::GetFullPath((Join-Path $fixtureRoot ($fixtureLine[0] -replace '^retained_fixture=','')))
         $directory = New-OutputDirectory
         $config = Get-Content -Raw (Join-Path $fixture 'server.TEST-ONLY.json') | ConvertFrom-Json
         foreach ($field in @('database','certificate','private_key','client_ca')) {
-            $config.$field = [IO.Path]::GetFullPath((Join-Path "$root/crates/giggles-server" $config.$field))
+            $config.$field = [IO.Path]::GetFullPath((Join-Path $fixtureRoot $config.$field))
         }
         $configPath = Join-Path $directory 'server.json'
         Write-Json $configPath $config
@@ -100,6 +126,7 @@ try {
         exit 0
     }
     switch ($Task) {
+        'dev-server' { Invoke-Binary 'giggles-server' 'giggles-server' @('--dev','--data',(Join-Path $Work 'dev-data'),'--port',"$Port") }
         'capabilities' { Invoke-Binary 'giggles-language' 'giggles-language' @('capability-manifest') }
         'topology' { Invoke-Binary 'giggles-topology' 'giggles-topology' @('analyze',"$root/crates/giggles-topology/tests/fixtures/three-providers.json",'baseline') }
         'outbox-example' {
