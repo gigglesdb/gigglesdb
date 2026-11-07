@@ -1122,6 +1122,62 @@ impl Query {
                 Expr::Literal(_) | Expr::Param(_) => true,
             })
     }
+    pub(super) fn sequence_only(&self) -> bool {
+        self.sources.is_empty() && !self.sequence_dependencies().is_empty()
+    }
+    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+        fn filter(f: &Filter, out: &mut Vec<Option<String>>) {
+            match f {
+                Filter::Clauses(c) => {
+                    if let Some(f) = &c.filter {
+                        filter(f, out);
+                    }
+                    for s in &c.group {
+                        s.sequence_dependencies(out);
+                    }
+                    if let Some(f) = &c.having {
+                        filter(f, out);
+                    }
+                }
+                Filter::Scalar(s) | Filter::Null(s, _) => s.sequence_dependencies(out),
+                Filter::Compare(a, _, b) => {
+                    a.sequence_dependencies(out);
+                    b.sequence_dependencies(out);
+                }
+                Filter::Like {
+                    value,
+                    pattern,
+                    escape,
+                    ..
+                } => {
+                    value.sequence_dependencies(out);
+                    pattern.sequence_dependencies(out);
+                    if let Some(escape) = escape {
+                        escape.sequence_dependencies(out);
+                    }
+                }
+                Filter::Not(f) => filter(f, out),
+                Filter::Logic(a, _, b) => {
+                    filter(a, out);
+                    filter(b, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (item, _) in &self.items {
+            match item {
+                Item::Scalar(s) | Item::Aggregate(_, Some(s)) => s.sequence_dependencies(&mut out),
+                _ => {}
+            }
+        }
+        if let Some(f) = &self.filter {
+            filter(f, &mut out);
+        }
+        for (s, _, _) in &self.order {
+            s.sequence_dependencies(&mut out);
+        }
+        out
+    }
     fn has_undefined_routine(&self) -> bool {
         fn filter(f: &Filter) -> bool {
             match f {
@@ -1189,6 +1245,7 @@ impl Query {
             limit,
         } = self;
         !self.has_undefined_routine()
+            && self.sequence_dependencies().is_empty()
             && !self.is_table_free()
             && !explain
             && sources.is_empty()

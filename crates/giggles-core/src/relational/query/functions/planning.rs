@@ -25,6 +25,10 @@ pub(super) fn clock_signature(name: &str) -> Option<(DataType, Volatility)> {
     })
 }
 
+/// Sequence routines are volatile even with literal arguments.
+pub(super) fn sequence_volatility(name: &str) -> Option<Volatility> {
+    sequence_name(name).then_some(Volatility::Volatile)
+}
 fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, bool)> {
     use DataType::*;
     if let Some((clock_type, _volatility)) = clock_signature(name) {
@@ -72,8 +76,8 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
         ("to_bin", &[BigInt], Text) => Some((true, true)),              // pg_proc 6331
         ("to_oct", &[Integer], Text) => Some((true, true)),             // pg_proc 6332
         ("to_oct", &[BigInt], Text) => Some((true, true)),              // pg_proc 6333
-        ("position", &[Text, Text], Integer) => Some((true, true)), // pg_proc 849
-        ("position", &[Bytes, Bytes], Integer) => Some((true, true)), // pg_proc 2014
+        ("position", &[Text, Text], Integer) => Some((true, true)),     // pg_proc 849
+        ("position", &[Bytes, Bytes], Integer) => Some((true, true)),   // pg_proc 2014
         ("strpos", &[Text, Text], Integer) => Some((true, true)),       // pg_proc 868
         ("lower", &[Text], Text) => Some((true, true)),                 // pg_proc 870
         ("ascii", &[Text], Integer) => Some((true, true)),              // pg_proc 1620
@@ -348,7 +352,7 @@ impl BoundScalar {
             version: 0,
         };
         match &self.node {
-            Node::Param(_) | Node::Column(..) | Node::Clock(..) => Ok(None),
+            Node::Param(_) | Node::Column(..) | Node::Clock(..) | Node::Sequence(..) => Ok(None),
             Node::Literal(v) => {
                 charge(budget, v)?;
                 Ok(Some(v.clone()))
@@ -431,6 +435,7 @@ impl BoundScalar {
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
             Node::Clock(..) => true,
+            Node::Sequence(_, args, _) => args.iter().all(Self::insert_input_only),
             Node::Cast(value) => {
                 value.insert_input_only()
                     && (immutable_cast(&value.ty, &self.ty)

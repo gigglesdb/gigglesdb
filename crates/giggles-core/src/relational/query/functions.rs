@@ -61,6 +61,11 @@ pub(in crate::relational) struct BoundScalar {
     node: Node,
 }
 enum Node {
+    Sequence(
+        String,
+        Vec<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     Clock(
         String,
         i32,
@@ -82,7 +87,41 @@ fn number(t: &DataType) -> bool {
 fn integer(t: &DataType) -> bool {
     matches!(t, DataType::SmallInt | DataType::Integer | DataType::BigInt)
 }
+pub(super) fn sequence_name(name: &str) -> bool {
+    matches!(name, "nextval" | "currval" | "setval")
+}
 impl Scalar {
+    /// Catalog dependencies are distinct from the positive table-free proof.
+    pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
+        match self {
+            Self::Call(name, args) => {
+                if sequence_name(name) {
+                    fn literal(arg: &Scalar) -> Option<String> {
+                        match arg {
+                            Scalar::Literal(Value::Text(name)) => Some(name.clone()),
+                            Scalar::Cast(arg, DataType::Text) => literal(arg),
+                            _ => None,
+                        }
+                    }
+                    out.push(args.first().and_then(literal));
+                }
+                for arg in args {
+                    arg.sequence_dependencies(out);
+                }
+            }
+            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.sequence_dependencies(out),
+            Self::Binary(_, a, b) => {
+                a.sequence_dependencies(out);
+                b.sequence_dependencies(out);
+            }
+            Self::SubstringOrder(args) => {
+                for arg in args {
+                    arg.sequence_dependencies(out);
+                }
+            }
+            _ => {}
+        }
+    }
     pub(super) fn has_undefined_routine(&self) -> bool {
         match self {
             Self::Call(name, args) => {
@@ -379,7 +418,23 @@ impl Scalar {
                         {
                             return Err(SqlError::Syntax);
                         }
-                        args.push(Self::parse_context(p, depth + 1, aggregate_argument)?);
+                        // regclass is an object reference only in the first sequence
+                        // argument. Lower its literal spelling without adding a wire type.
+                        if args.is_empty()
+                            && sequence_name(&name)
+                            && matches!(p.tokens.get(p.at), Some(Token::String(_)))
+                            && p.tokens.get(p.at + 1) == Some(&Token::Symbol(':'))
+                            && p.tokens.get(p.at + 2) == Some(&Token::Symbol(':'))
+                            && matches!(p.tokens.get(p.at + 3), Some(Token::Word(t)) if t == "regclass")
+                        {
+                            let Some(Token::String(value)) = p.tokens.get(p.at).cloned() else {
+                                unreachable!()
+                            };
+                            p.at += 4;
+                            args.push(Self::Literal(Value::Text(value)));
+                        } else {
+                            args.push(Self::parse_context(p, depth + 1, aggregate_argument)?);
+                        }
                         if !qualified_call
                             && !quoted
                             && name == "overlay"
@@ -592,6 +647,45 @@ impl Scalar {
                 return Self::bind_overlay(args, resolve, tables, parameters);
             }
             Self::Call(name, args) => {
+                if planning::sequence_volatility(name).is_some() {
+                    if !(matches!(name.as_str(), "nextval" | "currval") && args.len() == 1
+                        || name == "setval" && matches!(args.len(), 2 | 3))
+                    {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    let mut bound = Vec::with_capacity(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        let target = match i {
+                            0 => DataType::Text,
+                            1 => DataType::BigInt,
+                            _ => DataType::Boolean,
+                        };
+                        let mut value = arg.bind(resolve, tables, parameters)?;
+                        if value.ty != target {
+                            if matches!(arg, Self::Literal(Value::Text(_) | Value::Null)) {
+                                let Self::Literal(raw) = arg else {
+                                    unreachable!()
+                                };
+                                value = BoundScalar {
+                                    ty: target.clone(),
+                                    node: Node::Literal(cast_value(raw.clone(), &target, &mut 0)?),
+                                };
+                            } else if i == 1 && integer(&value.ty) {
+                                value = BoundScalar {
+                                    ty: target.clone(),
+                                    node: Node::Cast(Box::new(value)),
+                                };
+                            } else {
+                                return Err(SqlError::UndefinedFunction);
+                            }
+                        }
+                        bound.push(value);
+                    }
+                    return Ok(BoundScalar {
+                        ty: DataType::BigInt,
+                        node: Node::Sequence(name.clone(), bound, None),
+                    });
+                }
                 if let Some((ty, _volatility)) = planning::clock_signature(name) {
                     let keyword = matches!(
                         name.as_str(),
@@ -1060,6 +1154,10 @@ impl BoundScalar {
     ) {
         match &mut self.node {
             Node::Clock(_, _, target) => *target = clock.cloned(),
+            Node::Sequence(_, args, target) => {
+                *target = clock.cloned();
+                args.iter_mut().for_each(|a| a.attach_clock(clock));
+            }
             Node::Cast(value) => value.attach_clock(clock),
             Node::Call(_, args) => args.iter_mut().for_each(|a| a.attach_clock(clock)),
             _ => {}
@@ -1074,7 +1172,10 @@ impl BoundScalar {
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
-            Node::Column(_, name) | Node::Call(name, _) | Node::Clock(name, ..) => Some(name),
+            Node::Column(_, name)
+            | Node::Call(name, _)
+            | Node::Clock(name, ..)
+            | Node::Sequence(name, ..) => Some(name),
             Node::Cast(a) => a.strong_name(),
             _ => None,
         }
@@ -1108,11 +1209,37 @@ impl BoundScalar {
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
-            Node::Call(n, _) | Node::Clock(n, ..) => n,
+            Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) => n,
         }
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::Sequence(name, args, clock) => {
+                let clock = clock.as_ref().ok_or(SqlError::Unsupported)?;
+                let values = args
+                    .iter()
+                    .map(|a| a.eval(row, params, budget))
+                    .collect::<R<Vec<_>>>()?;
+                if values.contains(&Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let Value::Text(sequence) = &values[0] else {
+                    return Err(SqlError::Type);
+                };
+                let value = match values.get(1) {
+                    Some(Value::Int(value)) => Some(*value),
+                    None => None,
+                    _ => return Err(SqlError::Type),
+                };
+                let called = match values.get(2) {
+                    Some(Value::Bool(value)) => *value,
+                    None => true,
+                    _ => return Err(SqlError::Type),
+                };
+                let value = clock.sequence(name, sequence, value, called)?;
+                charge(budget, &value)?;
+                Ok(value)
+            }
             Node::Clock(name, precision, clock) => {
                 let value = clock
                     .as_ref()
@@ -1761,6 +1888,16 @@ impl Scalar {
                     validate(arg, parameters, resolve, tables)?;
                 }
                 return Err(deferred_routine_error(n).unwrap());
+            }
+            Self::Call(n, args) if sequence_name(n) => {
+                for (i, arg) in args.iter().enumerate() {
+                    let target = match i {
+                        0 => DataType::Text,
+                        1 => DataType::BigInt,
+                        _ => DataType::Boolean,
+                    };
+                    arg.infer(Some(&target), parameters, resolve, tables)?;
+                }
             }
             Self::Call(n, args) if n == "overlay" => {
                 Self::infer_overlay(args, parameters, resolve, tables)?;

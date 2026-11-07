@@ -91,6 +91,70 @@ fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
     }
 }
 impl InsertExpressions {
+    pub(in super::super) fn check_identity(&self, state: &Relational) -> R<()> {
+        let table = state.tables.get(&self.name).ok_or(SqlError::UnknownTable)?;
+        let indexes = if self.columns.is_empty() {
+            table.logical_offsets()
+        } else {
+            self.columns
+                .iter()
+                .map(|name| col(table, name))
+                .collect::<R<Vec<_>>>()?
+        };
+        for index in indexes {
+            defaults::check_explicit(state, &table.columns[index])?;
+        }
+        Ok(())
+    }
+    pub(in super::super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+        let mut dependencies = vec![];
+        for value in &self.values {
+            value.sequence_dependencies(&mut dependencies);
+        }
+        dependencies
+    }
+    /// Bind stored default syntax using the same assignment rules as VALUES.
+    pub(in super::super) fn default_value(
+        sql: &str,
+        target: &DataType,
+        clock: Option<&crate::relational::clock::ExecutionClock>,
+        evaluate: bool,
+    ) -> R<Option<Value>> {
+        let mut parser = Parser {
+            tokens: lex(sql)?,
+            at: 0,
+            params: BTreeSet::new(),
+        };
+        let value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
+        if parser.at != parser.tokens.len() || !parser.params.is_empty() {
+            return Err(SqlError::Unsupported);
+        }
+        shape(&value, 0, &mut 0)?;
+        let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::Unsupported);
+        let mut parameters = vec![];
+        value.infer(None, &mut parameters, &no_columns, &[])?;
+        let value = if matches!(value, Scalar::Literal(Value::Text(_) | Value::Null)) {
+            Scalar::Cast(Box::new(value), target.clone())
+        } else {
+            value
+        };
+        let mut value = value
+            .bind(&no_columns, &[], &parameters)?
+            .insert_assignment(target)?;
+        if !value.insert_input_only() {
+            return Err(SqlError::Unsupported);
+        }
+        let constant = value.plan_constant(&mut 0)?;
+        if !evaluate {
+            return Ok(constant);
+        }
+        value.attach_clock(clock);
+        let empty = Tuple {
+            values: vec![],
+            version: 0,
+        };
+        value.eval(&empty, &[], &mut 0).map(Some)
+    }
     pub(in super::super) fn parse(p: &mut Parser) -> R<Self> {
         p.need("insert")?;
         p.need("into")?;

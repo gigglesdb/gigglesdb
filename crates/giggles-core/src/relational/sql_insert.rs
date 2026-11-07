@@ -7,6 +7,9 @@ pub(super) struct Insert {
     pub table: String,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
+    defaults: Vec<Vec<bool>>,
+    default_values: bool,
+    overriding: Option<bool>,
     conflict: Option<Conflict>,
     pub(super) returning: Option<returning::Returning>,
 }
@@ -38,6 +41,11 @@ enum Condition {
 
 /// Claim only multiple VALUES tuples or a top-level ON CONFLICT clause.
 pub(super) fn claims(tokens: &[Token]) -> bool {
+    if tokens.iter().any(
+        |token| matches!(token, Token::Word(word) if word == "default" || word == "overriding"),
+    ) {
+        return true;
+    }
     let mut depth = 0usize;
     let mut values_at = None;
     for (index, token) in tokens.iter().enumerate() {
@@ -120,25 +128,55 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     } else {
         vec![]
     };
+    let overriding = if p.word("overriding") {
+        let system = if p.word("system") {
+            true
+        } else {
+            p.need("user")?;
+            false
+        };
+        p.need("value")?;
+        Some(system)
+    } else {
+        None
+    };
+    let default_values = p.word("default");
     if !p.word("values") {
         return Err(unsupported_or_syntax(p));
     }
     let mut rows = Vec::new();
-    loop {
-        p.punct('(')?;
-        let mut row = vec![value(p)?];
-        while p.sym(',') {
-            row.push(value(p)?);
-        }
-        if !p.sym(')') {
-            return Err(unsupported_or_syntax(p));
-        }
-        rows.push(row);
-        if rows.len() > MAX_ROWS {
-            return Err(SqlError::Limit);
-        }
-        if !p.sym(',') {
-            break;
+    let mut defaults = Vec::new();
+    if default_values {
+        rows.push(vec![]);
+        defaults.push(vec![]);
+    } else {
+        loop {
+            p.punct('(')?;
+            let mut row = Vec::new();
+            let mut row_defaults = Vec::new();
+            loop {
+                let default = p.word("default");
+                row_defaults.push(default);
+                row.push(if default {
+                    Expr::Literal(Value::Null)
+                } else {
+                    value(p)?
+                });
+                if !p.sym(',') {
+                    break;
+                }
+            }
+            if !p.sym(')') {
+                return Err(unsupported_or_syntax(p));
+            }
+            rows.push(row);
+            defaults.push(row_defaults);
+            if rows.len() > MAX_ROWS {
+                return Err(SqlError::Limit);
+            }
+            if !p.sym(',') {
+                break;
+            }
         }
     }
     let conflict = if p.word("on") {
@@ -196,6 +234,9 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         table,
         columns,
         rows,
+        defaults,
+        default_values,
+        overriding,
         conflict,
         returning,
     })
@@ -277,7 +318,12 @@ fn predicate(p: &mut Parser, table: &str, depth: usize) -> R<Condition> {
 }
 
 fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
-    let indexes = if insert.columns.is_empty() {
+    let indexes = if insert.default_values {
+        if !insert.columns.is_empty() {
+            return Err(SqlError::Syntax);
+        }
+        vec![]
+    } else if insert.columns.is_empty() {
         table.logical_offsets()
     } else {
         insert
@@ -351,6 +397,28 @@ fn infer_condition(
     Ok(())
 }
 impl Insert {
+    pub(super) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
+        let table = state
+            .tables
+            .get(&self.table)
+            .ok_or(SqlError::UnknownTable)?;
+        let indexes = indexes(self, table)?;
+        let mut dependencies = vec![];
+        for row_defaults in &self.defaults {
+            for (index, column) in table.columns.iter().enumerate() {
+                if column.name == HIDDEN_ROWID {
+                    continue;
+                }
+                let supplied = indexes.iter().position(|i| *i == index);
+                let generates = supplied.is_none_or(|slot| row_defaults[slot])
+                    || self.overriding == Some(false) && state.column_identity(column.id).is_some();
+                if generates && let Some(sql) = defaults::default_sql(state, column) {
+                    dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                }
+            }
+        }
+        Ok(dependencies)
+    }
     pub(super) fn describe(&self, state: &Relational, count: usize) -> R<Description> {
         let table = state
             .tables
@@ -378,6 +446,7 @@ impl Insert {
                 if !seen.insert(index) {
                     return Err(SqlError::Duplicate);
                 }
+                defaults::check_explicit(state, &table.columns[index])?;
                 if table.primary_key.contains(&index) {
                     return Err(SqlError::Unsupported);
                 }
@@ -712,6 +781,7 @@ pub(super) fn execute(
     params: &[Value],
     expected: Option<u64>,
     returning: &Option<returning::Plan<'_>>,
+    clock: Option<&clock::ExecutionClock>,
     cancel: &mut dyn FnMut() -> bool,
 ) -> R<SqlResult> {
     if cancel() {
@@ -731,11 +801,9 @@ pub(super) fn execute(
     // With no column list, actual table width can only be checked after the
     // borrowed raw admission; this still precedes every input-sized copy.
     let logical_width = table.logical_columns().count();
-    if insert.columns.is_empty()
-        && insert
-            .rows
-            .iter()
-            .any(|row| row.len() != logical_width)
+    if !insert.default_values
+        && insert.columns.is_empty()
+        && insert.rows.iter().any(|row| row.len() != logical_width)
     {
         return Err(SqlError::Type);
     }
@@ -748,13 +816,41 @@ pub(super) fn execute(
     Relational::sql_insert_test_event(1);
     let mut incoming = Vec::with_capacity(insert.rows.len());
     let mut total = 0usize;
-    for values in &insert.rows {
+    if let Some(Conflict {
+        update: Some(update),
+        ..
+    }) = &insert.conflict
+    {
+        for (name, _) in &update.sets {
+            defaults::check_explicit(state, &table.columns[col(&table, name)?])?;
+        }
+    }
+    for row_defaults in &insert.defaults {
+        for (index, default) in indexes.iter().zip(row_defaults) {
+            if !default && insert.overriding.is_none() {
+                defaults::check_explicit(state, &table.columns[*index])?;
+            }
+        }
+    }
+    for (values, row_defaults) in insert.rows.iter().zip(&insert.defaults) {
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        let mut row = vec![Value::Null; table.columns.len()];
-        for (expression, index) in values.iter().zip(&indexes) {
-            row[*index] = resolved_value(expression, params, &table.columns[*index].data_type)?;
+        let replaced = |index: usize, default: bool| {
+            default
+                || insert.overriding == Some(false)
+                    && state.column_identity(table.columns[index].id).is_some()
+        };
+        let supplied = indexes
+            .iter()
+            .zip(row_defaults)
+            .filter_map(|(i, default)| (!replaced(*i, *default)).then_some(*i))
+            .collect::<Vec<_>>();
+        let mut row = defaults::row(state, &table, &supplied, clock)?;
+        for ((expression, index), default) in values.iter().zip(&indexes).zip(row_defaults) {
+            if !replaced(*index, *default) {
+                row[*index] = resolved_value(expression, params, &table.columns[*index].data_type)?;
+            }
         }
         Relational::secondary_admit_values(row.iter())?;
         if let Some(hidden) = hidden_rowid {
@@ -765,7 +861,9 @@ pub(super) fn execute(
                 if index != hidden {
                     check(value, column)?;
                 }
-                size = size.checked_add(value_bytes(value)).ok_or(SqlError::Limit)?;
+                size = size
+                    .checked_add(value_bytes(value))
+                    .ok_or(SqlError::Limit)?;
             }
             if size > MAX_ROW_BYTES {
                 return Err(SqlError::Limit);
@@ -840,7 +938,8 @@ pub(super) fn execute(
             .enumerate()
             .map(|(input, mut values)| {
                 let version = allocate(&mut next_version)?;
-                values[hidden] = Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
+                values[hidden] =
+                    Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
                 Ok((pk(&table, &values)?, SqlRow { values, version }, input))
             })
             .collect::<R<Vec<_>>>()?

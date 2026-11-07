@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn no_sql_parser_and_no_business_row_evaluation() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+        let root = crate::test_artifact_root();
         std::fs::create_dir_all(&root).unwrap();
         let mut token = [0u8; 16];
         getrandom::fill(&mut token).unwrap();

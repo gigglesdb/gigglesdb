@@ -535,6 +535,11 @@ fn core<T>(r: Result<T, CoreError>) -> R<T> {
 }
 fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_catalog::Plan>> {
     diagnostic.phase = "catalog planning";
+    // Dependency-bearing sequence calls use the SQL execution context, never
+    // the immutable catalog evaluator or the positive table-free allowlist.
+    if !Prepared::sequence_dependencies(sql).is_empty() {
+        return Ok(None);
+    }
     match giggles_pg_catalog::plan_gateway(sql) {
         Ok(None) if Prepared::rejects_unsupported_table_free_scalar(sql) => {
             Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported))
@@ -820,6 +825,7 @@ impl State {
                 if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
+                core(session.authorize_sequence_sql(&sql))?;
                 let (p, mut d) = if let Some(stmt) = crate::auth::statements::parse(&sql) {
                     (
                         Plan::Admin(stmt),
@@ -1386,11 +1392,10 @@ async fn send<S: AsyncWrite + Unpin>(s: &mut S, b: &[u8]) -> io::Result<()> {
     .await
     .map_err(io::Error::other)?
 }
-pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
-    session: Session,
-) -> io::Result<()> {
-    use crate::pgwire_startup::{StartupPolicy, parse_startup, read_startup_packet, reject_startup};
+pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, session: Session) -> io::Result<()> {
+    use crate::pgwire_startup::{
+        StartupPolicy, parse_startup, read_startup_packet, reject_startup,
+    };
     if !session.service.admission.request() {
         return Ok(());
     }
@@ -1635,7 +1640,6 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         send(s, &response).await?;
     }
 }
-
 
 #[cfg(test)]
 #[path = "pgwire_input_contract_tests.rs"]

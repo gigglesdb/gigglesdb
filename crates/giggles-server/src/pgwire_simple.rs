@@ -125,6 +125,7 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        core(session.authorize_sequence_sql(sql))?;
         if let Some(json) = sql.strip_prefix("GIGGLES ") {
             if !matches!(session.role, Role::Task { .. }) {
                 return Err("42501");
@@ -217,9 +218,7 @@ impl State {
             settings_functions::parse(sql, session, &mut self.diagnostic)?
         {
             self.simple_settings_function(&function, session, implicit, out)?;
-        } else if !session.role.is_sql()
-            && Prepared::rejects_unsupported_table_free_scalar(sql)
-        {
+        } else if !session.role.is_sql() && Prepared::rejects_unsupported_table_free_scalar(sql) {
             // DD-0068: authority precedes routine classification. Sessions without
             // SQL authority (task bindings) must not learn whether a routine
             // exists; they get the same 42501 that application prepare gives them.

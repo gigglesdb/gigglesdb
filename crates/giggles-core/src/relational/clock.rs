@@ -39,16 +39,41 @@ impl std::fmt::Debug for StatementClock {
 /// Shared only by bound expressions from one execution. Prepared syntax never
 /// contains this context. The error slot bridges the SQL-only scalar evaluator
 /// without translating the caller's CoreError.
-#[derive(Clone, Debug)]
+pub(crate) type SequenceCallback =
+    Arc<dyn Fn(&str, &str, Option<i64>, bool) -> Result<Value, CoreError> + Send + Sync>;
+#[derive(Clone)]
 pub(crate) struct ExecutionClock {
     clock: StatementClock,
     error: Arc<Mutex<Option<CoreError>>>,
+    sequence: Option<SequenceCallback>,
 }
 impl ExecutionClock {
     pub(crate) fn new(clock: &StatementClock) -> Self {
         Self {
             clock: clock.clone(),
+            sequence: None,
             error: Arc::new(Mutex::new(None)),
+        }
+    }
+    pub(crate) fn with_sequences(&self, callback: SequenceCallback) -> Self {
+        let mut context = self.clone();
+        context.sequence = Some(callback);
+        context
+    }
+    pub(crate) fn sequence(
+        &self,
+        name: &str,
+        sequence: &str,
+        value: Option<i64>,
+        called: bool,
+    ) -> Result<Value, SqlError> {
+        match (self.sequence.as_ref().ok_or(SqlError::Unsupported)?)(name, sequence, value, called)
+        {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                Err(SqlError::Unsupported)
+            }
         }
     }
     pub(crate) fn take_error(&self) -> Option<CoreError> {
@@ -127,4 +152,13 @@ fn round(value: i64, precision: u32) -> Result<i64, SqlError> {
     let value = i128::from(value);
     let rounded = value.signum() * ((value.abs() + scale / 2) / scale) * scale;
     i64::try_from(rounded).map_err(|_| SqlError::DatetimeFieldOverflow)
+}
+
+impl std::fmt::Debug for ExecutionClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionClock")
+            .field("clock", &self.clock)
+            .field("sequence", &self.sequence.as_ref().map(|_| "<callback>"))
+            .finish_non_exhaustive()
+    }
 }

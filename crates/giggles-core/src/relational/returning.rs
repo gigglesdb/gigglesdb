@@ -7,6 +7,9 @@ pub(super) struct Returning {
 }
 
 impl Returning {
+    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+        self.query.sequence_dependencies()
+    }
     pub(super) fn parse(p: &mut Parser, table: &str) -> R<Option<Self>> {
         if !p.word("returning") {
             return Ok(None);

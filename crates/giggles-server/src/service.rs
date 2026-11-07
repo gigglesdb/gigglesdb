@@ -24,9 +24,7 @@ pub enum Role {
         tables: BTreeSet<String>,
     },
     #[serde(skip)]
-    Database {
-        name: String,
-    },
+    Database { name: String },
 }
 impl Role {
     pub fn is_sql(&self) -> bool {
@@ -461,7 +459,11 @@ impl Session {
         if self.is_aborted() {
             return Err("25P02");
         }
-        let actor = self.service.admin.roles().get(name)
+        let actor = self
+            .service
+            .admin
+            .roles()
+            .get(name)
             .map_err(|_| "28000")?
             .filter(|role| role.login && role.generation == self.epoch)
             .ok_or("28000")?;
@@ -607,6 +609,7 @@ impl Session {
             }
         }
         self.authority_scope(|session| {
+            session.authorize_sequence_sql(sql)?;
             let p = if matches!(&session.role, Role::Database { .. }) {
                 declared(
                     session
@@ -643,7 +646,77 @@ impl Session {
             Ok(p)
         })
     }
+    /// Check sequence authority before binding can resolve an object name.
+    /// Ownership of the owning table is this profile's analogue of PostgreSQL
+    /// sequence USAGE/UPDATE privileges; ordinary table grants do not confer it.
+    pub(crate) fn authorize_sequence_sql(&mut self, sql: &str) -> Result<(), CoreError> {
+        let dependencies = Prepared::sequence_dependencies(sql);
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        self.authority_scope(|session| session.authorize_sequences(&dependencies))
+    }
+    fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
+        let sequences = self.sql.sequence_owners()?;
+        let roles = self.service.admin.roles();
+        let allowed_table = |table: &str| -> bool {
+            match &self.role {
+                Role::Application { tables, .. } => tables.contains(table),
+                Role::Database { name } => roles
+                    .table_owner(table)
+                    .is_ok_and(|owner| owner.as_deref() == Some(name.as_str())),
+                _ => false,
+            }
+        };
+        let superuser = if let Role::Database { name } = &self.role {
+            roles
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .ok_or(CoreError::Policy(Error::Authentication))?
+                .superuser
+        } else {
+            false
+        };
+        let allowed_tables: BTreeSet<String> = sequences
+            .iter()
+            .filter_map(|(_, table)| table.as_ref().filter(|table| allowed_table(table)).cloned())
+            .collect();
+        let live_context = superuser || !allowed_tables.is_empty();
+        self.sql
+            .set_sequence_tables((!superuser).then_some(allowed_tables));
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        let allowed = live_context
+            && dependencies.iter().all(|dependency| {
+                if superuser {
+                    return true;
+                }
+                // Dynamic names are checked against the same table scope by the
+                // execution callback before any counter state is read or changed.
+                let Some(name) = dependency else {
+                    return true;
+                };
+                let Ok(name) = self.sql.normalize_sequence_reference(name) else {
+                    return true;
+                };
+                sequences
+                    .iter()
+                    .find(|(sequence, _)| sequence == &name)
+                    .is_none_or(|(_, table)| table.as_deref().is_some_and(allowed_table))
+            });
+        if !allowed {
+            self.sql.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        Ok(())
+    }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        self.authorize_sequences(&p.sequences())?;
+        if p.sequence_only() {
+            return Ok(());
+        }
         let allowed = matches!(&self.role, Role::Application { tables,.. }
             if !p.is_ddl() && p.table().is_none_or(|t| t != "giggles_join" && tables.contains(t)));
         let allowed = if let Role::Database { name } = &self.role {
@@ -658,7 +731,10 @@ impl Session {
             if role.superuser {
                 true
             } else if p.is_ddl() {
-                self.service.admin.roles().schema_privileges("public", name)
+                self.service
+                    .admin
+                    .roles()
+                    .schema_privileges("public", name)
                     .map_err(|_| CoreError::Policy(Error::Scope))?
                     .contains(&roles::SchemaPrivilege::Create)
             } else if let Some(table) = p.table() {
@@ -666,7 +742,8 @@ impl Session {
                     false
                 } else {
                     let roles = self.service.admin.roles();
-                    let owner = roles.table_owner(table)
+                    let owner = roles
+                        .table_owner(table)
                         .map_err(|_| CoreError::Policy(Error::Scope))?;
                     let privilege = match p.command() {
                         "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
@@ -675,10 +752,12 @@ impl Session {
                         "DELETE" => Some(roles::TablePrivilege::Delete),
                         _ => None,
                     };
-                    owner.as_deref() == Some(name.as_str()) || privilege.is_some_and(|privilege| {
-                        roles.table_privileges(table, name)
-                            .is_ok_and(|privileges| privileges.contains(&privilege))
-                    })
+                    owner.as_deref() == Some(name.as_str())
+                        || privilege.is_some_and(|privilege| {
+                            roles
+                                .table_privileges(table, name)
+                                .is_ok_and(|privileges| privileges.contains(&privilege))
+                        })
                 }
             } else {
                 true
@@ -690,6 +769,10 @@ impl Session {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));
         }
+        // Ordinary table/DDL authority precedes implicit default metadata:
+        // denied sessions must not discover whether a target table exists.
+        let implicit = self.sql.implicit_sequence_dependencies(p)?;
+        self.authorize_sequences(&implicit)?;
         Ok(())
     }
     pub fn execute_prepared(
@@ -942,9 +1025,7 @@ impl Session {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use std::{
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
     fn fixture() -> (Arc<Service>, Vec<Binding>) {
         let path = crate::test_support::fixture_root().join(format!(
             "binding-unit-{}-{}",
@@ -1134,16 +1215,16 @@ mod lifecycle_tests {
     #[test]
     fn database_role_cannot_be_installed_as_a_fingerprint_binding() {
         let (service, mut bindings) = fixture();
-        bindings[0].role = Role::Database { name: "owner".into() };
+        bindings[0].role = Role::Database {
+            name: "owner".into(),
+        };
         assert!(matches!(
             Service::validate(&service.admin, bindings.clone()),
             Err(CoreError::Policy(Error::Authentication))
         ));
         assert!(service.reload_bindings(bindings.clone()).is_err());
         assert!(serde_json::to_value(&bindings[0]).is_err());
-        assert!(
-            serde_json::from_str::<Role>(r#"{"role":"Database","name":"owner"}"#).is_err()
-        );
+        assert!(serde_json::from_str::<Role>(r#"{"role":"Database","name":"owner"}"#).is_err());
     }
     #[test]
     fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {
@@ -1191,17 +1272,24 @@ mod lifecycle_tests {
         );
         assert_eq!(reader.handle(Request::Ping).code, "ok");
         assert_eq!(
-            reader.handle(Request::Status { operation: OperationId(1) }).code,
+            reader
+                .handle(Request::Status {
+                    operation: OperationId(1)
+                })
+                .code,
             "42501"
         );
         assert!(reader.execute_sql("BEGIN", &[]).is_ok());
         assert!(reader.execute_sql("ROLLBACK", &[]).is_ok());
         assert!(reader.prepare("SELECT id FROM owned LIMIT 1").is_ok());
         roles
-            .alter("reader", roles::RoleChanges {
-                login: Some(false),
-                ..roles::RoleChanges::default()
-            })
+            .alter(
+                "reader",
+                roles::RoleChanges {
+                    login: Some(false),
+                    ..roles::RoleChanges::default()
+                },
+            )
             .unwrap();
         assert!(matches!(
             reader.catalog_snapshot(),

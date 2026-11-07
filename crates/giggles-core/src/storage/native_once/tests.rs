@@ -2,7 +2,7 @@ use super::*;
 use std::{cell::Cell, path::PathBuf};
 
 fn fresh(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+    let root = crate::test_artifact_root();
     fs::create_dir_all(&root).unwrap();
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).unwrap();

@@ -136,8 +136,7 @@ mod tests {
     fn native_secondary_read_and_index_creates_reject_heaps_but_accept_keyed_tables() {
         let mut token = [0; 16];
         getrandom::fill(&mut token).unwrap();
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("artifacts")
+        let path = crate::test_artifact_root()
             .join(format!("heap-native-index-{:032x}", u128::from_be_bytes(token)));
         let admin = Admin::create(&path, crate::Limits::default()).unwrap();
         let mut session = admin.sql_session();

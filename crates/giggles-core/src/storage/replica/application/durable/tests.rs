@@ -408,7 +408,7 @@ fn export_restore_fresh_domain_revokes_active_authority_retains_forensic_outcome
     let (image, out) = apply(&image, &read);
     let mut token = [0; 16];
     getrandom::fill(&mut token).unwrap();
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+    let root = crate::test_artifact_root();
     std::fs::create_dir_all(&root).unwrap();
     let base = root.join(format!("application-{:032x}", u128::from_be_bytes(token)));
     let admin = crate::Admin::create_state(

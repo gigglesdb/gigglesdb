@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod assign;
 pub(crate) mod clock;
+mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
@@ -663,6 +664,8 @@ enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
         typmods: Vec<Option<i32>>,
+        defaults: Vec<Option<String>>,
+        sequences: Vec<Option<defaults::SequenceSpec>>,
         keys: Vec<String>,
     },
     InsertExpressions(query::InsertExpressions),
@@ -818,6 +821,8 @@ impl Parser {
             let name = self.create_table_name()?;
             self.punct('(')?;
             let mut columns = vec![];
+            let mut defaults = vec![];
+            let mut sequences = vec![];
             let mut keys = vec![];
             loop {
                 if self.word("primary") {
@@ -828,7 +833,18 @@ impl Parser {
                     keys = self.names()?;
                 } else {
                     let name = self.name()?;
-                    let data_type = if self.word("boolean") || self.word("bool") {
+                    let serial = if self.word("smallserial") || self.word("serial2") {
+                        Some(DataType::SmallInt)
+                    } else if self.word("serial") || self.word("serial4") {
+                        Some(DataType::Integer)
+                    } else if self.word("bigserial") || self.word("serial8") {
+                        Some(DataType::BigInt)
+                    } else {
+                        None
+                    };
+                    let data_type = if let Some(ty) = &serial {
+                        ty.clone()
+                    } else if self.word("boolean") || self.word("bool") {
                         DataType::Boolean
                     } else if self.word("smallint") {
                         DataType::SmallInt
@@ -864,20 +880,37 @@ impl Parser {
                     } else {
                         return Err(SqlError::Unsupported);
                     };
-                    let mut not_null = false;
-                    if self.word("not") {
-                        self.need("null")?;
-                        not_null = true;
-                    } else {
-                        self.word("null");
-                    }
-                    if self.word("primary") {
-                        self.need("key")?;
-                        if !keys.is_empty() {
-                            return Err(SqlError::Duplicate);
+                    let mut not_null = serial.is_some();
+                    let mut default = None;
+                    let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
+                    loop {
+                        if self.word("generated") {
+                            if sequence.is_some() || default.is_some() {
+                                return Err(SqlError::Syntax);
+                            }
+                            sequence = Some(defaults::identity(self)?);
+                            not_null = true;
+                        } else if self.word("default") {
+                            if default.is_some() || sequence.is_some() {
+                                return Err(SqlError::Syntax);
+                            }
+                            default = Some(defaults::parse(self, &data_type)?);
+                        } else if self.word("not") {
+                            self.need("null")?;
+                            not_null = true;
+                        } else if self.word("null") {
+                        } else if self.word("primary") {
+                            self.need("key")?;
+                            if !keys.is_empty() {
+                                return Err(SqlError::Duplicate);
+                            }
+                            keys.push(name.clone());
+                        } else {
+                            break;
                         }
-                        keys.push(name.clone());
                     }
+                    defaults.push(default);
+                    sequences.push(sequence);
                     columns.push(ColumnDef {
                         id: 0,
                         name,
@@ -893,6 +926,8 @@ impl Parser {
             Statement::Create {
                 name,
                 typmods: vec![None; columns.len()],
+                defaults,
+                sequences,
                 columns,
                 keys,
             }
@@ -1122,6 +1157,8 @@ impl Prepared {
             Statement::Create {
                 name,
                 typmods: vec![None; columns.len()],
+                defaults: vec![None; columns.len()],
+                sequences: vec![None; columns.len()],
                 columns,
                 keys,
             },
@@ -1561,6 +1598,89 @@ impl Prepared {
     }
     pub fn parameter_count(&self) -> usize {
         self.params
+    }
+    /// Sequence references in syntax, without resolving catalog names.
+    pub fn sequence_dependencies(sql: &str) -> Vec<Option<String>> {
+        Self::parse(sql, 0, 0)
+            .map(|prepared| prepared.sequences())
+            .unwrap_or_default()
+    }
+    pub fn sequences(&self) -> Vec<Option<String>> {
+        let mut dependencies = match &self.statement {
+            Statement::Query(query) => query.sequence_dependencies(),
+            Statement::InsertExpressions(values) => values.sequence_dependencies(),
+            Statement::Create { defaults, .. } => defaults
+                .iter()
+                .flatten()
+                .flat_map(|sql| defaults::dependencies(sql).unwrap_or_default())
+                .map(Some)
+                .collect(),
+            Statement::UpdateExpressions { sets, .. } => sets
+                .iter()
+                .flat_map(|(_, value)| match value {
+                    assign::Value::Scalar(query) => query.sequence_dependencies(),
+                    _ => vec![],
+                })
+                .collect(),
+            _ => vec![],
+        };
+        if let Some(returning) = self.returning() {
+            dependencies.extend(returning.sequence_dependencies());
+        }
+        if let Some(search) = searched::target(self) {
+            dependencies.extend(search.sequence_dependencies());
+        }
+        dependencies
+    }
+    pub(crate) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
+        if let Statement::InsertMulti(insert) = &self.statement {
+            return insert.implicit_sequences(state);
+        }
+        let mut dependencies = vec![];
+        let mut add = |column: &ColumnDef| -> R<()> {
+            if let Some(sql) = defaults::default_sql(state, column) {
+                dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+            }
+            Ok(())
+        };
+        match &self.statement {
+            Statement::Insert { name, columns, .. } => {
+                let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                if !columns.is_empty() {
+                    for column in table.logical_columns() {
+                        if !columns.contains(&column.name) {
+                            add(column)?;
+                        }
+                    }
+                }
+            }
+            Statement::InsertExpressions(values) => {
+                let table = state
+                    .tables
+                    .get(&values.name)
+                    .ok_or(SqlError::UnknownTable)?;
+                if !values.columns.is_empty() {
+                    for column in table.logical_columns() {
+                        if !values.columns.contains(&column.name) {
+                            add(column)?;
+                        }
+                    }
+                }
+            }
+            Statement::UpdateExpressions { name, sets, .. } => {
+                let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                for (name, value) in sets {
+                    if matches!(value, assign::Value::Default) {
+                        add(&table.columns[col(table, name)?])?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(dependencies)
+    }
+    pub fn sequence_only(&self) -> bool {
+        matches!(&self.statement, Statement::Query(query) if query.sequence_only())
     }
     /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
     /// Parse failures and dependency-bearing queries keep their existing gateway path.
@@ -2003,6 +2123,7 @@ impl Relational {
         // Normalize expression outputs after mutation input admission.
         let normalized;
         let prepared = if let Statement::InsertExpressions(values) = &prepared.statement {
+            values.check_identity(self)?;
             if expected.is_some() {
                 return Err(SqlError::Unsupported);
             }
@@ -2053,6 +2174,7 @@ impl Relational {
                     params,
                     expected,
                     &returning,
+                    clock,
                     &mut cancel,
                 );
             }
@@ -2091,6 +2213,8 @@ impl Relational {
                 name,
                 columns,
                 typmods,
+                defaults,
+                sequences,
                 keys,
             } => {
                 if expected.is_some() {
@@ -2146,18 +2270,7 @@ impl Relational {
                     c.id = allocate(&mut next_id)?;
                 }
                 let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
-                // Typmods were validated above against these exact column types, so the ext
-                // update cannot fail; no whole-catalog clone is needed for atomicity.
-                for (column, typmod) in t.columns.iter().zip(typmods) {
-                    if let Some(typmod) = typmod {
-                        self.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
-                    }
-                }
-                self.next_id = next_id;
-                self.epoch = epoch;
-                self.rows.insert(t.id, BTreeMap::new());
-                self.tables.insert(name.clone(), t);
-                debug_assert!(self.validate_ext().is_ok());
+                defaults::install_create(self, t, defaults, sequences, typmods, next_id, epoch)?;
             }
             Statement::Insert {
                 name,
@@ -2178,7 +2291,10 @@ impl Relational {
                 if indexes.len() != values.len() {
                     return Err(SqlError::Type);
                 }
-                let mut row = vec![Value::Null; t.columns.len()];
+                for index in &indexes {
+                    defaults::check_explicit(self, &t.columns[*index])?;
+                }
+                let mut row = defaults::row(self, t, &indexes, clock)?;
                 for (i, v) in indexes.iter().zip(values) {
                     row[*i] = if matches!(v, Expr::Literal(_))
                         && matches!(
@@ -2352,19 +2468,44 @@ impl Relational {
                         row.values[i] = v;
                     }
                     row_check(t, &row.values)?;
+                    let new_key = pk(t, &row.values)?;
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
                     returned_rows = returning::project(&returning, self, params, &[&row])?;
                     // Witness cloning is admitted by secondary_admit_mutation before
                     // expression/row construction; stage checks its exact raw value.
                     let old = old.clone();
-                    result = self.secondary_apply_statement(
-                        table_id,
-                        Some((&b.low, &old)),
-                        Some((&b.low, &row)),
-                        next_version,
-                        &mut cancel,
-                    )?;
+                    result = if new_key == b.low {
+                        self.secondary_apply_statement(
+                            table_id,
+                            Some((&b.low, &old)),
+                            Some((&new_key, &row)),
+                            next_version,
+                            &mut cancel,
+                        )?
+                    } else {
+                        use secondary_index_adapter::BatchRowChange;
+                        let changes = [
+                            BatchRowChange {
+                                table: table_id,
+                                old: Some((&b.low, &old)),
+                                new: None,
+                            },
+                            BatchRowChange {
+                                table: table_id,
+                                old: None,
+                                new: Some((&new_key, &row)),
+                            },
+                        ];
+                        let mut result = self.secondary_apply_batch_engine(
+                            self.epoch,
+                            &changes,
+                            next_version,
+                            &mut cancel,
+                        )?;
+                        result.affected = 1;
+                        result
+                    };
                 } else {
                     result = self.secondary_apply_statement(
                         table_id,

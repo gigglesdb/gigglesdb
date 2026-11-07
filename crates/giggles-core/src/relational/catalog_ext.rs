@@ -304,6 +304,20 @@ fn constraint_object_name(table: &str, columns: &str, label: &str) -> String {
 }
 
 impl Relational {
+    pub(super) fn choose_sequence_name(&self, table: &str, column: &str) -> String {
+        for attempt in 0u64.. {
+            let label = if attempt == 0 {
+                "seq".to_owned()
+            } else {
+                format!("seq{attempt}")
+            };
+            let name = constraint_object_name(table, column, &label);
+            if !self.relation_name_taken(&name) {
+                return name;
+            }
+        }
+        unreachable!("bounded catalog cannot exhaust sequence names")
+    }
     pub(crate) fn relation_name_taken(&self, name: &str) -> bool {
         self.tables.contains_key(name)
             || self.secondary.descriptors().iter().any(|d| d.name == name)
@@ -421,9 +435,9 @@ impl Relational {
                     .sequences
                     .get(&i.sequence_id)
                     .is_some_and(|s| s.identity)
-                {
-                    return Err(SqlError::Type);
-                }
+            {
+                return Err(SqlError::Type);
+            }
         }
         let mut total = 0usize;
         for (table, cs) in &ext.constraints {
@@ -504,9 +518,10 @@ impl Relational {
                 return Err(SqlError::Type);
             }
             if let Some((t, c)) = s.owned_by
-                && !columns.get(&c).is_some_and(|(owner, _)| *owner == t) {
-                    return Err(SqlError::Type);
-                }
+                && !columns.get(&c).is_some_and(|(owner, _)| *owner == t)
+            {
+                return Err(SqlError::Type);
+            }
         }
         Ok(())
     }

@@ -2,8 +2,8 @@ use crate::*;
 mod catalog_inspection;
 mod drop_table;
 mod engine;
-mod format_policy;
 mod feature_envelope;
+mod format_policy;
 pub(crate) mod native_once;
 pub(crate) mod operation_adapter;
 pub mod replica;
@@ -11,6 +11,8 @@ pub mod roles;
 mod secondary_index;
 mod secondary_index_catalog;
 mod secondary_index_public;
+mod sequence_counters;
+pub(crate) mod sequences;
 pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
 use bincode::Options;
@@ -127,6 +129,8 @@ fn recovery(
 }
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
+    #[serde(skip)]
+    pub(crate) seq: BTreeMap<u64, sequences::SeqCounter>,
     pub applications: Option<replica::application::Ledger>,
     pub accounting: BTreeMap<TaskId, TaskAccounting>,
     pub native_outcomes: Option<native_once::NativeOutcomes>,
@@ -147,6 +151,7 @@ struct Metadata {
 }
 fn empty(domain: u128) -> State {
     State {
+        seq: BTreeMap::new(),
         applications: None,
         accounting: BTreeMap::new(),
         native_outcomes: None,
@@ -184,6 +189,7 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     if let Some(ledger) = &s.native_outcomes {
         out.insert(vec![7], ledger.to_bytes()?);
     }
+    sequence_counters::write(s, &mut out)?;
     for (task, account) in &s.accounting {
         out.insert(key(6, &[task.0]), encode(account)?);
     }
@@ -239,7 +245,9 @@ fn contains_temporal(s: &State) -> Result<bool, CoreError> {
             None => false,
         })
 }
-fn envelope_family(version: u32) -> Result<(format_policy::Features, bool, bool, bool, bool), CoreError> {
+fn envelope_family(
+    version: u32,
+) -> Result<(format_policy::Features, bool, bool, bool, bool), CoreError> {
     format_policy::legacy_version_to_bits(version).ok_or(CoreError::Unsupported)?;
     let (base, heap) = format_policy::heap_base(version).ok_or(CoreError::Unsupported)?;
     let (base, temporal) = format_policy::temporal_base(base).ok_or(CoreError::Unsupported)?;
@@ -358,12 +366,8 @@ fn from_records_mode(
                 s.accounting.insert(TaskId(num(1)?), decode(&v)?);
             }
             Some(10) if k.len() == 1 && m.format == 53 => {}
-            // TODO(E1): decode counters when State owns sequence counters. Until
-            // then their presence cannot agree with the content predicate.
-            Some(11) if k.len() == 17 && bits.is_some_and(|b| b & 256 != 0) => {
-                return Err(CoreError::Corrupt(
-                    "sequence counters not implemented".into(),
-                ));
+            Some(11) if bits.is_some_and(|b| b & 256 != 0) => {
+                sequence_counters::read(&mut s, &k, &v)?;
             }
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
@@ -421,6 +425,7 @@ fn from_records_mode(
 }
 fn validate(s: &State) -> Result<(), CoreError> {
     state_format(s)?;
+    sequence_counters::validate(s)?;
     if let Some(ledger) = &s.applications {
         ledger.validate()?;
     }
@@ -486,6 +491,7 @@ struct Inner {
     limits: Limits,
     crash: Mutex<CrashPoint>,
     decision_hook: Mutex<Option<DecisionHook>>,
+    sequences: Mutex<sequences::Live>,
     native_once_owners: Mutex<BTreeMap<native_once::NativeOnceKey, native_once::InFlight>>,
 }
 enum GuardedPersistError {
@@ -551,7 +557,10 @@ impl Inner {
             }
             out.insert(k.value().to_vec(), v.value().to_vec());
         }
-        from_records_mode(out, &mut || crate::cancellation::check().is_err(), false)
+        let mut state =
+            from_records_mode(out, &mut || crate::cancellation::check().is_err(), false)?;
+        self.merge_live_sequences(&mut state)?;
+        Ok(state)
     }
     fn inspect<T>(&self, f: impl FnOnce(&State) -> Result<T, CoreError>) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
@@ -637,11 +646,32 @@ impl Inner {
         decision: bool,
         valid_lease: &mut dyn FnMut() -> bool,
     ) -> Result<(), GuardedPersistError> {
-        s.sql.generation = s
-            .sql
-            .generation
-            .checked_add(1)
-            .ok_or(CoreError::Sql(relational::SqlError::Overflow))?;
+        self.persist_checked_mode(s, decision, true, valid_lease)
+    }
+    // Caller holds gate; counter reservations share crash/cancellation handling
+    // with SQL publication without advancing the SQL conflict generation.
+    fn persist_counters(&self, s: &mut State) -> Result<(), CoreError> {
+        self.persist_checked_mode(s, false, false, &mut || true)
+            .map_err(|error| match error {
+                GuardedPersistError::Core(error) => error,
+                GuardedPersistError::ClockExpired => unreachable!("counter write has no lease"),
+            })
+    }
+    fn persist_checked_mode(
+        &self,
+        s: &mut State,
+        decision: bool,
+        bump_generation: bool,
+        valid_lease: &mut dyn FnMut() -> bool,
+    ) -> Result<(), GuardedPersistError> {
+        self.merge_live_sequences(s)?;
+        if bump_generation {
+            s.sql.generation = s
+                .sql
+                .generation
+                .checked_add(1)
+                .ok_or(CoreError::Sql(relational::SqlError::Overflow))?;
+        }
         let values = records(s)?;
         let point = *self.crash.lock().map_err(|_| CoreError::Fenced)?;
         let persisted = (|| {
@@ -651,6 +681,20 @@ impl Inner {
                 let mut t = tx.open_table(RECORDS).map_err(io)?;
                 if !values.contains_key(&vec![8]) {
                     t.remove(&[8][..]).map_err(io)?;
+                }
+                if !values.contains_key(&vec![10]) {
+                    t.remove(&[10][..]).map_err(io)?;
+                }
+                let stale: Vec<Vec<u8>> = t
+                    .iter()
+                    .map_err(io)?
+                    .map(|item| item.map(|(key, _)| key.value().to_vec()).map_err(io))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|key| key.first() == Some(&11) && !values.contains_key(key))
+                    .collect();
+                for key in stale {
+                    t.remove(key.as_slice()).map_err(io)?;
                 }
                 for (k, v) in &values {
                     t.insert(k.as_slice(), v.as_slice()).map_err(io)?;
@@ -676,6 +720,7 @@ impl Inner {
                 crate::cancellation::check()?;
             }
             tx.commit().map_err(io)?;
+            self.accept_sequences(s)?;
             if decision {
                 self.decision_point(DecisionPoint::Committed);
             }
@@ -806,6 +851,7 @@ impl Admin {
                 limits,
                 crash: Mutex::new(CrashPoint::None),
                 decision_hook: Mutex::new(None),
+                sequences: Mutex::new(sequences::Live::default()),
                 native_once_owners: Mutex::new(BTreeMap::new()),
             }),
         };
@@ -1416,6 +1462,10 @@ pub struct SqlSession {
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
     staged_revision: u64,
+    sequence_values: sequences::SessionValues,
+    pending_sequences: sequences::Pending,
+    sequence_baseline: BTreeMap<u64, u128>,
+    sequence_tables: Option<std::collections::BTreeSet<String>>,
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
@@ -1429,6 +1479,10 @@ impl Admin {
             transaction_id: None,
             transaction_clock_us: None,
             staged_revision: 0,
+            sequence_values: Default::default(),
+            pending_sequences: Default::default(),
+            sequence_baseline: BTreeMap::new(),
+            sequence_tables: None,
         }
     }
     /// Catalog preflight for logical archives which cannot preserve secondary indexes.
@@ -1459,6 +1513,47 @@ impl Admin {
     }
 }
 impl SqlSession {
+    /// Report default and identity sequence dependencies without resolving names.
+    pub fn implicit_sequence_dependencies(
+        &self,
+        p: &relational::Prepared,
+    ) -> Result<Vec<Option<String>>, CoreError> {
+        let dependencies = |s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
+        match &self.staged {
+            Some(s) => dependencies(s),
+            None => self.admin.inner.inspect(dependencies),
+        }
+    }
+    pub fn set_sequence_tables(&mut self, tables: Option<std::collections::BTreeSet<String>>) {
+        self.sequence_tables = tables;
+    }
+    pub fn normalize_sequence_reference(&self, text: &str) -> Result<String, CoreError> {
+        sequences::sequence_name(text).map_err(CoreError::Sql)
+    }
+    /// Sequence names and owning tables for authorization, without evaluating SQL.
+    pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
+        let owners = |s: &State| {
+            Ok(s.sql
+                .catalog_ext()
+                .sequences
+                .values()
+                .map(|d| {
+                    let owner = d.owned_by.and_then(|(id, _)| {
+                        s.sql
+                            .tables
+                            .values()
+                            .find(|t| t.id == id)
+                            .map(|t| t.name.clone())
+                    });
+                    (d.name.clone(), owner)
+                })
+                .collect())
+        };
+        match &self.staged {
+            Some(s) => owners(s),
+            None => self.admin.inner.inspect(owners),
+        }
+    }
     /// Resolve metadata only. Never executes, stages, charges or publishes SQL.
     pub fn describe(
         &mut self,
@@ -1923,6 +2018,13 @@ impl SqlSession {
                         .map_err(|_| CoreError::Busy)?;
                     match self.admin.inner.inspect(|s| Ok(s.clone())) {
                         Ok(s) => {
+                            self.sequence_baseline = s
+                                .sql
+                                .catalog_ext()
+                                .sequences
+                                .iter()
+                                .map(|(&id, d)| (id, d.incarnation))
+                                .collect();
                             self.staged = Some(s);
                             self.transaction_id = Some(u128::from_be_bytes(token));
                             self.staged_revision = 0;
@@ -1948,6 +2050,14 @@ impl SqlSession {
                         .as_ref()
                         .ok_or(CoreError::Sql(E::Transaction))?
                         .clone();
+                    let mut staged = staged;
+                    sequences::merge(
+                        &mut staged,
+                        &*self
+                            .pending_sequences
+                            .lock()
+                            .map_err(|_| CoreError::Fenced)?,
+                    );
                     self.publish(staged)?;
                     self.rollback();
                 }
@@ -1962,6 +2072,33 @@ impl SqlSession {
         if p.domain != s.view.domain {
             return Err(CoreError::Sql(E::StaleSchema));
         }
+        sequences::merge(
+            &mut s,
+            &*self
+                .pending_sequences
+                .lock()
+                .map_err(|_| CoreError::Fenced)?,
+        );
+        let baseline = if self.staged.is_some() {
+            self.sequence_baseline.clone()
+        } else {
+            s.sql
+                .catalog_ext()
+                .sequences
+                .iter()
+                .map(|(&id, d)| (id, d.incarnation))
+                .collect()
+        };
+        let context = clock.map(|clock| {
+            clock.with_sequences(self.admin.inner.sequence_callback(
+                s.clone(),
+                baseline,
+                self.pending_sequences.clone(),
+                self.sequence_values.clone(),
+                self.sequence_tables.clone(),
+            ))
+        });
+        let clock = context.as_ref();
         let result = s.sql.execute_clocked(
             p,
             params,
@@ -1969,6 +2106,19 @@ impl SqlSession {
             || crate::cancellation::check().is_err(),
             clock,
         );
+        // Refresh only counters in the accepted transaction snapshot, including
+        // failed statements. Failed row/catalog mutations remain in local s.
+        self.admin.inner.merge_live_sequences(&mut s)?;
+        let pending = self
+            .pending_sequences
+            .lock()
+            .map_err(|_| CoreError::Fenced)?;
+        sequences::merge(&mut s, &pending);
+        if let Some(staged) = self.staged.as_mut() {
+            self.admin.inner.merge_live_sequences(staged)?;
+            sequences::merge(staged, &pending);
+        }
+        drop(pending);
         if let Some(error) = clock.and_then(|clock| clock.take_error()) {
             return Err(error);
         }
@@ -1994,6 +2144,9 @@ impl SqlSession {
             if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
+            let mut staged = staged;
+            sequences::merge(&mut staged, &s.seq);
+            self.admin.inner.merge_live_sequences(&mut staged)?;
             *s = staged;
             Ok(())
         })
@@ -2005,6 +2158,11 @@ impl SqlSession {
                 .sql_transactions
                 .fetch_sub(1, Ordering::AcqRel);
         }
+        self.pending_sequences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.sequence_baseline.clear();
         self.aborted = false;
         self.transaction_id = None;
         self.transaction_clock_us = None;
@@ -2022,7 +2180,7 @@ mod typed_session_tests {
     use relational::{Scan, SqlError as E, TableDef, Value as V, with_sql_parser_forbidden};
 
     fn fixture() -> (Admin, SqlSession, TableDef) {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+        let root = crate::test_artifact_root();
         fs::create_dir_all(&root).unwrap();
         let mut token = [0u8; 16];
         getrandom::fill(&mut token).unwrap();
@@ -2622,7 +2780,7 @@ mod tests {
         }
     }
     fn fresh(name: &str) -> std::path::PathBuf {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+        let root = crate::test_artifact_root();
         fs::create_dir_all(&root).unwrap();
         root.join(format!(
             "unit-{name}-{}-{}",

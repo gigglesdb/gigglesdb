@@ -1612,7 +1612,7 @@ mod tests {
         );
         assert_eq!(size_of::<relational::Relational>(), 240);
         assert_eq!(size_of::<Metadata>(), 80);
-        assert_eq!(size_of::<State>(), 560);
+        assert_eq!(size_of::<State>(), 576);
         assert_eq!(size_of::<DataType>(), 1);
         layouts().unwrap();
         println!(

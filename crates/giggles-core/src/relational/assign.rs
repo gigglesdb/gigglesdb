@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub(super) enum Value {
+    Default,
     Plain(Expr),
     Scalar(Box<query::Query>),
 }
@@ -10,7 +11,7 @@ pub(super) enum Value {
 impl Value {
     pub(super) fn parse(p: &mut Parser, table: &str) -> R<Self> {
         if p.word("default") {
-            return Err(SqlError::Unsupported);
+            return Ok(Self::Default);
         }
         let start = p.at;
         let parameters = p.params.clone();
@@ -26,15 +27,25 @@ impl Value {
     }
 }
 
-fn indexes(sets: &[(String, Value)], table: &TableDef) -> R<Vec<usize>> {
+pub(super) fn indexes(
+    sets: &[(String, Value)],
+    table: &TableDef,
+    state: &Relational,
+) -> R<Vec<usize>> {
     if sets.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
     let indexes = sets
         .iter()
-        .map(|(name, _)| {
+        .map(|(name, value)| {
             let index = col(table, name)?;
-            if table.primary_key.contains(&index) {
+            if !matches!(value, Value::Default) {
+                defaults::check_explicit(state, &table.columns[index])?;
+            }
+            if table.primary_key.contains(&index)
+                && !matches!(value, Value::Default)
+                && state.column_identity(table.columns[index].id).is_none()
+            {
                 return Err(SqlError::Unsupported);
             }
             Ok(index)
@@ -98,7 +109,7 @@ pub(super) fn describe(
     declared: &[Option<DataType>],
 ) -> R<Description> {
     let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
-    let indexes = indexes(sets, table)?;
+    let indexes = indexes(sets, table, state)?;
     let mut parameters = vec![None; count];
     if declared.len() > parameters.len() {
         return Err(SqlError::Parameters);
@@ -107,6 +118,7 @@ pub(super) fn describe(
     for ((_, value), index) in sets.iter().zip(indexes) {
         let target = &table.columns[index].data_type;
         match value {
+            Value::Default => {}
             Value::Plain(value) => {
                 infer_mutation_parameter(value, target, &mut parameters, declared, true)?
             }
@@ -148,6 +160,7 @@ pub(super) fn admit_literals(sets: &[(String, Value)]) -> R<()> {
     let mut bytes = 0;
     for (_, value) in sets {
         match value {
+            Value::Default => {}
             Value::Plain(Expr::Literal(value)) => {
                 Relational::secondary_admit_values(std::iter::once(value))?;
                 payload_bound(std::iter::once(value))?;
@@ -164,6 +177,7 @@ pub(super) fn admit_literals(sets: &[(String, Value)]) -> R<()> {
 }
 
 enum BoundValue<'a> {
+    Default(Option<String>, Option<clock::ExecutionClock>),
     Plain(super::Value),
     Scalar(Box<query::BoundQuery<'a>>),
 }
@@ -187,7 +201,10 @@ impl<'a> Plan<'a> {
                 .iter()
                 .map(|(name, value)| {
                     let index = col(table, name)?;
-                    if table.primary_key.contains(&index) {
+                    defaults::check_explicit(state, &table.columns[index])?;
+                    if table.primary_key.contains(&index)
+                        && state.column_identity(table.columns[index].id).is_none()
+                    {
                         return Err(SqlError::Unsupported);
                     }
                     let value = plain_value(value, &table.columns[index], prepared, params)?;
@@ -203,7 +220,7 @@ impl<'a> Plan<'a> {
         let Statement::UpdateExpressions { sets, .. } = &prepared.statement else {
             return Err(SqlError::Unsupported);
         };
-        let indexes = indexes(sets, table)?;
+        let indexes = indexes(sets, table, state)?;
         let parameters: Vec<Option<DataType>> = {
             let description = prepared.describe(state)?;
             for (value, ty) in params.iter().zip(&description.parameters) {
@@ -224,6 +241,10 @@ impl<'a> Plan<'a> {
             .zip(indexes)
             .map(|((_, value), index)| {
                 let value = match value {
+                    Value::Default => BoundValue::Default(
+                        defaults::default_sql(state, &table.columns[index]),
+                        clock.cloned(),
+                    ),
                     Value::Plain(value) => {
                         let value = plain_value(value, &table.columns[index], prepared, params)?;
                         BoundValue::Plain(value)
@@ -275,6 +296,14 @@ impl<'a> Plan<'a> {
                 return Err(SqlError::Aborted);
             }
             let value = match value {
+                BoundValue::Default(sql, clock) => match sql {
+                    Some(sql) => defaults::evaluate_sql(
+                        sql,
+                        &table.columns[index].data_type,
+                        clock.as_ref(),
+                    )?,
+                    None => super::Value::Null,
+                },
                 BoundValue::Plain(value) => value.clone(),
                 BoundValue::Scalar(value) => value
                     .project_row(&old.values, old.version, params, &mut work, &mut bytes)?

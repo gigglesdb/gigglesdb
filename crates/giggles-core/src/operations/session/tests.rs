@@ -6,8 +6,7 @@ use crate::{
 fn fixture() -> Admin {
     let mut token = [0; 16];
     getrandom::fill(&mut token).unwrap();
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("artifacts")
+    let path = crate::test_artifact_root()
         .join(format!(
             "native-session-{:032x}",
             u128::from_be_bytes(token)

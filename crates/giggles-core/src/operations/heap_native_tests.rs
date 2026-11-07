@@ -5,6 +5,7 @@ use crate::storage::State;
 
 fn state() -> State {
     let mut state = State {
+        seq: BTreeMap::new(),
         applications: None,
         accounting: BTreeMap::new(),
         native_outcomes: None,

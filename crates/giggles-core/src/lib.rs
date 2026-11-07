@@ -22,3 +22,10 @@ pub mod relational;
 
 pub mod cancellation;
 pub use cancellation::Cancellation;
+
+#[cfg(test)]
+fn test_artifact_root() -> std::path::PathBuf {
+    std::env::var_os("GIGGLES_TEST_ARTIFACTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("giggles-core-artifacts"))
+}

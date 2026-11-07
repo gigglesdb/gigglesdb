@@ -38,7 +38,10 @@ pub(super) fn target(prepared: &Prepared) -> Option<&query::Query> {
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "mirrors the execute arm that owns these inputs")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the execute arm that owns these inputs"
+)]
 pub(super) fn route(
     state: &mut Relational,
     prepared: &Prepared,
@@ -82,6 +85,8 @@ pub(super) fn route(
     let matched = bound.matching_rows(state, params, &mut retention, cancel)?;
     let mut next_version = state.next_version;
     let mut postimages = Vec::with_capacity(matched.len());
+    let mut postkeys = Vec::with_capacity(matched.len());
+    let mut vacated = BTreeSet::new();
     for (key, old) in &matched {
         if cancel() {
             return Err(SqlError::Aborted);
@@ -92,8 +97,20 @@ pub(super) fn route(
                 row.values[index] = value;
             }
             row_check(table, &row.values)?;
-            retention.charge(retained_row_bytes(key, &row)?)?;
+            let new_key = pk(table, &row.values)?;
+            // Immediate uniqueness is checked in logical evaluation order. A later
+            // matched row still occupies its key until that row is evaluated.
+            if postkeys.contains(&new_key)
+                || new_key != *key
+                    && state.rows[&table_id].contains_key(&new_key)
+                    && !vacated.contains(new_key.as_slice())
+            {
+                return Err(SqlError::Duplicate);
+            }
+            vacated.insert(key.as_slice());
+            retention.charge(retained_row_bytes(&new_key, &row)?)?;
             row.version = allocate(&mut next_version)?;
+            postkeys.push(new_key);
             postimages.push(row);
         }
     }
@@ -103,20 +120,49 @@ pub(super) fn route(
         matched.iter().map(|(_, row)| row).collect()
     };
     let returned = returning::project(returning, state, params, &projected)?;
-    let changes = matched
+    // Consolidate physical changes by key, keeping the central publisher's
+    // immutable-key witness contract even when logical rows move between keys.
+    let final_by_key = postkeys
         .iter()
-        .enumerate()
-        .map(|(index, (key, old))| BatchRowChange {
+        .zip(&postimages)
+        .map(|(key, row)| (key.as_slice(), row))
+        .collect::<BTreeMap<_, _>>();
+    let extra = if updating {
+        postkeys
+            .iter()
+            .filter(|key| !state.rows[&table_id].contains_key(*key))
+            .count()
+    } else {
+        0
+    };
+    if matched
+        .len()
+        .checked_add(extra)
+        .is_none_or(|n| n > MAX_ROWS)
+    {
+        return Err(SqlError::Limit);
+    }
+    let mut changes = Vec::with_capacity(matched.len() + extra);
+    for (key, old) in &matched {
+        changes.push(BatchRowChange {
             table: table_id,
             old: Some((key.as_slice(), old)),
-            new: if updating {
-                Some((key.as_slice(), &postimages[index]))
-            } else {
-                None
-            },
-        })
-        .collect::<Vec<_>>();
-    let mut result = state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)?;
+            new: final_by_key
+                .get(key.as_slice())
+                .map(|row| (key.as_slice(), *row)),
+        });
+    }
+    for (key, row) in postkeys.iter().zip(&postimages) {
+        if !state.rows[&table_id].contains_key(key) {
+            changes.push(BatchRowChange {
+                table: table_id,
+                old: None,
+                new: Some((key.as_slice(), row)),
+            });
+        }
+    }
+    let mut result =
+        state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)?;
     result.affected = matched.len() as u64;
     returning::attach(returning, &mut result, returned);
     Ok(result)
@@ -163,20 +209,11 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
             if sets.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit);
             }
-            let indexes = sets
-                .iter()
-                .map(|(name, _)| {
-                    let index = col(table, name)?;
-                    if table.primary_key.contains(&index) {
-                        return Err(SqlError::Unsupported);
-                    }
-                    Ok(index)
-                })
-                .collect::<R<Vec<_>>>()?;
-            unique(indexes.iter())?;
+            let indexes = assign::indexes(sets, table, state)?;
             for ((_, value), index) in sets.iter().zip(indexes) {
                 let ty = &table.columns[index].data_type;
                 match value {
+                    assign::Value::Default => {}
                     assign::Value::Plain(value) => infer(value, ty, &mut parameters)?,
                     assign::Value::Scalar(value) => {
                         value.infer_assignment(table, ty, &mut parameters)?;
@@ -258,12 +295,8 @@ mod tests {
             assert!(updated.version > old.version);
         }
         let updated = state.rows[&table_id].clone();
-        let prepared = Prepared::parse(
-            "DELETE FROM searched_heap WHERE n = 21",
-            1,
-            state.epoch,
-        )
-        .unwrap();
+        let prepared =
+            Prepared::parse("DELETE FROM searched_heap WHERE n = 21", 1, state.epoch).unwrap();
         assert_eq!(state.execute(&prepared, &[], None).unwrap().affected, 1);
         assert_eq!(state.rows[&table_id].len(), 2);
         for (key, survivor) in &state.rows[&table_id] {
@@ -292,7 +325,10 @@ mod tests {
             .into_iter()
             .map(Some)
             .collect();
-        let bound = target(&prepared).unwrap().bind_seeded(&state, parameters).unwrap();
+        let bound = target(&prepared)
+            .unwrap()
+            .bind_seeded(&state, parameters)
+            .unwrap();
         let matched = bound
             .matching_rows(&state, &[], &mut retention, &mut || false)
             .unwrap();

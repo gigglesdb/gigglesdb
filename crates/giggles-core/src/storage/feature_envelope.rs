@@ -17,8 +17,8 @@ fn extended_types_present(s: &State) -> bool {
         .any(|column| column.typmod.is_some())
 }
 /// E1: true for any namespace-11 sequence counter.
-fn sequence_counters_present(_: &State) -> bool {
-    false
+fn sequence_counters_present(s: &State) -> bool {
+    !s.seq.is_empty()
 }
 /// GD-0055 WO19: read the giggles_roles_v1 bootstrap marker in the same read
 /// transaction as RECORDS. No bootstrap marker is defined or written today.

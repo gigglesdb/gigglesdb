@@ -438,3 +438,41 @@ fn format_one_namespace_rejects_trailing_bytes_and_encoded_extension() {
         ));
     }
 }
+
+#[test]
+fn sequence_counter_feature_bit_matches_records_and_requires_catalog_metadata() {
+    let mut s = empty(17);
+    let p = crate::relational::Prepared::parse(
+        "CREATE TABLE counter_features (id serial PRIMARY KEY)",
+        17,
+        0,
+    )
+    .unwrap();
+    s.sql.execute(&p, &[], None).unwrap();
+    let id = *s.sql.catalog_ext().sequences.keys().next().unwrap();
+    crate::storage::sequences::next(&mut s, id).unwrap();
+    let r = records(&s).unwrap();
+    let bits = u64::from_be_bytes(r[&vec![10]].as_slice().try_into().unwrap());
+    assert_eq!(bits & (64 | 256), 64 | 256);
+    assert_eq!(records(&normal(r.clone()).unwrap()).unwrap(), r);
+    let counter_key = r.keys().find(|k| k.first() == Some(&11)).unwrap().clone();
+    let mut missing = r.clone();
+    missing.remove(&counter_key);
+    assert!(matches!(normal(missing), Err(CoreError::Corrupt(_))));
+    for forged_bits in [bits & !256, bits & !64] {
+        let mut mismatch = r.clone();
+        mismatch.insert(vec![10], forged_bits.to_be_bytes().to_vec());
+        assert!(matches!(normal(mismatch), Err(CoreError::Corrupt(_))));
+    }
+    let mut legacy = r.clone();
+    let mut metadata: Metadata = decode(&legacy[&vec![0]]).unwrap();
+    metadata.format = format_policy::bits_to_legacy_version(bits & 63).unwrap();
+    legacy.insert(vec![0], encode(&metadata).unwrap());
+    legacy.remove(&vec![10]);
+    assert!(matches!(normal(legacy), Err(CoreError::Corrupt(_))));
+    assert!(matches!(
+        crate::storage::replica::Image::from_bytes(encode(&r).unwrap()),
+        Err(CoreError::Unsupported)
+    ));
+    // Partition projection begins with the same rejecting replica source decoder.
+}
