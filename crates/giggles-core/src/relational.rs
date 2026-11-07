@@ -5,6 +5,7 @@ mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
+mod scan;
 // Candidate codec/read APIs await later internal release.
 #[allow(dead_code)]
 pub(crate) mod secondary_index;
@@ -499,10 +500,13 @@ fn lex(s: &str) -> R<Vec<Token>> {
         } else if b"(),*;.:".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
-        } else if b"=<>".contains(&c) {
+        } else if b"=<>!".contains(&c) {
+            if c == b'!' && b.get(i + 1) != Some(&b'=') {
+                return Err(SqlError::Unsupported);
+            }
             let start = i;
             i += 1;
-            if b.get(i) == Some(&b'=') {
+            if b.get(i) == Some(&b'=') || (c == b'<' && b.get(i) == Some(&b'>')) {
                 i += 1;
             }
             out.push(Token::Op(s[start..i].into()));
@@ -779,46 +783,6 @@ impl Parser {
                 name,
                 columns,
                 values,
-            }
-        } else if self.word("select") {
-            let projection = if self.sym('*') {
-                vec![]
-            } else {
-                let mut v = vec![self.name()?];
-                while self.sym(',') {
-                    v.push(self.name()?);
-                }
-                v
-            };
-            self.need("from")?;
-            let name = self.name()?;
-            let predicates = self.predicates()?;
-            let mut order = vec![];
-            if self.word("order") {
-                self.need("by")?;
-                loop {
-                    let c = self.name()?;
-                    let desc = self.word("desc");
-                    if !desc {
-                        self.word("asc");
-                    }
-                    order.push((c, desc));
-                    if !self.sym(',') {
-                        break;
-                    }
-                }
-            }
-            let limit = if self.word("limit") {
-                Some(self.expr()?)
-            } else {
-                None
-            };
-            Statement::Select {
-                name,
-                projection,
-                predicates,
-                order,
-                limit,
             }
         } else if self.word("update") {
             let name = self.name()?;
@@ -1327,25 +1291,20 @@ impl Prepared {
             at: 0,
             params: BTreeSet::new(),
         };
-        // Try the established grammar first, including identifiers named min/count.
-        let statement = match p.parse() {
-            Ok(statement) => statement,
-            Err(_)
-                if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert")
-                    && !sql_insert::claims(&p.tokens) =>
-            {
-                p.at = 0;
-                p.params.clear();
-                Statement::InsertExpressions(query::InsertExpressions::parse(&mut p)?)
-            }
-            Err(error) => {
-                if !matches!(p.tokens.first(), Some(Token::Word(w)) if w == "select" || w == "explain")
+        let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain") {
+            Statement::Query(query::Query::parse(&mut p)?)
+        } else {
+            match p.parse() {
+                Ok(statement) => statement,
+                Err(_)
+                    if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert")
+                        && !sql_insert::claims(&p.tokens) =>
                 {
-                    return Err(error);
+                    p.at = 0;
+                    p.params.clear();
+                    Statement::InsertExpressions(query::InsertExpressions::parse(&mut p)?)
                 }
-                p.at = 0;
-                p.params.clear();
-                Statement::Query(query::Query::parse(&mut p)?)
+                Err(error) => return Err(error),
             }
         };
         let params = p.params.last().copied().unwrap_or(0);

@@ -6,6 +6,7 @@ mod insert_values;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
 
+// Syntax node budget for INSERT expressions and IN/BETWEEN lowering; not a scan work cap.
 const MAX_WORK: usize = 4096;
 const MAX_SOURCES: usize = 8;
 
@@ -64,6 +65,43 @@ enum BoundFilter {
     Not(Box<BoundFilter>),
     Logic(Box<BoundFilter>, bool, Box<BoundFilter>),
 }
+/// Lowering IN/BETWEEN clones the lhs once per comparison. Admit the total
+/// cloned Scalar nodes against MAX_WORK and the cloned variable payload
+/// (literal values, column/qualifier and routine names) against MAX_SQL,
+/// measured on the borrowed AST, before anything is cloned.
+fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
+    fn cost(s: &Scalar, nodes: &mut usize, bytes: &mut usize) -> R<()> {
+        *nodes = nodes.checked_add(1).ok_or(SqlError::Limit)?;
+        let payload = match s {
+            Scalar::Param(_) => 0,
+            Scalar::Literal(v) => value_bytes(v),
+            Scalar::Column(c) => c.name.len() + c.qualifier.as_ref().map_or(0, String::len),
+            Scalar::Cast(inner, _) => return cost(inner, nodes, bytes),
+            Scalar::Call(name, args) => {
+                for a in args {
+                    cost(a, nodes, bytes)?;
+                }
+                name.len()
+            }
+            Scalar::SubstringOrder(args) => {
+                for a in args {
+                    cost(a, nodes, bytes)?;
+                }
+                0
+            }
+        };
+        *bytes = bytes.checked_add(payload).ok_or(SqlError::Limit)?;
+        Ok(())
+    }
+    let (mut nodes, mut bytes) = (0usize, 0usize);
+    cost(lhs, &mut nodes, &mut bytes)?;
+    if nodes.checked_mul(copies).is_none_or(|n| n > MAX_WORK)
+        || bytes.checked_mul(copies).is_none_or(|b| b > MAX_SQL)
+    {
+        return Err(SqlError::Limit);
+    }
+    Ok(())
+}
 impl Filter {
     fn parse(p: &mut Parser, precedence: usize, depth: usize) -> R<Self> {
         if depth > 32 {
@@ -78,10 +116,50 @@ impl Filter {
             let scalar = Scalar::parse(p, depth);
             match scalar {
                 Ok(a) => {
+                    let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
+                        && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between");
+                    if not {
+                        p.at += 1;
+                    }
                     if p.word("is") {
                         let not = p.word("not");
                         p.need("null")?;
                         Self::Null(a, not)
+                    } else if p.word("in") {
+                        p.punct('(')?;
+                        if p.sym(')') {
+                            return Err(SqlError::Syntax);
+                        }
+                        let mut values = vec![Scalar::parse(p, depth + 1)?];
+                        while p.sym(',') {
+                            values.push(Scalar::parse(p, depth + 1)?);
+                        }
+                        p.punct(')')?;
+                        // Admit the expanded size from the borrowed AST before any clone.
+                        admit_expansion(&a, values.len())?;
+                        Self::membership(&a, &values, not)
+                    } else if p.word("between") {
+                        if p.word("symmetric") {
+                            return Err(SqlError::Unsupported);
+                        }
+                        p.word("asymmetric");
+                        let lower = Scalar::parse(p, depth + 1)?;
+                        p.need("and")?;
+                        let upper = Scalar::parse(p, depth + 1)?;
+                        admit_expansion(&a, 2)?;
+                        Self::Logic(
+                            Box::new(Self::Compare(
+                                a.clone(),
+                                if not { "<" } else { ">=" }.into(),
+                                lower,
+                            )),
+                            !not,
+                            Box::new(Self::Compare(
+                                a,
+                                if not { ">" } else { "<=" }.into(),
+                                upper,
+                            )),
+                        )
                     } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
                         if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
                             return Err(SqlError::Unsupported);
@@ -125,6 +203,23 @@ impl Filter {
             );
         }
         Ok(f)
+    }
+    // Split the list in half so large IN lists retain logarithmic filter depth.
+    // Callers must call admit_expansion first: every entry clones the lhs.
+    fn membership(a: &Scalar, values: &[Scalar], not: bool) -> Self {
+        if values.len() == 1 {
+            return Self::Compare(
+                a.clone(),
+                if not { "<>" } else { "=" }.into(),
+                values[0].clone(),
+            );
+        }
+        let middle = values.len() / 2;
+        Self::Logic(
+            Box::new(Self::membership(a, &values[..middle], not)),
+            not,
+            Box::new(Self::membership(a, &values[middle..], not)),
+        )
     }
     fn bounds(&self, out: &mut Vec<(ColumnRef, String, Expr)>) {
         match self {
@@ -1114,22 +1209,6 @@ fn charge(bytes: &mut usize, value: &Value) -> R<()> {
     }
     Ok(())
 }
-fn fits(rows: &[Tuple]) -> R<()> {
-    if rows.len() > MAX_ROWS {
-        return Err(SqlError::Limit);
-    }
-    let bytes = rows
-        .iter()
-        .flat_map(|r| &r.values)
-        .flatten()
-        .try_fold(0usize, |n, v| {
-            n.checked_add(value_bytes(v)).ok_or(SqlError::Limit)
-        })?;
-    if bytes > MAX_RESULT_BYTES {
-        return Err(SqlError::Limit);
-    }
-    Ok(())
-}
 impl BoundQuery<'_> {
     pub(super) fn validate_immutable_constants(&self) -> R<()> {
         let mut budget = 0;
@@ -1191,10 +1270,11 @@ impl BoundQuery<'_> {
         }
         let limit = match &self.query.limit {
             Some(e) => match e.value(params)? {
-                Value::Int(n) if (0..=MAX_ROWS as i64).contains(&n) => n as usize,
+                Value::Int(n) if n >= 0 => Some(n as u64),
+                Value::Null => None,
                 _ => return Err(SqlError::Limit),
             },
-            None => MAX_ROWS,
+            None => None,
         };
         if self.tables.is_empty() {
             if self.aggregate || self.query.explain {
@@ -1205,7 +1285,7 @@ impl BoundQuery<'_> {
                 rows: vec![],
                 affected: 0,
             };
-            if limit != 0 {
+            if limit != Some(0) {
                 let row = Tuple {
                     values: vec![],
                     version: 0,
@@ -1252,17 +1332,27 @@ impl BoundQuery<'_> {
                 value: (*e).clone(),
             })
             .collect::<Vec<_>>();
-        let bounds = bounds(self.tables[0], &base_predicates, params)?;
+        let bounds = match bounds(self.tables[0], &base_predicates, params) {
+            // A gap in a composite key, or several bounds on one key column, cannot
+            // form one key range. SELECT then streams the full range; the complete
+            // WHERE filter is always re-applied, so the result is unchanged.
+            Err(SqlError::Unbounded | SqlError::Unsupported) => {
+                bounds(self.tables[0], &[], params)?
+            }
+            other => other?,
+        };
         if self.query.explain {
             let mut plan = format!(
-                "{}; candidate_work<={MAX_WORK}; intermediate_rows<={MAX_ROWS}; intermediate_bytes<={MAX_RESULT_BYTES}; result_bytes<={MAX_RESULT_BYTES}",
+                "{}; retained_bytes<={}; result_rows<={}; result_bytes<={MAX_RESULT_BYTES}",
                 if empty_input {
                     "EmptyInput"
                 } else if bounds.point {
                     "PrimaryKeyLookup"
                 } else {
                     "PrimaryKeyRangeScan"
-                }
+                },
+                scan::MAX_RETAINED_BYTES,
+                scan::MAX_QUERY_ROWS,
             );
             for j in &self.joins {
                 plan.push_str(if j.left {
@@ -1275,7 +1365,7 @@ impl BoundQuery<'_> {
                 plan.push_str("; GlobalAggregate");
             }
             if !self.order.is_empty() {
-                plan.push_str("; BoundedStableSort");
+                plan.push_str(if limit.is_some() { "; TopNSort" } else { "; StableSort" });
             }
             plan.push_str("; OutputLimit");
             return Ok(SqlResult {
@@ -1287,122 +1377,63 @@ impl BoundQuery<'_> {
                 affected: 0,
             });
         }
-        let mut work = 0usize;
-        let mut rows = vec![];
-        if !empty_input && (bounds.low < bounds.high || (bounds.low == bounds.high && bounds.point))
-        {
-            use std::ops::Bound::{Excluded, Included};
-            let lo = if bounds.low_inclusive {
-                Included(bounds.low)
-            } else {
-                Excluded(bounds.low)
-            };
-            let hi = if bounds.high_inclusive {
-                Included(bounds.high)
-            } else {
-                Excluded(bounds.high)
-            };
-            for (_, r) in state.rows[&self.tables[0].id].range((lo, hi)) {
-                work += 1;
-                if work > MAX_WORK {
-                    return Err(SqlError::Limit);
-                }
-                rows.push(Tuple {
-                    values: vec![r.values.clone()],
-                    version: r.version,
-                });
-                fits(&rows)?;
+        // LIMIT 0 yields no rows, so PostgreSQL executes no input, filter, join or
+        // aggregate work. Bind-phase immutable constant validation is separate and
+        // already ran. Keep the aggregate entry and normal-success cancel fences.
+        if limit == Some(0) {
+            if self.aggregate && cancel() {
+                return Err(SqlError::Aborted);
             }
+            return Ok(SqlResult {
+                columns: self.columns.iter().map(|c| c.name.clone()).collect(),
+                rows: vec![],
+                affected: 0,
+            });
         }
-        for (i, j) in self.joins.iter().enumerate() {
-            let table = self.tables[i + 1];
-            let mut next = vec![];
-            for mut row in rows {
-                work += 1;
-                if work > MAX_WORK {
-                    return Err(SqlError::Limit);
-                }
-                let key = j
-                    .key
-                    .iter()
-                    .map(|c| row.get(*c).clone())
-                    .collect::<Vec<_>>();
+        use scan::RowSource;
+        let source = scan::LegacyRows(state);
+        let range = if empty_input {
+            scan::KeyRange {
+                lo: std::ops::Bound::Excluded(Vec::new()),
+                hi: std::ops::Bound::Excluded(Vec::new()),
+            }
+        } else {
+            scan::KeyRange::from_bounds(bounds)
+        };
+        let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+        let mut meter = scan::Meter::new(cancel);
+        let mut filter_work = 0;
+        let filtered = scan::filtered(input, &mut meter, |r| {
+            let mut row = Tuple {
+                values: vec![r.row.values.clone()],
+                version: r.row.version,
+            };
+            for (i, j) in self.joins.iter().enumerate() {
+                let table = self.tables[i + 1];
+                let key = j.key.iter().map(|c| row.get(*c).clone()).collect::<Vec<_>>();
                 let found = if key.contains(&Value::Null) {
                     None
                 } else {
-                    state.rows[&table.id].get(&encode_key(&key)?)
+                    source.get(table, &encode_key(&key)?)?
                 };
                 let matched = found.filter(|r| {
-                    j.equalities
-                        .iter()
-                        .all(|(a, b)| equal(row.get(*a), &r.values[b.column]))
+                    j.equalities.iter().all(|(a, b)| equal(row.get(*a), &r.row.values[b.column]))
                 });
                 match matched {
-                    Some(r) => row.values.push(r.values.clone()),
+                    Some(r) => row.values.push(r.row.values.clone()),
                     None if j.left => row.values.push(vec![Value::Null; table.columns.len()]),
-                    None => continue,
+                    None => return Ok(None),
                 }
                 row.version = 0;
-                next.push(row);
-                fits(&next)?;
             }
-            rows = next;
-        }
-        let mut filtered = vec![];
-        let mut filter_work = 0;
-        for row in rows {
-            if match &self.filter {
-                Some(f) => f.eval(&row, params, &mut filter_work)? == Some(true),
-                None => true,
-            } {
-                filtered.push(row);
+            if let Some(f) = &self.filter
+                && f.eval(&row, params, &mut filter_work)? != Some(true)
+            {
+                return Ok(None);
             }
-        }
-        let rows = filtered;
-        // Evaluate each key exactly once, before entering the infallible comparator.
-        // Charge retained keys separately from evaluator temporary allocations.
-        let mut key_bytes = 0;
-        let mut key_work = 0;
-        let mut keyed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut keys = Vec::with_capacity(self.order.len());
-            for (e, _, _) in &self.order {
-                let value = e.eval(&row, params, &mut key_work)?;
-                charge(&mut key_bytes, &value)?;
-                keys.push(value);
-            }
-            keyed.push((row, keys));
-        }
-        keyed.sort_by(|(_, a), (_, b)| {
-            for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
-                let ord = match (a, b) {
-                    (Value::Null, Value::Null) => Ordering::Equal,
-                    (Value::Null, _) => {
-                        if *first {
-                            Ordering::Less
-                        } else {
-                            Ordering::Greater
-                        }
-                    }
-                    (_, Value::Null) => {
-                        if *first {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Less
-                        }
-                    }
-                    _ => {
-                        let ord = cmp(a, b);
-                        if *desc { ord.reverse() } else { ord }
-                    }
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            Ordering::Equal
+            Ok(Some(row))
         });
-        let rows = keyed.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
+        let page = scan::Page { offset: 0, limit };
         let mut result = SqlResult {
             columns: self.columns.iter().map(|c| c.name.clone()).collect(),
             rows: vec![],
@@ -1411,124 +1442,175 @@ impl BoundQuery<'_> {
         let mut result_bytes = 0usize;
         let mut scalar_work_bytes = 0usize;
         if self.aggregate {
-            let values = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
+            let mut values = self.items.iter().map(|item| {
+                if matches!(item, BoundItem::Aggregate(Aggregate::Count, _)) {
+                    Value::Int(0)
+                } else {
+                    Value::Null
+                }
+            }).collect::<Vec<_>>();
+            for row in filtered {
+                let row = row?;
+                for (index, item) in self.items.iter().enumerate() {
                     let BoundItem::Aggregate(a, c) = item else {
-                        unreachable!()
+                        return Err(SqlError::Unsupported);
                     };
-                    let mut value = if matches!(a, Aggregate::Count) {
-                        Value::Int(0)
-                    } else {
-                        Value::Null
-                    };
-                    for row in &rows {
-                        if cancel() {
-                            return Err(SqlError::Aborted);
-                        }
-                        let evaluated = c
-                            .as_ref()
-                            .map(|e| e.eval(row, params, &mut scalar_work_bytes))
-                            .transpose()?;
-                        let v = evaluated.as_ref();
-                        if v == Some(&Value::Null) {
-                            continue;
-                        }
-                        match a {
-                            Aggregate::Count => {
-                                if let Value::Int(n) = &mut value {
-                                    *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
-                                }
+                    let evaluated = c
+                        .as_ref()
+                        .map(|e| e.eval(&row, params, &mut scalar_work_bytes))
+                        .transpose()?;
+                    let v = evaluated.as_ref();
+                    if v == Some(&Value::Null) {
+                        continue;
+                    }
+                    let mut value = std::mem::replace(&mut values[index], Value::Null);
+                    match a {
+                        Aggregate::Count => {
+                            if let Value::Int(n) = &mut value {
+                                *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
                             }
-                            Aggregate::Sum => {
-                                let v = v.ok_or(SqlError::Type)?;
-                                value = match self.columns[index].data_type {
-                                    DataType::Numeric => functions::aggregate_numeric_add(
-                                        value,
-                                        evaluated.ok_or(SqlError::Type)?,
-                                        &mut scalar_work_bytes,
-                                    )?,
-                                    DataType::Real => {
-                                        let Value::Float4(n) = v else {
-                                            return Err(SqlError::Type);
-                                        };
-                                        let sum = if let Value::Float4(old) = value {
-                                            let sum = old.value() + n.value();
-                                            if sum.is_infinite()
-                                                && old.value().is_finite()
-                                                && n.value().is_finite()
-                                            {
-                                                return Err(SqlError::Overflow);
-                                            }
-                                            sum
-                                        } else {
-                                            n.value()
-                                        };
-                                        Value::Float4(Float4::from_bits(sum.to_bits()))
-                                    }
-                                    DataType::DoublePrecision => {
-                                        let Value::Float8(n) = v else {
-                                            return Err(SqlError::Type);
-                                        };
-                                        let sum = if let Value::Float8(old) = value {
-                                            let sum = old.value() + n.value();
-                                            if sum.is_infinite()
-                                                && old.value().is_finite()
-                                                && n.value().is_finite()
-                                            {
-                                                return Err(SqlError::Overflow);
-                                            }
-                                            sum
-                                        } else {
-                                            n.value()
-                                        };
-                                        Value::Float8(Float8::from_bits(sum.to_bits()))
-                                    }
-                                    DataType::BigInt => {
-                                        let Value::Int(n) = v else {
-                                            return Err(SqlError::Type);
-                                        };
-                                        Value::Int(if let Value::Int(old) = value {
-                                            old.checked_add(*n).ok_or(SqlError::Overflow)?
-                                        } else {
-                                            *n
-                                        })
-                                    }
-                                    DataType::Boolean
-                                    | DataType::SmallInt
-                                    | DataType::Integer
-                                    | DataType::Text
-                                    | DataType::Bytes
-                                    | DataType::Date
-                                    | DataType::Time
-                                    | DataType::TimeTz
-                                    | DataType::Timestamp
-                                    | DataType::TimestampTz
-                                    | DataType::Interval => return Err(SqlError::Type),
-                                };
-                            }
-                            Aggregate::Min | Aggregate::Max => {
-                                let v = v.ok_or(SqlError::Type)?;
-                                if value == Value::Null
-                                    || (matches!(a, Aggregate::Min)
-                                        && cmp(v, &value) == Ordering::Less)
-                                    || (matches!(a, Aggregate::Max)
-                                        && cmp(v, &value) == Ordering::Greater)
-                                {
-                                    value = evaluated.ok_or(SqlError::Type)?;
+                        }
+                        Aggregate::Sum => {
+                            let v = v.ok_or(SqlError::Type)?;
+                            value = match self.columns[index].data_type {
+                                DataType::Numeric => functions::aggregate_numeric_add(
+                                    value,
+                                    evaluated.ok_or(SqlError::Type)?,
+                                    &mut scalar_work_bytes,
+                                )?,
+                                DataType::Real => {
+                                    let Value::Float4(n) = v else {
+                                        return Err(SqlError::Type);
+                                    };
+                                    let sum = if let Value::Float4(old) = value {
+                                        let sum = old.value() + n.value();
+                                        if sum.is_infinite()
+                                            && old.value().is_finite()
+                                            && n.value().is_finite()
+                                        {
+                                            return Err(SqlError::Overflow);
+                                        }
+                                        sum
+                                    } else {
+                                        n.value()
+                                    };
+                                    Value::Float4(Float4::from_bits(sum.to_bits()))
                                 }
+                                DataType::DoublePrecision => {
+                                    let Value::Float8(n) = v else {
+                                        return Err(SqlError::Type);
+                                    };
+                                    let sum = if let Value::Float8(old) = value {
+                                        let sum = old.value() + n.value();
+                                        if sum.is_infinite()
+                                            && old.value().is_finite()
+                                            && n.value().is_finite()
+                                        {
+                                            return Err(SqlError::Overflow);
+                                        }
+                                        sum
+                                    } else {
+                                        n.value()
+                                    };
+                                    Value::Float8(Float8::from_bits(sum.to_bits()))
+                                }
+                                DataType::BigInt => {
+                                    let Value::Int(n) = v else {
+                                        return Err(SqlError::Type);
+                                    };
+                                    Value::Int(if let Value::Int(old) = value {
+                                        old.checked_add(*n).ok_or(SqlError::Overflow)?
+                                    } else {
+                                        *n
+                                    })
+                                }
+                                DataType::Boolean
+                                | DataType::SmallInt
+                                | DataType::Integer
+                                | DataType::Text
+                                | DataType::Bytes
+                                | DataType::Date
+                                | DataType::Time
+                                | DataType::TimeTz
+                                | DataType::Timestamp
+                                | DataType::TimestampTz
+                                | DataType::Interval => return Err(SqlError::Type),
+                            };
+                        }
+                        Aggregate::Min | Aggregate::Max => {
+                            let v = v.ok_or(SqlError::Type)?;
+                            if value == Value::Null
+                                || (matches!(a, Aggregate::Min)
+                                    && cmp(v, &value) == Ordering::Less)
+                                || (matches!(a, Aggregate::Max)
+                                    && cmp(v, &value) == Ordering::Greater)
+                            {
+                                value = evaluated.ok_or(SqlError::Type)?;
                             }
                         }
                     }
-                    charge(&mut result_bytes, &value)?;
-                    Ok(value)
-                })
-                .collect::<R<Vec<_>>>()?;
-            result.rows.push(SqlRow { values, version: 0 });
+                    values[index] = value;
+                }
+            }
+            for value in &values {
+                charge(&mut result_bytes, value)?;
+            }
+            result.rows.extend(page.apply(std::iter::once(SqlRow { values, version: 0 })));
         } else {
-            for row in rows {
+            let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
+                Box::new(filtered)
+            } else {
+                let mut key_work = 0;
+                let keyed = filtered.map(|row| {
+                    let row = row?;
+                    let keys = self.order.iter()
+                        .map(|(e, _, _)| e.eval(&row, params, &mut key_work))
+                        .collect::<R<Vec<_>>>()?;
+                    Ok((row, keys))
+                });
+                let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+                let sorted = scan::sort_bounded(
+                    keyed,
+                    page.keep(),
+                    |(row, keys)| row.values.iter().flatten().chain(keys).map(value_bytes).sum(),
+                    |(_, a), (_, b)| {
+                        for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
+                            let ord = match (a, b) {
+                                (Value::Null, Value::Null) => Ordering::Equal,
+                                (Value::Null, _) => {
+                                    if *first {
+                                        Ordering::Less
+                                    } else {
+                                        Ordering::Greater
+                                    }
+                                }
+                                (_, Value::Null) => {
+                                    if *first {
+                                        Ordering::Greater
+                                    } else {
+                                        Ordering::Less
+                                    }
+                                }
+                                _ => {
+                                    let ord = cmp(a, b);
+                                    if *desc { ord.reverse() } else { ord }
+                                }
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    },
+                    &mut retention,
+                )?;
+                Box::new(sorted.into_iter().map(|(row, _)| Ok(row)))
+            };
+            for row in page.apply(rows) {
+                let row = row?;
+                if result.rows.len() >= scan::MAX_QUERY_ROWS {
+                    return Err(SqlError::Limit);
+                }
                 let values = self
                     .items
                     .iter()
@@ -1556,7 +1638,6 @@ impl BoundQuery<'_> {
         if self.aggregate && cancel() {
             return Err(SqlError::Aborted);
         }
-        result.rows.truncate(limit);
         Ok(result)
     }
 }

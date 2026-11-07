@@ -400,7 +400,9 @@ fn explain_is_physical_redacted_and_read_only() {
         "PrimaryKeyRangeScan",
         "LeftPrimaryKeyNestedLoop",
         "GlobalAggregate",
-        "candidate_work<=4096",
+        "retained_bytes<=67108864",
+        "result_rows<=65536",
+        "result_bytes<=1048576",
     ] {
         assert!(plan.contains(op), "{plan}");
     }
@@ -451,7 +453,7 @@ fn limits_are_independent_of_limit() {
     let q = "SELECT p.id FROM people p LEFT JOIN people a ON a.id=p.manager LEFT JOIN people b ON b.id=a.manager LEFT JOIN people c ON c.id=b.manager";
     assert_eq!(run(&mut s, &format!("{q} LIMIT 0")).rows.len(), 0);
     let q = format!("{q} LEFT JOIN people d ON d.id=c.manager LIMIT 0");
-    err(&mut s, &q, E::Limit);
+    assert!(run(&mut s, &q).rows.is_empty());
     s.rollback();
 }
 #[test]
@@ -477,13 +479,8 @@ fn bytes_boundary_no_partial_result() {
             .len(),
         32
     );
-    // The input exactly fits its cap, but projection duplication must still fail
-    // before output truncation, independently of intermediate accounting.
-    err(
-        &mut s,
-        "SELECT p.body,p.body FROM payloads p LIMIT 0",
-        E::Limit,
-    );
+    // LIMIT 0 emits no projected bytes, even when the full projection would overflow.
+    assert!(run(&mut s, "SELECT p.body,p.body FROM payloads p LIMIT 0").rows.is_empty());
     s.rollback();
     run(&mut s, "BEGIN");
     for id in 0..32 {
@@ -496,7 +493,7 @@ fn bytes_boundary_no_partial_result() {
     }
     s.execute("INSERT INTO payloads VALUES(32,$1)", &[body], None)
         .unwrap();
-    err(&mut s, "SELECT p.body FROM payloads p LIMIT 0", E::Limit);
+    assert!(run(&mut s, "SELECT p.body FROM payloads p LIMIT 0").rows.is_empty());
     s.rollback();
 }
 
@@ -637,7 +634,10 @@ fn future_join_scope_and_conflicting_parameter_types_reject_empty_tables() {
         E::Parameters,
     );
     err(&mut s, "SELECT COUNT(*) FROM people p LIMIT -1", E::Limit);
-    err(&mut s, "SELECT COUNT(*) FROM people p LIMIT 1025", E::Limit);
+    assert_eq!(
+        vals(run(&mut s, "SELECT COUNT(*) FROM people p LIMIT 1025")),
+        vec![vec![V::Int(0)]]
+    );
 }
 
 #[test]
@@ -645,6 +645,14 @@ fn indexed_point_explain_metadata_and_version_preservation() {
     let (_, mut s) = db();
     schema(&mut s);
     run(&mut s, "INSERT INTO people VALUES(1,NULL,'x')");
+    let plain = s.prepare("SELECT id FROM people WHERE id=$1").unwrap();
+    let aliased = s.prepare("SELECT p.id FROM people p WHERE p.id=$1").unwrap();
+    assert_eq!(plain.command(), "SELECT");
+    assert_eq!(plain.table(), Some("people"));
+    let plain_description = s.describe(&plain).unwrap();
+    let aliased_description = s.describe(&aliased).unwrap();
+    assert_eq!(plain_description.parameters, aliased_description.parameters);
+    assert_eq!(plain_description.columns, aliased_description.columns);
     let old = run(&mut s, "SELECT id FROM people WHERE id=1").rows[0].version;
     assert_eq!(
         run(&mut s, "SELECT p.id FROM people p WHERE p.id=1").rows[0].version,

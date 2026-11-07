@@ -224,14 +224,28 @@ fn composite_prefix_ranges_and_binary_order() {
         1
     );
     for q in [
-        "SELECT * FROM messages WHERE id=3 LIMIT 5",
-        "SELECT * FROM messages WHERE tenant=1 AND id=3 LIMIT 5",
         "UPDATE messages SET body='z' WHERE tenant=1",
         "DELETE FROM messages WHERE tenant=1 AND bucket=1",
-        "SELECT * FROM messages WHERE body='x' LIMIT 3",
     ] {
         err(&mut s, q, E::Unbounded);
     }
+    for q in [
+        "SELECT * FROM messages WHERE id=3 LIMIT 5",
+        "SELECT * FROM messages WHERE tenant=1 AND id=3 LIMIT 5",
+    ] {
+        assert_eq!(
+            values(run(&mut s, q)),
+            vec![vec![V::Int(1), V::Int(1), V::Int(3), V::Text("x".into())]]
+        );
+    }
+    assert_eq!(
+        values(run(&mut s, "SELECT * FROM messages WHERE body='x' LIMIT 3")),
+        vec![
+            vec![V::Int(1), V::Int(0), V::Int(8), V::Text("x".into())],
+            vec![V::Int(1), V::Int(1), V::Int(-1), V::Text("x".into())],
+            vec![V::Int(1), V::Int(1), V::Int(3), V::Text("x".into())],
+        ]
+    );
     run(&mut s, "CREATE TABLE strings (id TEXT PRIMARY KEY)");
     for v in ["é", "a\0z", "", "a", "a\0", "aa", "雪"] {
         s.execute("INSERT INTO strings VALUES($1)", &[V::Text(v.into())], None)
@@ -394,7 +408,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "CREATE TABLE safe (id BIGINT PRIMARY KEY, n BIGINT)",
     );
     for q in [
-        "SELECT * FROM safe",
         "UPDATE safe SET n=1",
         "DELETE FROM safe",
         "CREATE TABLE nopk (id BIGINT)",
@@ -417,7 +430,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "SELECT * FROM public.safe LIMIT 1",
         "SELECT * FROM safe -- hi",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
-        "SELECT * FROM safe ORDER BY n LIMIT 1",
         "UPDATE safe SET n=n+1 WHERE id=1",
         "SELECT * FROM safe LIMIT 1 OFFSET 1",
     ] {
@@ -430,7 +442,9 @@ fn strict_rejection_matrix_and_resource_bounds() {
     ] {
         err(&mut s, q, E::Duplicate);
     }
-    err(&mut s, "SELECT * FROM safe LIMIT 1025", E::Limit);
+    assert!(run(&mut s, "SELECT * FROM safe ORDER BY n LIMIT 1").rows.is_empty());
+    assert!(run(&mut s, "SELECT * FROM safe").rows.is_empty());
+    assert!(run(&mut s, "SELECT * FROM safe LIMIT 1025").rows.is_empty());
     err(&mut s, "SELECT * FROM safe LIMIT -1", E::Limit);
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 0").rows.is_empty());
     // Table aliases are now part of the bounded query contract.
@@ -700,7 +714,7 @@ fn transaction_slots_released_on_rollback_drop_commit_and_abort() {
     // Dropping one transaction frees admission; existing snapshots hold no mutex.
     drop(sessions.pop());
     run(&mut main, "BEGIN");
-    err(&mut main, "SELECT * FROM slots", E::Unbounded);
+    err(&mut main, "SELECT * FROM missing_table", E::UnknownTable);
     assert!(main.is_aborted());
     run(&mut main, "ROLLBACK");
     run(&mut main, "BEGIN");

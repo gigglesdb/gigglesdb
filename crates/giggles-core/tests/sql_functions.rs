@@ -131,9 +131,11 @@ fn projection_bounds_and_transaction_failure_are_atomic() {
     let text = "ß".repeat(MAX_ROW_BYTES / 2 - 40);
     s.execute("INSERT INTO f VALUES(1,1,1,1,$1)", &[V::Text(text)], None)
         .unwrap();
-    // Repeated projections must fail even when LIMIT would discard their rows.
+    // Repeated projections fail on every produced row. As in PostgreSQL, rows
+    // that LIMIT discards are never projected.
     let calls = vec!["upper(txt)"; 32].join(",");
-    error(&mut s, &format!("SELECT {calls} FROM f LIMIT 0"), E::Limit);
+    error(&mut s, &format!("SELECT {calls} FROM f"), E::Limit);
+    assert!(run(&mut s, &format!("SELECT {calls} FROM f LIMIT 0")).rows.is_empty());
 }
 
 #[test]
@@ -220,7 +222,10 @@ fn output_and_work_budgets_have_independent_boundaries() {
     let calls = vec!["lower(txt)"; 16].join(",");
     assert_eq!(run(&mut s, &format!("SELECT {calls} FROM f")).rows.len(), 1);
     let calls = vec!["lower(txt)"; 17].join(",");
-    error(&mut s, &format!("SELECT {calls} FROM f LIMIT 0"), E::Limit);
+    // PostgreSQL evaluates no projection for rows LIMIT discards; the budget
+    // applies to every row that is actually produced.
+    error(&mut s, &format!("SELECT {calls} FROM f"), E::Limit);
+    assert!(run(&mut s, &format!("SELECT {calls} FROM f LIMIT 0")).rows.is_empty());
 }
 #[test]
 fn casts_and_prepared_projection_values() {
