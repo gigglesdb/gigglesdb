@@ -1595,8 +1595,8 @@ impl BoundQuery<'_> {
         let source = scan::LegacyRows(state);
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
         let mut meter = scan::Meter::per_row(cancel);
-        let mut work = 0;
         let filtered = scan::filtered(input, &mut meter, |row| {
+            let mut work = 0;
             let tuple = Tuple {
                 values: vec![row.row.values.clone()],
                 version: row.row.version,
@@ -1757,8 +1757,8 @@ impl BoundQuery<'_> {
         } else {
             scan::Meter::new(cancel)
         };
-        let mut filter_work = 0;
         let filtered = scan::filtered(input, &mut meter, |r| {
+            let mut filter_work = 0;
             let mut row = Tuple {
                 values: vec![r.row.values.clone()],
                 version: r.row.version,
@@ -1801,7 +1801,9 @@ impl BoundQuery<'_> {
             affected: 0,
         };
         let mut result_bytes = 0usize;
-        let mut scalar_work_bytes = 0usize;
+        // Aggregate inputs keep the statement-wide scalar work budget (DD-0068
+        // aggregate_scalar_work_budget_is_shared_over_full_input).
+        let mut aggregate_work_bytes = 0usize;
         if self.aggregate {
             let mut values = self
                 .items
@@ -1822,7 +1824,7 @@ impl BoundQuery<'_> {
                     };
                     let evaluated = c
                         .as_ref()
-                        .map(|e| e.eval(&row, params, &mut scalar_work_bytes))
+                        .map(|e| e.eval(&row, params, &mut aggregate_work_bytes))
                         .transpose()?;
                     let v = evaluated.as_ref();
                     if v == Some(&Value::Null) {
@@ -1841,7 +1843,7 @@ impl BoundQuery<'_> {
                                 DataType::Numeric => functions::aggregate_numeric_add(
                                     value,
                                     evaluated.ok_or(SqlError::Type)?,
-                                    &mut scalar_work_bytes,
+                                    &mut aggregate_work_bytes,
                                 )?,
                                 DataType::Real => {
                                     let Value::Float4(n) = v else {
@@ -1926,9 +1928,9 @@ impl BoundQuery<'_> {
             let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
                 Box::new(filtered)
             } else {
-                let mut key_work = 0;
                 let keyed = filtered.map(|row| {
                     let row = row?;
+                    let mut key_work = 0;
                     let keys = self
                         .order
                         .iter()
@@ -1983,6 +1985,7 @@ impl BoundQuery<'_> {
             };
             for row in page.apply(rows) {
                 let row = row?;
+                let mut scalar_work_bytes = 0usize;
                 if result.rows.len() >= scan::MAX_QUERY_ROWS {
                     return Err(SqlError::Limit);
                 }
