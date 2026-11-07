@@ -72,16 +72,18 @@ fn count_parameter_limit_inference_matches_pg18() {
 }
 
 fn fresh() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let root = std::env::temp_dir().join("dd68-count-inference");
     std::fs::create_dir_all(&root).unwrap();
     root.join(format!(
-        "count-{}-{:?}-{}",
+        "count-{}-{:?}-{}-{}",
         std::process::id(),
         std::thread::current().id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 

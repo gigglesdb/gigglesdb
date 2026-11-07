@@ -1,16 +1,53 @@
 use giggles_core::{Admin, CoreError, Limits, relational::SqlError};
 fn fresh() -> std::path::PathBuf {
-    let root = std::env::temp_dir().join("dd68-filter-planning");
-    std::fs::create_dir_all(&root).unwrap();
-    root.join(format!(
-        "filter-{}-{}",
-        std::process::id(),
+    fresh_at(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+    )
+}
+
+fn fresh_at(timestamp: u128) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join("dd68-filter-planning");
+    std::fs::create_dir_all(&root).unwrap();
+    root.join(format!(
+        "filter-{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
+
+#[test]
+fn fixture_paths_are_unique_with_a_coarse_clock() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let paths = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..8)
+                        .map(|_| {
+                            let path = fresh_at(timestamp);
+                            let admin = Admin::create(&path, Limits::default()).unwrap();
+                            drop(admin);
+                            path
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    assert_eq!(paths.len(), 64);
+}
+
 #[test]
 fn filter_planning_pg18_ordered_error_contract() {
     let a = Admin::create(fresh(), Limits::default()).unwrap();

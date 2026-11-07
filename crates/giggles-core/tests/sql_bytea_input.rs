@@ -2,9 +2,21 @@ use giggles_core::{
     Admin, CoreError, Limits,
     relational::{SqlError as E, Value as V},
 };
+fn fresh(prefix: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
 #[test]
 fn bytea_consumers_pg18_fixture() {
-    let path = std::env::temp_dir().join(format!("bytea-candidate-{}", std::process::id()));
+    let path = fresh("bytea-candidate");
     let a = Admin::create(path, Limits::default()).unwrap();
     let mut s = a.sql_session();
     {
@@ -210,11 +222,7 @@ fn nested_contexts() {
         Admin, CoreError, Limits,
         relational::{SqlError as E, Value as V},
     };
-    let a = Admin::create(
-        std::env::temp_dir().join(format!("bytea-nested-{}", std::process::id())),
-        Limits::default(),
-    )
-    .unwrap();
+    let a = Admin::create(fresh("bytea-nested"), Limits::default()).unwrap();
     let mut s = a.sql_session();
     let got=s.execute("SELECT octet_length($1::text::bytea), encode(substring($1::text::bytea FROM 1 FOR 2),'hex')",&[V::Text("\\101bc".into())],None).unwrap();
     assert_eq!(got.rows[0].values, vec![V::Int(3), V::Text("4162".into())]);
