@@ -128,6 +128,39 @@ fn ident(i: &a::Ident) -> String {
 fn object(n: &a::ObjectName) -> Vec<String> {
     n.0.iter().map(ident).collect()
 }
+fn unqualified_catalog(name: &str) -> bool {
+    catalog::relation_namespace(name) == "pg_catalog" && catalog::schema(name).is_some()
+}
+fn regclass_oid(value: &str) -> R<u32> {
+    if let Ok(oid) = value.parse::<u32>() {
+        return Ok(oid);
+    }
+    if value.len() > MAX_SQL {
+        return Err(Error::Unsupported);
+    }
+    let mut parser = Parser::new(&PostgreSqlDialect {})
+        .with_recursion_limit(64)
+        .try_with_sql(value)
+        .map_err(|_| Error::Unsupported)?;
+    let name = parser
+        .parse_object_name(false)
+        .map_err(|_| Error::Unsupported)?;
+    if parser.peek_token().token != Token::EOF
+        || name
+            .0
+            .iter()
+            .any(|ident| !matches!(ident.quote_style, None | Some('"')))
+    {
+        return Err(Error::Unsupported);
+    }
+    let parts = object(&name);
+    let name = match parts.as_slice() {
+        [name] if unqualified_catalog(name) => name,
+        [schema, name] if schema == catalog::relation_namespace(name) => name,
+        _ => return Err(Error::Unsupported),
+    };
+    catalog::relation_oid(name).ok_or(Error::Unsupported)
+}
 fn function(n: &a::ObjectName) -> R<String> {
     let p = object(n);
     match p.as_slice() {
@@ -213,7 +246,7 @@ impl Visitor for Scan {
     fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
         let p = object(n);
         let is_catalog = match p.as_slice() {
-            [n] => catalog::schema(n).is_some(),
+            [n] => unqualified_catalog(n),
             [s, _] => s == "pg_catalog" || s == "information_schema",
             _ => false,
         };
@@ -515,7 +548,7 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 }
                 let name = ident(&cte.alias.name);
-                if self.ctes.contains_key(&name) || catalog::schema(&name).is_some() {
+                if self.ctes.contains_key(&name) || unqualified_catalog(&name) {
                     return Err(Error::Unsupported);
                 }
                 let compiled = self.query(&cte.query, &vec![])?;
@@ -1020,7 +1053,15 @@ impl Compiler {
                 }
                 let p = object(name);
                 let n = p.last().ok_or(Error::Unsupported)?.clone();
-                if p.len() > 2 || p.len() == 2 && p[0] != "pg_catalog" {
+                if p.len() > 2
+                    || p.len() == 2
+                        && p[0]
+                            != if args.is_some() {
+                                "pg_catalog"
+                            } else {
+                                catalog::relation_namespace(&n)
+                            }
+                {
                     return Err(Error::Unsupported);
                 }
                 if let Some(args) = args {
@@ -1101,6 +1142,9 @@ impl Compiler {
                         let fields = q.fields.clone();
                         (Source::Derived(q), fields, alias, n)
                     } else {
+                        if p.len() == 1 && !unqualified_catalog(&n) {
+                            return Err(Error::Unsupported);
+                        }
                         (
                             Source::Catalog(n.clone()),
                             catalog::schema(&n).ok_or(Error::Unsupported)?,
@@ -2891,14 +2935,7 @@ impl Runtime<'_> {
             K::IntegerOid(e, source) => integer_oid(ev(e)?, *source)?,
             K::Regclass(e) => match ev(e)? {
                 N => N,
-                S(s) => {
-                    let name = s.strip_prefix("pg_catalog.").unwrap_or(&s);
-                    I(if let Ok(oid) = name.parse::<u32>() {
-                        oid as i64
-                    } else {
-                        catalog::relation_oid(name).ok_or(Error::Unsupported)? as i64
-                    })
-                }
+                S(s) => I(regclass_oid(&s)? as i64),
                 I(i) => I(i),
                 _ => return Err(Error::Type),
             },

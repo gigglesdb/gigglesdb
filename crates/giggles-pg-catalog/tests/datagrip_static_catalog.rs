@@ -458,7 +458,7 @@ fn catalog_identity_authorized_facts_and_null_xmin() {
     ));
     assert_eq!(
         run("select xmin from pg_catalog.pg_namespace", &[]).rows,
-        vec![vec![Value::Null], vec![Value::Null]]
+        vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]]
     );
     assert!(matches!(
         plan("select age(xmin) from pg_catalog.pg_proc"),

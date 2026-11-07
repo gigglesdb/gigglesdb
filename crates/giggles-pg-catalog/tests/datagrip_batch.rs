@@ -52,7 +52,7 @@ fn captured_expanded_global_discovery() {
         let expected = match i + 1 {
             2 => 17,
             5 => 1,
-            11 => 2,
+            11 => 3,
             _ => 0,
         };
         assert_eq!(r.rows.len(), expected, "case {}", i + 1);

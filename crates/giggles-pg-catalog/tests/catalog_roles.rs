@@ -261,7 +261,11 @@ fn owners_follow_snapshot_with_oid10_fallback() {
             "SELECT nspname,nspowner FROM pg_namespace ORDER BY nspname"
         )
         .rows,
-        vec![vec![s("pg_catalog"), i(10)], vec![s("public"), i(6171)]]
+        vec![
+            vec![s("information_schema"), i(10)],
+            vec![s("pg_catalog"), i(10)],
+            vec![s("public"), i(6171)]
+        ]
     );
 }
 

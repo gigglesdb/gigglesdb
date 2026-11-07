@@ -65,6 +65,7 @@ fn exact_jdbc_schemas() {
     assert_eq!(
         r.rows,
         vec![
+            vec![s("information_schema"), Value::Null],
             vec![s("pg_catalog"), Value::Null],
             vec![s("public"), Value::Null]
         ]
@@ -595,7 +596,7 @@ fn exact_transport_and_parameter_descriptors() {
 fn no_postgres_mvcc_state_is_invented() {
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").rows,
-        vec![vec![Value::Null], vec![Value::Null]]
+        vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]]
     );
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").fields[0]

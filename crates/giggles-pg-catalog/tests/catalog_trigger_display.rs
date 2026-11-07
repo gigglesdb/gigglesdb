@@ -204,8 +204,7 @@ fn exact_remaining_output_n_and_n_plus_one() {
         Error::Limit
     );
     // A later row also receives the aggregate remaining-output budget.
-    let across_rows =
-        "SELECT CASE WHEN n.oid=11 THEN $1::text ELSE encode($2,'escape') END FROM pg_namespace n";
+    let across_rows = "SELECT CASE WHEN n.oid=11 THEN $1::text ELSE encode($2,'escape') END FROM pg_namespace n WHERE n.oid IN (11,2200)";
     assert_eq!(
         run(across_rows, &params).unwrap().rows,
         vec![
@@ -215,7 +214,7 @@ fn exact_remaining_output_n_and_n_plus_one() {
     );
     assert_eq!(
         run(
-            "SELECT CASE WHEN n.oid=11 THEN $1::text ELSE encode($2,'escape') END,false FROM pg_namespace n",
+            "SELECT CASE WHEN n.oid=11 THEN $1::text ELSE encode($2,'escape') END,false FROM pg_namespace n WHERE n.oid IN (11,2200)",
             &params
         )
         .unwrap_err(),
@@ -234,17 +233,17 @@ fn global_output_and_work_admission() {
         run(&sql, &[Value::Bytes(vec![b'a'; MAX_BYTES / 2])]).unwrap_err(),
         Error::Limit
     );
-    // This fixed two-namespace, one-result query reaches exactly2,000,000
-    // work units at653055 ASCII bytes; one more byte exceeds the work cap.
+    // This fixed three-namespace, one-result query reaches exactly2,000,000
+    // work units at653053 ASCII bytes; one more byte exceeds the work cap.
     // Both outputs fit4MiB, so output admission cannot hide the work boundary.
     assert_eq!(
-        run(&sql, &[Value::Bytes(vec![b'a'; 653_055])])
+        run(&sql, &[Value::Bytes(vec![b'a'; 653_053])])
             .unwrap()
             .rows,
-        vec![vec![Value::Text("a".repeat(653_055))]]
+        vec![vec![Value::Text("a".repeat(653_053))]]
     );
     assert_eq!(
-        run(&sql, &[Value::Bytes(vec![b'a'; 653_056])]).unwrap_err(),
+        run(&sql, &[Value::Bytes(vec![b'a'; 653_054])]).unwrap_err(),
         Error::Limit
     );
 }

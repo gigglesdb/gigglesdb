@@ -1,3 +1,4 @@
+mod information_schema;
 use crate::*;
 use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct Relation {
@@ -65,6 +66,9 @@ pub fn table_oid(id: u64) -> R<u32> {
     })
 }
 pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
+    if let Some(fields) = information_schema::schema(name) {
+        return Some(fields);
+    }
     Some(fields(match name {
         "pg_namespace" => &[
             ("oid", T::Oid),
@@ -612,6 +616,11 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
 }
 pub(crate) fn known_names() -> &'static [&'static str] {
     &[
+        "schemata",
+        "tables",
+        "columns",
+        "table_constraints",
+        "key_column_usage",
         "pg_namespace",
         "pg_class",
         "pg_attribute",
@@ -658,7 +667,17 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_trigger",
     ]
 }
+pub(crate) fn relation_namespace(name: &str) -> &'static str {
+    if information_schema::identity(name).is_some() {
+        "information_schema"
+    } else {
+        "pg_catalog"
+    }
+}
 pub(crate) fn relation_oid(name: &str) -> Option<u32> {
+    if let Some((oid, _)) = information_schema::identity(name) {
+        return Some(oid);
+    }
     Some(match name {
         "pg_class" => 1259,
         "pg_type" => 1247,
@@ -872,7 +891,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
-    for (id, name, owner) in [(11, "pg_catalog", 10), (2200, "public", 6171)] {
+    for (id, name, owner) in [
+        (11, "pg_catalog", 10),
+        (2200, "public", 6171),
+        (13293, "information_schema", 10),
+    ] {
         // No PostgreSQL MVCC tuple exists: xmin is NULL, never a made-up transaction ID.
         add("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
     }
@@ -967,19 +990,26 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     for &name in known_names() {
         let oid = relation_oid(name).unwrap() as i64;
         let fs = schema(name).unwrap();
+        let info = information_schema::identity(name);
+        let namespace = if info.is_some() { 13293 } else { 11 };
+        let rowtype = info.map_or(32768 + oid, |(_, ty)| i64::from(ty));
         add(
             "pg_class",
             vec![
                 I(oid),
                 s(name),
-                I(11),
-                s(if name == "pg_indexes" { "v" } else { "r" }),
+                I(namespace),
+                s(if name == "pg_indexes" || info.is_some() {
+                    "v"
+                } else {
+                    "r"
+                }),
                 I(10),
                 I(fs.len() as i64),
                 B(false),
                 s("p"),
                 B(false),
-                I(32768 + oid),
+                I(rowtype),
                 I(0),
                 I(0),
                 N,
@@ -990,7 +1020,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         );
         add(
             "pg_type",
-            composite_row((32768 + oid) as u32, name, 11, oid, 10),
+            composite_row(rowtype as u32, name, namespace, oid, 10),
         );
         for (i, f) in fs.iter().enumerate() {
             add(
@@ -1405,6 +1435,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     for row in &mut all.get_mut("pg_database").unwrap().rows {
         row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N]);
     }
+    information_schema::populate(snapshot, &key_names, &mut all)?;
     let total: usize = all
         .values()
         .flat_map(|r| &r.rows)
