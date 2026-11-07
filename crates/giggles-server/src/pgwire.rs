@@ -12,8 +12,14 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
+#[path = "pgwire_settings_functions.rs"]
+mod settings_functions;
 #[path = "pgwire_simple.rs"]
 mod simple;
+use simple::{execute_settings, parse_settings, settings_status, show_settings};
+#[path = "pgwire_transaction.rs"]
+mod transaction;
+use transaction::{admin_command, execute_mode, parse_control, read_only_check};
 
 type R<T> = Result<T, &'static str>;
 const MAX_OBJECTS: usize = 32;
@@ -107,9 +113,20 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 #[derive(Default)]
 struct Diagnostic {
     phase: &'static str,
+    message: Option<&'static str>,
     query_id: Option<String>,
 }
 impl Diagnostic {
+    // Only errors returned by the settings/mode parsers receive GUC diagnostics.
+    fn settings<T>(&mut self, result: R<T>) -> R<T> {
+        result.inspect_err(|code| {
+            self.message = match *code {
+                "42704" => Some("unrecognized configuration parameter"),
+                "22023" => Some("invalid parameter value; not supported by this server profile"),
+                _ => None,
+            };
+        })
+    }
     fn query(&mut self, sql: &str) {
         use sha2::{Digest, Sha256};
         self.query_id = Some(hex::encode(Sha256::digest(sql.as_bytes())));
@@ -533,9 +550,10 @@ fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_c
 enum Plan {
     Empty,
     Admin(crate::auth::statements::AdminStatement),
-    Control(&'static str),
+    Control(crate::pg_transaction::Command),
     Settings(Vec<crate::pg_settings::Setting>),
     Inspect(crate::pg_settings::Show),
+    SettingsFunction(crate::pg_settings::Function),
     Catalog(
         Box<giggles_pg_catalog::Plan>,
         Vec<giggles_pg_catalog::Field>,
@@ -567,6 +585,7 @@ impl Statement {
             | Plan::Empty
             | Plan::Settings(_)
             | Plan::Control(_)
+            | Plan::SettingsFunction(_)
             | Plan::Inspect(_) => Ok(self.d.clone()),
         }
     }
@@ -671,10 +690,12 @@ fn execute_control(
     session: &mut Session,
     implicit: &mut bool,
     settings: &mut crate::pg_settings::SessionSettings,
+    out: &mut Vec<u8>,
 ) -> R<&'static str> {
     if !session.role.is_sql() {
         return Err("42501");
     }
+    let before = settings.current.clone();
     let was = session.in_transaction();
     let actual = if command == "COMMIT" && session.is_aborted() {
         "ROLLBACK"
@@ -696,6 +717,7 @@ fn execute_control(
     }
     *implicit = false;
     settings.transaction(was, session.in_transaction(), actual);
+    settings_status(&before, settings, session, out)?;
     Ok(actual)
 }
 impl State {
@@ -722,6 +744,7 @@ impl State {
             b'S' => {
                 r.end()?;
                 self.drain = false;
+                let before = self.settings.current.clone();
                 if self.implicit {
                     self.implicit = false;
                     if session.is_aborted() {
@@ -741,6 +764,7 @@ impl State {
                 if !session.in_transaction() {
                     self.portals.clear();
                 }
+                settings_status(&before, &self.settings, session, out)?;
                 ready(session, out)?;
             }
             b'H' => {
@@ -796,7 +820,7 @@ impl State {
                             parameters: vec![],
                         },
                     )
-                } else if let Some(command) = control(&sql) {
+                } else if let Some(command) = parse_control(&sql, session, &mut self.diagnostic)? {
                     if !session.role.is_sql() {
                         return Err("42501");
                     }
@@ -807,10 +831,11 @@ impl State {
                             parameters: vec![],
                         },
                     )
-                } else if let Some(show) = crate::pg_settings::show(&sql)? {
+                } else if let Some(show) = show_settings(&sql, session, &mut self.diagnostic)? {
                     let (description, _) = inspect(show, &self.settings.current, session)?;
                     (Plan::Inspect(show), description)
-                } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
+                } else if let Some(settings) = parse_settings(&sql, session, &mut self.diagnostic)?
+                {
                     if !session.role.is_sql() {
                         return Err("42501");
                     }
@@ -833,6 +858,11 @@ impl State {
                     }
                     let task = crate::task_statement::TaskStatement::parse(&sql)?;
                     (Plan::Task(task), task.description())
+                } else if let Some(function) =
+                    settings_functions::parse(&sql, session, &mut self.diagnostic)?
+                {
+                    let description = settings_functions::description(&function);
+                    (Plan::SettingsFunction(function), description)
                 } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
                     let (epoch, _, _) = core(session.catalog_snapshot())?;
                     let fields =
@@ -1059,6 +1089,12 @@ impl State {
                     if p.result.is_some() {
                         return Err("55000");
                     }
+                    read_only_check(
+                        admin_command(stmt),
+                        &self.settings,
+                        session,
+                        &mut self.diagnostic,
+                    )?;
                     let tag = session.execute_admin(stmt)?;
                     self.admin_completed = true;
                     p.result = Some(SqlResult::default());
@@ -1073,6 +1109,7 @@ impl State {
                         return Err("0A000");
                     }
                     if p.catalog_result.is_none() {
+                        self.settings.queried = true;
                         let result = catalog_wire::execute(
                             plan,
                             &catalog_wire::snapshot(session, tables, indexes),
@@ -1117,12 +1154,33 @@ impl State {
                     frame(b'I', &[], out)?;
                     return Ok(true);
                 }
+                if matches!(p.s.p, Plan::SettingsFunction(_)) {
+                    settings_functions::execute(
+                        p,
+                        session,
+                        &mut self.implicit,
+                        &mut self.settings,
+                        &mut self.diagnostic,
+                        retained,
+                        out,
+                    )?;
+                    return Ok(true);
+                }
                 if let Plan::Control(command) = p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
-                    let actual =
-                        execute_control(command, session, &mut self.implicit, &mut self.settings)?;
+                    if matches!(command, crate::pg_transaction::Command::Session(_)) {
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    }
+                    let actual = execute_mode(
+                        command,
+                        session,
+                        &mut self.implicit,
+                        &mut self.settings,
+                        &mut self.diagnostic,
+                        out,
+                    )?;
                     p.result = Some(SqlResult::default());
                     complete(actual, &SqlResult::default(), out)?;
                     if !session.in_transaction() {
@@ -1140,12 +1198,20 @@ impl State {
                     if p.result.is_some() {
                         return Err("55000");
                     }
-                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    for setting in settings {
-                        self.settings.current.apply(setting);
+                    if !matches!(
+                        settings.as_slice(),
+                        [crate::pg_settings::Setting::Database { local: true, .. }]
+                    ) {
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }
+                    execute_settings(
+                        settings,
+                        &mut self.settings,
+                        session,
+                        session.in_transaction() && !self.implicit,
+                        out,
+                    )?;
                     p.result = Some(SqlResult::default());
-                    frame(b'C', b"SET\0", out)?;
                     return Ok(true);
                 }
                 // Task results are never retained in a portal. Each Execute is a
@@ -1206,8 +1272,12 @@ impl State {
                 }
                 if p.result.is_none() {
                     let command = prepared.command();
+                    read_only_check(command, &self.settings, session, &mut self.diagnostic)?;
                     if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    }
+                    if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
+                        self.settings.queried = true;
                     }
                     let result = if command == "BEGIN" && self.implicit {
                         self.implicit = false;
@@ -1368,6 +1438,11 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         drain: false,
     };
     startup_settings.timezone = timezone;
+    // Preserve the locked agent profile's existing presentation default.
+    if !matches!(session.role, Role::Database { .. }) {
+        startup_settings.search_path = "public".into();
+    }
+    state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     let mut admin_sync = false;
     loop {
@@ -1439,6 +1514,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             }
         };
         state.diagnostic = Diagnostic {
+            message: None,
             phase: match tag {
                 b'Q' => "simple query",
                 b'P' => "parse",
@@ -1480,7 +1556,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             state.implicit = false;
                             state.portals.clear();
                         }
-                        let message = match code {
+                        let message = state.diagnostic.message.unwrap_or(match code {
                             "0A000" => {
                                 "unsupported SQL feature or parameter type in this server profile"
                             }
@@ -1488,7 +1564,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 "statement syntax is not supported by this server SQL profile"
                             }
                             _ => "request rejected; consult documented code",
-                        };
+                        });
                         diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
                         if matches!(tag, b'Q' | b'S') {
                             state.drain = false;

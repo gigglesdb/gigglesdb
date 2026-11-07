@@ -3,6 +3,7 @@ mod blocking;
 pub mod clock;
 mod pg_catalog_wire;
 mod pg_settings;
+mod pg_transaction;
 pub mod pgwire;
 pub(crate) mod pgwire_startup;
 pub mod service;

@@ -1,0 +1,192 @@
+//! PostgreSQL transaction modes. The engine currently executes at serializable.
+use crate::pg_settings::database::Parser;
+
+type Result<T> = std::result::Result<T, &'static str>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IsolationLevel {
+    Serializable,
+    RepeatableRead,
+    ReadCommitted,
+    ReadUncommitted,
+}
+impl IsolationLevel {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "serializable" => Ok(Self::Serializable),
+            "repeatable read" => Ok(Self::RepeatableRead),
+            "read committed" => Ok(Self::ReadCommitted),
+            "read uncommitted" => Ok(Self::ReadUncommitted),
+            _ => Err("22023"),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Serializable => "serializable",
+            Self::RepeatableRead => "repeatable read",
+            Self::ReadCommitted => "read committed",
+            Self::ReadUncommitted => "read uncommitted",
+        }
+    }
+}
+/// GD-0054 F3b (track F v2 engine) will add real READ COMMITTED (planned default)
+/// and REPEATABLE READ; change only this function (and the default) then.
+pub(crate) fn effective_isolation(requested: IsolationLevel) -> IsolationLevel {
+    match requested {
+        IsolationLevel::Serializable
+        | IsolationLevel::RepeatableRead
+        | IsolationLevel::ReadCommitted
+        | IsolationLevel::ReadUncommitted => IsolationLevel::Serializable,
+    }
+}
+pub(crate) const DEFAULT_ISOLATION: IsolationLevel = IsolationLevel::Serializable;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Modes {
+    pub isolation: Option<IsolationLevel>,
+    pub read_only: Option<bool>,
+    pub deferrable: Option<bool>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    Begin(Modes),
+    Commit,
+    Rollback,
+    Set(Modes),
+    Session(Modes),
+}
+impl Command {
+    pub fn legacy(command: &str) -> Self {
+        match command {
+            "BEGIN" => Self::Begin(Modes::default()),
+            "COMMIT" => Self::Commit,
+            "ROLLBACK" => Self::Rollback,
+            _ => unreachable!(),
+        }
+    }
+}
+fn modes(p: &mut Parser, required: bool) -> Result<Modes> {
+    let mut modes = Modes::default();
+    let start = p.at;
+    loop {
+        if p.at == p.tokens.len() {
+            if required && p.at == start {
+                return Err("42601");
+            }
+            return Ok(modes);
+        }
+        if p.kw("ISOLATION") {
+            p.need("LEVEL")?;
+            modes.isolation = Some(if p.kw("SERIALIZABLE") {
+                IsolationLevel::Serializable
+            } else if p.kw("REPEATABLE") {
+                p.need("READ")?;
+                IsolationLevel::RepeatableRead
+            } else {
+                p.need("READ")?;
+                if p.kw("COMMITTED") {
+                    IsolationLevel::ReadCommitted
+                } else {
+                    p.need("UNCOMMITTED")?;
+                    IsolationLevel::ReadUncommitted
+                }
+            });
+        } else if p.kw("READ") {
+            modes.read_only = Some(if p.kw("ONLY") {
+                true
+            } else {
+                p.need("WRITE")?;
+                false
+            });
+        } else if p.kw("NOT") {
+            p.need("DEFERRABLE")?;
+            modes.deferrable = Some(false);
+        } else if p.kw("DEFERRABLE") {
+            modes.deferrable = Some(true);
+        } else {
+            return Err("42601");
+        }
+        if p.comma() && p.at == p.tokens.len() {
+            return Err("42601");
+        }
+    }
+}
+pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
+    let first = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    if ![
+        "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SET",
+    ]
+    .iter()
+    .any(|s| first.eq_ignore_ascii_case(s))
+    {
+        return Ok(None);
+    }
+    let mut p = Parser::new(sql)?;
+    let command = if p.kw("BEGIN") {
+        if !p.kw("WORK") {
+            p.kw("TRANSACTION");
+        }
+        Command::Begin(modes(&mut p, false)?)
+    } else if p.kw("START") {
+        p.need("TRANSACTION")?;
+        Command::Begin(modes(&mut p, false)?)
+    } else if p.kw("COMMIT") || p.kw("END") {
+        if !p.kw("WORK") {
+            p.kw("TRANSACTION");
+        }
+        Command::Commit
+    } else if p.kw("ROLLBACK") || p.kw("ABORT") {
+        if !p.kw("WORK") {
+            p.kw("TRANSACTION");
+        }
+        Command::Rollback
+    } else {
+        p.need("SET")?;
+        if p.kw("TRANSACTION") {
+            Command::Set(modes(&mut p, true)?)
+        } else if p.kw("SESSION") && p.kw("CHARACTERISTICS") {
+            p.need("AS")?;
+            p.need("TRANSACTION")?;
+            Command::Session(modes(&mut p, true)?)
+        } else {
+            return Ok(None);
+        }
+    };
+    p.end()?;
+    Ok(Some(command))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_requested_isolation_maps_to_the_engine_level() {
+        for requested in [
+            IsolationLevel::Serializable,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::ReadUncommitted,
+        ] {
+            assert_eq!(effective_isolation(requested), IsolationLevel::Serializable);
+        }
+    }
+    #[test]
+    fn bounded_modes_reject_suffixes_and_trailing_commas() {
+        for sql in [
+            "BEGIN READ ONLY,",
+            "START",
+            "COMMIT AND CHAIN",
+            "SET TRANSACTION",
+            "BEGIN ISOLATION LEVEL READ UNKNOWN",
+            "END WORK extra",
+        ] {
+            assert_eq!(parse(sql), Err("42601"), "{sql}");
+        }
+        assert!(matches!(
+            parse("begin work isolation level read committed, read only not deferrable"),
+            Ok(Some(Command::Begin(_)))
+        ));
+        assert_eq!(parse("SET SESSION application_name='x'"), Ok(None));
+    }
+}

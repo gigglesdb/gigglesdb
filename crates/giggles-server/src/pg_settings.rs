@@ -1,14 +1,42 @@
-//! Bounded presentation-only JDBC initialization commands, not a general SET engine.
+//! Session presentation settings. `parse`/`show` retain the locked agent grammar.
+#[path = "pg_settings_database.rs"]
+pub(crate) mod database;
+pub(crate) use database::{parse_database, show_database};
+#[path = "pg_settings_functions.rs"]
+mod functions;
+pub(crate) use functions::{Function, parse_function};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Setting {
     ApplicationName(String),
     ExtraFloatDigits(i32),
+    Database {
+        name: Show,
+        value: Option<String>,
+        local: bool,
+        reset: bool,
+    },
+    ResetAll,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub application_name: String,
     pub extra_float_digits: i32,
     pub timezone: String,
+    pub datestyle: String,
+    /// Only public contains engine tables; non-public schemas resolve nothing.
+    /// Unqualified names still resolve to public even for an empty path, until
+    /// schemas exist. This is an intentional restore-compatibility divergence.
+    pub search_path: String,
+    /// No NOTICE/DEBUG messages are emitted today. WARNING is suppressed at error.
+    pub client_min_messages: String,
+    /// Presentation only: there are no user-defined functions to validate.
+    pub check_function_bodies: String,
+    /// Presentation only: the engine has no XML type.
+    pub xmloption: String,
+    pub default_read_only: bool,
+    pub transaction_read_only: bool,
+    pub default_isolation: crate::pg_transaction::IsolationLevel,
+    pub transaction_isolation: crate::pg_transaction::IsolationLevel,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -16,6 +44,15 @@ impl Default for Settings {
             application_name: String::new(),
             extra_float_digits: 0,
             timezone: "UTC".into(),
+            datestyle: "ISO".into(),
+            search_path: r#""$user", public"#.into(),
+            client_min_messages: "notice".into(),
+            check_function_bodies: "on".into(),
+            xmloption: "content".into(),
+            default_read_only: false,
+            transaction_read_only: false,
+            default_isolation: crate::pg_transaction::DEFAULT_ISOLATION,
+            transaction_isolation: crate::pg_transaction::DEFAULT_ISOLATION,
         }
     }
 }
@@ -24,6 +61,7 @@ impl Settings {
         match setting {
             Setting::ApplicationName(value) => self.application_name.clone_from(value),
             Setting::ExtraFloatDigits(value) => self.extra_float_digits = *value,
+            Setting::Database { .. } | Setting::ResetAll => unreachable!("session assignment"),
         }
     }
 }
@@ -31,11 +69,19 @@ impl Settings {
 pub(crate) struct SessionSettings {
     pub current: Settings,
     saved: Option<Settings>,
+    pub defaults: Settings,
+    pub queried: bool,
+    local: std::collections::BTreeMap<Show, String>,
 }
 impl SessionSettings {
     pub fn transaction(&mut self, was: bool, now: bool, command: &str) {
         if !was && now {
             self.saved = Some(self.current.clone());
+            self.queried = false;
+            self.current.transaction_read_only = self.current.default_read_only;
+            self.current.transaction_isolation =
+                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+            self.local.clear();
         }
         if was && !now {
             if command == "ROLLBACK" {
@@ -44,22 +90,144 @@ impl SessionSettings {
                 }
             } else {
                 self.saved = None;
+                for (name, value) in std::mem::take(&mut self.local) {
+                    self.current.assign(name, value);
+                }
             }
+            self.local.clear();
+            self.queried = false;
+            self.current.transaction_read_only = self.current.default_read_only;
+            self.current.transaction_isolation =
+                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+        }
+    }
+    pub fn apply(&mut self, setting: &Setting, in_transaction: bool) -> bool {
+        match setting {
+            Setting::ResetAll => {
+                for name in RESETTABLE {
+                    self.local.remove(name);
+                    self.current.assign(*name, name.value(&self.defaults).1);
+                }
+            }
+            Setting::Database {
+                name, value, local, ..
+            } => {
+                if *local && !in_transaction {
+                    return true;
+                }
+                if *local {
+                    self.local
+                        .entry(*name)
+                        .or_insert_with(|| name.value(&self.current).1);
+                } else {
+                    self.local.remove(name);
+                }
+                let value = value
+                    .clone()
+                    .unwrap_or_else(|| name.value(&self.defaults).1);
+                self.current.assign(*name, value);
+            }
+            _ => self.current.apply(setting),
+        }
+        if !in_transaction {
+            self.current.transaction_read_only = self.current.default_read_only;
+            self.current.transaction_isolation =
+                crate::pg_transaction::effective_isolation(self.current.default_isolation);
+        }
+        false
+    }
+}
+impl Setting {
+    pub fn tag(&self) -> &'static str {
+        if matches!(self, Self::ResetAll | Self::Database { reset: true, .. }) {
+            "RESET"
+        } else {
+            "SET"
         }
     }
 }
+impl Settings {
+    fn assign(&mut self, name: Show, value: String) {
+        match name {
+            Show::ApplicationName => self.application_name = value,
+            Show::ExtraFloatDigits => {
+                self.extra_float_digits = value.parse().expect("validated GUC")
+            }
+            Show::TimeZone => self.timezone = value,
+            Show::DateStyle => self.datestyle = value,
+            Show::SearchPath => self.search_path = value,
+            Show::ClientMinMessages => self.client_min_messages = value,
+            Show::CheckFunctionBodies => self.check_function_bodies = value,
+            Show::XmlOption => self.xmloption = value,
+            Show::DefaultTransactionReadOnly => self.default_read_only = value == "on",
+            Show::DefaultTransactionIsolation => {
+                self.default_isolation =
+                    crate::pg_transaction::IsolationLevel::parse(&value).expect("validated GUC")
+            }
+            _ => {} // Fixed-value GUCs were validated by the parser.
+        }
+    }
+}
+pub(crate) const RESETTABLE: &[Show] = &[
+    Show::ApplicationName,
+    Show::ExtraFloatDigits,
+    Show::TimeZone,
+    Show::DateStyle,
+    Show::SearchPath,
+    Show::ClientEncoding,
+    Show::StandardConformingStrings,
+    Show::IntervalStyle,
+    Show::ByteaOutput,
+    Show::StatementTimeout,
+    Show::LockTimeout,
+    Show::IdleInTransactionSessionTimeout,
+    Show::DefaultTransactionReadOnly,
+    Show::DefaultTransactionIsolation,
+    Show::TransactionTimeout,
+    Show::ClientMinMessages,
+    Show::RowSecurity,
+    Show::CheckFunctionBodies,
+    Show::XmlOption,
+    Show::DefaultTablespace,
+    Show::DefaultTableAccessMethod,
+];
+pub(crate) const REPORTABLE: &[Show] = &[
+    Show::ApplicationName,
+    Show::TimeZone,
+    Show::DateStyle,
+    Show::ClientEncoding,
+    Show::StandardConformingStrings,
+    Show::IntervalStyle,
+    Show::SearchPath,
+];
 type Result<T> = std::result::Result<T, &'static str>;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Show {
     ApplicationName,
     ExtraFloatDigits,
     TransactionIsolation,
+    DefaultTransactionIsolation,
+    TransactionReadOnly,
+    DefaultTransactionReadOnly,
     SearchPath,
     ClientEncoding,
     ServerVersion,
     StandardConformingStrings,
     DateStyle,
     TimeZone,
+    IntervalStyle,
+    ByteaOutput,
+    StatementTimeout,
+    LockTimeout,
+    IdleInTransactionSessionTimeout,
+    TransactionTimeout,
+    ClientMinMessages,
+    /// No RLS exists: off is the only behavior; requests for on are rejected.
+    RowSecurity,
+    CheckFunctionBodies,
+    XmlOption,
+    DefaultTablespace,
+    DefaultTableAccessMethod,
 }
 impl Show {
     pub fn value(self, settings: &Settings) -> (&'static str, String) {
@@ -69,12 +237,60 @@ impl Show {
                 "extra_float_digits",
                 settings.extra_float_digits.to_string(),
             ),
-            Self::TransactionIsolation => ("transaction_isolation", "serializable".into()),
-            Self::SearchPath => ("search_path", "public".into()),
+            Self::TransactionIsolation => (
+                "transaction_isolation",
+                crate::pg_transaction::effective_isolation(settings.transaction_isolation)
+                    .name()
+                    .into(),
+            ),
+            Self::DefaultTransactionIsolation => (
+                "default_transaction_isolation",
+                crate::pg_transaction::effective_isolation(settings.default_isolation)
+                    .name()
+                    .into(),
+            ),
+            Self::TransactionReadOnly => (
+                "transaction_read_only",
+                if settings.transaction_read_only {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+            ),
+            Self::DefaultTransactionReadOnly => (
+                "default_transaction_read_only",
+                if settings.default_read_only {
+                    "on"
+                } else {
+                    "off"
+                }
+                .into(),
+            ),
+            Self::SearchPath => ("search_path", settings.search_path.clone()),
             Self::ClientEncoding => ("client_encoding", "UTF8".into()),
             Self::ServerVersion => ("server_version", "14.0".into()),
-            Self::DateStyle => ("DateStyle", "ISO".into()),
+            Self::DateStyle => ("DateStyle", settings.datestyle.clone()),
             Self::TimeZone => ("TimeZone", settings.timezone.clone()),
+            Self::IntervalStyle => ("IntervalStyle", "postgres".into()),
+            Self::ByteaOutput => ("bytea_output", "hex".into()),
+            Self::TransactionTimeout => ("transaction_timeout", "0".into()),
+            Self::ClientMinMessages => {
+                ("client_min_messages", settings.client_min_messages.clone())
+            }
+            Self::RowSecurity => ("row_security", "off".into()),
+            Self::CheckFunctionBodies => (
+                "check_function_bodies",
+                settings.check_function_bodies.clone(),
+            ),
+            Self::XmlOption => ("xmloption", settings.xmloption.clone()),
+            Self::DefaultTablespace => ("default_tablespace", "".into()),
+            Self::DefaultTableAccessMethod => ("default_table_access_method", "heap".into()),
+            Self::StatementTimeout => ("statement_timeout", "0".into()),
+            Self::LockTimeout => ("lock_timeout", "0".into()),
+            Self::IdleInTransactionSessionTimeout => {
+                ("idle_in_transaction_session_timeout", "0".into())
+            }
             Self::StandardConformingStrings => ("standard_conforming_strings", "on".into()),
         };
         (name, value)
@@ -301,6 +517,10 @@ mod tests {
         assert_eq!(show("show DateStyle"), Ok(Some(Show::DateStyle)));
         assert_eq!(show("SHOW timezone;"), Ok(Some(Show::TimeZone)));
         let mut settings = Settings::default();
+        assert_eq!(
+            Show::SearchPath.value(&settings),
+            ("search_path", r#""$user", public"#.into())
+        );
         assert_eq!(
             Show::DateStyle.value(&settings),
             ("DateStyle", "ISO".into())

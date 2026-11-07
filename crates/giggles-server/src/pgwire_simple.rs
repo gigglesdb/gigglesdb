@@ -32,7 +32,13 @@ impl State {
         for sql in statements {
             let completed = out.len();
             let result = (|| {
-                if control(&sql).is_none() {
+                if parse_control(&sql, session, &mut self.diagnostic)?.is_none_or(|command| {
+                    matches!(
+                        command,
+                        crate::pg_transaction::Command::Set(_)
+                            | crate::pg_transaction::Command::Session(_)
+                    )
+                }) {
                     begin_implicit(session, &mut implicit, &mut self.settings)?;
                 }
                 self.simple_statement(&sql, session, out, received, &mut implicit)?;
@@ -55,7 +61,8 @@ impl State {
         }
         if implicit {
             let completed = out.len();
-            if let Err(code) = execute_control("COMMIT", session, &mut implicit, &mut self.settings)
+            if let Err(code) =
+                execute_control("COMMIT", session, &mut implicit, &mut self.settings, out)
             {
                 self.simple_failure(code, true, completed, session, out);
             }
@@ -71,6 +78,7 @@ impl State {
         session: &mut Session,
         out: &mut Vec<u8>,
     ) {
+        let before = self.settings.current.clone();
         session.abort();
         if implicit {
             session.sql.rollback();
@@ -80,12 +88,13 @@ impl State {
         // Keep successful statements' responses; discard only a partially
         // encoded failing statement. The caller emits exactly one ReadyForQuery.
         out.truncate(completed);
+        let _ = settings_status(&before, &self.settings, session, out);
         let mut error = Vec::new();
-        let message = match code {
+        let message = self.diagnostic.message.unwrap_or(match code {
             "0A000" => "unsupported SQL feature or parameter type in this server profile",
             "42601" => "statement syntax is not supported by this server SQL profile",
             _ => "request rejected; consult documented code",
-        };
+        });
         diagnostic_error(code, message, Some(&self.diagnostic), &mut error);
         out.extend(error);
     }
@@ -139,15 +148,28 @@ impl State {
             )?;
             complete("SELECT", &result, out)?;
         } else if let Some(stmt) = crate::auth::statements::parse(sql) {
+            read_only_check(
+                admin_command(&stmt),
+                &self.settings,
+                session,
+                &mut self.diagnostic,
+            )?;
             let tag = session.execute_admin(&stmt)?;
             self.admin_completed = true;
             complete(tag, &SqlResult::default(), out)?;
         } else if crate::pg_settings::empty_sql(sql)? {
             frame(b'I', &[], out)?;
-        } else if let Some(command) = control(sql) {
-            let actual = execute_control(command, session, implicit, &mut self.settings)?;
+        } else if let Some(command) = parse_control(sql, session, &mut self.diagnostic)? {
+            let actual = execute_mode(
+                command,
+                session,
+                implicit,
+                &mut self.settings,
+                &mut self.diagnostic,
+                out,
+            )?;
             complete(actual, &SqlResult::default(), out)?;
-        } else if let Some(show) = crate::pg_settings::show(sql)? {
+        } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(show, &self.settings.current, session)?;
             row_description(&description, &[], out)?;
             rows(
@@ -160,19 +182,27 @@ impl State {
                 out,
             )?;
             complete("SHOW", &result, out)?;
-        } else if let Some(settings) = crate::pg_settings::parse(sql)? {
+        } else if let Some(settings) = parse_settings(sql, session, &mut self.diagnostic)? {
             if !session.role.is_sql() {
                 return Err("42501");
             }
             if session.is_aborted() {
                 return Err("25P02");
             }
-            for setting in &settings {
-                self.settings.current.apply(setting);
-                frame(b'C', b"SET\0", out)?;
-            }
+            execute_settings(
+                &settings,
+                &mut self.settings,
+                session,
+                session.in_transaction(),
+                out,
+            )?;
+        } else if let Some(function) =
+            settings_functions::parse(sql, session, &mut self.diagnostic)?
+        {
+            self.simple_settings_function(&function, session, implicit, out)?;
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic)? {
             self.diagnostic.phase = "catalog execution";
+            self.settings.queried = session.in_transaction();
             let (_, tables, indexes) = core(session.catalog_snapshot())?;
             let result = catalog_wire::execute(
                 &plan,
@@ -208,6 +238,8 @@ impl State {
             } else {
                 let p = core(session.prepare(sql))?;
                 let d = core(session.describe(&p))?;
+                read_only_check(p.command(), &self.settings, session, &mut self.diagnostic)?;
+                self.settings.queried = session.in_transaction();
                 let result = core(session.execute_prepared(&p, &[]))?;
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
@@ -355,6 +387,99 @@ fn push_statement(statements: &mut Vec<String>, statement: &mut Vec<u8>) {
     if !text.trim().is_empty() {
         statements.push(text);
     }
+}
+
+pub(super) fn parse_settings(
+    sql: &str,
+    session: &Session,
+    diagnostic: &mut Diagnostic,
+) -> R<Option<Vec<crate::pg_settings::Setting>>> {
+    if matches!(session.role, Role::Database { .. }) {
+        diagnostic.settings(crate::pg_settings::parse_database(sql))
+    } else {
+        crate::pg_settings::parse(sql)
+    }
+}
+pub(super) fn show_settings(
+    sql: &str,
+    session: &Session,
+    diagnostic: &mut Diagnostic,
+) -> R<Option<crate::pg_settings::Show>> {
+    if matches!(session.role, Role::Database { .. }) {
+        diagnostic.settings(crate::pg_settings::show_database(sql))
+    } else {
+        crate::pg_settings::show(sql)
+    }
+}
+pub(super) fn settings_status(
+    before: &crate::pg_settings::Settings,
+    settings: &crate::pg_settings::SessionSettings,
+    session: &Session,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    if matches!(session.role, Role::Database { .. }) {
+        for show in crate::pg_settings::REPORTABLE {
+            let (name, value) = show.value(&settings.current);
+            if value != show.value(before).1 {
+                let mut body = Vec::new();
+                z(name, &mut body);
+                z(&value, &mut body);
+                frame(b'S', &body, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn warning(
+    message: &str,
+    settings: &crate::pg_settings::Settings,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    if settings.client_min_messages == "error" {
+        return Ok(());
+    }
+    let mut body = vec![b'S'];
+    z("WARNING", &mut body);
+    body.push(b'C');
+    z("25P01", &mut body);
+    body.push(b'M');
+    z(message, &mut body);
+    body.push(0);
+    frame(b'N', &body, out)
+}
+pub(super) fn execute_settings(
+    assignments: &[crate::pg_settings::Setting],
+    settings: &mut crate::pg_settings::SessionSettings,
+    session: &Session,
+    local_allowed: bool,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    if !session.role.is_sql() {
+        return Err("42501");
+    }
+    if session.is_aborted() {
+        return Err("25P02");
+    }
+    for assignment in assignments {
+        let before = settings.current.clone();
+        let local = matches!(
+            assignment,
+            crate::pg_settings::Setting::Database { local: true, .. }
+        );
+        if settings.apply(
+            assignment,
+            session.in_transaction() && (!local || local_allowed),
+        ) {
+            warning(
+                "SET LOCAL can only be used in transaction blocks",
+                &settings.current,
+                out,
+            )?;
+        }
+        settings_status(&before, settings, session, out)?;
+        complete(assignment.tag(), &SqlResult::default(), out)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
