@@ -7,7 +7,11 @@ use std::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
 pub fn fresh(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("artifacts");
+    let root = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("giggles-core-artifacts")
+        });
     std::fs::create_dir_all(&root).unwrap();
     root.join(format!(
         "{name}-{}-{}-{}",

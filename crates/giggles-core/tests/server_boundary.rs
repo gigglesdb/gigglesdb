@@ -1,20 +1,11 @@
+mod common;
 use giggles_core::{
     relational::{DataType, SqlError, Value},
     *,
 };
-use std::{
-    collections::BTreeSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeSet;
 fn admin() -> Admin {
-    let path = std::path::PathBuf::from("artifacts").join(format!(
-        "p2-core-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = common::fresh("p2-core");
     std::fs::create_dir_all(&path).unwrap();
     Admin::create(path.join("db.redb"), Default::default()).unwrap()
 }
