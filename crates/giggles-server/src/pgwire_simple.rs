@@ -200,6 +200,14 @@ impl State {
             settings_functions::parse(sql, session, &mut self.diagnostic)?
         {
             self.simple_settings_function(&function, session, implicit, out)?;
+        } else if !session.role.is_sql()
+            && Prepared::rejects_unsupported_table_free_scalar(sql)
+        {
+            // DD-0068: authority precedes routine classification. Sessions without
+            // SQL authority (task bindings) must not learn whether a routine
+            // exists; they get the same 42501 that application prepare gives them.
+            self.diagnostic.phase = "application SQL";
+            return Err("42501");
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();

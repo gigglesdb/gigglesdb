@@ -863,6 +863,14 @@ impl State {
                 {
                     let description = settings_functions::description(&function);
                     (Plan::SettingsFunction(function), description)
+                } else if !session.role.is_sql()
+                    && Prepared::rejects_unsupported_table_free_scalar(&sql)
+                {
+                    // DD-0068: authority precedes routine classification. Sessions without
+                    // SQL authority (task bindings) must not learn whether a routine
+                    // exists; they get the same 42501 that application prepare gives them.
+                    self.diagnostic.phase = "application prepare";
+                    return Err("42501");
                 } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
                     let (epoch, _, _) = core(session.catalog_snapshot())?;
                     let fields =
