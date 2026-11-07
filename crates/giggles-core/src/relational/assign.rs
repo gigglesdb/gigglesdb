@@ -82,6 +82,9 @@ pub(super) fn plain_value(
                 (DataType::Integer, super::Value::Int(n)) if i32::try_from(*n).is_err() => {
                     return Err(SqlError::Overflow);
                 }
+                (DataType::Numeric, super::Value::Int(_)) => {
+                    bound = query::coerce(bound, &DataType::Numeric)?;
+                }
                 (DataType::Text, super::Value::Int(n)) => bound = super::Value::Text(n.to_string()),
                 (DataType::Text, super::Value::Bytes(bytes)) => {
                     use std::fmt::Write;

@@ -54,9 +54,9 @@ const OVERLAY_WIRE_DEVIATIONS: &[(usize, Option<&str>, &str, &str)] = &[
 const OVERLAY_ADVERSARIAL_DEVIATIONS: &[(&str, Option<&str>, &str, &str)] = &[
     (
         "overlay_int8_outside_int4",
-        Some("42804"),
+        None,
         "execute",
-        "Known gap (DD-0068 F4 follow-up): declared int8 narrowed by ::int4 is type-checked at Execute (42804); PG18 reports 22003 at Bind.",
+        "Parameter-dependent evaluation runs at Execute; PG18 custom planning reports the same SQLSTATE at Bind.",
     ),
     (
         "overlay_min_min",

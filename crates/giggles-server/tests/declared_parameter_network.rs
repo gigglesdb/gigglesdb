@@ -570,8 +570,8 @@ async fn short_binary_integer_parameters_are_protocol_errors() {
 }
 
 #[tokio::test]
-async fn declared_int8_cast_to_int4_out_of_range_keeps_execute_type_error() {
-    // Known gap (DD-0068 F4 follow-up): PG18 reports 22003 at Bind for an explicit/assignment narrowing of a declared int8; GigglesDB reports 42804 at Execute.
+async fn declared_integer_narrowing_cast_out_of_range_is_22003() {
+    // PG18.6 reports 22003 at Bind (custom-plan constant folding); GigglesDB evaluates parameter-dependent casts at Execute — same SQLSTATE, documented phase deviation.
     let fixture = Fixture::new().await;
     for (sql, oid, value) in [
         ("SELECT $1::int4", 20, &b"2147483648"[..]),
@@ -580,14 +580,14 @@ async fn declared_int8_cast_to_int4_out_of_range_keeps_execute_type_error() {
         ("SELECT $1::int4+0", 20, &b"2147483648"[..]),
     ] {
         let response = query(&fixture, sql, &[oid], false, &[Some(value)]).await;
-        assert_eq!(response.errors, ["42804"], "{response:?}");
+        assert_eq!(response.errors, ["22003"], "{response:?}");
         assert!(response.tags.contains(&b'1'), "{response:?}");
         assert!(response.tags.contains(&b'2'), "{response:?}");
         assert!(response.rows.is_empty(), "{response:?}");
     }
     let binary = 2147483648i64.to_be_bytes();
     let response = query(&fixture, "SELECT $1::int4", &[20], true, &[Some(&binary)]).await;
-    assert_eq!(response.errors, ["42804"], "{response:?}");
+    assert_eq!(response.errors, ["22003"], "{response:?}");
     assert!(response.tags.contains(&b'1'), "{response:?}");
     assert!(response.tags.contains(&b'2'), "{response:?}");
     assert!(response.rows.is_empty(), "{response:?}");
@@ -655,38 +655,302 @@ async fn declared_wider_integer_comparison_against_narrow_column_matches_pg18() 
         }
     }
     drop(stream);
-    for (sql, oid, value) in [
-        // Known gap: PG18 succeeds at Execute with no rows and ParameterDescription [20].
+    for (sql, oid, value, ids) in [
         (
             "SELECT id FROM t WHERE s = $1 ORDER BY id",
             20,
             &b"100000"[..],
+            &[][..],
         ),
-        // Known gap: PG18 succeeds at Execute with rows 1, 2 and ParameterDescription [20].
         (
             "SELECT id FROM t WHERE n < $1 ORDER BY id",
             20,
             &b"1099511627776"[..],
+            &["1", "2"][..],
         ),
-        // Known gap: PG18 succeeds at Execute with no rows and ParameterDescription [20].
         (
             "SELECT id FROM t WHERE n = $1 ORDER BY id",
             20,
             &b"1099511627776"[..],
+            &[][..],
         ),
-        // Known gap: PG18 succeeds at Execute with rows 1, 2 and ParameterDescription [23].
         (
             "SELECT id FROM t WHERE s < $1 ORDER BY id",
             23,
             &b"100000"[..],
+            &["1", "2"][..],
         ),
     ] {
         let response = query(&fixture, sql, &[oid], false, &[Some(value)]).await;
-        assert_eq!(response.errors, ["42804"], "{response:?}");
+        assert!(response.errors.is_empty(), "{response:?}");
         assert!(response.tags.contains(&b'1'), "{response:?}");
         assert!(response.tags.contains(&b'2'), "{response:?}");
         assert_eq!(response.parameters, [oid], "{response:?}");
-        assert!(response.rows.is_empty(), "{response:?}");
+        assert_eq!(response.columns, vec![vec![23], vec![23]], "{response:?}");
+        let rows: Vec<_> = ids
+            .iter()
+            .map(|id| vec![Some(id.as_bytes().to_vec())])
+            .collect();
+        assert_eq!(response.rows, rows, "{response:?}");
+        assert_eq!(
+            response.commands,
+            [format!("SELECT {}", ids.len())],
+            "{response:?}"
+        );
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn declared_integer_parameters_match_pg18_probe_table() {
+    let fixture = Fixture::new().await;
+    for sql in [
+        "CREATE TABLE t(id integer primary key, s smallint, n integer, b bigint)",
+        "INSERT INTO t VALUES (1, 1, 1, 1), (2, 2, 2, 2)",
+        "CREATE TABLE t2(id integer primary key, num numeric)",
+    ] {
+        let response = query(&fixture, sql, &[], false, &[]).await;
+        assert!(response.errors.is_empty(), "{response:?}");
+    }
+
+    struct Case {
+        sql: &'static str,
+        oids: &'static [u32],
+        values: &'static [&'static str],
+        column: Option<u32>,
+        rows: &'static [&'static str],
+        command: &'static str,
+    }
+    // An empty command denotes 22003 at Execute: Parse and Bind both complete.
+    let cases = [
+        Case {
+            sql: "SELECT id FROM t WHERE $1 = n ORDER BY id",
+            oids: &[20],
+            values: &["1099511627776"],
+            column: Some(23),
+            rows: &[],
+            command: "SELECT 0",
+        },
+        Case {
+            sql: "SELECT id FROM t WHERE id = $1",
+            oids: &[20],
+            values: &["1"],
+            column: Some(23),
+            rows: &["1"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT id FROM t WHERE id = $1",
+            oids: &[20],
+            values: &["1099511627776"],
+            column: Some(23),
+            rows: &[],
+            command: "SELECT 0",
+        },
+        Case {
+            sql: "SELECT id FROM t WHERE n IN ($1,$2) ORDER BY id",
+            oids: &[20, 20],
+            values: &["1099511627776", "2"],
+            column: Some(23),
+            rows: &["2"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "DELETE FROM t WHERE n = $1",
+            oids: &[20],
+            values: &["1099511627776"],
+            column: None,
+            rows: &[],
+            command: "DELETE 0",
+        },
+        Case {
+            sql: "SELECT $1 + 1",
+            oids: &[20],
+            values: &["5"],
+            column: Some(20),
+            rows: &["6"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1 + 1",
+            oids: &[21],
+            values: &["5"],
+            column: Some(23),
+            rows: &["6"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1 + $2",
+            oids: &[21, 21],
+            values: &["5", "6"],
+            column: Some(21),
+            rows: &["11"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1 + $2",
+            oids: &[21, 21],
+            values: &["20000", "20000"],
+            column: Some(21),
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "SELECT $1 + $2",
+            oids: &[23, 20],
+            values: &["5", "6"],
+            column: Some(20),
+            rows: &["11"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1 * 2",
+            oids: &[21],
+            values: &["20000"],
+            column: Some(23),
+            rows: &["40000"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1",
+            oids: &[20],
+            values: &["5"],
+            column: Some(20),
+            rows: &["5"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT $1",
+            oids: &[23],
+            values: &["5"],
+            column: Some(23),
+            rows: &["5"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "SELECT s + $1 FROM t WHERE id = 1",
+            oids: &[21],
+            values: &["32767"],
+            column: Some(21),
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "INSERT INTO t VALUES ($1, 1, 1, 1)",
+            oids: &[20],
+            values: &["2147483648"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "INSERT INTO t(id,s) VALUES (3,$1)",
+            oids: &[20],
+            values: &["40000"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "UPDATE t SET n = $1 WHERE id = 1",
+            oids: &[20],
+            values: &["1099511627776"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "UPDATE t SET s = $1 WHERE id = $2",
+            oids: &[23, 23],
+            values: &["40000", "1"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "UPDATE t SET n = $1 + 1 WHERE id = 1",
+            oids: &[20],
+            values: &["1099511627776"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "INSERT INTO t(id,n) VALUES (6,$1),(7,$2)",
+            oids: &[20, 20],
+            values: &["1", "1099511627776"],
+            column: None,
+            rows: &[],
+            command: "",
+        },
+        Case {
+            sql: "SELECT id FROM t WHERE id = 6",
+            oids: &[],
+            values: &[],
+            column: Some(23),
+            rows: &[],
+            command: "SELECT 0",
+        },
+        Case {
+            sql: "INSERT INTO t(id,s) VALUES (5,$1)",
+            oids: &[20],
+            values: &["7"],
+            column: None,
+            rows: &[],
+            command: "INSERT 0 1",
+        },
+        Case {
+            sql: "SELECT s FROM t WHERE id = 5",
+            oids: &[],
+            values: &[],
+            column: Some(21),
+            rows: &["7"],
+            command: "SELECT 1",
+        },
+        Case {
+            sql: "INSERT INTO t2(id,num) VALUES (3,$1)",
+            oids: &[20],
+            values: &["9"],
+            column: None,
+            rows: &[],
+            command: "INSERT 0 1",
+        },
+        Case {
+            sql: "SELECT num FROM t2 WHERE id = 3",
+            oids: &[],
+            values: &[],
+            column: Some(1700),
+            rows: &["9"],
+            command: "SELECT 1",
+        },
+    ];
+    for case in cases {
+        let values: Vec<_> = case
+            .values
+            .iter()
+            .map(|value| Some(value.as_bytes()))
+            .collect();
+        let response = query(&fixture, case.sql, case.oids, false, &values).await;
+        assert!(response.tags.contains(&b'1'), "{response:?}");
+        assert!(response.tags.contains(&b'2'), "{response:?}");
+        assert_eq!(response.parameters, case.oids, "{response:?}");
+        let columns = case
+            .column
+            .map_or_else(Vec::new, |oid| vec![vec![oid], vec![oid]]);
+        assert_eq!(response.columns, columns, "{response:?}");
+        let rows: Vec<_> = case
+            .rows
+            .iter()
+            .map(|value| vec![Some(value.as_bytes().to_vec())])
+            .collect();
+        assert_eq!(response.rows, rows, "{response:?}");
+        if case.command.is_empty() {
+            assert_eq!(response.errors, ["22003"], "{response:?}");
+            assert!(response.commands.is_empty(), "{response:?}");
+        } else {
+            assert!(response.errors.is_empty(), "{response:?}");
+            assert_eq!(response.commands, [case.command], "{response:?}");
+        }
     }
     fixture.stop().await;
 }

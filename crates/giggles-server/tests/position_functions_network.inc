@@ -40,12 +40,6 @@ const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
         "GD-0001 Q8 (open): application-session authority rejects table-free aggregates. PG18 returns 2.",
     ),
     (
-        75,
-        Some("0A000"),
-        "parse",
-        "A declared parameter type that conflicts with the inferred POSITION signature is rejected as unsupported before lookup. PG18: 42883.",
-    ),
-    (
         76,
         Some("0A000"),
         "parse",

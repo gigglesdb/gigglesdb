@@ -362,6 +362,7 @@ fn infer_mutation_parameter(
     if let Some(Some(ty)) = declared.get(n - 1) {
         let compatible = ty == target
             || (integer_type(ty) && integer_type(target))
+            || (assignment && *target == DataType::Numeric && integer_type(ty))
             || (assignment
                 && *target == DataType::Text
                 && (integer_type(ty) || *ty == DataType::Bytes));

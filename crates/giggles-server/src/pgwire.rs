@@ -569,10 +569,20 @@ fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
     }
 }
 
+fn core_declared_type(oid: u32) -> Option<DataType> {
+    match oid {
+        17 => Some(DataType::Bytes),
+        20 => Some(DataType::BigInt),
+        21 => Some(DataType::SmallInt),
+        23 => Some(DataType::Integer),
+        _ => None,
+    }
+}
+
 fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Plan, Description)> {
     let mut declared = oids
         .iter()
-        .map(|o| (*o == 17).then_some(DataType::Bytes))
+        .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
     let prepared = core(session.prepare_with_parameter_types(sql, &declared))?;
     let description = core(session.describe(&prepared))?;
