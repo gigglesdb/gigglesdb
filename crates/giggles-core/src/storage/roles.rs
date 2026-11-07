@@ -124,13 +124,12 @@ fn validate_name(name: &str) -> Result<(), RoleError> {
 }
 
 fn validate_verifier(verifier: Option<&str>) -> Result<(), RoleError> {
-    if let Some(verifier) = verifier {
-        if verifier.is_empty()
+    if let Some(verifier) = verifier
+        && (verifier.is_empty()
             || verifier.len() > MAX_VERIFIER
-            || !verifier.bytes().all(|byte| (b' '..=b'~').contains(&byte))
-        {
-            return Err(RoleError::Invalid);
-        }
+            || !verifier.bytes().all(|byte| (b' '..=b'~').contains(&byte)))
+    {
+        return Err(RoleError::Invalid);
     }
     Ok(())
 }
