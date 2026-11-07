@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 /// local timestamp, date and time functions return Unsupported without one.
 #[derive(Clone)]
 pub struct StatementClock {
+    /// Failure returned only when a SQL time function is evaluated.
+    /// transaction_us and statement_us are ignored while this is Some.
+    pub unavailable: Option<CoreError>,
     /// Transaction start instant, pinned across an explicit transaction.
     pub transaction_us: i64,
     /// Statement start instant; must be at least transaction_us.
@@ -24,6 +27,7 @@ pub struct StatementClock {
 impl std::fmt::Debug for StatementClock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StatementClock")
+            .field("unavailable", &self.unavailable)
             .field("transaction_us", &self.transaction_us)
             .field("statement_us", &self.statement_us)
             .field("zone", &self.zone)
@@ -34,7 +38,7 @@ impl std::fmt::Debug for StatementClock {
 
 /// Shared only by bound expressions from one execution. Prepared syntax never
 /// contains this context. The error slot bridges the SQL-only scalar evaluator
-/// without translating or cloning the caller's CoreError.
+/// without translating the caller's CoreError.
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionClock {
     clock: StatementClock,
@@ -52,6 +56,10 @@ impl ExecutionClock {
     }
     pub(crate) fn eval(&self, name: &str, precision: u32) -> Result<Value, SqlError> {
         let clock = &self.clock;
+        if let Some(error) = &clock.unavailable {
+            *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+            return Err(SqlError::Unsupported);
+        }
         let instant = match name {
             "statement_timestamp" => clock.statement_us,
             "clock_timestamp" => match (clock.wall.as_ref().ok_or(SqlError::Unsupported)?)() {

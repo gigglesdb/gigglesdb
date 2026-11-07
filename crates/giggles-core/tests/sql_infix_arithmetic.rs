@@ -1,6 +1,9 @@
 use giggles_core::{Admin, CoreError, Limits, relational::*};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Parallel tests can read the same nanosecond on Windows; a counter keeps paths unique.
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Db {
     admin: Option<Admin>,
     path: std::path::PathBuf,
@@ -8,12 +11,13 @@ struct Db {
 impl Db {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "giggles-infix-{}-{}",
+            "giggles-infix-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         Self {
             admin: Some(Admin::create(&path, Limits::default()).unwrap()),

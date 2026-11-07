@@ -190,6 +190,7 @@ fn searched_update_uses_one_statement_clock_for_every_row() {
             statement_us: 2_000,
             zone: Some(SessionZone::Fixed(0)),
             wall: None,
+            unavailable: None,
         };
         let result = s
             .execute_at(

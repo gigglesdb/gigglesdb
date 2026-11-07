@@ -1,8 +1,9 @@
 use crate::clock::Clock;
 use giggles_core::{
-    relational::{Prepared, SqlResult, Value},
+    relational::{Prepared, SqlResult, StatementClock, Value},
     *,
 };
+use giggles_pg_types::temporal::SessionZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -329,6 +330,8 @@ impl Service {
             connection: None,
             database: None,
             sql: self.admin.sql_session(),
+            zone: Some(SessionZone::Fixed(0)),
+            transaction_us: None,
         })
     }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
@@ -349,6 +352,8 @@ impl Service {
             database: None,
             fingerprint: fingerprint.to_owned(),
             sql: self.admin.sql_session(),
+            zone: Some(SessionZone::Fixed(0)),
+            transaction_us: None,
         })
     }
 }
@@ -361,8 +366,21 @@ pub struct Session {
     scoped: bool,
     pub(crate) connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) sql: SqlSession,
+    zone: Option<SessionZone>,
+    transaction_us: Option<i64>,
 }
 impl Session {
+    pub(crate) fn set_time_zone(&mut self, name: &str) {
+        self.zone = if ["UTC", "Etc/UTC", "GMT", "Z"]
+            .iter()
+            .any(|alias| name.eq_ignore_ascii_case(alias))
+        {
+            Some(SessionZone::Fixed(0))
+        } else {
+            // No PostgreSQL POSIX-offset parser is exposed by pg-types.
+            SessionZone::named(name).ok()
+        };
+    }
     pub(crate) fn check_binding(&self) -> Result<(), CoreError> {
         if let Role::Database { name } = &self.role {
             return self
@@ -645,7 +663,38 @@ impl Session {
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
             session.authorize(p)?;
-            let result = session.sql.execute_prepared(p, params, None)?;
+            // Recovery must remain available even after the host clock latches.
+            if session.sql.is_aborted() && p.command() == "ROLLBACK" {
+                let result = session.sql.execute_prepared(p, params, None);
+                if !session.sql.in_transaction() {
+                    session.transaction_us = None;
+                }
+                return result;
+            }
+            // pgwire can roll core back directly; ignore a pin unless a block is open.
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            }
+            let (statement_us, unavailable) = match session.service.clock.sql_micros() {
+                Ok(sample) => (sample, None),
+                Err(error) => (session.transaction_us.unwrap_or(0), Some(error)),
+            };
+            let transaction_us = session.transaction_us.unwrap_or(statement_us);
+            let service = session.service.clone();
+            let clock = StatementClock {
+                unavailable,
+                transaction_us,
+                statement_us,
+                zone: session.zone,
+                wall: Some(Arc::new(move || service.clock.sql_micros())),
+            };
+            let result = session.sql.execute_prepared_at(p, params, None, &clock);
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            } else if clock.unavailable.is_none() {
+                session.transaction_us = Some(transaction_us);
+            }
+            let result = result?;
             if p.is_ddl()
                 && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
             {
@@ -674,7 +723,11 @@ impl Session {
                 .trim_end_matches(';')
                 .eq_ignore_ascii_case("rollback")
         {
-            return self.sql.execute(sql, params, None);
+            let result = self.sql.execute(sql, params, None);
+            if !self.sql.in_transaction() {
+                self.transaction_us = None;
+            }
+            return result;
         }
         let p = self.prepare(sql)?;
         self.execute_prepared(&p, params)
@@ -883,6 +936,164 @@ mod lifecycle_tests {
             Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
             bindings,
         )
+    }
+    fn sql_instant(session: &mut Session, sql: &str) -> i64 {
+        match session.execute_sql(sql, &[]).unwrap().rows[0].values[0] {
+            Value::TimestampTz(value) => value.microseconds(),
+            ref value => panic!("expected timestamptz, got {value:?}"),
+        }
+    }
+    #[test]
+    fn sql_time_tracks_host_and_pins_transaction_start() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let first = sql_instant(&mut session, "SELECT now()");
+        let host = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap()
+            - 946_684_800_000_000;
+        assert!(first.abs_diff(host) < 2_000_000);
+        session.execute_sql("BEGIN", &[]).unwrap();
+        let now = sql_instant(&mut session, "SELECT now()");
+        let statement = sql_instant(&mut session, "SELECT statement_timestamp()");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(sql_instant(&mut session, "SELECT now()"), now);
+        assert!(sql_instant(&mut session, "SELECT statement_timestamp()") > statement);
+        session.execute_sql("COMMIT", &[]).unwrap();
+        assert!(sql_instant(&mut session, "SELECT now()") > now);
+        session.execute_sql("BEGIN", &[]).unwrap();
+        let stale = sql_instant(&mut session, "SELECT now()");
+        session.sql.rollback();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        session.execute_sql("BEGIN", &[]).unwrap();
+        assert!(sql_instant(&mut session, "SELECT now()") > stale);
+        session.execute_sql("ROLLBACK", &[]).unwrap();
+    }
+    #[test]
+    fn local_sql_time_uses_session_zone_and_unresolved_zones_stay_partial() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        session.set_time_zone("America/Chicago");
+        let result = session
+            .execute_sql("SELECT now(), CURRENT_DATE, LOCALTIMESTAMP", &[])
+            .unwrap();
+        let Value::TimestampTz(instant) = result.rows[0].values[0] else {
+            panic!("expected instant")
+        };
+        let local = SessionZone::named("America/Chicago")
+            .unwrap()
+            .to_local(instant)
+            .unwrap();
+        assert_eq!(result.rows[0].values[2], Value::Timestamp(local));
+        assert_eq!(
+            result.rows[0].values[1],
+            Value::Date(
+                giggles_pg_types::temporal::Date::from_days(
+                    i32::try_from(local.microseconds().div_euclid(86_400_000_000)).unwrap()
+                )
+                .unwrap()
+            )
+        );
+        session.set_time_zone("unresolved/timezone");
+        assert_eq!(
+            sqlstate(&session.execute_sql("SELECT CURRENT_DATE", &[]).unwrap_err()),
+            "0A000"
+        );
+        sql_instant(&mut session, "SELECT now()");
+        session.set_time_zone("+03:00");
+        assert!(session.zone.is_none());
+        for name in ["UTC", "etc/utc", "GMT", "Z"] {
+            session.set_time_zone(name);
+            assert!(matches!(session.zone, Some(SessionZone::Fixed(0))));
+        }
+    }
+    #[test]
+    fn uncertain_sql_clock_only_denies_time_functions_and_rollback_escapes() {
+        let (service, _) = fixture();
+        service
+            .admin
+            .roles()
+            .create(roles::NewRole {
+                name: "owner".into(),
+                login: true,
+                superuser: true,
+                ..roles::NewRole::default()
+            })
+            .unwrap();
+        let mut session = service.role_session("owner").unwrap();
+        service.clock.latch_uncertain();
+        // GigglesDB-specific: PostgreSQL now() does not fail on host-clock uncertainty.
+        assert_eq!(
+            sqlstate(&session.execute_sql("SELECT now()", &[]).unwrap_err()),
+            "55000"
+        );
+        assert!(!session.in_transaction());
+        assert_eq!(
+            session.execute_sql("SELECT 1", &[]).unwrap().rows[0].values,
+            vec![Value::Int(1)]
+        );
+        session
+            .execute_sql("CREATE TABLE uncertain_clock (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        session
+            .execute_sql("INSERT INTO uncertain_clock VALUES (7)", &[])
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_sql("SELECT id FROM uncertain_clock", &[])
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![Value::Int(7)]
+        );
+        session.execute_sql("BEGIN", &[]).unwrap();
+        assert!(session.transaction_us.is_none());
+        session.execute_sql("SELECT 1", &[]).unwrap();
+        assert!(session.transaction_us.is_none());
+        assert_eq!(
+            sqlstate(&session.execute_sql("SELECT now()", &[]).unwrap_err()),
+            "55000"
+        );
+        assert!(session.is_aborted());
+        session.execute_sql("ROLLBACK", &[]).unwrap();
+        assert!(!session.in_transaction());
+        assert!(session.transaction_us.is_none());
+        session.execute_sql("SELECT 1", &[]).unwrap();
+        assert_eq!(
+            sqlstate(&session.execute_sql("SELECT now()", &[]).unwrap_err()),
+            "55000"
+        );
+    }
+    #[test]
+    fn prepared_rollback_recovers_after_clock_failure_without_manual_abort() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        session.execute_sql("BEGIN", &[]).unwrap();
+        let rollback = session.prepare("ROLLBACK").unwrap();
+        let query = session.prepare("SELECT now()").unwrap();
+        service.clock.latch_uncertain();
+        assert_eq!(
+            sqlstate(&session.execute_prepared(&query, &[]).unwrap_err()),
+            "55000"
+        );
+        assert!(session.is_aborted());
+        assert_eq!(
+            sqlstate(
+                &session
+                    .execute_prepared(&rollback, &[Value::Null])
+                    .unwrap_err()
+            ),
+            "42804"
+        );
+        assert!(session.in_transaction());
+        session.execute_prepared(&rollback, &[]).unwrap();
+        assert!(!session.in_transaction());
+        assert!(!session.is_aborted());
+        assert!(session.transaction_us.is_none());
     }
     #[test]
     fn database_role_cannot_be_installed_as_a_fingerprint_binding() {

@@ -47,6 +47,7 @@ impl Drop for Fixture {
 }
 fn clock(transaction_us: i64, statement_us: i64) -> StatementClock {
     StatementClock {
+        unavailable: None,
         transaction_us,
         statement_us,
         zone: Some(SessionZone::Fixed(0)),
@@ -425,6 +426,88 @@ fn absent_clock_zone_and_wall_fail_closed_and_parser_errors_match_pg() {
 }
 
 #[test]
+fn unavailable_clock_only_fails_evaluated_time_functions() {
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    let mut c = clock(i64::MAX, i64::MIN);
+    c.unavailable = Some(CoreError::Policy(Error::UncertainTime));
+    c.zone = None;
+    let calls = Arc::new(AtomicI64::new(0));
+    let source = calls.clone();
+    c.wall = Some(Arc::new(move || {
+        source.fetch_add(1, Ordering::SeqCst);
+        Err(CoreError::Storage(
+            "wall must not override unavailable".into(),
+        ))
+    }));
+    for sql in [
+        "SELECT now()",
+        "SELECT transaction_timestamp()",
+        "SELECT statement_timestamp()",
+        "SELECT clock_timestamp()",
+        "SELECT CURRENT_TIMESTAMP",
+        "SELECT LOCALTIMESTAMP",
+        "SELECT CURRENT_DATE",
+        "SELECT CURRENT_TIME",
+        "SELECT LOCALTIME",
+    ] {
+        assert!(
+            matches!(
+                s.execute_at(sql, &[], None, &c),
+                Err(CoreError::Policy(Error::UncertainTime))
+            ),
+            "{sql}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(values(&mut s, "SELECT 1", &c), vec![Value::Int(1)]);
+    s.execute_at(
+        "CREATE TABLE unavailable_clock (id BIGINT PRIMARY KEY)",
+        &[],
+        None,
+        &c,
+    )
+    .unwrap();
+    s.execute_at("INSERT INTO unavailable_clock VALUES (1)", &[], None, &c)
+        .unwrap();
+    assert_eq!(
+        values(&mut s, "SELECT id FROM unavailable_clock", &c),
+        vec![Value::Int(1)]
+    );
+}
+
+#[test]
+fn unavailable_time_free_statements_preserve_or_leave_unset_transaction_pins() {
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    let mut unavailable = clock(i64::MAX, i64::MIN);
+    unavailable.unavailable = Some(CoreError::Policy(Error::UncertainTime));
+    for pin_first in [false, true] {
+        s.execute("BEGIN", &[], None).unwrap();
+        if pin_first {
+            assert_eq!(
+                values(&mut s, "SELECT now()", &clock(100, 100)),
+                vec![tz(100)]
+            );
+        }
+        assert_eq!(
+            values(&mut s, "SELECT 1", &unavailable),
+            vec![Value::Int(1)]
+        );
+        assert_eq!(
+            values(&mut s, "SELECT now()", &clock(100, 200)),
+            vec![tz(100)]
+        );
+        assert!(matches!(
+            s.execute_at("SELECT now()", &[], None, &unavailable),
+            Err(CoreError::Policy(Error::UncertainTime))
+        ));
+        assert!(s.is_aborted());
+        s.execute("ROLLBACK", &[], None).unwrap();
+    }
+}
+
+#[test]
 fn wall_clock_is_called_per_invocation_and_preserves_core_errors() {
     let f = Fixture::new();
     let mut s = f.admin().sql_session();
@@ -576,5 +659,18 @@ fn commit_clears_the_transaction_pin_for_a_later_unclocked_begin() {
         s.execute_at("SELECT now()", &[], None, &clock(201, 300)),
         Err(CoreError::Sql(SqlError::Type))
     ));
+    s.execute("ROLLBACK", &[], None).unwrap();
+}
+
+#[test]
+fn unavailable_begin_does_not_pin_a_placeholder_transaction_time() {
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    let mut down = clock(0, 0);
+    down.unavailable = Some(CoreError::Policy(Error::UncertainTime));
+    s.execute_at("BEGIN", &[], None, &down).unwrap();
+    // The first available statement pins its own transaction time, not the placeholder 0.
+    assert_eq!(values(&mut s, "SELECT now()", &clock(500, 500)), vec![tz(500)]);
+    assert_eq!(values(&mut s, "SELECT now()", &clock(500, 600)), vec![tz(500)]);
     s.execute("ROLLBACK", &[], None).unwrap();
 }

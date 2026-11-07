@@ -109,6 +109,22 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        // A multi-statement Query needs settings changes before its next SQL
+        // statement, rather than only at the enclosing protocol-frame boundary.
+        session.set_time_zone(&self.settings.current.timezone);
+        let result = self.simple_statement_inner(sql, session, out, received, implicit);
+        session.set_time_zone(&self.settings.current.timezone);
+        result
+    }
+
+    fn simple_statement_inner(
+        &mut self,
+        sql: &str,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        received: std::time::Instant,
+        implicit: &mut bool,
+    ) -> R<()> {
         if let Some(json) = sql.strip_prefix("GIGGLES ") {
             if !matches!(session.role, Role::Task { .. }) {
                 return Err("42501");

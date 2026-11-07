@@ -743,6 +743,16 @@ impl Query {
                     matches!(
                         name.as_str(),
                         "abs"
+                            // Clock functions read only the per-execution StatementClock.
+                            | "now"
+                            | "transaction_timestamp"
+                            | "statement_timestamp"
+                            | "clock_timestamp"
+                            | "current_timestamp"
+                            | "localtimestamp"
+                            | "current_date"
+                            | "current_time"
+                            | "localtime"
                             | "coalesce"
                             | "pi"
                             | "lower"

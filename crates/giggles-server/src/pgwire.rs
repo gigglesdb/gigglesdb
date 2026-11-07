@@ -730,6 +730,21 @@ impl State {
         out: &mut Vec<u8>,
         received: std::time::Instant,
     ) -> R<bool> {
+        // Settings also change through set_config and transaction recovery. Keep
+        // the execution clock's zone aligned on every dispatch exit, including errors.
+        session.set_time_zone(&self.settings.current.timezone);
+        let result = self.handle_inner(tag, b, session, out, received);
+        session.set_time_zone(&self.settings.current.timezone);
+        result
+    }
+    fn handle_inner(
+        &mut self,
+        tag: u8,
+        b: &[u8],
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        received: std::time::Instant,
+    ) -> R<bool> {
         let mut r = Reader { b, at: 0 };
         if self.drain && tag != b'S' && tag != b'X' {
             return Ok(true);
@@ -1462,6 +1477,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     }
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
+    session.set_time_zone(&state.settings.current.timezone);
     let mut admin_sync = false;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
@@ -1517,6 +1533,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                 if tag == b'S' && state.implicit {
                     session.sql.rollback();
                     state.settings.transaction(true, false, "ROLLBACK");
+                    session.set_time_zone(&state.settings.current.timezone);
                     state.implicit = false;
                     state.portals.clear();
                 }
@@ -1571,6 +1588,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                         if tag == b'S' && state.implicit {
                             session.sql.rollback();
                             state.settings.transaction(true, false, "ROLLBACK");
+                            session.set_time_zone(&state.settings.current.timezone);
                             state.implicit = false;
                             state.portals.clear();
                         }

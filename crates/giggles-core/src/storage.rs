@@ -1788,12 +1788,18 @@ impl SqlSession {
         self.guard_clock(clock)?;
         let context = relational::clock::ExecutionClock::new(clock);
         let result = self.execute_bound_clocked(p, params, expected_version, Some(&context));
-        if result.is_ok() && p.control() == Some("begin") {
+        // A BEGIN under an unavailable clock stays unpinned, so the first available clocked statement
+        // becomes the pin. That is acceptable: the server clock stays latched until restart.
+        if result.is_ok() && p.control() == Some("begin") && clock.unavailable.is_none() {
             self.transaction_clock_us = Some(clock.transaction_us);
         }
         result
     }
     fn guard_clock(&mut self, clock: &relational::StatementClock) -> Result<(), CoreError> {
+        // Unavailable instants cannot be validated or establish a transaction pin.
+        if clock.unavailable.is_some() {
+            return Ok(());
+        }
         use relational::SqlError as E;
         let error = if clock.statement_us < clock.transaction_us {
             Some(E::InvalidParameterValue)

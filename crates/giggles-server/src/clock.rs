@@ -29,6 +29,38 @@ impl Clock {
             after_certification: Mutex::new(None),
         })
     }
+    /// SQL time is not policy time: sampling does not certify or persist a watermark.
+    pub fn sql_micros(&self) -> Result<i64, CoreError> {
+        let mut s = self.state.lock().map_err(|_| uncertain())?;
+        let sampled_at = Instant::now();
+        let sample = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            s.2 = true;
+            uncertain()
+        })?;
+        let now = sample.as_secs();
+        let elapsed = s.0.elapsed();
+        if s.2
+            || elapsed > self.max_pause
+            || now < s.1
+            || now.abs_diff(s.1.saturating_add(elapsed.as_secs())) > self.skew.saturating_add(1)
+        {
+            s.2 = true;
+            return Err(uncertain());
+        }
+        let micros = i128::try_from(sample.as_micros())
+            .ok()
+            .and_then(|us| i64::try_from(us - 946_684_800_000_000).ok())
+            .ok_or_else(|| {
+                s.2 = true;
+                uncertain()
+            })?;
+        *s = (sampled_at, now, false);
+        Ok(micros)
+    }
+    #[cfg(test)]
+    pub(crate) fn latch_uncertain(&self) {
+        self.state.lock().unwrap().2 = true;
+    }
     pub fn now(&self, admin: &Admin) -> Result<(u64, u64), CoreError> {
         let mut s = self.state.lock().map_err(|_| uncertain())?;
         // Keep the monotonic anchor paired with the wall sample across certification.
@@ -93,6 +125,35 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Admin::create(dir.join("db.redb"), Default::default()).unwrap()
+    }
+    #[test]
+    fn sql_sample_matches_host_and_inherits_policy_latch() {
+        let c = Clock::new(0, 10).unwrap();
+        let actual = c.sql_micros().unwrap();
+        let expected = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros(),
+        )
+        .unwrap()
+            - 946_684_800_000_000;
+        assert!(actual.abs_diff(expected) < 2_000_000);
+        let a = admin();
+        c.state.lock().unwrap().1 = wall().unwrap() + 20;
+        assert!(c.now(&a).is_err());
+        assert!(matches!(
+            c.sql_micros(),
+            Err(CoreError::Policy(Error::UncertainTime))
+        ));
+    }
+    #[test]
+    fn sql_discontinuity_latches_policy_clock() {
+        let c = Clock::new(0, 10).unwrap();
+        c.state.lock().unwrap().1 = wall().unwrap() + 20;
+        assert!(c.sql_micros().is_err());
+        c.state.lock().unwrap().1 = wall().unwrap();
+        assert!(c.now(&admin()).is_err());
     }
     #[test]
     fn cancelled_watermark_does_not_latch_clock_uncertainty() {

@@ -2,6 +2,9 @@ use bincode::Options;
 use giggles_core::{Admin, CoreError, Limits, local, relational::SqlError as E};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Parallel tests can read the same nanosecond on Windows; a counter keeps paths unique.
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[test]
 fn e1_error_names_and_local_codes() {
     let le = bincode::DefaultOptions::new()
@@ -139,12 +142,13 @@ fn e1_error_names_and_local_codes() {
 #[test]
 fn sql_create_reports_duplicate_table_and_column() {
     let path = std::env::temp_dir().join(format!(
-        "giggles-sql-e1-errors-{}-{}",
+        "giggles-sql-e1-errors-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let admin = Admin::create(&path, Limits::default()).unwrap();
     let mut session = admin.sql_session();
