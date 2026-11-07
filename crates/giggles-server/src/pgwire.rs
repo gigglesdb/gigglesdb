@@ -516,6 +516,9 @@ fn core<T>(r: Result<T, CoreError>) -> R<T> {
 fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_catalog::Plan>> {
     diagnostic.phase = "catalog planning";
     match giggles_pg_catalog::plan_gateway(sql) {
+        Ok(None) if Prepared::rejects_unsupported_table_free_scalar(sql) => {
+            Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported))
+        }
         // Preserve the finite application grammar's own diagnostics (for
         // example COPY rejection). Core still parses and authorizes the entire
         // original statement; no failed catalog plan is executed as metadata.

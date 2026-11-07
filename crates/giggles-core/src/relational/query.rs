@@ -672,6 +672,57 @@ impl Query {
                 Expr::Literal(_) | Expr::Param(_) => true,
             })
     }
+    /// Negative diagnostic classification only; this never grants table-free access.
+    pub(super) fn rejects_unsupported_table_free_scalar(&self) -> bool {
+        fn scalar(s: &Scalar) -> bool {
+            match s {
+                Scalar::Literal(_) | Scalar::Param(_) => true,
+                Scalar::Column(_) => false,
+                Scalar::Cast(s, _) => scalar(s),
+                Scalar::Call(_, args) => args.iter().all(scalar),
+                Scalar::SubstringOrder([first, second, third]) => {
+                    scalar(first) && scalar(second) && scalar(third)
+                }
+            }
+        }
+        fn operand(s: &Scalar) -> bool {
+            s.reject_nested_aggregate().is_ok() && scalar(s)
+        }
+        fn filter(f: &Filter) -> bool {
+            match f {
+                Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
+                Filter::Compare(a, _, b) => operand(a) && operand(b),
+                Filter::Not(f) => filter(f),
+                Filter::Logic(a, _, b) => filter(a) && filter(b),
+            }
+        }
+        // Keep the authoritative positive proof and its routine registry unchanged.
+        // Every dependency-bearing AST field must be reviewed when the AST grows.
+        let Self {
+            explain,
+            sources,
+            joins,
+            items,
+            predicates,
+            filter: predicate,
+            order,
+            limit,
+        } = self;
+        !self.is_table_free()
+            && !explain
+            && sources.is_empty()
+            && joins.is_empty()
+            && predicates.is_empty()
+            && items.iter().all(|(item, _)| match item {
+                Item::Scalar(s) => operand(s),
+                Item::Aggregate(_, _) | Item::Star => false,
+            })
+            && predicate.as_ref().is_none_or(filter)
+            && order.iter().all(|(s, _, _)| operand(s))
+            && limit.as_ref().is_none_or(|e| match e {
+                Expr::Literal(_) | Expr::Param(_) => true,
+            })
+    }
     pub(super) fn target(&self) -> &str {
         if !self.sources.is_empty() && self.sources.iter().all(|s| s.name == self.sources[0].name) {
             &self.sources[0].name

@@ -3060,3 +3060,5 @@ mod text_nul_network {
     use super::*;
     include!("text_nul_network.inc");
 }
+
+include!("routing_rejection_network.inc");

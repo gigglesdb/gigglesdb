@@ -1299,6 +1299,14 @@ impl Prepared {
     pub fn parameter_count(&self) -> usize {
         self.params
     }
+    /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
+    /// Parse failures and dependency-bearing queries keep their existing gateway path.
+    pub fn rejects_unsupported_table_free_scalar(sql: &str) -> bool {
+        Self::parse(sql, 0, 0).is_ok_and(|prepared| {
+            matches!(&prepared.statement,
+                Statement::Query(query) if query.rejects_unsupported_table_free_scalar())
+        })
+    }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
         assert_sql_frontend_allowed();
         let mut p = Parser {
