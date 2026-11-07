@@ -12,6 +12,9 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
+#[path = "pgwire_simple.rs"]
+mod simple;
+
 type R<T> = Result<T, &'static str>;
 const MAX_OBJECTS: usize = 32;
 pub async fn ssl_request<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
@@ -749,135 +752,7 @@ impl State {
                 r.end()?;
                 self.statements.remove("");
                 self.portals.remove("");
-                if let Some(json) = sql.strip_prefix("GIGGLES ") {
-                    if !matches!(session.role, Role::Task { .. }) {
-                        return Err("42501");
-                    }
-                    let req: Request = serde_json::from_str(json).map_err(|_| "08P01")?;
-                    if matches!(req, Request::Sql { .. } | Request::Ping) {
-                        return Err("42501");
-                    }
-                    let response = session.handle_received(req, received);
-                    let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
-                    let d = Description {
-                        parameters: vec![],
-                        columns: vec![giggles_core::relational::ColumnDef {
-                            id: 0,
-                            name: "decision".into(),
-                            data_type: DataType::Text,
-                            not_null: true,
-                        }],
-                    };
-                    let result = SqlResult {
-                        columns: vec!["decision".into()],
-                        rows: vec![giggles_core::relational::SqlRow {
-                            values: vec![Value::Text(value)],
-                            version: 0,
-                        }],
-                        affected: 0,
-                    };
-                    row_description(&d, &[], out)?;
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &d,
-                        &[],
-                        0,
-                        1,
-                        out,
-                    )?;
-                    complete("SELECT", &result, out)?;
-                } else if let Some(stmt) = crate::auth::statements::parse(&sql) {
-                    let tag = session.execute_admin(&stmt)?;
-                    self.admin_completed = true;
-                    complete(tag, &SqlResult::default(), out)?;
-                } else if crate::pg_settings::empty_sql(&sql)? {
-                    frame(b'I', &[], out)?;
-                } else if let Some(command) = control(&sql) {
-                    let actual =
-                        execute_control(command, session, &mut self.implicit, &mut self.settings)?;
-                    complete(actual, &SqlResult::default(), out)?;
-                } else if let Some(show) = crate::pg_settings::show(&sql)? {
-                    let (description, result) = inspect(show, &self.settings.current, session)?;
-                    row_description(&description, &[], out)?;
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &description,
-                        &[],
-                        0,
-                        1,
-                        out,
-                    )?;
-                    complete("SHOW", &result, out)?;
-                } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
-                    if !session.role.is_sql() {
-                        return Err("42501");
-                    }
-                    if session.is_aborted() {
-                        return Err("25P02");
-                    }
-                    for setting in &settings {
-                        self.settings.current.apply(setting);
-                        frame(b'C', b"SET\0", out)?;
-                    }
-                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
-                    self.diagnostic.phase = "catalog execution";
-                    let (_, tables) = core(session.catalog_snapshot())?;
-                    let result = catalog_wire::execute(&plan, &catalog_wire::snapshot(tables), &[])
-                        .map_err(catalog_wire::error)?;
-                    catalog_wire::retained_bytes(&result)?;
-                    catalog_wire::description(&result.fields, &[], out)?;
-                    catalog_wire::rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &[],
-                        0,
-                        result.rows.len(),
-                        out,
-                    )?;
-                    catalog_complete(result.rows.len(), out)?;
-                } else {
-                    self.diagnostic.phase = "application SQL";
-                    let was_transaction = session.in_transaction();
-                    // ROLLBACK must bypass normal prepare when already aborted.
-                    if session.is_aborted()
-                        && sql
-                            .trim()
-                            .trim_end_matches(';')
-                            .eq_ignore_ascii_case("rollback")
-                    {
-                        let result = core(session.execute_sql(&sql, &[]))?;
-                        self.settings.transaction(
-                            was_transaction,
-                            session.in_transaction(),
-                            "ROLLBACK",
-                        );
-                        complete("ROLLBACK", &result, out)?;
-                    } else {
-                        let p = core(session.prepare(&sql))?;
-                        let d = core(session.describe(&p))?;
-                        let result = core(session.execute_prepared(&p, &[]))?;
-                        self.settings.transaction(
-                            was_transaction,
-                            session.in_transaction(),
-                            p.command(),
-                        );
-                        if !d.columns.is_empty() {
-                            row_description(&d, &[], out)?;
-                            rows(
-                                self.settings.current.extra_float_digits,
-                                &result,
-                                &d,
-                                &[],
-                                0,
-                                result.rows.len(),
-                                out,
-                            )?;
-                        }
-                        complete(p.command(), &result, out)?;
-                    }
-                }
+                self.simple_query(&sql, session, out, received)?;
                 if !session.in_transaction() {
                     self.portals.clear();
                 }

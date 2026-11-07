@@ -52,11 +52,27 @@ pub(crate) fn parse_startup(
         }
         let mut fields = BTreeMap::new();
         loop {
-            let k = r.text()?;
+            let mut k = r.text()?;
             if k.is_empty() {
                 break;
             }
             let v = r.text()?;
+            // Only GUC names are case-insensitive. Protocol keys and the
+            // certificate-authenticated agent profile retain exact matching.
+            if matches!(policy, StartupPolicy::Postgresql { .. }) {
+                for canonical in [
+                    "client_encoding",
+                    "application_name",
+                    "DateStyle",
+                    "TimeZone",
+                    "extra_float_digits",
+                ] {
+                    if k.eq_ignore_ascii_case(canonical) {
+                        k = canonical.into();
+                        break;
+                    }
+                }
+            }
             if fields.insert(k, v).is_some() {
                 return Err("08P01");
             }
@@ -239,6 +255,91 @@ mod tests {
             assert_eq!(error(&[("user", "giggles"), ("database", "giggles"), ("unknown", "x")], &policy),
                 ("0A000", "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits"));
         }
+    }
+
+    #[test]
+    fn postgresql_guc_names_fold_but_agent_and_protocol_keys_do_not() {
+        let databases = vec![String::from("giggles")];
+        let pg = StartupPolicy::Postgresql {
+            databases: &databases,
+        };
+        for key in ["timezone", "TIMEZONE", "TimeZone"] {
+            let startup = parse_startup(
+                &body(&[
+                    ("user", "giggles"),
+                    ("database", "giggles"),
+                    (key, "America/Chicago"),
+                    ("CLIENT_ENCODING", "utf8"),
+                    ("APPLICATION_NAME", "driver"),
+                    ("datestyle", "iso"),
+                    ("EXTRA_FLOAT_DIGITS", "3"),
+                ]),
+                &pg,
+            )
+            .ok()
+            .unwrap();
+            assert_eq!(startup.timezone, "America/Chicago");
+            assert_eq!(startup.settings.application_name, "driver");
+            assert_eq!(startup.settings.extra_float_digits, 3);
+        }
+        for (canonical, variant) in [
+            ("TimeZone", "timezone"),
+            ("DateStyle", "DATESTYLE"),
+            ("client_encoding", "CLIENT_ENCODING"),
+            ("application_name", "APPLICATION_NAME"),
+            ("extra_float_digits", "EXTRA_FLOAT_DIGITS"),
+        ] {
+            let fields = [
+                ("user", "giggles"),
+                ("database", "giggles"),
+                (canonical, "invalid"),
+                (variant, "invalid"),
+            ];
+            assert_eq!(
+                error(&fields, &pg),
+                ("08P01", "malformed PostgreSQL startup packet")
+            );
+            assert_eq!(
+                error(&fields, &StartupPolicy::Agent),
+                (
+                    "0A000",
+                    "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits"
+                )
+            );
+        }
+        for key in ["User", "DATABASE", "OPTIONS", "REPLICATION"] {
+            assert!(
+                parse_startup(
+                    &body(&[("user", "giggles"), ("database", "giggles"), (key, "x"),]),
+                    &pg
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            error(
+                &[
+                    ("user", "giggles"),
+                    ("database", "giggles"),
+                    ("CLIENT_ENCODING", "LATIN1")
+                ],
+                &pg
+            )
+            .1,
+            "startup client_encoding must be UTF8"
+        );
+        assert_eq!(
+            error(
+                &[
+                    ("user", "giggles"),
+                    ("database", "giggles"),
+                    ("timezone", "")
+                ],
+                &pg
+            )
+            .1,
+            "startup TimeZone must be a bounded timezone label"
+        );
     }
 
     #[test]

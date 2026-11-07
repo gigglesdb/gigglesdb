@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     static NEXT_CLOCK_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     fn admin() -> Admin {
-        let dir = std::path::PathBuf::from("artifacts").join(format!(
+        let dir = crate::test_support::fixture_root().join(format!(
             "clock-unit-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
