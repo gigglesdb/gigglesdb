@@ -1,0 +1,8 @@
+# Generated build output and dependency caches are never committed.
+/target/
+/target-*/
+/cargo-home/
+/vendor/
+
+# Retained spike source is staged explicitly; generated evidence stays ignored.
+/artifacts/
