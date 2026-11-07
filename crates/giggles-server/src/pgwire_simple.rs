@@ -288,7 +288,7 @@ impl State {
 
 // A boundary lexer, not a second SQL parser. Preserve quoted bytes exactly;
 // replace comments with whitespace so every dispatch path sees the same SQL.
-fn split(sql: &str) -> R<Vec<String>> {
+pub(super) fn split(sql: &str) -> R<Vec<String>> {
     if sql.len() > giggles_core::relational::MAX_SQL {
         return Err("54000");
     }

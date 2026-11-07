@@ -711,6 +711,9 @@ enum Statement {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    Release(String),
+    RollbackTo(String),
 }
 struct Parser {
     tokens: Vec<Token>,
@@ -776,6 +779,27 @@ impl Parser {
             Token::Word(s) if s == "null" => Expr::Literal(Value::Null),
             _ => return Err(SqlError::Unsupported),
         })
+    }
+    fn optional_savepoint_keyword(&mut self) {
+        // With no following identifier, SAVEPOINT itself is the name.
+        if matches!(
+            self.tokens.get(self.at + 1),
+            Some(Token::Word(_) | Token::QuotedIdent(_))
+        ) {
+            self.word("savepoint");
+        }
+    }
+    fn savepoint_name(&mut self) -> R<String> {
+        let name = match self.tokens.get(self.at) {
+            Some(Token::Word(name) | Token::QuotedIdent(name)) => name,
+            _ => return Err(SqlError::Syntax),
+        };
+        if name.is_empty() || name.contains('\0') {
+            return Err(SqlError::Syntax);
+        }
+        let name = ident::truncate(name, 63).to_owned();
+        self.at += 1;
+        Ok(name)
     }
     fn names(&mut self) -> R<Vec<String>> {
         self.punct('(')?;
@@ -1026,8 +1050,19 @@ impl Parser {
             Statement::Begin
         } else if self.word("commit") {
             Statement::Commit
+        } else if self.word("savepoint") {
+            Statement::Savepoint(self.savepoint_name()?)
+        } else if self.word("release") {
+            self.optional_savepoint_keyword();
+            Statement::Release(self.savepoint_name()?)
         } else if self.word("rollback") {
-            Statement::Rollback
+            let _ = self.word("work") || self.word("transaction");
+            if self.word("to") {
+                self.optional_savepoint_keyword();
+                Statement::RollbackTo(self.savepoint_name()?)
+            } else {
+                Statement::Rollback
+            }
         } else {
             return Err(SqlError::Unsupported);
         };
@@ -1567,7 +1602,9 @@ impl Prepared {
             Statement::Delete { .. } => "DELETE",
             Statement::Begin => "BEGIN",
             Statement::Commit => "COMMIT",
-            Statement::Rollback => "ROLLBACK",
+            Statement::Rollback | Statement::RollbackTo(_) => "ROLLBACK",
+            Statement::Savepoint(_) => "SAVEPOINT",
+            Statement::Release(_) => "RELEASE",
         }
     }
     pub(crate) fn scan(scan: Scan, domain: u128, state: &Relational) -> R<Self> {
@@ -1829,11 +1866,30 @@ impl Prepared {
             parameter_types: vec![],
         })
     }
+    /// Transaction-local name, normalized using PostgreSQL identifier rules.
+    pub fn savepoint_name(&self) -> Option<&str> {
+        match &self.statement {
+            Statement::Savepoint(name) | Statement::Release(name) | Statement::RollbackTo(name) => {
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+    /// Recovery controls remain available in a failed transaction block.
+    pub fn allows_aborted_transaction(&self) -> bool {
+        matches!(
+            self.statement,
+            Statement::Rollback | Statement::RollbackTo(_)
+        )
+    }
     pub(crate) fn control(&self) -> Option<&'static str> {
         match self.statement {
             Statement::Begin => Some("begin"),
             Statement::Commit => Some("commit"),
             Statement::Rollback => Some("rollback"),
+            Statement::Savepoint(_) => Some("savepoint"),
+            Statement::Release(_) => Some("release"),
+            Statement::RollbackTo(_) => Some("rollback_to"),
             _ => None,
         }
     }

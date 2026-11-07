@@ -114,6 +114,7 @@ pub(crate) fn error_message(code: &str, message: &'static str, out: &mut Vec<u8>
 struct Diagnostic {
     phase: &'static str,
     message: Option<&'static str>,
+    wire_message: Option<String>,
     query_id: Option<String>,
 }
 impl Diagnostic {
@@ -157,7 +158,12 @@ fn diagnostic_error(
     b.push(b'C');
     z(code, &mut b);
     b.push(b'M');
-    z(message, &mut b);
+    z(
+        diagnostic
+            .and_then(|d| d.wire_message.as_deref())
+            .unwrap_or(message),
+        &mut b,
+    );
     if let Some(detail) = detail {
         b.push(b'D');
         z(&detail, &mut b);
@@ -1296,7 +1302,7 @@ impl State {
                     )?;
                     return Ok(true);
                 }
-                if let Plan::Control(command) = p.s.p {
+                if let Plan::Control(command) = &p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
                     }
@@ -1304,7 +1310,7 @@ impl State {
                         begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     }
                     let actual = execute_mode(
-                        command,
+                        command.clone(),
                         session,
                         &mut self.implicit,
                         &mut self.settings,
@@ -1647,6 +1653,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             }
         };
         state.diagnostic = Diagnostic {
+            wire_message: None,
             message: None,
             phase: match tag {
                 b'Q' => "simple query",

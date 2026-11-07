@@ -65,6 +65,12 @@ impl Settings {
         }
     }
 }
+struct SavepointSettings {
+    name: String,
+    current: Settings,
+    local: std::collections::BTreeMap<Show, String>,
+    queried: bool,
+}
 #[derive(Default)]
 pub(crate) struct SessionSettings {
     pub current: Settings,
@@ -72,8 +78,31 @@ pub(crate) struct SessionSettings {
     pub defaults: Settings,
     pub queried: bool,
     local: std::collections::BTreeMap<Show, String>,
+    savepoints: Vec<SavepointSettings>,
 }
 impl SessionSettings {
+    pub fn savepoint(&mut self, name: String) {
+        self.savepoints.push(SavepointSettings {
+            name,
+            current: self.current.clone(),
+            local: self.local.clone(),
+            queried: self.queried,
+        });
+    }
+    pub fn release(&mut self, name: &str) {
+        if let Some(at) = self.savepoints.iter().rposition(|s| s.name == name) {
+            self.savepoints.truncate(at);
+        }
+    }
+    pub fn rollback_to(&mut self, name: &str) {
+        if let Some(at) = self.savepoints.iter().rposition(|s| s.name == name) {
+            let saved = &self.savepoints[at];
+            self.current = saved.current.clone();
+            self.local = saved.local.clone();
+            self.queried = saved.queried;
+            self.savepoints.truncate(at + 1);
+        }
+    }
     pub fn transaction(&mut self, was: bool, now: bool, command: &str) {
         if !was && now {
             self.saved = Some(self.current.clone());
@@ -84,6 +113,7 @@ impl SessionSettings {
             self.local.clear();
         }
         if was && !now {
+            self.savepoints.clear();
             if command == "ROLLBACK" {
                 if let Some(saved) = self.saved.take() {
                     self.current = saved;

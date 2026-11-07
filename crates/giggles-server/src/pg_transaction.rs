@@ -45,13 +45,37 @@ pub(crate) struct Modes {
     pub read_only: Option<bool>,
     pub deferrable: Option<bool>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Begin(Modes),
     Commit,
     Rollback,
+    Savepoint(String),
+    Release(String),
+    RollbackTo(String),
     Set(Modes),
     Session(Modes),
+}
+fn savepoint_name(p: &mut Parser) -> Result<String> {
+    use crate::pg_settings::database::Token;
+    let mut name = match p.tokens.get(p.at) {
+        Some(Token::Word(s))
+            if s.chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_') =>
+        {
+            s.to_ascii_lowercase()
+        }
+        Some(Token::Ident(s)) if !s.is_empty() => s.clone(),
+        _ => return Err("42601"),
+    };
+    let mut end = name.len().min(63);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    p.at += 1;
+    Ok(name)
 }
 impl Command {
     pub fn legacy(command: &str) -> Self {
@@ -116,7 +140,15 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
         .next()
         .unwrap_or("");
     if ![
-        "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SET",
+        "BEGIN",
+        "START",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "ABORT",
+        "SET",
+        "SAVEPOINT",
+        "RELEASE",
     ]
     .iter()
     .any(|s| first.eq_ignore_ascii_case(s))
@@ -141,7 +173,21 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>> {
         if !p.kw("WORK") {
             p.kw("TRANSACTION");
         }
-        Command::Rollback
+        if p.kw("TO") {
+            if p.tokens.len() - p.at > 1 {
+                p.kw("SAVEPOINT");
+            }
+            Command::RollbackTo(savepoint_name(&mut p)?)
+        } else {
+            Command::Rollback
+        }
+    } else if p.kw("SAVEPOINT") {
+        Command::Savepoint(savepoint_name(&mut p)?)
+    } else if p.kw("RELEASE") {
+        if p.tokens.len() - p.at > 1 {
+            p.kw("SAVEPOINT");
+        }
+        Command::Release(savepoint_name(&mut p)?)
     } else {
         p.need("SET")?;
         if p.kw("TRANSACTION") {

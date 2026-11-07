@@ -1573,11 +1573,39 @@ impl Executor {
         })
     }
 }
+// Legacy transactions own whole State snapshots. This named capture is the
+// session counterpart of v2 F3c's live write-set mark; future transactional
+// session state (including a deferred-work queue) belongs in this capture.
+#[derive(Clone)]
+struct SqlSavepointState {
+    staged: State,
+}
+struct SqlSavepoint {
+    name: String,
+    state: SqlSavepointState,
+    /// Encoded size of the captured snapshot, charged against the session budget.
+    bytes: u64,
+}
+/// Per-session cap on captured savepoint snapshot bytes, in addition to the 64-mark cap.
+const SAVEPOINT_BYTES: u64 = 64 * 1024 * 1024;
+/// Snapshot size by the same fixed-int record accounting as envelope_bound.
+fn snapshot_bytes(s: &State) -> Result<u64, CoreError> {
+    records(s)?
+        .iter()
+        .try_fold(8u64, |n, (k, v)| {
+            n.checked_add(16)?
+                .checked_add(k.len() as u64)?
+                .checked_add(v.len() as u64)
+        })
+        .ok_or(CoreError::Limit)
+}
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
     admin: Admin,
     staged: Option<State>,
+    savepoints: Vec<SqlSavepoint>,
+    savepoint_budget: u64,
     aborted: bool,
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
@@ -1595,6 +1623,8 @@ impl Admin {
         SqlSession {
             admin: self.clone(),
             staged: None,
+            savepoints: Vec::new(),
+            savepoint_budget: SAVEPOINT_BYTES,
             aborted: false,
             transaction_id: None,
             transaction_clock_us: None,
@@ -1685,7 +1715,7 @@ impl SqlSession {
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
-            if self.aborted && p.control() != Some("rollback") {
+            if self.aborted && !p.allows_aborted_transaction() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             if p.transaction.is_some() && p.transaction != self.transaction_id {
@@ -1716,7 +1746,7 @@ impl SqlSession {
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
-            if self.aborted && p.control() != Some("rollback") {
+            if self.aborted && !p.allows_aborted_transaction() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             if p.transaction.is_some() && p.transaction != self.transaction_id {
@@ -1955,7 +1985,7 @@ impl SqlSession {
             if self.aborted {
                 let p = relational::Prepared::parse(sql, s.view.domain, s.sql.epoch)
                     .map_err(CoreError::Sql)?;
-                if p.control() != Some("rollback") {
+                if !p.allows_aborted_transaction() {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
                 Ok(p)
@@ -1986,14 +2016,16 @@ impl SqlSession {
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
             let p = relational::Prepared::parse(sql, 0, 0).map_err(CoreError::Sql)?;
-            if p.control() != Some("rollback") {
+            if !p.allows_aborted_transaction() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             if !params.is_empty() || expected_version.is_some() {
                 return Err(CoreError::Sql(relational::SqlError::Parameters));
             }
-            self.rollback();
-            return Ok(Default::default());
+            if p.control() == Some("rollback") {
+                self.rollback();
+                return Ok(Default::default());
+            }
         }
         let p = self.prepare(sql)?;
         self.execute_prepared(&p, params, expected_version)
@@ -2093,7 +2125,7 @@ impl SqlSession {
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
-        if self.aborted && p.control() != Some("rollback") {
+        if self.aborted && !p.allows_aborted_transaction() {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
         let inner = self.admin.inner.clone();
@@ -2181,6 +2213,67 @@ impl SqlSession {
                                 .sql_transactions
                                 .fetch_sub(1, Ordering::AcqRel);
                             return Err(e);
+                        }
+                    }
+                }
+                "savepoint" | "release" | "rollback_to" => {
+                    let staged = self
+                        .staged
+                        .as_ref()
+                        .ok_or(CoreError::Sql(E::NoActiveTransaction))?;
+                    let name = p.savepoint_name().expect("savepoint control has a name");
+                    if control == "savepoint" {
+                        // Bound whole snapshots independently of the statement limits.
+                        if self.savepoints.len() >= 64 {
+                            return Err(CoreError::Sql(E::Limit));
+                        }
+                        // Byte budget across all live captures (54000 beyond it; nothing captured).
+                        let bytes = snapshot_bytes(staged)?;
+                        let used = self.savepoints.iter().map(|mark| mark.bytes).sum::<u64>();
+                        if used
+                            .checked_add(bytes)
+                            .is_none_or(|total| total > self.savepoint_budget)
+                        {
+                            return Err(CoreError::Sql(E::Limit));
+                        }
+                        self.savepoints.push(SqlSavepoint {
+                            name: name.to_owned(),
+                            state: SqlSavepointState {
+                                staged: staged.clone(),
+                            },
+                            bytes,
+                        });
+                    } else {
+                        let index = self
+                            .savepoints
+                            .iter()
+                            .rposition(|mark| mark.name == name)
+                            .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
+                        if control == "release" {
+                            self.savepoints.truncate(index);
+                        } else {
+                            let SqlSavepointState {
+                                staged: mut restored,
+                            } = self.savepoints[index].state.clone();
+                            // Allocation and currval are nontransactional. Merge by
+                            // incarnation/stamp, rather than restoring older counters.
+                            sequences::merge(&mut restored, &staged.seq);
+                            self.admin.inner.merge_live_sequences(&mut restored)?;
+                            sequences::merge(
+                                &mut restored,
+                                &*self
+                                    .pending_sequences
+                                    .lock()
+                                    .map_err(|_| CoreError::Fenced)?,
+                            );
+                            let revision = self
+                                .staged_revision
+                                .checked_add(1)
+                                .ok_or(CoreError::Sql(E::Overflow))?;
+                            self.staged = Some(restored);
+                            self.staged_revision = revision;
+                            self.savepoints.truncate(index + 1);
+                            self.aborted = false;
                         }
                     }
                 }
@@ -2324,6 +2417,7 @@ impl SqlSession {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.sequence_baseline.clear();
+        self.savepoints.clear();
         self.aborted = false;
         self.transaction_id = None;
         self.transaction_clock_us = None;
@@ -2380,6 +2474,68 @@ mod typed_session_tests {
                 limit: relational::MAX_ROWS,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn rollback_to_restores_whole_session_capture_after_statement_failure() {
+        let (_admin, mut session, table) = fixture();
+        session.execute("BEGIN", &[], None).unwrap();
+        session.insert_engine(&table, row(1)).unwrap();
+        session.execute("SAVEPOINT captured", &[], None).unwrap();
+        let before = records(&session.savepoints[0].state.staged).unwrap();
+        let transaction_id = session.transaction_id;
+        session.transaction_clock_us = Some(123);
+        session.insert_engine(&table, row(2)).unwrap();
+        session
+            .execute("CREATE TABLE later (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert!(
+            session
+                .execute("INSERT INTO later VALUES (1), (1)", &[], None)
+                .is_err()
+        );
+        assert!(session.aborted);
+        let failed_revision = session.staged_revision;
+        session.execute("ROLLBACK TO captured", &[], None).unwrap();
+        assert!(session.in_transaction());
+        assert!(!session.aborted);
+        assert_eq!(session.transaction_id, transaction_id);
+        assert_eq!(session.transaction_clock_us, Some(123));
+        assert!(session.staged_revision > failed_revision);
+        assert_eq!(records(session.staged.as_ref().unwrap()).unwrap(), before);
+        assert_eq!(session.savepoints.len(), 1);
+        // Target remains live and can restore the same complete capture again.
+        session.insert_engine(&table, row(3)).unwrap();
+        session.execute("ROLLBACK TO captured", &[], None).unwrap();
+        assert_eq!(records(session.staged.as_ref().unwrap()).unwrap(), before);
+        session.rollback();
+        assert!(session.savepoints.is_empty());
+    }
+
+    #[test]
+    fn savepoint_byte_budget_rejects_captures_without_changing_the_stack() {
+        let (_admin, mut session, table) = fixture();
+        session.execute("BEGIN", &[], None).unwrap();
+        session.insert_engine(&table, row(1)).unwrap();
+        let one = snapshot_bytes(session.staged.as_ref().unwrap()).unwrap();
+        // Room for exactly one capture of this size.
+        session.savepoint_budget = one + one / 2;
+        session.execute("SAVEPOINT first", &[], None).unwrap();
+        assert_eq!(session.savepoints.len(), 1);
+        assert!(matches!(
+            session.execute("SAVEPOINT second", &[], None),
+            Err(CoreError::Sql(relational::SqlError::Limit))
+        ));
+        assert_eq!(session.savepoints.len(), 1);
+        assert_eq!(session.savepoints[0].name, "first");
+        // The failed SAVEPOINT aborts the block, as any error does; ROLLBACK TO recovers it.
+        session.execute("ROLLBACK TO first", &[], None).unwrap();
+        session.execute("RELEASE first", &[], None).unwrap();
+        assert!(session.savepoints.is_empty());
+        // Releasing frees the budget for a new capture.
+        session.execute("SAVEPOINT again", &[], None).unwrap();
+        assert_eq!(session.savepoints.len(), 1);
+        session.rollback();
     }
 
     #[test]

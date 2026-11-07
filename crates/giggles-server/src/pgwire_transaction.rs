@@ -7,10 +7,24 @@ pub(super) fn parse_control(
     session: &Session,
     diagnostic: &mut Diagnostic,
 ) -> R<Option<crate::pg_transaction::Command>> {
+    let original = sql;
+    let statements = super::simple::split(sql)?;
+    let sql = if statements.len() == 1 {
+        statements[0].as_str()
+    } else {
+        sql
+    };
     if matches!(session.role, Role::Database { .. }) {
         diagnostic.settings(crate::pg_transaction::parse(sql))
     } else {
-        Ok(control(sql).map(crate::pg_transaction::Command::legacy))
+        match crate::pg_transaction::parse(sql) {
+            Ok(Some(
+                command @ (crate::pg_transaction::Command::Savepoint(_)
+                | crate::pg_transaction::Command::Release(_)
+                | crate::pg_transaction::Command::RollbackTo(_)),
+            )) => Ok(Some(command)),
+            _ => Ok(control(original).map(crate::pg_transaction::Command::legacy)),
+        }
     }
 }
 pub(super) fn execute_mode(
@@ -41,6 +55,51 @@ pub(super) fn execute_mode(
         }
         Command::Commit => execute_control("COMMIT", session, implicit, settings, out),
         Command::Rollback => execute_control("ROLLBACK", session, implicit, settings, out),
+        Command::Savepoint(ref name)
+        | Command::Release(ref name)
+        | Command::RollbackTo(ref name) => {
+            let tag = match &command {
+                Command::Savepoint(_) => "SAVEPOINT",
+                Command::Release(_) => "RELEASE",
+                _ => "ROLLBACK",
+            };
+            if session.is_aborted() && tag != "ROLLBACK" {
+                return Err("25P02");
+            }
+            if !session.in_transaction() || *implicit {
+                diagnostic.message = Some(match tag {
+                    "SAVEPOINT" => "SAVEPOINT can only be used in transaction blocks",
+                    "RELEASE" => "RELEASE SAVEPOINT can only be used in transaction blocks",
+                    _ => "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+                });
+                return Err("25P01");
+            }
+            let sql = format!(
+                "{} \"{}\"",
+                if tag == "ROLLBACK" {
+                    "ROLLBACK TO"
+                } else {
+                    tag
+                },
+                name.replace('"', "\"\"")
+            );
+            let prepared = core(session.prepare(&sql))?;
+            let before = settings.current.clone();
+            if let Err(error) = session.execute_prepared(&prepared, &[]) {
+                let code = crate::service::sqlstate(&error);
+                if code == "3B001" {
+                    diagnostic.wire_message = Some(format!("savepoint \"{name}\" does not exist"));
+                }
+                return Err(code);
+            }
+            match tag {
+                "SAVEPOINT" => settings.savepoint(name.clone()),
+                "RELEASE" => settings.release(name),
+                _ => settings.rollback_to(name),
+            }
+            settings_status(&before, settings, session, out)?;
+            Ok(tag)
+        }
         Command::Set(modes) => {
             if session.is_aborted() {
                 return Err("25P02");
