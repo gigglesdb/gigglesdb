@@ -78,6 +78,9 @@ pub(crate) trait RowSource {
         dir: Direction,
     ) -> R<Box<dyn Iterator<Item = R<SourceRow<'s>>> + 's>>;
     fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> R<Option<SourceRow<'s>>>;
+    fn contains(&self, table: &TableDef, key: &[u8]) -> R<bool> {
+        Ok(self.get(table, key)?.is_some())
+    }
 }
 pub(crate) struct LegacyRows<'a>(pub(crate) &'a Relational);
 impl RowSource for LegacyRows<'_> {

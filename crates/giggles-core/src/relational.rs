@@ -20,6 +20,8 @@ use query::{TypmodSource, result_typmod};
 mod returning;
 mod scan;
 mod searched;
+#[cfg(test)]
+mod source_plumbing_tests;
 use returning::Returning;
 // Candidate codec/read APIs await later internal release.
 #[allow(dead_code)]
@@ -2139,8 +2141,29 @@ impl Relational {
         prepared: &Prepared,
         params: &[Value],
         expected: Option<u64>,
+        cancel: impl FnMut() -> bool,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<SqlResult> {
+        self.execute_clocked_inner(prepared, params, expected, cancel, clock, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn execute_with_source(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        source: &dyn scan::RowSource,
+    ) -> R<SqlResult> {
+        self.execute_clocked_inner(prepared, params, expected, || false, None, Some(source))
+    }
+    fn execute_clocked_inner(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
         mut cancel: impl FnMut() -> bool,
         clock: Option<&clock::ExecutionClock>,
+        injected_source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
@@ -2266,10 +2289,12 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
+                let legacy = scan::LegacyRows(&*self);
+                let source = injected_source.unwrap_or(&legacy);
                 return q
                     .bind(self, prepared.params, &prepared.parameter_types)?
                     .with_clock(clock)
-                    .execute(self, params, &mut cancel);
+                    .execute(self, source, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
             Statement::InsertMulti(insert) => {
@@ -2435,8 +2460,9 @@ impl Relational {
                 row_check(t, &row)?;
                 let key = pk(t, &row)?;
                 let table_id = t.id;
-                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
-                if rows.contains_key(&key) {
+                let legacy = scan::LegacyRows(&*self);
+                let source = injected_source.unwrap_or(&legacy);
+                if source.contains(t, &key)? {
                     return Err(SqlError::Duplicate);
                 }
                 let version = match heap_version {
@@ -2508,29 +2534,23 @@ impl Relational {
                     }
                 }
                 result.columns = indexes.iter().map(|i| t.columns[*i].name.clone()).collect();
-                let rows = self.rows.get(&t.id).ok_or(SqlError::UnknownTable)?;
-                if b.low > b.high || (b.low == b.high && !b.point) {
-                    return Ok(result);
-                }
-                use std::ops::Bound::{Excluded, Included};
-                let lo = if b.low_inclusive {
-                    Included(b.low)
+                let legacy = scan::LegacyRows(&*self);
+                let source = injected_source.unwrap_or(&legacy);
+                let iter: Box<dyn Iterator<Item = R<scan::SourceRow<'_>>>> = if b.point {
+                    Box::new(source.get(t, &b.low)?.into_iter().map(Ok))
                 } else {
-                    Excluded(b.low)
-                };
-                let hi = if b.high_inclusive {
-                    Included(b.high)
-                } else {
-                    Excluded(b.high)
-                };
-                let iter = rows.range((lo, hi));
-                let iter: Box<dyn Iterator<Item = (&Vec<u8>, &SqlRow)>> = if desc {
-                    Box::new(iter.rev())
-                } else {
-                    Box::new(iter)
+                    let range = scan::KeyRange::from_bounds(b);
+                    let direction = if desc {
+                        scan::Direction::Reverse
+                    } else {
+                        scan::Direction::Forward
+                    };
+                    source.scan(t, &range, direction)?
                 };
                 let mut bytes = 0usize;
-                for (_, r) in iter.take(limit) {
+                for row in iter.take(limit) {
+                    let row = row?;
+                    let r = &row.row;
                     bytes += indexes
                         .iter()
                         .map(|i| value_bytes(&r.values[*i]))
@@ -2564,20 +2584,22 @@ impl Relational {
                             other.map(|_| ()),
                             &mut cancel,
                             clock,
+                            injected_source,
                         );
                     }
                 };
                 let assignments = assign::Plan::new(t, self, prepared, params, clock)?;
                 let table_id = t.id;
-                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
-                let old = rows.get(&b.low);
+                let legacy = scan::LegacyRows(&*self);
+                let source = injected_source.unwrap_or(&legacy);
+                let old = source.get(t, &b.low)?.map(|row| row.row.into_owned());
                 if let Some(want) = expected
-                    && old.is_none_or(|r| r.version != want)
+                    && old.as_ref().is_none_or(|r| r.version != want)
                 {
                     return Err(SqlError::Version);
                 }
                 if let Some(old) = old {
-                    let indexes = assignments.evaluate(t, old, params, &mut cancel)?;
+                    let indexes = assignments.evaluate(t, &old, params, &mut cancel)?;
                     let mut row = old.clone();
                     for (i, v) in indexes {
                         row.values[i] = v;
@@ -2587,9 +2609,8 @@ impl Relational {
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
                     returned_rows = returning::project(&returning, self, params, &[&row])?;
-                    // Witness cloning is admitted by secondary_admit_mutation before
+                    // Witness ownership is admitted by secondary_admit_mutation before
                     // expression/row construction; stage checks its exact raw value.
-                    let old = old.clone();
                     result = if new_key == b.low {
                         self.secondary_apply_statement(
                             table_id,
@@ -2647,24 +2668,21 @@ impl Relational {
                             other.map(|_| ()),
                             &mut cancel,
                             clock,
+                            injected_source,
                         );
                     }
                 };
                 let table_id = t.id;
-                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
-                let old = rows.get(&b.low);
+                let legacy = scan::LegacyRows(&*self);
+                let source = injected_source.unwrap_or(&legacy);
+                let old = source.get(t, &b.low)?.map(|row| row.row.into_owned());
                 if let Some(want) = expected
-                    && old.is_none_or(|r| r.version != want)
+                    && old.as_ref().is_none_or(|r| r.version != want)
                 {
                     return Err(SqlError::Version);
                 }
-                returned_rows = returning::project(
-                    &returning,
-                    self,
-                    params,
-                    &old.into_iter().collect::<Vec<_>>(),
-                )?;
-                let old = old.cloned();
+                returned_rows =
+                    returning::project(&returning, self, params, &old.iter().collect::<Vec<_>>())?;
                 result = self.secondary_apply_statement(
                     table_id,
                     old.as_ref().map(|r| (b.low.as_slice(), r)),

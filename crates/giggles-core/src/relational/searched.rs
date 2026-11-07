@@ -51,6 +51,7 @@ pub(super) fn route(
     bounds: R<()>,
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&clock::ExecutionClock>,
+    injected_source: Option<&dyn scan::RowSource>,
 ) -> R<SqlResult> {
     if expected.is_some() {
         return Err(SqlError::Unbounded);
@@ -82,7 +83,9 @@ pub(super) fn route(
         None
     };
     let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
-    let matched = bound.matching_rows(state, params, &mut retention, cancel)?;
+    let legacy = scan::LegacyRows(&*state);
+    let source = injected_source.unwrap_or(&legacy);
+    let matched = bound.matching_rows(state, source, params, &mut retention, cancel)?;
     let mut next_version = state.next_version;
     let mut postimages = Vec::with_capacity(matched.len());
     let mut postkeys = Vec::with_capacity(matched.len());
@@ -102,7 +105,7 @@ pub(super) fn route(
             // matched row still occupies its key until that row is evaluated.
             if postkeys.contains(&new_key)
                 || new_key != *key
-                    && state.rows[&table_id].contains_key(&new_key)
+                    && source.contains(table, &new_key)?
                     && !vacated.contains(new_key.as_slice())
             {
                 return Err(SqlError::Duplicate);
@@ -128,10 +131,13 @@ pub(super) fn route(
         .map(|(key, row)| (key.as_slice(), row))
         .collect::<BTreeMap<_, _>>();
     let extra = if updating {
-        postkeys
-            .iter()
-            .filter(|key| !state.rows[&table_id].contains_key(*key))
-            .count()
+        let mut extra = 0;
+        for key in &postkeys {
+            if !source.contains(table, key)? {
+                extra += 1;
+            }
+        }
+        extra
     } else {
         0
     };
@@ -153,7 +159,7 @@ pub(super) fn route(
         });
     }
     for (key, row) in postkeys.iter().zip(&postimages) {
-        if !state.rows[&table_id].contains_key(key) {
+        if !source.contains(table, key)? {
             changes.push(BatchRowChange {
                 table: table_id,
                 old: None,
@@ -330,7 +336,13 @@ mod tests {
             .bind_seeded(&state, parameters)
             .unwrap();
         let matched = bound
-            .matching_rows(&state, &[], &mut retention, &mut || false)
+            .matching_rows(
+                &state,
+                &scan::LegacyRows(&state),
+                &[],
+                &mut retention,
+                &mut || false,
+            )
             .unwrap();
         assert_eq!(matched.len(), 1);
         let (key, old) = &matched[0];

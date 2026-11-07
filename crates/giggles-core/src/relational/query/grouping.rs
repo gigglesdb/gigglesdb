@@ -600,7 +600,7 @@ fn page_expr(expr: Option<&Expr>, params: &[Value]) -> R<Option<u64>> {
 // grouped path uses scan joins; ordinary queries still require right-side PKs.
 fn visit_joins(
     query: &BoundQuery<'_>,
-    source: &impl scan::RowSource,
+    source: &dyn scan::RowSource,
     index: usize,
     row: &mut Tuple,
     meter: &mut scan::Meter<'_>,
@@ -680,7 +680,8 @@ impl Grouping {
     pub(super) fn execute(
         &self,
         query: &BoundQuery<'_>,
-        state: &Relational,
+        _state: &Relational,
+        source: &dyn scan::RowSource,
         params: &[Value],
         cancel: &mut impl FnMut() -> bool,
     ) -> R<SqlResult> {
@@ -777,8 +778,6 @@ impl Grouping {
                     version: 0,
                 })?;
             } else {
-                use scan::RowSource;
-                let source = scan::LegacyRows(state);
                 let range = scan::KeyRange {
                     lo: std::ops::Bound::Unbounded,
                     hi: std::ops::Bound::Unbounded,
@@ -792,7 +791,7 @@ impl Grouping {
                     };
                     visit_joins(
                         query,
-                        &source,
+                        source,
                         0,
                         &mut row,
                         &mut meter,
@@ -972,7 +971,7 @@ mod tests {
         for fence in [3, 5] {
             let mut polls = 0;
             assert_eq!(
-                bound.execute(&state, &[], &mut || {
+                bound.execute(&state, &scan::LegacyRows(&state), &[], &mut || {
                     polls += 1;
                     polls == fence
                 }),
@@ -1005,7 +1004,7 @@ mod tests {
         for fence in [3, 4, 5] {
             let mut polls = 0;
             assert_eq!(
-                bound.execute(&state, &[], &mut || {
+                bound.execute(&state, &scan::LegacyRows(&state), &[], &mut || {
                     polls += 1;
                     polls == fence
                 }),
@@ -1014,7 +1013,9 @@ mod tests {
             assert_eq!(polls, fence);
             assert_eq!(bincode::serialize(&state).unwrap(), before);
         }
-        let result = bound.execute(&state, &[], &mut || false).unwrap();
+        let result = bound
+            .execute(&state, &scan::LegacyRows(&state), &[], &mut || false)
+            .unwrap();
         assert_eq!(
             result
                 .rows
@@ -1035,10 +1036,12 @@ mod tests {
         let mut state = state(scan::MAX_QUERY_ROWS + 1);
         let query = query("SELECT count(*) FROM group_cap GROUP BY id LIMIT 1");
         assert_eq!(
-            query
-                .bind(&state, 0, &[])
-                .unwrap()
-                .execute(&state, &[], &mut || false),
+            query.bind(&state, 0, &[]).unwrap().execute(
+                &state,
+                &scan::LegacyRows(&state),
+                &[],
+                &mut || false
+            ),
             Err(SqlError::Limit)
         );
         let table = &state.tables["group_cap"];
@@ -1046,7 +1049,7 @@ mod tests {
         let result = query
             .bind(&state, 0, &[])
             .unwrap()
-            .execute(&state, &[], &mut || false)
+            .execute(&state, &scan::LegacyRows(&state), &[], &mut || false)
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values, vec![Value::Int(1)]);

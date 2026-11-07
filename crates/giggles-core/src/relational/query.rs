@@ -2201,7 +2201,8 @@ impl BoundQuery<'_> {
     /// Collect complete mutation rows in primary-key order, retaining their keys.
     pub(super) fn matching_rows(
         &self,
-        state: &Relational,
+        _state: &Relational,
+        source: &dyn scan::RowSource,
         params: &[Value],
         retention: &mut scan::Retention,
         cancel: &mut impl FnMut() -> bool,
@@ -2229,8 +2230,6 @@ impl BoundQuery<'_> {
         } else {
             scan::KeyRange::from_bounds(bounds)
         };
-        use scan::RowSource;
-        let source = scan::LegacyRows(state);
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
         let mut meter = scan::Meter::per_row(cancel);
         let filtered = scan::filtered(input, &mut meter, |row| {
@@ -2260,6 +2259,7 @@ impl BoundQuery<'_> {
     pub(super) fn execute(
         &self,
         state: &Relational,
+        source: &dyn scan::RowSource,
         params: &[Value],
         cancel: &mut impl FnMut() -> bool,
     ) -> R<SqlResult> {
@@ -2278,7 +2278,7 @@ impl BoundQuery<'_> {
             )?;
         }
         if let Some(grouping) = &self.grouping {
-            return grouping.execute(self, state, params, cancel);
+            return grouping.execute(self, state, source, params, cancel);
         }
         let limit = match &self.query.limit {
             Some(e) => match e.value(params)? {
@@ -2390,8 +2390,6 @@ impl BoundQuery<'_> {
                 affected: 0,
             });
         }
-        use scan::RowSource;
-        let source = scan::LegacyRows(state);
         let range = if empty_input {
             scan::KeyRange {
                 lo: std::ops::Bound::Excluded(Vec::new()),
