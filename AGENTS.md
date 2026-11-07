@@ -132,6 +132,15 @@ creating a new archive or target directory per proof. A target directory can
 then be deleted at any time to free disk, because rebuilding it comes from the
 cache. Two concurrent builds must never share one CARGO_TARGET_DIR.
 
+Builds share one machine (32 threads, limited Windows commit charge). Too many
+parallel links fail with LNK1171 or OOM, and that wastes a whole gate run. So:
+- every cargo command also sets `CARGO_BUILD_JOBS=4`;
+- each coordinator, together with its own Codex workers, runs at most one heavy
+  cargo build or test at a time. Hold a per-coordinator lock file under
+  J:/gigglesdb-work/<track>/ while it runs;
+- a gate that fails with LNK1171, an OOM or a lost connection in a timing test
+  is rerun alone before anyone treats it as a code failure.
+
 The shared repository sets core.autocrlf=true, so a plain worktree checkout
 gives files CRLF line endings, and LF-sensitive fixtures (tzdata, typmod
 oracles) then show as modified or fail. Create and move worktrees with
