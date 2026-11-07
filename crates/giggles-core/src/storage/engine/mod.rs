@@ -6,6 +6,8 @@ pub(crate) mod crc32c;
 pub(crate) mod hlc;
 pub(crate) mod kv;
 pub(crate) mod kv_mem;
+#[cfg(feature = "engine-rocksdb")]
+pub(crate) mod kv_rocksdb;
 pub(crate) mod locks;
 
 #[cfg(test)]
