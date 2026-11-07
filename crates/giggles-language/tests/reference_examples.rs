@@ -353,8 +353,8 @@ fn reference_inventory_is_complete_and_traceable() {
     for (expectation, count) in [
         ("parse-supported", 4),
         ("parse-rejected", 64),
-        ("prepare-supported", 1),
-        ("prepare-rejected", 17),
+        ("prepare-supported", 2),
+        ("prepare-rejected", 16),
         ("non-executable", 9),
     ] {
         assert_eq!(
@@ -455,17 +455,20 @@ fn sql_reference_examples_keep_the_sql_interface() {
                 let prepared = prepared.unwrap_or_else(|e| panic!("{}: {e}", example.id));
                 let expected = example.execution.as_ref().unwrap();
                 assert_eq!(expected.expectation, "execute-supported");
-                let description = sql.describe(&prepared).unwrap();
-                assert_eq!(
-                    description
-                        .columns
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .collect::<Vec<_>>(),
-                    expected.columns,
-                    "{}",
-                    example.id
-                );
+                // DDL has no result description (describe deliberately returns Unsupported).
+                if !prepared.is_ddl() {
+                    let description = sql.describe(&prepared).unwrap();
+                    assert_eq!(
+                        description
+                            .columns
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect::<Vec<_>>(),
+                        expected.columns,
+                        "{}",
+                        example.id
+                    );
+                }
                 let result = sql
                     .execute_prepared(&prepared, &expected.positional_bindings, None)
                     .unwrap();

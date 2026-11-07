@@ -487,12 +487,12 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "SQL assignment arithmetic and RETURNING are outside the current bounded SQL write grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "SQL assignment arithmetic (E1 A4b) and RETURNING (E1a) now parse, so preparation reaches the table name and rejects the reserved deliveries name.",
               "features": [
                 "sql_assignment_expressions",
                 "sql_returning"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             }
           ]
         },
@@ -1131,11 +1131,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This PostgreSQL online-migration statement requires ALTER TABLE, concurrent index build, or CTE-based joined backfill syntax beyond the bounded SQL DDL/write surface. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "CREATE INDEX CONCURRENTLY parses, but concurrent index builds are not supported by the bounded SQL DDL surface.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Syntax"
+              "prepare_error": "Unsupported"
             },
             {
               "id": "schemas-fence06-example04",
@@ -1695,12 +1695,19 @@
               "source": "CREATE TABLE messages (\n  channel_id BIGINT NOT NULL,\n  bucket INTEGER NOT NULL,\n  message_id BIGINT NOT NULL,\n  author_id BIGINT NOT NULL,\n  body TEXT NOT NULL,\n  edited_at TIMESTAMPTZ,\n  PRIMARY KEY (channel_id, bucket, message_id)\n);",
               "interface": "sql",
               "kind": "statement",
-              "expectation": "prepare-rejected",
-              "reason": "TIMESTAMPTZ is outside the current SQL scalar type set; this full proposed CREATE TABLE is not accepted.",
+              "expectation": "prepare-supported",
+              "reason": "The bounded SQL DDL surface supports this CREATE TABLE, including TIMESTAMPTZ and the composite primary key.",
               "features": [
                 "sql_temporal_types"
               ],
-              "prepare_error": "Unsupported"
+              "execution_fixture": "messages_create_v0",
+              "execution": {
+                "positional_bindings": [],
+                "columns": [],
+                "rows": [],
+                "expectation": "execute-supported",
+                "reason": "CREATE TABLE executes through SqlSession against the explicit fixture and returns no columns or rows; DDL describe currently returns Unsupported."
+              }
             },
             {
               "id": "sql-fence01-example02",
@@ -1867,12 +1874,12 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "UPDATE aliases/FROM and expression assignments are outside the bounded SQL point-write grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "UPDATE aliases/FROM and expression assignments now parse, so preparation reaches the table name and rejects the reserved deliveries name.",
               "features": [
                 "sql_joined_writes",
                 "sql_assignment_expressions"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             }
           ]
         },
@@ -1916,12 +1923,12 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "Nested derived tables and row_number OVER window expressions are outside the bounded SQL read grammar. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "Nested derived tables and row_number OVER window expressions are outside the bounded SQL read surface; this exact source is classified Unsupported before reaching the reserved deliveries name.",
               "features": [
                 "sql_nested_reads",
                 "sql_windows"
               ],
-              "prepare_error": "Syntax"
+              "prepare_error": "Unsupported"
             }
           ]
         }
@@ -1954,6 +1961,13 @@
   ],
   "execution_fixtures": [
     {
+      "id": "messages_create_v0",
+      "scope": "Fresh SQL DDL fixture with harmless setup; the source CREATE TABLE creates messages without prerequisite objects.",
+      "setup_sql": [
+        "SELECT 1"
+      ]
+    },
+    {
       "id": "deliveries_reserved_boundary",
       "scope": "Rejection fixture for exact deliveries references. The reserved table is deliberately not created or renamed. An unrelated permitted table checks that failed native execution preserves data and versions.",
       "setup_sql": [
@@ -1969,7 +1983,7 @@
     },
     {
       "id": "messages_v0",
-      "scope": "Small trusted embedded SQL read fixture using supported scalar columns only. The source CREATE TABLE with TIMESTAMPTZ and the physical partition directive remain rejected and are not silently rewritten or advertised as supported.",
+      "scope": "Small trusted embedded SQL read fixture using supported scalar columns only. The source CREATE TABLE with TIMESTAMPTZ is exercised separately; the physical partition directive remains rejected.",
       "setup_sql": [
         "CREATE TABLE messages (channel_id BIGINT, bucket INTEGER, message_id BIGINT, author_id BIGINT, body TEXT, PRIMARY KEY (channel_id, bucket, message_id))",
         "INSERT INTO messages VALUES (42,0,10,1,'earlier')",
