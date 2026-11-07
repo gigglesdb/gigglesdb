@@ -64,6 +64,12 @@ plus `cargo clippy --all-targets -- -D warnings`. Pass `--no-fail-fast` to
 stops at the first failing binary and hides the rest. Run them on an exact archive of
 HEAD with the staged changes applied. `cargo check` alone is not enough.
 
+Committed blobs must be LF. K: copies are CRLF (core.autocrlf=true), so never
+`git hash-object -w` a K: file with autocrlf disabled. Hash from an LF worktree
+or strip CR first. Before the compare-and-swap, check
+`git diff --cached --numstat <expected-old>`: a small edit that shows as a
+whole-file rewrite means CRLF blobs, so stop and fix them.
+
 After a successful compare-and-swap, run `git reset -q -- <committed paths>` so
 the shared index matches HEAD for those paths. Otherwise the shared index keeps
 the old content staged, and anyone's plain `git commit` reverts your work. Never
