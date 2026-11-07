@@ -59,6 +59,36 @@ struct Join {
     left: bool,
     equalities: Vec<(ColumnRef, ColumnRef)>,
 }
+impl Join {
+    fn parse_equalities(
+        p: &mut Parser,
+        equalities: &mut Vec<(ColumnRef, ColumnRef)>,
+        depth: usize,
+    ) -> R<()> {
+        if depth > 32 {
+            return Err(SqlError::Limit);
+        }
+        loop {
+            if p.sym('(') {
+                Self::parse_equalities(p, equalities, depth + 1)?;
+                p.punct(')')?;
+            } else {
+                let a = p.column_ref()?;
+                if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
+                    return Err(SqlError::Unsupported);
+                }
+                p.at += 1;
+                equalities.push((a, p.column_ref()?));
+                if equalities.len() > MAX_COLUMNS {
+                    return Err(SqlError::Limit);
+                }
+            }
+            if !p.word("and") {
+                return Ok(());
+            }
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub(super) struct Query {
     pub(super) explain: bool,
@@ -817,20 +847,7 @@ impl Query {
             }
             p.need("on")?;
             let mut equalities = vec![];
-            loop {
-                let a = p.column_ref()?;
-                if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
-                    return Err(SqlError::Unsupported);
-                }
-                p.at += 1;
-                equalities.push((a, p.column_ref()?));
-                if equalities.len() > MAX_COLUMNS {
-                    return Err(SqlError::Limit);
-                }
-                if !p.word("and") {
-                    break;
-                }
-            }
+            Join::parse_equalities(p, &mut equalities, 0)?;
             joins.push(Join { left, equalities });
         }
         let filter = if p.word("where") {
@@ -1344,7 +1361,9 @@ impl Query {
                 if c.qualifier.as_ref().is_some_and(|q| q != &s.alias) {
                     continue;
                 }
-                if let Some(column) = t.columns.iter().position(|v| v.name == c.name) {
+                if let Some(column) = t.columns.iter().enumerate().find_map(|(n, v)| {
+                    (v.name == c.name && t.hidden_rowid() != Some(n)).then_some(n)
+                }) {
                     if found.is_some() {
                         return Err(SqlError::Duplicate);
                     }
@@ -1353,6 +1372,21 @@ impl Query {
             }
             found.ok_or(SqlError::UnknownColumn)
         };
+        let grouped = !self.group().is_empty()
+            || self.having().is_some()
+            || self
+                .order
+                .iter()
+                .any(|(s, _, _)| grouping::contains_aggregate(s))
+            || (self
+                .items
+                .iter()
+                .any(|(i, _)| matches!(i, Item::Aggregate(..)))
+                && (!self.order.is_empty()
+                    || self
+                        .items
+                        .iter()
+                        .any(|(i, _)| !matches!(i, Item::Aggregate(..)))));
         let mut joins = vec![];
         for (j, join) in self.joins.iter().enumerate() {
             let right = j + 1;
@@ -1383,30 +1417,21 @@ impl Query {
             let key = tables[right]
                 .primary_key
                 .iter()
-                .map(|i| keys.get(i).copied().ok_or(SqlError::Unbounded))
-                .collect::<R<Vec<_>>>()?;
+                .map(|i| keys.get(i).copied())
+                .collect::<Option<Vec<_>>>();
+            let scan = key.is_none();
+            if scan && !grouped {
+                return Err(SqlError::Unbounded);
+            }
+            let key = key.unwrap_or_default();
             joins.push(BoundJoin {
                 left: join.left,
+                scan,
                 key,
                 equalities,
             });
         }
-        if !self.group().is_empty()
-            || self.having().is_some()
-            || self
-                .order
-                .iter()
-                .any(|(s, _, _)| grouping::contains_aggregate(s))
-            || (self
-                .items
-                .iter()
-                .any(|(i, _)| matches!(i, Item::Aggregate(..)))
-                && (!self.order.is_empty()
-                    || self
-                        .items
-                        .iter()
-                        .any(|(i, _)| !matches!(i, Item::Aggregate(..)))))
-        {
+        if grouped {
             return grouping::bind(self, &tables, joins, parameters, &resolve);
         }
         let mut items = vec![];
@@ -1695,6 +1720,8 @@ enum BoundItem {
 }
 struct BoundJoin {
     left: bool,
+    // Only bounded grouped execution accepts a non-primary-key scan join.
+    scan: bool,
     key: Vec<BoundColumn>,
     equalities: Vec<(BoundColumn, BoundColumn)>,
 }

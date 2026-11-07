@@ -1,10 +1,11 @@
-//! Bounded grouping plan. Synthetic slots contain only group keys and aggregate
-//! transition values; input columns cannot leak into post-group evaluation.
+//! Bounded grouping plan. Synthetic slots hold keys, aggregate transitions and
+//! columns proven dependent on a fully grouped declared primary key.
 use super::*;
 
 pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
     aggregates: Vec<BoundItem>,
+    dependents: Vec<BoundColumn>,
     aggregate_columns: Vec<ColumnDef>,
     outputs: Vec<BoundScalar>,
     output_sources: Vec<Option<BoundColumn>>,
@@ -92,6 +93,8 @@ struct Lower<'a, F> {
     resolve: &'a F,
     tables: &'a [&'a TableDef],
     aggregates: Vec<(Aggregate, Option<Scalar>)>,
+    dependent_sources: Vec<bool>,
+    dependents: Vec<BoundColumn>,
 }
 impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
     fn scalar(&mut self, s: &Scalar) -> R<Scalar> {
@@ -102,7 +105,24 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
             }
         }
         Ok(match s {
-            Scalar::Column(_) => return Err(SqlError::GroupingError),
+            Scalar::Column(c) => {
+                let c = (self.resolve)(c, self.scope)?;
+                if !self.dependent_sources[c.source] {
+                    return Err(SqlError::GroupingError);
+                }
+                let index = self
+                    .dependents
+                    .iter()
+                    .position(|d| d.source == c.source && d.column == c.column)
+                    .unwrap_or_else(|| {
+                        self.dependents.push(c);
+                        self.dependents.len() - 1
+                    });
+                Scalar::Column(ColumnRef {
+                    qualifier: None,
+                    name: format!("__dependent_slot_{index}"),
+                })
+            }
             Scalar::Call(n, args) if aggregate(n).is_some() => {
                 if args.len() != 1 {
                     return Err(SqlError::UndefinedFunction);
@@ -269,15 +289,30 @@ pub(super) fn bind<'a>(
             }
         }
     }
+    let group_identity = groups
+        .iter()
+        .map(|s| canonical(s, resolve, tables.len(), tables))
+        .collect::<R<Vec<_>>>()?;
+    let dependent_sources = tables
+        .iter()
+        .enumerate()
+        .map(|(source, table)| {
+            table.hidden_rowid().is_none()
+                && !table.primary_key.is_empty()
+                && table
+                    .primary_key
+                    .iter()
+                    .all(|column| group_identity.contains(&format!("column:{source}:{column}")))
+        })
+        .collect();
     let mut lower = Lower {
-        groups: groups
-            .iter()
-            .map(|s| canonical(s, resolve, tables.len(), tables))
-            .collect::<R<Vec<_>>>()?,
+        groups: group_identity,
         scope: tables.len(),
         resolve,
         tables,
         aggregates: vec![],
+        dependent_sources,
+        dependents: vec![],
     };
     let output_syntax = projection
         .iter()
@@ -406,6 +441,14 @@ pub(super) fn bind<'a>(
         aggregate_columns.push(column);
         aggregates.push(BoundItem::Aggregate(a, Some(b)));
     }
+    for (index, c) in lower.dependents.iter().enumerate() {
+        let mut column = tables[c.source].columns[c.column].clone();
+        column.name = format!("__dependent_slot_{index}");
+        if c.source > 0 && q.joins[c.source - 1].left {
+            column.not_null = false;
+        }
+        slots.push(column);
+    }
     let slot_table = TableDef {
         id: 0,
         name: "__groups".into(),
@@ -518,6 +561,7 @@ pub(super) fn bind<'a>(
             keys,
             aggregates,
             aggregate_columns,
+            dependents: lower.dependents,
             outputs,
             output_sources,
             having,
@@ -557,6 +601,74 @@ fn page_expr(expr: Option<&Expr>, params: &[Value]) -> R<Option<u64>> {
         Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
         _ => Err(SqlError::Limit),
     }
+}
+// Stream each join branch without retaining a Cartesian product. Only the
+// grouped path uses scan joins; ordinary queries still require right-side PKs.
+fn visit_joins(
+    query: &BoundQuery<'_>,
+    source: &impl scan::RowSource,
+    index: usize,
+    row: &mut Tuple,
+    meter: &mut scan::Meter<'_>,
+    work: &mut usize,
+    accept: &mut impl FnMut(&Tuple) -> R<()>,
+) -> R<()> {
+    let Some(join) = query.joins.get(index) else {
+        return accept(row);
+    };
+    let table = query.tables[index + 1];
+    let mut matched = false;
+    if join.scan {
+        let range = scan::KeyRange {
+            lo: std::ops::Bound::Unbounded,
+            hi: std::ops::Bound::Unbounded,
+        };
+        for candidate in source.scan(table, &range, scan::Direction::Forward)? {
+            meter.tick()?;
+            *work = work.checked_add(1).ok_or(SqlError::Limit)?;
+            if *work > scan::MAX_QUERY_ROWS {
+                return Err(SqlError::Limit);
+            }
+            let candidate = candidate?;
+            if join
+                .equalities
+                .iter()
+                .all(|(a, b)| equal(row.get(*a), &candidate.row.values[b.column]))
+            {
+                matched = true;
+                row.values.push(candidate.row.values.clone());
+                visit_joins(query, source, index + 1, row, meter, work, accept)?;
+                row.values.pop();
+            }
+        }
+    } else {
+        let key = join
+            .key
+            .iter()
+            .map(|c| row.get(*c).clone())
+            .collect::<Vec<_>>();
+        let found = if key.contains(&Value::Null) {
+            None
+        } else {
+            source.get(table, &encode_key(&key)?)?
+        };
+        if let Some(candidate) = found.filter(|candidate| {
+            join.equalities
+                .iter()
+                .all(|(a, b)| equal(row.get(*a), &candidate.row.values[b.column]))
+        }) {
+            matched = true;
+            row.values.push(candidate.row.values.clone());
+            visit_joins(query, source, index + 1, row, meter, work, accept)?;
+            row.values.pop();
+        }
+    }
+    if !matched && join.left {
+        row.values.push(vec![Value::Null; table.columns.len()]);
+        visit_joins(query, source, index + 1, row, meter, work, accept)?;
+        row.values.pop();
+    }
+    Ok(())
 }
 impl Grouping {
     fn initial(&self) -> Vec<Value> {
@@ -615,12 +727,13 @@ impl Grouping {
             groups.insert(Key(vec![]), initial);
         }
         let mut aggregate_work = 0;
+        let mut join_work = 0;
         {
             let mut meter = scan::Meter::per_row(cancel);
-            let mut accept = |row: Tuple| -> R<()> {
+            let mut accept = |row: &Tuple| -> R<()> {
                 let mut work = 0;
                 if let Some(f) = &query.filter
-                    && f.eval(&row, params, &mut work)? != Some(true)
+                    && f.eval(row, params, &mut work)? != Some(true)
                 {
                     return Ok(());
                 }
@@ -628,13 +741,14 @@ impl Grouping {
                 let key = Key(self
                     .keys
                     .iter()
-                    .map(|s| s.eval(&row, params, &mut key_work))
+                    .map(|s| s.eval(row, params, &mut key_work))
                     .collect::<R<Vec<_>>>()?);
                 if !groups.contains_key(&key) {
                     if groups.len() >= scan::MAX_QUERY_ROWS {
                         return Err(SqlError::Limit);
                     }
-                    let initial = self.initial();
+                    let mut initial = self.initial();
+                    initial.extend(self.dependents.iter().map(|c| row.get(*c).clone()));
                     retention.charge(
                         retained(&key.0) + retained(&initial) + 6 * std::mem::size_of::<usize>(),
                     )?;
@@ -646,7 +760,7 @@ impl Grouping {
                     &self.aggregates,
                     &self.aggregate_columns,
                     values,
-                    &row,
+                    row,
                     params,
                     &mut aggregate_work,
                 )?;
@@ -660,7 +774,7 @@ impl Grouping {
             };
             if query.tables.is_empty() {
                 meter.tick()?;
-                accept(Tuple {
+                accept(&Tuple {
                     values: vec![],
                     version: 0,
                 })?;
@@ -678,38 +792,15 @@ impl Grouping {
                         values: vec![input.row.values.clone()],
                         version: 0,
                     };
-                    let mut skip = false;
-                    for (i, join) in query.joins.iter().enumerate() {
-                        let table = query.tables[i + 1];
-                        let key = join
-                            .key
-                            .iter()
-                            .map(|c| row.get(*c).clone())
-                            .collect::<Vec<_>>();
-                        let found = if key.contains(&Value::Null) {
-                            None
-                        } else {
-                            source.get(table, &encode_key(&key)?)?
-                        };
-                        let matched = found.filter(|r| {
-                            join.equalities
-                                .iter()
-                                .all(|(a, b)| equal(row.get(*a), &r.row.values[b.column]))
-                        });
-                        match matched {
-                            Some(r) => row.values.push(r.row.values.clone()),
-                            None if join.left => {
-                                row.values.push(vec![Value::Null; table.columns.len()])
-                            }
-                            None => {
-                                skip = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !skip {
-                        accept(row)?;
-                    }
+                    visit_joins(
+                        query,
+                        &source,
+                        0,
+                        &mut row,
+                        &mut meter,
+                        &mut join_work,
+                        &mut accept,
+                    )?;
                 }
             }
         }
@@ -886,6 +977,52 @@ mod tests {
             assert_eq!(polls, fence);
             assert_eq!(bincode::serialize(&state).unwrap(), before);
         }
+    }
+    #[test]
+    fn scan_join_candidate_cancellation_leaves_source_unchanged() {
+        let mut state = state(0);
+        for sql in [
+            "CREATE TABLE group_scan(id bigint PRIMARY KEY,g bigint)",
+            "INSERT INTO group_cap VALUES(0),(1),(2)",
+            "INSERT INTO group_scan VALUES(11,0),(12,0),(13,0)",
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state
+                .execute_with_cancel(&prepared, &[], None, || false)
+                .unwrap();
+        }
+        let before = bincode::serialize(&state).unwrap();
+        let query = query(
+            "SELECT group_cap.id,count(group_scan.id) FROM group_cap LEFT JOIN group_scan ON group_cap.id=group_scan.g GROUP BY group_cap.id ORDER BY group_cap.id",
+        );
+        let bound = query.bind(&state, 0, &[]).unwrap();
+        // Entry and the first left row consume two polls. The next three
+        // fences occur inside the right scan, including non-final candidates.
+        for fence in [3, 4, 5] {
+            let mut polls = 0;
+            assert_eq!(
+                bound.execute(&state, &[], &mut || {
+                    polls += 1;
+                    polls == fence
+                }),
+                Err(SqlError::Aborted)
+            );
+            assert_eq!(polls, fence);
+            assert_eq!(bincode::serialize(&state).unwrap(), before);
+        }
+        let result = bound.execute(&state, &[], &mut || false).unwrap();
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|r| r.values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![Value::Int(0), Value::Int(3)],
+                vec![Value::Int(1), Value::Int(0)],
+                vec![Value::Int(2), Value::Int(0)],
+            ]
+        );
     }
     #[test]
     fn production_group_count_cap_precedes_paging() {
