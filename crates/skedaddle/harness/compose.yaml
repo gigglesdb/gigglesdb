@@ -1,0 +1,81 @@
+name: skedaddle-${RUN_ID:?run through run.ps1}
+x-common: &common
+  labels: {skedaddle.test: '${RUN_ID}'}
+  restart: 'no'
+  logging:
+    driver: json-file
+    options: {max-size: 2m, max-file: '2'}
+  networks: [test]
+services:
+  pg:
+    <<: *common
+    image: ${PG_IMAGE}
+    environment: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: skedaddle, POSTGRES_DB: skedaddle}
+    command: [postgres, -c, max_wal_size=128MB, -c, min_wal_size=32MB, -c, logging_collector=off]
+    volumes: [pgdata:/var/lib/postgresql]
+    ports: ['127.0.0.1::5432']
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d skedaddle]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  minio:
+    <<: *common
+    image: ${MINIO_IMAGE}
+    command: [server, /data, --console-address, ':9001']
+    environment: {MINIO_ROOT_USER: skedaddle, MINIO_ROOT_PASSWORD: skedaddle-secret}
+    volumes: [miniodata:/data]
+    ports: ['127.0.0.1::9000']
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:9000/minio/health/live]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  gcs:
+    <<: *common
+    image: ${GCS_IMAGE}
+    command: [-scheme, http, -port, '4443', -backend, filesystem, -filesystem-root, /storage]
+    volumes: [gcsdata:/storage]
+    ports: ['127.0.0.1::4443']
+    mem_limit: 128m
+    healthcheck:
+      test: [CMD-SHELL, wget -q -O - http://127.0.0.1:4443/storage/v1/b]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  toxiproxy:
+    <<: *common
+    image: ${TOXIPROXY_IMAGE}
+    ports: ['127.0.0.1::8474', '127.0.0.1::9002', '127.0.0.1::9003', '127.0.0.1::9004']
+    mem_limit: 64m
+    healthcheck:
+      test: [CMD, /toxiproxy-cli, -host, 'http://127.0.0.1:8474', list]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  faults:
+    <<: *common
+    image: ${FAULTS_IMAGE}
+    command:
+      - sh
+      - -c
+      - >-
+        trap 'exit 0' INT TERM;
+        while true; do
+          printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' | nc -l -p 8080 >/dev/null;
+        done
+    mem_limit: 32m
+    read_only: true
+    healthcheck:
+      test: [CMD, 'true']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  pgdata: {labels: {skedaddle.test: '${RUN_ID}'}}
+  miniodata: {labels: {skedaddle.test: '${RUN_ID}'}}
+  gcsdata: {labels: {skedaddle.test: '${RUN_ID}'}}
+networks:
+  test: {labels: {skedaddle.test: '${RUN_ID}'}}
