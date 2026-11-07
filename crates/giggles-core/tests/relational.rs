@@ -418,7 +418,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "SELECT * FROM safe -- hi",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
         "SELECT * FROM safe ORDER BY n LIMIT 1",
-        "INSERT INTO safe VALUES(1,1),(2,2)",
         "UPDATE safe SET n=n+1 WHERE id=1",
         "SELECT * FROM safe LIMIT 1 OFFSET 1",
     ] {

@@ -15,6 +15,7 @@ mod secondary_index_catalog;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
 mod sql_index;
+mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
 pub use giggles_pg_types::temporal::{
     Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
@@ -536,6 +537,7 @@ struct Predicate {
 #[derive(Debug, Clone)]
 enum Statement {
     CreateIndex(sql_index::CreateIndex),
+    InsertMulti(sql_insert::Insert),
     Query(query::Query),
     Create {
         name: String,
@@ -666,6 +668,11 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if word == "insert")
+            && sql_insert::claims(&self.tokens)
+        {
+            return sql_insert::parse(self).map(Statement::InsertMulti);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "create")
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index" || w == "unique")
         {
@@ -1101,6 +1108,9 @@ impl Prepared {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
+        if let Statement::InsertMulti(insert) = &self.statement {
+            return insert.describe(state, self.params);
+        }
         if let Statement::InsertExpressions(values) = &self.statement {
             return values.describe(state, self.params);
         }
@@ -1201,6 +1211,7 @@ impl Prepared {
             }
             Statement::InsertExpressions(values) => Some(&values.name),
             Statement::CreateIndex(index) => Some(&index.table),
+            Statement::InsertMulti(insert) => Some(&insert.table),
             Statement::Create { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
@@ -1226,7 +1237,9 @@ impl Prepared {
             }
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
-            Statement::Insert { .. } | Statement::InsertExpressions(_) => "INSERT",
+            Statement::Insert { .. }
+            | Statement::InsertExpressions(_)
+            | Statement::InsertMulti(_) => "INSERT",
             Statement::Select { .. } => "SELECT",
             Statement::Update { .. } => "UPDATE",
             Statement::Delete { .. } => "DELETE",
@@ -1317,7 +1330,10 @@ impl Prepared {
         // Try the established grammar first, including identifiers named min/count.
         let statement = match p.parse() {
             Ok(statement) => statement,
-            Err(_) if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert") => {
+            Err(_)
+                if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert")
+                    && !sql_insert::claims(&p.tokens) =>
+            {
                 p.at = 0;
                 p.params.clear();
                 Statement::InsertExpressions(query::InsertExpressions::parse(&mut p)?)
@@ -1633,6 +1649,7 @@ impl Relational {
             prepared.statement,
             Statement::Insert { .. }
                 | Statement::InsertExpressions(_)
+                | Statement::InsertMulti(_)
                 | Statement::Update { .. }
                 | Statement::Delete { .. }
         ) {
@@ -1706,6 +1723,9 @@ impl Relational {
                 return q.bind(self, prepared.params)?.execute(self, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
+            Statement::InsertMulti(insert) => {
+                return sql_insert::execute(self, insert, params, expected, &mut cancel);
+            }
             Statement::CreateIndex(index) => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);

@@ -7,13 +7,6 @@ use super::secondary_index::{self as si, Descriptor};
 use super::secondary_index_adapter::{encode_tuple, tuple_len};
 use super::*;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "private foundation awaiting separately released caller"
-    )
-)]
 pub(crate) struct Limits {
     /// Conservative copy/temporary-byte reservation, at most 64 MiB.
     pub bytes: usize,
@@ -80,13 +73,6 @@ impl Relational {
     /// `expected` pins table/id/ordered columns/encoding/unique (name is not
     /// identity). Returns the authoritative map's borrowed PK and row/version.
     /// NULL skips only after full source, metadata and type validation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private foundation awaiting separately released caller"
-        )
-    )]
     pub(crate) fn secondary_unique_lookup_engine<'a>(
         &'a self,
         table: &TableDef,

@@ -3062,3 +3062,5 @@ mod text_nul_network {
 }
 
 include!("routing_rejection_network.inc");
+
+include!("sql_upsert_network.inc");

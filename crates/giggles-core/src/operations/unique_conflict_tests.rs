@@ -119,7 +119,9 @@ fn attempt(
             returning.then_some(projection.as_slice()),
             retained,
             cancel,
-        ) {
+        )
+        .map_err(PlanError::into_operations)
+        {
             Ok(plan) => plan,
             Err(error) => {
                 assert_eq!(
@@ -226,7 +228,7 @@ fn target_identity_is_exact() {
             assert_eq!(
                 error,
                 if matches!(case, 5 | 6) {
-                    sql(SqlError::StaleSchema)
+                    sql(SqlError::StaleSchema).into_operations()
                 } else {
                     Error::Unsupported
                 }
@@ -358,7 +360,7 @@ fn duplicate_rules() {
             &BoundConflict::Nothing
         )
         .unwrap_err(),
-        sql(SqlError::Duplicate)
+        sql(SqlError::Duplicate).into_operations()
     );
     assert!(session.is_aborted());
 }
@@ -465,7 +467,10 @@ fn swap_and_collision_through_publisher() {
         ];
         let result = run(&mut session, &proposals, &update(3));
         if collision {
-            assert_eq!(result.unwrap_err(), sql(SqlError::Duplicate));
+            assert_eq!(
+                result.unwrap_err(),
+                sql(SqlError::Duplicate).into_operations()
+            );
             assert!(session.is_aborted());
             assert_eq!(
                 session.execute("SELECT * FROM items", &[], None),
@@ -559,7 +564,7 @@ fn cancellation() {
             &mut || true
         )
         .unwrap_err(),
-        sql(SqlError::Aborted)
+        sql(SqlError::Aborted).into_operations()
     );
     assert!(session.is_aborted());
 }
@@ -702,7 +707,9 @@ fn sql_attempt(
             Some(&projection),
             None,
             &mut || false,
-        ) {
+        )
+        .map_err(PlanError::into_operations)
+        {
             Ok(plan) => plan,
             Err(error) => {
                 assert_eq!(
@@ -1054,7 +1061,7 @@ fn sql_insert_pk_duplicate_left_to_publisher() {
             &update(4)
         )
         .unwrap_err(),
-        sql(SqlError::Duplicate)
+        sql(SqlError::Duplicate).into_operations()
     );
     assert!(session.is_aborted());
     assert_eq!(actual(&mut admin.sql_session()), before);

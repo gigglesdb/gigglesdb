@@ -540,13 +540,6 @@ fn row_bound(key: &[u8], row: &SqlRow, bytes: &mut usize, work: &mut usize) -> R
     cap(*work, STATEMENT_MAX_WORK)
 }
 /// Crate-visible borrowed batch change; same meaning as RowChange.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "private foundation awaiting the unique-conflict kernel"
-    )
-)]
 pub(crate) struct BatchRowChange<'a> {
     pub table: u64,
     pub old: Option<(&'a [u8], &'a SqlRow)>,
@@ -554,13 +547,6 @@ pub(crate) struct BatchRowChange<'a> {
 }
 impl Relational {
     /// Next unassigned row version of this exact relational state.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private foundation awaiting the unique-conflict kernel"
-        )
-    )]
     pub(crate) fn next_version_engine(&self) -> u64 {
         self.next_version
     }
@@ -581,13 +567,6 @@ impl Relational {
         Ok(staged.result)
     }
     /// Validated typed entry to the central statement publisher.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private foundation awaiting the unique-conflict kernel"
-        )
-    )]
     pub(crate) fn secondary_apply_batch_engine(
         &mut self,
         epoch: u64,

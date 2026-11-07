@@ -6,11 +6,29 @@ use crate::relational::{
     secondary_unique_lookup::Limits,
 };
 
+/// Preserve SQL failures until the frontend chooses its error representation.
+#[derive(Debug)]
+pub(super) enum PlanError {
+    Engine(Error),
+    Sql(SqlError),
+}
+impl From<Error> for PlanError {
+    fn from(error: Error) -> Self {
+        Self::Engine(error)
+    }
+}
+impl PlanError {
+    /// Exactly the previous native representation.
+    #[cfg_attr(not(test), allow(dead_code, reason = "native planner compatibility"))]
+    pub(super) fn into_operations(self) -> Error {
+        match self {
+            Self::Engine(error) => error,
+            Self::Sql(error) => core(CoreError::Sql(error)),
+        }
+    }
+}
+
 /// Arbiter used to resolve an incoming conflict.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner awaiting K2 integration")
-)]
 pub(super) enum Arbiter<'a> {
     /// Exact named unique descriptor (existing behavior).
     Unique(&'a Descriptor),
@@ -20,10 +38,6 @@ pub(super) enum Arbiter<'a> {
     AnyUnique,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner awaiting K2 integration")
-)]
 pub(super) enum Semantics {
     Native,
     Sql,
@@ -34,7 +48,10 @@ struct ResolvedArbiter<'a> {
     descriptor: Option<&'a Descriptor>,
 }
 impl ResolvedArbiter<'_> {
-    fn tuple(&self, value: impl Fn(usize) -> Value) -> Result<Option<Vec<u8>>> {
+    fn tuple(
+        &self,
+        value: impl Fn(usize) -> Value,
+    ) -> std::result::Result<Option<Vec<u8>>, PlanError> {
         let values = self
             .columns
             .iter()
@@ -51,19 +68,11 @@ impl ResolvedArbiter<'_> {
 }
 
 /// One physical change; skips and no-op updates never appear here.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner awaiting K2 integration")
-)]
 pub(super) struct PlannedChange<'s> {
     pub(super) table: u64,
     pub(super) old: Option<(&'s [u8], &'s SqlRow)>,
     pub(super) new: (Vec<u8>, SqlRow),
 }
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner awaiting K2 integration")
-)]
 pub(super) struct UniquePlan<'s> {
     pub(super) changes: Vec<PlannedChange<'s>>,
     pub(super) next_version: u64,
@@ -71,10 +80,6 @@ pub(super) struct UniquePlan<'s> {
 }
 impl UniquePlan<'_> {
     /// Borrowed view for BatchApply::apply.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "private planner awaiting K2 integration")
-    )]
     pub(super) fn batch(&self) -> Vec<crate::relational::BatchRowChange<'_>> {
         self.changes
             .iter()
@@ -86,15 +91,15 @@ impl UniquePlan<'_> {
             .collect()
     }
 }
-fn tick(cancel: &mut dyn FnMut() -> bool) -> Result<()> {
+fn tick(cancel: &mut dyn FnMut() -> bool) -> std::result::Result<(), PlanError> {
     if cancel() {
-        Err(core(CoreError::Sql(SqlError::Aborted)))
+        Err(PlanError::Sql(SqlError::Aborted))
     } else {
         Ok(())
     }
 }
-fn sql(error: SqlError) -> Error {
-    core(CoreError::Sql(error))
+fn sql(error: SqlError) -> PlanError {
+    PlanError::Sql(error)
 }
 fn legacy(column: &ColumnDef) -> bool {
     matches!(
@@ -143,10 +148,6 @@ fn value<'a>(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner awaiting K2 integration")
-)]
 #[expect(clippy::too_many_arguments, reason = "frozen private planner contract")]
 pub(super) fn plan_unique_conflict<'s>(
     src: &'s Relational,
@@ -159,15 +160,15 @@ pub(super) fn plan_unique_conflict<'s>(
     returning: Option<&[BoundProjection]>,
     mut retained: Option<&mut usize>,
     cancel: &mut dyn FnMut() -> bool,
-) -> Result<UniquePlan<'s>> {
+) -> std::result::Result<UniquePlan<'s>, PlanError> {
     // Raw incoming admission precedes comparisons, key copies and callbacks.
     if incoming.len() > crate::relational::MAX_ROWS {
-        return Err(Error::Limit);
+        return Err(Error::Limit.into());
     }
     let mut remaining_input = MAX_INSERT_BYTES;
     for row in incoming {
         if row.len() != table.columns.len() {
-            return Err(Error::Type);
+            return Err(Error::Type.into());
         }
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
         for (value, column) in row.iter().zip(&table.columns) {
@@ -192,12 +193,12 @@ pub(super) fn plan_unique_conflict<'s>(
     if semantics == Semantics::Native && !matches!(arbiter, Arbiter::Unique(_))
         || matches!(arbiter, Arbiter::AnyUnique) && matches!(action, BoundConflict::Update { .. })
     {
-        return Err(Error::Unsupported);
+        return Err(Error::Unsupported.into());
     }
     if let Arbiter::Unique(target) = &arbiter
         && (!target.unique || target.table != table.id || target.columns.is_empty())
     {
-        return Err(Error::Unsupported);
+        return Err(Error::Unsupported.into());
     }
     let sidecar = src.secondary_state_engine(&mut *cancel).map_err(sql)?;
     let mut targets = Vec::new();
@@ -214,7 +215,7 @@ pub(super) fn plan_unique_conflict<'s>(
                 || descriptor.key_encoding != target.key_encoding
                 || descriptor.unique != target.unique
             {
-                return Err(Error::Unsupported);
+                return Err(Error::Unsupported.into());
             }
             targets.push(target);
         }
@@ -245,7 +246,7 @@ pub(super) fn plan_unique_conflict<'s>(
                 .position(|column| column.id == *id)
                 .ok_or(Error::Unsupported)?;
             if !legacy(&table.columns[index]) {
-                return Err(Error::Unsupported);
+                return Err(Error::Unsupported.into());
             }
             columns.push(index);
         }
@@ -259,7 +260,7 @@ pub(super) fn plan_unique_conflict<'s>(
     if !include_pk {
         for index in &table.primary_key {
             if !table.columns.get(*index).is_some_and(legacy) {
-                return Err(Error::Unsupported);
+                return Err(Error::Unsupported.into());
             }
         }
     }
@@ -338,15 +339,15 @@ pub(super) fn plan_unique_conflict<'s>(
         if let Some((pk, _)) = resolved.winner
             && !winners.insert(pk)
         {
-            return Err(Error::DuplicateTarget);
+            return Err(Error::DuplicateTarget.into());
         }
         if let Some(arbiter) = &resolved.arbiters[0]
             && !native_arbiters.insert(arbiter.as_slice())
         {
-            return Err(Error::DuplicateTarget);
+            return Err(Error::DuplicateTarget.into());
         }
         if resolved.winner.is_none() && !inserts.insert(resolved.key.as_slice()) {
-            return Err(Error::DuplicateTarget);
+            return Err(Error::DuplicateTarget.into());
         }
     }
     tick(cancel)?;
@@ -356,7 +357,7 @@ pub(super) fn plan_unique_conflict<'s>(
         .1
         .len();
     if source_rows.checked_add(inserts.len()).ok_or(Error::Limit)? > crate::relational::MAX_ROWS {
-        return Err(Error::Limit);
+        return Err(Error::Limit.into());
     }
     tick(cancel)?;
     let mut guards = vec![true; incoming.len()];
@@ -368,7 +369,7 @@ pub(super) fn plan_unique_conflict<'s>(
                     != Value::Bool(true)
             {
                 if semantics == Semantics::Native {
-                    return Err(Error::ConditionFailed);
+                    return Err(Error::ConditionFailed.into());
                 }
                 guards[index] = false;
             }
@@ -397,7 +398,7 @@ pub(super) fn plan_unique_conflict<'s>(
                             .winner
                             .is_some_and(|(key, _)| !claimed_winners.insert(key))
                     {
-                        return Err(Error::DuplicateTarget);
+                        return Err(Error::DuplicateTarget.into());
                     }
                     skip = !guards[input_index];
                 }
@@ -411,7 +412,7 @@ pub(super) fn plan_unique_conflict<'s>(
                 let mut evaluated = Vec::new();
                 for (index, expression) in values {
                     if table.primary_key.contains(index) {
-                        return Err(Error::Unsupported);
+                        return Err(Error::Unsupported.into());
                     }
                     evaluated.push((
                         *index,
@@ -460,7 +461,7 @@ pub(super) fn plan_unique_conflict<'s>(
     }
     tick(cancel)?;
     if source_rows.checked_add(sql_inserts).ok_or(Error::Limit)? > crate::relational::MAX_ROWS {
-        return Err(Error::Limit);
+        return Err(Error::Limit.into());
     }
     let mut order = (0..incoming.len()).collect::<Vec<_>>();
     let key = |index: usize| {
@@ -586,6 +587,144 @@ pub(super) fn plan_unique_conflict<'s>(
         next_version,
         outcome,
     })
+}
+
+fn into_sql(error: PlanError) -> SqlError {
+    match error {
+        PlanError::Sql(error) => error,
+        PlanError::Engine(error) => match error {
+            Error::DuplicateTarget => SqlError::Duplicate,
+            Error::Unsupported => SqlError::Unsupported,
+            Error::Type | Error::DivisionByZero => SqlError::Type,
+            Error::Limit => SqlError::Limit,
+            Error::Overflow => SqlError::Overflow,
+            Error::ConditionFailed => {
+                debug_assert!(false, "SQL planner returned native condition failure");
+                SqlError::Type
+            }
+            Error::Core(_) => {
+                debug_assert!(false, "SQL planner lost a structured SQL error");
+                SqlError::Unsupported
+            }
+            _ => SqlError::Unsupported,
+        },
+    }
+}
+
+impl Relational {
+    /// SQL-only binding and publication; native planner semantics stay unchanged.
+    pub(crate) fn sql_conflict_engine(
+        &mut self,
+        table: &TableDef,
+        target: (Option<&[String]>, Option<&str>),
+        incoming: &[Vec<Value>],
+        action: &ConflictAction,
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
+        if cancel() {
+            return Err(SqlError::Aborted);
+        }
+        Self::sql_admit_conflict_input(table.columns.len(), incoming, action)?;
+        if cancel() {
+            return Err(SqlError::Aborted);
+        }
+        // Immutable planner source. Its whole-state size was already bounded
+        // by secondary_admit_mutation in the relational mutation entry.
+        #[cfg(test)]
+        Self::sql_insert_test_event(2);
+        let src = self.clone();
+        let descriptors = src.secondary_descriptors_engine();
+        let arbiter = if let Some(columns) = target.0 {
+            let columns = columns
+                .iter()
+                .map(|name| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| &column.name == name)
+                        .ok_or(SqlError::UnknownColumn)
+                })
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+            let primary = table.primary_key.iter().copied().collect::<BTreeSet<_>>();
+            if columns == primary {
+                Arbiter::PrimaryKey
+            } else {
+                let ids = columns
+                    .iter()
+                    .map(|index| table.columns[*index].id)
+                    .collect::<BTreeSet<_>>();
+                let descriptor = descriptors
+                    .iter()
+                    .filter(|descriptor| {
+                        descriptor.table == table.id
+                            && descriptor.unique
+                            && descriptor.columns.iter().copied().collect::<BTreeSet<_>>() == ids
+                    })
+                    .min_by_key(|descriptor| descriptor.id)
+                    .ok_or(SqlError::Unsupported)?;
+                Arbiter::Unique(descriptor)
+            }
+        } else if let Some(name) = target.1 {
+            if let Some(descriptor) = descriptors.iter().find(|descriptor| {
+                descriptor.table == table.id && descriptor.unique && descriptor.name == name
+            }) {
+                Arbiter::Unique(descriptor)
+            } else if name == format!("{}_pkey", table.name) {
+                Arbiter::PrimaryKey
+            } else {
+                return Err(SqlError::Unsupported);
+            }
+        } else if matches!(action, ConflictAction::Nothing) {
+            Arbiter::AnyUnique
+        } else {
+            return Err(SqlError::Syntax);
+        };
+        let bindings = Bindings::new();
+        let mut binder = Binder {
+            table: Some(table),
+            allow_fields: false,
+            allow_conflict_fields: true,
+            locals: None,
+            bindings: &bindings,
+            used: BTreeSet::new(),
+            remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
+        };
+        let bound = (|| -> Result<BoundConflict> {
+            Ok(match action {
+                ConflictAction::Nothing => BoundConflict::Nothing,
+                ConflictAction::Update { guard, values } => BoundConflict::Update {
+                    guard: binder.optional(guard)?,
+                    values: binder.expression_assignments(values)?,
+                },
+            })
+        })()
+        .map_err(|error| into_sql(error.into()))?;
+        #[cfg(test)]
+        Self::sql_insert_test_event(3);
+        let plan = plan_unique_conflict(
+            &src,
+            table,
+            self.epoch,
+            arbiter,
+            Semantics::Sql,
+            incoming,
+            &bound,
+            None,
+            None,
+            cancel,
+        )
+        .map_err(into_sql)?;
+        #[cfg(test)]
+        Self::sql_insert_test_event(4);
+        let mut result = self.secondary_apply_batch_engine(
+            self.epoch,
+            &plan.batch(),
+            plan.next_version,
+            cancel,
+        )?;
+        result.affected = plan.outcome.affected as u64;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
