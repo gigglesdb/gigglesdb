@@ -111,6 +111,20 @@ pub(crate) struct WriteTarget {
     pub(crate) current: Option<Vec<u8>>,
     pub(crate) changed_since_snapshot: bool,
 }
+/// An opaque mark belonging to one transaction instance, even when TxnId is reused.
+#[derive(Clone, Debug)]
+pub(crate) struct Savepoint {
+    owner: Arc<()>,
+    sequence: u64,
+    undo_len: usize,
+}
+struct UndoWrite {
+    key: (Keyspace, Vec<u8>),
+    // None means absent from the overlay; Some(None) means a buffered tombstone.
+    previous: Option<Option<Vec<u8>>>,
+    write_bytes: usize,
+    bytes: usize,
+}
 pub(crate) struct Transaction {
     seq: Arc<Sequencer>,
     locks: Arc<LockManager>,
@@ -119,6 +133,11 @@ pub(crate) struct Transaction {
     snapshot: Option<SnapshotHandle>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     write_bytes: usize,
+    savepoint_owner: Arc<()>,
+    savepoint_sequence: u64,
+    savepoints: Vec<(u64, usize)>,
+    undo: Vec<UndoWrite>,
+    undo_bytes: usize,
     locked: BTreeSet<(Keyspace, Vec<u8>)>,
     reads: ReadSet,
     validation_config: ValidationConfig,
@@ -138,6 +157,11 @@ impl Transaction {
             snapshot: None,
             writes: BTreeMap::new(),
             write_bytes: 0,
+            savepoint_owner: Arc::new(()),
+            savepoint_sequence: 0,
+            savepoints: Vec::new(),
+            undo: Vec::new(),
+            undo_bytes: 0,
             locked: BTreeSet::new(),
             reads: ReadSet::default(),
             validation_config: ValidationConfig::default(),
@@ -146,6 +170,63 @@ impl Transaction {
             txn.begin_statement();
         }
         txn
+    }
+    /// Marks buffered writes; undo records, keys, and prior values count against
+    /// the write-set limit while a savepoint remains live.
+    pub(crate) fn savepoint(&mut self) -> Savepoint {
+        // Never wrap and revive a released token, even at an identical undo mark.
+        self.savepoint_sequence = self
+            .savepoint_sequence
+            .checked_add(1)
+            .expect("transaction savepoint sequence exhausted");
+        let mark = Savepoint {
+            owner: self.savepoint_owner.clone(),
+            sequence: self.savepoint_sequence,
+            undo_len: self.undo.len(),
+        };
+        self.savepoints.push((mark.sequence, mark.undo_len));
+        mark
+    }
+    fn savepoint_index(&self, mark: &Savepoint) -> Result<usize, TxnError> {
+        if !Arc::ptr_eq(&self.savepoint_owner, &mark.owner) {
+            return Err(TxnError::Misuse);
+        }
+        self.savepoints
+            .iter()
+            .position(|entry| *entry == (mark.sequence, mark.undo_len))
+            .ok_or(TxnError::Misuse)
+    }
+    /// Restores buffered writes and keeps this mark reusable, invalidating later marks.
+    /// Locks, the `locked` entries permitting writes, and SERIALIZABLE reads are
+    /// deliberately retained until transaction end. Unlike PostgreSQL subtransaction
+    /// rollback, this does not release locks acquired after the mark.
+    pub(crate) fn rollback_to(&mut self, mark: &Savepoint) -> Result<(), TxnError> {
+        let index = self.savepoint_index(mark)?;
+        while self.undo.len() > mark.undo_len {
+            let undo = self.undo.pop().unwrap();
+            match undo.previous {
+                Some(value) => {
+                    self.writes.insert(undo.key, value);
+                }
+                None => {
+                    self.writes.remove(&undo.key);
+                }
+            }
+            self.write_bytes = undo.write_bytes;
+            self.undo_bytes -= undo.bytes;
+        }
+        self.savepoints.truncate(index + 1);
+        Ok(())
+    }
+    /// Keeps writes while invalidating this mark and all later marks.
+    pub(crate) fn release(&mut self, mark: Savepoint) -> Result<(), TxnError> {
+        let index = self.savepoint_index(&mark)?;
+        self.savepoints.truncate(index);
+        if self.savepoints.is_empty() {
+            self.undo = Vec::new();
+            self.undo_bytes = 0;
+        }
+        Ok(())
     }
     pub(crate) fn begin_statement(&mut self) {
         if self.isolation == Isolation::ReadCommitted {
@@ -286,19 +367,48 @@ impl Transaction {
         {
             return Err(TxnError::Misuse);
         }
-        let old = self
-            .writes
-            .get(&(ks, key.clone()))
-            .map_or(0, |v| key.len() + v.as_ref().map_or(0, Vec::len));
-        let size = key
+        let write_key = (ks, key);
+        let previous = self.writes.get(&write_key);
+        if previous == Some(&value) {
+            return Ok(());
+        }
+        let old = previous.map_or(0, |v| write_key.1.len() + v.as_ref().map_or(0, Vec::len));
+        let undo_size = if self.savepoints.is_empty() {
+            0
+        } else {
+            std::mem::size_of::<UndoWrite>()
+                .checked_add(write_key.1.len())
+                .and_then(|n| n.checked_add(previous.and_then(Option::as_ref).map_or(0, Vec::len)))
+                .ok_or(TxnError::WriteSetLimit)?
+        };
+        let undo_bytes = self
+            .undo_bytes
+            .checked_add(undo_size)
+            .ok_or(TxnError::WriteSetLimit)?;
+        let size = write_key
+            .1
             .len()
             .checked_add(value.as_ref().map_or(0, Vec::len))
             .and_then(|n| self.write_bytes.checked_sub(old)?.checked_add(n))
             .ok_or(TxnError::WriteSetLimit)?;
-        if size > self.seq.write_set_bytes() {
+        if size
+            .checked_add(undo_bytes)
+            .is_none_or(|n| n > self.seq.write_set_bytes())
+        {
             return Err(TxnError::WriteSetLimit);
         }
-        self.writes.insert((ks, key), value);
+        if undo_size == 0 {
+            self.writes.insert(write_key, value);
+        } else {
+            let previous = self.writes.insert(write_key.clone(), value);
+            self.undo.push(UndoWrite {
+                key: write_key,
+                previous,
+                write_bytes: self.write_bytes,
+                bytes: undo_size,
+            });
+        }
+        self.undo_bytes = undo_bytes;
         self.write_bytes = size;
         Ok(())
     }
@@ -515,3 +625,6 @@ impl Iterator for TxnScan<'_> {
 #[cfg(test)]
 #[path = "txn_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "savepoint_tests.rs"]
+mod savepoint_tests;
