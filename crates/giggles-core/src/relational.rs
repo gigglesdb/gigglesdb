@@ -1259,9 +1259,14 @@ impl Prepared {
                 returning.as_ref(),
                 state,
                 self.params,
+                &self.parameter_types,
             );
         }
         let mut params = vec![None; self.params];
+        if self.parameter_types.len() > params.len() {
+            return Err(SqlError::Parameters);
+        }
+        params[..self.parameter_types.len()].clone_from_slice(&self.parameter_types);
         let mut columns = vec![];
         if let Some(name) = self.table() {
             if self.is_ddl() {
@@ -1473,7 +1478,7 @@ impl Prepared {
             },
         })
     }
-    /// Declare input types for SELECT parameters before query type inference.
+    /// Declare input types for SELECT and UPDATE parameters before type inference.
     /// A shorter slice or `None` entries leave the corresponding inputs inferred.
     /// Other statement kinds retain their existing parameter inference.
     pub fn with_parameter_types(mut self, types: &[Option<DataType>]) -> R<Self> {
@@ -1484,7 +1489,10 @@ impl Prepared {
         if types.len() > self.params {
             return Err(SqlError::Parameters);
         }
-        if matches!(self.statement, Statement::Query(_)) {
+        if matches!(
+            self.statement,
+            Statement::Query(_) | Statement::Update { .. } | Statement::UpdateExpressions { .. }
+        ) {
             self.parameter_types = types.to_vec();
         }
         Ok(self)

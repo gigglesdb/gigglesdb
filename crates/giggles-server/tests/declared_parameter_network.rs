@@ -115,6 +115,7 @@ struct Response {
     parameters: Vec<u32>,
     columns: Vec<Vec<u32>>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
+    commands: Vec<String>,
 }
 impl Response {
     fn success(&self, parameters: &[u32], column: u32, value: Option<&[u8]>) {
@@ -168,11 +169,17 @@ async fn query(
         parameters: vec![],
         columns: vec![],
         rows: vec![],
+        commands: vec![],
     };
     loop {
         let (tag, body) = read(&mut stream).await;
         response.tags.push(tag);
         match tag {
+            b'C' => response.commands.push(
+                std::str::from_utf8(body.strip_suffix(&[0]).expect("CommandComplete terminator"))
+                    .unwrap()
+                    .into(),
+            ),
             b'E' => {
                 let code = body
                     .split(|byte| *byte == 0)
@@ -227,6 +234,88 @@ async fn query(
             _ => {}
         }
     }
+}
+
+async fn seed_update_table(fixture: &Fixture) {
+    let mut stream = fixture.connect().await;
+    for sql in [
+        "CREATE TABLE t(id integer primary key, n integer)",
+        "INSERT INTO t VALUES (1, 0)",
+    ] {
+        let mut body = vec![];
+        cstr(sql, &mut body);
+        send(&mut stream, b'Q', &body).await;
+        loop {
+            let (tag, body) = read(&mut stream).await;
+            assert_ne!(tag, b'E', "{sql}: {body:?}");
+            if tag == b'Z' {
+                break;
+            }
+        }
+    }
+}
+
+fn assert_update(response: &Response, parameters: &[u32]) {
+    assert!(
+        response.errors.is_empty(),
+        "{}: {response:?}",
+        response.context
+    );
+    assert!(response.tags.contains(&b'1'), "{response:?}");
+    assert!(response.tags.contains(&b'2'), "{response:?}");
+    assert_eq!(response.parameters, parameters, "{response:?}");
+    assert_eq!(response.commands, ["UPDATE 1"], "{response:?}");
+    assert!(response.rows.is_empty(), "{response:?}");
+}
+
+#[tokio::test]
+async fn update_declared_bytea_position_uses_bytes_for_text_and_binary_inputs() {
+    let fixture = Fixture::new().await;
+    seed_update_table(&fixture).await;
+    for binary in [false, true] {
+        let values: [Option<&[u8]>; 2] = if binary {
+            [Some(&[0, 255]), Some(&[1, 0, 255, 2])]
+        } else {
+            [Some(br"\x00ff"), Some(br"\x0100ff02")]
+        };
+        let response = query(
+            &fixture,
+            "UPDATE t SET n=position($1 in $2) WHERE id=1",
+            &[17, 17],
+            binary,
+            &values,
+        )
+        .await;
+        assert_update(&response, &[17, 17]);
+        query(&fixture, "SELECT n FROM t WHERE id=1", &[], false, &[])
+            .await
+            .success(&[], 23, Some(b"2"));
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn update_undeclared_position_keeps_text_semantics() {
+    let fixture = Fixture::new().await;
+    seed_update_table(&fixture).await;
+    for (needle, haystack, expected) in [
+        (&b"z"[..], "\u{e9}z".as_bytes(), &b"2"[..]),
+        (&br"\x00ff"[..], &br"\x0100ff02"[..], &b"0"[..]),
+    ] {
+        let response = query(
+            &fixture,
+            "UPDATE t SET n=position($1 in $2) WHERE id=1",
+            &[0, 0],
+            false,
+            &[Some(needle), Some(haystack)],
+        )
+        .await;
+        assert_update(&response, &[25, 25]);
+        query(&fixture, "SELECT n FROM t WHERE id=1", &[], false, &[])
+            .await
+            .success(&[], 23, Some(expected));
+    }
+    fixture.stop().await;
 }
 
 #[tokio::test]

@@ -62,10 +62,15 @@ pub(super) fn describe(
     returning: Option<&Returning>,
     state: &Relational,
     count: usize,
+    declared: &[Option<DataType>],
 ) -> R<Description> {
     let table = state.tables.get(name).ok_or(SqlError::UnknownTable)?;
     let indexes = indexes(sets, table)?;
     let mut parameters = vec![None; count];
+    if declared.len() > parameters.len() {
+        return Err(SqlError::Parameters);
+    }
+    parameters[..declared.len()].clone_from_slice(declared);
     for ((_, value), index) in sets.iter().zip(indexes) {
         let target = &table.columns[index].data_type;
         match value {
