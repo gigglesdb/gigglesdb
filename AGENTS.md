@@ -67,7 +67,13 @@ HEAD with the staged changes applied. `cargo check` alone is not enough.
 After a successful compare-and-swap, run `git reset -q -- <committed paths>` so
 the shared index matches HEAD for those paths. Otherwise the shared index keeps
 the old content staged, and anyone's plain `git commit` reverts your work. Never
-reset or stage another owner's paths. End every commit message with the
+reset or stage another owner's paths.
+
+Then bring the K: working copies of your committed paths up to date. A path
+whose K: content still equals its pre-commit blob gets
+`git -c core.autocrlf=false checkout HEAD -- <path>`. A path that holds someone
+else's uncommitted edits gets your hunks merged in, or is left alone and
+reported. A stale K: copy reads as a revert of your commit. End every commit message with the
 required Co-Authored-By trailer, and never push.
 
 ## Shared compile cache (sccache)
