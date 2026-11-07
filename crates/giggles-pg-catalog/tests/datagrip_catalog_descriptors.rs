@@ -65,7 +65,7 @@ fn exact_nominal_descriptors_and_attribute_type_links() {
 #[test]
 fn primary_pg14_nominal_type_facts_are_explicit() {
     // pg_type.dat entries24/194 + pg_type.h default typtype=b. Node tree is
-    // category S and has no array, despite being an internal-only descriptor.
+    // category Z and has no array, despite being an internal-only descriptor.
     let result = run(
         "select oid, typname, typlen, typtype, typcategory, typelem, typarray, typinput, typisdefined, typispreferred from pg_catalog.pg_type where oid in (24,194,1008) order by oid",
     );
@@ -89,7 +89,7 @@ fn primary_pg14_nominal_type_facts_are_explicit() {
                 s("pg_node_tree"),
                 i(-1),
                 s("b"),
-                s("S"),
+                s("Z"),
                 i(0),
                 i(0),
                 i(195),

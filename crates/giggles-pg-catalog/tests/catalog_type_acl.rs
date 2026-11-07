@@ -179,7 +179,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
     assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typacl'", &snapshot(), &[]).rows,vec![vec![i(1034),i(-1),i(21)]]);
     assert_eq!(run("select oid, typname, typtype, typcategory, typelem, typarray, typacl from pg_catalog.pg_type where oid in (24,194,1008,65567) order by oid", &snapshot(), &[]).rows,vec![
         vec![i(24),s("regproc"),s("b"),s("N"),i(0),i(1008),Value::Null],
-        vec![i(194),s("pg_node_tree"),s("b"),s("S"),i(0),i(0),Value::Null],
+        vec![i(194),s("pg_node_tree"),s("b"),s("Z"),i(0),i(0),Value::Null],
         vec![i(1008),s("_regproc"),s("b"),s("A"),i(24),i(0),Value::Null],
         vec![i(65567),s("inventory"),s("c"),s("C"),i(0),i(0),Value::Null],
     ]);

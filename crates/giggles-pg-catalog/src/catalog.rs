@@ -342,7 +342,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("proargdefaults", T::PgNodeTree),
             ("prosqlbody", T::PgNodeTree),
         ],
-        // Nominal PostgreSQL14 descriptors preserve regproc/pg_node_tree identity;
+        // Nominal PostgreSQL 18 descriptors preserve regproc/pg_node_tree identity;
         // these absent features still contribute no invented rows.
         "pg_aggregate" => &[
             ("aggkind", T::Char),
@@ -775,7 +775,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (19, "name", 64, 1003),
         (26, "oid", 4, 1028),
         (28, "xid", 4, 1011),
-        (1033, "aclitem", 12, 1034),
+        (1033, "aclitem", 16, 1034),
     ] {
         add("pg_type", type_row(oid, name, len, 0, arr, false));
         add(
@@ -787,13 +787,13 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     add("pg_type", type_row(1006, "_int2vector", -1, 22, 0, true));
     add("pg_type", type_row(30, "oidvector", -1, 26, 1013, false));
     add("pg_type", type_row(1013, "_oidvector", -1, 30, 0, true));
-    // PostgreSQL14 nominal metadata only, not a callable routine registry.
-    // pg_type.dat + pg_type.h: both are base types; node trees are category S,
+    // PostgreSQL 18 nominal metadata only, not a callable routine registry.
+    // pg_type.dat + pg_type.h: both are base types; node trees are category Z,
     // not pseudo-types. Only regproc has an associated array type.
     for (oid, name, len, category, elem, array, input) in [
         (24, "regproc", 4, "N", 0, 1008, 44),
         (1008, "_regproc", -1, "A", 24, 0, 750),
-        (194, "pg_node_tree", -1, "S", 0, 0, 195),
+        (194, "pg_node_tree", -1, "Z", 0, 0, 195),
     ] {
         add(
             "pg_type",
@@ -1012,9 +1012,12 @@ fn composite_row(oid: u32, name: &str, namespace: i64, relation: i64) -> Vec<Val
         I(0),
         N,
         B(true),
-        B(oid == 701),
+        B(false),
         N,
     ]
+}
+fn type_is_preferred(oid: u32) -> bool {
+    matches!(oid, 16 | 25 | 26 | 701 | 869 | 1184 | 1186 | 1562)
 }
 fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: bool) -> Vec<Value> {
     vec![
@@ -1055,7 +1058,7 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
         I(0),
         N,
         B(true),
-        B(oid == 701),
+        B(type_is_preferred(oid)),
         N,
     ]
 }
