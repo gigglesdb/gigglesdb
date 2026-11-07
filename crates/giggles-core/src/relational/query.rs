@@ -2,6 +2,7 @@
 use super::*;
 use std::cmp::Ordering;
 mod functions;
+mod grouping;
 mod insert_values;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
@@ -71,7 +72,16 @@ pub(super) struct Query {
 }
 
 #[derive(Debug, Clone)]
+struct QueryClauses {
+    filter: Option<Filter>,
+    group: Vec<Scalar>,
+    having: Option<Filter>,
+    offset: Option<Expr>,
+}
+#[derive(Debug, Clone)]
 enum Filter {
+    // Root-only SELECT clause bundle keeps legacy Query constructors stable.
+    Clauses(Box<QueryClauses>),
     Scalar(Scalar),
     Compare(Scalar, String, Scalar),
     Null(Scalar, bool),
@@ -296,6 +306,7 @@ impl Filter {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
+            Self::Clauses(_) => Err(SqlError::Unsupported),
             Self::Scalar(a) => a.infer(Some(&DataType::Boolean), params, resolve, tables),
             Self::Null(a, _) => a.infer(None, params, resolve, tables),
             Self::Compare(a, _, b) => {
@@ -369,6 +380,7 @@ impl Filter {
     ) -> R<BoundFilter> {
         let bind = |a: &Scalar| a.bind(resolve, tables, params);
         Ok(match self {
+            Self::Clauses(_) => return Err(SqlError::Unsupported),
             Self::Scalar(a) => {
                 let a = if matches!(a, Scalar::Literal(Value::Null)) {
                     bind(&Scalar::Cast(Box::new(a.clone()), DataType::Boolean))?
@@ -579,10 +591,32 @@ impl Parser {
 }
 
 impl Query {
+    fn clauses(&self) -> Option<&QueryClauses> {
+        match &self.filter {
+            Some(Filter::Clauses(c)) => Some(c),
+            _ => None,
+        }
+    }
+    fn where_filter(&self) -> Option<&Filter> {
+        match &self.filter {
+            Some(Filter::Clauses(c)) => c.filter.as_ref(),
+            f => f.as_ref(),
+        }
+    }
+    fn group(&self) -> &[Scalar] {
+        self.clauses().map_or(&[], |c| &c.group)
+    }
+    fn having(&self) -> Option<&Filter> {
+        self.clauses().and_then(|c| c.having.as_ref())
+    }
+    fn offset(&self) -> Option<&Expr> {
+        self.clauses().and_then(|c| c.offset.as_ref())
+    }
     fn parse_items(p: &mut Parser) -> R<Vec<(Item, Option<String>)>> {
         let mut items = Vec::new();
         loop {
-            let item = if p.sym('*') {
+            let item_start = p.at;
+            let mut item = if p.sym('*') {
                 Item::Star
             } else {
                 let aggregate = match p.tokens.get(p.at) {
@@ -614,6 +648,21 @@ impl Query {
                     Item::Scalar(Scalar::parse(p, 0)?)
                 }
             };
+            if matches!(item, Item::Aggregate(..))
+                && matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||"].contains(&op.as_str()))
+            {
+                for n in item_start..p.tokens.len().saturating_sub(3) {
+                    if matches!(&p.tokens[n], Token::Word(w) if w == "count")
+                        && p.tokens[n + 1] == Token::Symbol('(')
+                        && p.tokens[n + 2] == Token::Symbol('*')
+                        && p.tokens[n + 3] == Token::Symbol(')')
+                    {
+                        p.tokens[n + 2] = Token::Number("1".into());
+                    }
+                }
+                p.at = item_start;
+                item = Item::Scalar(Scalar::parse_aggregate_argument(p, 0)?);
+            }
             let alias = if p.word("as") { Some(p.name()?) } else { None };
             items.push((item, alias));
             if items.len() > MAX_COLUMNS {
@@ -674,7 +723,11 @@ impl Query {
             .get(&source.name)
             .ok_or(SqlError::UnknownTable)?;
         let resolve = |column: &ColumnRef, _scope: usize| -> R<BoundColumn> {
-            if column.qualifier.as_ref().is_some_and(|name| name != &source.alias) {
+            if column
+                .qualifier
+                .as_ref()
+                .is_some_and(|name| name != &source.alias)
+            {
                 return Err(SqlError::UnknownTable);
             }
             let column = table
@@ -684,7 +737,7 @@ impl Query {
                 .ok_or(SqlError::UnknownColumn)?;
             Ok(BoundColumn { source: 0, column })
         };
-        if let Some(filter) = &self.filter {
+        if let Some(filter) = self.where_filter() {
             // Infer independently of SET to retain undeclared column conflicts.
             // Plain comparisons preserve explicit declarations, including widths.
             let mut inferred = vec![None; parameters.len()];
@@ -788,6 +841,35 @@ impl Query {
         if let Some(f) = &filter {
             f.bounds(&mut predicates);
         }
+        let mut group = vec![];
+        if p.word("group") {
+            p.need("by")?;
+            loop {
+                group.push(Scalar::parse_aggregate_argument(p, 0)?);
+                if group.len() > MAX_COLUMNS {
+                    return Err(SqlError::Limit);
+                }
+                if !p.sym(',') {
+                    break;
+                }
+            }
+        }
+        // Scalar's ordinary parser deliberately rejects count(*). In post-group
+        // clauses count(*) has the same transition input as count(1).
+        for n in p.at..p.tokens.len().saturating_sub(3) {
+            if matches!(&p.tokens[n], Token::Word(w) if w == "count")
+                && p.tokens[n + 1] == Token::Symbol('(')
+                && p.tokens[n + 2] == Token::Symbol('*')
+                && p.tokens[n + 3] == Token::Symbol(')')
+            {
+                p.tokens[n + 2] = Token::Number("1".into());
+            }
+        }
+        let having = if p.word("having") {
+            Some(Filter::parse(p, 0, 0)?)
+        } else {
+            None
+        };
         let mut order = vec![];
         if p.word("order") {
             p.need("by")?;
@@ -821,6 +903,25 @@ impl Query {
         } else {
             None
         };
+        let offset = if p.word("offset") {
+            Some(p.expr()?)
+        } else {
+            None
+        };
+        // OFFSET is admitted by this work item only for grouped output.
+        // Preserve the existing rejection boundary for ordinary row queries.
+        if offset.is_some()
+            && group.is_empty()
+            && having.is_none()
+            && !items
+                .iter()
+                .any(|(item, _)| matches!(item, Item::Aggregate(..)))
+            && !order
+                .iter()
+                .any(|(s, _, _)| grouping::contains_aggregate(s))
+        {
+            return Err(SqlError::Unsupported);
+        }
         p.sym(';');
         if p.at != p.tokens.len() {
             return Err(SqlError::Unsupported);
@@ -831,7 +932,16 @@ impl Query {
             joins,
             items,
             predicates,
-            filter,
+            filter: if group.is_empty() && having.is_none() && offset.is_none() {
+                filter
+            } else {
+                Some(Filter::Clauses(Box::new(QueryClauses {
+                    filter,
+                    group,
+                    having,
+                    offset,
+                })))
+            },
             order,
             limit,
         })
@@ -975,6 +1085,11 @@ impl Query {
         }
         fn filter(f: &Filter) -> bool {
             match f {
+                Filter::Clauses(c) => {
+                    c.filter.as_ref().is_none_or(filter)
+                        && c.group.iter().all(scalar)
+                        && c.having.as_ref().is_none_or(filter)
+                }
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
                 Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
@@ -1010,6 +1125,11 @@ impl Query {
     fn has_undefined_routine(&self) -> bool {
         fn filter(f: &Filter) -> bool {
             match f {
+                Filter::Clauses(c) => {
+                    c.filter.as_ref().is_some_and(filter)
+                        || c.group.iter().any(Scalar::has_undefined_routine)
+                        || c.having.as_ref().is_some_and(filter)
+                }
                 Filter::Scalar(s) | Filter::Null(s, _) => s.has_undefined_routine(),
                 Filter::Compare(a, _, b) => a.has_undefined_routine() || b.has_undefined_routine(),
                 Filter::Like { value, pattern, escape, .. } => value.has_undefined_routine() || pattern.has_undefined_routine() || escape.as_ref().is_some_and(Scalar::has_undefined_routine),
@@ -1020,7 +1140,9 @@ impl Query {
         self.items.iter().any(|(item, _)| match item {
             Item::Scalar(s) | Item::Aggregate(_, Some(s)) => s.has_undefined_routine(),
             _ => false,
-        }) || self.filter.as_ref().is_some_and(filter)
+        }) || self.where_filter().is_some_and(filter)
+            || self.group().iter().any(Scalar::has_undefined_routine)
+            || self.having().is_some_and(filter)
             || self.order.iter().any(|(s, _, _)| s.has_undefined_routine())
     }
     /// Negative diagnostic classification only; this never grants table-free access.
@@ -1042,6 +1164,11 @@ impl Query {
         }
         fn filter(f: &Filter) -> bool {
             match f {
+                Filter::Clauses(c) => {
+                    c.filter.as_ref().is_none_or(filter)
+                        && c.group.iter().all(operand)
+                        && c.having.as_ref().is_none_or(filter)
+                }
                 Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
                 Filter::Compare(a, _, b) => operand(a) && operand(b),
                 Filter::Like { value, pattern, escape, .. } => operand(value) && operand(pattern) && escape.as_ref().is_none_or(operand),
@@ -1206,6 +1333,24 @@ impl Query {
                 equalities,
             });
         }
+        if !self.group().is_empty()
+            || self.having().is_some()
+            || self
+                .order
+                .iter()
+                .any(|(s, _, _)| grouping::contains_aggregate(s))
+            || (self
+                .items
+                .iter()
+                .any(|(i, _)| matches!(i, Item::Aggregate(..)))
+                && (!self.order.is_empty()
+                    || self
+                        .items
+                        .iter()
+                        .any(|(i, _)| !matches!(i, Item::Aggregate(..)))))
+        {
+            return grouping::bind(self, &tables, joins, parameters, &resolve);
+        }
         let mut items = vec![];
         let mut unresolved_count_parameters = Vec::new();
         for (item, _) in &self.items {
@@ -1234,13 +1379,13 @@ impl Query {
                 _ => {}
             }
         }
-        if let Some(f) = &self.filter {
+        if let Some(f) = self.where_filter() {
             f.infer(&mut parameters, &resolve, &tables)?;
         }
         for (e, _, _) in &self.order {
             e.infer(None, &mut parameters, &resolve, &tables)?;
         }
-        let mut bind_expr = |e: &Expr, ty: &DataType| -> R<bool> {
+        let bind_expr = |e: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<bool> {
             if let Expr::Param(n) = e {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
                 if let Some(old) = slot.as_ref().filter(|old| *old != ty) {
@@ -1268,11 +1413,15 @@ impl Query {
         let mut predicates = vec![];
         for (c, op, e) in &self.predicates {
             let c = resolve(c, tables.len())?;
-            if bind_expr(e, &tables[c.source].columns[c.column].data_type)? {
+            if bind_expr(
+                e,
+                &tables[c.source].columns[c.column].data_type,
+                &mut parameters,
+            )? {
                 predicates.push((c, op.as_str(), e));
             }
         }
-        if let Some(e) = &self.limit {
+        for e in self.limit.iter().chain(self.offset()) {
             // LIMIT accepts the integer widths by implicit widening. Keep an
             // input type already fixed by the SELECT list.
             if let Expr::Param(n) = e {
@@ -1290,7 +1439,7 @@ impl Query {
                     _ => return Err(SqlError::Type),
                 }
             } else {
-                bind_expr(e, &DataType::BigInt)?;
+                bind_expr(e, &DataType::BigInt, &mut parameters)?;
             }
         }
         if unresolved_count_parameters
@@ -1438,8 +1587,7 @@ impl Query {
             return Err(SqlError::Unsupported);
         }
         let filter = self
-            .filter
-            .as_ref()
+            .where_filter()
             .map(|f| f.bind(&parameters, &resolve, &tables))
             .transpose()?;
         let order = self
@@ -1462,6 +1610,7 @@ impl Query {
             filter,
             order,
             aggregate,
+            grouping: None,
         })
     }
 }
@@ -1492,6 +1641,7 @@ pub(super) struct BoundQuery<'a> {
     filter: Option<BoundFilter>,
     order: Vec<(BoundScalar, bool, bool)>,
     aggregate: bool,
+    grouping: Option<grouping::Grouping>,
 }
 struct Tuple {
     values: Vec<Vec<Value>>,
@@ -1589,6 +1739,9 @@ impl BoundQuery<'_> {
     }
     pub(super) fn validate_immutable_constants(&self) -> R<()> {
         let mut budget = 0;
+        if let Some(grouping) = &self.grouping {
+            grouping.validate_constants(self.parameters.is_empty(), &mut budget)?;
+        }
         for item in &self.items {
             match item {
                 BoundItem::Scalar(value) => {
@@ -1615,6 +1768,8 @@ impl BoundQuery<'_> {
             parameters: self.parameters.clone(),
             typmods: if self.query.explain {
                 vec![result_typmod(state, TypmodSource::Other)]
+            } else if let Some(grouping) = &self.grouping {
+                grouping.typmods(state, &self.tables)
             } else {
                 self.items
                     .iter()
@@ -1749,6 +1904,9 @@ impl BoundQuery<'_> {
                 },
             )?;
         }
+        if let Some(grouping) = &self.grouping {
+            return grouping.execute(self, state, params, cancel);
+        }
         let limit = match &self.query.limit {
             Some(e) => match e.value(params)? {
                 Value::Int(n) if n >= 0 => Some(n as u64),
@@ -1766,7 +1924,15 @@ impl BoundQuery<'_> {
                 rows: vec![],
                 affected: 0,
             };
-            if limit != Some(0) {
+            let offset = match self.query.offset() {
+                Some(e) => match e.value(params)? {
+                    Value::Int(n) if n >= 0 => n as u64,
+                    Value::Null => 0,
+                    _ => return Err(SqlError::Limit),
+                },
+                None => 0,
+            };
+            if limit != Some(0) && offset == 0 {
                 let row = Tuple {
                     values: vec![],
                     version: 0,
@@ -1904,7 +2070,15 @@ impl BoundQuery<'_> {
             }
             Ok(Some(row))
         });
-        let page = scan::Page { offset: 0, limit };
+        let offset = match self.query.offset() {
+            Some(e) => match e.value(params)? {
+                Value::Int(n) if n >= 0 => n as u64,
+                Value::Null => 0,
+                _ => return Err(SqlError::Limit),
+            },
+            None => 0,
+        };
+        let page = scan::Page { offset, limit };
         let mut result = SqlResult {
             columns: self.columns.iter().map(|c| c.name.clone()).collect(),
             rows: vec![],
@@ -1928,105 +2102,14 @@ impl BoundQuery<'_> {
                 .collect::<Vec<_>>();
             for row in filtered {
                 let row = row?;
-                for (index, item) in self.items.iter().enumerate() {
-                    let BoundItem::Aggregate(a, c) = item else {
-                        return Err(SqlError::Unsupported);
-                    };
-                    let evaluated = c
-                        .as_ref()
-                        .map(|e| e.eval(&row, params, &mut aggregate_work_bytes))
-                        .transpose()?;
-                    let v = evaluated.as_ref();
-                    if v == Some(&Value::Null) {
-                        continue;
-                    }
-                    let mut value = std::mem::replace(&mut values[index], Value::Null);
-                    match a {
-                        Aggregate::Count => {
-                            if let Value::Int(n) = &mut value {
-                                *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
-                            }
-                        }
-                        Aggregate::Sum => {
-                            let v = v.ok_or(SqlError::Type)?;
-                            value = match self.columns[index].data_type {
-                                DataType::Numeric => functions::aggregate_numeric_add(
-                                    value,
-                                    evaluated.ok_or(SqlError::Type)?,
-                                    &mut aggregate_work_bytes,
-                                )?,
-                                DataType::Real => {
-                                    let Value::Float4(n) = v else {
-                                        return Err(SqlError::Type);
-                                    };
-                                    let sum = if let Value::Float4(old) = value {
-                                        let sum = old.value() + n.value();
-                                        if sum.is_infinite()
-                                            && old.value().is_finite()
-                                            && n.value().is_finite()
-                                        {
-                                            return Err(SqlError::Overflow);
-                                        }
-                                        sum
-                                    } else {
-                                        n.value()
-                                    };
-                                    Value::Float4(Float4::from_bits(sum.to_bits()))
-                                }
-                                DataType::DoublePrecision => {
-                                    let Value::Float8(n) = v else {
-                                        return Err(SqlError::Type);
-                                    };
-                                    let sum = if let Value::Float8(old) = value {
-                                        let sum = old.value() + n.value();
-                                        if sum.is_infinite()
-                                            && old.value().is_finite()
-                                            && n.value().is_finite()
-                                        {
-                                            return Err(SqlError::Overflow);
-                                        }
-                                        sum
-                                    } else {
-                                        n.value()
-                                    };
-                                    Value::Float8(Float8::from_bits(sum.to_bits()))
-                                }
-                                DataType::BigInt => {
-                                    let Value::Int(n) = v else {
-                                        return Err(SqlError::Type);
-                                    };
-                                    Value::Int(if let Value::Int(old) = value {
-                                        old.checked_add(*n).ok_or(SqlError::Overflow)?
-                                    } else {
-                                        *n
-                                    })
-                                }
-                                DataType::Boolean
-                                | DataType::SmallInt
-                                | DataType::Integer
-                                | DataType::Text
-                                | DataType::Bytes
-                                | DataType::Date
-                                | DataType::Time
-                                | DataType::TimeTz
-                                | DataType::Timestamp
-                                | DataType::TimestampTz
-                                | DataType::Interval => return Err(SqlError::Type),
-                            };
-                        }
-                        Aggregate::Min | Aggregate::Max => {
-                            let v = v.ok_or(SqlError::Type)?;
-                            if value == Value::Null
-                                || (matches!(a, Aggregate::Min) && cmp(v, &value) == Ordering::Less)
-                                || (matches!(a, Aggregate::Max)
-                                    && cmp(v, &value) == Ordering::Greater)
-                            {
-                                value = evaluated.ok_or(SqlError::Type)?;
-                            }
-                        }
-                    }
-                    values[index] = value;
-                }
+                update_aggregates(
+                    &self.items,
+                    &self.columns,
+                    &mut values,
+                    &row,
+                    params,
+                    &mut aggregate_work_bytes,
+                )?;
             }
             for value in &values {
                 charge(&mut result_bytes, value)?;
@@ -2149,6 +2232,9 @@ impl BoundQuery<'_> {
         mut self,
         clock: Option<&super::clock::ExecutionClock>,
     ) -> Self {
+        if let Some(grouping) = &mut self.grouping {
+            grouping.attach_clock(clock);
+        }
         for item in &mut self.items {
             match item {
                 BoundItem::Scalar(a) | BoundItem::Aggregate(_, Some(a)) => a.attach_clock(clock),
@@ -2183,4 +2269,106 @@ fn eval_like(value: Value, pattern: Value, escape: super::like::Escape, insensit
         return Err(SqlError::UndefinedFunction);
     };
     Ok(Some(super::like::like(&value, &pattern, escape, insensitive, work)? != negated))
+}
+
+fn update_aggregates(
+    items: &[BoundItem],
+    columns: &[ColumnDef],
+    values: &mut [Value],
+    row: &Tuple,
+    params: &[Value],
+    work: &mut usize,
+) -> R<()> {
+    for (index, item) in items.iter().enumerate() {
+        let BoundItem::Aggregate(a, c) = item else {
+            return Err(SqlError::Unsupported);
+        };
+        let evaluated = c.as_ref().map(|e| e.eval(row, params, work)).transpose()?;
+        let v = evaluated.as_ref();
+        if v == Some(&Value::Null) {
+            continue;
+        }
+        let mut value = std::mem::replace(&mut values[index], Value::Null);
+        match a {
+            Aggregate::Count => {
+                if let Value::Int(n) = &mut value {
+                    *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
+                }
+            }
+            Aggregate::Sum => {
+                let v = v.ok_or(SqlError::Type)?;
+                value = match columns[index].data_type {
+                    DataType::Numeric => functions::aggregate_numeric_add(
+                        value,
+                        evaluated.ok_or(SqlError::Type)?,
+                        work,
+                    )?,
+                    DataType::Real => {
+                        let Value::Float4(n) = v else {
+                            return Err(SqlError::Type);
+                        };
+                        let sum = if let Value::Float4(old) = value {
+                            let sum = old.value() + n.value();
+                            if sum.is_infinite() && old.value().is_finite() && n.value().is_finite()
+                            {
+                                return Err(SqlError::Overflow);
+                            }
+                            sum
+                        } else {
+                            n.value()
+                        };
+                        Value::Float4(Float4::from_bits(sum.to_bits()))
+                    }
+                    DataType::DoublePrecision => {
+                        let Value::Float8(n) = v else {
+                            return Err(SqlError::Type);
+                        };
+                        let sum = if let Value::Float8(old) = value {
+                            let sum = old.value() + n.value();
+                            if sum.is_infinite() && old.value().is_finite() && n.value().is_finite()
+                            {
+                                return Err(SqlError::Overflow);
+                            }
+                            sum
+                        } else {
+                            n.value()
+                        };
+                        Value::Float8(Float8::from_bits(sum.to_bits()))
+                    }
+                    DataType::BigInt => {
+                        let Value::Int(n) = v else {
+                            return Err(SqlError::Type);
+                        };
+                        Value::Int(if let Value::Int(old) = value {
+                            old.checked_add(*n).ok_or(SqlError::Overflow)?
+                        } else {
+                            *n
+                        })
+                    }
+                    DataType::Boolean
+                    | DataType::SmallInt
+                    | DataType::Integer
+                    | DataType::Text
+                    | DataType::Bytes
+                    | DataType::Date
+                    | DataType::Time
+                    | DataType::TimeTz
+                    | DataType::Timestamp
+                    | DataType::TimestampTz
+                    | DataType::Interval => return Err(SqlError::Type),
+                };
+            }
+            Aggregate::Min | Aggregate::Max => {
+                let v = v.ok_or(SqlError::Type)?;
+                if value == Value::Null
+                    || (matches!(a, Aggregate::Min) && cmp(v, &value) == Ordering::Less)
+                    || (matches!(a, Aggregate::Max) && cmp(v, &value) == Ordering::Greater)
+                {
+                    value = evaluated.ok_or(SqlError::Type)?;
+                }
+            }
+        }
+        values[index] = value;
+    }
+    Ok(())
 }

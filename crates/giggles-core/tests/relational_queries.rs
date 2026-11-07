@@ -350,11 +350,14 @@ fn checked_sum_overflow_and_group_rejection() {
             giggles_core::relational::Numeric::parse("9223372036854775808").unwrap()
         )]]
     );
-    err(&mut s, "SELECT j.id,COUNT(*) FROM jobs j", E::Unsupported);
-    err(
-        &mut s,
-        "SELECT j.id,COUNT(*) FROM jobs j GROUP BY j.id",
-        E::Unsupported,
+    // PG18.6: an ungrouped column is 42803; grouped by it, one count per id.
+    err(&mut s, "SELECT j.id,COUNT(*) FROM jobs j", E::GroupingError);
+    assert_eq!(
+        vals(run(
+            &mut s,
+            "SELECT j.id,COUNT(*) FROM jobs j GROUP BY j.id ORDER BY j.id"
+        )),
+        vec![vec![V::Int(1), V::Int(1)], vec![V::Int(2), V::Int(1)]]
     );
     err(&mut s, "SELECT SUM(p.label) FROM people p", E::Type);
 }
