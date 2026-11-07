@@ -242,7 +242,7 @@ async fn temporal_sqlstate_preserves_dependency_and_task_authorization() {
     let f = Fixture::new().await;
     let (app, connection) = f.pg(f.app.clone()).await;
     for (q, state) in [
-        ("SELECT unknown_routine(1)", "0A000"),
+        ("SELECT unknown_routine(1)", "42501"),
         ("SELECT public.isfinite(date '2000-01-01')", "42501"),
         ("SELECT id FROM other LIMIT 1", "42501"),
         (

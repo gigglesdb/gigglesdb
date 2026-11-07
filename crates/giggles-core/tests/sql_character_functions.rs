@@ -133,8 +133,8 @@ fn character_known_error_contract_gaps_are_explicit() {
         let p = session.prepare(query).unwrap();
         assert_eq!(
             session.describe(&p).unwrap_err(),
-            CoreError::Sql(SqlError::Unsupported),
-            "PG42883 versus current profile: {query}"
+            CoreError::Sql(SqlError::UndefinedFunction),
+            "PG42883: {query}"
         );
     }
     // Core public calls match PostgreSQL 42883; server authorization failures

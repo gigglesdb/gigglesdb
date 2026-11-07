@@ -27,14 +27,17 @@ fn quoted_routines_preserve_case_and_do_not_enable_special_forms() {
         "SELECT \"ab\"\"s\"(-2)",
         "SELECT \"coalesce\"(NULL,1)",
         "SELECT pg_catalog.\"coalesce\"(NULL,1)",
-        "SELECT \"PG_CATALOG\".\"abs\"(-2)",
     ] {
         assert_eq!(
             s.execute(sql, &[], None),
-            Err(CoreError::Sql(SqlError::Unsupported)),
+            Err(CoreError::Sql(SqlError::UndefinedFunction)),
             "{sql}"
         );
     }
+    assert_eq!(
+        s.execute("SELECT \"PG_CATALOG\".\"abs\"(-2)", &[], None),
+        Err(CoreError::Sql(SqlError::InvalidSchema))
+    );
     // No routine exists in public: PG 42883 (core binds UndefinedFunction).
     assert_eq!(
         s.execute("SELECT public.\"abs\"(-2)", &[], None),
@@ -117,7 +120,7 @@ fn quoted_identifiers_are_accepted_for_objects_and_are_bounded() {
     assert!(s.prepare(&at_limit).is_ok());
     assert_eq!(
         s.execute(&at_limit, &[], None),
-        Err(CoreError::Sql(SqlError::Unsupported))
+        Err(CoreError::Sql(SqlError::UndefinedFunction))
     );
     assert_eq!(
         s.prepare(&(at_limit + " ")).err(),

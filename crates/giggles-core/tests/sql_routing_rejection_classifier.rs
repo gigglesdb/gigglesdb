@@ -2,13 +2,14 @@ use giggles_core::relational::Prepared;
 
 #[test]
 fn negative_scalar_classifier_preserves_authority_boundaries() {
+    // Missing routines bind to 42883 after authorization (E939).
     for (sql, expected) in [
-        ("SELECT private_probe('never_log_this_secret')", true),
-        ("SELECT pg_catalog.private_probe('x')", true),
-        ("SELECT lower(private_probe('x'))", true),
-        ("SELECT 1 WHERE private_probe('x')=1", true),
-        ("SELECT 1 ORDER BY private_probe('x')", true),
-        ("SELECT private_probe('sum(abs(-1))')", true),
+        ("SELECT private_probe('never_log_this_secret')", false),
+        ("SELECT pg_catalog.private_probe('x')", false),
+        ("SELECT lower(private_probe('x'))", false),
+        ("SELECT 1 WHERE private_probe('x')=1", false),
+        ("SELECT 1 ORDER BY private_probe('x')", false),
+        ("SELECT private_probe('sum(abs(-1))')", false),
         ("SELECT 1", false),
         ("SELECT lower('X')", false),
         ("SELECT abs(-1)", false),
@@ -40,14 +41,14 @@ fn negative_scalar_classifier_preserves_authority_boundaries() {
         ),
         ("SELECT lower(", false),
         ("SELECT evil.lower('x')", false),
-        ("SELECT substring(private_probe('x') from 1 for 1)", true),
+        ("SELECT substring(private_probe('x') from 1 for 1)", false),
         (
             "SELECT substring('abc' from private_probe('x') for 1)",
-            true,
+            false,
         ),
         (
             "SELECT substring('abc' from 1 for private_probe('x'))",
-            true,
+            false,
         ),
         ("SELECT substring('abc' from id for 1)", false),
         ("SELECT substring('abc' from sum(abs(-1)) for 1)", false),

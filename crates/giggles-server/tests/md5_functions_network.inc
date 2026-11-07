@@ -50,8 +50,8 @@ async fn md5_overload_parse0_binary_bind_result_and_authority() {
         ("SELECT md5(TRUE)", "42883"),
         ("SELECT md5('a','b')", "42883"),
         ("SELECT public.md5('abc')", "42501"),
-        ("SELECT pg_catalog.unknown_md5('abc')", "0A000"),
-        ("SELECT pg_catalog.unknown_md5('abc') FROM app", "0A000"),
+        ("SELECT pg_catalog.unknown_md5('abc')", "42501"),
+        ("SELECT pg_catalog.unknown_md5('abc') FROM app", "42883"),
     ] {
         let response = temporal_state_extended(&mut raw, query).await;
         assert_eq!(response["sqlstate"], code, "{query}: {response}");

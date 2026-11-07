@@ -110,11 +110,11 @@ async fn trim_construct_parse_errors_routine_nonactivation_and_authority() {
     pg_send(&mut raw, b'X', &[]).await;
     drop(raw);
     let (pg, connection) = f.pg(f.app.clone()).await;
-    // fc080f7 classifies an unknown quoted routine on an application session as 0A000.
+    // Unknown routines must pass application authority before routine binding.
     for query in ["SELECT \"trim\"(' x ')", "SELECT pg_catalog.trim(' x ')"] {
         assert_eq!(
             code(pg.prepare(query).await.unwrap_err()),
-            "0A000",
+            "42501",
             "{query}"
         );
     }
@@ -134,7 +134,7 @@ async fn trim_construct_parse_errors_routine_nonactivation_and_authority() {
     ] {
         assert_eq!(
             code(pg.prepare(query).await.unwrap_err()),
-            "0A000",
+            "42883",
             "{query}"
         );
     }

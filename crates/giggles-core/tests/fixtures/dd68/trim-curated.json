@@ -2,8 +2,8 @@
   "raw_denominator": 112,
   "substring_proposal_only": 7,
   "additional_keyword": 4,
-  "eligible": 95,
-  "known_gaps": 14,
+  "eligible": 100,
+  "known_gaps": 9,
   "cases": [
     {
       "kind": "text-syntax",
@@ -982,8 +982,8 @@
         "message": "function trim(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "known_gap_core": null,
+      "eligible": true
     },
     {
       "kind": "namespace",
@@ -1014,8 +1014,8 @@
         "message": "function TRIM(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "known_gap_core": null,
+      "eligible": true
     },
     {
       "kind": "namespace",
@@ -1046,8 +1046,8 @@
         "message": "function pg_catalog.trim(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "known_gap_core": null,
+      "eligible": true
     },
     {
       "kind": "namespace",
@@ -1078,8 +1078,8 @@
         "message": "function pg_catalog.trim(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "known_gap_core": null,
+      "eligible": true
     },
     {
       "kind": "namespace",
@@ -1110,8 +1110,8 @@
         "message": "function pg_catalog.trim(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "known_gap_core": null,
+      "eligible": true
     },
     {
       "kind": "namespace",

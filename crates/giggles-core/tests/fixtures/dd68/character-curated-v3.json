@@ -1710,8 +1710,8 @@
         "message": "function ASCII(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+      "known_gap_core": null,
+      "known_gap_reason": null
     },
     {
       "kind": "ascii-namespace",
@@ -1993,8 +1993,8 @@
         "message": "function INITCAP(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+      "known_gap_core": null,
+      "known_gap_reason": null
     },
     {
       "kind": "initcap-namespace",
@@ -2296,8 +2296,8 @@
         "message": "function CHR(integer) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+      "known_gap_core": null,
+      "known_gap_reason": null
     },
     {
       "kind": "chr-namespace",
@@ -2606,6 +2606,6 @@
       "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
     }
   ],
-  "matched_case_count": 117,
-  "known_gap_case_count": 3
+  "matched_case_count": 120,
+  "known_gap_case_count": 0
 }

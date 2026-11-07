@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "case_count": 210,
-  "planned_parity": 195,
-  "known_gaps": 9,
+  "planned_parity": 198,
+  "known_gaps": 6,
   "pg_only_input_domain": 2,
   "seed": 681106,
   "identity": {
@@ -9722,8 +9722,8 @@
         "quoted_uppercase"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": null,
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,
@@ -9787,8 +9787,8 @@
         "quoted_uppercase"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": null,
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,
@@ -9852,8 +9852,8 @@
         "quoted_uppercase"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": null,
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,

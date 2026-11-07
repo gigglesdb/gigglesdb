@@ -191,7 +191,7 @@ async fn qualified_routines_simple_and_extended_database_role() {
             ("SELECT \"public\".abs(1)", "42883"),
             ("SELECT public.count(*)", "42883"),
             ("SELECT upper(public.lower('a'))", "42883"),
-            ("SELECT nosuchfn(1)", "0A000"),
+            ("SELECT nosuchfn(1)", "42883"),
             ("SELECT public.quote_ident('a' FROM", "42601"),
         ] {
             let error = if extended {
@@ -413,9 +413,6 @@ async fn qualified_routines_authorization_and_wire_stages() {
                     ("SELECT public.abs(id) FROM U", "42501"),
                 ]);
             }
-            // Unqualified unknown routines are deliberately not asserted here: they
-            // still take pgwire's pre-authorization 0A000 shortcut (fc080f7), which
-            // the DD-0068 authority-order track owns and is fixing under E939.
             for (sql, expected) in cases {
                 let (code, stage) = observe(&fixture, session, sql, extended).await;
                 println!(

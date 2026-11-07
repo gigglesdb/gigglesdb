@@ -88,7 +88,7 @@ fn position_curated_pg18_core_results_metadata_and_exact_error_contracts() {
                 "error",
                 Some("42883"),
                 "parse",
-                SqlError::Unsupported,
+                SqlError::UndefinedFunction,
             )),
             // Core matches PG 42883; server authorization failure is 42501 (E939).
             52 => Some((

@@ -83,8 +83,8 @@ async fn degree_math_parse0_describe_bind_execute_and_authority() {
         ("SELECT sind('Infinity')", "22003"),
         ("SELECT public.sind(30)", "42501"),
         // Existing no-FROM authority classification rejects unknown routines.
-        ("SELECT pg_catalog.unknown_degree(1)", "0A000"),
-        ("SELECT pg_catalog.unknown_degree(1) FROM app", "0A000"),
+        ("SELECT pg_catalog.unknown_degree(1)", "42501"),
+        ("SELECT pg_catalog.unknown_degree(1) FROM app", "42883"),
     ] {
         let result = temporal_state_extended(&mut raw, query).await;
         assert_eq!(result["sqlstate"], code, "{query}: {result}");

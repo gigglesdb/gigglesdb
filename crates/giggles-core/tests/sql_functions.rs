@@ -92,7 +92,7 @@ fn schema_and_signature_errors_on_empty_and_limit_zero() {
         error(
             &mut s,
             &format!("SELECT unknown(txt) FROM f{suffix}"),
-            E::Unsupported,
+            E::UndefinedFunction,
         );
     }
 }

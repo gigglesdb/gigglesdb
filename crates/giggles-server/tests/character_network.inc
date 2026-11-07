@@ -70,10 +70,10 @@ async fn character_pg18_utf8_c_describe_repeated_binary_bind_and_errors() {
             "{query}"
         );
     }
-    // Current unknown quoted routine classification differs from PostgreSQL 42883.
+    // Table-free unknown routines fail authority; authorized FROM reaches binding.
     assert_eq!(
         code_from_character_error(pg.prepare("SELECT \"ASCII\"('a')").await.unwrap_err()),
-        "0A000"
+        "42501"
     );
     assert_eq!(
         code_from_character_error(
@@ -81,7 +81,7 @@ async fn character_pg18_utf8_c_describe_repeated_binary_bind_and_errors() {
                 .await
                 .unwrap_err()
         ),
-        "0A000"
+        "42883"
     );
     for query in [
         "SELECT chr(missing,1) FROM app",

@@ -2810,10 +2810,10 @@ async fn rejected_queries_report_stage_and_fingerprint_without_sql_or_values() {
     let sql = "SELECT private_probe('never_log_this_secret')";
     let error = pg.query(sql, &[]).await.unwrap_err();
     let error = error.as_db_error().unwrap();
-    assert_eq!(error.code().code(), "0A000");
-    assert!(error.message().contains("unsupported SQL feature"));
+    assert_eq!(error.code().code(), "42501");
+    assert!(error.message().contains("request rejected; consult documented code"));
     let detail = error.detail().unwrap();
-    assert!(detail.contains("phase=catalog planning"));
+    assert!(detail.contains("phase=application prepare"));
     assert!(detail.contains(&hex::encode(Sha256::digest(sql.as_bytes()))));
     for private in ["private_probe", "never_log_this_secret", "SELECT"] {
         assert!(!detail.contains(private));

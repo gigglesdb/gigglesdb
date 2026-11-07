@@ -91,7 +91,7 @@ fn targeted_public_calls_reach_analysis_without_catalog_rejection() {
     for sql in ["SELECT count(1)", "SELECT sum(1)", "SELECT nosuchfn(1)"] {
         assert!(s.prepare(sql).unwrap().table().is_some(), "{sql}");
     }
-    assert!(Prepared::rejects_unsupported_table_free_scalar(
+    assert!(!Prepared::rejects_unsupported_table_free_scalar(
         "SELECT nosuchfn(1)"
     ));
 }
@@ -236,15 +236,15 @@ fn other_routine_resolution_is_unchanged() {
             .values,
         vec![V::Text("a".into())]
     );
-    for call in [
-        "pg_catalog.nosuchfn(1)",
-        "nosuchfn(1)",
-        "information_schema.quote_ident('a')",
-        "\"PUBLIC\".quote_ident('a')",
-        "nosuchschema.abs(1)",
-        "pg_catalog.\"public.abs\"(1)",
-        "pg_catalog.coalesce(1, 2)",
+    for (call, expected) in [
+        ("pg_catalog.nosuchfn(1)", E::UndefinedFunction),
+        ("nosuchfn(1)", E::UndefinedFunction),
+        ("information_schema.quote_ident('a')", E::UndefinedFunction),
+        ("\"PUBLIC\".quote_ident('a')", E::InvalidSchema),
+        ("nosuchschema.abs(1)", E::InvalidSchema),
+        ("pg_catalog.\"public.abs\"(1)", E::UndefinedFunction),
+        ("pg_catalog.coalesce(1, 2)", E::UndefinedFunction),
     ] {
-        error(&mut s, &format!("SELECT {call}"), E::Unsupported);
+        error(&mut s, &format!("SELECT {call}"), expected);
     }
 }

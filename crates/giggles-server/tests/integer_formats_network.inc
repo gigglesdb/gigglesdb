@@ -117,7 +117,7 @@ async fn integer_formats_parse_ambiguity_child_priority_and_authority() {
     );
     assert_eq!(
         code(app.prepare("SELECT \"TO_HEX\"(1)").await.unwrap_err()),
-        "0A000"
+        "42501"
     );
     assert_eq!(
         code(
@@ -125,7 +125,7 @@ async fn integer_formats_parse_ambiguity_child_priority_and_authority() {
                 .await
                 .unwrap_err()
         ),
-        "0A000"
+        "42883"
     );
     drop(app);
     app_connection.await.unwrap();

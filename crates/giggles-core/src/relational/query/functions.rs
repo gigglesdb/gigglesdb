@@ -12,15 +12,25 @@ mod numeric;
 mod overlay;
 #[cfg(test)]
 mod overlay_tests;
+mod pg18_routines;
 mod planning;
 mod position;
 mod quoting;
 mod substring_order;
 mod temporal;
 mod text;
-// No routine can exist in public. Keep its calls distinct from builtin names
-// (including quoted names containing dots) until binding rejects them.
+// Preserve failed routine lookup until argument and source analysis finishes.
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
+const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
+fn deferred_routine_error(name: &str) -> Option<SqlError> {
+    if name.starts_with(UNDEFINED_ROUTINE_PREFIX) {
+        Some(SqlError::UndefinedFunction)
+    } else if name.starts_with(INVALID_SCHEMA_ROUTINE_PREFIX) {
+        Some(SqlError::InvalidSchema)
+    } else {
+        None
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UnaryOp {
     Neg,
@@ -76,7 +86,7 @@ impl Scalar {
     pub(super) fn has_undefined_routine(&self) -> bool {
         match self {
             Self::Call(name, args) => {
-                name.starts_with(UNDEFINED_ROUTINE_PREFIX)
+                deferred_routine_error(name).is_some()
                     || args.iter().any(Self::has_undefined_routine)
             }
             Self::Cast(arg, _) | Self::Unary(_, arg) => arg.has_undefined_routine(),
@@ -96,7 +106,7 @@ impl Scalar {
     }
     pub(super) fn reject_nested_aggregate(&self) -> R<()> {
         match self {
-            Self::Call(name, _) if name.starts_with(UNDEFINED_ROUTINE_PREFIX) => Ok(()),
+            Self::Call(name, _) if deferred_routine_error(name).is_some() => Ok(()),
             Self::Call(name, _) if matches!(name.as_str(), "count" | "sum" | "min" | "max") => {
                 Err(SqlError::GroupingError)
             }
@@ -272,25 +282,39 @@ impl Scalar {
                 let (name, quoted) = Self::routine_name(p)?;
                 let (name, quoted) = if qualified_call {
                     p.punct('.')?;
-                    // Fixed builtin and empty public namespaces; preserve quoted case.
-                    if name != "pg_catalog" && name != "public" {
-                        return Err(SqlError::Unsupported);
-                    }
                     let (routine, quoted) = Self::routine_name(p)?;
-                    if name == "public" {
-                        (format!("{UNDEFINED_ROUTINE_PREFIX}{routine}"), quoted)
-                    } else {
-                        (routine, quoted)
-                    }
-                } else if quoted && name.contains('.') {
-                    (format!("{UNDEFINED_ROUTINE_PREFIX}{name}"), quoted)
-                } else {
+                    let prefix = match name.as_str() {
+                        "pg_catalog"
+                            if pg18_routines::PG_CATALOG
+                                .binary_search(&routine.as_str())
+                                .is_ok() =>
+                        {
+                            ""
+                        }
+                        "pg_catalog" | "public" | "pg_toast" => UNDEFINED_ROUTINE_PREFIX,
+                        "information_schema"
+                            if pg18_routines::INFORMATION_SCHEMA
+                                .binary_search(&routine.as_str())
+                                .is_ok() =>
+                        {
+                            return Err(SqlError::Unsupported);
+                        }
+                        "information_schema" => UNDEFINED_ROUTINE_PREFIX,
+                        _ => INVALID_SCHEMA_ROUTINE_PREFIX,
+                    };
+                    (format!("{prefix}{routine}"), quoted)
+                } else if pg18_routines::PG_CATALOG
+                    .binary_search(&name.as_str())
+                    .is_ok()
+                    || (!quoted
+                        && pg18_routines::NON_UNRESERVED_KEYWORDS
+                            .binary_search(&name.as_str())
+                            .is_ok())
+                {
                     (name, quoted)
+                } else {
+                    (format!("{UNDEFINED_ROUTINE_PREFIX}{name}"), quoted)
                 };
-                // Quoted/qualified COALESCE names denote routines, never SQL syntax.
-                if (qualified_call || quoted) && name == "coalesce" {
-                    return Err(SqlError::Unsupported);
-                }
                 p.punct('(')?;
                 if name == "position" && !qualified_call && !quoted {
                     if matches!(
@@ -311,7 +335,7 @@ impl Scalar {
                     p.punct(')')?;
                     return Ok(Self::Call(name, vec![source, needle]));
                 }
-                if name.starts_with(UNDEFINED_ROUTINE_PREFIX) && p.sym('*') {
+                if deferred_routine_error(&name).is_some() && p.sym('*') {
                     p.punct(')')?;
                     return Ok(Self::Call(name, vec![Self::Literal(Value::Null)]));
                 }
@@ -350,7 +374,7 @@ impl Scalar {
                         if args.len() >= MAX_COLUMNS {
                             return Err(SqlError::Limit);
                         }
-                        if name.starts_with(UNDEFINED_ROUTINE_PREFIX)
+                        if deferred_routine_error(&name).is_some()
                             && matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',')))
                         {
                             return Err(SqlError::Syntax);
@@ -561,8 +585,8 @@ impl Scalar {
             Self::SubstringOrder(args) => {
                 return Self::bind_substring_order(args, resolve, tables, parameters);
             }
-            Self::Call(name, _) if name.starts_with(UNDEFINED_ROUTINE_PREFIX) => {
-                return Err(SqlError::UndefinedFunction);
+            Self::Call(name, _) if deferred_routine_error(name).is_some() => {
+                return Err(deferred_routine_error(name).unwrap());
             }
             Self::Call(name, args) if name == "overlay" => {
                 return Self::bind_overlay(args, resolve, tables, parameters);
@@ -1697,7 +1721,7 @@ impl Scalar {
             Self::SubstringOrder(args) => {
                 Self::infer_substring_order(args, parameters, resolve, tables)?;
             }
-            Self::Call(n, args) if n.starts_with(UNDEFINED_ROUTINE_PREFIX) => {
+            Self::Call(n, args) if deferred_routine_error(n).is_some() => {
                 // Validate ordinary arguments without inventing a signature for
                 // unresolved parameters or binding aggregates as scalar calls.
                 fn validate(
@@ -1736,7 +1760,7 @@ impl Scalar {
                     arg.infer(None, parameters, resolve, tables)?;
                     validate(arg, parameters, resolve, tables)?;
                 }
-                return Err(SqlError::UndefinedFunction);
+                return Err(deferred_routine_error(n).unwrap());
             }
             Self::Call(n, args) if n == "overlay" => {
                 Self::infer_overlay(args, parameters, resolve, tables)?;

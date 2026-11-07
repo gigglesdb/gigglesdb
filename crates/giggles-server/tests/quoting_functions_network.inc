@@ -74,8 +74,8 @@ async fn quoting_text_parse0_describe_bind_null_and_scoped_errors() {
         ("SELECT quote_nullable(missing,1) FROM app", "42703"),
         ("SELECT quote_ident($1::text,1)", "42883"),
         ("SELECT public.quote_ident('a')", "42501"),
-        ("SELECT \"QUOTE_IDENT\"('a')", "0A000"),
-        ("SELECT \"QUOTE_IDENT\"('a') FROM app", "0A000"),
+        ("SELECT \"QUOTE_IDENT\"('a')", "42501"),
+        ("SELECT \"QUOTE_IDENT\"('a') FROM app", "42883"),
         // Unknown arity retains generic parameter finalization (PG42883).
         // Missing no-FROM columns fail the positive authority proof; only
         // the authorized FROM case reaches the inherited priority gap (PG42703).

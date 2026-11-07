@@ -19349,8 +19349,8 @@
       },
       "core_setup": [],
       "scope_note": null,
-      "expected_core_error": "Unsupported",
-      "classification": "scoped_gap"
+      "expected_core_error": null,
+      "classification": "parity"
     },
     {
       "id": "Q_LOWER_QUOTED_quote_ident",
@@ -19674,8 +19674,8 @@
       },
       "core_setup": [],
       "scope_note": null,
-      "expected_core_error": "Unsupported",
-      "classification": "scoped_gap"
+      "expected_core_error": null,
+      "classification": "parity"
     },
     {
       "id": "Q_LOWER_QUOTED_quote_literal",
@@ -19999,8 +19999,8 @@
       },
       "core_setup": [],
       "scope_note": null,
-      "expected_core_error": "Unsupported",
-      "classification": "scoped_gap"
+      "expected_core_error": null,
+      "classification": "parity"
     },
     {
       "id": "Q_LOWER_QUOTED_quote_nullable",
@@ -22861,9 +22861,9 @@
   "priority_raw_sha256": "004045f70ec2e222bb4cbc04c6951a6f68c69cf477ca6a9a38d1ca6887513a9c",
   "profile": "PG18 UTF8 C/Ctype, quote_all_identifiers=off, text overloads only. ANYELEMENT siblings, nondefault identifier GUC, inherited namespace/unknown-param gaps unqualified.",
   "counts": {
-    "parity": 637,
+    "parity": 640,
     "inherited_unknown_parameter_gap": 9,
-    "scoped_gap": 48,
+    "scoped_gap": 45,
     "inherited_mixed_priority_gap": 3
   },
   "revision": 2,

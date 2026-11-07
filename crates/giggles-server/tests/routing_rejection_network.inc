@@ -7,12 +7,15 @@ async fn dd68_negative_scalar_routing_tls_redaction_and_authority() {
     // Simple query and extended Parse must preserve the same negative contract.
     let simple = pg.simple_query(sql).await.unwrap_err();
     let extended = pg.prepare(sql).await.unwrap_err();
-    for error in [&simple, &extended] {
+    for (error, phase) in [
+        (&simple, "application SQL"),
+        (&extended, "application prepare"),
+    ] {
         let error = error.as_db_error().unwrap();
-        assert_eq!(error.code().code(), "0A000");
-        assert!(error.message().contains("unsupported SQL feature"));
+        assert_eq!(error.code().code(), "42501");
+        assert!(error.message().contains("request rejected; consult documented code"));
         let detail = error.detail().unwrap();
-        assert!(detail.contains("phase=catalog planning"));
+        assert!(detail.contains(&format!("phase={phase}")));
         assert!(detail.contains(&hex::encode(Sha256::digest(sql.as_bytes()))));
         for secret in ["private_probe", "never_log_this_secret", "SELECT"] {
             assert!(!error.message().contains(secret));
@@ -151,10 +154,10 @@ async fn dd68_negative_scalar_task_raw_extended_pipeline_authority() {
 }
 
 #[tokio::test]
-async fn dd68_negative_scalar_app_raw_extended_pipeline_keeps_unsupported() {
+async fn dd68_negative_scalar_app_raw_extended_pipeline_keeps_authority() {
     let f = Fixture::new().await;
     let mut s = raw_pg(&f).await;
-    dd68_assert_negative_scalar_pipeline(&mut s, "app", "0A000", "42501").await;
+    dd68_assert_negative_scalar_pipeline(&mut s, "app", "42501", "0A000").await;
     drop(s);
     f.stop().await;
 }
@@ -227,13 +230,13 @@ async fn dd68_quoted_routine_authority_precedes_classification() {
     ] {
         let (pg, conn) = f.pg(config.clone()).await;
         for (probe, sql) in probes.iter().enumerate() {
-            // Measured on unmodified HEAD: lowercase quoted position succeeds;
-            // public.coalesce returns 42501; all other probes return 0A000.
+            // Lowercase quoted position succeeds; table-free unknown calls fail
+            // authority, while the authorized FROM reaches routine binding.
             if role == "app" && probe == 1 {
                 continue;
             }
-            let expected = if role == "app" && probe != 12 {
-                "0A000"
+            let expected = if role == "app" && probe == 9 {
+                "42883"
             } else {
                 "42501"
             };
@@ -344,4 +347,136 @@ async fn dd68_quoted_routine_authority_precedes_classification() {
     }
     f.stop().await;
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn dd68_undefined_routine_authority_precedes_classification() {
+    let f = Fixture::new().await;
+    // This TLS fixture has no database role; app FROM app is the authorized control.
+    let probes = [
+        "SELECT nosuchfn('a')",
+        "SELECT frobnicate(1, 2)",
+        "SELECT \"LOWER\"('a')",
+        "SELECT nosuchfn(*)",
+        "SELECT pg_catalog.nosuchfn('a')",
+        "SELECT information_schema.nosuchfn('a')",
+        "SELECT pg_toast.lower('a')",
+        "SELECT nosuchschema.lower('a')",
+        "SELECT nosuchschema.count(*)",
+        "SELECT \"PUBLIC\".nosuchfn(1)",
+        "SELECT \"PG_CATALOG\".lower('a')",
+        "SELECT pg_temp.lower('a')",
+        "SELECT nosuchfn(body) FROM app",
+        "SELECT nosuchschema.lower(body) FROM app",
+        "SELECT 1 WHERE nosuchfn(1) = 1",
+        "SELECT information_schema._pg_expandarray(1)",
+    ];
+    let redacted = |message: &str, detail: &str| {
+        [
+            "SELECT",
+            "nosuchfn",
+            "frobnicate",
+            "LOWER",
+            "lower",
+            "pg_catalog",
+            "information_schema",
+            "pg_toast",
+            "nosuchschema",
+            "count",
+            "PUBLIC",
+            "PG_CATALOG",
+            "pg_temp",
+            "body",
+            "FROM app",
+            "WHERE",
+            "_pg_expandarray",
+            "'a'",
+            "1, 2",
+        ]
+        .iter()
+        .all(|secret| !message.contains(secret) && !detail.contains(secret))
+    };
+    for (role, config) in [
+        ("task", f.task.clone()),
+        ("other", f.other.clone()),
+        ("app", f.app.clone()),
+    ] {
+        let (pg, conn) = f.pg(config.clone()).await;
+        let mut raw = dd68_raw_role_pg(&f, config).await;
+        for (probe, sql) in probes.iter().enumerate() {
+            let expected = match (role, probe) {
+                ("app", 12) => "42883",
+                ("app", 13) => "3F000",
+                ("app", 15) => "0A000",
+                _ => "42501",
+            };
+            for (method, result) in [
+                ("simple_query", pg.simple_query(sql).await.map(|_| ())),
+                ("prepare", pg.prepare(sql).await.map(|_| ())),
+            ] {
+                let error = result.expect_err(&format!(
+                    "role={role} method={method} probe={probe} sql={sql}"
+                ));
+                let db = error.as_db_error().unwrap();
+                let actual = db.code().code();
+                let safe = redacted(db.message(), db.detail().unwrap_or(""));
+                println!(
+                    "undefined role={role} method={method} probe={probe} code={actual} redacted={safe}"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "role={role} method={method} probe={probe} sql={sql}"
+                );
+                assert!(
+                    safe,
+                    "role={role} method={method} probe={probe}: SQL leaked"
+                );
+            }
+            for statement_describe in [false, true] {
+                pg_send(&mut raw, b'P', &parse("", sql)).await;
+                let method = if statement_describe {
+                    pg_send(&mut raw, b'D', b"S\0").await;
+                    "raw_statement_describe"
+                } else {
+                    pg_send(&mut raw, b'B', &bind("", "", &[], false)).await;
+                    pg_send(&mut raw, b'D', b"P\0").await;
+                    pg_send(&mut raw, b'E', &execute("", 0)).await;
+                    "raw_portal_execute"
+                };
+                let frames = pg_sync(&mut raw).await;
+                let errors: Vec<_> = frames.iter().filter(|(tag, _)| *tag == b'E').collect();
+                assert_eq!(errors.len(), 1, "role={role} method={method} probe={probe}");
+                let field = |tag: u8| {
+                    errors[0]
+                        .1
+                        .split(|byte| *byte == 0)
+                        .find_map(|part| part.strip_prefix(&[tag]))
+                        .map(|part| String::from_utf8_lossy(part).into_owned())
+                        .unwrap_or_default()
+                };
+                let actual = field(b'C');
+                let safe = redacted(&field(b'M'), &field(b'D'));
+                println!(
+                    "undefined role={role} method={method} probe={probe} code={actual} redacted={safe}"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "role={role} method={method} probe={probe} sql={sql}"
+                );
+                assert!(
+                    safe,
+                    "role={role} method={method} probe={probe}: SQL leaked"
+                );
+                assert_eq!(
+                    frames.last().map(|(tag, _)| *tag),
+                    Some(b'Z'),
+                    "role={role} method={method} probe={probe}"
+                );
+            }
+        }
+        drop(raw);
+        drop(pg);
+        conn.await.unwrap();
+    }
+    f.stop().await;
 }

@@ -18,7 +18,7 @@ fn trim_escaping_quoted_nul_and_cast_depth_preserve_existing_lexical_contract() 
         let p = session.prepare(query).unwrap();
         assert_eq!(
             session.describe(&p).unwrap_err(),
-            CoreError::Sql(SqlError::Unsupported),
+            CoreError::Sql(SqlError::UndefinedFunction),
             "quoted routine must not become construct: {query}"
         );
     }
