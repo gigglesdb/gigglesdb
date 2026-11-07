@@ -160,7 +160,8 @@ fn missing_rows_skip_scalar_evaluation_but_validate_types_and_inputs() {
             ),
             ("UPDATE items SET n=missing+1 WHERE id=99", E::UnknownColumn),
             ("UPDATE items SET n='bad' WHERE id=99", E::Type),
-            ("UPDATE items SET n=n+1,n=n+2 WHERE id=99", E::Duplicate),
+            // PG18.6 rejects repeated SET targets with 42601.
+            ("UPDATE items SET n=n+1,n=n+2 WHERE id=99", E::Syntax),
         ] {
             error(s, sql, expected);
         }
@@ -227,10 +228,11 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
 fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
     database(|s| {
         let old = row(s);
-        // Each assignment is validated in order; duplicate targets are checked last.
+        // Existing nonduplicate PK/type order remains; SQL analysis precedes duplicates.
         for (sql, expected) in [
             ("UPDATE items SET id=2 WHERE id=1", E::Unsupported),
-            ("UPDATE items SET n=1,n=2 WHERE id=1", E::Duplicate),
+            // PG18.6 rejects repeated SET targets with 42601.
+            ("UPDATE items SET n=1,n=2 WHERE id=1", E::Syntax),
             ("UPDATE items SET n='x' WHERE id=1", E::Type),
             ("UPDATE items SET id='x',n='x' WHERE id=1", E::Unsupported),
             ("UPDATE items SET n='x',id=2 WHERE id=1", E::Type),
@@ -246,8 +248,10 @@ fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
             ("UPDATE items SET n=$1 WHERE id=1", E::Type),
             ("UPDATE items SET id=2,n=$1 WHERE id=1", E::Unsupported),
             ("UPDATE items SET n=$1,id=2 WHERE id=1", E::Type),
-            ("UPDATE items SET n=1,n=2,m=$1 WHERE id=1", E::Type),
-            ("UPDATE items SET m=$1,n=1,n=2 WHERE id=1", E::Type),
+            // PG18.6 rejects duplicate targets before binding parameter values.
+            ("UPDATE items SET n=1,n=2,m=$1 WHERE id=1", E::Syntax),
+            // PG18.6 rejects duplicate targets before binding parameter values.
+            ("UPDATE items SET m=$1,n=1,n=2 WHERE id=1", E::Syntax),
         ] {
             assert_eq!(
                 s.execute(sql, &[V::Text("x".into())], None),
@@ -264,11 +268,12 @@ fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
         run(s, "INSERT INTO required VALUES(1,10)");
         let select = "SELECT id,n FROM required WHERE id=1";
         let required_old = run(s, select).rows.remove(0);
-        for sql in [
-            "UPDATE required SET n=NULL WHERE id=1",
-            "UPDATE required SET n=1,n=NULL WHERE id=1",
+        for (sql, expected) in [
+            ("UPDATE required SET n=NULL WHERE id=1", E::Null),
+            // PG18.6 rejects duplicate targets before postimage NOT NULL checks.
+            ("UPDATE required SET n=1,n=NULL WHERE id=1", E::Syntax),
         ] {
-            error(s, sql, E::Null);
+            error(s, sql, expected);
             assert_eq!(run(s, select).rows.remove(0), required_old, "{sql}");
         }
     });
@@ -309,5 +314,154 @@ fn searched_primary_key_moves_check_uniqueness_in_order_and_return_new_keys() {
         ];
         assert_eq!(returned, expected);
         assert_eq!(ids(s), expected);
+    });
+}
+
+#[test]
+fn duplicate_set_analysis_precedes_binding_and_row_lookup() {
+    database(|s| {
+        let old = row(s);
+        for (sql, expected) in [
+            ("UPDATE missing SET n=1,n=2 WHERE id=1", E::UnknownTable),
+            (
+                "UPDATE items SET n=1,n=2,missing=1 WHERE id=1",
+                E::UnknownColumn,
+            ),
+            ("UPDATE items SET n=1,n=2 WHERE missing=1", E::UnknownColumn),
+            (
+                "UPDATE items SET n=1,n=2 WHERE id=1 RETURNING missing",
+                E::UnknownColumn,
+            ),
+            (
+                "UPDATE items SET n=missing+1,n=2 WHERE id=99",
+                E::UnknownColumn,
+            ),
+            ("UPDATE items SET id=2,n=1,n=2 WHERE id=1", E::Syntax),
+            ("UPDATE items SET n=n/0,n=n+2 WHERE id=99", E::Syntax),
+            ("UPDATE items SET n=NULL,n=2 WHERE id>99", E::Syntax),
+        ] {
+            error(s, sql, expected);
+            assert_eq!(row(s), old);
+        }
+        let prepared = s.prepare("UPDATE items SET n=$1,n=2 WHERE id=1").unwrap();
+        assert_eq!(
+            s.describe(&prepared).unwrap_err(),
+            CoreError::Sql(E::Syntax)
+        );
+        for id in [1, 99] {
+            for value in ["NULL", "n+1"] {
+                error(
+                    s,
+                    &format!("UPDATE items SET n={value},n=2 WHERE id={id}"),
+                    E::Syntax,
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn not_null_checks_only_matched_update_postimages() {
+    database(|s| {
+        run(
+            s,
+            "CREATE TABLE required (id BIGINT PRIMARY KEY, n INTEGER NOT NULL, m INTEGER)",
+        );
+        run(s, "INSERT INTO required VALUES(1,10,20)");
+        let select = "SELECT id,n,m FROM required WHERE id=1";
+        let old = run(s, select).rows.remove(0);
+        // PG18.6: NULL constraints inspect matched postimages, in both SET paths.
+        for (predicate, matched) in [
+            ("id=99", false),
+            ("n>99", false),
+            ("id=1", true),
+            ("n>0", true),
+        ] {
+            for extra in ["", ",m=m+1"] {
+                for rhs in ["NULL", "(NULL)", "DEFAULT"] {
+                    let sql = format!("UPDATE required SET n={rhs}{extra} WHERE {predicate}");
+                    if matched {
+                        error(s, &sql, E::Null);
+                    } else {
+                        assert_eq!(run(s, &sql).affected, 0);
+                    }
+                    assert_eq!(run(s, select).rows.remove(0), old);
+                }
+                for declared in [None, Some(T::Integer), Some(T::BigInt)] {
+                    let prepared = s
+                        .prepare(&format!(
+                            "UPDATE required SET n=$1{extra} WHERE {predicate}"
+                        ))
+                        .unwrap();
+                    let prepared = if let Some(ty) = declared {
+                        prepared.with_parameter_types(&[Some(ty)]).unwrap()
+                    } else {
+                        prepared
+                    };
+                    let result = s.execute_prepared(&prepared, &[V::Null], None);
+                    if matched {
+                        assert_eq!(result, Err(CoreError::Sql(E::Null)));
+                    } else {
+                        assert_eq!(result.unwrap().affected, 0);
+                    }
+                    assert_eq!(run(s, select).rows.remove(0), old);
+                }
+            }
+            error(
+                s,
+                &format!("UPDATE required SET n='bad' WHERE {predicate}"),
+                E::Type,
+            );
+        }
+    });
+}
+
+#[test]
+fn conflict_set_duplicates_and_guarded_nulls_follow_sql_analysis() {
+    database(|s| {
+        for id in [1, 99] {
+            for (sets, expected) in [
+                ("n=1,n=2", E::Syntax),
+                ("n=excluded.n,n=items.n", E::Syntax),
+                ("n=NULL,n=2", E::Syntax),
+                ("n=1,n=2,missing=1", E::UnknownColumn),
+                ("n=1,n=2,m='bad'", E::Type),
+            ] {
+                error(
+                    s,
+                    &format!(
+                        "INSERT INTO items(id,n) VALUES({id},10) ON CONFLICT(id) DO UPDATE SET {sets}"
+                    ),
+                    expected,
+                );
+            }
+        }
+        run(
+            s,
+            "CREATE TABLE required (id BIGINT PRIMARY KEY, n INTEGER NOT NULL)",
+        );
+        run(s, "INSERT INTO required VALUES(1,10)");
+        let old = run(s, "SELECT id,n FROM required WHERE id=1")
+            .rows
+            .remove(0);
+        assert_eq!(
+            run(
+                s,
+                "INSERT INTO required VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=NULL WHERE n<0"
+            )
+            .affected,
+            0
+        );
+        error(
+            s,
+            "INSERT INTO required VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=NULL",
+            E::Null,
+        );
+        assert_eq!(
+            run(s, "SELECT id,n FROM required WHERE id=1")
+                .rows
+                .remove(0),
+            old
+        );
     });
 }

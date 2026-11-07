@@ -27,6 +27,56 @@ impl Value {
     }
 }
 
+pub(super) fn duplicate_names<'a>(names: impl IntoIterator<Item = &'a String>) -> bool {
+    let mut seen = BTreeSet::new();
+    names.into_iter().any(|name| !seen.insert(name))
+}
+
+pub(super) fn has_duplicates(prepared: &Prepared) -> bool {
+    match &prepared.statement {
+        Statement::Update { sets, .. } => duplicate_names(sets.iter().map(|(name, _)| name)),
+        Statement::UpdateExpressions { sets, .. } => {
+            duplicate_names(sets.iter().map(|(name, _)| name))
+        }
+        _ => false,
+    }
+}
+
+// PG18.6 analyzes SQL before rejecting duplicate targets, before binding values.
+pub(super) fn check_duplicate_literals(prepared: &Prepared, state: &Relational) -> R<()> {
+    let table = state
+        .tables
+        .get(prepared.table().ok_or(SqlError::UnknownTable)?)
+        .ok_or(SqlError::UnknownTable)?;
+    let values: Vec<(&String, Option<&Expr>)> = match &prepared.statement {
+        Statement::Update { sets, .. } => sets
+            .iter()
+            .map(|(name, value)| (name, Some(value)))
+            .collect(),
+        Statement::UpdateExpressions { sets, .. } => sets
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name,
+                    match value {
+                        Value::Plain(value) => Some(value),
+                        _ => None,
+                    },
+                )
+            })
+            .collect(),
+        _ => return Ok(()),
+    };
+    for (name, value) in values {
+        let mut column = table.columns[col(table, name)?].clone();
+        column.not_null = false;
+        if let Some(value @ Expr::Literal(_)) = value {
+            plain_value(value, &column, &prepared.parameter_types, &[])?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn indexes(
     sets: &[(String, Value)],
     table: &TableDef,
@@ -35,14 +85,15 @@ pub(super) fn indexes(
     if sets.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    let indexes = sets
-        .iter()
+    let duplicate = duplicate_names(sets.iter().map(|(name, _)| name));
+    sets.iter()
         .map(|(name, value)| {
             let index = col(table, name)?;
             if !matches!(value, Value::Default) {
                 defaults::check_explicit(state, &table.columns[index])?;
             }
-            if table.primary_key.contains(&index)
+            if !duplicate
+                && table.primary_key.contains(&index)
                 && !matches!(value, Value::Default)
                 && state.column_identity(table.columns[index].id).is_none()
             {
@@ -50,9 +101,7 @@ pub(super) fn indexes(
             }
             Ok(index)
         })
-        .collect::<R<Vec<_>>>()?;
-    unique(indexes.iter())?;
-    Ok(indexes)
+        .collect::<R<Vec<_>>>()
 }
 
 pub(super) fn plain_value(
@@ -196,8 +245,8 @@ impl<'a> Plan<'a> {
         params: &[super::Value],
         clock: Option<&super::clock::ExecutionClock>,
     ) -> R<Self> {
-        // Preserve the native and plain SQL assignment path exactly, including
-        // value checks before finding a row. Scalar inputs need a shared schema
+        // Plain SQL type checks precede row lookup; NOT NULL checks apply to
+        // matched postimages. Scalar inputs need a shared schema
         // for SET, WHERE and RETURNING before any parameter is evaluated.
         if let Statement::Update { sets, .. } = &prepared.statement {
             let values = sets
@@ -210,12 +259,9 @@ impl<'a> Plan<'a> {
                     {
                         return Err(SqlError::Unsupported);
                     }
-                    let value = plain_value(
-                        value,
-                        &table.columns[index],
-                        &prepared.parameter_types,
-                        params,
-                    )?;
+                    let mut column = table.columns[index].clone();
+                    column.not_null = false;
+                    let value = plain_value(value, &column, &prepared.parameter_types, params)?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
@@ -254,12 +300,9 @@ impl<'a> Plan<'a> {
                         clock.cloned(),
                     ),
                     Value::Plain(value) => {
-                        let value = plain_value(
-                            value,
-                            &table.columns[index],
-                            &prepared.parameter_types,
-                            params,
-                        )?;
+                        let mut column = table.columns[index].clone();
+                        column.not_null = false;
+                        let value = plain_value(value, &column, &prepared.parameter_types, params)?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(

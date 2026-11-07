@@ -895,11 +895,14 @@ fn null_update_assignments_are_not_null_violations_only_for_matched_rows() {
             before
         );
     }
-    // PG 18.6 gives UPDATE 0 (NOT NULL is a post-image check); GigglesDB checks plain SET NULL before row lookup (follow-up).
-    assert!(matches!(
-        session.execute("UPDATE t SET n=NULL WHERE id=999", &[], None),
-        Err(CoreError::Sql(SqlError::Null))
-    ));
+    // PG 18.6 gives UPDATE 0: NOT NULL is a post-image check, so a non-matching UPDATE succeeds.
+    assert_eq!(
+        session
+            .execute("UPDATE t SET n=NULL WHERE id=999", &[], None)
+            .unwrap()
+            .affected,
+        0
+    );
     assert_eq!(
         session.execute("SELECT * FROM t", &[], None).unwrap(),
         before

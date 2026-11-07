@@ -1320,6 +1320,17 @@ impl Prepared {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
+        if assign::has_duplicates(self) {
+            assign::check_duplicate_literals(self, state)?;
+            self.describe_inner(state)?;
+            return Err(SqlError::Syntax);
+        }
+        self.describe_inner(state)
+    }
+    fn describe_inner(&self, state: &Relational) -> R<Description> {
+        if self.epoch != state.epoch {
+            return Err(SqlError::StaleSchema);
+        }
         if let Statement::AlterTable(alter) = &self.statement {
             if let Some(error) = &alter.resolution_error {
                 return Err(error.clone());
@@ -2203,6 +2214,11 @@ impl Relational {
                     | Statement::UpdateExpressions { .. }
                     | Statement::Delete { .. }
             )
+        {
+            prepared.describe(self)?;
+        }
+        if assign::has_duplicates(prepared)
+            || matches!(&prepared.statement, Statement::InsertMulti(insert) if insert.has_duplicate_assignments())
         {
             prepared.describe(self)?;
         }

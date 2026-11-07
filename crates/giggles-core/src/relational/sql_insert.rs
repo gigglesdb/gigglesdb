@@ -438,6 +438,12 @@ impl Insert {
         }
         Ok(dependencies)
     }
+    pub(super) fn has_duplicate_assignments(&self) -> bool {
+        self.conflict
+            .as_ref()
+            .and_then(|conflict| conflict.update.as_ref())
+            .is_some_and(|update| assign::duplicate_names(update.sets.iter().map(|(name, _)| name)))
+    }
     pub(super) fn describe(
         &self,
         state: &Relational,
@@ -465,19 +471,17 @@ impl Insert {
                 )?;
             }
         }
+        let mut duplicate = false;
         if let Some(Conflict {
             update: Some(update),
             ..
         }) = &self.conflict
         {
-            let mut seen = BTreeSet::new();
+            duplicate = assign::duplicate_names(update.sets.iter().map(|(name, _)| name));
             for (name, operand) in &update.sets {
                 let index = col(table, name)?;
-                if !seen.insert(index) {
-                    return Err(SqlError::Duplicate);
-                }
                 defaults::check_explicit(state, &table.columns[index])?;
-                if table.primary_key.contains(&index) {
+                if !duplicate && table.primary_key.contains(&index) {
                     return Err(SqlError::Unsupported);
                 }
                 if let Operand::Value(expression @ Expr::Param(n)) = operand
@@ -517,11 +521,17 @@ impl Insert {
         }
         if let Some(returning) = &self.returning {
             let (columns, parameters, typmods) = returning.describe(state, parameters)?;
+            if duplicate {
+                return Err(SqlError::Syntax);
+            }
             return Ok(Description {
                 typmods,
                 columns,
                 parameters,
             });
+        }
+        if duplicate {
+            return Err(SqlError::Syntax);
         }
         Ok(Description {
             parameters: parameters
