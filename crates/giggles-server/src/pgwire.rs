@@ -153,30 +153,14 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::BigInt => 20,
         DataType::Text => 25,
         DataType::Bytes => 17,
-        DataType::Numeric => 1700,
-        DataType::Real => 700,
-        DataType::DoublePrecision => 701,
-        DataType::Date => 1082,
-        DataType::Time => 1083,
-        DataType::TimeTz => 1266,
-        DataType::Timestamp => 1114,
-        DataType::TimestampTz => 1184,
-        DataType::Interval => 1186,
     }
 }
 fn size(t: &DataType) -> i16 {
     match t {
         DataType::Boolean => 1,
-        DataType::Date => 4,
-        DataType::Time => 8,
-        DataType::TimeTz => 12,
-        DataType::Timestamp => 8,
-        DataType::TimestampTz => 8,
-        DataType::Interval => 16,
-
         DataType::SmallInt => 2,
-        DataType::Integer | DataType::Real => 4,
-        DataType::BigInt | DataType::DoublePrecision => 8,
+        DataType::Integer => 4,
+        DataType::BigInt => 8,
         _ => -1,
     }
 }
@@ -248,82 +232,11 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
                 .map(|v| Value::Int(v.into()))
                 .map_err(|_| "22P02"),
             DataType::BigInt => s.parse::<i64>().map(Value::Int).map_err(|_| "22P02"),
-            DataType::Numeric => giggles_pg_types::Numeric::parse(s)
-                .map(Value::Numeric)
-                .map_err(numeric_error),
-            DataType::Real => giggles_pg_types::Float4::parse(s)
-                .map(Value::Float4)
-                .map_err(numeric_error),
-            DataType::DoublePrecision => giggles_pg_types::Float8::parse(s)
-                .map(Value::Float8)
-                .map_err(numeric_error),
-            DataType::Date => giggles_core::relational::Date::parse(
-                s,
-                &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
-                    offset_east: 0,
-                },
-            )
-            .map(Value::Date)
-            .map_err(temporal_error),
-            DataType::Time => giggles_core::relational::PgTime::parse(s)
-                .map(Value::Time)
-                .map_err(temporal_error),
-            DataType::TimeTz => giggles_core::relational::TimeTz::parse(
-                s,
-                &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
-                    offset_east: 0,
-                },
-            )
-            .map(Value::TimeTz)
-            .map_err(temporal_error),
-            DataType::Timestamp => giggles_core::relational::Timestamp::parse(
-                s,
-                &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
-                    offset_east: 0,
-                },
-            )
-            .map(Value::Timestamp)
-            .map_err(temporal_error),
-            DataType::TimestampTz => giggles_core::relational::TimestampTz::parse_in_session(
-                s,
-                &giggles_pg_types::temporal::SessionSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
-                    zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
-                },
-            )
-            .map(Value::TimestampTz)
-            .map_err(temporal_error),
-            DataType::Interval => giggles_core::relational::Interval::parse(s)
-                .map(Value::Interval)
-                .map_err(temporal_error),
             DataType::Text => Ok(Value::Text(s.into())),
             DataType::Bytes => hex::decode(s.strip_prefix("\\x").ok_or("22P02")?)
                 .map(Value::Bytes)
                 .map_err(|_| "22P02"),
         };
-    }
-    let temporal_size = match ty {
-        DataType::Date => Some(4),
-        DataType::Time | DataType::Timestamp | DataType::TimestampTz => Some(8),
-        DataType::TimeTz => Some(12),
-        DataType::Interval => Some(16),
-        _ => None,
-    };
-    if let Some(size) = temporal_size {
-        if b.len() < size {
-            return Err("08P01");
-        }
-        if b.len() > size {
-            return Err("22P03");
-        }
-        if matches!(ty, DataType::TimeTz)
-            && !(-57_599..=57_599).contains(&i32::from_be_bytes(b[8..12].try_into().unwrap()))
-        {
-            return Err("22009");
-        }
     }
     match (ty, b.len()) {
         (DataType::Boolean, 1) if b[0] <= 1 => Ok(Value::Bool(b[0] != 0)),
@@ -333,56 +246,11 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
         (DataType::Text, _) => String::from_utf8(b.to_vec())
             .map(Value::Text)
             .map_err(|_| "22021"),
-        (DataType::Numeric, _) => giggles_pg_types::Numeric::from_binary(b)
-            .map(Value::Numeric)
-            .map_err(numeric_error),
-        (DataType::Real, _) => giggles_pg_types::Float4::from_binary(b)
-            .map(Value::Float4)
-            .map_err(numeric_error),
-        (DataType::DoublePrecision, _) => giggles_pg_types::Float8::from_binary(b)
-            .map(Value::Float8)
-            .map_err(numeric_error),
-        (DataType::Date, _) => giggles_core::relational::Date::from_binary(b)
-            .map(Value::Date)
-            .map_err(temporal_error),
-        (DataType::Time, _) => giggles_core::relational::PgTime::from_binary(b)
-            .map(Value::Time)
-            .map_err(temporal_error),
-        (DataType::TimeTz, _) => giggles_core::relational::TimeTz::from_binary(b)
-            .map(Value::TimeTz)
-            .map_err(temporal_error),
-        (DataType::Timestamp, _) => giggles_core::relational::Timestamp::from_binary(b)
-            .map(Value::Timestamp)
-            .map_err(temporal_error),
-        (DataType::TimestampTz, _) => giggles_core::relational::TimestampTz::from_binary(b)
-            .map(Value::TimestampTz)
-            .map_err(temporal_error),
-        (DataType::Interval, _) => giggles_core::relational::Interval::from_binary(b)
-            .map(Value::Interval)
-            .map_err(temporal_error),
         (DataType::Bytes, _) => Ok(Value::Bytes(b.to_vec())),
         _ => Err("22P03"),
     }
 }
-fn temporal_error(e: giggles_pg_types::Error) -> &'static str {
-    match e {
-        giggles_pg_types::Error::Range => "22008",
-        giggles_pg_types::Error::Binary => "22P03",
-        giggles_pg_types::Error::Limit => "54000",
-        _ => "22007",
-    }
-}
-fn numeric_error(e: giggles_pg_types::Error) -> &'static str {
-    match e {
-        giggles_pg_types::Error::Range | giggles_pg_types::Error::Limit => "22003",
-        giggles_pg_types::Error::Binary => "22P03",
-        _ => "22P02",
-    }
-}
-fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<Option<Vec<u8>>> {
-    if format > 1 {
-        return Err("08P01");
-    }
+fn encode(v: &Value, ty: &DataType, format: u16) -> R<Option<Vec<u8>>> {
     if *v == Value::Null {
         return Ok(None);
     }
@@ -396,24 +264,6 @@ fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<O
                     b"f".to_vec()
                 }
             }
-            Value::Date(v) => v.to_string().into_bytes(),
-            Value::Time(v) => v.to_string().into_bytes(),
-            Value::TimeTz(v) => v.to_string().into_bytes(),
-            Value::Timestamp(v) => v.to_string().into_bytes(),
-            Value::TimestampTz(v) => v
-                .format_in_zone(giggles_pg_types::temporal::SessionZone::Fixed(0))
-                .map_err(temporal_error)?
-                .into_bytes(),
-            Value::Interval(v) => v.to_string().into_bytes(),
-            Value::Numeric(v) => v.to_string().into_bytes(),
-            Value::Float4(v) => v
-                .to_text_with_extra_float_digits(extra_float_digits)
-                .map_err(numeric_error)?
-                .into_bytes(),
-            Value::Float8(v) => v
-                .to_text_with_extra_float_digits(extra_float_digits)
-                .map_err(numeric_error)?
-                .into_bytes(),
             Value::Int(v) => v.to_string().into_bytes(),
             Value::Text(s) => s.as_bytes().to_vec(),
             Value::Bytes(b) => format!("\\x{}", hex::encode(b)).into_bytes(),
@@ -431,21 +281,11 @@ fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<O
             .to_vec(),
         (Value::Int(v), DataType::BigInt) => v.to_be_bytes().to_vec(),
         (Value::Text(s), DataType::Text) => s.as_bytes().to_vec(),
-        (Value::Numeric(v), DataType::Numeric) => v.to_binary(),
-        (Value::Float4(v), DataType::Real) => v.to_binary().to_vec(),
-        (Value::Float8(v), DataType::DoublePrecision) => v.to_binary().to_vec(),
-        (Value::Date(v), DataType::Date) => v.to_binary().to_vec(),
-        (Value::Time(v), DataType::Time) => v.to_binary().to_vec(),
-        (Value::TimeTz(v), DataType::TimeTz) => v.to_binary().to_vec(),
-        (Value::Timestamp(v), DataType::Timestamp) => v.to_binary().to_vec(),
-        (Value::TimestampTz(v), DataType::TimestampTz) => v.to_binary().to_vec(),
-        (Value::Interval(v), DataType::Interval) => v.to_binary().to_vec(),
         (Value::Bytes(b), DataType::Bytes) => b.clone(),
         _ => return Err("42804"),
     }))
 }
 fn rows(
-    extra_float_digits: i32,
     result: &SqlResult,
     d: &Description,
     formats: &[u16],
@@ -461,7 +301,6 @@ fn rows(
                 v,
                 &d.columns.get(i).ok_or("XX000")?.data_type,
                 format_at(formats, i),
-                extra_float_digits,
             )? {
                 None => b.extend((-1i32).to_be_bytes()),
                 Some(v) => {
@@ -501,6 +340,7 @@ fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_c
 #[derive(Clone)]
 enum Plan {
     Empty,
+    Admin(crate::auth::statements::AdminStatement),
     Control(&'static str),
     Settings(Vec<crate::pg_settings::Setting>),
     Inspect(crate::pg_settings::Show),
@@ -531,6 +371,7 @@ impl Statement {
             }
             Plan::Sql(p) => core(session.describe(p)),
             Plan::Task(_)
+            | Plan::Admin(_)
             | Plan::Empty
             | Plan::Settings(_)
             | Plan::Control(_)
@@ -576,6 +417,7 @@ fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
 }
 struct State {
     diagnostic: Diagnostic,
+    admin_completed: bool,
     implicit: bool,
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
@@ -746,16 +588,12 @@ impl State {
                         affected: 0,
                     };
                     row_description(&d, &[], out)?;
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &d,
-                        &[],
-                        0,
-                        1,
-                        out,
-                    )?;
+                    rows(&result, &d, &[], 0, 1, out)?;
                     complete("SELECT", &result, out)?;
+                } else if let Some(stmt) = crate::auth::statements::parse(&sql) {
+                    let tag = session.execute_admin(&stmt)?;
+                    self.admin_completed = true;
+                    complete(tag, &SqlResult::default(), out)?;
                 } else if crate::pg_settings::empty_sql(&sql)? {
                     frame(b'I', &[], out)?;
                 } else if let Some(command) = control(&sql) {
@@ -765,15 +603,7 @@ impl State {
                 } else if let Some(show) = crate::pg_settings::show(&sql)? {
                     let (description, result) = inspect(show, &self.settings.current, session)?;
                     row_description(&description, &[], out)?;
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &description,
-                        &[],
-                        0,
-                        1,
-                        out,
-                    )?;
+                    rows(&result, &description, &[], 0, 1, out)?;
                     complete("SHOW", &result, out)?;
                 } else if let Some(settings) = crate::pg_settings::parse(&sql)? {
                     if !session.role.is_sql() {
@@ -793,14 +623,7 @@ impl State {
                         .map_err(catalog_wire::error)?;
                     catalog_wire::retained_bytes(&result)?;
                     catalog_wire::description(&result.fields, &[], out)?;
-                    catalog_wire::rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &[],
-                        0,
-                        result.rows.len(),
-                        out,
-                    )?;
+                    catalog_wire::rows(&result, &[], 0, result.rows.len(), out)?;
                     catalog_complete(result.rows.len(), out)?;
                 } else {
                     self.diagnostic.phase = "application SQL";
@@ -830,15 +653,7 @@ impl State {
                         );
                         if !d.columns.is_empty() {
                             row_description(&d, &[], out)?;
-                            rows(
-                                self.settings.current.extra_float_digits,
-                                &result,
-                                &d,
-                                &[],
-                                0,
-                                result.rows.len(),
-                                out,
-                            )?;
+                            rows(&result, &d, &[], 0, result.rows.len(), out)?;
                         }
                         complete(p.command(), &result, out)?;
                     }
@@ -870,7 +685,15 @@ impl State {
                 if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
-                let (p, mut d) = if crate::pg_settings::empty_sql(&sql)? {
+                let (p, mut d) = if let Some(stmt) = crate::auth::statements::parse(&sql) {
+                    (
+                        Plan::Admin(stmt),
+                        Description {
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if crate::pg_settings::empty_sql(&sql)? {
                     (
                         Plan::Empty,
                         Description {
@@ -1134,6 +957,16 @@ impl State {
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
                 p.s.describe(session)?;
+                if let Plan::Admin(stmt) = &p.s.p {
+                    if p.result.is_some() {
+                        return Err("55000");
+                    }
+                    let tag = session.execute_admin(stmt)?;
+                    self.admin_completed = true;
+                    p.result = Some(SqlResult::default());
+                    complete(tag, &SqlResult::default(), out)?;
+                    return Ok(true);
+                }
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
                     self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
@@ -1166,14 +999,7 @@ impl State {
                     } else {
                         p.at.saturating_add(max as usize).min(result.rows.len())
                     };
-                    catalog_wire::rows(
-                        self.settings.current.extra_float_digits,
-                        result,
-                        &p.formats,
-                        p.at,
-                        end,
-                        out,
-                    )?;
+                    catalog_wire::rows(result, &p.formats, p.at, end, out)?;
                     p.at = end;
                     if end < result.rows.len() {
                         frame(b's', &[], out)?;
@@ -1230,15 +1056,7 @@ impl State {
                         p.result = Some(current);
                     }
                     let result = p.result.as_ref().unwrap();
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        result,
-                        &p.s.d,
-                        &p.formats,
-                        p.at,
-                        result.rows.len(),
-                        out,
-                    )?;
+                    rows(result, &p.s.d, &p.formats, p.at, result.rows.len(), out)?;
                     p.at = result.rows.len();
                     complete("SHOW", result, out)?;
                     return Ok(true);
@@ -1255,15 +1073,7 @@ impl State {
                         }],
                         affected: 0,
                     };
-                    rows(
-                        self.settings.current.extra_float_digits,
-                        &result,
-                        &p.s.d,
-                        &p.formats,
-                        0,
-                        1,
-                        out,
-                    )?;
+                    rows(&result, &p.s.d, &p.formats, 0, 1, out)?;
                     complete("SELECT", &result, out)?;
                     return Ok(true);
                 }
@@ -1305,15 +1115,7 @@ impl State {
                 } else {
                     p.at.saturating_add(max as usize).min(result.rows.len())
                 };
-                rows(
-                    self.settings.current.extra_float_digits,
-                    result,
-                    &p.s.d,
-                    &p.formats,
-                    p.at,
-                    end,
-                    out,
-                )?;
+                rows(result, &p.s.d, &p.formats, p.at, end, out)?;
                 p.at = end;
                 if end < result.rows.len() {
                     frame(b's', &[], out)?;
@@ -1429,6 +1231,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     send(s, &out).await?;
     let mut state = State {
         diagnostic: Diagnostic::default(),
+        admin_completed: false,
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
@@ -1437,6 +1240,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     };
     startup_settings.timezone = timezone;
     state.settings.current = startup_settings;
+    let mut admin_sync = false;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
         // Once a frame starts, its remaining header and body have a deadline.
@@ -1458,6 +1262,20 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(Ok(v)) => v,
             _ => return Ok(()),
         };
+        // An admin command may invalidate its own login generation. Deliver its
+        // completion and finish the extended cycle, then reject further work.
+        if admin_sync {
+            if tag == b'H' && b.is_empty() {
+                continue;
+            }
+            if tag == b'S' && b.is_empty() {
+                let mut out = Vec::new();
+                ready(&session, &mut out).map_err(io::Error::other)?;
+                send(s, &out).await?;
+            }
+            return Ok(());
+        }
+        state.admin_completed = false;
         if !session.service.admission.request() {
             return Ok(());
         }
@@ -1564,6 +1382,13 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
         if session.check_binding().is_err() {
+            if state.admin_completed {
+                send(s, &response).await?;
+                if tag == b'E' {
+                    admin_sync = true;
+                    continue;
+                }
+            }
             return Ok(());
         }
         send(s, &response).await?;

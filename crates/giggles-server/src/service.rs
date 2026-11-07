@@ -139,18 +139,6 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::Aborted) => "25P02",
         CoreError::Sql(S::Overflow) => "22003",
-        CoreError::Sql(S::UndefinedFunction) => "42883",
-        CoreError::Sql(S::InvalidParameterValue) => "22023",
-        CoreError::Sql(S::InvalidDatetimeFormat) => "22007",
-        CoreError::Sql(S::DatetimeFieldOverflow) => "22008",
-        CoreError::Sql(S::IntervalFieldOverflow) => "22015",
-        CoreError::Sql(S::AmbiguousFunction) => "42725",
-        CoreError::Sql(S::GroupingError) => "42803",
-        CoreError::Sql(S::IndeterminateDatatype) => "42P18",
-        CoreError::Sql(S::AmbiguousParameter) => "42P08",
-        CoreError::Sql(S::InvalidTextRepresentation) => "22P02",
-        CoreError::Sql(S::SubstringError) => "22011",
-        CoreError::Sql(S::CharacterNotInRepertoire) => "22021",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
@@ -410,6 +398,26 @@ impl Session {
     pub fn is_aborted(&self) -> bool {
         self.sql.is_aborted()
     }
+    pub(crate) fn execute_admin(
+        &mut self,
+        stmt: &crate::auth::statements::AdminStatement,
+    ) -> Result<&'static str, &'static str> {
+        let Role::Database { name } = &self.role else {
+            return Err("42501");
+        };
+        self.check_binding().map_err(|error| sqlstate(&error))?;
+        if self.in_transaction() {
+            return Err("25001");
+        }
+        if self.is_aborted() {
+            return Err("25P02");
+        }
+        let actor = self.service.admin.roles().get(name)
+            .map_err(|_| "28000")?
+            .filter(|role| role.login && role.generation == self.epoch)
+            .ok_or("28000")?;
+        crate::auth::statements::execute(stmt, &self.service.admin, &actor)
+    }
     /// Wire description of a prepared statement. DDL returns no rows and takes
     /// no parameters; core does not describe it, so report an empty shape.
     pub fn describe(&mut self, p: &Prepared) -> Result<relational::Description, CoreError> {
@@ -531,7 +539,34 @@ impl Session {
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
                 .filter(|role| role.login && role.generation == self.epoch)
                 .ok_or(CoreError::Policy(Error::Authentication))?;
-            role.superuser || p.table().is_none()
+            if role.superuser {
+                true
+            } else if p.is_ddl() {
+                self.service.admin.roles().schema_privileges("public", name)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?
+                    .contains(&roles::SchemaPrivilege::Create)
+            } else if let Some(table) = p.table() {
+                if table == "giggles_join" {
+                    false
+                } else {
+                    let roles = self.service.admin.roles();
+                    let owner = roles.table_owner(table)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                    let privilege = match p.command() {
+                        "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
+                        "INSERT" => Some(roles::TablePrivilege::Insert),
+                        "UPDATE" => Some(roles::TablePrivilege::Update),
+                        "DELETE" => Some(roles::TablePrivilege::Delete),
+                        _ => None,
+                    };
+                    owner.as_deref() == Some(name.as_str()) || privilege.is_some_and(|privilege| {
+                        roles.table_privileges(table, name)
+                            .is_ok_and(|privileges| privileges.contains(&privilege))
+                    })
+                }
+            } else {
+                true
+            }
         } else {
             allowed
         };
@@ -852,10 +887,7 @@ mod lifecycle_tests {
         );
         assert!(reader.execute_sql("BEGIN", &[]).is_ok());
         assert!(reader.execute_sql("ROLLBACK", &[]).is_ok());
-        assert!(matches!(
-            reader.prepare("SELECT id FROM owned LIMIT 1"),
-            Err(CoreError::Policy(Error::Scope))
-        ));
+        assert!(reader.prepare("SELECT id FROM owned LIMIT 1").is_ok());
         roles
             .alter("reader", roles::RoleChanges {
                 login: Some(false),
