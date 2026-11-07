@@ -709,4 +709,89 @@ mod tests {
         };
         assert_eq!(retained_bytes(&huge), Err("54000"));
     }
+
+    #[test]
+    fn t44b_nominal_row_description_and_null_framing() {
+        let fields = vec![
+            Field {
+                name: "routine".into(),
+                data_type: PgType::Regproc,
+            },
+            Field {
+                name: "expression".into(),
+                data_type: PgType::PgNodeTree,
+            },
+        ];
+        for format in [0, 1] {
+            let mut actual = vec![];
+            description(&fields, &[format], &mut actual).unwrap();
+            let mut body = 2u16.to_be_bytes().to_vec();
+            for (name, oid, size) in [("routine", 24u32, 4i16), ("expression", 194, -1)] {
+                body.extend(name.as_bytes());
+                body.push(0);
+                body.extend(0u32.to_be_bytes());
+                body.extend(0i16.to_be_bytes());
+                body.extend(oid.to_be_bytes());
+                body.extend(size.to_be_bytes());
+                body.extend((-1i32).to_be_bytes());
+                body.extend(format.to_be_bytes());
+            }
+            let expected = [
+                vec![b'T'],
+                ((body.len() + 4) as u32).to_be_bytes().to_vec(),
+                body,
+            ]
+            .concat();
+            assert_eq!(actual, expected);
+            let mut actual = vec![];
+            rows(
+                0,
+                &ResultSet {
+                    fields: fields.clone(),
+                    rows: vec![vec![Value::Null, Value::Null]],
+                },
+                &[format],
+                0,
+                1,
+                &mut actual,
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                [
+                    vec![b'D'],
+                    14u32.to_be_bytes().to_vec(),
+                    2u16.to_be_bytes().to_vec(),
+                    (-1i32).to_be_bytes().to_vec(),
+                    (-1i32).to_be_bytes().to_vec()
+                ]
+                .concat()
+            );
+        }
+    }
+    #[test]
+    fn t44b_nominal_nonnull_io_and_parameter_oids_stay_closed() {
+        for ty in [PgType::Regproc, PgType::PgNodeTree] {
+            assert_eq!(parameter_type(ty.oid()), Err("0A000"));
+            for format in [0, 1] {
+                assert_eq!(encode(&Value::Null, ty, format), Ok(None));
+                for v in [
+                    Value::Int(0),
+                    Value::Text(String::new()),
+                    Value::Bytes(vec![]),
+                ] {
+                    assert_eq!(encode(&v, ty, format), Err("42804"));
+                }
+                assert_eq!(decode(&[], ty, format), Err("0A000"));
+                assert_eq!(decode(&[0, 0, 0, 0], ty, format), Err("0A000"));
+            }
+        }
+        assert_eq!(parameter_type(1008), Err("0A000"));
+        assert_eq!(parameter_type(u32::MAX), Err("0A000"));
+        assert_eq!(parameter_type(26), Ok(PgType::Oid));
+        assert_eq!(
+            encode(&Value::Int(7), PgType::Oid, 1),
+            Ok(Some(7u32.to_be_bytes().to_vec()))
+        );
+    }
 }
