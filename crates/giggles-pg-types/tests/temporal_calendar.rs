@@ -127,6 +127,7 @@ fn setup() {
     );
 }
 #[test]
+#[ignore = "requires PostgreSQL 18 oracle container dd68-temporal-calendar-oracle; run with --ignored"]
 fn calendar_pg18() {
     let _session = session();
     setup();
@@ -190,6 +191,7 @@ fn calendar_pg18() {
     }
 }
 #[test]
+#[ignore = "requires PostgreSQL 18 oracle container dd68-temporal-calendar-oracle; run with --ignored"]
 fn constructors_pg18() {
     let _session = session();
     setup();
@@ -252,6 +254,7 @@ fn constructors_pg18() {
     }
 }
 #[test]
+#[ignore = "requires PostgreSQL 18 oracle container dd68-temporal-calendar-oracle; run with --ignored"]
 fn zones_pg18() {
     let _session = session();
     setup();
@@ -293,6 +296,7 @@ fn zones_pg18() {
 }
 
 #[test]
+#[ignore = "requires PostgreSQL 18 oracle container dd68-temporal-calendar-oracle; run with --ignored"]
 fn audit_extract_trunc_bin_pg18() {
     let _session = session();
     setup();

@@ -3,11 +3,13 @@ use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 use std::{cmp::Ordering, fmt};
 pub mod bytea;
+pub mod character;
 mod float;
 pub mod integer;
 mod numeric_aggregate;
 mod numeric_math;
 pub mod temporal;
+pub mod typmod;
 pub use float::{Float4, Float8};
 
 /// Deliberate resource ceiling, smaller than PostgreSQL's maximum integral width.
