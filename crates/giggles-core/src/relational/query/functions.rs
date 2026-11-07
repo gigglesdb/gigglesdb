@@ -2189,6 +2189,17 @@ pub(super) fn aggregate_numeric_add(old: Value, input: Value, budget: &mut usize
     }
 }
 
+pub(super) fn aggregate_numeric_average(sum: Value, count: i64, budget: &mut usize) -> R<Value> {
+    let Value::Numeric(sum) = sum else {
+        return Err(SqlError::Type);
+    };
+    let denominator = Numeric::aggregate_from_i64(count);
+    reserve(budget, sum.aggregate_scratch_bound(&denominator))?;
+    let out = sum.checked_div(&denominator).map_err(pg_error)?;
+    reserve(budget, out.display_byte_bound())?;
+    Ok(Value::Numeric(out))
+}
+
 impl BoundScalar {
     pub(in super::super) fn insert_assignment(self, target: &DataType) -> R<Self> {
         if &self.ty == target {

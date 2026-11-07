@@ -45,8 +45,80 @@ struct Source {
 enum Aggregate {
     Count,
     Sum,
+    Avg,
+    CountDistinct,
+    SumDistinct,
+    AvgDistinct,
+    MinDistinct,
+    MaxDistinct,
     Min,
     Max,
+}
+impl Aggregate {
+    fn base(self) -> Self {
+        match self {
+            Self::CountDistinct => Self::Count,
+            Self::SumDistinct => Self::Sum,
+            Self::AvgDistinct => Self::Avg,
+            Self::MinDistinct => Self::Min,
+            Self::MaxDistinct => Self::Max,
+            a => a,
+        }
+    }
+    fn distinct(self) -> bool {
+        matches!(
+            self,
+            Self::CountDistinct
+                | Self::SumDistinct
+                | Self::AvgDistinct
+                | Self::MinDistinct
+                | Self::MaxDistinct
+        )
+    }
+    fn with_distinct(self) -> Self {
+        match self.base() {
+            Self::Count => Self::CountDistinct,
+            Self::Sum => Self::SumDistinct,
+            Self::Avg => Self::AvgDistinct,
+            Self::Min => Self::MinDistinct,
+            Self::Max => Self::MaxDistinct,
+            _ => unreachable!(),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self.base() {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Min => "min",
+            Self::Max => "max",
+            _ => unreachable!(),
+        }
+    }
+    fn call_name(self) -> String {
+        if self.distinct() {
+            format!("\0aggregate_distinct_{}", self.name())
+        } else {
+            self.name().into()
+        }
+    }
+    fn from_name(name: &str) -> Option<Self> {
+        let name = name
+            .strip_prefix("public.\0")
+            .filter(|name| name.starts_with("\0aggregate_distinct_"))
+            .unwrap_or(name);
+        let distinct = name.starts_with("\0aggregate_distinct_");
+        let name = name.strip_prefix("\0aggregate_distinct_").unwrap_or(name);
+        let a = match name {
+            "count" => Self::Count,
+            "sum" => Self::Sum,
+            "avg" => Self::Avg,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            _ => return None,
+        };
+        Some(if distinct { a.with_distinct() } else { a })
+    }
 }
 #[derive(Debug, Clone)]
 enum Item {
@@ -204,7 +276,8 @@ impl Filter {
                         let not = p.word("not");
                         p.need("null")?;
                         Self::Null(a, not)
-                    } else if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike") {
+                    } else if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike")
+                    {
                         let insensitive = p.word("ilike");
                         if !insensitive {
                             p.need("like")?;
@@ -216,7 +289,11 @@ impl Filter {
                             None
                         };
                         Self::Like {
-                            value: a, pattern, escape, insensitive, negated: not,
+                            value: a,
+                            pattern,
+                            escape,
+                            insensitive,
+                            negated: not,
                         }
                     } else if p.word("in") {
                         p.punct('(')?;
@@ -354,9 +431,18 @@ impl Filter {
                 }
                 Ok(())
             }
-            Self::Like { value, pattern, escape, .. } => {
-                for a in [Some(value), Some(pattern), escape.as_ref()].into_iter().flatten() {
-                    let expected = if matches!(a, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some)) {
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                ..
+            } => {
+                for a in [Some(value), Some(pattern), escape.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let expected = if matches!(a, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
+                    {
                         None
                     } else {
                         Some(&DataType::Text)
@@ -455,7 +541,13 @@ impl Filter {
                 }
                 BoundFilter::Compare(av, op.clone(), bv)
             }
-            Self::Like { value, pattern, escape, insensitive, negated } => {
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                insensitive,
+                negated,
+            } => {
                 let text = |a: &Scalar| {
                     let bound = bind(a)?;
                     if bound.ty != DataType::Text && !matches!(a, Scalar::Literal(Value::Null)) {
@@ -463,7 +555,13 @@ impl Filter {
                     }
                     Ok(bound)
                 };
-                BoundFilter::Like { value: text(value)?, pattern: text(pattern)?, escape: escape.as_ref().map(text).transpose()?, insensitive: *insensitive, negated: *negated }
+                BoundFilter::Like {
+                    value: text(value)?,
+                    pattern: text(pattern)?,
+                    escape: escape.as_ref().map(text).transpose()?,
+                    insensitive: *insensitive,
+                    negated: *negated,
+                }
             }
             Self::Not(a) => BoundFilter::Not(Box::new(a.bind(params, resolve, tables)?)),
             Self::Logic(a, and, b) => BoundFilter::Logic(
@@ -507,7 +605,13 @@ impl BoundFilter {
                     _ => None,
                 })
             }
-            Self::Like { value, pattern, escape, insensitive, negated } => {
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                insensitive,
+                negated,
+            } => {
                 let pattern = pattern.plan_constant(budget)?;
                 let escape = match escape {
                     Some(a) => a.plan_constant(budget)?,
@@ -522,7 +626,14 @@ impl BoundFilter {
                 };
                 let value = value.plan_constant(budget)?;
                 match (value, pattern, escape) {
-                    (Some(value), Some(pattern), Some(escape)) => Ok(Some(eval_like(value, pattern, escape, *insensitive, *negated, budget)?)),
+                    (Some(value), Some(pattern), Some(escape)) => Ok(Some(eval_like(
+                        value,
+                        pattern,
+                        escape,
+                        *insensitive,
+                        *negated,
+                        budget,
+                    )?)),
                     _ => Ok(None),
                 }
             }
@@ -555,9 +666,18 @@ impl BoundFilter {
                 _ => return Err(SqlError::Type),
             },
             Self::Null(a, n) => Some((a.eval(row, params, bytes)? == Value::Null) != *n),
-            Self::Like { value, pattern, escape, insensitive, negated } => {
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                insensitive,
+                negated,
+            } => {
                 let pattern = pattern.eval(row, params, bytes)?;
-                let escape = match escape { Some(a) => a.eval(row, params, bytes)?, None => Value::Text("\\".into()) };
+                let escape = match escape {
+                    Some(a) => a.eval(row, params, bytes)?,
+                    None => Value::Text("\\".into()),
+                };
                 let Some(escape) = parse_like_escape(&pattern, &escape)? else {
                     return Ok(None);
                 };
@@ -621,6 +741,87 @@ impl Parser {
     }
 }
 
+// DISTINCT is syntax owned by this query layer; scalar calls retain their
+// ordinary argument tree so dependency and authorization walkers see every input.
+fn preprocess_aggregates(p: &mut Parser) -> R<()> {
+    let mut n = p.at;
+    while n + 2 < p.tokens.len() {
+        let a = match &p.tokens[n] {
+            Token::Word(name) | Token::QuotedIdent(name) => Aggregate::from_name(name),
+            _ => None,
+        };
+        let qualified = n > 0 && p.tokens[n - 1] == Token::Symbol('.');
+        let catalog = qualified
+            && n >= 2
+            && matches!(&p.tokens[n - 2], Token::Word(w) | Token::QuotedIdent(w) if w == "pg_catalog");
+        if let Some(a) = a
+            && p.tokens[n + 1] == Token::Symbol('(')
+            && matches!(&p.tokens[n + 2], Token::Word(w) if w == "distinct")
+        {
+            if matches!(p.tokens.get(n + 3), None | Some(Token::Symbol('*' | ')'))) {
+                return Err(SqlError::Syntax);
+            }
+            if !qualified || catalog {
+                p.tokens[n] = Token::Word(a.with_distinct().call_name());
+            }
+            p.tokens.remove(n + 2);
+        }
+        n += 1;
+    }
+    Ok(())
+}
+fn reject_nested_aggregate(s: &Scalar) -> R<()> {
+    if grouping::contains_aggregate(s) {
+        Err(SqlError::GroupingError)
+    } else {
+        s.reject_nested_aggregate()
+    }
+}
+fn filter_contains_aggregate(f: &Filter) -> bool {
+    match f {
+        Filter::Clauses(c) => {
+            c.filter.as_ref().is_some_and(filter_contains_aggregate)
+                || c.group.iter().any(grouping::contains_aggregate)
+                || c.having.as_ref().is_some_and(filter_contains_aggregate)
+        }
+        Filter::Scalar(s) | Filter::Null(s, _) => grouping::contains_aggregate(s),
+        Filter::Compare(a, _, b) => {
+            grouping::contains_aggregate(a) || grouping::contains_aggregate(b)
+        }
+        Filter::Like {
+            value,
+            pattern,
+            escape,
+            ..
+        } => {
+            grouping::contains_aggregate(value)
+                || grouping::contains_aggregate(pattern)
+                || escape.as_ref().is_some_and(grouping::contains_aggregate)
+        }
+        Filter::Not(f) => filter_contains_aggregate(f),
+        Filter::Logic(a, _, b) => filter_contains_aggregate(a) || filter_contains_aggregate(b),
+    }
+}
+fn scalar_has_undefined_routine(s: &Scalar) -> bool {
+    if !grouping::contains_aggregate(s) {
+        return s.has_undefined_routine();
+    }
+    match s {
+        Scalar::Call(n, args) if Aggregate::from_name(n).is_some() => {
+            args.iter().any(scalar_has_undefined_routine)
+        }
+        Scalar::Call(n, args) => {
+            (n.starts_with("public.\0") || n.starts_with("schema.\0"))
+                || args.iter().any(scalar_has_undefined_routine)
+        }
+        Scalar::Unary(_, a) | Scalar::Cast(a, _) => scalar_has_undefined_routine(a),
+        Scalar::Binary(_, a, b) => {
+            scalar_has_undefined_routine(a) || scalar_has_undefined_routine(b)
+        }
+        Scalar::SubstringOrder(args) => args.iter().any(|a| scalar_has_undefined_routine(a)),
+        _ => false,
+    }
+}
 impl Query {
     fn clauses(&self) -> Option<&QueryClauses> {
         match &self.filter {
@@ -652,13 +853,7 @@ impl Query {
             } else {
                 let aggregate = match p.tokens.get(p.at) {
                     Some(Token::Word(w)) if p.tokens.get(p.at + 1) == Some(&Token::Symbol('(')) => {
-                        match w.as_str() {
-                            "count" => Some(Aggregate::Count),
-                            "sum" => Some(Aggregate::Sum),
-                            "min" => Some(Aggregate::Min),
-                            "max" => Some(Aggregate::Max),
-                            _ => None,
-                        }
+                        Aggregate::from_name(w)
                     }
                     _ => None,
                 };
@@ -666,7 +861,10 @@ impl Query {
                     p.at += 1;
                     p.punct('(')?;
                     let c = if p.sym('*') {
-                        if !matches!(a, Aggregate::Count) {
+                        if a.distinct() {
+                            return Err(SqlError::Syntax);
+                        }
+                        if !matches!(a.base(), Aggregate::Count) {
                             return Err(SqlError::Unsupported);
                         }
                         None
@@ -792,11 +990,12 @@ impl Query {
         Ok(())
     }
     pub(super) fn returning(p: &mut Parser, table: &str) -> R<Self> {
+        preprocess_aggregates(p)?;
         let items = Self::parse_items(p)?;
         for (item, _) in &items {
             match item {
                 Item::Aggregate(..) => return Err(SqlError::GroupingError),
-                Item::Scalar(value) => value.reject_nested_aggregate()?,
+                Item::Scalar(value) => reject_nested_aggregate(value)?,
                 Item::Star => {}
             }
         }
@@ -817,6 +1016,7 @@ impl Query {
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         let explain = p.word("explain");
         p.need("select")?;
+        preprocess_aggregates(p)?;
         // Subqueries remain outside this bounded relational grammar.
         if p.tokens[p.at..].windows(2).any(
             |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
@@ -1110,7 +1310,12 @@ impl Query {
                 }
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
-                Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
+                Filter::Like {
+                    value,
+                    pattern,
+                    escape,
+                    ..
+                } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
@@ -1201,23 +1406,37 @@ impl Query {
             match f {
                 Filter::Clauses(c) => {
                     c.filter.as_ref().is_some_and(filter)
-                        || c.group.iter().any(Scalar::has_undefined_routine)
+                        || c.group.iter().any(scalar_has_undefined_routine)
                         || c.having.as_ref().is_some_and(filter)
                 }
-                Filter::Scalar(s) | Filter::Null(s, _) => s.has_undefined_routine(),
-                Filter::Compare(a, _, b) => a.has_undefined_routine() || b.has_undefined_routine(),
-                Filter::Like { value, pattern, escape, .. } => value.has_undefined_routine() || pattern.has_undefined_routine() || escape.as_ref().is_some_and(Scalar::has_undefined_routine),
+                Filter::Scalar(s) | Filter::Null(s, _) => scalar_has_undefined_routine(s),
+                Filter::Compare(a, _, b) => {
+                    scalar_has_undefined_routine(a) || scalar_has_undefined_routine(b)
+                }
+                Filter::Like {
+                    value,
+                    pattern,
+                    escape,
+                    ..
+                } => {
+                    scalar_has_undefined_routine(value)
+                        || scalar_has_undefined_routine(pattern)
+                        || escape.as_ref().is_some_and(scalar_has_undefined_routine)
+                }
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) || filter(b),
             }
         }
         self.items.iter().any(|(item, _)| match item {
-            Item::Scalar(s) | Item::Aggregate(_, Some(s)) => s.has_undefined_routine(),
+            Item::Scalar(s) | Item::Aggregate(_, Some(s)) => scalar_has_undefined_routine(s),
             _ => false,
         }) || self.where_filter().is_some_and(filter)
-            || self.group().iter().any(Scalar::has_undefined_routine)
+            || self.group().iter().any(scalar_has_undefined_routine)
             || self.having().is_some_and(filter)
-            || self.order.iter().any(|(s, _, _)| s.has_undefined_routine())
+            || self
+                .order
+                .iter()
+                .any(|(s, _, _)| scalar_has_undefined_routine(s))
     }
     /// Negative diagnostic classification only; this never grants table-free access.
     pub(super) fn rejects_unsupported_table_free_scalar(&self) -> bool {
@@ -1234,7 +1453,7 @@ impl Query {
             }
         }
         fn operand(s: &Scalar) -> bool {
-            s.reject_nested_aggregate().is_ok() && scalar(s)
+            reject_nested_aggregate(s).is_ok() && scalar(s)
         }
         fn filter(f: &Filter) -> bool {
             match f {
@@ -1245,7 +1464,12 @@ impl Query {
                 }
                 Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
                 Filter::Compare(a, _, b) => operand(a) && operand(b),
-                Filter::Like { value, pattern, escape, .. } => operand(value) && operand(pattern) && escape.as_ref().is_none_or(operand),
+                Filter::Like {
+                    value,
+                    pattern,
+                    escape,
+                    ..
+                } => operand(value) && operand(pattern) && escape.as_ref().is_none_or(operand),
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
@@ -1387,7 +1611,28 @@ impl Query {
             }
             found.ok_or(SqlError::UnknownColumn)
         };
-        let grouped = !self.group().is_empty()
+        // Aggregate expressions without a FROM source retain the scalar
+        // rejection boundary; grouping must not turn them into a one-row input.
+        // Plain aggregate items still describe normally and reject at execution.
+        if self.sources.is_empty()
+            && !self.has_undefined_routine()
+            && (self.items.iter().any(|(item, _)| {
+                matches!(item, Item::Scalar(s) if grouping::contains_aggregate(s))
+            }) || self.where_filter().is_some_and(filter_contains_aggregate)
+                || self.group().iter().any(grouping::contains_aggregate)
+                || self.having().is_some_and(filter_contains_aggregate)
+                || self.order.iter().any(|(s, _, _)| grouping::contains_aggregate(s)))
+        {
+            return Err(SqlError::Unsupported);
+        }
+        if self.where_filter().is_some_and(filter_contains_aggregate) {
+            return Err(SqlError::GroupingError);
+        }
+        let grouped = self
+            .items
+            .iter()
+            .any(|(i, _)| matches!(i, Item::Scalar(s) if grouping::contains_aggregate(s)))
+            || !self.group().is_empty()
             || self.having().is_some()
             || self
                 .order
@@ -1447,6 +1692,12 @@ impl Query {
             });
         }
         if grouped {
+            if self.sources.is_empty()
+                && !self.has_undefined_routine()
+                && self.items.iter().any(|(item, _)| matches!(item, Item::Aggregate(..)))
+            {
+                return Err(SqlError::Unsupported);
+            }
             return grouping::bind(self, &tables, joins, parameters, &resolve);
         }
         let mut items = vec![];
@@ -1455,17 +1706,19 @@ impl Query {
             match item {
                 Item::Scalar(e) => e.infer(None, &mut parameters, &resolve, &tables)?,
                 Item::Aggregate(a, Some(e)) => {
-                    e.reject_nested_aggregate()?;
-                    if matches!(a, Aggregate::Count)
+                    reject_nested_aggregate(e)?;
+                    if matches!(a.base(), Aggregate::Count)
                         && let Scalar::Param(n) = e
                         && parameters.get(n - 1).is_none_or(Option::is_none)
                     {
                         unresolved_count_parameters.push(*n);
                     }
-                    if matches!(a, Aggregate::Sum) && e.aggregate_unknown(&parameters) {
+                    if matches!(a.base(), Aggregate::Sum | Aggregate::Avg)
+                        && e.aggregate_unknown(&parameters)
+                    {
                         return Err(SqlError::AmbiguousFunction);
                     }
-                    let expected = if matches!(a, Aggregate::Min | Aggregate::Max)
+                    let expected = if matches!(a.base(), Aggregate::Min | Aggregate::Max)
                         && e.aggregate_unknown(&parameters)
                     {
                         Some(&DataType::Text)
@@ -1606,7 +1859,7 @@ impl Query {
                     push(item, d);
                 }
                 Item::Aggregate(a, c) => {
-                    if matches!(a, Aggregate::Count)
+                    if matches!(a.base(), Aggregate::Count)
                         && let Some(Scalar::Param(n)) = c
                         && parameters.get(n - 1).is_none_or(Option::is_none)
                     {
@@ -1618,7 +1871,7 @@ impl Query {
                         .map(|e| e.bind(&resolve, &tables, &parameters))
                         .transpose()?;
                     let ty = c.as_ref().map(|e| e.ty.clone());
-                    if matches!(a, Aggregate::Sum)
+                    if matches!(a.base(), Aggregate::Sum | Aggregate::Avg)
                         && !matches!(
                             ty,
                             Some(
@@ -1631,26 +1884,33 @@ impl Query {
                             )
                         )
                     {
-                        return Err(if legacy_column {
+                        return Err(if legacy_column && !matches!(a.base(), Aggregate::Avg) {
                             SqlError::Type
                         } else {
                             SqlError::UndefinedFunction
                         });
                     }
                     if !legacy_column
-                        && matches!(a, Aggregate::Min | Aggregate::Max)
+                        && matches!(a.base(), Aggregate::Min | Aggregate::Max)
                         && matches!(ty, Some(DataType::Boolean | DataType::Bytes))
                     {
                         return Err(SqlError::UndefinedFunction);
                     }
-                    let data_type = if matches!(a, Aggregate::Sum) {
+                    let data_type = if matches!(a.base(), Aggregate::Avg) {
+                        match ty {
+                            Some(DataType::Real | DataType::DoublePrecision) => {
+                                DataType::DoublePrecision
+                            }
+                            _ => DataType::Numeric,
+                        }
+                    } else if matches!(a.base(), Aggregate::Sum) {
                         match ty {
                             Some(DataType::BigInt | DataType::Numeric) => DataType::Numeric,
                             Some(DataType::Real) => DataType::Real,
                             Some(DataType::DoublePrecision) => DataType::DoublePrecision,
                             _ => DataType::BigInt,
                         }
-                    } else if matches!(a, Aggregate::Count) {
+                    } else if matches!(a.base(), Aggregate::Count) {
                         DataType::BigInt
                     } else {
                         ty.ok_or(SqlError::Type)?
@@ -1659,15 +1919,9 @@ impl Query {
                         BoundItem::Aggregate(*a, c),
                         ColumnDef {
                             id: 0,
-                            name: match a {
-                                Aggregate::Count => "count",
-                                Aggregate::Sum => "sum",
-                                Aggregate::Min => "min",
-                                Aggregate::Max => "max",
-                            }
-                            .into(),
+                            name: a.name().into(),
                             data_type,
-                            not_null: matches!(a, Aggregate::Count),
+                            not_null: matches!(a.base(), Aggregate::Count),
                         },
                     );
                 }
@@ -2212,24 +2466,42 @@ impl BoundQuery<'_> {
                 .items
                 .iter()
                 .map(|item| {
-                    if matches!(item, BoundItem::Aggregate(Aggregate::Count, _)) {
+                    if matches!(item, BoundItem::Aggregate(kind, _) if matches!(kind.base(), Aggregate::Count)) {
                         Value::Int(0)
                     } else {
                         Value::Null
                     }
                 })
                 .collect::<Vec<_>>();
+            let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+            let mut auxiliary = aggregate_auxiliary(&self.items, &mut retention)?;
+            retention.charge(aggregate_retained(&values))?;
             for row in filtered {
                 let row = row?;
+                let before = aggregate_retained(&values);
                 update_aggregates(
                     &self.items,
                     &self.columns,
                     &mut values,
+                    &mut auxiliary,
+                    &mut retention,
                     &row,
                     params,
                     &mut aggregate_work_bytes,
                 )?;
+                let after = aggregate_retained(&values);
+                if after > before {
+                    retention.charge(after - before)?;
+                } else {
+                    retention.release(before - after);
+                }
             }
+            finish_aggregates(
+                &self.items,
+                &mut values,
+                &auxiliary,
+                &mut aggregate_work_bytes,
+            )?;
             for value in &values {
                 charge(&mut result_bytes, value)?;
             }
@@ -2331,7 +2603,12 @@ impl BoundFilter {
                 a.attach_clock(clock);
                 b.attach_clock(clock);
             }
-            Self::Like { value, pattern, escape, .. } => {
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                ..
+            } => {
                 value.attach_clock(clock);
                 pattern.attach_clock(clock);
                 if let Some(a) = escape {
@@ -2380,20 +2657,75 @@ fn parse_like_escape(pattern: &Value, escape: &Value) -> R<Option<super::like::E
     Ok(Some(super::like::Escape::parse(escape)?))
 }
 
-fn eval_like(value: Value, pattern: Value, escape: super::like::Escape, insensitive: bool, negated: bool, work: &mut usize) -> R<Option<bool>> {
+fn eval_like(
+    value: Value,
+    pattern: Value,
+    escape: super::like::Escape,
+    insensitive: bool,
+    negated: bool,
+    work: &mut usize,
+) -> R<Option<bool>> {
     if value == Value::Null {
         return Ok(None);
     }
     let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {
         return Err(SqlError::UndefinedFunction);
     };
-    Ok(Some(super::like::like(&value, &pattern, escape, insensitive, work)? != negated))
+    Ok(Some(
+        super::like::like(&value, &pattern, escape, insensitive, work)? != negated,
+    ))
 }
 
+struct AggregateAuxiliary {
+    count: i64,
+    distinct: std::collections::BTreeSet<grouping::Key>,
+}
+fn aggregate_auxiliary(
+    items: &[BoundItem],
+    retention: &mut scan::Retention,
+) -> R<Vec<AggregateAuxiliary>> {
+    retention.charge(items.len() * std::mem::size_of::<AggregateAuxiliary>())?;
+    Ok(items
+        .iter()
+        .map(|_| AggregateAuxiliary {
+            count: 0,
+            distinct: std::collections::BTreeSet::new(),
+        })
+        .collect())
+}
+fn aggregate_retained(values: &[Value]) -> usize {
+    std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
+}
+fn finish_aggregates(
+    items: &[BoundItem],
+    values: &mut [Value],
+    auxiliary: &[AggregateAuxiliary],
+    work: &mut usize,
+) -> R<()> {
+    for ((item, value), state) in items.iter().zip(values).zip(auxiliary) {
+        if let BoundItem::Aggregate(a, _) = item
+            && matches!(a.base(), Aggregate::Avg)
+            && state.count != 0
+        {
+            *value = match std::mem::replace(value, Value::Null) {
+                Value::Float8(sum) => Value::Float8(Float8::from_bits(
+                    (sum.value() / state.count as f64).to_bits(),
+                )),
+                sum => functions::aggregate_numeric_average(sum, state.count, work)?,
+            };
+        }
+    }
+    Ok(())
+}
+
+// Transition inputs and retained state remain explicit at both physical call sites.
+#[allow(clippy::too_many_arguments)]
 fn update_aggregates(
     items: &[BoundItem],
     columns: &[ColumnDef],
     values: &mut [Value],
+    auxiliary: &mut [AggregateAuxiliary],
+    retention: &mut scan::Retention,
     row: &Tuple,
     params: &[Value],
     work: &mut usize,
@@ -2407,12 +2739,48 @@ fn update_aggregates(
         if v == Some(&Value::Null) {
             continue;
         }
+        let state = &mut auxiliary[index];
+        if a.distinct() {
+            let input = evaluated.as_ref().ok_or(SqlError::Type)?;
+            let bytes = std::mem::size_of::<Value>()
+                + value_bytes(input)
+                + 6 * std::mem::size_of::<usize>();
+            retention.charge(bytes)?;
+            let key = grouping::Key(vec![input.clone()]);
+            if !state.distinct.insert(key) {
+                retention.release(bytes);
+                continue;
+            }
+        }
         let mut value = std::mem::replace(&mut values[index], Value::Null);
-        match a {
+        match a.base() {
             Aggregate::Count => {
                 if let Value::Int(n) = &mut value {
                     *n = n.checked_add(1).ok_or(SqlError::Overflow)?;
                 }
+            }
+            Aggregate::Avg => {
+                let v = v.ok_or(SqlError::Type)?;
+                value = if columns[index].data_type == DataType::Numeric {
+                    functions::aggregate_numeric_add(value, v.clone(), work)?
+                } else {
+                    let n = match v {
+                        Value::Float4(n) => f64::from(n.value()),
+                        Value::Float8(n) => n.value(),
+                        _ => return Err(SqlError::Type),
+                    };
+                    let sum = if let Value::Float8(old) = value {
+                        let sum = old.value() + n;
+                        if sum.is_infinite() && old.value().is_finite() && n.is_finite() {
+                            return Err(SqlError::Overflow);
+                        }
+                        sum
+                    } else {
+                        n
+                    };
+                    Value::Float8(Float8::from_bits(sum.to_bits()))
+                };
+                state.count = state.count.checked_add(1).ok_or(SqlError::Overflow)?;
             }
             Aggregate::Sum => {
                 let v = v.ok_or(SqlError::Type)?;
@@ -2480,14 +2848,147 @@ fn update_aggregates(
             Aggregate::Min | Aggregate::Max => {
                 let v = v.ok_or(SqlError::Type)?;
                 if value == Value::Null
-                    || (matches!(a, Aggregate::Min) && cmp(v, &value) == Ordering::Less)
-                    || (matches!(a, Aggregate::Max) && cmp(v, &value) == Ordering::Greater)
+                    || (matches!(a.base(), Aggregate::Min) && cmp(v, &value) == Ordering::Less)
+                    || (matches!(a.base(), Aggregate::Max) && cmp(v, &value) == Ordering::Greater)
                 {
                     value = evaluated.ok_or(SqlError::Type)?;
                 }
             }
+            _ => unreachable!(),
         }
         values[index] = value;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod average_distinct_retention_tests {
+    use super::*;
+
+    fn aggregate_input(a: Aggregate, ty: DataType) -> (Vec<BoundItem>, Vec<ColumnDef>) {
+        let input = Scalar::Param(1)
+            .bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[Some(ty)])
+            .unwrap();
+        let result = if matches!(a.base(), Aggregate::Count) {
+            DataType::BigInt
+        } else {
+            DataType::Numeric
+        };
+        (
+            vec![BoundItem::Aggregate(a, Some(input))],
+            vec![ColumnDef {
+                id: 0,
+                name: a.name().into(),
+                data_type: result,
+                not_null: false,
+            }],
+        )
+    }
+
+    #[test]
+    fn distinct_state_hits_production_retention_cap_without_scalar_budget() {
+        let (items, columns) = aggregate_input(Aggregate::CountDistinct, DataType::Text);
+        let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+        let mut auxiliary = aggregate_auxiliary(&items, &mut retention).unwrap();
+        let mut values = vec![Value::Int(0)];
+        let row = Tuple {
+            values: vec![],
+            version: 0,
+        };
+        let mut limited = false;
+        for n in 0..2400 {
+            let input = Value::Text(format!("{n:08}{}", "x".repeat(32 * 1024)));
+            // Reset only the scalar evaluation budget to isolate retained state.
+            let result = update_aggregates(
+                &items,
+                &columns,
+                &mut values,
+                &mut auxiliary,
+                &mut retention,
+                &row,
+                &[input],
+                &mut 0,
+            );
+            if result == Err(SqlError::Limit) {
+                limited = true;
+                break;
+            }
+            result.unwrap();
+        }
+        assert!(limited);
+        assert!(retention.used() <= scan::MAX_RETAINED_BYTES);
+        assert!(retention.used() > 60 * 1024 * 1024);
+        assert_eq!(values, vec![Value::Int(auxiliary[0].distinct.len() as i64)]);
+    }
+
+    #[test]
+    fn average_distinct_polls_during_global_and_grouped_scans() {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE avg_cancel(id int PRIMARY KEY,k int,v int)",
+            "INSERT INTO avg_cancel VALUES(1,0,1),(2,0,1),(3,1,2),(4,1,2),(5,0,3),(6,1,3)",
+        ] {
+            let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        let before = bincode::serialize(&state).unwrap();
+        for sql in [
+            "SELECT avg(DISTINCT v) FROM avg_cancel",
+            "SELECT k,avg(DISTINCT v) FROM avg_cancel GROUP BY k",
+        ] {
+            let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+            for fence in [3, 4] {
+                let mut polls = 0;
+                assert_eq!(
+                    state.execute_with_cancel(&p, &[], None, || {
+                        polls += 1;
+                        polls == fence
+                    }),
+                    Err(SqlError::Aborted)
+                );
+                assert_eq!(polls, fence);
+                assert_eq!(bincode::serialize(&state).unwrap(), before);
+            }
+            assert!(state.execute_with_cancel(&p, &[], None, || false).is_ok());
+        }
+    }
+
+    #[test]
+    fn average_state_is_charged_before_allocation_and_numeric_sum_grows() {
+        let (items, columns) = aggregate_input(Aggregate::Avg, DataType::Numeric);
+        let mut too_small = scan::Retention::new(std::mem::size_of::<AggregateAuxiliary>() - 1);
+        assert!(matches!(
+            aggregate_auxiliary(&items, &mut too_small),
+            Err(SqlError::Limit)
+        ));
+        assert_eq!(too_small.used(), 0);
+        let mut retention = scan::Retention::new(4096);
+        let mut auxiliary = aggregate_auxiliary(&items, &mut retention).unwrap();
+        assert_eq!(retention.used(), std::mem::size_of::<AggregateAuxiliary>());
+        let mut values = vec![Value::Null];
+        let row = Tuple {
+            values: vec![],
+            version: 0,
+        };
+        let input = Value::Numeric(Numeric::parse("123456789012345678901234567890.123").unwrap());
+        let before = aggregate_retained(&values);
+        update_aggregates(
+            &items,
+            &columns,
+            &mut values,
+            &mut auxiliary,
+            &mut retention,
+            &row,
+            &[input],
+            &mut 0,
+        )
+        .unwrap();
+        let growth = aggregate_retained(&values) - before;
+        retention.charge(growth).unwrap();
+        assert_eq!(
+            retention.used(),
+            std::mem::size_of::<AggregateAuxiliary>() + growth
+        );
+        assert_eq!(auxiliary[0].count, 1);
+    }
 }

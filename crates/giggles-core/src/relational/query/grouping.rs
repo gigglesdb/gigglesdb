@@ -13,13 +13,7 @@ pub(super) struct Grouping {
     order: Vec<(BoundScalar, bool, bool)>,
 }
 fn aggregate(name: &str) -> Option<Aggregate> {
-    Some(match name {
-        "count" => Aggregate::Count,
-        "sum" => Aggregate::Sum,
-        "min" => Aggregate::Min,
-        "max" => Aggregate::Max,
-        _ => return None,
-    })
+    Aggregate::from_name(name)
 }
 pub(super) fn contains_aggregate(s: &Scalar) -> bool {
     match s {
@@ -127,7 +121,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 if args.len() != 1 {
                     return Err(SqlError::UndefinedFunction);
                 }
-                args[0].reject_nested_aggregate()?;
+                reject_nested_aggregate(&args[0])?;
                 let index = self.groups.len() + self.aggregates.len();
                 self.aggregates.push((
                     aggregate(n).ok_or(SqlError::UndefinedFunction)?,
@@ -184,13 +178,7 @@ fn output_scalar(item: &Item) -> R<Scalar> {
     match item {
         Item::Scalar(s) => Ok(s.clone()),
         Item::Aggregate(a, arg) => Ok(Scalar::Call(
-            match a {
-                Aggregate::Count => "count",
-                Aggregate::Sum => "sum",
-                Aggregate::Min => "min",
-                Aggregate::Max => "max",
-            }
-            .into(),
+            a.call_name(),
             vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
         )),
         Item::Star => Err(SqlError::GroupingError),
@@ -275,7 +263,7 @@ pub(super) fn bind<'a>(
         .map(|s| resolve_output(s, &projection, true, resolve, tables.len(), tables))
         .collect::<R<Vec<_>>>()?;
     for s in &groups {
-        s.reject_nested_aggregate()?;
+        reject_nested_aggregate(s)?;
         s.infer(None, &mut parameters, resolve, tables)?;
     }
     if let Some(f) = q.where_filter() {
@@ -350,21 +338,23 @@ pub(super) fn bind<'a>(
         let Some(arg) = arg else {
             continue;
         };
-        if matches!(a, Aggregate::Count)
+        if matches!(a.base(), Aggregate::Count)
             && let Scalar::Param(n) = arg
             && parameters.get(n - 1).is_none_or(Option::is_none)
         {
             unresolved_count.push(*n);
         }
-        if matches!(a, Aggregate::Sum) && arg.aggregate_unknown(&parameters) {
+        if matches!(a.base(), Aggregate::Sum | Aggregate::Avg) && arg.aggregate_unknown(&parameters)
+        {
             return Err(SqlError::AmbiguousFunction);
         }
-        let expected =
-            if matches!(a, Aggregate::Min | Aggregate::Max) && arg.aggregate_unknown(&parameters) {
-                Some(&DataType::Text)
-            } else {
-                None
-            };
+        let expected = if matches!(a.base(), Aggregate::Min | Aggregate::Max)
+            && arg.aggregate_unknown(&parameters)
+        {
+            Some(&DataType::Text)
+        } else {
+            None
+        };
         arg.infer(expected, &mut parameters, resolve, tables)?;
     }
     if unresolved_count
@@ -398,20 +388,29 @@ pub(super) fn bind<'a>(
             aggregates.push(BoundItem::Aggregate(Aggregate::Count, None));
             continue;
         };
-        if matches!(a, Aggregate::Sum) && arg.aggregate_unknown(&parameters) {
+        if matches!(a.base(), Aggregate::Sum | Aggregate::Avg) && arg.aggregate_unknown(&parameters)
+        {
             return Err(SqlError::AmbiguousFunction);
         }
-        let expected =
-            if matches!(a, Aggregate::Min | Aggregate::Max) && arg.aggregate_unknown(&parameters) {
-                Some(&DataType::Text)
-            } else {
-                None
-            };
+        let expected = if matches!(a.base(), Aggregate::Min | Aggregate::Max)
+            && arg.aggregate_unknown(&parameters)
+        {
+            Some(&DataType::Text)
+        } else {
+            None
+        };
         arg.infer(expected, &mut parameters, resolve, tables)?;
         let legacy_column = matches!(arg, Scalar::Column(_));
         let b = arg.bind(resolve, tables, &parameters)?;
-        let ty = match a {
+        let ty = match a.base() {
             Aggregate::Count => DataType::BigInt,
+            Aggregate::Avg => match b.ty {
+                DataType::SmallInt | DataType::Integer | DataType::BigInt | DataType::Numeric => {
+                    DataType::Numeric
+                }
+                DataType::Real | DataType::DoublePrecision => DataType::DoublePrecision,
+                _ => return Err(SqlError::UndefinedFunction),
+            },
             Aggregate::Sum => match b.ty {
                 DataType::SmallInt | DataType::Integer => DataType::BigInt,
                 DataType::BigInt | DataType::Numeric => DataType::Numeric,
@@ -431,11 +430,12 @@ pub(super) fn bind<'a>(
                 }
                 b.ty.clone()
             }
+            _ => unreachable!(),
         };
         let column = col(
             format!("__group_slot_{}", slots.len()),
             ty,
-            matches!(a, Aggregate::Count),
+            matches!(a.base(), Aggregate::Count),
         );
         slots.push(column.clone());
         aggregate_columns.push(column);
@@ -511,17 +511,11 @@ pub(super) fn bind<'a>(
             } else {
                 col(
                     match i {
-                        Item::Aggregate(a, _) => match a {
-                            Aggregate::Count => "count",
-                            Aggregate::Sum => "sum",
-                            Aggregate::Min => "min",
-                            Aggregate::Max => "max",
-                        }
-                        .into(),
+                        Item::Aggregate(a, _) => a.name().into(),
                         _ => output_name.clone(),
                     },
                     b.ty.clone(),
-                    matches!(i, Item::Aggregate(Aggregate::Count, _)),
+                    matches!(i, Item::Aggregate(kind, _) if matches!(kind.base(), Aggregate::Count)),
                 )
             };
             if let Some(alias) = alias {
@@ -570,7 +564,7 @@ pub(super) fn bind<'a>(
     })
 }
 #[derive(Clone)]
-struct Key(Vec<Value>);
+pub(super) struct Key(pub(super) Vec<Value>);
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -675,7 +669,7 @@ impl Grouping {
         self.aggregates
             .iter()
             .map(|a| {
-                if matches!(a, BoundItem::Aggregate(Aggregate::Count, _)) {
+                if matches!(a, BoundItem::Aggregate(kind, _) if matches!(kind.base(), Aggregate::Count)) {
                     Value::Int(0)
                 } else {
                     Value::Null
@@ -719,12 +713,13 @@ impl Grouping {
             }
             return Ok(result);
         }
-        let mut groups = BTreeMap::<Key, Vec<Value>>::new();
+        let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
         let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
         if self.keys.is_empty() {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
-            groups.insert(Key(vec![]), initial);
+            let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            groups.insert(Key(vec![]), (initial, auxiliary));
         }
         let mut aggregate_work = 0;
         let mut join_work = 0;
@@ -752,14 +747,17 @@ impl Grouping {
                     retention.charge(
                         retained(&key.0) + retained(&initial) + 6 * std::mem::size_of::<usize>(),
                     )?;
-                    groups.insert(key.clone(), initial);
+                    let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+                    groups.insert(key.clone(), (initial, auxiliary));
                 }
-                let values = groups.get_mut(&key).ok_or(SqlError::Limit)?;
+                let (values, auxiliary) = groups.get_mut(&key).ok_or(SqlError::Limit)?;
                 let before = retained(values);
                 update_aggregates(
                     &self.aggregates,
                     &self.aggregate_columns,
                     values,
+                    auxiliary,
+                    &mut retention,
                     row,
                     params,
                     &mut aggregate_work,
@@ -805,7 +803,13 @@ impl Grouping {
             }
         }
         let mut rows = vec![];
-        for (key, values) in groups {
+        for (key, (mut values, auxiliary)) in groups {
+            finish_aggregates(
+                &self.aggregates,
+                &mut values,
+                &auxiliary,
+                &mut aggregate_work,
+            )?;
             let mut slots = key.0;
             slots.extend(values);
             let row = Tuple {
