@@ -435,18 +435,15 @@ fn keyed_tables_keep_canonical_base_export_versions() {
 }
 
 #[test]
-fn heap_keyed_sql_mutations_and_native_scan_remain_unavailable() {
+fn heap_searched_sql_mutations_work_and_native_scan_remains_unavailable() {
     let (_a, mut s) = db();
     run(&mut s, "CREATE TABLE h (a BIGINT, b TEXT)");
     run(&mut s, "INSERT INTO h VALUES (1, 'x')");
-    // UPDATE/DELETE still require a full primary key, which SQL cannot name.
+    run(&mut s, "BEGIN");
     for sql in ["UPDATE h SET b='z' WHERE a=1", "DELETE FROM h WHERE a=1"] {
-        assert_eq!(
-            s.execute(sql, &[], None),
-            Err(CoreError::Sql(E::Unbounded)),
-            "{sql}"
-        );
+        assert_eq!(s.execute(sql, &[], None).unwrap().affected, 1, "{sql}");
     }
+    run(&mut s, "ROLLBACK");
     assert_eq!(
         s.scan(Scan {
             table: "h".into(),

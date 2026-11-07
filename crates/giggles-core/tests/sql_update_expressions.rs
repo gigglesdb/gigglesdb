@@ -211,12 +211,13 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
             ("UPDATE items SET n='12' WHERE id=1", E::Type),
             ("UPDATE items SET id=id+1 WHERE id=1", E::Unsupported),
             ("UPDATE items SET n=DEFAULT WHERE id=1", E::Unsupported),
-            ("UPDATE items SET n=n+1", E::Unbounded),
             ("UPDATE items SET n=sum(n) WHERE id=1", E::GroupingError),
         ] {
             error(s, sql, expected);
             assert_eq!(row(s), old);
         }
+        assert_eq!(run(s, "UPDATE items SET n=n+1").affected, 1);
+        assert_eq!(row(s).values[1], V::Int(10));
     });
 }
 

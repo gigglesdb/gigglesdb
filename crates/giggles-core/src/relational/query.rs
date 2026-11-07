@@ -518,6 +518,88 @@ impl Query {
         }
         Ok(items)
     }
+    pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
+        // Keep subqueries outside the same bounded grammar as SELECT.
+        if p.tokens[p.at..].windows(2).any(
+            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
+        ) {
+            return Err(SqlError::Unsupported);
+        }
+        let filter = if p.word("where") {
+            Some(Filter::parse(p, 0, 0)?)
+        } else {
+            None
+        };
+        let mut predicates = vec![];
+        if let Some(filter) = &filter {
+            filter.bounds(&mut predicates);
+        }
+        Ok(Self {
+            explain: false,
+            sources: vec![Source {
+                name: table.into(),
+                alias: table.into(),
+            }],
+            joins: vec![],
+            items: vec![(Item::Star, None)],
+            predicates,
+            filter,
+            order: vec![],
+            limit: None,
+        })
+    }
+    /// Infer WHERE parameters without requiring unrelated mutation slots to be typed.
+    pub(super) fn infer_mutation_parameters(
+        &self,
+        state: &Relational,
+        parameters: &mut [Option<DataType>],
+    ) -> R<()> {
+        if self.sources.len() != 1 || !self.joins.is_empty() {
+            return Err(SqlError::Unsupported);
+        }
+        if parameters.len() > MAX_PARAMS {
+            return Err(SqlError::Limit);
+        }
+        let source = &self.sources[0];
+        let table = state
+            .tables
+            .get(&source.name)
+            .ok_or(SqlError::UnknownTable)?;
+        let resolve = |column: &ColumnRef, _scope: usize| -> R<BoundColumn> {
+            if column.qualifier.as_ref().is_some_and(|name| name != &source.alias) {
+                return Err(SqlError::UnknownTable);
+            }
+            let column = table
+                .columns
+                .iter()
+                .position(|c| c.name == column.name)
+                .ok_or(SqlError::UnknownColumn)?;
+            Ok(BoundColumn { source: 0, column })
+        };
+        if let Some(filter) = &self.filter {
+            // WHERE owns its column constraints independently of SET. Comparing
+            // already seeded numeric parameters would otherwise permit a width
+            // mismatch that the frozen mutation grammar rejects.
+            let mut inferred = vec![None; parameters.len()];
+            let inference = filter.infer(&mut inferred, &resolve, &[table]);
+            for (parameter, inferred) in parameters.iter_mut().zip(inferred) {
+                if let Some(inferred) = inferred {
+                    if parameter.as_ref().is_some_and(|old| old != &inferred) {
+                        return Err(SqlError::Type);
+                    }
+                    *parameter = Some(inferred);
+                }
+            }
+            match inference {
+                Ok(()) | Err(SqlError::AmbiguousFunction | SqlError::IndeterminateDatatype) => {}
+                Err(error) => return Err(error),
+            }
+            // SET can resolve a parameter-only WHERE expression. Unresolved
+            // slots remain unresolved here and are rejected by full binding.
+            filter.infer(parameters, &resolve, &[table])?;
+        }
+        Ok(())
+    }
     pub(super) fn returning(p: &mut Parser, table: &str) -> R<Self> {
         let items = Self::parse_items(p)?;
         for (item, _) in &items {
@@ -1440,6 +1522,93 @@ impl BoundQuery<'_> {
             },
         }
     }
+    fn base_bounds(&self, params: &[Value]) -> R<(bool, Bounds)> {
+        let empty_input = self
+            .predicates
+            .iter()
+            .any(|(_, _, e)| matches!(e.value(params), Ok(Value::Null)));
+        let base_predicates = self
+            .predicates
+            .iter()
+            .filter(|(c, _, _)| {
+                !empty_input && c.source == 0 && self.tables[0].primary_key.contains(&c.column)
+            })
+            .map(|(c, op, e)| Predicate {
+                column: self.tables[0].columns[c.column].name.clone(),
+                op: (*op).into(),
+                value: (*e).clone(),
+            })
+            .collect::<Vec<_>>();
+        let bounds = match bounds(self.tables[0], &base_predicates, params) {
+            // A gap in a composite key, or several bounds on one key column, cannot
+            // form one key range. Stream the full range; the complete
+            // WHERE filter is always re-applied, so the result is unchanged.
+            Err(SqlError::Unbounded | SqlError::Unsupported) => {
+                bounds(self.tables[0], &[], params)?
+            }
+            other => other?,
+        };
+        Ok((empty_input, bounds))
+    }
+    /// Collect complete mutation rows in primary-key order, retaining their keys.
+    pub(super) fn matching_rows(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        retention: &mut scan::Retention,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<Vec<(Vec<u8>, SqlRow)>> {
+        if self.tables.len() != 1 || !self.joins.is_empty() || self.aggregate {
+            return Err(SqlError::Unsupported);
+        }
+        for (value, ty) in params.iter().zip(&self.parameters) {
+            check(
+                value,
+                &ColumnDef {
+                    id: 0,
+                    name: String::new(),
+                    data_type: ty.clone(),
+                    not_null: false,
+                },
+            )?;
+        }
+        let (empty_input, bounds) = self.base_bounds(params)?;
+        let range = if empty_input {
+            scan::KeyRange {
+                lo: std::ops::Bound::Excluded(Vec::new()),
+                hi: std::ops::Bound::Excluded(Vec::new()),
+            }
+        } else {
+            scan::KeyRange::from_bounds(bounds)
+        };
+        use scan::RowSource;
+        let source = scan::LegacyRows(state);
+        let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+        let mut meter = scan::Meter::per_row(cancel);
+        let mut work = 0;
+        let filtered = scan::filtered(input, &mut meter, |row| {
+            let tuple = Tuple {
+                values: vec![row.row.values.clone()],
+                version: row.row.version,
+            };
+            if let Some(filter) = &self.filter
+                && filter.eval(&tuple, params, &mut work)? != Some(true)
+            {
+                return Ok(None);
+            }
+            Ok(Some(row))
+        });
+        let mut rows = Vec::new();
+        for row in filtered {
+            let row = row?;
+            if rows.len() >= scan::MAX_QUERY_ROWS.min(super::MAX_ROWS) {
+                return Err(SqlError::Limit);
+            }
+            retention.charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
+            rows.push((row.key.into_owned(), row.row.into_owned()));
+        }
+        Ok(rows)
+    }
     pub(super) fn execute(
         &self,
         state: &Relational,
@@ -1508,31 +1677,7 @@ impl BoundQuery<'_> {
             }
             return Ok(result);
         }
-        let empty_input = self
-            .predicates
-            .iter()
-            .any(|(_, _, e)| matches!(e.value(params), Ok(Value::Null)));
-        let base_predicates = self
-            .predicates
-            .iter()
-            .filter(|(c, _, _)| {
-                !empty_input && c.source == 0 && self.tables[0].primary_key.contains(&c.column)
-            })
-            .map(|(c, op, e)| Predicate {
-                column: self.tables[0].columns[c.column].name.clone(),
-                op: (*op).into(),
-                value: (*e).clone(),
-            })
-            .collect::<Vec<_>>();
-        let bounds = match bounds(self.tables[0], &base_predicates, params) {
-            // A gap in a composite key, or several bounds on one key column, cannot
-            // form one key range. SELECT then streams the full range; the complete
-            // WHERE filter is always re-applied, so the result is unchanged.
-            Err(SqlError::Unbounded | SqlError::Unsupported) => {
-                bounds(self.tables[0], &[], params)?
-            }
-            other => other?,
-        };
+        let (empty_input, bounds) = self.base_bounds(params)?;
         if self.query.explain {
             let mut plan = format!(
                 "{}; retained_bytes<={}; result_rows<={}; result_bytes<={MAX_RESULT_BYTES}",

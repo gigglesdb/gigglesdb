@@ -41,6 +41,7 @@ fn heap_insert_allocates_one_version_and_update_preserves_rowid() {
                 op: "=".into(),
                 value: Expr::Literal(key),
             }],
+            search: None,
             returning: None,
         },
         1,

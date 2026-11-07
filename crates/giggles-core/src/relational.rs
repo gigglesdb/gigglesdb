@@ -16,6 +16,7 @@ mod query;
 use query::{TypmodSource, result_typmod};
 mod returning;
 mod scan;
+mod searched;
 use returning::Returning;
 // Candidate codec/read APIs await later internal release.
 #[allow(dead_code)]
@@ -641,17 +642,20 @@ enum Statement {
         name: String,
         sets: Vec<(String, Expr)>,
         predicates: Vec<Predicate>,
+        search: Option<Box<query::Query>>,
         returning: Option<Returning>,
     },
     UpdateExpressions {
         name: String,
         sets: Vec<(String, assign::Value)>,
         predicates: Vec<Predicate>,
+        search: Option<Box<query::Query>>,
         returning: Option<Returning>,
     },
     Delete {
         name: String,
         predicates: Vec<Predicate>,
+        search: Option<Box<query::Query>>,
         returning: Option<Returning>,
     },
     Begin,
@@ -888,7 +892,7 @@ impl Parser {
                     break;
                 }
             }
-            let predicates = self.predicates(&name)?;
+            let (predicates, search) = searched::parse_target(self, &name)?;
             let returning = Returning::parse(self, &name)?;
             if sets
                 .iter()
@@ -907,6 +911,7 @@ impl Parser {
                     name,
                     sets,
                     predicates,
+                    search,
                     returning,
                 }
             } else {
@@ -914,17 +919,19 @@ impl Parser {
                     name,
                     sets,
                     predicates,
+                    search,
                     returning,
                 }
             }
         } else if self.word("delete") {
             self.need("from")?;
             let name = self.table_name()?;
-            let predicates = self.predicates(&name)?;
+            let (predicates, search) = searched::parse_target(self, &name)?;
             let returning = Returning::parse(self, &name)?;
             Statement::Delete {
                 name,
                 predicates,
+                search,
                 returning,
             }
         } else if self.word("begin") {
@@ -1176,6 +1183,7 @@ impl Prepared {
                 name: table.name.clone(),
                 sets,
                 predicates,
+                search: None,
                 returning: None,
             },
             domain,
@@ -1197,6 +1205,7 @@ impl Prepared {
             Statement::Delete {
                 name: table.name.clone(),
                 predicates,
+                search: None,
                 returning: None,
             },
             domain,
@@ -1232,11 +1241,15 @@ impl Prepared {
                 .bind_description(state, self.params, &self.parameter_types)
                 .map(|b| b.description(state));
         }
+        if searched::target(self).is_some() {
+            return searched::describe(self, state);
+        }
         if let Statement::UpdateExpressions {
             name,
             sets,
             predicates,
             returning,
+            ..
         } = &self.statement
         {
             return assign::describe(
@@ -2219,10 +2232,21 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let b = bounds(t, predicates, params)?;
-                if !b.point {
-                    return Err(SqlError::Unbounded);
-                }
+                let b = match bounds(t, predicates, params) {
+                    Ok(b) if b.point => b,
+                    other => {
+                        return searched::route(
+                            self,
+                            prepared,
+                            params,
+                            expected,
+                            &returning,
+                            other.map(|_| ()),
+                            &mut cancel,
+                            clock,
+                        );
+                    }
+                };
                 let assignments = assign::Plan::new(t, self, prepared, params, clock)?;
                 let table_id = t.id;
                 let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
@@ -2266,10 +2290,21 @@ impl Relational {
                 name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
-                let b = bounds(t, predicates, params)?;
-                if !b.point {
-                    return Err(SqlError::Unbounded);
-                }
+                let b = match bounds(t, predicates, params) {
+                    Ok(b) if b.point => b,
+                    other => {
+                        return searched::route(
+                            self,
+                            prepared,
+                            params,
+                            expected,
+                            &returning,
+                            other.map(|_| ()),
+                            &mut cancel,
+                            clock,
+                        );
+                    }
+                };
                 let table_id = t.id;
                 let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
                 let old = rows.get(&b.low);

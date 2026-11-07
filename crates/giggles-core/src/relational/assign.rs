@@ -208,7 +208,7 @@ impl<'a> Plan<'a> {
     }
 
     pub(super) fn evaluate(
-        self,
+        &self,
         table: &TableDef,
         old: &SqlRow,
         params: &[super::Value],
@@ -217,24 +217,25 @@ impl<'a> Plan<'a> {
         if !self.scalar {
             return Ok(self
                 .values
-                .into_iter()
+                .iter()
                 .map(|(index, value)| {
                     let BoundValue::Plain(value) = value else {
                         unreachable!()
                     };
-                    (index, value)
+                    (*index, value.clone())
                 })
                 .collect());
         }
         let mut work = 0;
         let mut bytes = 0;
         let mut values = Vec::with_capacity(self.values.len());
-        for (index, value) in self.values {
+        for (index, value) in &self.values {
+            let index = *index;
             if cancel() {
                 return Err(SqlError::Aborted);
             }
             let value = match value {
-                BoundValue::Plain(value) => value,
+                BoundValue::Plain(value) => value.clone(),
                 BoundValue::Scalar(value) => value
                     .project_row(&old.values, old.version, params, &mut work, &mut bytes)?
                     .pop()

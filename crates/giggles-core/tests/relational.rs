@@ -223,12 +223,14 @@ fn composite_prefix_ranges_and_binary_order() {
         .len(),
         1
     );
+    run(&mut s, "BEGIN");
     for q in [
         "UPDATE messages SET body='z' WHERE tenant=1",
         "DELETE FROM messages WHERE tenant=1 AND bucket=1",
     ] {
-        err(&mut s, q, E::Unbounded);
+        assert!(run(&mut s, q).affected > 0, "{q}");
     }
+    run(&mut s, "ROLLBACK");
     for q in [
         "SELECT * FROM messages WHERE id=3 LIMIT 5",
         "SELECT * FROM messages WHERE tenant=1 AND id=3 LIMIT 5",
@@ -411,7 +413,7 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "UPDATE safe SET n=1",
         "DELETE FROM safe",
     ] {
-        err(&mut s, q, E::Unbounded);
+        assert_eq!(run(&mut s, q).affected, 0, "{q}");
     }
     run(&mut s, "CREATE TABLE nopk (id BIGINT)");
     for q in [
