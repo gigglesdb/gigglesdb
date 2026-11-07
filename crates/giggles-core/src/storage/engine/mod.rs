@@ -30,3 +30,4 @@ pub(crate) mod ssi_validate;
 mod history_tests;
 
 pub(crate) mod kernel;
+pub(crate) mod meta;
