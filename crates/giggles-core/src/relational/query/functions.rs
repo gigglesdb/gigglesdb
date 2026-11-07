@@ -51,6 +51,11 @@ pub(in crate::relational) struct BoundScalar {
     node: Node,
 }
 enum Node {
+    Clock(
+        String,
+        i32,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     Param(usize),
     Cast(Box<BoundScalar>),
     Column(BoundColumn, String),
@@ -203,6 +208,33 @@ impl Scalar {
     fn primary_context(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         if depth > 32 {
             return Err(SqlError::Limit);
+        }
+        if let Some(Token::Word(name)) = p.tokens.get(p.at)
+            && matches!(
+                name.as_str(),
+                "current_timestamp"
+                    | "localtimestamp"
+                    | "current_date"
+                    | "current_time"
+                    | "localtime"
+            )
+        {
+            let name = name.clone();
+            p.at += 1;
+            let mut args = vec![];
+            if p.sym('(') {
+                if name == "current_date" {
+                    return Err(SqlError::Syntax);
+                }
+                let Some(Token::Number(value)) = p.tokens.get(p.at) else {
+                    return Err(SqlError::Syntax);
+                };
+                let value = value.parse::<u32>().map_err(|_| SqlError::Syntax)?.min(6);
+                p.at += 1;
+                p.punct(')')?;
+                args.push(Self::Literal(Value::Int(i64::from(value))));
+            }
+            return Ok(Self::Call(name, args));
         }
         if p.word("cast") {
             p.punct('(')?;
@@ -536,6 +568,21 @@ impl Scalar {
                 return Self::bind_overlay(args, resolve, tables, parameters);
             }
             Self::Call(name, args) => {
+                if let Some((ty, _volatility)) = planning::clock_signature(name) {
+                    let keyword = matches!(
+                        name.as_str(),
+                        "current_timestamp" | "localtimestamp" | "current_time" | "localtime"
+                    );
+                    let precision = match args.as_slice() {
+                        [] => -1,
+                        [Self::Literal(Value::Int(p))] if keyword && *p >= 0 => (*p as i32).min(6),
+                        _ => return Err(SqlError::UndefinedFunction),
+                    };
+                    return Ok(BoundScalar {
+                        ty,
+                        node: Node::Clock(name.clone(), precision, None),
+                    });
+                }
                 if name == "position" {
                     return Self::bind_position(args, resolve, tables, parameters);
                 }
@@ -983,10 +1030,27 @@ impl Scalar {
     }
 }
 impl BoundScalar {
+    pub(in crate::relational) fn attach_clock(
+        &mut self,
+        clock: Option<&crate::relational::clock::ExecutionClock>,
+    ) {
+        match &mut self.node {
+            Node::Clock(_, _, target) => *target = clock.cloned(),
+            Node::Cast(value) => value.attach_clock(clock),
+            Node::Call(_, args) => args.iter_mut().for_each(|a| a.attach_clock(clock)),
+            _ => {}
+        }
+    }
+    pub(in crate::relational) fn clock_typmod(&self) -> i32 {
+        match &self.node {
+            Node::Clock(_, precision, _) => *precision,
+            _ => -1,
+        }
+    }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
-            Node::Column(_, name) | Node::Call(name, _) => Some(name),
+            Node::Column(_, name) | Node::Call(name, _) | Node::Clock(name, ..) => Some(name),
             Node::Cast(a) => a.strong_name(),
             _ => None,
         }
@@ -1020,11 +1084,19 @@ impl BoundScalar {
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
-            Node::Call(n, _) => n,
+            Node::Call(n, _) | Node::Clock(n, ..) => n,
         }
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::Clock(name, precision, clock) => {
+                let value = clock
+                    .as_ref()
+                    .ok_or(SqlError::Unsupported)?
+                    .eval(name, if *precision < 0 { 6 } else { *precision as u32 })?;
+                charge(budget, &value)?;
+                Ok(value)
+            }
             Node::Param(n) => {
                 let v = params.get(n - 1).ok_or(SqlError::Parameters)?;
                 charge(budget, v)?;

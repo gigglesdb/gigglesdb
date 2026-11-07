@@ -1,8 +1,41 @@
 //! Closed PG18 overload metadata and bounded, dependency-free constant planning.
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Volatility {
+    Stable,
+    Volatile,
+}
+
+/// Clock overload metadata is shared by binding and immutable planning.
+/// None of these functions may be evaluated during preparation.
+pub(super) fn clock_signature(name: &str) -> Option<(DataType, Volatility)> {
+    use DataType::*;
+    use Volatility::*;
+    Some(match name {
+        "clock_timestamp" => (TimestampTz, Volatile),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "current_timestamp" => {
+            (TimestampTz, Stable)
+        }
+        "localtimestamp" => (Timestamp, Stable),
+        "current_date" => (Date, Stable),
+        "current_time" => (TimeTz, Stable),
+        "localtime" => (Time, Stable),
+        _ => return None,
+    })
+}
+
 fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, bool)> {
     use DataType::*;
+    if let Some((clock_type, _volatility)) = clock_signature(name) {
+        let precision_keyword = matches!(
+            name,
+            "current_timestamp" | "localtimestamp" | "current_time" | "localtime"
+        );
+        return (clock_type == *result
+            && (args.is_empty() || precision_keyword && args == [Integer]))
+        .then_some((false, false));
+    }
     match (name, args, result) {
         ("overlay", &[Text, Text, Integer], Text)
         | ("overlay", &[Text, Text, Integer, Integer], Text)
@@ -315,7 +348,7 @@ impl BoundScalar {
             version: 0,
         };
         match &self.node {
-            Node::Param(_) | Node::Column(..) => Ok(None),
+            Node::Param(_) | Node::Column(..) | Node::Clock(..) => Ok(None),
             Node::Literal(v) => {
                 charge(budget, v)?;
                 Ok(Some(v.clone()))
@@ -397,6 +430,7 @@ impl BoundScalar {
         match &self.node {
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
+            Node::Clock(..) => true,
             Node::Cast(value) => {
                 value.insert_input_only()
                     && (immutable_cast(&value.ty, &self.ty)
@@ -437,5 +471,61 @@ impl BoundScalar {
                     .is_some_and(|(immutable, _)| immutable)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn clock_overloads_are_stable_or_volatile_and_never_immutable() {
+        for name in [
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "current_timestamp",
+            "localtimestamp",
+            "current_date",
+            "current_time",
+            "localtime",
+            "clock_timestamp",
+        ] {
+            let (ty, volatility) = clock_signature(name).unwrap();
+            assert_eq!(
+                volatility,
+                if name == "clock_timestamp" {
+                    Volatility::Volatile
+                } else {
+                    Volatility::Stable
+                }
+            );
+            assert_eq!(signature(name, &[], &ty), Some((false, false)));
+            let value = BoundScalar {
+                ty,
+                node: Node::Clock(name.into(), -1, None),
+            };
+            assert_eq!(value.plan_constant(&mut 0).unwrap(), None);
+        }
+        assert_eq!(
+            clock_signature("localtime"),
+            Some((DataType::Time, Volatility::Stable))
+        );
+        assert_eq!(
+            clock_signature("current_time"),
+            Some((DataType::TimeTz, Volatility::Stable))
+        );
+        assert_eq!(
+            signature("now", &[DataType::Integer], &DataType::TimestampTz),
+            None
+        );
+        assert_eq!(
+            signature(
+                "current_timestamp",
+                &[DataType::Integer],
+                &DataType::TimestampTz
+            ),
+            Some((false, false))
+        );
     }
 }

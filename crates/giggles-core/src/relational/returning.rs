@@ -32,13 +32,14 @@ impl Returning {
         ))
     }
 
+    #[cfg(test)]
     pub(super) fn project(
         &self,
         state: &Relational,
         params: &[Value],
         rows: &[&[Value]],
     ) -> R<Vec<SqlRow>> {
-        self.project_seeded(state, params, rows, vec![None; params.len()])
+        self.project_seeded(state, params, rows, vec![None; params.len()], None)
     }
 
     fn project_seeded(
@@ -47,8 +48,9 @@ impl Returning {
         params: &[Value],
         rows: &[&[Value]],
         seed: Vec<Option<DataType>>,
+        clock: Option<&super::clock::ExecutionClock>,
     ) -> R<Vec<SqlRow>> {
-        let bound = self.query.bind_seeded(state, seed)?;
+        let bound = self.query.bind_seeded(state, seed)?.with_clock(clock);
         let mut bytes = 0usize;
         let mut work = 0usize;
         if rows.len() > MAX_ROWS {
@@ -116,27 +118,30 @@ pub(super) fn evaluate_insert(
     count: usize,
     params: &[Value],
     cancel: &mut impl FnMut() -> bool,
+    clock: Option<&super::clock::ExecutionClock>,
 ) -> R<Vec<Expr>> {
     if let Some(map) = &values.parameter_map {
         let inputs = map
             .iter()
             .map(|n| params.get(n - 1).cloned().ok_or(SqlError::Parameters))
             .collect::<R<Vec<_>>>()?;
-        values.evaluate(state, inputs.len(), &inputs, cancel)
+        values.evaluate_clocked(state, inputs.len(), &inputs, cancel, clock)
     } else {
-        values.evaluate(state, count, params, cancel)
+        values.evaluate_clocked(state, count, params, cancel, clock)
     }
 }
 
 pub(super) struct Plan<'a> {
     returning: &'a Returning,
     description: Description,
+    clock: Option<super::clock::ExecutionClock>,
 }
 impl<'a> Plan<'a> {
     pub(super) fn new(
         prepared: &'a Prepared,
         state: &Relational,
         params: &[Value],
+        clock: Option<&super::clock::ExecutionClock>,
     ) -> R<Option<Self>> {
         let Some(returning) = prepared.returning() else {
             return Ok(None);
@@ -156,6 +161,7 @@ impl<'a> Plan<'a> {
         Ok(Some(Self {
             returning,
             description,
+            clock: clock.cloned(),
         }))
     }
 }
@@ -180,12 +186,9 @@ pub(super) fn project(
         .cloned()
         .map(Some)
         .collect();
-    let mut output = if params.is_empty() {
-        plan.returning.project(state, params, &inputs)?
-    } else {
+    let mut output =
         plan.returning
-            .project_seeded(state, params, &inputs, seed)?
-    };
+            .project_seeded(state, params, &inputs, seed, plan.clock.as_ref())?;
     for (projected, source) in output.iter_mut().zip(rows) {
         projected.version = source.version;
     }

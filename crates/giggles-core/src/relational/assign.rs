@@ -135,6 +135,7 @@ impl<'a> Plan<'a> {
         state: &'a Relational,
         prepared: &'a Prepared,
         params: &[super::Value],
+        clock: Option<&super::clock::ExecutionClock>,
     ) -> R<Self> {
         // Preserve the native and plain SQL assignment path exactly, including
         // value checks before finding a row. Scalar inputs need a shared schema
@@ -187,11 +188,15 @@ impl<'a> Plan<'a> {
                         check(&value, &table.columns[index])?;
                         BoundValue::Plain(value)
                     }
-                    Value::Scalar(value) => BoundValue::Scalar(Box::new(value.bind_assignment(
-                        state,
-                        parameters.clone(),
-                        &table.columns[index].data_type,
-                    )?)),
+                    Value::Scalar(value) => BoundValue::Scalar(Box::new(
+                        value
+                            .bind_assignment(
+                                state,
+                                parameters.clone(),
+                                &table.columns[index].data_type,
+                            )?
+                            .with_clock(clock),
+                    )),
                 };
                 Ok((index, value))
             })

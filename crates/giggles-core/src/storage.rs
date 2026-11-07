@@ -1414,6 +1414,7 @@ pub struct SqlSession {
     staged: Option<State>,
     aborted: bool,
     transaction_id: Option<u128>,
+    transaction_clock_us: Option<i64>,
     staged_revision: u64,
 }
 mod complete_relation;
@@ -1426,6 +1427,7 @@ impl Admin {
             staged: None,
             aborted: false,
             transaction_id: None,
+            transaction_clock_us: None,
             staged_revision: 0,
         }
     }
@@ -1762,6 +1764,62 @@ impl SqlSession {
         let p = self.prepare(sql)?;
         self.execute_prepared(&p, params, expected_version)
     }
+    /// Execute using caller-supplied transaction, statement and wall time.
+    pub fn execute_at(
+        &mut self,
+        sql: &str,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+    ) -> Result<relational::SqlResult, CoreError> {
+        relational::assert_sql_frontend_allowed();
+        self.guard_clock(clock)?;
+        let p = self.prepare(sql)?;
+        self.execute_prepared_at(&p, params, expected_version, clock)
+    }
+    pub fn execute_prepared_at(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: &relational::StatementClock,
+    ) -> Result<relational::SqlResult, CoreError> {
+        relational::assert_sql_frontend_allowed();
+        self.guard_clock(clock)?;
+        let context = relational::clock::ExecutionClock::new(clock);
+        let result = self.execute_bound_clocked(p, params, expected_version, Some(&context));
+        if result.is_ok() && p.control() == Some("begin") {
+            self.transaction_clock_us = Some(clock.transaction_us);
+        }
+        result
+    }
+    fn guard_clock(&mut self, clock: &relational::StatementClock) -> Result<(), CoreError> {
+        use relational::SqlError as E;
+        let error = if clock.statement_us < clock.transaction_us {
+            Some(E::InvalidParameterValue)
+        } else if self.staged.is_some()
+            && self
+                .transaction_clock_us
+                .is_some_and(|us| us != clock.transaction_us)
+        {
+            // A caller (server) invariant violation, not a user type error: the server must pass
+            // the same transaction_us for every statement of an open transaction. SqlError has no
+            // dedicated internal variant, so Type is used; it aborts the block before any effect.
+            Some(E::Type)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            if self.staged.is_some() {
+                self.aborted = true;
+            }
+            return Err(CoreError::Sql(error));
+        }
+        if self.staged.is_some() && self.transaction_clock_us.is_none() {
+            self.transaction_clock_us = Some(clock.transaction_us);
+        }
+        Ok(())
+    }
     pub fn execute_prepared(
         &mut self,
         p: &relational::Prepared,
@@ -1780,6 +1838,15 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
+        self.execute_bound_clocked(p, params, expected_version, None)
+    }
+    fn execute_bound_clocked(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
+    ) -> Result<relational::SqlResult, CoreError> {
         if self.aborted && p.control() != Some("rollback") {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
         }
@@ -1793,10 +1860,15 @@ impl SqlSession {
                 return Err(e);
             }
         };
-        let result =
-            crate::cancellation::check().and_then(|()| self.run(p, params, expected_version));
+        let result = crate::cancellation::check()
+            .and_then(|()| self.run(p, params, expected_version, clock));
         if result.is_err() && self.staged.is_some() {
             self.aborted = true;
+        }
+        if self.staged.is_none() {
+            // No open transaction (implicit statement, COMMIT or ROLLBACK): drop the pin so
+            // a later BEGIN, clocked or not, starts with a fresh transaction_us.
+            self.transaction_clock_us = None;
         }
         result
     }
@@ -1805,6 +1877,7 @@ impl SqlSession {
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::SqlError as E;
         if p.transaction.is_some() && p.transaction != self.transaction_id {
@@ -1883,10 +1956,17 @@ impl SqlSession {
         if p.domain != s.view.domain {
             return Err(CoreError::Sql(E::StaleSchema));
         }
-        let result = s
-            .sql
-            .execute(p, params, expected_version)
-            .map_err(CoreError::Sql)?;
+        let result = s.sql.execute_clocked(
+            p,
+            params,
+            expected_version,
+            || crate::cancellation::check().is_err(),
+            clock,
+        );
+        if let Some(error) = clock.and_then(|clock| clock.take_error()) {
+            return Err(error);
+        }
+        let result = result.map_err(CoreError::Sql)?;
         // Reserve the complete durable/export envelope before accepting a stage.
         records(&s)?;
         if self.staged.is_some() {
@@ -1921,6 +2001,7 @@ impl SqlSession {
         }
         self.aborted = false;
         self.transaction_id = None;
+        self.transaction_clock_us = None;
         self.staged_revision = 0;
     }
 }

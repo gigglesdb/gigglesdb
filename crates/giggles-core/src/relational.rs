@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod assign;
+pub(crate) mod clock;
+pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
 use catalog_ext::*;
@@ -1492,7 +1494,8 @@ impl Prepared {
             at: 0,
             params: BTreeSet::new(),
         };
-        let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain") {
+        let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
+        {
             Statement::Query(query::Query::parse(&mut p)?)
         } else {
             match p.parse() {
@@ -1821,6 +1824,16 @@ impl Relational {
         expected: Option<u64>,
         mut cancel: impl FnMut() -> bool,
     ) -> R<SqlResult> {
+        self.execute_clocked(prepared, params, expected, &mut cancel, None)
+    }
+    pub(crate) fn execute_clocked(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        mut cancel: impl FnMut() -> bool,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<SqlResult> {
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -1883,7 +1896,7 @@ impl Relational {
         }
         // Bound parameters even if a statement affects no rows.
         payload_bound(params.iter())?;
-        let returning = returning::Plan::new(prepared, self, params)?;
+        let returning = returning::Plan::new(prepared, self, params, clock)?;
         let mut returned_rows = vec![];
         // Normalize expression outputs after mutation input admission.
         let normalized;
@@ -1894,8 +1907,14 @@ impl Relational {
             if cancel() {
                 return Err(SqlError::Aborted);
             }
-            let output =
-                returning::evaluate_insert(values, self, prepared.params, params, &mut cancel)?;
+            let output = returning::evaluate_insert(
+                values,
+                self,
+                prepared.params,
+                params,
+                &mut cancel,
+                clock,
+            )?;
             normalized = Prepared {
                 domain: prepared.domain,
                 epoch: prepared.epoch,
@@ -1921,6 +1940,7 @@ impl Relational {
                 }
                 return q
                     .bind(self, prepared.params, &prepared.parameter_types)?
+                    .with_clock(clock)
                     .execute(self, params, &mut cancel);
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
@@ -2203,7 +2223,7 @@ impl Relational {
                 if !b.point {
                     return Err(SqlError::Unbounded);
                 }
-                let assignments = assign::Plan::new(t, self, prepared, params)?;
+                let assignments = assign::Plan::new(t, self, prepared, params, clock)?;
                 let table_id = t.id;
                 let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
                 let old = rows.get(&b.low);
@@ -2338,9 +2358,9 @@ mod arithmetic_lexer_tests {
 mod catalog_ext_tests;
 
 #[cfg(test)]
-mod describe_create_tests;
-#[cfg(test)]
 mod catalog_names_tests;
+#[cfg(test)]
+mod describe_create_tests;
 
 #[cfg(test)]
 mod catalog_typmods_tests;

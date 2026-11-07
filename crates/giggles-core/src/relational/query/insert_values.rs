@@ -258,14 +258,18 @@ impl InsertExpressions {
         }
         Ok(())
     }
-    pub(in super::super) fn evaluate(
+    pub(in crate::relational) fn evaluate_clocked(
         &self,
         state: &Relational,
         count: usize,
         params: &[Value],
         cancel: &mut impl FnMut() -> bool,
+        clock: Option<&crate::relational::clock::ExecutionClock>,
     ) -> R<Vec<Expr>> {
-        let bound = self.bind(state, count)?;
+        let mut bound = self.bind(state, count)?;
+        for value in &mut bound.values {
+            value.attach_clock(clock);
+        }
         if params.len() != bound.parameters.len() {
             return Err(SqlError::Parameters);
         }

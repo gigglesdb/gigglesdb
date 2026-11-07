@@ -21,10 +21,7 @@ pub(super) fn result_typmod(state: &Relational, source: TypmodSource<'_>) -> i32
                 state.column_typmod(column.id)
             }
         }
-        TypmodSource::Scalar(_value) => {
-            // E2a-1: Cast(_, ty, typmod) → typmod; later CASE/COALESCE/UNION when all arms agree.
-            -1
-        }
+        TypmodSource::Scalar(value) => value.clock_typmod(),
         TypmodSource::Other => -1,
     }
 }
@@ -182,11 +179,7 @@ impl Filter {
                                 lower,
                             )),
                             !not,
-                            Box::new(Self::Compare(
-                                a,
-                                if not { ">" } else { "<=" }.into(),
-                                upper,
-                            )),
+                            Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
                         )
                     } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
                         if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
@@ -953,17 +946,15 @@ impl Query {
             .map(|s| state.tables.get(&s.name).ok_or(SqlError::UnknownTable))
             .collect::<R<Vec<_>>>()?;
         let resolve = |c: &ColumnRef, scope: usize| -> R<BoundColumn> {
-            if c.qualifier.as_ref().is_some_and(|q| {
-                !self.sources.iter().take(scope).any(|s| q == &s.alias)
-            }) {
+            if c.qualifier
+                .as_ref()
+                .is_some_and(|q| !self.sources.iter().take(scope).any(|s| q == &s.alias))
+            {
                 return Err(SqlError::UnknownTable);
             }
             let mut found = None;
             for (source, (s, t)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
-                if c.qualifier
-                    .as_ref()
-                    .is_some_and(|q| q != &s.alias)
-                {
+                if c.qualifier.as_ref().is_some_and(|q| q != &s.alias) {
                     continue;
                 }
                 if let Some(column) = t.columns.iter().position(|v| v.name == c.name) {
@@ -1566,7 +1557,11 @@ impl BoundQuery<'_> {
                 plan.push_str("; GlobalAggregate");
             }
             if !self.order.is_empty() {
-                plan.push_str(if limit.is_some() { "; TopNSort" } else { "; StableSort" });
+                plan.push_str(if limit.is_some() {
+                    "; TopNSort"
+                } else {
+                    "; StableSort"
+                });
             }
             plan.push_str("; OutputLimit");
             return Ok(SqlResult {
@@ -1615,14 +1610,20 @@ impl BoundQuery<'_> {
             };
             for (i, j) in self.joins.iter().enumerate() {
                 let table = self.tables[i + 1];
-                let key = j.key.iter().map(|c| row.get(*c).clone()).collect::<Vec<_>>();
+                let key = j
+                    .key
+                    .iter()
+                    .map(|c| row.get(*c).clone())
+                    .collect::<Vec<_>>();
                 let found = if key.contains(&Value::Null) {
                     None
                 } else {
                     source.get(table, &encode_key(&key)?)?
                 };
                 let matched = found.filter(|r| {
-                    j.equalities.iter().all(|(a, b)| equal(row.get(*a), &r.row.values[b.column]))
+                    j.equalities
+                        .iter()
+                        .all(|(a, b)| equal(row.get(*a), &r.row.values[b.column]))
                 });
                 match matched {
                     Some(r) => row.values.push(r.row.values.clone()),
@@ -1647,13 +1648,17 @@ impl BoundQuery<'_> {
         let mut result_bytes = 0usize;
         let mut scalar_work_bytes = 0usize;
         if self.aggregate {
-            let mut values = self.items.iter().map(|item| {
-                if matches!(item, BoundItem::Aggregate(Aggregate::Count, _)) {
-                    Value::Int(0)
-                } else {
-                    Value::Null
-                }
-            }).collect::<Vec<_>>();
+            let mut values = self
+                .items
+                .iter()
+                .map(|item| {
+                    if matches!(item, BoundItem::Aggregate(Aggregate::Count, _)) {
+                        Value::Int(0)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect::<Vec<_>>();
             for row in filtered {
                 let row = row?;
                 for (index, item) in self.items.iter().enumerate() {
@@ -1745,8 +1750,7 @@ impl BoundQuery<'_> {
                         Aggregate::Min | Aggregate::Max => {
                             let v = v.ok_or(SqlError::Type)?;
                             if value == Value::Null
-                                || (matches!(a, Aggregate::Min)
-                                    && cmp(v, &value) == Ordering::Less)
+                                || (matches!(a, Aggregate::Min) && cmp(v, &value) == Ordering::Less)
                                 || (matches!(a, Aggregate::Max)
                                     && cmp(v, &value) == Ordering::Greater)
                             {
@@ -1760,7 +1764,9 @@ impl BoundQuery<'_> {
             for value in &values {
                 charge(&mut result_bytes, value)?;
             }
-            result.rows.extend(page.apply(std::iter::once(SqlRow { values, version: 0 })));
+            result
+                .rows
+                .extend(page.apply(std::iter::once(SqlRow { values, version: 0 })));
         } else {
             let rows: Box<dyn Iterator<Item = R<Tuple>> + '_> = if self.order.is_empty() {
                 Box::new(filtered)
@@ -1768,7 +1774,9 @@ impl BoundQuery<'_> {
                 let mut key_work = 0;
                 let keyed = filtered.map(|row| {
                     let row = row?;
-                    let keys = self.order.iter()
+                    let keys = self
+                        .order
+                        .iter()
                         .map(|(e, _, _)| e.eval(&row, params, &mut key_work))
                         .collect::<R<Vec<_>>>()?;
                     Ok((row, keys))
@@ -1777,7 +1785,14 @@ impl BoundQuery<'_> {
                 let sorted = scan::sort_bounded(
                     keyed,
                     page.keep(),
-                    |(row, keys)| row.values.iter().flatten().chain(keys).map(value_bytes).sum(),
+                    |(row, keys)| {
+                        row.values
+                            .iter()
+                            .flatten()
+                            .chain(keys)
+                            .map(value_bytes)
+                            .sum()
+                    },
                     |(_, a), (_, b)| {
                         for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
                             let ord = match (a, b) {
@@ -1837,3 +1852,40 @@ pub(super) fn coerce(v: Value, t: &DataType) -> R<Value> {
 
 #[cfg(test)]
 mod aggregate_tests;
+
+impl BoundFilter {
+    fn attach_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
+        match self {
+            Self::Scalar(a) | Self::Null(a, _) => a.attach_clock(clock),
+            Self::Compare(a, _, b) => {
+                a.attach_clock(clock);
+                b.attach_clock(clock);
+            }
+            Self::Not(a) => a.attach_clock(clock),
+            Self::Logic(a, _, b) => {
+                a.attach_clock(clock);
+                b.attach_clock(clock);
+            }
+        }
+    }
+}
+impl BoundQuery<'_> {
+    pub(in crate::relational) fn with_clock(
+        mut self,
+        clock: Option<&super::clock::ExecutionClock>,
+    ) -> Self {
+        for item in &mut self.items {
+            match item {
+                BoundItem::Scalar(a) | BoundItem::Aggregate(_, Some(a)) => a.attach_clock(clock),
+                _ => {}
+            }
+        }
+        if let Some(filter) = &mut self.filter {
+            filter.attach_clock(clock);
+        }
+        for (a, _, _) in &mut self.order {
+            a.attach_clock(clock);
+        }
+        self
+    }
+}
