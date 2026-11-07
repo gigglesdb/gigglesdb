@@ -18,3 +18,4 @@ pub mod admission;
 pub mod api;
 pub mod auth;
 pub mod dev;
+#[cfg(test)] pub(crate) mod test_support;

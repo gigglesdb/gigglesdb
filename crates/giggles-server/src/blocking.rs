@@ -240,7 +240,7 @@ mod tests {
             collections::BTreeSet,
             time::{Instant, SystemTime, UNIX_EPOCH},
         };
-        let path = std::path::PathBuf::from("artifacts").join(format!(
+        let path = crate::test_support::fixture_root().join(format!(
             "queued-deadline-{}-{}",
             std::process::id(),
             SystemTime::now()

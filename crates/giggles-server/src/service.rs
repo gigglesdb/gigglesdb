@@ -804,11 +804,10 @@ impl Session {
 mod lifecycle_tests {
     use super::*;
     use std::{
-        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
     fn fixture() -> (Arc<Service>, Vec<Binding>) {
-        let path = PathBuf::from("artifacts").join(format!(
+        let path = crate::test_support::fixture_root().join(format!(
             "binding-unit-{}-{}",
             std::process::id(),
             SystemTime::now()

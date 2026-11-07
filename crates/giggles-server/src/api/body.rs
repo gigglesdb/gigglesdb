@@ -249,7 +249,7 @@ mod tests {
 
     impl ReleaseFixture {
         fn new() -> Self {
-            let path = std::path::PathBuf::from("artifacts").join(format!(
+            let path = crate::test_support::fixture_root().join(format!(
                 "api-body-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()

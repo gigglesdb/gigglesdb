@@ -39,7 +39,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(slots: usize) -> Self {
-        let path = std::path::PathBuf::from("artifacts").join(format!(
+        let path = crate::test_support::fixture_root().join(format!(
             "api-registry-{}-{}-{}",
             std::process::id(),
             SystemTime::now()

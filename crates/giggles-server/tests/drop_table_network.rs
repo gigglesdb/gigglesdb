@@ -485,3 +485,23 @@ async fn simple_application_cannot_drop() {
 async fn extended_application_cannot_drop() {
     application(Protocol::Extended).await;
 }
+
+#[tokio::test]
+async fn mixed_case_unquoted_and_quoted_drop_targets() {
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        let f = Fixture::new().await;
+        let owner = f.connect("owner", "owner-pw").await;
+        for unquoted_drop in ["DROP TABLE MixedCase", "DROP TABLE mixedcase"] {
+            protocol
+                .ok(&owner, "CREATE TABLE MixedCase (id BIGINT PRIMARY KEY)")
+                .await;
+            assert_eq!(protocol.strings(&owner, CATALOG).await, ["mixedcase"]);
+            protocol.error(&owner, "DROP TABLE \"MixedCase\"", "42P01").await;
+            assert_eq!(protocol.strings(&owner, CATALOG).await, ["mixedcase"]);
+            protocol.ok(&owner, unquoted_drop).await;
+            assert!(protocol.strings(&owner, CATALOG).await.is_empty());
+        }
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
+}
