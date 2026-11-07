@@ -137,17 +137,21 @@ fn character_known_error_contract_gaps_are_explicit() {
             "PG42883 versus current profile: {query}"
         );
     }
+    // Core public calls match PostgreSQL 42883; server authorization failures
+    // use 42501 under E939 to avoid revealing routine existence.
     for query in [
         "SELECT public.ascii('a')",
         "SELECT public.initcap('a')",
         "SELECT public.chr(65)",
     ] {
-        assert!(
-            matches!(
-                session.prepare(query),
-                Err(CoreError::Sql(SqlError::Unsupported))
-            ),
-            "PG42883 versus current namespace profile: {query}"
+        let prepared = session.prepare(query).unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap_err(),
+            CoreError::Sql(SqlError::UndefinedFunction)
+        );
+        assert_eq!(
+            session.execute_prepared(&prepared, &[], None).unwrap_err(),
+            CoreError::Sql(SqlError::UndefinedFunction)
         );
     }
     for query in [

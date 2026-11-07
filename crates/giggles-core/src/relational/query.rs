@@ -785,6 +785,21 @@ impl Query {
                 Expr::Literal(_) | Expr::Param(_) => true,
             })
     }
+    fn has_undefined_routine(&self) -> bool {
+        fn filter(f: &Filter) -> bool {
+            match f {
+                Filter::Scalar(s) | Filter::Null(s, _) => s.has_undefined_routine(),
+                Filter::Compare(a, _, b) => a.has_undefined_routine() || b.has_undefined_routine(),
+                Filter::Not(f) => filter(f),
+                Filter::Logic(a, _, b) => filter(a) || filter(b),
+            }
+        }
+        self.items.iter().any(|(item, _)| match item {
+            Item::Scalar(s) | Item::Aggregate(_, Some(s)) => s.has_undefined_routine(),
+            _ => false,
+        }) || self.filter.as_ref().is_some_and(filter)
+            || self.order.iter().any(|(s, _, _)| s.has_undefined_routine())
+    }
     /// Negative diagnostic classification only; this never grants table-free access.
     pub(super) fn rejects_unsupported_table_free_scalar(&self) -> bool {
         fn scalar(s: &Scalar) -> bool {
@@ -821,7 +836,8 @@ impl Query {
             order,
             limit,
         } = self;
-        !self.is_table_free()
+        !self.has_undefined_routine()
+            && !self.is_table_free()
             && !explain
             && sources.is_empty()
             && joins.is_empty()

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "case_count": 210,
-  "planned_parity": 192,
-  "known_gaps": 12,
+  "planned_parity": 195,
+  "known_gaps": 9,
   "pg_only_input_domain": 2,
   "seed": 681106,
   "identity": {
@@ -9739,12 +9739,12 @@
       "query": "SELECT public.ascii('a')",
       "params": [],
       "tags": [
-        "known_gap",
+        "parity",
         "namespace"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": "UndefinedFunction",
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,
@@ -9804,12 +9804,12 @@
       "query": "SELECT public.initcap('a')",
       "params": [],
       "tags": [
-        "known_gap",
+        "parity",
         "namespace"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": "UndefinedFunction",
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,
@@ -9869,12 +9869,12 @@
       "query": "SELECT public.chr(65)",
       "params": [],
       "tags": [
-        "known_gap",
+        "parity",
         "namespace"
       ],
       "setup": [],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": "UndefinedFunction",
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": null,

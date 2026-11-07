@@ -1,8 +1,8 @@
 {
   "original_raw": 123,
   "additional_encounter": 27,
-  "eligible": 138,
-  "known_gaps": 12,
+  "eligible": 141,
+  "known_gaps": 9,
   "metadata": {
     "version": "180000",
     "encoding": "UTF8",
@@ -958,9 +958,7 @@
         "message": "function public.to_bin(integer) does not exist"
       },
       "stage": "parse",
-      "eligible": false,
-      "known_gap_core": "Unsupported",
-      "gap_reason": "existing namespace/unknown quoted routine profile"
+      "eligible": true
     },
     {
       "kind": "value-type",
@@ -1862,9 +1860,7 @@
         "message": "function public.to_hex(integer) does not exist"
       },
       "stage": "parse",
-      "eligible": false,
-      "known_gap_core": "Unsupported",
-      "gap_reason": "existing namespace/unknown quoted routine profile"
+      "eligible": true
     },
     {
       "kind": "value-type",
@@ -2766,9 +2762,7 @@
         "message": "function public.to_oct(integer) does not exist"
       },
       "stage": "parse",
-      "eligible": false,
-      "known_gap_core": "Unsupported",
-      "gap_reason": "existing namespace/unknown quoted routine profile"
+      "eligible": true
     },
     {
       "query": "SELECT $1::integer,to_bin($1)",

@@ -3,18 +3,18 @@
   "baseline_corpus": {
     "total": 697,
     "classes": {
-      "parity": 634,
+      "parity": 637,
       "inherited_unknown_parameter_gap": 9,
-      "scoped_gap": 51,
+      "scoped_gap": 48,
       "inherited_mixed_priority_gap": 3
     },
     "success_values_text_NULL_OID": 591,
-    "error_contract_interpretations": 43,
+    "error_contract_interpretations": 46,
     "not_697_PG_parity_matches": true,
     "scope_gaps": {
       "nontext_ANYELEMENT": 44,
       "quote_all_identifiers_on": 1,
-      "namespace": 6,
+      "namespace": 3,
       "unknown_arity": 9,
       "mixed_priority": 3
     },
@@ -35,7 +35,7 @@
     "crates/giggles-core/src/relational/query/functions/quoting.rs": "f3dfd15882dcfd8dc3c49d24782a9d18397a408301dce4906d3ee4f172388793",
     "crates/giggles-core/src/relational/query/functions/quoting_keywords.rs": "f0333ba8060fb75cec6f8fa52047eca7700b5b01ea668303a1ba4436a7aa17f6",
     "crates/giggles-core/tests/sql_quoting_functions.rs": "a15872f30ad9a959e289516a18824d65bca2e10f9c14c6a6919794454a64ebfb",
-    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4e8f8a7689f89438f0b7988e8e74d53a885e47443ed4016753d50143432ba9fa",
+    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4c70d680a42367d8acf4a470e83bf87f6adcfdfda54ec2c661296ebbf474be9b",
     "crates/giggles-server/tests/quoting_functions_network.inc": "8b9a03acff68a3d209a6f17878300496057dc2c7272fe5fdc310bba870f74df4"
   },
   "upstream": {
@@ -158,8 +158,8 @@
   },
   "resource_scope": "Module borrowed inputs, upfront inputlen cap, exact UTF8 expansion and sharedbyteadmission before soleoutputString allocation; fixed bounded scans. Existing caller parameter/result copies not a new allocator-proof claim.",
   "limitations": [
-    "63declaredscope/profile controls are NOT exactPGmatches:44nontextANYELEMENT,1nondefaultquote_all_identifiers,6namespace,9untypedarity,3mixedpriority",
-    "634commensurate Core observations partition591successful text/NULL/OID and43errorcontracts; mappedCorestates are adapterinterpretations, actualwire evidence is the selectedTLScontrols",
+    "60declaredscope/profile controls are NOT exactPGmatches:44nontextANYELEMENT,1nondefaultquote_all_identifiers,3namespace,9untypedarity,3mixedpriority",
+    "637commensurate Core observations partition591successful text/NULL/OID and46errorcontracts; mappedCorestates are adapterinterpretations, actualwire evidence is the selectedTLScontrols",
     "FixedPG18/defaultidentifierGUC/validPGtext domain only; no custom session/formatters/otherpatch/locale-general claim",
     "776localcapturedsourcefiles and3testexecutable pre/post replay guards only; no global buildscript/compiler/externalregistry/allocator hermeticity claim",
     "No stage/commit/push/delete or immutablehistoricaltest changes"
@@ -171,7 +171,7 @@
     "crates/giggles-core/src/relational/query/functions/quoting.rs": "f3dfd15882dcfd8dc3c49d24782a9d18397a408301dce4906d3ee4f172388793",
     "crates/giggles-core/src/relational/query/functions/quoting_keywords.rs": "f0333ba8060fb75cec6f8fa52047eca7700b5b01ea668303a1ba4436a7aa17f6",
     "crates/giggles-core/tests/sql_quoting_functions.rs": "a15872f30ad9a959e289516a18824d65bca2e10f9c14c6a6919794454a64ebfb",
-    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4e8f8a7689f89438f0b7988e8e74d53a885e47443ed4016753d50143432ba9fa",
+    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4c70d680a42367d8acf4a470e83bf87f6adcfdfda54ec2c661296ebbf474be9b",
     "crates/giggles-server/tests/quoting_functions_network.inc": "8b9a03acff68a3d209a6f17878300496057dc2c7272fe5fdc310bba870f74df4"
   }
 }

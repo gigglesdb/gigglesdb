@@ -27,7 +27,6 @@ fn quoted_routines_preserve_case_and_do_not_enable_special_forms() {
         "SELECT \"ab\"\"s\"(-2)",
         "SELECT \"coalesce\"(NULL,1)",
         "SELECT pg_catalog.\"coalesce\"(NULL,1)",
-        "SELECT public.\"abs\"(-2)",
         "SELECT \"PG_CATALOG\".\"abs\"(-2)",
     ] {
         assert_eq!(
@@ -36,6 +35,11 @@ fn quoted_routines_preserve_case_and_do_not_enable_special_forms() {
             "{sql}"
         );
     }
+    // No routine exists in public: PG 42883 (core binds UndefinedFunction).
+    assert_eq!(
+        s.execute("SELECT public.\"abs\"(-2)", &[], None),
+        Err(CoreError::Sql(SqlError::UndefinedFunction))
+    );
     assert!(
         s.prepare("SELECT \"extract\"(year FROM date '2000-01-01')")
             .is_err()

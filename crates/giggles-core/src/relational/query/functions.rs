@@ -17,6 +17,9 @@ mod quoting;
 mod substring_order;
 mod temporal;
 mod text;
+// No routine can exist in public. Keep its calls distinct from builtin names
+// (including quoted names containing dots) until binding rejects them.
+const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 #[derive(Debug, Clone)]
 pub(super) enum Scalar {
     Param(usize),
@@ -48,6 +51,17 @@ fn integer(t: &DataType) -> bool {
     matches!(t, DataType::SmallInt | DataType::Integer | DataType::BigInt)
 }
 impl Scalar {
+    pub(super) fn has_undefined_routine(&self) -> bool {
+        match self {
+            Self::Call(name, args) => {
+                name.starts_with(UNDEFINED_ROUTINE_PREFIX)
+                    || args.iter().any(Self::has_undefined_routine)
+            }
+            Self::Cast(arg, _) => arg.has_undefined_routine(),
+            Self::SubstringOrder(args) => args.iter().any(|a| a.has_undefined_routine()),
+            _ => false,
+        }
+    }
     pub(super) fn aggregate_unknown(&self, parameters: &[Option<DataType>]) -> bool {
         match self {
             Self::Literal(Value::Null | Value::Text(_)) => true,
@@ -57,6 +71,7 @@ impl Scalar {
     }
     pub(super) fn reject_nested_aggregate(&self) -> R<()> {
         match self {
+            Self::Call(name, _) if name.starts_with(UNDEFINED_ROUTINE_PREFIX) => Ok(()),
             Self::Call(name, _) if matches!(name.as_str(), "count" | "sum" | "min" | "max") => {
                 Err(SqlError::GroupingError)
             }
@@ -138,11 +153,18 @@ impl Scalar {
                 let (name, quoted) = Self::routine_name(p)?;
                 let (name, quoted) = if qualified_call {
                     p.punct('.')?;
-                    // Fixed builtin namespace only; exact quoted case is preserved.
-                    if name != "pg_catalog" {
+                    // Fixed builtin and empty public namespaces; preserve quoted case.
+                    if name != "pg_catalog" && name != "public" {
                         return Err(SqlError::Unsupported);
                     }
-                    Self::routine_name(p)?
+                    let (routine, quoted) = Self::routine_name(p)?;
+                    if name == "public" {
+                        (format!("{UNDEFINED_ROUTINE_PREFIX}{routine}"), quoted)
+                    } else {
+                        (routine, quoted)
+                    }
+                } else if quoted && name.contains('.') {
+                    (format!("{UNDEFINED_ROUTINE_PREFIX}{name}"), quoted)
                 } else {
                     (name, quoted)
                 };
@@ -169,6 +191,10 @@ impl Scalar {
                     let source = Self::parse_context(p, depth + 1, aggregate_argument)?;
                     p.punct(')')?;
                     return Ok(Self::Call(name, vec![source, needle]));
+                }
+                if name.starts_with(UNDEFINED_ROUTINE_PREFIX) && p.sym('*') {
+                    p.punct(')')?;
+                    return Ok(Self::Call(name, vec![Self::Literal(Value::Null)]));
                 }
                 if aggregate_argument && p.sym('*') {
                     p.punct(')')?;
@@ -204,6 +230,11 @@ impl Scalar {
                     loop {
                         if args.len() >= MAX_COLUMNS {
                             return Err(SqlError::Limit);
+                        }
+                        if name.starts_with(UNDEFINED_ROUTINE_PREFIX)
+                            && matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',')))
+                        {
+                            return Err(SqlError::Syntax);
                         }
                         args.push(Self::parse_context(p, depth + 1, aggregate_argument)?);
                         if !qualified_call
@@ -406,6 +437,9 @@ impl Scalar {
             ),
             Self::SubstringOrder(args) => {
                 return Self::bind_substring_order(args, resolve, tables, parameters);
+            }
+            Self::Call(name, _) if name.starts_with(UNDEFINED_ROUTINE_PREFIX) => {
+                return Err(SqlError::UndefinedFunction);
             }
             Self::Call(name, args) if name == "overlay" => {
                 return Self::bind_overlay(args, resolve, tables, parameters);
@@ -1359,6 +1393,47 @@ impl Scalar {
             }
             Self::SubstringOrder(args) => {
                 Self::infer_substring_order(args, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if n.starts_with(UNDEFINED_ROUTINE_PREFIX) => {
+                // Validate ordinary arguments without inventing a signature for
+                // unresolved parameters or binding aggregates as scalar calls.
+                fn validate(
+                    arg: &Scalar,
+                    parameters: &[Option<DataType>],
+                    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+                    tables: &[&TableDef],
+                ) -> R<bool> {
+                    let mut bindable = true;
+                    match arg {
+                        Scalar::Param(n) => {
+                            bindable = parameters.get(n - 1).is_some_and(Option::is_some);
+                        }
+                        Scalar::Cast(arg, _) => {
+                            bindable = validate(arg, parameters, resolve, tables)?;
+                        }
+                        Scalar::Call(name, args) => {
+                            for arg in args {
+                                bindable &= validate(arg, parameters, resolve, tables)?;
+                            }
+                            bindable &= !matches!(name.as_str(), "count" | "sum" | "min" | "max");
+                        }
+                        Scalar::SubstringOrder(args) => {
+                            for arg in args {
+                                bindable &= validate(arg, parameters, resolve, tables)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if bindable {
+                        arg.bind(resolve, tables, parameters)?;
+                    }
+                    Ok(bindable)
+                }
+                for arg in args {
+                    arg.infer(None, parameters, resolve, tables)?;
+                    validate(arg, parameters, resolve, tables)?;
+                }
+                return Err(SqlError::UndefinedFunction);
             }
             Self::Call(n, args) if n == "overlay" => {
                 Self::infer_overlay(args, parameters, resolve, tables)?;

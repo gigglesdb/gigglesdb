@@ -144,6 +144,7 @@ fn trim_pg18_curated_syntax_unicode_bytea_rows_and_metadata() {
             let error = match reference["sqlstate"].as_str().unwrap() {
                 "42601" => SqlError::Syntax,
                 "42703" => SqlError::UnknownColumn,
+                "42883" => SqlError::UndefinedFunction,
                 state => panic!("unclassified {state}: {case}"),
             };
             assert_eq!(result.unwrap_err(), CoreError::Sql(error), "{case}");

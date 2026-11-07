@@ -2,8 +2,8 @@
   "raw_denominator": 112,
   "substring_proposal_only": 7,
   "additional_keyword": 4,
-  "eligible": 93,
-  "known_gaps": 16,
+  "eligible": 95,
+  "known_gaps": 14,
   "cases": [
     {
       "kind": "text-syntax",
@@ -1142,8 +1142,7 @@
         "message": "function public.trim(unknown) does not exist"
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "eligible": true
     },
     {
       "kind": "namespace",
@@ -1158,8 +1157,7 @@
         "message": "syntax error at or near \"FROM\""
       },
       "stage": "parse",
-      "known_gap_core": "Unsupported",
-      "eligible": false
+      "eligible": true
     },
     {
       "kind": "namespace",
