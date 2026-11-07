@@ -1,5 +1,6 @@
 use crate::*;
 mod catalog_inspection;
+mod engine;
 mod format_policy;
 pub(crate) mod native_once;
 pub(crate) mod operation_adapter;
