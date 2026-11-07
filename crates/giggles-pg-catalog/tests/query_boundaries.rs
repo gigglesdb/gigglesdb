@@ -132,3 +132,72 @@ fn numeric_wire_override_cannot_change_projected_parameter_types() {
             .allows_numeric_input_override()
     );
 }
+
+#[test]
+fn temporal_table_free_casts_route_to_core_but_catalog_relations_remain_owned() {
+    for ty in [
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+    ] {
+        assert!(
+            giggles_pg_catalog::plan_gateway(&format!("SELECT $1::{ty}"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            giggles_pg_catalog::plan_gateway(&format!("SELECT $1::{ty} FROM pg_catalog.pg_type"))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn gateway_routes_scalar_structure_without_a_core_function_whitelist() {
+    use giggles_pg_catalog::plan_gateway;
+    for expression in [
+        "abs(-7)",
+        "sqrt(4)",
+        "round(1.25::numeric,1)",
+        "lower(upper('MiXeD'))",
+        "length('abc')",
+        "substring('abc',2,1)",
+        "encode(decode('00ff','hex'),'hex')",
+        "reverse('\\x00ff'::bytea)",
+        "date_part('year', DATE '2000-01-01')",
+        "make_time(12,34,56)",
+        "NULL::interval",
+        "NULL::numeric",
+        "NULL::bytea",
+        "pg_catalog.abs(-7)",
+        "pg_catalog.lower('ABC')",
+        "unknown_function()",
+        "public.abs(-7)",
+    ] {
+        assert!(
+            plan_gateway(&format!("SELECT {expression}"))
+                .unwrap()
+                .is_none(),
+            "{expression}"
+        );
+    }
+    for sql in [
+        "SELECT 1",
+        "/* SELECT sqrt(4) */ SELECT 'pg_class'",
+        "SELECT version()",
+        "SELECT current_database()",
+        "SELECT oid FROM pg_catalog.pg_type",
+    ] {
+        assert!(plan_gateway(sql).unwrap().is_some(), "{sql}");
+    }
+    for sql in [
+        "SELECT abs(-7) FROM pg_catalog.pg_type",
+        "SELECT c.oid FROM pg_type c JOIN app a ON true",
+        "SELECT current_database(), (SELECT id FROM app)",
+    ] {
+        assert!(plan_gateway(sql).is_err(), "{sql}");
+    }
+}

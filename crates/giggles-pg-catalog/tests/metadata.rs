@@ -761,6 +761,41 @@ fn postgres_int2vector_lower_bound_differs_from_arrays() {
     );
 }
 
+#[test]
+fn numeric_float_type_rows_are_precise() {
+    let r = run(
+        "SELECT oid, typname, typlen, typcategory, typispreferred, typarray FROM pg_catalog.pg_type WHERE oid IN (700, 701, 1700) ORDER BY oid",
+    );
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![
+                i(700),
+                s("float4"),
+                i(4),
+                s("N"),
+                Value::Bool(false),
+                i(1021)
+            ],
+            vec![
+                i(701),
+                s("float8"),
+                i(8),
+                s("N"),
+                Value::Bool(true),
+                i(1022)
+            ],
+            vec![
+                i(1700),
+                s("numeric"),
+                i(-1),
+                s("N"),
+                Value::Bool(false),
+                i(1231)
+            ],
+        ]
+    );
+}
 
 #[test]
 fn temporal_catalog_identity_width_and_category() {

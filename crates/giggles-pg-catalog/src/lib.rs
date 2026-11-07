@@ -95,6 +95,10 @@ pub enum PgType {
     Numeric,
     Float4,
     Float8,
+    /// Metadata descriptor only; non-NULL wire I/O is unsupported.
+    Regproc,
+    /// Metadata descriptor only; non-NULL wire I/O is unsupported.
+    PgNodeTree,
 }
 impl PgType {
     pub fn oid(self) -> u32 {
@@ -125,13 +129,15 @@ impl PgType {
             Self::Numeric => 1700,
             Self::Float4 => 700,
             Self::Float8 => 701,
+            Self::Regproc => 24,
+            Self::PgNodeTree => 194,
         }
     }
     pub fn type_size(self) -> i16 {
         match self {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
-            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 => 4,
+            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc => 4,
             Self::Int8 | Self::Float8 => 8,
             Self::Name => 64,
             _ => -1,
