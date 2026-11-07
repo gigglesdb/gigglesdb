@@ -161,6 +161,7 @@ pub enum SqlError {
     InvalidSavepoint,
     InvalidForeignKey,
     InvalidSchema,
+    DivisionByZero,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +434,31 @@ fn lex(s: &str) -> R<Vec<Token>> {
             continue;
         }
         let c = b[i];
-        if c == b'\'' {
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut depth = 1usize;
+            while i < b.len() && depth != 0 {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth != 0 {
+                return Err(SqlError::Syntax);
+            }
+            continue;
+        } else if c == b'\'' {
             i += 1;
             let mut v = Vec::new();
             let mut closed = false;
@@ -496,8 +521,7 @@ fn lex(s: &str) -> R<Vec<Token>> {
                 i += 1;
             }
             out.push(Token::Word(s[start..i].to_ascii_lowercase()));
-        } else if c.is_ascii_digit() || (c == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
-        {
+        } else if c.is_ascii_digit() {
             let start = i;
             i += 1;
             while i < b.len() && b[i].is_ascii_digit() {
@@ -535,6 +559,12 @@ fn lex(s: &str) -> R<Vec<Token>> {
         } else if b"(),*;.:".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
+        } else if b"+-/%".contains(&c) {
+            out.push(Token::Op((c as char).to_string()));
+            i += 1;
+        } else if c == b'|' && b.get(i + 1) == Some(&b'|') {
+            out.push(Token::Op("||".into()));
+            i += 2;
         } else if b"=<>!".contains(&c) {
             if c == b'!' && b.get(i + 1) != Some(&b'=') {
                 return Err(SqlError::Unsupported);
@@ -649,8 +679,17 @@ impl Parser {
         }
     }
     fn expr(&mut self) -> R<Expr> {
-        let t = self.tokens.get(self.at).cloned().ok_or(SqlError::Syntax)?;
+        let mut t = self.tokens.get(self.at).cloned().ok_or(SqlError::Syntax)?;
         self.at += 1;
+        if let Token::Op(sign) = &t
+            && (sign == "+" || sign == "-")
+        {
+            let Some(Token::Number(number)) = self.tokens.get(self.at) else {
+                return Err(SqlError::Syntax);
+            };
+            t = Token::Number(format!("{sign}{number}"));
+            self.at += 1;
+        }
         Ok(match t {
             Token::Param(n) => {
                 self.params.insert(n);
@@ -2121,5 +2160,59 @@ impl Relational {
         }
         returning::attach(&returning, &mut result, returned_rows);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_lexer_tests {
+    use super::*;
+
+    #[test]
+    fn operators_and_comments_are_distinct_tokens() {
+        assert_eq!(
+            lex("1-2 +3 /4 %5 ||6 *7 -- ignored / %\n /* outer /* nested */ end */ -8").unwrap(),
+            vec![
+                Token::Number("1".into()),
+                Token::Op("-".into()),
+                Token::Number("2".into()),
+                Token::Op("+".into()),
+                Token::Number("3".into()),
+                Token::Op("/".into()),
+                Token::Number("4".into()),
+                Token::Op("%".into()),
+                Token::Number("5".into()),
+                Token::Op("||".into()),
+                Token::Number("6".into()),
+                Token::Symbol('*'),
+                Token::Number("7".into()),
+                Token::Op("-".into()),
+                Token::Number("8".into()),
+            ]
+        );
+        assert_eq!(lex("1 /* unterminated /* nested */"), Err(SqlError::Syntax));
+        assert_eq!(
+            lex("'-- /* */'"),
+            Ok(vec![Token::String("-- /* */".into())])
+        );
+    }
+
+    #[test]
+    fn legacy_signed_number_preserves_minimum_integer() {
+        for (sql, expected) in [
+            ("-9223372036854775808", i64::MIN),
+            ("+7", 7),
+            ("- /*gap*/ 7", -7),
+        ] {
+            let mut parser = Parser {
+                tokens: lex(sql).unwrap(),
+                at: 0,
+                params: BTreeSet::new(),
+            };
+            assert_eq!(
+                parser.expr().unwrap().value(&[]).unwrap(),
+                Value::Int(expected)
+            );
+            assert_eq!(parser.at, parser.tokens.len());
+        }
     }
 }

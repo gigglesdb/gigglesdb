@@ -7,6 +7,7 @@ pub mod character;
 mod float;
 pub mod integer;
 mod numeric_aggregate;
+mod numeric_arith;
 mod numeric_math;
 pub mod temporal;
 pub mod typmod;

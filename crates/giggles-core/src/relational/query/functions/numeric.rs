@@ -68,7 +68,13 @@ fn quotient(a: &Numeric, b: &Numeric) -> R<Numeric> {
     }
 }
 fn remainder(a: &Numeric, b: &Numeric) -> R<Numeric> {
-    if a.to_string() == "NaN" || b.to_string() == "NaN" || a.scale().is_none() {
+    if a.to_string() == "NaN" || b.to_string() == "NaN" {
+        return Numeric::parse("NaN").map_err(pg_error);
+    }
+    if *b == Numeric::parse("0").map_err(pg_error)? {
+        return Err(SqlError::DivisionByZero);
+    }
+    if a.scale().is_none() {
         return Numeric::parse("NaN").map_err(pg_error);
     }
     if b.scale().is_none() {
@@ -162,7 +168,7 @@ pub(super) fn eval(name: &str, values: &[Value]) -> Option<R<Value>> {
         if let [Value::Int(a), Value::Int(b)] = values {
             let out = if name == "mod" {
                 if *b == 0 {
-                    return Err(SqlError::Type);
+                    return Err(SqlError::DivisionByZero);
                 }
                 a.checked_rem(*b).unwrap_or(0)
             } else {

@@ -269,7 +269,7 @@ fn concat_exact_output_limits_and_no_partial_result() {
     );
     assert_eq!(
         s.execute(
-            "SELECT concat(-9223372036854775808::bigint,0,true,false,'ab'::bytea)",
+            "SELECT concat((-9223372036854775808)::bigint,0,true,false,'ab'::bytea)",
             &[],
             None
         )

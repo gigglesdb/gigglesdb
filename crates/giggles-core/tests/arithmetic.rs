@@ -513,7 +513,7 @@ fn arithmetic_nodes_keep_depth_size_and_binding_limits() {
 }
 
 #[test]
-fn sql_sum_and_expression_rejections_keep_existing_contract() {
+fn sql_sum_and_scalar_predicates_preserve_update_rejection() {
     let (admin, _) = fixture(&[(1, Some(-7)), (2, Some(2)), (3, None)]);
     let mut sql = admin.sql_session();
     assert_eq!(
@@ -526,17 +526,25 @@ fn sql_sum_and_expression_rejections_keep_existing_contract() {
         )]
     );
     let before = rows(&admin);
-    for source in [
-        "UPDATE numbers SET n=n+1 WHERE id=1",
-        "SELECT * FROM numbers WHERE n+1=2 LIMIT 1",
-        "SELECT * FROM numbers WHERE n%2=0 LIMIT 1",
-    ] {
-        assert_eq!(
-            sql.execute(source, &[], None),
-            Err(CoreError::Sql(SqlError::Unsupported)),
-            "{source}"
-        );
-    }
+    assert_eq!(
+        sql.execute("UPDATE numbers SET n=n+1 WHERE id=1", &[], None),
+        Err(CoreError::Sql(SqlError::Unsupported))
+    );
+    assert!(
+        sql.execute("SELECT * FROM numbers WHERE n+1=2 LIMIT 1", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        sql.execute("SELECT * FROM numbers WHERE n%2=0 LIMIT 1", &[], None)
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row.values)
+            .collect::<Vec<_>>(),
+        vec![vec![V::Int(2), V::Int(2), V::Text("original".into())]]
+    );
     assert_eq!(rows(&admin), before);
     sql.execute(
         "UPDATE numbers SET n=$1 WHERE id=1",

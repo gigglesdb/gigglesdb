@@ -160,10 +160,12 @@ fn heap_catalog_insert_visibility_and_descriptions() {
 fn heap_expressions_filters_sort_limits_and_aggregates() {
     let (_a, mut s) = db();
     run(&mut s, "CREATE TABLE h (a BIGINT, b TEXT)");
-    // Arithmetic expressions are outside the current scalar parser's contract.
+    // Arithmetic expressions are supported in INSERT values.
     assert_eq!(
-        s.execute("INSERT INTO h VALUES (1 + 1, lower('Z'))", &[], None),
-        Err(CoreError::Sql(E::Unsupported))
+        s.execute("INSERT INTO h VALUES (1 + 1, lower('Z'))", &[], None)
+            .unwrap()
+            .affected,
+        1
     );
     run(&mut s, "INSERT INTO h VALUES (abs(-2)::bigint, lower('Z'))");
     run(
@@ -181,15 +183,15 @@ fn heap_expressions_filters_sort_limits_and_aggregates() {
     assert_eq!(
         run(&mut s, "SELECT COUNT(*), SUM(a), MIN(a), MAX(a) FROM h"),
         vec![vec![
-            V::Int(3),
-            V::Numeric(Numeric::parse("6").unwrap()),
+            V::Int(4),
+            V::Numeric(Numeric::parse("8").unwrap()),
             V::Int(1),
             V::Int(3)
         ]]
     );
     assert_eq!(
         run(&mut s, "SELECT b FROM h WHERE b='z'"),
-        vec![vec![V::Text("z".into())]]
+        vec![vec![V::Text("z".into())], vec![V::Text("z".into())]]
     );
 }
 

@@ -120,6 +120,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidSavepoint => 40,
                 relational::SqlError::InvalidForeignKey => 41,
                 relational::SqlError::InvalidSchema => 42,
+                relational::SqlError::DivisionByZero => 43,
             }
         }
     };

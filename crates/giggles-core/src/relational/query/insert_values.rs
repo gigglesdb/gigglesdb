@@ -33,9 +33,13 @@ impl<'a> Iterator for Literals<'a> {
                     self.depth -= 1;
                     return Some(out);
                 }
-                Scalar::Cast(value, _) if cursor == 0 => {
+                Scalar::Cast(value, _) | Scalar::Unary(_, value) if cursor == 0 => {
                     self.stack[self.depth - 1] = Some((node, 1));
                     Some(value.as_ref())
+                }
+                Scalar::Binary(_, a, b) if cursor < 2 => {
+                    self.stack[self.depth - 1] = Some((node, cursor + 1));
+                    Some(if cursor == 0 { a.as_ref() } else { b.as_ref() })
                 }
                 Scalar::Call(_, args) if cursor < args.len() => {
                     let out = &args[cursor];
@@ -72,7 +76,11 @@ fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
     }
     *nodes += 1;
     match value {
-        Scalar::Cast(child, _) => shape(child, depth + 1, nodes),
+        Scalar::Cast(child, _) | Scalar::Unary(_, child) => shape(child, depth + 1, nodes),
+        Scalar::Binary(_, a, b) => {
+            shape(a, depth + 1, nodes)?;
+            shape(b, depth + 1, nodes)
+        }
         Scalar::Call(_, children) => children
             .iter()
             .try_for_each(|child| shape(child, depth + 1, nodes)),
@@ -129,7 +137,11 @@ impl InsertExpressions {
             fn remap(value: &mut Scalar, map: &[usize]) {
                 match value {
                     Scalar::Param(n) => *n = map.binary_search(n).unwrap() + 1,
-                    Scalar::Cast(value, _) => remap(value, map),
+                    Scalar::Cast(value, _) | Scalar::Unary(_, value) => remap(value, map),
+                    Scalar::Binary(_, a, b) => {
+                        remap(a, map);
+                        remap(b, map);
+                    }
                     Scalar::Call(_, args) => args.iter_mut().for_each(|arg| remap(arg, map)),
                     Scalar::SubstringOrder(args) => args.iter_mut().for_each(|arg| remap(arg, map)),
                     _ => {}

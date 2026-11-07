@@ -432,7 +432,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
-        "SELECT * FROM safe -- hi",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
         "UPDATE safe SET n=n+1 WHERE id=1",
         "SELECT * FROM safe LIMIT 1 OFFSET 1",
@@ -452,6 +451,10 @@ fn strict_rejection_matrix_and_resource_bounds() {
     }
     assert!(run(&mut s, "SELECT * FROM safe ORDER BY n LIMIT 1").rows.is_empty());
     assert!(run(&mut s, "SELECT * FROM safe").rows.is_empty());
+    assert_eq!(
+        run(&mut s, "SELECT * FROM safe -- hi").rows,
+        run(&mut s, "SELECT * FROM safe").rows
+    );
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 1025").rows.is_empty());
     err(&mut s, "SELECT * FROM safe LIMIT -1", E::Limit);
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 0").rows.is_empty());

@@ -43,7 +43,9 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
         if matches!(
             p.tokens.get(p.at),
             Some(Token::Symbol('(') | Token::Number(_) | Token::String(_) | Token::Param(_))
-        ) {
+        ) || (matches!(p.tokens.get(p.at), Some(Token::Op(sign)) if sign == "+" || sign == "-")
+            && matches!(p.tokens.get(p.at + 1), Some(Token::Number(_))))
+        {
             return Err(SqlError::Unsupported);
         }
         columns.push(p.name()?);

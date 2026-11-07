@@ -652,7 +652,8 @@ fn into_sql(error: PlanError) -> SqlError {
         PlanError::Engine(error) => match error {
             Error::DuplicateTarget => SqlError::Duplicate,
             Error::Unsupported => SqlError::Unsupported,
-            Error::Type | Error::DivisionByZero => SqlError::Type,
+            Error::Type => SqlError::Type,
+            Error::DivisionByZero => SqlError::DivisionByZero,
             Error::Limit => SqlError::Limit,
             Error::Overflow => SqlError::Overflow,
             Error::ConditionFailed => {

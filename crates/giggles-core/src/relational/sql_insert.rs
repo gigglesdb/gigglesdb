@@ -206,6 +206,8 @@ fn operand(p: &mut Parser, table: &str) -> R<Operand> {
             p.tokens.get(p.at),
             Some(Token::String(_) | Token::Number(_) | Token::Param(_))
         )
+        || (matches!(p.tokens.get(p.at), Some(Token::Op(sign)) if sign == "+" || sign == "-")
+            && matches!(p.tokens.get(p.at + 1), Some(Token::Number(_))))
     {
         return value(p).map(Operand::Value);
     }

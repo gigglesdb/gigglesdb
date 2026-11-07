@@ -24,8 +24,22 @@ fn bytea_closed_29_goldens() {
     assert_eq!(be.serialize(&error).unwrap(), [0, 0, 0, 28]);
     assert_eq!(le.deserialize::<E>(&[28, 0, 0, 0]).unwrap(), error);
     assert_eq!(be.deserialize::<E>(&[0, 0, 0, 28]).unwrap(), error);
-    assert!(le.deserialize::<E>(&[43, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 43]).is_err());
+    let division = E::DivisionByZero;
+    assert_eq!(local::failure(CoreError::Sql(division.clone())).code, 243);
+    assert_eq!(
+        serde_json::to_string(&division).unwrap(),
+        "\"DivisionByZero\""
+    );
+    assert_eq!(
+        serde_json::from_str::<E>("{\"DivisionByZero\":null}").unwrap(),
+        division
+    );
+    assert_eq!(le.serialize(&division).unwrap(), [43, 0, 0, 0]);
+    assert_eq!(be.serialize(&division).unwrap(), [0, 0, 0, 43]);
+    assert_eq!(le.deserialize::<E>(&[43, 0, 0, 0]).unwrap(), division);
+    assert_eq!(be.deserialize::<E>(&[0, 0, 0, 43]).unwrap(), division);
+    assert!(le.deserialize::<E>(&[44, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 44]).is_err());
     assert!(le.deserialize::<E>(&[28, 0, 0, 0, 0]).is_err());
     assert!(be.deserialize::<E>(&[0, 0, 0, 28, 0]).is_err());
     for value in [

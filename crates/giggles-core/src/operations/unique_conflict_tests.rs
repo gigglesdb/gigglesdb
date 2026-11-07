@@ -1,5 +1,14 @@
 use super::*;
 
+#[test]
+fn into_sql_preserves_division_by_zero_and_type_errors() {
+    assert_eq!(
+        into_sql(PlanError::Engine(Error::DivisionByZero)),
+        SqlError::DivisionByZero
+    );
+    assert_eq!(into_sql(PlanError::Engine(Error::Type)), SqlError::Type);
+}
+
 fn fixture() -> (Admin, SqlSession) {
     fixture_with_indexes(false)
 }

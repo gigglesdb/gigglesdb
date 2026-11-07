@@ -111,6 +111,13 @@ fn e1_error_names_and_local_codes() {
             "InvalidSchema",
             E::InvalidSchema,
         ),
+        (
+            [43, 0, 0, 0],
+            [0, 0, 0, 43],
+            243,
+            "DivisionByZero",
+            E::DivisionByZero,
+        ),
     ] {
         let json = serde_json::to_string(&error).unwrap();
         assert_eq!(json, format!("\"{name}\""));
@@ -125,8 +132,8 @@ fn e1_error_names_and_local_codes() {
         assert_eq!(be.deserialize::<E>(&be_bytes).unwrap(), error);
         assert_eq!(local::failure(CoreError::Sql(error)).code, code);
     }
-    assert!(le.deserialize::<E>(&[43, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 43]).is_err());
+    assert!(le.deserialize::<E>(&[44, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 44]).is_err());
 }
 
 #[test]

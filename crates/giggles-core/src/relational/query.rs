@@ -76,7 +76,12 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
             Scalar::Param(_) => 0,
             Scalar::Literal(v) => value_bytes(v),
             Scalar::Column(c) => c.name.len() + c.qualifier.as_ref().map_or(0, String::len),
-            Scalar::Cast(inner, _) => return cost(inner, nodes, bytes),
+            Scalar::Cast(inner, _) | Scalar::Unary(_, inner) => return cost(inner, nodes, bytes),
+            Scalar::Binary(_, a, b) => {
+                cost(a, nodes, bytes)?;
+                cost(b, nodes, bytes)?;
+                0
+            }
             Scalar::Call(name, args) => {
                 for a in args {
                     cost(a, nodes, bytes)?;
@@ -633,7 +638,8 @@ impl Query {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
-                Scalar::Cast(s, _) => scalar(s),
+                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
                 Scalar::Call(name, args) => {
                     matches!(
@@ -806,7 +812,8 @@ impl Query {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
-                Scalar::Cast(s, _) => scalar(s),
+                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::Call(_, args) => args.iter().all(scalar),
                 Scalar::SubstringOrder([first, second, third]) => {
                     scalar(first) && scalar(second) && scalar(third)

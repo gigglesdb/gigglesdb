@@ -1,5 +1,6 @@
 //! Typed scalar projection binding. No SQL generation or catalog emulation.
 use super::*;
+mod arithmetic;
 mod binary;
 mod character;
 mod degree_math;
@@ -20,8 +21,24 @@ mod text;
 // No routine can exist in public. Keep its calls distinct from builtin names
 // (including quoted names containing dots) until binding rejects them.
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnaryOp {
+    Neg,
+    Plus,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Concat,
+}
 #[derive(Debug, Clone)]
 pub(super) enum Scalar {
+    Unary(UnaryOp, Box<Scalar>),
+    Binary(BinaryOp, Box<Scalar>, Box<Scalar>),
     Param(usize),
     Cast(Box<Scalar>, DataType),
     Column(ColumnRef),
@@ -57,7 +74,10 @@ impl Scalar {
                 name.starts_with(UNDEFINED_ROUTINE_PREFIX)
                     || args.iter().any(Self::has_undefined_routine)
             }
-            Self::Cast(arg, _) => arg.has_undefined_routine(),
+            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.has_undefined_routine(),
+            Self::Binary(_, left, right) => {
+                left.has_undefined_routine() || right.has_undefined_routine()
+            }
             Self::SubstringOrder(args) => args.iter().any(|a| a.has_undefined_routine()),
             _ => false,
         }
@@ -77,7 +97,11 @@ impl Scalar {
             }
             Self::Call(_, args) => args.iter().try_for_each(Self::reject_nested_aggregate),
             Self::SubstringOrder(args) => args.iter().try_for_each(|a| a.reject_nested_aggregate()),
-            Self::Cast(arg, _) => arg.reject_nested_aggregate(),
+            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.reject_nested_aggregate(),
+            Self::Binary(_, a, b) => {
+                a.reject_nested_aggregate()?;
+                b.reject_nested_aggregate()
+            }
             _ => Ok(()),
         }
     }
@@ -89,7 +113,70 @@ impl Scalar {
         Self::parse_context(p, depth, true)
     }
     fn parse_context(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
-        let mut value = Self::primary_context(p, depth, aggregate_argument)?;
+        let value = Self::parse_binary(p, depth, aggregate_argument, 0)?;
+        arithmetic::admit_shape(&value, depth, &mut 0)?;
+        Ok(value)
+    }
+    fn parse_binary(
+        p: &mut Parser,
+        depth: usize,
+        aggregate_argument: bool,
+        minimum: u8,
+    ) -> R<Self> {
+        if depth > 32 {
+            return Err(SqlError::Limit);
+        }
+        let mut value = Self::parse_unary(p, depth, aggregate_argument)?;
+        while let Some((op, precedence)) = arithmetic::token_operator(p.tokens.get(p.at)) {
+            if precedence < minimum {
+                break;
+            }
+            p.at += 1;
+            let right = Self::parse_binary(p, depth + 1, aggregate_argument, precedence + 1)?;
+            value = Self::Binary(op, Box::new(value), Box::new(right));
+            arithmetic::admit_shape(&value, depth, &mut 0)?;
+        }
+        Ok(value)
+    }
+    fn parse_unary(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
+        if depth > 32 {
+            return Err(SqlError::Limit);
+        }
+        let sign = match p.tokens.get(p.at) {
+            Some(Token::Op(op)) if op == "-" => Some(UnaryOp::Neg),
+            Some(Token::Op(op)) if op == "+" => Some(UnaryOp::Plus),
+            _ => None,
+        };
+        let value = if let Some(sign) = sign {
+            p.at += 1;
+            if sign == UnaryOp::Neg
+                && let Some(Token::Number(n)) = p.tokens.get(p.at)
+                && p.tokens.get(p.at + 1) != Some(&Token::Symbol(':'))
+            {
+                // Fold bare numeric tokens; postfix casts bind before unary minus.
+                let n = if let Some(n) = n.strip_prefix('-') {
+                    n.to_owned()
+                } else {
+                    format!("-{n}")
+                };
+                p.at += 1;
+                let value = match n.parse::<i64>() {
+                    Ok(n) => Value::Int(n),
+                    Err(_) => Value::Numeric(Numeric::parse(&n).map_err(pg_error)?),
+                };
+                return Self::parse_casts(p, depth, Self::Literal(value));
+            }
+            Self::Unary(
+                sign,
+                Box::new(Self::parse_unary(p, depth + 1, aggregate_argument)?),
+            )
+        } else {
+            let value = Self::primary_context(p, depth, aggregate_argument)?;
+            return Self::parse_casts(p, depth, value);
+        };
+        Ok(value)
+    }
+    fn parse_casts(p: &mut Parser, depth: usize, mut value: Self) -> R<Self> {
         let mut casts = depth;
         while p.sym(':') {
             p.punct(':')?;
@@ -375,7 +462,11 @@ impl Scalar {
         tables: &[&TableDef],
         parameters: &[Option<DataType>],
     ) -> R<BoundScalar> {
+        if matches!(self, Self::Unary(..) | Self::Binary(..)) {
+            return arithmetic::bind(self, resolve, tables, parameters);
+        }
         let (ty, node) = match self {
+            Self::Unary(..) | Self::Binary(..) => unreachable!(),
             Self::Param(n) => (
                 parameters[*n - 1].clone().ok_or(SqlError::Parameters)?,
                 Node::Param(*n),
@@ -894,6 +985,7 @@ impl Scalar {
 impl BoundScalar {
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
+            Node::Call(name, _) if arithmetic::internal_name(name) => None,
             Node::Column(_, name) | Node::Call(name, _) => Some(name),
             Node::Cast(a) => a.strong_name(),
             _ => None,
@@ -927,6 +1019,7 @@ impl BoundScalar {
             }
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
+            Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
             Node::Call(n, _) => n,
         }
     }
@@ -963,6 +1056,13 @@ impl BoundScalar {
                 Ok(v.clone())
             }
             Node::Call(n, args) => {
+                if arithmetic::internal_name(n) {
+                    let values = args
+                        .iter()
+                        .map(|a| a.eval(row, params, budget))
+                        .collect::<R<Vec<_>>>()?;
+                    return arithmetic::eval(n, &self.ty, &values, budget);
+                }
                 if n == "coalesce" {
                     for a in args {
                         let v = a.eval(row, params, budget)?;
@@ -1368,6 +1468,9 @@ impl Scalar {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
+            Self::Unary(..) | Self::Binary(..) => {
+                arithmetic::infer(self, parameters, resolve, tables)?
+            }
             Self::Param(n) => {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
                 if let Some(ty) = expected {
@@ -1574,6 +1677,7 @@ fn pg_error(e: giggles_pg_types::Error) -> SqlError {
     match e {
         giggles_pg_types::Error::Limit => SqlError::Limit,
         giggles_pg_types::Error::Range => SqlError::Overflow,
+        giggles_pg_types::Error::DivisionByZero => SqlError::DivisionByZero,
         _ => SqlError::Type,
     }
 }

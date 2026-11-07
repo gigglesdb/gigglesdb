@@ -373,7 +373,10 @@ impl BoundScalar {
                         types[6] = DataType::DoublePrecision;
                     }
                 }
-                let Some((true, _strict)) = signature(name, &types, &self.ty) else {
+                let Some((true, _strict)) = arithmetic::internal_name(name)
+                    .then_some((true, true))
+                    .or_else(|| signature(name, &types, &self.ty))
+                else {
                     return Ok(None);
                 };
                 if dependent {
@@ -428,7 +431,10 @@ impl BoundScalar {
                         types[6] = DataType::DoublePrecision;
                     }
                 }
-                signature(name, &types, &self.ty).is_some_and(|(immutable, _)| immutable)
+                arithmetic::internal_name(name)
+                    .then_some((true, true))
+                    .or_else(|| signature(name, &types, &self.ty))
+                    .is_some_and(|(immutable, _)| immutable)
             }
         }
     }

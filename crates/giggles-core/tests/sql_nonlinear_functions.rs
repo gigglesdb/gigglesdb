@@ -169,7 +169,7 @@ fn nonlinear_error_precedence_and_display_scale() {
     let mut s = admin.sql_session();
     for (q, expected) in [
         ("SELECT ln(-1::numeric)", "Sql(Overflow)"),
-        ("SELECT log(1::numeric,2::numeric)", "Sql(Type)"),
+        ("SELECT log(1::numeric,2::numeric)", "Sql(DivisionByZero)"),
         ("SELECT log(NULL::numeric,'bad'::numeric)", "Sql(Type)"),
         ("SELECT log('bad',2) LIMIT 0", "Sql(Type)"),
         ("SELECT ln('bad'::numeric) LIMIT 0", "Sql(Type)"),

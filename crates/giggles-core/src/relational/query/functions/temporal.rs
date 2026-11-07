@@ -379,7 +379,8 @@ pub(super) fn parse_error(e: giggles_pg_types::Error, interval: bool) -> SqlErro
         E::Range if interval => SqlError::IntervalFieldOverflow,
         E::Range => SqlError::DatetimeFieldOverflow,
         E::Limit => SqlError::Limit,
-        E::Unimplemented | E::DivisionByZero => SqlError::Unsupported,
+        E::DivisionByZero => SqlError::DivisionByZero,
+        E::Unimplemented => SqlError::Unsupported,
     }
 }
 fn zone_error(e: giggles_pg_types::Error) -> SqlError {
@@ -388,7 +389,8 @@ fn zone_error(e: giggles_pg_types::Error) -> SqlError {
         E::Syntax => SqlError::InvalidParameterValue,
         E::Range => SqlError::DatetimeFieldOverflow,
         E::Limit => SqlError::Limit,
-        E::Unimplemented | E::Binary | E::DivisionByZero => SqlError::Unsupported,
+        E::DivisionByZero => SqlError::DivisionByZero,
+        E::Unimplemented | E::Binary => SqlError::Unsupported,
     }
 }
 fn function_error(e: giggles_pg_types::temporal::TemporalFunctionError) -> SqlError {
