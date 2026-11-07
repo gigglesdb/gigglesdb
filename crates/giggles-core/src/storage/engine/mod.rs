@@ -15,6 +15,7 @@ pub(crate) mod kv_conformance;
 mod tests;
 
 pub(crate) mod commit;
+pub(crate) mod gc;
 pub(crate) mod mvcc;
 pub(crate) mod txn;
 
