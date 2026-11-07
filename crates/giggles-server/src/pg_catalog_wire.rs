@@ -39,18 +39,35 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
     }
 }
 
+#[allow(
+    clippy::needless_update,
+    reason = "trailing ..default() keeps this literal compiling when giggles-pg-catalog adds CatalogSnapshot fields"
+)]
 pub(crate) fn snapshot(
     session: &crate::Session,
     tables: Vec<giggles_core::relational::TableDef>,
+    indexes: Vec<giggles_core::IndexInfo>,
 ) -> giggles_pg_catalog::CatalogSnapshot {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
+    let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     giggles_pg_catalog::CatalogSnapshot {
         user: match &session.role {
             crate::Role::Database { name } => name.clone(),
             _ => "giggles".into(),
         },
         database: session.database.as_deref().unwrap_or("giggles").into(),
+        indexes: indexes
+            .into_iter()
+            .filter(|index| visible.contains(&index.table))
+            .map(|index| giggles_pg_catalog::IndexDef {
+                id: index.id,
+                table: index.table,
+                name: index.name,
+                columns: index.columns,
+                unique: index.unique,
+            })
+            .collect(),
         tables: tables
             .into_iter()
             .map(|table| giggles_pg_catalog::TableDef {
@@ -85,6 +102,8 @@ pub(crate) fn snapshot(
                     .collect(),
             })
             .collect(),
+        // Forward-compatible with CatalogSnapshot fields added by giggles-pg-catalog (track G).
+        ..giggles_pg_catalog::CatalogSnapshot::default()
     }
 }
 
@@ -325,10 +344,14 @@ fn encode_with_extra(
                 v.to_be_bytes().to_vec()
             }
         }
-        (Value::Int(v), PgType::Oid) => {
+        (Value::Int(v), PgType::Oid | PgType::Regproc) if ty == PgType::Oid || *v == 330 => {
             let v = u32::try_from(*v).map_err(|_| "22003")?;
             if format == 0 {
-                v.to_string().into_bytes()
+                if ty == PgType::Regproc && v == 330 {
+                    b"bthandler".to_vec()
+                } else {
+                    v.to_string().into_bytes()
+                }
             } else {
                 v.to_be_bytes().to_vec()
             }

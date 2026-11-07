@@ -116,6 +116,21 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("indoption", T::Int2Vector),
             ("indcollation", T::OidVector),
             ("indclass", T::OidVector),
+            ("indisexclusion", T::Bool),
+            ("indimmediate", T::Bool),
+            ("indisready", T::Bool),
+            ("indislive", T::Bool),
+            ("indisclustered", T::Bool),
+            ("indisreplident", T::Bool),
+            ("indcheckxmin", T::Bool),
+            ("indnullsnotdistinct", T::Bool),
+        ],
+        "pg_indexes" => &[
+            ("schemaname", T::Name),
+            ("tablename", T::Name),
+            ("indexname", T::Name),
+            ("tablespace", T::Name),
+            ("indexdef", T::Text),
         ],
         "pg_constraint" => &[
             ("oid", T::Oid),
@@ -242,7 +257,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
         "pg_am" => &[
             ("oid", T::Oid),
             ("amname", T::Name),
-            ("amhandler", T::Oid),
+            ("amhandler", T::Regproc),
             ("amtype", T::Char),
             ("xmin", T::Xid),
         ],
@@ -507,6 +522,7 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_attribute",
         "pg_type",
         "pg_index",
+        "pg_indexes",
         "pg_constraint",
         "pg_description",
         "pg_shdescription",
@@ -552,6 +568,7 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_namespace" => 2615,
         "pg_attribute" => 1249,
         "pg_index" => 2610,
+        "pg_indexes" => 12006,
         "pg_constraint" => 2606,
         "pg_description" => 2609,
         "pg_attrdef" => 2604,
@@ -646,11 +663,41 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             return Err(Error::Limit);
         }
     }
+    // Table and descriptor IDs share the core allocator. The same four-slot
+    // encoding is injective; reject malformed snapshots that reuse an ID.
+    let visible_indexes = snapshot
+        .indexes
+        .iter()
+        .filter(|i| ids.contains(&i.table))
+        .collect::<Vec<_>>();
+    let mut descriptor_ids = ids.clone();
+    let mut descriptor_names = BTreeSet::new();
+    for i in &visible_indexes {
+        let t = snapshot.tables.iter().find(|t| t.id == i.table).unwrap();
+        if !descriptor_ids.insert(i.id)
+            || !descriptor_names.insert(&i.name)
+            || i.name.is_empty()
+            || i.columns.is_empty()
+            || i.columns.len() > 64
+            || i.columns.iter().collect::<BTreeSet<_>>().len() != i.columns.len()
+            || i.columns
+                .iter()
+                .any(|id| !t.columns.iter().any(|c| c.id == *id))
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        table_oid(i.id)?;
+        input_bytes += i.name.len();
+        if input_bytes > 65536 {
+            return Err(Error::Limit);
+        }
+    }
     let mut occupied = snapshot
         .tables
         .iter()
         .map(|t| t.name.clone())
         .collect::<BTreeSet<_>>();
+    occupied.extend(visible_indexes.iter().map(|i| i.name.clone()));
     let mut key_names = BTreeMap::new();
     let mut sorted = snapshot.tables.iter().collect::<Vec<_>>();
     sorted.sort_by_key(|t| t.id);
@@ -690,6 +737,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         "pg_database",
         vec![I(16384), s("giggles"), I(10), B(false), B(true), N],
     );
+    add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
     add("pg_user", vec![s("giggles"), I(10), B(false)]);
     // One certificate-bound presentation identity; PostgreSQL role management,
     // inheritance, expiration and role connection-limit policies do not exist.
@@ -722,7 +770,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(oid),
                 s(name),
                 I(11),
-                s("r"),
+                s(if name == "pg_indexes" { "v" } else { "r" }),
                 I(10),
                 I(fs.len() as i64),
                 B(false),
@@ -843,7 +891,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             ],
         );
     }
-    for t in &snapshot.tables {
+    let mut ordered_tables = snapshot.tables.iter().collect::<Vec<_>>();
+    ordered_tables.sort_by_key(|t| t.id);
+    for t in ordered_tables {
         let oid = table_oid(t.id)? as i64;
         let has_pk = !t.primary_key.is_empty();
         add(
@@ -855,11 +905,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 s("r"),
                 I(10),
                 I(t.columns.len() as i64),
-                B(has_pk),
+                B(has_pk || visible_indexes.iter().any(|i| i.table == t.id)),
                 s("p"),
                 B(false),
                 I(oid + 3),
-                I(0),
+                I(2),
                 I(0),
                 N,
                 N,
@@ -899,6 +949,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             let key = Value::Array(t.primary_key.iter().map(|k| I(*k as i64 + 1)).collect());
             let n = &key_names[&t.id];
             add(
+                "pg_indexes",
+                vec![
+                    s("public"),
+                    s(&t.name),
+                    s(n),
+                    N,
+                    s(&index_definition(t, n, &t.primary_key, true)),
+                ],
+            );
+            add(
                 "pg_class",
                 vec![
                     I(oid + 1),
@@ -911,7 +971,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     s("p"),
                     B(false),
                     I(0),
-                    I(0),
+                    I(403),
                     I(0),
                     N,
                     N,
@@ -935,6 +995,14 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     Value::Array(vec![I(0); t.primary_key.len()]),
                     Value::Array(vec![I(0); t.primary_key.len()]),
                     Value::Array(vec![I(0); t.primary_key.len()]),
+                    B(false),
+                    B(true),
+                    B(true),
+                    B(true),
+                    B(false),
+                    B(false),
+                    B(false),
+                    B(false),
                 ],
             );
             for (i, k) in t.primary_key.iter().enumerate() {
@@ -947,7 +1015,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                         s(&c.name),
                         I(ty as i64),
                         I(i as i64 + 1),
-                        B(true),
+                        B(false),
                         I(-1),
                         I(len),
                         B(false),
@@ -988,7 +1056,111 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 ],
             );
         }
+        let mut indexes = visible_indexes
+            .iter()
+            .filter(|i| i.table == t.id)
+            .collect::<Vec<_>>();
+        indexes.sort_by_key(|i| i.id);
+        for index in indexes {
+            let index_oid = table_oid(index.id)? as i64;
+            let n = &index.name;
+            let keys = index
+                .columns
+                .iter()
+                .map(|id| t.columns.iter().position(|c| c.id == *id).unwrap())
+                .collect::<Vec<_>>();
+            let key = Value::Array(keys.iter().map(|k| I(*k as i64 + 1)).collect());
+            add(
+                "pg_class",
+                vec![
+                    I(index_oid),
+                    s(n),
+                    I(2200),
+                    s("i"),
+                    I(10),
+                    I(keys.len() as i64),
+                    B(false),
+                    s("p"),
+                    B(false),
+                    I(0),
+                    I(403),
+                    I(0),
+                    N,
+                    N,
+                    N,
+                    N,
+                ],
+            );
+            add(
+                "pg_index",
+                vec![
+                    I(index_oid),
+                    I(oid),
+                    I(keys.len() as i64),
+                    I(keys.len() as i64),
+                    B(index.unique),
+                    B(false),
+                    B(true),
+                    key.clone(),
+                    N,
+                    N,
+                    Value::Array(vec![I(0); keys.len()]),
+                    Value::Array(vec![I(0); keys.len()]),
+                    Value::Array(vec![I(0); keys.len()]),
+                    B(false),
+                    B(true),
+                    B(true),
+                    B(true),
+                    B(false),
+                    B(false),
+                    B(false),
+                    B(false),
+                ],
+            );
+            for (i, k) in keys.iter().enumerate() {
+                let c = &t.columns[*k];
+                let (ty, _, len, _) = scalar(c.data_type);
+                add(
+                    "pg_attribute",
+                    vec![
+                        I(index_oid),
+                        s(&c.name),
+                        I(ty as i64),
+                        I(i as i64 + 1),
+                        B(false),
+                        I(-1),
+                        I(len),
+                        B(false),
+                        s(""),
+                        s(""),
+                        B(false),
+                        I(0),
+                        N,
+                        I(0),
+                        B(true),
+                        N,
+                    ],
+                );
+            }
+            add(
+                "pg_indexes",
+                vec![
+                    s("public"),
+                    s(&t.name),
+                    s(n),
+                    N,
+                    s(&index_definition(t, n, &keys, index.unique)),
+                ],
+            );
+        }
     }
+    all.get_mut("pg_index")
+        .unwrap()
+        .rows
+        .sort_by_key(|r| match (&r[1], &r[0]) {
+            (I(t), I(i)) => (*t, *i),
+            _ => unreachable!(),
+        });
     let total: usize = all
         .values()
         .flat_map(|r| &r.rows)
@@ -1118,3 +1290,228 @@ fn type_receive(oid: u32, is_array: bool) -> i64 {
         _ => 0,
     }
 }
+
+/// PostgreSQL identifier spelling for emitted index DDL.
+pub(crate) fn quote_identifier(name: &str) -> String {
+    let simple = !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_lowercase() || i > 0 && c.is_ascii_digit());
+    // Match the committed core quote_ident policy: only non-unreserved
+    // PostgreSQL keywords need quoting, not every sqlparser dialect keyword.
+    let keyword = REQUIRES_QUOTES.binary_search(&name).is_ok();
+    if simple && !keyword {
+        name.into()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+fn index_definition(t: &TableDef, name: &str, keys: &[usize], unique: bool) -> String {
+    format!(
+        "CREATE {}INDEX {} ON public.{} USING btree ({})",
+        if unique { "UNIQUE " } else { "" },
+        quote_identifier(name),
+        quote_identifier(&t.name),
+        keys.iter()
+            .map(|k| quote_identifier(&t.columns[*k].name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+// Copied from the committed core quoting_keywords.rs; keep category policy aligned.
+// PostgreSQL REL_18_0-derived algorithm/data.
+// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+// Portions Copyright (c) 1994, Regents of the University of California
+// PostgreSQL Database Management System
+// (also known as Postgres, formerly known as Postgres95)
+//
+// Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+//
+// Portions Copyright (c) 1994, The Regents of the University of California
+//
+// Permission to use, copy, modify, and distribute this software and its
+// documentation for any purpose, without fee, and without a written agreement
+// is hereby granted, provided that the above copyright notice and this
+// paragraph and the following two paragraphs appear in all copies.
+//
+// IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR
+// DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+// LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+// DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+//
+// THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+// INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+// AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+// ON AN "AS IS" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
+// PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+// Source: src/include/parser/kwlist.h, SHA256 fdcdf3694513cba63b4016f63032472b686e381bb35f17c5d645bc2f6f1dac16.
+// All and only non-UNRESERVED_KEYWORD names, in source ASCII order.
+const REQUIRES_QUOTES: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];

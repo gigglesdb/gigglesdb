@@ -555,7 +555,7 @@ impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
             Plan::Catalog(_, _, epoch) => {
-                let (current, _) = core(session.catalog_snapshot())?;
+                let (current, _, _) = core(session.catalog_snapshot())?;
                 if current != *epoch {
                     return Err("0A000");
                 }
@@ -834,7 +834,7 @@ impl State {
                     let task = crate::task_statement::TaskStatement::parse(&sql)?;
                     (Plan::Task(task), task.description())
                 } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
-                    let (epoch, _) = core(session.catalog_snapshot())?;
+                    let (epoch, _, _) = core(session.catalog_snapshot())?;
                     let fields =
                         giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
                     let d = Description {
@@ -1068,14 +1068,14 @@ impl State {
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
                     self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    let (current, tables) = core(session.catalog_snapshot())?;
+                    let (current, tables, indexes) = core(session.catalog_snapshot())?;
                     if current != *epoch {
                         return Err("0A000");
                     }
                     if p.catalog_result.is_none() {
                         let result = catalog_wire::execute(
                             plan,
-                            &catalog_wire::snapshot(session, tables),
+                            &catalog_wire::snapshot(session, tables, indexes),
                             &p.catalog_params,
                         )
                         .map_err(catalog_wire::error)?;

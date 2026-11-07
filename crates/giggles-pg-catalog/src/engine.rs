@@ -1943,10 +1943,18 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(&mut args[0], PgType::Oid)?;
                 expect(&mut args[1], PgType::Text)?;
             }
+            "pg_get_constraintdef" => {
+                expect(&mut args[0], PgType::Oid)?;
+                if args.len() == 2 {
+                    expect(&mut args[1], PgType::Bool)?;
+                }
+            }
             "pg_get_indexdef" => {
                 expect(&mut args[0], PgType::Oid)?;
-                expect(&mut args[1], PgType::Int4)?;
-                expect(&mut args[2], PgType::Bool)?;
+                if args.len() == 3 {
+                    expect(&mut args[1], PgType::Int4)?;
+                    expect(&mut args[2], PgType::Bool)?;
+                }
             }
             "obj_description" => {
                 expect(&mut args[0], PgType::Oid)?;
@@ -1993,7 +2001,8 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         | ("obj_description", 2)
         | ("col_description", 2) => PgType::Text,
         ("pg_get_userbyid", 1) => PgType::Name,
-        ("pg_get_indexdef", 3) => PgType::Text,
+        ("pg_get_indexdef", 1 | 3) => PgType::Text,
+        ("pg_get_constraintdef", 1 | 2) => PgType::Text,
         ("pg_get_viewdef" | "pg_get_ruledef" | "pg_get_triggerdef" | "encode", 2)
         | ("pg_get_function_arguments" | "pg_get_function_result" | "pg_get_function_sqlbody", 1) => {
             PgType::Text
@@ -3076,8 +3085,101 @@ impl Runtime<'_> {
             "pg_tablespace_location" | "pg_get_partkeydef" => N,
             "_row" => Value::Record(v),
             "pg_indexam_has_property" => N,
-            "pg_get_indexdef"
-            | "pg_get_viewdef"
+            "pg_get_constraintdef" => {
+                let oid = integer(v[0].clone())?;
+                self.catalogs["pg_constraint"]
+                    .rows
+                    .iter()
+                    .find(|r| r[0] == I(oid) && r[3] == S("p".into()))
+                    .and_then(|constraint| match &constraint[6] {
+                        Value::Array(keys) => keys
+                            .iter()
+                            .map(|key| {
+                                self.catalogs["pg_attribute"]
+                                    .rows
+                                    .iter()
+                                    .find(|r| r[0] == constraint[4] && r[3] == *key)
+                                    .and_then(|r| match &r[1] {
+                                        S(name) => Some(catalog::quote_identifier(name)),
+                                        _ => None,
+                                    })
+                            })
+                            .collect::<Option<Vec<_>>>(),
+                        _ => None,
+                    })
+                    .map(|keys| S(format!("PRIMARY KEY ({})", keys.join(", "))))
+                    .unwrap_or(N)
+            }
+            "pg_get_indexdef" => {
+                let oid = integer(v[0].clone())?;
+                let column = if v.len() == 1 {
+                    0
+                } else {
+                    integer(v[1].clone())?
+                };
+                if column == 0 {
+                    let name = self.catalogs["pg_class"]
+                        .rows
+                        .iter()
+                        .find(|r| r[0] == I(oid) && r[3] == S("i".into()))
+                        .map(|r| &r[1]);
+                    self.catalogs["pg_indexes"]
+                        .rows
+                        .iter()
+                        .find(|r| Some(&r[2]) == name)
+                        .map(|r| match &r[4] {
+                            S(definition) if v.len() == 3 && v[2] == B(true) => {
+                                let index_name = match &r[2] {
+                                    S(name) => catalog::quote_identifier(name),
+                                    _ => return N,
+                                };
+                                let prefix = if definition.starts_with("CREATE UNIQUE INDEX ") {
+                                    "CREATE UNIQUE INDEX "
+                                } else {
+                                    "CREATE INDEX "
+                                };
+                                // Remove qualification only at the table position; an
+                                // index identifier may itself contain " ON public.".
+                                let offset = prefix.len() + index_name.len() + " ON ".len();
+                                S(format!(
+                                    "{}{}",
+                                    &definition[..offset],
+                                    &definition[offset + "public.".len()..]
+                                ))
+                            }
+                            value => value.clone(),
+                        })
+                        .unwrap_or(N)
+                } else {
+                    self.catalogs["pg_attribute"]
+                        .rows
+                        .iter()
+                        .find(|r| {
+                            r[0] == I(oid)
+                                && r[3] == I(column)
+                                && self.catalogs["pg_index"]
+                                    .rows
+                                    .iter()
+                                    .any(|i| i[0] == I(oid))
+                        })
+                        .map(|r| match &r[1] {
+                            S(name) => S(catalog::quote_identifier(name)),
+                            _ => N,
+                        })
+                        .unwrap_or_else(|| {
+                            if self.catalogs["pg_index"]
+                                .rows
+                                .iter()
+                                .any(|i| i[0] == I(oid))
+                            {
+                                S(String::new())
+                            } else {
+                                N
+                            }
+                        })
+                }
+            }
+            "pg_get_viewdef"
             | "pg_get_ruledef"
             | "pg_get_triggerdef"
             | "pg_get_function_arguments"

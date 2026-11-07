@@ -61,10 +61,20 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<usize>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDef {
+    pub id: u64,
+    pub table: u64,
+    pub name: String,
+    /// Ordered stable column IDs, not attribute numbers.
+    pub columns: Vec<u64>,
+    pub unique: bool,
+}
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     pub tables: Vec<TableDef>,
+    pub indexes: Vec<IndexDef>,
     pub user: String,
     pub database: String,
 }
@@ -72,6 +82,7 @@ impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
             tables: Vec::new(),
+            indexes: Vec::new(),
             user: "giggles".into(),
             database: "giggles".into(),
         }
@@ -106,7 +117,7 @@ pub enum PgType {
     Numeric,
     Float4,
     Float8,
-    /// Metadata descriptor only; non-NULL wire I/O is unsupported.
+    /// Metadata descriptor for finite catalog handler OIDs, not a routine registry.
     Regproc,
     /// Metadata descriptor only; non-NULL wire I/O is unsupported.
     PgNodeTree,

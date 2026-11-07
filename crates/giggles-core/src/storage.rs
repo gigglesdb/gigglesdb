@@ -9,6 +9,8 @@ pub mod replica;
 pub mod roles;
 mod secondary_index;
 mod secondary_index_catalog;
+mod secondary_index_public;
+pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
 use bincode::Options;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};

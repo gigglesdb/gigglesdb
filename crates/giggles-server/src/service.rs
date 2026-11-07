@@ -449,7 +449,7 @@ impl Session {
     /// metadata never falls back to an unrestricted owner query.
     pub(crate) fn catalog_snapshot(
         &mut self,
-    ) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+    ) -> Result<(u64, Vec<relational::TableDef>, Vec<giggles_core::IndexInfo>), CoreError> {
         self.authority_scope(|session| {
             if session.is_aborted() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -494,7 +494,16 @@ impl Session {
                         .is_none_or(|tables| tables.contains(&table.name))
                 })
                 .collect::<Vec<_>>();
-            session.validate_catalog_snapshot(epoch, visible)
+            let (index_epoch, indexes) = session.service.admin.secondary_index_catalog()?;
+            if index_epoch != epoch {
+                return Err(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            let indexes = indexes
+                .into_iter()
+                .filter(|index| visible.iter().any(|table| table.id == index.table))
+                .collect();
+            let (epoch, visible) = session.validate_catalog_snapshot(epoch, visible)?;
+            Ok((epoch, visible, indexes))
         })
     }
     fn validate_catalog_snapshot(
@@ -884,7 +893,8 @@ mod lifecycle_tests {
             .grant_table("missing", "reader", &[roles::TablePrivilege::Select])
             .unwrap();
         let catalog = service.admin.catalog().unwrap();
-        assert_eq!(owner.catalog_snapshot().unwrap(), catalog);
+        let snapshot = owner.catalog_snapshot().unwrap();
+        assert_eq!((snapshot.0, snapshot.1), catalog);
         let mut reader = service.role_session("reader").unwrap();
         assert_eq!(reader.fingerprint, "pgrole:reader");
         let visible = reader.catalog_snapshot().unwrap().1;
@@ -963,7 +973,7 @@ mod lifecycle_tests {
         ).unwrap();
         let before = service.admin.catalog().unwrap();
         let mut session = service.session(&bindings[0].fingerprint).unwrap();
-        let (epoch, visible) = session.catalog_snapshot().unwrap();
+        let (epoch, visible, _) = session.catalog_snapshot().unwrap();
         assert_eq!(epoch, before.0);
         assert_eq!(visible.len(), 1);
         assert_eq!(
