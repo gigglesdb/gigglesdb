@@ -3,10 +3,16 @@ use super::*;
 mod arithmetic;
 mod binary;
 mod character;
+mod comparison;
+#[cfg(test)]
+mod cross_binding_tests;
+pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod degree_math;
 #[cfg(test)]
 mod integer_cast_tests;
 mod integer_formats;
+mod join;
+pub(super) use join::{join_equal, join_key, join_key_supported};
 mod md5;
 mod numeric;
 mod overlay;
@@ -68,6 +74,12 @@ pub(in crate::relational) struct BoundScalar {
     node: Node,
 }
 enum Node {
+    CrossCompare(
+        String,
+        Box<BoundScalar>,
+        Box<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     Sequence(
         String,
         Vec<BoundScalar>,
@@ -1167,6 +1179,11 @@ impl BoundScalar {
         clock: Option<&crate::relational::clock::ExecutionClock>,
     ) {
         match &mut self.node {
+            Node::CrossCompare(_, a, b, target) => {
+                *target = clock.cloned();
+                a.attach_clock(clock);
+                b.attach_clock(clock);
+            }
             Node::Clock(_, _, target) => *target = clock.cloned(),
             Node::Sequence(_, args, target) => {
                 *target = clock.cloned();
@@ -1196,6 +1213,7 @@ impl BoundScalar {
     }
     pub(super) fn name(&self) -> &str {
         match &self.node {
+            Node::CrossCompare(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Cast(a) => {
                 if let Some(name) = a.strong_name() {
@@ -1228,6 +1246,25 @@ impl BoundScalar {
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::CrossCompare(op, a, b, clock) => {
+                let a = a.eval(row, params, budget)?;
+                let b = b.eval(row, params, budget)?;
+                if a == Value::Null || b == Value::Null {
+                    return Ok(Value::Null);
+                }
+                let order = compare_cross(&a, &b, clock.as_ref())?;
+                let value = Value::Bool(match op.as_str() {
+                    "=" => order == Ordering::Equal,
+                    "<>" | "!=" => order != Ordering::Equal,
+                    "<" => order == Ordering::Less,
+                    "<=" => order != Ordering::Greater,
+                    ">" => order == Ordering::Greater,
+                    ">=" => order != Ordering::Less,
+                    _ => return Err(SqlError::UndefinedFunction),
+                });
+                charge(budget, &value)?;
+                Ok(value)
+            }
             Node::Sequence(name, args, clock) => {
                 let clock = clock.as_ref().ok_or(SqlError::Unsupported)?;
                 let values = args
@@ -2173,23 +2210,19 @@ fn float_function(name: &str, n: f64) -> f64 {
     }
 }
 
-pub(super) fn comparison_mismatch(a: &DataType, b: &DataType) -> SqlError {
-    // Type cases are known unimplemented implicit cast gaps, not PostgreSQL behavior.
-    if matches!(
-        a,
-        DataType::Date | DataType::Timestamp | DataType::TimestampTz
-    ) && matches!(
-        b,
-        DataType::Date | DataType::Timestamp | DataType::TimestampTz
-    ) || matches!(
-        (a, b),
-        (DataType::Time, DataType::TimeTz | DataType::Interval)
-            | (DataType::TimeTz | DataType::Interval, DataType::Time)
-    ) {
-        SqlError::Type
-    } else {
-        SqlError::UndefinedFunction
+pub(super) fn comparison_mismatch(_a: &DataType, _b: &DataType) -> SqlError {
+    SqlError::UndefinedFunction
+}
+
+pub(in crate::relational) fn comparison_requires_filter(value: &Value, ty: &DataType) -> R<bool> {
+    if matches!(value, Value::Null | Value::Text(_)) {
+        return Ok(false);
     }
+    let literal =
+        Scalar::Literal(value.clone()).bind(&|_, _| Err(SqlError::UnknownColumn), &[], &[])?;
+    // Integer widths share their exact key representation. Other cross-type
+    // comparisons must retain the original values in the full filter.
+    Ok(literal.ty != *ty && !(integer(&literal.ty) && integer(ty)) && comparable(&literal.ty, ty))
 }
 
 // PostgreSQL implicit numeric operator promotion. Integer cross-width

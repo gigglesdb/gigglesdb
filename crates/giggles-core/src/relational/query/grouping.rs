@@ -624,11 +624,7 @@ fn visit_joins(
                 return Err(SqlError::Limit);
             }
             let candidate = candidate?;
-            if join
-                .equalities
-                .iter()
-                .all(|(a, b)| equal(row.get(*a), &candidate.row.values[b.column]))
-            {
+            if join.matches(row, &candidate.row.values)? {
                 matched = true;
                 row.values.push(candidate.row.values.clone());
                 visit_joins(query, source, index + 1, row, meter, work, accept)?;
@@ -636,21 +632,13 @@ fn visit_joins(
             }
         }
     } else {
-        let key = join
-            .key
-            .iter()
-            .map(|c| row.get(*c).clone())
-            .collect::<Vec<_>>();
-        let found = if key.contains(&Value::Null) {
-            None
-        } else {
-            source.get(table, &encode_key(&key)?)?
+        let found = match join.key(row)? {
+            Some(key) => source.get(table, &encode_key(&key)?)?,
+            None => None,
         };
-        if let Some(candidate) = found.filter(|candidate| {
-            join.equalities
-                .iter()
-                .all(|(a, b)| equal(row.get(*a), &candidate.row.values[b.column]))
-        }) {
+        if let Some(candidate) = found
+            && join.matches(row, &candidate.row.values)?
+        {
             matched = true;
             row.values.push(candidate.row.values.clone());
             visit_joins(query, source, index + 1, row, meter, work, accept)?;
@@ -912,7 +900,14 @@ impl Grouping {
         }
         Ok(())
     }
-    pub(super) fn attach_clock(&mut self, clock: Option<&super::super::clock::ExecutionClock>) {
+    pub(super) fn attach_clock(
+        &mut self,
+        clock: Option<&super::super::clock::ExecutionClock>,
+        joins: &mut [BoundJoin],
+    ) {
+        for join in joins {
+            join.clock = clock.cloned();
+        }
         for s in self
             .keys
             .iter_mut()

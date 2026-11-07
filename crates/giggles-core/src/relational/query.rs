@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 mod functions;
 mod grouping;
 mod insert_values;
+pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
 
@@ -536,7 +537,10 @@ impl Filter {
                             bv = bind(&Scalar::Cast(Box::new(b.clone()), ty))?;
                         }
                     } else {
-                        return Err(functions::comparison_mismatch(&av.ty, &bv.ty));
+                        let mismatch = functions::comparison_mismatch(&av.ty, &bv.ty);
+                        return functions::cross_compare(op, av, bv)?
+                            .map(BoundFilter::Scalar)
+                            .ok_or(mismatch);
                     }
                 }
                 BoundFilter::Compare(av, op.clone(), bv)
@@ -1702,6 +1706,7 @@ impl Query {
             let right = j + 1;
             let mut keys = BTreeMap::new();
             let mut equalities = vec![];
+            let mut unsupported_key = false;
             for (a, b) in &join.equalities {
                 let a = resolve(a, right + 1)?;
                 let b = resolve(b, right + 1)?;
@@ -1712,26 +1717,37 @@ impl Query {
                 } else {
                     return Err(SqlError::Unsupported);
                 };
-                if tables[outer.source].columns[outer.column].data_type
-                    != tables[inner.source].columns[inner.column].data_type
-                {
-                    return Err(SqlError::Type);
+                let outer_ty = &tables[outer.source].columns[outer.column].data_type;
+                let inner_ty = &tables[inner.source].columns[inner.column].data_type;
+                if !functions::comparable(outer_ty, inner_ty) {
+                    return Err(functions::comparison_mismatch(outer_ty, inner_ty));
                 }
-                if tables[right].primary_key.contains(&inner.column)
-                    && keys.insert(inner.column, outer).is_some()
-                {
-                    return Err(SqlError::Duplicate);
+                if tables[right].primary_key.contains(&inner.column) {
+                    if functions::join_key_supported(outer_ty, inner_ty) {
+                        if keys
+                            .insert(inner.column, (outer, outer_ty.clone(), inner_ty.clone()))
+                            .is_some()
+                        {
+                            return Err(SqlError::Duplicate);
+                        }
+                    } else {
+                        unsupported_key = true;
+                    }
                 }
-                equalities.push((outer, inner));
+                equalities.push((outer, inner, outer_ty.clone(), inner_ty.clone()));
             }
             let key = tables[right]
                 .primary_key
                 .iter()
-                .map(|i| keys.get(i).copied())
+                .map(|i| keys.get(i).cloned())
                 .collect::<Option<Vec<_>>>();
             let scan = key.is_none();
             if scan && !grouped {
-                return Err(SqlError::Unbounded);
+                return Err(if unsupported_key {
+                    SqlError::Unsupported
+                } else {
+                    SqlError::Unbounded
+                });
             }
             let key = key.unwrap_or_default();
             joins.push(BoundJoin {
@@ -1739,6 +1755,7 @@ impl Query {
                 scan,
                 key,
                 equalities,
+                clock: None,
             });
         }
         if grouped {
@@ -1784,8 +1801,8 @@ impl Query {
             if let Expr::Param(n) = e {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
                 if let Some(old) = slot.as_ref().filter(|old| *old != ty) {
-                    if functions::comparison_type(old, ty).is_some() {
-                        // Mixed numeric comparisons run in the full filter. A
+                    if functions::comparable(old, ty) {
+                        // Cross-type comparisons run in the full filter. A
                         // converted column key can round and miss matching rows.
                         return Ok(false);
                     }
@@ -1793,6 +1810,12 @@ impl Query {
                 }
                 slot.get_or_insert_with(|| ty.clone());
             } else if let Expr::Literal(v) = e {
+                if !matches!(v, Value::Null | Value::Text(_)) {
+                    let literal = Scalar::Literal(v.clone()).bind(&resolve, &tables, parameters)?;
+                    if literal.ty != *ty && functions::comparable(&literal.ty, ty) {
+                        return Ok(false);
+                    }
+                }
                 if let Value::Int(value) = v
                     && match ty {
                         DataType::SmallInt => i16::try_from(*value).is_err(),
@@ -1824,7 +1847,7 @@ impl Query {
                 let literal = Scalar::Literal(value.clone()).bind(&resolve, &tables, &parameters)?;
                 let column_type = &tables[c.source].columns[c.column].data_type;
                 if literal.ty != *column_type
-                    && functions::comparison_type(&literal.ty, column_type).is_none()
+                    && !functions::comparable(&literal.ty, column_type)
                 {
                     return Err(functions::comparison_mismatch(&literal.ty, column_type));
                 }
@@ -2055,8 +2078,9 @@ struct BoundJoin {
     left: bool,
     // Only bounded grouped execution accepts a non-primary-key scan join.
     scan: bool,
-    key: Vec<BoundColumn>,
-    equalities: Vec<(BoundColumn, BoundColumn)>,
+    key: Vec<(BoundColumn, DataType, DataType)>,
+    equalities: Vec<(BoundColumn, BoundColumn, DataType, DataType)>,
+    clock: Option<super::clock::ExecutionClock>,
 }
 pub(super) struct BoundQuery<'a> {
     query: &'a Query,
@@ -2467,21 +2491,14 @@ impl BoundQuery<'_> {
             };
             for (i, j) in self.joins.iter().enumerate() {
                 let table = self.tables[i + 1];
-                let key = j
-                    .key
-                    .iter()
-                    .map(|c| row.get(*c).clone())
-                    .collect::<Vec<_>>();
-                let found = if key.contains(&Value::Null) {
-                    None
-                } else {
-                    source.get(table, &encode_key(&key)?)?
+                let found = match j.key(&row)? {
+                    Some(key) => source.get(table, &encode_key(&key)?)?,
+                    None => None,
                 };
-                let matched = found.filter(|r| {
-                    j.equalities
-                        .iter()
-                        .all(|(a, b)| equal(row.get(*a), &r.row.values[b.column]))
-                });
+                let matched = match found {
+                    Some(r) if j.matches(&row, &r.row.values)? => Some(r),
+                    _ => None,
+                };
                 match matched {
                     Some(r) => row.values.push(r.row.values.clone()),
                     None if j.left => row.values.push(vec![Value::Null; table.columns.len()]),
@@ -2682,7 +2699,11 @@ impl BoundQuery<'_> {
         clock: Option<&super::clock::ExecutionClock>,
     ) -> Self {
         if let Some(grouping) = &mut self.grouping {
-            grouping.attach_clock(clock);
+            grouping.attach_clock(clock, &mut self.joins);
+        } else {
+            for join in &mut self.joins {
+                join.clock = clock.cloned();
+            }
         }
         for item in &mut self.items {
             match item {

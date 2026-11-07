@@ -1948,6 +1948,9 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         {
             return Err(SqlError::Unbounded);
         }
+        if query::comparison_requires_filter(&v, &t.columns[i].data_type)? {
+            return Err(SqlError::Unbounded);
+        }
         check(&v, &t.columns[i])?;
         by.entry(i).or_default().push((&p.op, v));
     }

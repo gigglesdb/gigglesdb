@@ -352,7 +352,11 @@ impl BoundScalar {
             version: 0,
         };
         match &self.node {
-            Node::Param(_) | Node::Column(..) | Node::Clock(..) | Node::Sequence(..) => Ok(None),
+            Node::Param(_)
+            | Node::Column(..)
+            | Node::Clock(..)
+            | Node::Sequence(..)
+            | Node::CrossCompare(..) => Ok(None),
             Node::Literal(v) => {
                 charge(budget, v)?;
                 Ok(Some(v.clone()))
@@ -435,6 +439,7 @@ impl BoundScalar {
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
             Node::Clock(..) => true,
+            Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
             Node::Sequence(_, args, _) => args.iter().all(Self::insert_input_only),
             Node::Cast(value) => {
                 value.insert_input_only()

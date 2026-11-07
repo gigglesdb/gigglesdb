@@ -578,10 +578,13 @@ fn scalar_extrema_binary_order_and_narrow_parameter_types() {
         s.execute_prepared(&p, &[V::Int(32768)], None),
         Err(CoreError::Sql(E::Type))
     );
-    err(
-        &mut s,
-        "SELECT s.id FROM scalars s JOIN scalars t ON t.id=s.n",
-        E::Type,
+    // PG 18.6 joins bigint = smallint through int82eq; no key matches -4/-2/0.
+    assert!(
+        vals(run(
+            &mut s,
+            "SELECT s.id FROM scalars s JOIN scalars t ON t.id=s.n"
+        ))
+        .is_empty()
     );
 }
 

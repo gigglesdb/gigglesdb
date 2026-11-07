@@ -76,6 +76,16 @@ impl ExecutionClock {
             }
         }
     }
+    pub(crate) fn comparison_context(&self) -> Result<(i64, SessionZone), SqlError> {
+        if let Some(error) = &self.clock.unavailable {
+            *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+            return Err(SqlError::Unsupported);
+        }
+        Ok((
+            self.clock.transaction_us,
+            self.clock.zone.ok_or(SqlError::Unsupported)?,
+        ))
+    }
     pub(crate) fn take_error(&self) -> Option<CoreError> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
