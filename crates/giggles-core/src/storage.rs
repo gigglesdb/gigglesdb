@@ -318,7 +318,7 @@ fn from_records_mode(
         }
     }
     match records.get(&vec![5]) {
-        Some(v) if base_version >= 2 => s.sql = decode(v)?,
+        Some(v) if base_version >= 2 => s.sql = feature_envelope::decode_relational(v)?,
         None if base_version == 1 => {}
         _ => {
             return Err(CoreError::Corrupt(
@@ -406,6 +406,11 @@ fn from_records_mode(
     }
     if let Some(bits) = bits
         && feature_envelope::feature_bits_present(&s)? != bits
+    {
+        return Err(CoreError::Corrupt("feature content mismatch".into()));
+    }
+    if bits.is_none()
+        && feature_envelope::feature_bits_present(&s)? & feature_envelope::NEW_BITS != 0
     {
         return Err(CoreError::Corrupt("feature content mismatch".into()));
     }

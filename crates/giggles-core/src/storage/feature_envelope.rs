@@ -1,15 +1,20 @@
 //! Format 53 content policy. Future owners replace only their named predicate.
 use super::*;
+use crate::relational::Relational;
 pub(super) const NEW_BITS: u64 = 0x3c0;
 pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 
 /// E1 B0b: true when CatalogExt is nonempty.
-fn catalog_ext_present(_: &State) -> bool {
-    false
+fn catalog_ext_present(s: &State) -> bool {
+    !s.sql.catalog_ext().is_empty()
 }
-/// E2: true for extended types or typmod content.
-fn extended_types_present(_: &State) -> bool {
-    false
+/// E1 detects typmod content; E2 adds extended type tags here later.
+fn extended_types_present(s: &State) -> bool {
+    s.sql
+        .catalog_ext()
+        .columns
+        .values()
+        .any(|column| column.typmod.is_some())
 }
 /// E1: true for any namespace-11 sequence counter.
 fn sequence_counters_present(_: &State) -> bool {
@@ -75,6 +80,19 @@ pub(super) fn decode_bits(
         return Err(CoreError::Corrupt("noncanonical feature bits".into()));
     }
     Ok(Some(bits))
+}
+
+/// Decode the relational payload once while preserving forward-version errors.
+pub(super) fn decode_relational(bytes: &[u8]) -> Result<Relational, CoreError> {
+    codec().deserialize(bytes).map_err(|error| {
+        if matches!(error.as_ref(), bincode::ErrorKind::Custom(message)
+            if message == crate::relational::catalog_ext::UNSUPPORTED_CATALOG_EXT)
+        {
+            CoreError::Unsupported
+        } else {
+            CoreError::Corrupt(error.to_string())
+        }
+    })
 }
 
 #[cfg(test)]

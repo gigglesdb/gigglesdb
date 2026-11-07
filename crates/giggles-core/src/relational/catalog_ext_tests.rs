@@ -1,0 +1,448 @@
+use super::*;
+use bincode::Options;
+
+fn codec() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_big_endian()
+        .reject_trailing_bytes()
+}
+
+fn fixture(ty: DataType) -> (Relational, u64) {
+    let mut state = Relational::default();
+    let p = Prepared::parse("CREATE TABLE t (id BIGINT PRIMARY KEY, value TEXT)", 1, 0).unwrap();
+    state.execute(&p, &[], None).unwrap();
+    let table = state.tables.get_mut("t").unwrap();
+    table.columns[1].data_type = ty;
+    let id = table.columns[1].id;
+    (state, id)
+}
+
+fn legacy(state: &Relational) -> Vec<u8> {
+    codec()
+        .serialize(&(
+            1u32,
+            state.generation,
+            state.epoch,
+            state.next_id,
+            state.next_version,
+            &state.tables,
+            &state.rows,
+        ))
+        .unwrap()
+}
+
+fn wire(state: &Relational) -> Vec<u8> {
+    codec()
+        .serialize(&(
+            2u32,
+            state.generation,
+            state.epoch,
+            state.next_id,
+            state.next_version,
+            &state.tables,
+            &state.rows,
+            &state.ext,
+        ))
+        .unwrap()
+}
+
+fn numeric(p: i32, s: i32) -> i32 {
+    ((p << 16) | (s & 0x7ff)) + 4
+}
+
+fn sequence(table: u64, column: u64) -> SequenceDef {
+    SequenceDef {
+        name: "t_identity_seq".into(),
+        data_type: DataType::BigInt,
+        start: 1,
+        increment: 1,
+        min: 1,
+        max: i64::MAX,
+        cache: 1,
+        cycle: false,
+        owned_by: Some((table, column)),
+        identity: true,
+        incarnation: 1,
+    }
+}
+
+#[test]
+fn catalog_ext_legacy_is_exactly_seven_fields() {
+    let (state, _) = fixture(DataType::Text);
+    let bytes = legacy(&state);
+    assert_eq!(codec().serialize(&state).unwrap(), bytes);
+    assert_eq!(codec().deserialize::<Relational>(&bytes).unwrap(), state);
+    assert_eq!(
+        bincode::deserialize::<Relational>(&bincode::serialize(&state).unwrap()).unwrap(),
+        state
+    );
+}
+
+#[test]
+fn catalog_ext_all_metadata_roundtrips_and_drop_cleans_owned_entries() {
+    let (mut state, column) = fixture(DataType::BigInt);
+    let table = state.tables["t"].clone();
+    let seq = state.add_sequence(sequence(table.id, column)).unwrap();
+    state
+        .set_column_identity(
+            column,
+            Some(Identity {
+                always: true,
+                sequence_id: seq,
+            }),
+        )
+        .unwrap();
+    state.set_column_default(column, Some("42".into())).unwrap();
+    for (name, kind) in [
+        (
+            "positive",
+            ConstraintKind::Check {
+                expr: "value > 0".into(),
+                not_valid: true,
+            },
+        ),
+        (
+            "parent",
+            ConstraintKind::ForeignKey {
+                columns: vec![column],
+                ref_table: table.id,
+                ref_columns: vec![table.columns[0].id],
+                on_delete: Action::Cascade,
+                on_update: Action::NoAction,
+                not_valid: false,
+            },
+        ),
+        ("t_pkey", ConstraintKind::PrimaryKey),
+    ] {
+        state
+            .add_constraint(
+                table.id,
+                Constraint {
+                    id: state.next_id,
+                    name: name.into(),
+                    kind,
+                },
+            )
+            .unwrap();
+    }
+    state.validate().unwrap();
+    assert_eq!(state.table_constraints(table.id).len(), 3);
+    assert!(state.column_default(column).is_some());
+    assert!(state.column_identity(column).is_some());
+    assert!(state.sequence_by_name("t_identity_seq").is_some());
+    assert_eq!(
+        codec()
+            .deserialize::<Relational>(&codec().serialize(&state).unwrap())
+            .unwrap(),
+        state
+    );
+    assert_eq!(
+        bincode::deserialize::<Relational>(&bincode::serialize(&state).unwrap()).unwrap(),
+        state
+    );
+    let mut removed = state.clone();
+    removed.set_column_identity(column, None).unwrap();
+    removed.set_column_default(column, None).unwrap();
+    for name in ["positive", "parent", "t_pkey"] {
+        removed.remove_constraint(table.id, name).unwrap();
+    }
+    removed.remove_sequence(seq).unwrap();
+    assert!(removed.catalog_ext().is_empty());
+    assert_eq!(codec().serialize(&removed).unwrap(), legacy(&removed));
+    assert!(state.drop_table("t").unwrap());
+    assert!(state.catalog_ext().is_empty());
+    assert_eq!(codec().serialize(&state).unwrap(), legacy(&state));
+}
+
+#[test]
+fn catalog_ext_orphan_identity_and_constraint_reject_decode() {
+    let (state, column) = fixture(DataType::BigInt);
+    for identity_sequence in [false, true] {
+        let mut invalid = state.clone();
+        let table = invalid.tables["t"].id;
+        let mut seq = sequence(table, column);
+        seq.identity = identity_sequence;
+        let seq_id = invalid.add_sequence(seq).unwrap();
+        invalid.ext.columns.insert(
+            column,
+            ColumnExt {
+                identity: Some(Identity {
+                    always: false,
+                    sequence_id: if identity_sequence { u64::MAX } else { seq_id },
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+    }
+    let mut invalid = state;
+    invalid.ext.constraints.insert(
+        u64::MAX,
+        vec![Constraint {
+            id: invalid.next_id,
+            name: "orphan".into(),
+            kind: ConstraintKind::PrimaryKey,
+        }],
+    );
+    invalid.next_id += 1;
+    assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+}
+
+#[test]
+fn catalog_ext_foreign_keys_owned_sequences_and_ids_are_validated() {
+    let (state, column) = fixture(DataType::BigInt);
+    let table = state.tables["t"].clone();
+    for (columns, ref_table, ref_columns) in [
+        (vec![u64::MAX], table.id, vec![table.columns[0].id]),
+        (vec![column], u64::MAX, vec![table.columns[0].id]),
+        (vec![column], table.id, vec![u64::MAX]),
+        (vec![column], table.id, vec![]),
+    ] {
+        let mut invalid = state.clone();
+        let constraint = Constraint {
+            id: invalid.next_id,
+            name: "bad_fk".into(),
+            kind: ConstraintKind::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                on_delete: Action::NoAction,
+                on_update: Action::NoAction,
+                not_valid: false,
+            },
+        };
+        let before = invalid.clone();
+        assert!(
+            invalid
+                .add_constraint(table.id, constraint.clone())
+                .is_err()
+        );
+        assert_eq!(invalid, before);
+        invalid.ext.constraints.insert(table.id, vec![constraint]);
+        invalid.next_id += 1;
+        assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+    }
+    for owner in [(u64::MAX, column), (table.id, u64::MAX)] {
+        let mut invalid = state.clone();
+        let mut seq = sequence(table.id, column);
+        seq.owned_by = Some(owner);
+        let before = invalid.clone();
+        assert!(invalid.add_sequence(seq.clone()).is_err());
+        assert_eq!(invalid, before);
+        invalid.ext.sequences.insert(invalid.next_id, seq);
+        invalid.next_id += 1;
+        assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+    }
+    for id in [column, state.next_id] {
+        let mut invalid = state.clone();
+        invalid.ext.constraints.insert(
+            table.id,
+            vec![Constraint {
+                id,
+                name: "bad_id".into(),
+                kind: ConstraintKind::PrimaryKey,
+            }],
+        );
+        assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+    }
+}
+
+#[test]
+fn catalog_ext_typmods_roundtrip_and_clear_to_legacy() {
+    for (ty, typmod) in [
+        (DataType::Numeric, numeric(10, 2)),
+        (DataType::Numeric, numeric(2, -3)),
+        (DataType::Numeric, numeric(3, 5)),
+        (DataType::Numeric, numeric(1000, 1000)),
+        (DataType::Timestamp, 0),
+        (DataType::TimeTz, 6),
+        (DataType::Interval, (0x7fff << 16) | 3),
+        (DataType::Interval, ((8 | 1024 | 2048 | 4096) << 16) | 3),
+        (DataType::Interval, (6 << 16) | 0xffff),
+    ] {
+        let (mut state, column) = fixture(ty);
+        let before = legacy(&state);
+        state.set_column_typmod(column, Some(typmod)).unwrap();
+        assert_eq!(state.column_typmod(column), typmod);
+        let decoded: Relational = codec()
+            .deserialize(&codec().serialize(&state).unwrap())
+            .unwrap();
+        assert_eq!(decoded, state);
+        state.set_column_typmod(column, None).unwrap();
+        assert_eq!(state.column_typmod(column), -1);
+        assert_eq!(codec().serialize(&state).unwrap(), before);
+    }
+}
+
+#[test]
+fn catalog_ext_invalid_typmods_reject_decode_and_mutation_atomically() {
+    for (ty, typmod) in [
+        (DataType::Numeric, numeric(0, 0)),
+        (DataType::Numeric, numeric(1001, 0)),
+        (DataType::Numeric, numeric(10, 1001)),
+        (DataType::Numeric, numeric(10, -1001)),
+        (DataType::Numeric, numeric(10, 2) | (1 << 11)),
+        (DataType::Timestamp, 7),
+        (DataType::Timestamp, -2),
+        (DataType::Interval, (0x7fff << 16) | 7),
+        (DataType::Interval, (3 << 16) | 0xffff),
+        (DataType::Interval, (0x7fff << 16) | 0xffff),
+        (DataType::Integer, 0),
+        (DataType::Text, 5),
+    ] {
+        let (mut state, column) = fixture(ty.clone());
+        let before = state.clone();
+        assert!(
+            state.set_column_typmod(column, Some(typmod)).is_err(),
+            "{ty:?} {typmod}"
+        );
+        assert_eq!(state, before);
+        state.ext.columns.insert(
+            column,
+            ColumnExt {
+                typmod: Some(typmod),
+                ..Default::default()
+            },
+        );
+        assert!(
+            codec().deserialize::<Relational>(&wire(&state)).is_err(),
+            "{ty:?} {typmod}"
+        );
+    }
+}
+
+#[test]
+fn catalog_ext_orphan_columns_and_empty_format_two_reject_decode() {
+    let (state, column) = fixture(DataType::Numeric);
+    assert!(codec().deserialize::<Relational>(&wire(&state)).is_err());
+    for id in [column, u64::MAX] {
+        for ext in [
+            ColumnExt {
+                typmod: Some(numeric(10, 2)),
+                ..Default::default()
+            },
+            ColumnExt {
+                default: Some("42".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut invalid = state.clone();
+            invalid.ext.columns.insert(id, ext);
+            if id == column {
+                invalid.tables.get_mut("t").unwrap().columns.pop();
+            }
+            assert!(codec().deserialize::<Relational>(&wire(&invalid)).is_err());
+        }
+    }
+}
+
+#[test]
+fn catalog_ext_default_limits_and_unknown_columns_are_atomic() {
+    let (mut state, column) = fixture(DataType::Text);
+    let before = state.clone();
+    assert!(state.set_column_typmod(u64::MAX, None).is_err());
+    assert!(state.set_column_default(u64::MAX, None).is_err());
+    assert!(state.set_column_identity(u64::MAX, None).is_err());
+    assert_eq!(state, before);
+    for (id, value) in [(u64::MAX, "42".into()), (column, "x".repeat(65537))] {
+        let before = state.clone();
+        assert!(state.set_column_default(id, Some(value)).is_err());
+        assert_eq!(state, before);
+    }
+    state
+        .set_column_default(column, Some("x".repeat(65536)))
+        .unwrap();
+    assert_eq!(
+        codec()
+            .deserialize::<Relational>(&codec().serialize(&state).unwrap())
+            .unwrap(),
+        state
+    );
+    state.set_column_default(column, None).unwrap();
+    assert_eq!(codec().serialize(&state).unwrap(), legacy(&state));
+}
+
+#[test]
+fn catalog_ext_incoming_foreign_key_drop_is_atomic() {
+    let (mut state, column) = fixture(DataType::BigInt);
+    for sql in [
+        "CREATE TABLE child (id BIGINT PRIMARY KEY, parent_id BIGINT)",
+        "INSERT INTO t VALUES (1, 42)",
+        "INSERT INTO child VALUES (2, 1)",
+    ] {
+        let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+        state.execute(&prepared, &[], None).unwrap();
+    }
+    let parent = state.tables["t"].clone();
+    let child = state.tables["child"].clone();
+    let seq = state.add_sequence(sequence(parent.id, column)).unwrap();
+    state
+        .set_column_identity(
+            column,
+            Some(Identity {
+                always: false,
+                sequence_id: seq,
+            }),
+        )
+        .unwrap();
+    state
+        .add_constraint(
+            child.id,
+            Constraint {
+                id: state.next_id,
+                name: "child_parent_fk".into(),
+                kind: ConstraintKind::ForeignKey {
+                    columns: vec![child.columns[1].id],
+                    ref_table: parent.id,
+                    ref_columns: vec![parent.columns[0].id],
+                    on_delete: Action::NoAction,
+                    on_update: Action::NoAction,
+                    not_valid: false,
+                },
+            },
+        )
+        .unwrap();
+    state.validate().unwrap();
+    let before = state.clone();
+    assert!(matches!(state.drop_table("t"), Err(SqlError::Unsupported)));
+    assert_eq!(state.tables, before.tables);
+    assert_eq!(state.rows, before.rows);
+    assert_eq!(state.ext, before.ext);
+    assert_eq!(state.format, before.format);
+    assert_eq!(state.next_id, before.next_id);
+    assert_eq!(state.epoch, before.epoch);
+    assert_eq!(state, before);
+    state.validate().unwrap();
+}
+
+#[test]
+fn catalog_ext_missing_identity_sequence_mutation_is_atomic() {
+    let (mut state, column) = fixture(DataType::BigInt);
+    for populated in [false, true] {
+        if populated {
+            state.set_column_default(column, Some("42".into())).unwrap();
+        }
+        let before = state.clone();
+        assert!(matches!(
+            state.set_column_identity(
+                column,
+                Some(Identity {
+                    always: true,
+                    sequence_id: state.next_id,
+                })
+            ),
+            Err(SqlError::Type)
+        ));
+        assert_eq!(state.ext, before.ext);
+        assert_eq!(state.format, before.format);
+        assert_eq!(state.next_id, before.next_id);
+        assert_eq!(state, before);
+    }
+}
+
+impl Relational {
+    pub(crate) fn assert_legacy_format_for_catalog_ext_test(&self) {
+        assert_eq!(self.format, 1);
+    }
+}

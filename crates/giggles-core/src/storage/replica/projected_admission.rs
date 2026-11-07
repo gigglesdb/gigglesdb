@@ -609,6 +609,7 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Gated<'_, '_, D> {
                 "next_version",
                 "tables",
                 "rows",
+                "ext",
             ],
             (Role::Table, "TableDef") => &["id", "name", "columns", "primary_key"],
             (Role::Column, "ColumnDef") => &["id", "name", "data_type", "not_null"],
@@ -1017,7 +1018,10 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Wrapped<'_, '_, V> {
                 index: 0,
             };
             let out = self.inner.visit_seq(&mut seq)?;
-            if seq.index != n {
+            // Relational declares an 8th `ext` field that only format 2 carries; replica
+            // images admit format 1 alone, so its visitor stops after the 7 legacy fields.
+            let legacy_relational = self.role == Role::Relational && n == 8 && seq.index == 7;
+            if seq.index != n && !legacy_relational {
                 return Err(Failure::Invalid);
             }
             Ok(out)
@@ -1428,7 +1432,7 @@ fn layouts() -> Result<(), Failure> {
         size_of::<TableDef>(),
         size_of::<SqlRow>(),
         size_of::<relational::Relational>(),
-    ] != [40, 40, 80, 32, 136]
+    ] != [40, 40, 80, 32, 240]
         || [
             align_of::<Value>(),
             align_of::<ColumnDef>(),
@@ -1606,9 +1610,9 @@ mod tests {
             ],
             [8; 4]
         );
-        assert_eq!(size_of::<relational::Relational>(), 136);
+        assert_eq!(size_of::<relational::Relational>(), 240);
         assert_eq!(size_of::<Metadata>(), 80);
-        assert_eq!(size_of::<State>(), 448);
+        assert_eq!(size_of::<State>(), 560);
         assert_eq!(size_of::<DataType>(), 1);
         layouts().unwrap();
         println!(
@@ -1637,6 +1641,36 @@ mod tests {
         let s = c.decode_canonical(&mut b, &mut || false).unwrap();
         assert_eq!(wire(&records(&s).unwrap()), original);
         assert_eq!(image.0, original);
+    }
+    #[test]
+    fn format_two_catalog_extension_rejected_but_base_admitted() {
+        let image = fixture();
+        let mut map: BTreeMap<Vec<u8>, Vec<u8>> = super::super::decode(&image.0).unwrap();
+        let mut sql: relational::Relational = super::super::decode(&map[&vec![5]]).unwrap();
+        let column = sql.tables["items"].columns[0].id;
+        sql.set_column_default(column, Some("1".into())).unwrap();
+        assert!(!sql.catalog_ext().is_empty());
+        let extended = wire(&sql);
+        assert_eq!(&extended[..4], &2u32.to_be_bytes());
+        let decoded: relational::Relational = super::super::decode(&extended).unwrap();
+        decoded.assert_legacy_format_for_catalog_ext_test();
+        assert_eq!(decoded.catalog_ext(), sql.catalog_ext());
+        map.insert(vec![5], extended);
+        let extended_image = Image(wire(&map));
+        let limits = SourceAdmissionLimits::default();
+        let mut budget = SourceBudget::new(SourceAdmissionLimits::default());
+        assert!(matches!(
+            admit_projected_source(&extended_image, &limits, &mut budget, &mut || false),
+            Err(CoreError::Unsupported)
+        ));
+
+        sql.set_column_default(column, None).unwrap();
+        assert!(sql.catalog_ext().is_empty());
+        map.insert(vec![5], wire(&sql));
+        let base_image = Image(wire(&map));
+        assert_eq!(base_image.0, image.0);
+        let mut budget = SourceBudget::new(SourceAdmissionLimits::default());
+        assert!(admit_projected_source(&base_image, &limits, &mut budget, &mut || false).is_ok());
     }
     #[test]
     fn actual_public_nested_types() {

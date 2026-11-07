@@ -38,7 +38,10 @@ fn feature_record_precedes_payload_and_is_canonical() {
         from_records(forged(512)),
         Err(CoreError::Unsupported)
     ));
-    assert!(matches!(from_records(forged(512 | 256)), Err(CoreError::Unsupported)));
+    assert!(matches!(
+        from_records(forged(512 | 256)),
+        Err(CoreError::Unsupported)
+    ));
     let mut r = forged(320);
     r.insert(key(11, &[1, 2]), vec![255]);
     assert!(matches!(normal(r), Err(CoreError::Corrupt(_))));
@@ -142,7 +145,296 @@ fn export_refuses_role_bootstrap_bits_without_panicking() {
         export_allowed(ROLE_BOOTSTRAP | 64),
         Err(CoreError::Unsupported)
     ));
-    assert!(matches!(export_allowed(ROLE_BOOTSTRAP), Err(CoreError::Unsupported)));
+    assert!(matches!(
+        export_allowed(ROLE_BOOTSTRAP),
+        Err(CoreError::Unsupported)
+    ));
     assert!(export_allowed(64 | 128 | 256).is_ok());
     assert!(export_allowed(0).is_ok());
+}
+
+fn catalog_ext_fixture() -> (State, u64, u64) {
+    let mut s = empty(17);
+    let p = crate::relational::Prepared::parse(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, value NUMERIC)",
+        17,
+        s.sql.epoch,
+    )
+    .unwrap();
+    s.sql.execute(&p, &[], None).unwrap();
+    let table = &s.sql.tables["t"];
+    let (tid, cid) = (table.id, table.columns[1].id);
+    (s, tid, cid)
+}
+
+#[test]
+fn catalog_ext_records_roundtrip_gate_bits_and_restore_legacy() {
+    use crate::relational::catalog_ext::*;
+    let (mut s, tid, cid) = catalog_ext_fixture();
+    let legacy = records(&s).unwrap();
+    let metadata: Metadata = decode(&legacy[&vec![0]]).unwrap();
+    let bits = format_policy::legacy_version_to_bits(metadata.format).unwrap();
+    let seq = s
+        .sql
+        .add_sequence(SequenceDef {
+            name: "t_identity_seq".into(),
+            data_type: crate::relational::DataType::BigInt,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: Some((tid, cid)),
+            identity: true,
+            incarnation: 1,
+        })
+        .unwrap();
+    s.sql.set_column_default(cid, Some("42".into())).unwrap();
+    s.sql
+        .set_column_identity(
+            cid,
+            Some(Identity {
+                always: true,
+                sequence_id: seq,
+            }),
+        )
+        .unwrap();
+    for (offset, name, kind) in [
+        (
+            1,
+            "positive",
+            ConstraintKind::Check {
+                expr: "value > 0".into(),
+                not_valid: false,
+            },
+        ),
+        (
+            2,
+            "parent",
+            ConstraintKind::ForeignKey {
+                columns: vec![cid],
+                ref_table: tid,
+                ref_columns: vec![s.sql.tables["t"].columns[0].id],
+                on_delete: Action::Restrict,
+                on_update: Action::SetDefault,
+                not_valid: true,
+            },
+        ),
+        (3, "t_pkey", ConstraintKind::PrimaryKey),
+    ] {
+        s.sql
+            .add_constraint(
+                tid,
+                Constraint {
+                    id: seq + offset,
+                    name: name.into(),
+                    kind,
+                },
+            )
+            .unwrap();
+    }
+    let r = records(&s).unwrap();
+    assert_eq!(decode::<Metadata>(&r[&vec![0]]).unwrap().format, 53);
+    assert_eq!(r[&vec![10]], (bits | 64).to_be_bytes());
+    let recovered = from_records(r.clone()).unwrap();
+    assert_eq!(recovered.sql, s.sql);
+    assert_eq!(records(&recovered).unwrap(), r);
+    let mut no_typmod = r.clone();
+    no_typmod.insert(vec![10], (bits | 64 | 128).to_be_bytes().to_vec());
+    assert!(matches!(
+        from_records(no_typmod),
+        Err(CoreError::Corrupt(_))
+    ));
+    s.sql
+        .set_column_typmod(cid, Some((10 << 16) | 2 | 4))
+        .unwrap();
+    let typed = records(&s).unwrap();
+    assert_eq!(typed[&vec![10]], (bits | 64 | 128).to_be_bytes());
+    assert_eq!(
+        records(&from_records(typed.clone()).unwrap()).unwrap(),
+        typed
+    );
+    let mut missing_bit = typed;
+    missing_bit.insert(vec![10], (bits | 64).to_be_bytes().to_vec());
+    assert!(matches!(
+        from_records(missing_bit),
+        Err(CoreError::Corrupt(_))
+    ));
+    s.sql.set_column_typmod(cid, None).unwrap();
+    s.sql.set_column_default(cid, None).unwrap();
+    s.sql.set_column_identity(cid, None).unwrap();
+    for name in ["positive", "parent", "t_pkey"] {
+        s.sql.remove_constraint(tid, name).unwrap();
+    }
+    s.sql.remove_sequence(seq).unwrap();
+    let restored = records(&s).unwrap();
+    assert!(!restored.contains_key(&vec![10]));
+    assert_eq!(
+        decode::<Metadata>(&restored[&vec![0]]).unwrap().format,
+        metadata.format
+    );
+    // A never-extended state with the same consumed counters has identical bytes.
+    let legacy_payload = &restored[&vec![5]];
+    let mut expected = legacy.clone();
+    let mut expected_payload = expected[&vec![5]].clone();
+    // generation, epoch and allocator counters are the only permitted differences.
+    expected_payload[4..36].copy_from_slice(&legacy_payload[4..36]);
+    expected.insert(vec![5], expected_payload);
+    assert_eq!(restored, expected);
+}
+
+#[derive(Serialize)]
+struct CatalogExtTestWire {
+    ext_version: u32,
+    columns: BTreeMap<u64, crate::relational::catalog_ext::ColumnExt>,
+    constraints: BTreeMap<u64, Vec<crate::relational::catalog_ext::Constraint>>,
+    sequences: BTreeMap<u64, crate::relational::catalog_ext::SequenceDef>,
+    types: BTreeMap<u64, u32>,
+}
+
+fn catalog_ext_raw_records(ext: Vec<u8>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let (s, _, _) = catalog_ext_fixture();
+    let mut r = records(&s).unwrap();
+    let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
+    let bits = format_policy::legacy_version_to_bits(m.format).unwrap();
+    m.format = 53;
+    r.insert(vec![0], encode(&m).unwrap());
+    r.insert(vec![10], (bits | 64).to_be_bytes().to_vec());
+    let payload = r.get_mut(&vec![5]).unwrap();
+    payload[..4].copy_from_slice(&2u32.to_be_bytes());
+    payload.extend(ext);
+    r
+}
+
+#[test]
+fn catalog_ext_wire_errors_distinguish_corrupt_and_unsupported() {
+    let empty_ext = || CatalogExtTestWire {
+        ext_version: 1,
+        columns: BTreeMap::new(),
+        constraints: BTreeMap::new(),
+        sequences: BTreeMap::new(),
+        types: BTreeMap::new(),
+    };
+    assert!(matches!(
+        from_records(catalog_ext_raw_records(encode(&empty_ext()).unwrap())),
+        Err(CoreError::Corrupt(_))
+    ));
+    let mut ext = empty_ext();
+    ext.ext_version = 2;
+    assert!(matches!(
+        from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
+        Err(CoreError::Unsupported)
+    ));
+    let mut ext = empty_ext();
+    ext.types.insert(100, 0);
+    assert!(matches!(
+        from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
+        Err(CoreError::Unsupported)
+    ));
+    // Advertise a huge expression without a payload: bounded decoding must reject
+    // its length, before requesting or allocating the missing string bytes.
+    let (_, _, column) = catalog_ext_fixture();
+    let mut malicious = Vec::new();
+    malicious.extend(1u32.to_be_bytes());
+    malicious.extend(1u64.to_be_bytes());
+    malicious.extend(column.to_be_bytes());
+    malicious.push(0); // no typmod
+    malicious.push(1); // default present
+    malicious.extend(u64::MAX.to_be_bytes());
+    assert!(matches!(
+        from_records(catalog_ext_raw_records(malicious)),
+        Err(CoreError::Corrupt(_)) | Err(CoreError::Limit)
+    ));
+}
+
+#[test]
+fn legacy_envelope_rejects_nonempty_catalog_extension() {
+    let (mut s, _, cid) = catalog_ext_fixture();
+    let mut legacy = records(&s).unwrap();
+    assert!(!legacy.contains_key(&vec![10]));
+    s.sql.set_column_default(cid, Some("42".into())).unwrap();
+    let extended = records(&s).unwrap();
+    legacy.insert(vec![5], extended[&vec![5]].clone());
+    assert!(matches!(
+        from_records(legacy),
+        Err(CoreError::Corrupt(message)) if message == "feature content mismatch"
+    ));
+}
+
+#[test]
+fn catalog_default_preserves_readiness_but_blocks_projectors_until_cleared() {
+    use crate::relational::{Prepared, SqlError};
+    let mut state = empty(17);
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, value TEXT)",
+        "INSERT INTO t VALUES (1, 'one'), (2, 'two')",
+    ] {
+        let p = Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&p, &[], None).unwrap();
+    }
+    let table = state.sql.tables["t"].clone();
+    let column = table.columns[1].id;
+    let baseline = records(&state).unwrap();
+    let check = |state: &State, extended: bool| {
+        state.sql.assert_legacy_format_for_catalog_ext_test();
+        let mut indexed = state.sql.clone();
+        let p = Prepared::parse(
+            "CREATE UNIQUE INDEX by_value ON t (value)",
+            17,
+            indexed.epoch,
+        )
+        .unwrap();
+        indexed.execute(&p, &[], None).unwrap();
+        let rows =
+            state
+                .sql
+                .with_complete_table_engine(table.id, || false, |_, rows| Ok(rows.len()));
+        let counters =
+            state
+                .sql
+                .projector_counters_engine(state.sql.epoch, state.sql.generation, &mut || false);
+        if extended {
+            assert!(matches!(rows, Err(SqlError::Unsupported)));
+            assert!(matches!(counters, Err(SqlError::Unsupported)));
+        } else {
+            assert_eq!(rows.unwrap(), 2);
+            counters.unwrap();
+        }
+    };
+    check(&state, false);
+    state
+        .sql
+        .set_column_default(column, Some("'fallback'".into()))
+        .unwrap();
+    let expected_ext = state.sql.catalog_ext().clone();
+    let reopened = from_records(records(&state).unwrap()).unwrap();
+    for mut candidate in [state, reopened] {
+        assert_eq!(candidate.sql.catalog_ext(), &expected_ext);
+        check(&candidate, true);
+        candidate.sql.set_column_default(column, None).unwrap();
+        check(&candidate, false);
+        assert_eq!(records(&candidate).unwrap()[&vec![5]], baseline[&vec![5]]);
+        let reopened = from_records(records(&candidate).unwrap()).unwrap();
+        check(&reopened, false);
+        assert_eq!(records(&reopened).unwrap()[&vec![5]], baseline[&vec![5]]);
+    }
+}
+
+#[test]
+fn format_one_namespace_rejects_trailing_bytes_and_encoded_extension() {
+    let (mut state, _, column) = catalog_ext_fixture();
+    let base = records(&state).unwrap();
+    state
+        .sql
+        .set_column_default(column, Some("42".into()))
+        .unwrap();
+    for suffix in [vec![0xff], encode(state.sql.catalog_ext()).unwrap()] {
+        let mut malformed = base.clone();
+        malformed.get_mut(&vec![5]).unwrap().extend(suffix);
+        assert!(matches!(
+            from_records(malformed),
+            Err(CoreError::Corrupt(_))
+        ));
+    }
 }

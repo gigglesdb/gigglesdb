@@ -2,6 +2,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod assign;
+#[allow(dead_code)]
+pub(crate) mod catalog_ext;
+use catalog_ext::*;
 mod ident;
 use ident::ident;
 mod numeric;
@@ -269,8 +272,9 @@ pub struct SqlResult {
     pub rows: Vec<SqlRow>,
     pub affected: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Relational {
+    // Base in-memory format is always 1; wire format is 2 iff ext is nonempty.
     format: u32,
     pub generation: u64,
     pub epoch: u64,
@@ -278,7 +282,7 @@ pub(crate) struct Relational {
     next_version: u64,
     pub tables: BTreeMap<String, TableDef>,
     rows: BTreeMap<u64, BTreeMap<Vec<u8>, SqlRow>>,
-    #[serde(skip, default)]
+    ext: CatalogExt,
     secondary: secondary_index::Sidecar,
 }
 impl Default for Relational {
@@ -291,6 +295,7 @@ impl Default for Relational {
             next_version: 1,
             tables: BTreeMap::new(),
             rows: BTreeMap::new(),
+            ext: CatalogExt::default(),
             secondary: secondary_index::Sidecar::default(),
         }
     }
@@ -1667,10 +1672,21 @@ impl Relational {
         let Some(table) = self.tables.get(name) else {
             return Ok(false);
         };
+        let table_id = table.id;
         let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
-        self.rows.remove(&table.id);
-        self.secondary.drop_table(table.id);
+        let mut ext = self.ext.clone();
+        for column in &table.columns {
+            ext.columns.remove(&column.id);
+        }
+        ext.constraints.remove(&table_id);
+        ext.sequences
+            .retain(|_, seq| !matches!(seq.owned_by, Some((id, _)) if id == table_id));
+        Self::normalize_ext(&mut ext);
+        self.validate_ext_candidate(&ext, self.next_id, Some(table_id))?;
+        self.rows.remove(&table_id);
+        self.secondary.drop_table(table_id);
         self.tables.remove(name);
+        self.ext = ext;
         self.epoch = epoch;
         Ok(true)
     }
@@ -1730,6 +1746,7 @@ impl Relational {
         if self.format != 1 {
             return Err(SqlError::Unsupported);
         }
+        self.validate_ext()?;
         if self.tables.len() > MAX_TABLES || self.rows.len() != self.tables.len() {
             return Err(SqlError::Type);
         }
@@ -2287,3 +2304,6 @@ mod arithmetic_lexer_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod catalog_ext_tests;

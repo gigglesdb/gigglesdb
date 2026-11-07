@@ -14,7 +14,8 @@ impl Relational {
     // descriptor, name, or PK offset. No row traversal is needed here.
     fn projector_table(&self, table_id: u64, cancel: &mut impl FnMut() -> bool) -> R<&TableDef> {
         tick(cancel)?;
-        if self.format != 1 {
+        // TODO(E1 C-phase): database-wide; narrow to this table's ext entries (columns and constraints).
+        if self.format != 1 || !self.catalog_ext().is_empty() {
             return Err(SqlError::Unsupported);
         }
         if self.tables.len() > MAX_TABLES || self.rows.len() != self.tables.len() {

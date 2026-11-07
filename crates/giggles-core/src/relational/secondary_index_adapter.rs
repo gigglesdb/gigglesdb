@@ -493,14 +493,19 @@ impl Serialize for StatementRows<'_> {
 }
 impl Serialize for StatementNamespace5<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("Relational", 7)?;
-        s.serialize_field("format", &self.source.format)?;
+        let extended = !self.source.ext.is_empty();
+        let format = if extended { 2u32 } else { 1u32 };
+        let mut s = serializer.serialize_struct("Relational", if extended { 8 } else { 7 })?;
+        s.serialize_field("format", &format)?;
         s.serialize_field("generation", &self.source.generation)?;
         s.serialize_field("epoch", &self.source.epoch)?;
         s.serialize_field("next_id", &self.source.next_id)?;
         s.serialize_field("next_version", &self.next_version)?;
         s.serialize_field("tables", &self.source.tables)?;
         s.serialize_field("rows", &StatementRows(self))?;
+        if extended {
+            s.serialize_field("ext", &self.source.ext)?;
+        }
         s.end()
     }
 }
@@ -1096,15 +1101,88 @@ impl Serialize for Relational {
 struct LegacyNamespace5<'a>(&'a Relational);
 impl Serialize for LegacyNamespace5<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("Relational", 7)?;
-        s.serialize_field("format", &self.0.format)?;
+        let extended = !self.0.ext.is_empty();
+        let format = if extended { 2u32 } else { 1u32 };
+        let mut s = serializer.serialize_struct("Relational", if extended { 8 } else { 7 })?;
+        s.serialize_field("format", &format)?;
         s.serialize_field("generation", &self.0.generation)?;
         s.serialize_field("epoch", &self.0.epoch)?;
         s.serialize_field("next_id", &self.0.next_id)?;
         s.serialize_field("next_version", &self.0.next_version)?;
         s.serialize_field("tables", &self.0.tables)?;
         s.serialize_field("rows", &self.0.rows)?;
+        if extended {
+            s.serialize_field("ext", &self.0.ext)?;
+        }
         s.end()
+    }
+}
+
+// Bincode structs have no field count on the wire. Read the discriminator before
+// choosing whether the eighth field exists, preserving every format-1 byte.
+impl<'de> Deserialize<'de> for Relational {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RelationalVisitor;
+        impl<'de> serde::de::Visitor<'de> for RelationalVisitor {
+            type Value = Relational;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a versioned relational catalog")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let format: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::custom("missing relational format"))?;
+                if !matches!(format, 1 | 2) {
+                    return Err(A::Error::custom(catalog_ext::UNSUPPORTED_CATALOG_EXT));
+                }
+                macro_rules! field {
+                    ($name:literal) => {
+                        seq.next_element()?.ok_or_else(|| {
+                            A::Error::custom(concat!("missing relational ", $name))
+                        })?
+                    };
+                }
+                let mut value = Relational {
+                    format: 1,
+                    generation: field!("generation"),
+                    epoch: field!("epoch"),
+                    next_id: field!("next_id"),
+                    next_version: field!("next_version"),
+                    tables: field!("tables"),
+                    rows: field!("rows"),
+                    ext: CatalogExt::default(),
+                    secondary: Sidecar::default(),
+                };
+                if format == 2 {
+                    value.ext = field!("ext");
+                    if value.ext.is_empty() {
+                        return Err(A::Error::custom("empty format-2 catalog extension"));
+                    }
+                    value.validate_ext().map_err(|error| {
+                        A::Error::custom(format!("relational catalog invariant: {error:?}"))
+                    })?;
+                }
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_struct(
+            "Relational",
+            &[
+                "format",
+                "generation",
+                "epoch",
+                "next_id",
+                "next_version",
+                "tables",
+                "rows",
+                "ext",
+            ],
+            RelationalVisitor,
+        )
     }
 }
 

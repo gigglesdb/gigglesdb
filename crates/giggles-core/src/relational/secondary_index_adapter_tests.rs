@@ -967,3 +967,40 @@ fn unique_typed_nonkeys_lossless_and_raw_numeric_scale_witness() {
         (base, payload)
     );
 }
+
+#[test]
+fn statement_namespace_follows_catalog_extension_wire_shape() {
+    use bincode::Options;
+    let mut state = base();
+    insert(&mut state, 1, Value::Text("one".into()));
+    let column = state.tables["items"].columns[1].id;
+    for default in [None, Some("'default'".into())] {
+        state.set_column_default(column, default).unwrap();
+        let replacements = BTreeMap::new();
+        let image = StatementNamespace5 {
+            source: &state,
+            replacements: &replacements,
+            next_version: state.next_version,
+        };
+        assert_eq!(
+            bincode::serialize(&image).unwrap(),
+            bincode::serialize(&LegacyNamespace5(&state)).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&image).unwrap(),
+            bincode::serialize(&state).unwrap()
+        );
+        let codec = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_big_endian()
+            .reject_trailing_bytes();
+        assert_eq!(
+            codec.serialize(&image).unwrap(),
+            codec.serialize(&LegacyNamespace5(&state)).unwrap()
+        );
+        assert_eq!(
+            codec.serialize(&image).unwrap(),
+            codec.serialize(&state).unwrap()
+        );
+    }
+}

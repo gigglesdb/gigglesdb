@@ -89,7 +89,9 @@ impl Relational {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<ProjectionCounters> {
         tick(cancel)?;
-        if self.format != 1 || self.has_secondary_indexes_engine() {
+        // TODO(E1 C-phase): database-wide; narrow to this table's ext entries (columns and constraints).
+        if self.format != 1 || !self.catalog_ext().is_empty() || self.has_secondary_indexes_engine()
+        {
             return Err(SqlError::Unsupported);
         }
         if self.epoch != expected_epoch || self.generation != expected_generation {
@@ -342,6 +344,7 @@ impl ScratchRelation {
         tick(cancel)?;
         let relation = Relational {
             format: 1,
+            ext: Default::default(),
             generation: counters.generation,
             epoch: counters.epoch,
             next_id: counters.next_id,
