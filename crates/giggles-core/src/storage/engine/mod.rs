@@ -4,6 +4,7 @@
 pub(crate) mod codec;
 pub(crate) mod crc32c;
 pub(crate) mod hlc;
+pub(crate) mod locks;
 
 #[cfg(test)]
 mod tests;
