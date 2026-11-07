@@ -61,14 +61,14 @@ async fn trim_standard_forms_describe_binary_bind_bytea_and_rows() {
             .get::<_, Vec<u8>>(0),
         vec![97u8, 98]
     );
-    // Existing bytea-one-argument resolver classification is a retained PG42883 gap.
+    // PG18: function pg_catalog.btrim(bytea) does not exist (42883).
     assert_eq!(
         code(
             pg.prepare("SELECT TRIM(decode('20','hex'))")
                 .await
                 .unwrap_err()
         ),
-        "42804"
+        "42883"
     );
     pg.execute("INSERT INTO app(id,body) VALUES(1,'xxAbxx')", &[])
         .await

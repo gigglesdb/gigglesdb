@@ -227,12 +227,12 @@ fn declared_type_conflicts_return_existing_binder_errors_at_every_query_entry() 
         (
             "SELECT upper($1)",
             vec![Some(DataType::Bytes)],
-            SqlError::Type,
+            SqlError::UndefinedFunction,
         ),
         (
             "SELECT id FROM declared_inputs WHERE id=$1",
             vec![Some(DataType::Bytes)],
-            SqlError::Type,
+            SqlError::UndefinedFunction,
         ),
         (
             "SELECT position($1 in $2)",

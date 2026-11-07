@@ -238,6 +238,9 @@ fn trim_existing_callee_and_namespace_error_gaps_are_explicit() {
         let query = case["query"].as_str().unwrap();
         let result = session.prepare(query).and_then(|p| session.describe(&p));
         let want = match case["known_gap_core"].as_str().unwrap() {
+            // F10: PG18 reports every curated wrong-type and wrong-arity
+            // TRIM callee as 42883; core now resolves the same way.
+            "Type" if case["observation"]["sqlstate"] == "42883" => SqlError::UndefinedFunction,
             "Type" => SqlError::Type,
             "Unsupported" => SqlError::Unsupported,
             _ => panic!("{case}"),
@@ -245,7 +248,7 @@ fn trim_existing_callee_and_namespace_error_gaps_are_explicit() {
         assert_eq!(
             result.unwrap_err(),
             CoreError::Sql(want),
-            "retained PG error mismatch: {case}"
+            "PG error or retained gap mismatch: {case}"
         );
         gaps += 1;
     }

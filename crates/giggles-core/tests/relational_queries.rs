@@ -642,7 +642,12 @@ fn future_join_scope_and_conflicting_parameter_types_reject_empty_tables() {
     let p = s
         .prepare("SELECT COUNT(*) FROM people p WHERE p.id=$1 AND p.label=$1")
         .unwrap();
-    assert!(matches!(s.describe(&p), Err(CoreError::Sql(E::Type))));
+    // PG 18.6 infers $1 = bigint from p.id; p.label = $1 then has no
+    // text = bigint operator: 42883 "operator does not exist: text = bigint".
+    assert!(matches!(
+        s.describe(&p),
+        Err(CoreError::Sql(E::UndefinedFunction))
+    ));
     err(
         &mut s,
         "SELECT p.id FROM people p WHERE p.id=$2",

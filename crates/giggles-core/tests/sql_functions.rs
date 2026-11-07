@@ -82,7 +82,13 @@ fn schema_and_signature_errors_on_empty_and_limit_zero() {
             "coalesce(txt,i)",
             "substring(txt,txt)",
         ] {
-            error(&mut s, &format!("SELECT {q} FROM f{suffix}"), E::Type);
+            // PostgreSQL's substring(text,text) regex overload is not implemented.
+            let expected = if q.starts_with("coalesce(") || q == "substring(txt,txt)" {
+                E::Type
+            } else {
+                E::UndefinedFunction
+            };
+            error(&mut s, &format!("SELECT {q} FROM f{suffix}"), expected);
         }
         error(
             &mut s,

@@ -99,7 +99,7 @@ fn nulls_signatures_metadata_and_prepared() {
     ] {
         assert_eq!(
             s.execute(&format!("SELECT {q} LIMIT 0"), &[], None),
-            Err(CoreError::Sql(E::Type)),
+            Err(CoreError::Sql(E::UndefinedFunction)),
             "{q}"
         );
     }
@@ -183,7 +183,7 @@ fn all_signatures_reject_arity_and_wrong_types_before_scan() {
         ] {
             assert_eq!(
                 s.execute(&query, &[], None),
-                Err(CoreError::Sql(E::Type)),
+                Err(CoreError::Sql(E::UndefinedFunction)),
                 "{query}"
             );
         }
@@ -231,7 +231,7 @@ fn pg18_right_int_min_and_concat_ws_min_arity() {
     );
     assert_eq!(
         s.execute("SELECT concat_ws(',') LIMIT 0", &[], None),
-        Err(CoreError::Sql(E::Type))
+        Err(CoreError::Sql(E::UndefinedFunction))
     );
 }
 

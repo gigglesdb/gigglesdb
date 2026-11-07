@@ -20,7 +20,7 @@ pub(super) fn signature(n: &str, count: usize) -> Option<R<Signature>> {
         _ => return None,
     };
     Some(if count < min || count > max {
-        Err(SqlError::Type)
+        Err(SqlError::UndefinedFunction)
     } else {
         Ok((
             (0..count)

@@ -780,17 +780,7 @@ impl Scalar {
                                     && (ty == DataType::BigInt
                                         || ty == DataType::Integer && a.ty == DataType::SmallInt))
                             {
-                                return Err(
-                                    if temporal::known_name(name)
-                                        || character::known_name(name)
-                                        || name == "md5"
-                                        || name == "strpos" && a.ty == DataType::Bytes
-                                    {
-                                        SqlError::UndefinedFunction
-                                    } else {
-                                        SqlError::Type
-                                    },
-                                );
+                                return Err(SqlError::UndefinedFunction);
                             }
                         }
                     }
@@ -821,7 +811,7 @@ impl Scalar {
                                         Self::Literal(Value::Text(_) | Value::Null)
                                     ))
                                 {
-                                    return Err(SqlError::Type);
+                                    return Err(SqlError::UndefinedFunction);
                                 }
                                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
                                     &original[i]
@@ -865,7 +855,7 @@ impl Scalar {
                                     };
                                 } else {
                                     if !number(&a.ty) {
-                                        return Err(SqlError::Type);
+                                        return Err(SqlError::UndefinedFunction);
                                     }
                                     let old = std::mem::replace(
                                         a,
@@ -893,7 +883,7 @@ impl Scalar {
                                 };
                             } else {
                                 if !(integer(&args[0].ty) || args[0].ty == target) {
-                                    return Err(SqlError::Type);
+                                    return Err(SqlError::UndefinedFunction);
                                 }
                                 let old = args.remove(0);
                                 args.push(BoundScalar {
@@ -909,15 +899,9 @@ impl Scalar {
                         }
                         "div" | "mod" | "gcd" | "lcm" if args.len() == 2 => {
                             if name != "div"
-                                && original.iter().all(|a| {
-                                    matches!(
-                                        a,
-                                        Self::Literal(Value::Text(_) | Value::Null)
-                                            | Self::Param(_)
-                                    )
-                                })
+                                && original.iter().all(|a| a.aggregate_unknown(parameters))
                             {
-                                return Err(SqlError::Type);
+                                return Err(SqlError::AmbiguousFunction);
                             }
                             if matches!(name.as_str(), "gcd" | "lcm")
                                 && args.iter().all(|a| {
@@ -927,7 +911,19 @@ impl Scalar {
                                     )
                                 })
                             {
-                                return Err(SqlError::Type);
+                                return Err(
+                                    if args.iter().zip(original).all(|(a, source)| {
+                                        a.ty == DataType::SmallInt
+                                            || matches!(
+                                                source,
+                                                Self::Literal(Value::Text(_) | Value::Null)
+                                            )
+                                    }) {
+                                        SqlError::AmbiguousFunction
+                                    } else {
+                                        SqlError::UndefinedFunction
+                                    },
+                                );
                             }
                             let target = if name == "div"
                                 || args.iter().any(|a| a.ty == DataType::Numeric)
@@ -955,7 +951,7 @@ impl Scalar {
                                         Self::Literal(Value::Text(_) | Value::Null)
                                     )
                                 {
-                                    return Err(SqlError::Type);
+                                    return Err(SqlError::UndefinedFunction);
                                 }
                                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
                                     &original[i]
@@ -1006,7 +1002,7 @@ impl Scalar {
                                         DataType::Real | DataType::DoublePrecision
                                     ))
                             {
-                                return Err(SqlError::Type);
+                                return Err(SqlError::UndefinedFunction);
                             }
                             if args[0].ty != target {
                                 if !number(&args[0].ty)
@@ -1015,7 +1011,7 @@ impl Scalar {
                                         Self::Literal(Value::Text(_) | Value::Null)
                                     )
                                 {
-                                    return Err(SqlError::Type);
+                                    return Err(SqlError::UndefinedFunction);
                                 }
                                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
                                     &original[0]
@@ -1055,13 +1051,13 @@ impl Scalar {
                                 args[0].ty = DataType::DoublePrecision;
                             }
                             if !number(&args[0].ty) {
-                                return Err(SqlError::Type);
+                                return Err(SqlError::UndefinedFunction);
                             }
                             args[0].ty.clone()
                         }
                         "length" | "lower" | "upper" if args.len() == 1 => {
                             if !null(&args[0]) && args[0].ty != DataType::Text {
-                                return Err(SqlError::Type);
+                                return Err(SqlError::UndefinedFunction);
                             }
                             if name == "length" {
                                 DataType::Integer
@@ -1070,6 +1066,15 @@ impl Scalar {
                             }
                         }
                         "substring" | "substr" if (2..=3).contains(&args.len()) => {
+                            if name == "substring"
+                                && args.iter().all(|a| a.ty == DataType::Text)
+                                && original[1..]
+                                    .iter()
+                                    .any(|a| !a.aggregate_unknown(parameters))
+                            {
+                                // PostgreSQL regex overloads exist but are not implemented here.
+                                return Err(SqlError::Type);
+                            }
                             for (i, a) in args.iter_mut().enumerate() {
                                 let ty = if i == 0 {
                                     DataType::Text
@@ -1088,7 +1093,7 @@ impl Scalar {
                                     a.ty = ty.clone();
                                 }
                                 if a.ty != ty {
-                                    return Err(SqlError::Type);
+                                    return Err(SqlError::UndefinedFunction);
                                 }
                             }
                             DataType::Text
@@ -1143,9 +1148,9 @@ impl Scalar {
                             }
                             ty
                         }
-                        "abs" | "length" | "lower" | "upper" | "substring" | "substr"
-                        | "coalesce" => {
-                            return Err(SqlError::Type);
+                        "coalesce" => return Err(SqlError::Type),
+                        "abs" | "length" | "lower" | "upper" | "substring" | "substr" => {
+                            return Err(SqlError::UndefinedFunction);
                         }
                         _ => return Err(SqlError::Unsupported),
                     }
@@ -1934,6 +1939,12 @@ impl Scalar {
                 integer_formats::argument_type(ty.as_ref())?;
             }
             Self::Call(n, args) => {
+                if matches!(n.as_str(), "mod" | "gcd" | "lcm")
+                    && args.len() == 2
+                    && args.iter().all(|a| a.aggregate_unknown(parameters))
+                {
+                    return Err(SqlError::AmbiguousFunction);
+                }
                 if n == "strpos" {
                     // Reject the missing bytea overload before text inference
                     // turns a declared argument into a parameter-type conflict.
@@ -2046,7 +2057,15 @@ impl Scalar {
                             _ => None,
                         }
                     };
-                    a.infer(ty.as_ref(), parameters, resolve, tables)?;
+                    // Preserve declared parameter types for overload resolution at bind time.
+                    let expected = if n != "coalesce"
+                        && matches!(a, Self::Param(slot) if parameters.get(slot - 1).is_some_and(Option::is_some))
+                    {
+                        None
+                    } else {
+                        ty.as_ref()
+                    };
+                    a.infer(expected, parameters, resolve, tables)?;
                 }
             }
             _ => {}
@@ -2151,6 +2170,25 @@ fn float_function(name: &str, n: f64) -> f64 {
             }
         }
         _ => n,
+    }
+}
+
+pub(super) fn comparison_mismatch(a: &DataType, b: &DataType) -> SqlError {
+    // Type cases are known unimplemented implicit cast gaps, not PostgreSQL behavior.
+    if matches!(
+        a,
+        DataType::Date | DataType::Timestamp | DataType::TimestampTz
+    ) && matches!(
+        b,
+        DataType::Date | DataType::Timestamp | DataType::TimestampTz
+    ) || matches!(
+        (a, b),
+        (DataType::Time, DataType::TimeTz | DataType::Interval)
+            | (DataType::TimeTz | DataType::Interval, DataType::Time)
+    ) {
+        SqlError::Type
+    } else {
+        SqlError::UndefinedFunction
     }
 }
 

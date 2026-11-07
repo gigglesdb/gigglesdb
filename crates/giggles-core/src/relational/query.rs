@@ -536,7 +536,7 @@ impl Filter {
                             bv = bind(&Scalar::Cast(Box::new(b.clone()), ty))?;
                         }
                     } else {
-                        return Err(SqlError::Type);
+                        return Err(functions::comparison_mismatch(&av.ty, &bv.ty));
                     }
                 }
                 BoundFilter::Compare(av, op.clone(), bv)
@@ -1805,7 +1805,7 @@ impl Query {
                         // converted column key can round and miss matching rows.
                         return Ok(false);
                     }
-                    return Err(SqlError::Type);
+                    return Err(functions::comparison_mismatch(old, ty));
                 }
                 slot.get_or_insert_with(|| ty.clone());
             } else if let Expr::Literal(v) = e {
@@ -1834,6 +1834,17 @@ impl Query {
         let mut predicates = vec![];
         for (c, op, e) in &self.predicates {
             let c = resolve(c, tables.len())?;
+            if let Expr::Literal(value) = e
+                && !matches!(value, Value::Null | Value::Text(_))
+            {
+                let literal = Scalar::Literal(value.clone()).bind(&resolve, &tables, &parameters)?;
+                let column_type = &tables[c.source].columns[c.column].data_type;
+                if literal.ty != *column_type
+                    && functions::comparison_type(&literal.ty, column_type).is_none()
+                {
+                    return Err(functions::comparison_mismatch(&literal.ty, column_type));
+                }
+            }
             if bind_expr(
                 e,
                 &tables[c.source].columns[c.column].data_type,

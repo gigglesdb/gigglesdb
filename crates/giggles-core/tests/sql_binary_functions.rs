@@ -78,7 +78,15 @@ fn binary_values_metadata_nulls_and_errors() {
     ] {
         assert_eq!(
             s.execute(&format!("SELECT {q}"), &[], None),
-            Err(CoreError::Sql(E::Type)),
+            Err(CoreError::Sql(if q == "sha256(1)"
+                || q == "get_byte('\\x00'::bytea,0::bigint)"
+                || q == "btrim(''::bytea)"
+                || q == "sha512()"
+            {
+                E::UndefinedFunction
+            } else {
+                E::Type
+            })),
             "{q}"
         );
     }

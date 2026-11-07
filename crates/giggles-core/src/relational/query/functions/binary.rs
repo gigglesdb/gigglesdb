@@ -26,7 +26,7 @@ pub(super) fn signature(n: &str, count: usize, first: Option<&DataType>) -> Opti
         _ => return None,
     };
     Some(if types.len() != count {
-        Err(SqlError::Type)
+        Err(SqlError::UndefinedFunction)
     } else {
         Ok((types.into_iter().map(Some).collect(), result))
     })

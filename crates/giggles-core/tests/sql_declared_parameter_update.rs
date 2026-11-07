@@ -834,12 +834,8 @@ fn declared_update_expressions_preserve_types_and_assignment_ranges() {
             .unwrap()
             .with_parameter_types(&[Some(declared.clone())])
             .unwrap();
-        // PG 18.6 gives 42883 for abs(bytea); GigglesDB maps scalar signature mismatches to 42804 (DD-0068 follow-up).
-        let expected = if declared == DataType::Bytes {
-            SqlError::Type
-        } else {
-            SqlError::UndefinedFunction
-        };
+        // PG 18.6 gives 42883 for both text + integer and abs(bytea).
+        let expected = SqlError::UndefinedFunction;
         assert!(matches!(
             session.describe(&prepared),
             Err(CoreError::Sql(error)) if error == expected

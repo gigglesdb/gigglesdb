@@ -3,10 +3,6 @@ use super::*;
 
 type Signature = (Vec<Option<DataType>>, DataType);
 
-pub(super) fn known_name(name: &str) -> bool {
-    matches!(name, "ascii" | "chr" | "initcap")
-}
-
 pub(super) fn signature(name: &str, count: usize) -> Option<R<Signature>> {
     let (argument, result) = match name {
         "ascii" => (DataType::Text, DataType::Integer),
