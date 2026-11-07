@@ -1515,6 +1515,8 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     authenticated_already: bool,
     extra_status: &[(&str, String)],
 ) -> io::Result<()> {
+    // DD-0068 F9: only PostgreSQL wire sessions opt into PostgreSQL diagnostics.
+    session.surface = crate::service::Surface::Postgres;
     let blocking = session.service.blocking.clone();
     let mut startup_settings = startup.settings;
     let timezone = startup.timezone;

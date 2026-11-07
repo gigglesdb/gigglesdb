@@ -81,9 +81,10 @@ async fn degree_math_parse0_describe_bind_execute_and_authority() {
         ("SELECT atan2d(1)", "42883"),
         ("SELECT asind(2)", "22003"),
         ("SELECT sind('Infinity')", "22003"),
-        ("SELECT public.sind(30)", "42501"),
-        // Existing no-FROM authority classification rejects unknown routines.
-        ("SELECT pg_catalog.unknown_degree(1)", "42501"),
+        // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+        ("SELECT public.sind(30)", "42883"),
+        // Deferred routine classification matches the table-bound case.
+        ("SELECT pg_catalog.unknown_degree(1)", "42883"),
         ("SELECT pg_catalog.unknown_degree(1) FROM app", "42883"),
     ] {
         let result = temporal_state_extended(&mut raw, query).await;

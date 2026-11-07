@@ -324,6 +324,7 @@ impl Service {
             .filter(|role| role.login)
             .ok_or(CoreError::Policy(Error::Authentication))?;
         Ok(Session {
+            surface: Surface::Native,
             service: self.clone(),
             fingerprint: format!("pgrole:{}", role.name),
             role: Role::Database { name: role.name },
@@ -346,6 +347,7 @@ impl Service {
             .cloned()
             .ok_or(CoreError::Policy(Error::Authentication))?;
         Ok(Session {
+            surface: Surface::Native,
             service: self.clone(),
             role,
             epoch,
@@ -359,7 +361,15 @@ impl Service {
         })
     }
 }
+/// DD-0068 F9: protocol surface of a session. Only pgwire opts into Postgres; every other surface stays Native (E939 42501), fail-closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Surface {
+    #[default]
+    Native,
+    Postgres,
+}
 pub struct Session {
+    pub(crate) surface: Surface,
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
     pub(crate) database: Option<String>,
@@ -825,6 +835,11 @@ impl Session {
         } else {
             allowed
         };
+        // DD-0068 F9 (GD-0001 Q8): on the PostgreSQL wire, SQL roles reach bind for deferred-routine-only SELECTs, so 42883/3F000 surface as in PG 18; native surfaces keep 42501.
+        let allowed = allowed
+            || (self.surface == Surface::Postgres
+                && self.role.is_sql()
+                && p.deferred_routine_only());
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));

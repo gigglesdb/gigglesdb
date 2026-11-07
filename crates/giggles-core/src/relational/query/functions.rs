@@ -21,15 +21,22 @@ mod temporal;
 mod text;
 // Preserve failed routine lookup until argument and source analysis finishes.
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
+const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
 const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
 fn deferred_routine_error(name: &str) -> Option<SqlError> {
-    if name.starts_with(UNDEFINED_ROUTINE_PREFIX) {
+    if name.starts_with(UNDEFINED_ROUTINE_PREFIX) || name.starts_with(PG_TOAST_ROUTINE_PREFIX) {
         Some(SqlError::UndefinedFunction)
     } else if name.starts_with(INVALID_SCHEMA_ROUTINE_PREFIX) {
         Some(SqlError::InvalidSchema)
     } else {
         None
     }
+}
+pub(super) fn is_deferred_routine_name(name: &str) -> bool {
+    deferred_routine_error(name).is_some()
+}
+pub(super) fn deferred_routine_binds_for_sql_role(name: &str) -> bool {
+    deferred_routine_error(name).is_some() && !name.starts_with(PG_TOAST_ROUTINE_PREFIX)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UnaryOp {
@@ -330,7 +337,8 @@ impl Scalar {
                         {
                             ""
                         }
-                        "pg_catalog" | "public" | "pg_toast" => UNDEFINED_ROUTINE_PREFIX,
+                        "pg_catalog" | "public" => UNDEFINED_ROUTINE_PREFIX,
+                        "pg_toast" => PG_TOAST_ROUTINE_PREFIX,
                         "information_schema"
                             if pg18_routines::INFORMATION_SCHEMA
                                 .binary_search(&routine.as_str())

@@ -73,8 +73,9 @@ async fn quoting_text_parse0_describe_bind_null_and_scoped_errors() {
         ("SELECT quote_ident('a','b')", "42883"),
         ("SELECT quote_nullable(missing,1) FROM app", "42703"),
         ("SELECT quote_ident($1::text,1)", "42883"),
-        ("SELECT public.quote_ident('a')", "42501"),
-        ("SELECT \"QUOTE_IDENT\"('a')", "42501"),
+        // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+        ("SELECT public.quote_ident('a')", "42883"),
+        ("SELECT \"QUOTE_IDENT\"('a')", "42883"),
         ("SELECT \"QUOTE_IDENT\"('a') FROM app", "42883"),
         // Unknown arity retains generic parameter finalization (PG42883).
         // Missing no-FROM columns fail the positive authority proof; only

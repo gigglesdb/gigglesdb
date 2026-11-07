@@ -1,6 +1,6 @@
-//! E939 policy: PostgreSQL 18 returns 42883 for these public calls for every role.
-//! GigglesDB first authorizes: failure is 42501 to avoid revealing routine existence;
-//! only an authorized statement reaches routine binding and returns 42883.
+//! E939 policy: pgwire SQL roles reach deferred routine binding for table-free calls.
+//! Task bindings and denied table access retain 42501 before routine classification;
+//! native surfaces retain their authorization policy.
 use giggles_core::{Admin, Limits, Principal, TaskId, roles::NewRole};
 use giggles_server::{
     Binding, Role, Running, Service,
@@ -403,9 +403,11 @@ async fn qualified_routines_authorization_and_wire_stages() {
                 ]);
             }
             if matches!(session, "Application" | "Task") {
+                // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+                let table_free = if session == "Application" { "42883" } else { "42501" };
                 cases.extend([
-                    ("SELECT public.quote_ident('a')", "42501"),
-                    ("SELECT public.isfinite(date '2000-01-01')", "42501"),
+                    ("SELECT public.quote_ident('a')", table_free),
+                    ("SELECT public.isfinite(date '2000-01-01')", table_free),
                     ("SELECT public.abs(id) FROM U", "42501"),
                 ]);
             } else if session == "Database denied" {

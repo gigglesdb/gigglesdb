@@ -111,13 +111,14 @@ async fn integer_formats_parse_ambiguity_child_priority_and_authority() {
             "{query}"
         );
     }
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(
         code(app.prepare("SELECT public.to_hex(1)").await.unwrap_err()),
-        "42501"
+        "42883"
     );
     assert_eq!(
         code(app.prepare("SELECT \"TO_HEX\"(1)").await.unwrap_err()),
-        "42501"
+        "42883"
     );
     assert_eq!(
         code(

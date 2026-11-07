@@ -70,10 +70,10 @@ async fn character_pg18_utf8_c_describe_repeated_binary_bind_and_errors() {
             "{query}"
         );
     }
-    // Table-free unknown routines fail authority; authorized FROM reaches binding.
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(
         code_from_character_error(pg.prepare("SELECT \"ASCII\"('a')").await.unwrap_err()),
-        "42501"
+        "42883"
     );
     assert_eq!(
         code_from_character_error(
@@ -155,10 +155,10 @@ async fn character_constant_bind_errors_and_authority_controls() {
             "{query}"
         );
     }
-    // Namespace and input literal admission remain the existing bounded profile.
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(
         code_from_character_error(app.prepare("SELECT public.ascii('a')").await.unwrap_err()),
-        "42501"
+        "42883"
     );
     drop(app);
     app_connection.await.unwrap();

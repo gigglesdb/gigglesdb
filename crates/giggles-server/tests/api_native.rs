@@ -992,3 +992,16 @@ async fn native_large_zero_payload_emissions_obey_encoded_reply_limit_without_pa
     ok(&f, &token, operation(read(1)), Wire::Grpc).await;
     f.stop().await;
 }
+
+#[tokio::test]
+async fn dd68_f9_native_surface_keeps_authority_for_deferred_routines() {
+    let f = Fixture::new().await;
+    let token = f.open_http(&f.app, false).await;
+    for wire in WIRES {
+        for query in ["SELECT nosuchfn()", "SELECT nosuchschema.lower('a')"] {
+            let reply = execute(&f, &token, json!({"sql":{"sql":query}}), wire).await;
+            assert_eq!(reply["code"], "42501", "{wire:?}: {query}: {reply}");
+        }
+    }
+    f.stop().await;
+}

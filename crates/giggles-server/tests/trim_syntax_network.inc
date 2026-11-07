@@ -110,11 +110,11 @@ async fn trim_construct_parse_errors_routine_nonactivation_and_authority() {
     pg_send(&mut raw, b'X', &[]).await;
     drop(raw);
     let (pg, connection) = f.pg(f.app.clone()).await;
-    // Unknown routines must pass application authority before routine binding.
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     for query in ["SELECT \"trim\"(' x ')", "SELECT pg_catalog.trim(' x ')"] {
         assert_eq!(
             code(pg.prepare(query).await.unwrap_err()),
-            "42501",
+            "42883",
             "{query}"
         );
     }

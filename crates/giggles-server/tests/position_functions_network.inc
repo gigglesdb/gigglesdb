@@ -17,15 +17,15 @@ fn position_wire_oids(payload: &[u8]) -> Vec<u32> {
 const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
     (
         51,
-        Some("42501"),
+        Some("42883"),
         "parse",
-        "GD-0001 Q8 (open): application-session authority rejects an unknown case-sensitive routine before lookup. PG18: 42883.",
+        "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
     (
         52,
-        Some("42501"),
+        Some("42883"),
         "parse",
-        "GD-0001 Q8 (open): public.<fn> is rejected by application authority before lookup (fd4fc26). PG18: 42883.",
+        "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
     (
         71,

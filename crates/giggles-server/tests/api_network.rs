@@ -879,3 +879,20 @@ async fn task_approval_retry_conflict_and_repair_sql_use_existing_authority() {
     drop(client);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn dd68_f9_native_surface_keeps_authority_for_deferred_routines() {
+    let f = Fixture::new().await;
+    let token = f.open_http(&f.app, false).await;
+    let mut client = f.grpc_client(&f.app).await;
+    for query in ["SELECT nosuchfn()", "SELECT nosuchschema.lower('a')"] {
+        let reply = client
+            .execute(rpc(&token, sql(query)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.code, "42501", "{query}: {reply:?}");
+    }
+    drop(client);
+    f.stop().await;
+}

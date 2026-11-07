@@ -28,9 +28,9 @@ const OVERLAY_WIRE_DEVIATIONS: &[(usize, Option<&str>, &str, &str)] = &[
     ),
     (
         129,
-        Some("42501"),
+        Some("42883"),
         "parse",
-        "GD-0001 Q8 (open): application-session authority rejects an unknown case-sensitive routine before lookup. PG18: 42883.",
+        "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
     (
         147,
@@ -96,9 +96,9 @@ const OVERLAY_ADVERSARIAL_DEVIATIONS: &[(&str, Option<&str>, &str, &str)] = &[
     ),
     (
         "overlay_upper",
-        Some("42501"),
+        Some("42883"),
         "parse",
-        "GD-0001 Q8 (open): application-session authority rejects an unknown case-sensitive routine before lookup. PG18: 42883.",
+        "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501.",
     ),
     (
         "overlay_column",
@@ -338,8 +338,8 @@ async fn overlay_authority_bind_failure_portal_and_transaction_controls() {
     for (query, code) in [
         ("SELECT overlay()", "42883"),                         // PG18: 42883.
         ("SELECT overlay(TRUE,'X',2)", "42883"),               // PG18: 42883.
-        ("SELECT public.overlay('abc','X',2)", "42501"),       // PG18: 42883; authority Q8.
-        ("SELECT pg_catalog.unknown_overlay('abc')", "42501"), // PG18: 42883; authority Q8.
+        ("SELECT public.overlay('abc','X',2)", "42883"),       // PG18: 42883; DD-0068 F9 (Q8 decided)
+        ("SELECT pg_catalog.unknown_overlay('abc')", "42883"), // PG18: 42883; DD-0068 F9 (Q8 decided)
         ("SELECT pg_catalog.unknown_overlay('abc') FROM app", "42883"), // PG18: 42883.
         ("SELECT overlay(body,'X',2) FROM other", "42501"),    // PG18: 42P01; authority Q8.
         ("SELECT overlay(missing,'X',2)", "42501"),            // PG18: 42703; authority Q8.

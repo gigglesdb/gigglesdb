@@ -242,8 +242,9 @@ async fn temporal_sqlstate_preserves_dependency_and_task_authorization() {
     let f = Fixture::new().await;
     let (app, connection) = f.pg(f.app.clone()).await;
     for (q, state) in [
-        ("SELECT unknown_routine(1)", "42501"),
-        ("SELECT public.isfinite(date '2000-01-01')", "42501"),
+        // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+        ("SELECT unknown_routine(1)", "42883"),
+        ("SELECT public.isfinite(date '2000-01-01')", "42883"),
         ("SELECT id FROM other LIMIT 1", "42501"),
         (
             "SELECT a.id FROM app a JOIN other b ON a.id=b.id LIMIT 1",

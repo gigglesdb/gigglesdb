@@ -1099,6 +1099,10 @@ pub(crate) fn validate_create_definition(
     Ok(())
 }
 impl Prepared {
+    /// DD-0068 F9 (GD-0001 Q8): table-free SELECT whose only non-table-free parts are deferred undefined / unknown-schema routine calls. Classification only; grants nothing by itself.
+    pub fn deferred_routine_only(&self) -> bool {
+        matches!(&self.statement, Statement::Query(query) if query.deferred_routine_only())
+    }
     fn engine(statement: Statement, domain: u128, epoch: u64) -> Self {
         Self {
             domain,

@@ -178,7 +178,7 @@
     "data_rows": 0,
     "error_responses": 1,
     "ready": "I",
-    "sqlstate": "42501",
+    "sqlstate": "42883",
     "stage": "parse",
     "tags": [
      "E",
@@ -191,7 +191,7 @@
    "expected_rows": [],
    "expected_parameter_oids": null,
    "expected_result_oids": null,
-   "note": "Observed inherited authorization/profile control; no PG parity claim."
+   "note": "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501."
   },
   {
    "index": 7,
@@ -262,7 +262,7 @@
     "data_rows": 0,
     "error_responses": 1,
     "ready": "I",
-    "sqlstate": "42501",
+    "sqlstate": "42883",
     "stage": "parse",
     "tags": [
      "E",
@@ -275,7 +275,7 @@
    "expected_rows": [],
    "expected_parameter_oids": null,
    "expected_result_oids": null,
-   "note": "GD-0001 Q8 (open): public.<fn> is rejected by application authority before lookup (fd4fc26). PG18: 42883."
+   "note": "GD-0001 Q8 decided (DD-0068 F9): pgwire follows PG18 42883 for deferred-routine-only queries; native surfaces keep 42501."
   },
   {
    "index": 10,

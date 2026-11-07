@@ -2810,7 +2810,8 @@ async fn rejected_queries_report_stage_and_fingerprint_without_sql_or_values() {
     let sql = "SELECT private_probe('never_log_this_secret')";
     let error = pg.query(sql, &[]).await.unwrap_err();
     let error = error.as_db_error().unwrap();
-    assert_eq!(error.code().code(), "42501");
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+    assert_eq!(error.code().code(), "42883");
     assert!(error.message().contains("request rejected; consult documented code"));
     let detail = error.detail().unwrap();
     assert!(detail.contains("phase=application prepare"));
@@ -3100,5 +3101,6 @@ mod text_nul_network {
 }
 
 include!("routing_rejection_network.inc");
+include!("deferred_routine_surface_network.inc");
 
 include!("sql_upsert_network.inc");

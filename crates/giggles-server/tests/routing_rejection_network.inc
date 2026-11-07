@@ -12,7 +12,8 @@ async fn dd68_negative_scalar_routing_tls_redaction_and_authority() {
         (&extended, "application prepare"),
     ] {
         let error = error.as_db_error().unwrap();
-        assert_eq!(error.code().code(), "42501");
+        // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+        assert_eq!(error.code().code(), "42883");
         assert!(error.message().contains("request rejected; consult documented code"));
         let detail = error.detail().unwrap();
         assert!(detail.contains(&format!("phase={phase}")));
@@ -154,10 +155,11 @@ async fn dd68_negative_scalar_task_raw_extended_pipeline_authority() {
 }
 
 #[tokio::test]
-async fn dd68_negative_scalar_app_raw_extended_pipeline_keeps_authority() {
+async fn dd68_negative_scalar_app_raw_extended_pipeline_reaches_classification() {
     let f = Fixture::new().await;
     let mut s = raw_pg(&f).await;
-    dd68_assert_negative_scalar_pipeline(&mut s, "app", "42501", "0A000").await;
+    // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+    dd68_assert_negative_scalar_pipeline(&mut s, "app", "42883", "42501").await;
     drop(s);
     f.stop().await;
 }
@@ -230,12 +232,11 @@ async fn dd68_quoted_routine_authority_precedes_classification() {
     ] {
         let (pg, conn) = f.pg(config.clone()).await;
         for (probe, sql) in probes.iter().enumerate() {
-            // Lowercase quoted position succeeds; table-free unknown calls fail
-            // authority, while the authorized FROM reaches routine binding.
+            // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
             if role == "app" && probe == 1 {
                 continue;
             }
-            let expected = if role == "app" && probe == 9 {
+            let expected = if role == "app" {
                 "42883"
             } else {
                 "42501"
@@ -405,8 +406,9 @@ async fn dd68_undefined_routine_authority_precedes_classification() {
         let mut raw = dd68_raw_role_pg(&f, config).await;
         for (probe, sql) in probes.iter().enumerate() {
             let expected = match (role, probe) {
-                ("app", 12) => "42883",
-                ("app", 13) => "3F000",
+                // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
+                ("app", 0..=5 | 12 | 14) => "42883",
+                ("app", 7..=11 | 13) => "3F000",
                 ("app", 15) => "0A000",
                 _ => "42501",
             };

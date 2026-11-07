@@ -250,14 +250,14 @@ async fn bytea_consumers_actual_tls_current_profile() {
     pg_send(&mut raw, b'X', &[]).await;
     drop(raw);
     f.stop().await;
-    let expected:serde_json::Value=serde_json::from_str(r####"[{"differences":["phase expected=bind actual=execute"],"id":"text-odd"},{"differences":["phase expected=bind actual=execute"],"id":"text-invalid"},{"differences":["phase expected=bind actual=execute"],"id":"text-slash"},{"differences":["phase expected=bind actual=execute"],"id":"text-octshort1"},{"differences":["phase expected=bind actual=execute"],"id":"text-octshort2"},{"differences":["phase expected=bind actual=execute"],"id":"text-octwide"},{"differences":["phase expected=bind actual=execute"],"id":"text-octdigit8"},{"differences":["phase expected=bind actual=execute"],"id":"nested-text-strict-null"},{"differences":["state expected=None actual=Some(\"0A000\")","phase expected=execute actual=parse"],"id":"literal-escape"},{"differences":["state expected=None actual=Some(\"0A000\")","phase expected=execute actual=parse"],"id":"literal-lexical"},{"differences":["phase expected=bind actual=execute"],"id":"literal-text-invalid"},{"differences":["state expected=Some(\"42883\") actual=Some(\"42501\")"],"id":"namespace-public-missing"}]"####).unwrap();
+    let expected:serde_json::Value=serde_json::from_str(r####"[{"differences":["phase expected=bind actual=execute"],"id":"text-odd"},{"differences":["phase expected=bind actual=execute"],"id":"text-invalid"},{"differences":["phase expected=bind actual=execute"],"id":"text-slash"},{"differences":["phase expected=bind actual=execute"],"id":"text-octshort1"},{"differences":["phase expected=bind actual=execute"],"id":"text-octshort2"},{"differences":["phase expected=bind actual=execute"],"id":"text-octwide"},{"differences":["phase expected=bind actual=execute"],"id":"text-octdigit8"},{"differences":["phase expected=bind actual=execute"],"id":"nested-text-strict-null"},{"differences":["state expected=None actual=Some(\"0A000\")","phase expected=execute actual=parse"],"id":"literal-escape"},{"differences":["state expected=None actual=Some(\"0A000\")","phase expected=execute actual=parse"],"id":"literal-lexical"},{"differences":["phase expected=bind actual=execute"],"id":"literal-text-invalid"}]"####).unwrap();
     assert_eq!(
         serde_json::json!(gaps),
         expected,
         "profile differs; gaps remain PG incompatibilities"
     );
     println!(
-        "bytea_profile_pg_matches=50 bytea_profile_pg_gaps=12; passing profile gate does not claim gap compatibility"
+        "bytea_profile_pg_matches=51 bytea_profile_pg_gaps=11; passing profile gate does not claim gap compatibility"
     );
 }
 #[tokio::test]

@@ -1345,6 +1345,66 @@ impl Query {
                 Expr::Literal(_) | Expr::Param(_) => true,
             })
     }
+    /// DD-0068 F9 (GD-0001 Q8, E1048/E1050): table-free SELECT that is not table-free only because of
+    /// deferred undefined or unknown-schema routine calls (pg_toast excluded), so binding fails with
+    /// 42883/3F000 before any execution. Classification only; grants nothing by itself.
+    pub(super) fn deferred_routine_only(&self) -> bool {
+        fn scalar(s: &Scalar) -> bool {
+            match s {
+                Scalar::Literal(_) | Scalar::Param(_) => true,
+                Scalar::Column(_) => false,
+                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
+                Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
+                Scalar::Call(name, args) => {
+                    (!functions::is_deferred_routine_name(name)
+                        || functions::deferred_routine_binds_for_sql_role(name))
+                        && args.iter().all(scalar)
+                }
+            }
+        }
+        fn filter_ok(f: &Filter) -> bool {
+            match f {
+                Filter::Clauses(c) => {
+                    c.filter.as_ref().is_none_or(filter_ok)
+                        && c.group.iter().all(scalar)
+                        && c.having.as_ref().is_none_or(filter_ok)
+                }
+                Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
+                Filter::Compare(a, _, b) => scalar(a) && scalar(b),
+                Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
+                Filter::Not(f) => filter_ok(f),
+                Filter::Logic(a, _, b) => filter_ok(a) && filter_ok(b),
+            }
+        }
+        // Exhaustive destructuring forces review when dependency-bearing AST changes.
+        let Self {
+            explain,
+            sources,
+            joins,
+            items,
+            predicates,
+            filter,
+            order,
+            limit,
+        } = self;
+        !explain
+            && sources.is_empty()
+            && joins.is_empty()
+            && predicates.is_empty()
+            && self.sequence_dependencies().is_empty()
+            && self.has_undefined_routine()
+            && items.iter().all(|(item, _)| match item {
+                Item::Scalar(s) | Item::Aggregate(_, Some(s)) => scalar(s),
+                Item::Aggregate(_, None) => true,
+                Item::Star => false,
+            })
+            && filter.as_ref().is_none_or(filter_ok)
+            && order.iter().all(|(s, _, _)| scalar(s))
+            && limit.as_ref().is_none_or(|e| match e {
+                Expr::Literal(_) | Expr::Param(_) => true,
+            })
+    }
     pub(super) fn sequence_only(&self) -> bool {
         self.sources.is_empty() && !self.sequence_dependencies().is_empty()
     }
@@ -2988,5 +3048,66 @@ mod average_distinct_retention_tests {
             std::mem::size_of::<AggregateAuxiliary>() + growth
         );
         assert_eq!(auxiliary[0].count, 1);
+    }
+}
+
+#[cfg(test)]
+mod deferred_routine_only_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_routine_only_classification() {
+        for sql in [
+            "SELECT nosuchfn()",
+            "SELECT \"LOWER\"('a')",
+            "SELECT pg_catalog.nosuchfn()",
+            "SELECT public.coalesce(1,2)",
+            "SELECT nosuchagg(1)",
+            "SELECT avg(nosuchfn(1))",
+            "SELECT count(DISTINCT nosuchfn(1))",
+            "SELECT avg(DISTINCT nosuchfn(1))",
+            "SELECT sum(nosuchfn(1))",
+            "SELECT nosuchschema.lower('a')",
+            "SELECT nosuchschema.lower(1/0)",
+            "SELECT count(*), nosuchfn()",
+            "SELECT lower(nosuchfn())",
+            "SELECT 1 WHERE nosuchfn(1) = 1",
+            "SELECT nosuchschema.count(*)",
+            "SELECT \"PUBLIC\".nosuchfn(1)",
+            "SELECT pg_temp.lower('a')",
+            "SELECT information_schema.nosuchfn('a')",
+            "SELECT upper(lower(nosuchfn()))",
+        ] {
+            let p = Prepared::parse(sql, 1, 0).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(p.deferred_routine_only(), "{sql}");
+        }
+        let sql = "SELECT nosuchfn() ORDER BY 1";
+        match Prepared::parse(sql, 1, 0) {
+            Ok(p) => assert!(p.deferred_routine_only(), "{sql}"),
+            Err(e) => eprintln!("F9 skipped {sql}: prepare error code={e:?}; ORDER BY literal not admitted"),
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT lower('a')",
+            "SELECT pg_toast.lower('a')",
+            "SELECT pg_toast.nosuchfn(1)",
+            "SELECT lower(pg_toast.nosuchfn(1))",
+            "SELECT avg(1)",
+            "SELECT information_schema._pg_expandarray(1)",
+            "SELECT nosuchfn(x)",
+            "SELECT nosuchfn(x) FROM t",
+            "SELECT nosuchfn() FROM t",
+            "SELECT t.a,nosuchfn() FROM t JOIN u ON t.a=u.a",
+            "EXPLAIN SELECT nosuchfn()",
+            "SELECT nextval('s'),nosuchfn()",
+            "SELECT *",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a=1",
+        ] {
+            match Prepared::parse(sql, 1, 0) {
+                Ok(p) => assert!(!p.deferred_routine_only(), "{sql}"),
+                Err(e) => eprintln!("F9 skipped {sql}: prepare error code={e:?}; no Prepared classification exists"),
+            }
+        }
     }
 }
