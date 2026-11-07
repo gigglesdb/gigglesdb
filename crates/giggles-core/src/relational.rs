@@ -1,6 +1,7 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+mod assign;
 mod ident;
 use ident::ident;
 mod numeric;
@@ -633,6 +634,12 @@ enum Statement {
         predicates: Vec<Predicate>,
         returning: Option<Returning>,
     },
+    UpdateExpressions {
+        name: String,
+        sets: Vec<(String, assign::Value)>,
+        predicates: Vec<Predicate>,
+        returning: Option<Returning>,
+    },
     Delete {
         name: String,
         predicates: Vec<Predicate>,
@@ -866,18 +873,39 @@ impl Parser {
                     return Err(SqlError::Syntax);
                 }
                 self.at += 1;
-                sets.push((c, self.expr()?));
+                sets.push((c, assign::Value::parse(self, &name)?));
                 if !self.sym(',') {
                     break;
                 }
             }
             let predicates = self.predicates(&name)?;
             let returning = Returning::parse(self, &name)?;
-            Statement::Update {
-                name,
-                sets,
-                predicates,
-                returning,
+            if sets
+                .iter()
+                .all(|(_, value)| matches!(value, assign::Value::Plain(_)))
+            {
+                let sets = sets
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let assign::Value::Plain(value) = value else {
+                            unreachable!()
+                        };
+                        (name, value)
+                    })
+                    .collect();
+                Statement::Update {
+                    name,
+                    sets,
+                    predicates,
+                    returning,
+                }
+            } else {
+                Statement::UpdateExpressions {
+                    name,
+                    sets,
+                    predicates,
+                    returning,
+                }
             }
         } else if self.word("delete") {
             self.need("from")?;
@@ -1185,6 +1213,22 @@ impl Prepared {
         if let Statement::Query(q) = &self.statement {
             return q.bind(state, self.params).map(|b| b.description());
         }
+        if let Statement::UpdateExpressions {
+            name,
+            sets,
+            predicates,
+            returning,
+        } = &self.statement
+        {
+            return assign::describe(
+                name,
+                sets,
+                predicates,
+                returning.as_ref(),
+                state,
+                self.params,
+            );
+        }
         let mut params = vec![None; self.params];
         let mut columns = vec![];
         if let Some(name) = self.table() {
@@ -1294,6 +1338,7 @@ impl Prepared {
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
             | Statement::Update { name, .. }
+            | Statement::UpdateExpressions { name, .. }
             | Statement::Delete { name, .. } => Some(name),
             _ => None,
         }
@@ -1319,7 +1364,7 @@ impl Prepared {
             | Statement::InsertExpressions(_)
             | Statement::InsertMulti(_) => "INSERT",
             Statement::Select { .. } => "SELECT",
-            Statement::Update { .. } => "UPDATE",
+            Statement::Update { .. } | Statement::UpdateExpressions { .. } => "UPDATE",
             Statement::Delete { .. } => "DELETE",
             Statement::Begin => "BEGIN",
             Statement::Commit => "COMMIT",
@@ -1736,6 +1781,7 @@ impl Relational {
                 | Statement::InsertExpressions(_)
                 | Statement::InsertMulti(_)
                 | Statement::Update { .. }
+                | Statement::UpdateExpressions { .. }
                 | Statement::Delete { .. }
         ) {
             self.secondary_admit_mutation(&mut cancel)?;
@@ -1745,6 +1791,7 @@ impl Relational {
             Statement::Insert { .. }
                 | Statement::InsertExpressions(_)
                 | Statement::Update { .. }
+                | Statement::UpdateExpressions { .. }
                 | Statement::Delete { .. }
         ) {
             let mut source_values = Vec::new();
@@ -1763,6 +1810,13 @@ impl Relational {
                         }
                     }
                 }
+                Statement::UpdateExpressions { sets, .. } => {
+                    for (_, e) in sets {
+                        if let assign::Value::Plain(Expr::Literal(v)) = e {
+                            source_values.push(v);
+                        }
+                    }
+                }
                 _ => {}
             }
             Self::secondary_admit_values(params.iter())?;
@@ -1770,6 +1824,9 @@ impl Relational {
             payload_bound(source_values.into_iter())?;
             if let Statement::InsertExpressions(values) = &prepared.statement {
                 values.admit_literals()?;
+            }
+            if let Statement::UpdateExpressions { sets, .. } = &prepared.statement {
+                assign::admit_literals(sets)?;
             }
         }
         // Bound parameters even if a statement affects no rows.
@@ -2065,29 +2122,17 @@ impl Relational {
                 }
             }
             Statement::Update {
-                name,
-                sets,
-                predicates,
-                ..
+                name, predicates, ..
+            }
+            | Statement::UpdateExpressions {
+                name, predicates, ..
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let b = bounds(t, predicates, params)?;
                 if !b.point {
                     return Err(SqlError::Unbounded);
                 }
-                let indexes = sets
-                    .iter()
-                    .map(|(c, v)| {
-                        let i = col(t, c)?;
-                        if t.primary_key.contains(&i) {
-                            return Err(SqlError::Unsupported);
-                        }
-                        let value = v.value(params)?;
-                        check(&value, &t.columns[i])?;
-                        Ok((i, value))
-                    })
-                    .collect::<R<Vec<_>>>()?;
-                unique(indexes.iter().map(|(i, _)| i))?;
+                let assignments = assign::Plan::new(t, self, prepared, params)?;
                 let table_id = t.id;
                 let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
                 let old = rows.get(&b.low);
@@ -2097,6 +2142,7 @@ impl Relational {
                     return Err(SqlError::Version);
                 }
                 if let Some(old) = old {
+                    let indexes = assignments.evaluate(t, old, params, &mut cancel)?;
                     let mut row = old.clone();
                     for (i, v) in indexes {
                         row.values[i] = v;

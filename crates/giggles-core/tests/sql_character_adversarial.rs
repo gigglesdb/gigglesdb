@@ -289,17 +289,43 @@ fn character_giggles_byte_caps_and_failed_writes_preserve_rows_and_inputs() {
         assert_eq!(input, original);
     }
     let oversize = Value::Text("a".repeat(MAX_ROW_BYTES + 1));
-    // Function-valued DML is outside the qualified expression surface. Keep
-    // this visible rather than treating its rejection as a kernel failure.
-    for query in [
-        "UPDATE adv_budget SET label=initcap($1) WHERE id=1",
-        "UPDATE adv_budget SET label=chr($1::smallint) WHERE id=1",
-    ] {
-        assert!(matches!(
-            session.prepare(query),
-            Err(CoreError::Sql(SqlError::Unsupported))
-        ));
-    }
+    // Function-valued SET is supported, and byte caps still apply.
+    let original = oversize.clone();
+    let p = session
+        .prepare("UPDATE adv_budget SET label=initcap($1) WHERE id=1")
+        .unwrap();
+    assert_eq!(
+        session
+            .execute_prepared(&p, std::slice::from_ref(&oversize), None)
+            .unwrap_err(),
+        CoreError::Sql(SqlError::Limit)
+    );
+    assert_eq!(
+        session
+            .execute("SELECT label FROM adv_budget WHERE id=1", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("sentinel".into())]
+    );
+    assert_eq!(oversize, original);
+    let p = session
+        .prepare("UPDATE adv_budget SET label=chr($1::smallint) WHERE id=1")
+        .unwrap();
+    session
+        .execute_prepared(&p, &[Value::Int(65)], None)
+        .unwrap();
+    assert_eq!(
+        session
+            .execute("SELECT label FROM adv_budget WHERE id=1", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("A".into())]
+    );
+    session
+        .execute("UPDATE adv_budget SET label='sentinel' WHERE id=1", &[], None)
+        .unwrap();
     let p = session
         .prepare("UPDATE adv_budget SET label=$1 WHERE id=1")
         .unwrap();

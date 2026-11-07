@@ -513,7 +513,7 @@ fn arithmetic_nodes_keep_depth_size_and_binding_limits() {
 }
 
 #[test]
-fn sql_sum_and_scalar_predicates_preserve_update_rejection() {
+fn sql_sum_and_scalar_predicates_preserve_primary_key_update_rejection() {
     let (admin, _) = fixture(&[(1, Some(-7)), (2, Some(2)), (3, None)]);
     let mut sql = admin.sql_session();
     assert_eq!(
@@ -527,7 +527,7 @@ fn sql_sum_and_scalar_predicates_preserve_update_rejection() {
     );
     let before = rows(&admin);
     assert_eq!(
-        sql.execute("UPDATE numbers SET n=n+1 WHERE id=1", &[], None),
+        sql.execute("UPDATE numbers SET id=id+1 WHERE id=1", &[], None),
         Err(CoreError::Sql(SqlError::Unsupported))
     );
     assert!(

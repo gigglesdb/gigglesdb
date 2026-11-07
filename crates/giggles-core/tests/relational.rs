@@ -433,7 +433,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
-        "UPDATE safe SET n=n+1 WHERE id=1",
         "SELECT * FROM safe LIMIT 1 OFFSET 1",
     ] {
         err(&mut s, q, E::Unsupported);

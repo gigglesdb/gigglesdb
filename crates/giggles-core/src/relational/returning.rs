@@ -61,6 +61,7 @@ impl Prepared {
         match &self.statement {
             Statement::Insert { returning, .. }
             | Statement::Update { returning, .. }
+            | Statement::UpdateExpressions { returning, .. }
             | Statement::Delete { returning, .. } => returning.as_ref(),
             Statement::InsertExpressions(values) => values.returning.as_ref(),
             Statement::InsertMulti(insert) => insert.returning.as_ref(),

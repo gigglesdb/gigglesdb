@@ -1175,6 +1175,134 @@ impl BoundScalar {
         }
     }
 }
+
+// UPDATE keeps its assignment orchestration outside the query executor. These
+// helpers expose the existing scalar machinery through a single-source query.
+impl Query {
+    pub(in super::super) fn assignment(p: &mut Parser, table: &str) -> R<Self> {
+        let value = Scalar::parse_aggregate_argument(p, 0)?;
+        value.reject_nested_aggregate()?;
+        Ok(Self {
+            explain: false,
+            sources: vec![Source {
+                name: table.into(),
+                alias: table.into(),
+            }],
+            joins: vec![],
+            items: vec![(Item::Scalar(value), None)],
+            predicates: vec![],
+            filter: None,
+            order: vec![],
+            limit: None,
+        })
+    }
+
+    pub(in super::super) fn infer_assignment(
+        &self,
+        table: &TableDef,
+        target: &DataType,
+        parameters: &mut [Option<DataType>],
+    ) -> R<()> {
+        let resolve = |column: &ColumnRef, _: usize| {
+            if column
+                .qualifier
+                .as_ref()
+                .is_some_and(|name| name != &table.name)
+            {
+                return Err(SqlError::UnknownTable);
+            }
+            Ok(BoundColumn {
+                source: 0,
+                column: col(table, &column.name)?,
+            })
+        };
+        let Item::Scalar(value) = &self.items[0].0 else {
+            return Err(SqlError::Unsupported);
+        };
+        // Parentheses around an otherwise plain unknown value still receive
+        // the assignment context, just as INSERT scalar values do.
+        let expected = matches!(value, Scalar::Param(_)).then_some(target);
+        value.infer(expected, parameters, &resolve, &[table])?;
+        if matches!(value, Scalar::Literal(Value::Text(_) | Value::Null)) {
+            Scalar::Cast(Box::new(value.clone()), target.clone()).bind(
+                &resolve,
+                &[table],
+                parameters,
+            )?;
+        } else {
+            value
+                .bind(&resolve, &[table], parameters)?
+                .insert_assignment(target)?;
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn bind_assignment<'a>(
+        &'a self,
+        state: &'a Relational,
+        parameters: Vec<Option<DataType>>,
+        target: &DataType,
+    ) -> R<BoundQuery<'a>> {
+        let mut bound = self.bind_seeded(state, parameters)?;
+        let item = bound.items.pop().ok_or(SqlError::Type)?;
+        let BoundItem::Scalar(value) = item else {
+            return Err(SqlError::Unsupported);
+        };
+        let value = if let Item::Scalar(Scalar::Literal(value @ (Value::Text(_) | Value::Null))) =
+            &self.items[0].0
+        {
+            BoundScalar {
+                ty: target.clone(),
+                node: Node::Literal(cast_value(value.clone(), target, &mut 0)?),
+            }
+        } else {
+            value.insert_assignment(target)?
+        };
+        bound.items.push(BoundItem::Scalar(value));
+        Ok(bound)
+    }
+
+    pub(in super::super) fn admit_assignment_literals(&self, bytes: &mut usize) -> R<()> {
+        fn admit(value: &Scalar, bytes: &mut usize) -> R<()> {
+            match value {
+                Scalar::Literal(value) => {
+                    Relational::secondary_admit_values(std::iter::once(value))?;
+                    let bound = if let Value::Numeric(value) = value {
+                        value.display_byte_bound()
+                    } else {
+                        value_bytes(value)
+                    };
+                    *bytes = bytes.checked_add(bound).ok_or(SqlError::Limit)?;
+                    if *bytes > MAX_ROW_BYTES {
+                        return Err(SqlError::Limit);
+                    }
+                }
+                Scalar::Cast(value, _) | Scalar::Unary(_, value) => admit(value, bytes)?,
+                Scalar::Binary(_, a, b) => {
+                    admit(a, bytes)?;
+                    admit(b, bytes)?;
+                }
+                Scalar::Call(_, args) => {
+                    for arg in args {
+                        admit(arg, bytes)?;
+                    }
+                }
+                Scalar::SubstringOrder(args) => {
+                    for arg in args {
+                        admit(arg, bytes)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let Item::Scalar(value) = &self.items[0].0 else {
+            return Err(SqlError::Unsupported);
+        };
+        arithmetic::admit_shape(value, 0, &mut 0)?;
+        admit(value, bytes)
+    }
+}
 fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
     let total = budget.checked_add(bytes).ok_or(SqlError::Limit)?;
     if bytes > MAX_ROW_BYTES || total > MAX_RESULT_BYTES {
