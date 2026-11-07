@@ -1,0 +1,5310 @@
+[
+  {
+    "id": "binary-0-normal",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-1-null-0",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(CAST(NULL AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-2-null-1",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-3-empty",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-4-primitive-text-cast",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST($1 AS bytea),1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-5-arity-missing",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-6-wrong-type",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring(true,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-7-start--2147483648",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-8-start--2",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),-2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-9-start-0",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),0) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-10-start-1",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-11-start-8",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),8) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-12-start-2147483647",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),2147483647) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-13-normal",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-14-null-0",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(CAST(NULL AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-15-null-1",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-16-null-2",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-17-empty",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-18-primitive-text-cast",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST($1 AS bytea),1,1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-19-arity-missing",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-20-wrong-type",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring(true,1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-21-start--2147483648",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),-2147483648,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-22-start--2",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),-2,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-23-start-0",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),0,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-24-start-1",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-25-start-8",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),8,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-26-start-2147483647",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),2147483647,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-27-length--1",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,-1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22011"
+    }
+  },
+  {
+    "id": "binary-28-length-0",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,0) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-29-length-2147483647",
+    "routines": [
+      "pg_catalog.\"substring\"(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring(CAST('\\x0080ff01026162' AS bytea),1,2147483647) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-30-normal",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT bit_length(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          56
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-31-null-0",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT bit_length(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-32-empty",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT bit_length(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-33-primitive-text-cast",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT bit_length(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          56
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-34-arity-missing",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT bit_length() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-35-wrong-type",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT bit_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-36-normal",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim(CAST('\\x0080ff01026162' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x80ff010261"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-37-null-0",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST(NULL AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-38-null-1",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-39-empty",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT btrim(CAST('\\x' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-40-primitive-text-cast",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x80ff010261"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-41-arity-missing",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT btrim() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-42-wrong-type",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT btrim(true,CAST('\\x0062' AS bytea)) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-43-normal",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT decode('0080ff','hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-44-null-0",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT decode(CAST(NULL AS text),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-45-null-1",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT decode('0080ff',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-46-empty",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('','hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-47-arity-missing",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-48-wrong-type",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode(true,'hex') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-49-encoding-hex",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('00ff','hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ff"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-50-encoding-HEX",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('00ff','HEX') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ff"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-51-encoding-base64",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('YWJj','base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-52-encoding-escape",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('abc','escape') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-53-encoding-bogus",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('00ff','bogus') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-54-encoding-",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('00ff','') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-55-normal",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x0080ff01026162' AS bytea),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-56-null-0",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT encode(CAST(NULL AS bytea),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-57-null-1",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-58-empty",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x' AS bytea),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-59-primitive-text-cast",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST($1 AS bytea),'hex') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-60-arity-missing",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT encode() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-61-wrong-type",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT encode(true,'hex') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-62-encoding-hex",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "000aff5c80"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-63-encoding-HEX",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'HEX') AS v",
+    "expected": {
+      "rows": [
+        [
+          "000aff5c80"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-64-encoding-base64",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "AAr/XIA="
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-65-encoding-escape",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'escape') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\000\n\\377\\\\\\200"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-66-encoding-bogus",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'bogus') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-67-encoding-",
+    "routines": [
+      "pg_catalog.encode(bytea, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT encode(CAST('\\x000aff5c80' AS bytea),'') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-68-normal",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-69-null-0",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT get_bit(CAST(NULL AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-70-null-1",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS bigint)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-71-empty",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x' AS bytea),1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-72-primitive-text-cast",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST($1 AS bytea),1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-73-arity-missing",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-74-wrong-type",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit(true,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-75-index--1",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),-1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-76-index-0",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),0) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-77-index-7",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),7) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-78-index-8",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),8) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-79-index-55",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),55) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-80-index-56",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),56) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-81-index-2147483647",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0080ff01026162' AS bytea),2147483647) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-82-normal",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          128
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-83-null-0",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT get_byte(CAST(NULL AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-84-null-1",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-85-empty",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x' AS bytea),1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-86-primitive-text-cast",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_byte(CAST($1 AS bytea),1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          128
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-87-arity-missing",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-88-wrong-type",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(true,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-89-index--1",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),-1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-90-index-0",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),0) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-91-index-7",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),7) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-92-index-8",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),8) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-93-index-55",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),55) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-94-index-56",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),56) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-95-index-2147483647",
+    "routines": [
+      "pg_catalog.get_byte(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT get_byte(CAST('\\x0080ff01026162' AS bytea),2147483647) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-96-normal",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT length(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-97-null-0",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT length(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-98-empty",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT length(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-99-primitive-text-cast",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT length(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-100-arity-missing",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-101-wrong-type",
+    "routines": [
+      "pg_catalog.length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-102-normal",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT length(CAST('\\x616263' AS bytea),CAST('UTF8' AS name)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-103-null-0",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT length(CAST(NULL AS bytea),CAST('UTF8' AS name)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-104-null-1",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT length(CAST('\\x616263' AS bytea),CAST(NULL AS name)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-105-empty",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT length(CAST('\\x' AS bytea),CAST('UTF8' AS name)) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-106-primitive-text-cast",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length(CAST($1 AS bytea),CAST('UTF8' AS name)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22021"
+    }
+  },
+  {
+    "id": "binary-107-arity-missing",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-108-wrong-type",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length(true,CAST('UTF8' AS name)) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-109-normal",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim(CAST('\\x0080ff01026162' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x80ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-110-null-0",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST(NULL AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-111-null-1",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-112-empty",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT ltrim(CAST('\\x' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-113-primitive-text-cast",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x80ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-114-arity-missing",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT ltrim() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-115-wrong-type",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT ltrim(true,CAST('\\x0062' AS bytea)) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-116-normal",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-117-null-0",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT octet_length(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-118-empty",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT octet_length(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-119-primitive-text-cast",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT octet_length(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-120-arity-missing",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT octet_length() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-121-wrong-type",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT octet_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-122-normal",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT reverse(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x62610201ff8000"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-123-null-0",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT reverse(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-124-empty",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT reverse(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-125-primitive-text-cast",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT reverse(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x62610201ff8000"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-126-arity-missing",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT reverse() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-127-wrong-type",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT reverse(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-128-normal",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim(CAST('\\x0080ff01026162' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff010261"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-129-null-0",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST(NULL AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-130-null-1",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-131-empty",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rtrim(CAST('\\x' AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-132-primitive-text-cast",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff010261"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-133-arity-missing",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rtrim() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-134-wrong-type",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rtrim(true,CAST('\\x0062' AS bytea)) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-135-normal",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0280ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-136-null-0",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_bit(CAST(NULL AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-137-null-1",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS bigint),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-138-null-2",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-139-empty",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x' AS bytea),1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-140-primitive-text-cast",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_bit(CAST($1 AS bytea),1,1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x0280ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-141-arity-missing",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-142-wrong-type",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(true,1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-143-index--1",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),-1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-144-index-0",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),0,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0180ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-145-index-7",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),7,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x8080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-146-index-8",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),8,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0081ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-147-index-55",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),55,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff010261e2"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-148-index-56",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),56,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-149-index-2147483647",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),2147483647,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-150-value--1",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,-1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-151-value-2",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,2) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-152-value-255",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,255) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-153-value-256",
+    "routines": [
+      "pg_catalog.set_bit(bytea, bigint, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_bit(CAST('\\x0080ff01026162' AS bytea),1,256) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-154-normal",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0001ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-155-null-0",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_byte(CAST(NULL AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-156-null-1",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-157-null-2",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-158-empty",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x' AS bytea),1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-159-primitive-text-cast",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST($1 AS bytea),1,1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x0001ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-160-arity-missing",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-161-wrong-type",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(true,1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-162-index--1",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),-1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-163-index-0",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),0,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0180ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-164-index-7",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),7,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-165-index-8",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),8,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-166-index-55",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),55,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-167-index-56",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),56,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-168-index-2147483647",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),2147483647,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "2202E"
+    }
+  },
+  {
+    "id": "binary-169-value--1",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,-1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ffff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-170-value-2",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0002ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-171-value-255",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,255) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ffff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-172-value-256",
+    "routines": [
+      "pg_catalog.set_byte(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT set_byte(CAST('\\x0080ff01026162' AS bytea),1,256) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0000ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-173-normal",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT sha224(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x43802b54462192191822dfa91d076b686623ce22a6dca648f7e660bc"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-174-null-0",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT sha224(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-175-empty",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha224(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-176-primitive-text-cast",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha224(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x43802b54462192191822dfa91d076b686623ce22a6dca648f7e660bc"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-177-arity-missing",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha224() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-178-wrong-type",
+    "routines": [
+      "pg_catalog.sha224(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha224(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-179-normal",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT sha256(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\xcaf611fbb7847f73e368afd6e64b8da9d07051783009c1008fd993f00dbee15b"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-180-null-0",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT sha256(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-181-empty",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha256(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-182-primitive-text-cast",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha256(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\xcaf611fbb7847f73e368afd6e64b8da9d07051783009c1008fd993f00dbee15b"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-183-arity-missing",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha256() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-184-wrong-type",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha256(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-185-normal",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT sha384(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x582a116cf283a7c3493c3ccee3b430b2ccd3ebc62cb9faf2cdf8b91f8196c71edc0b2426aee2cdd43c94ad0133d13a7e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-186-null-0",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT sha384(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-187-empty",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha384(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-188-primitive-text-cast",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha384(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x582a116cf283a7c3493c3ccee3b430b2ccd3ebc62cb9faf2cdf8b91f8196c71edc0b2426aee2cdd43c94ad0133d13a7e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-189-arity-missing",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha384() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-190-wrong-type",
+    "routines": [
+      "pg_catalog.sha384(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha384(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-191-normal",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT sha512(CAST('\\x0080ff01026162' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x80271fcfb7cd50260077fe28002794c8d637bab64c83ac076928f23218569fd67cefd7ebe25de51ff892c271091242901c1bfdbc22fa65dfc0a1b2189116d4ba"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-192-null-0",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT sha512(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-193-empty",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha512(CAST('\\x' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\xcf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-194-primitive-text-cast",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT sha512(CAST($1 AS bytea)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x80271fcfb7cd50260077fe28002794c8d637bab64c83ac076928f23218569fd67cefd7ebe25de51ff892c271091242901c1bfdbc22fa65dfc0a1b2189116d4ba"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-195-arity-missing",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha512() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-196-wrong-type",
+    "routines": [
+      "pg_catalog.sha512(bytea)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT sha512(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-197-normal",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-198-null-0",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substr(CAST(NULL AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-199-null-1",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-200-empty",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-201-primitive-text-cast",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST($1 AS bytea),1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-202-arity-missing",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substr() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-203-wrong-type",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substr(true,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-204-start--2147483648",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-205-start--2",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),-2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-206-start-0",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),0) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-207-start-1",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-208-start-8",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),8) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-209-start-2147483647",
+    "routines": [
+      "pg_catalog.substr(bytea, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),2147483647) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-210-normal",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-211-null-0",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substr(CAST(NULL AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-212-null-1",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),CAST(NULL AS integer),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-213-null-2",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-214-empty",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-215-primitive-text-cast",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST($1 AS bytea),1,1) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "\\x0080ff01026162"
+      }
+    ],
+    "binding_evidence": "Primitive parameter with explicit SQL cast to bytea; reference literal expansion, no binary wire evidence.",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-216-arity-missing",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substr() AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-217-wrong-type",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substr(true,1,1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "binary-218-start--2147483648",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),-2147483648,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-219-start--2",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),-2,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-220-start-0",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),0,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-221-start-1",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-222-start-8",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),8,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-223-start-2147483647",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),2147483647,1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-224-length--1",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,-1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22011"
+    }
+  },
+  {
+    "id": "binary-225-length-0",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,0) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-226-length-2147483647",
+    "routines": [
+      "pg_catalog.substr(bytea, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substr(CAST('\\x0080ff01026162' AS bytea),1,2147483647) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-227-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('0','hex') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-228-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('gg','hex') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-229-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('00 ff','hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ff"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-230-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode(' 00\nff\t','hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ff"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-231-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('YQ==','base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x61"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-232-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('YWI=','base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x6162"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-233-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('YWJj','base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-234-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('YQ','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-235-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('YQ=','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-236-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('Y===','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-237-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('YQ===','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-238-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('YW Jj\n\t\r','base64') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-239-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('!','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-240-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('====','base64') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "binary-241-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('abc','escape') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-242-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT decode('\\000\\377\\\\','escape') AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x00ff5c"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-243-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('\\400','escape') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22P02"
+    }
+  },
+  {
+    "id": "binary-244-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('\\08x','escape') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22P02"
+    }
+  },
+  {
+    "id": "binary-245-decode-edge",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT decode('\\','escape') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Intended binding/domain validation variant, independent of observed SQLSTATE. Parser Syntax rejection remains a failure.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22P02"
+    }
+  },
+  {
+    "id": "binary-246-output-boundary-32768",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT octet_length(decode(repeat('00',32768),'hex')) AS v",
+    "expected": {
+      "rows": [
+        [
+          32768
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-247-output-boundary-65536",
+    "routines": [
+      "pg_catalog.decode(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT octet_length(decode(repeat('00',65536),'hex')) AS v",
+    "expected": {
+      "rows": [
+        [
+          65536
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-248-bit-order-1",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),1) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-249-bit-order-15",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),15) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-250-bit-order-16",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),16) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-251-bit-order-23",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),23) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-252-bit-order-24",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),24) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-253-bit-order-25",
+    "routines": [
+      "pg_catalog.get_bit(bytea, bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT get_bit(CAST('\\x0180ff01' AS bytea),25) AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "binary-254-nested-digest",
+    "routines": [
+      "pg_catalog.sha256(bytea)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT encode(sha256(decode('0080ff','hex')),'hex') AS v",
+    "expected": {
+      "rows": [
+        [
+          "5240672d7b51756b829ad0ef8d9468b7a078afa2f410484fd3892dab47becb72"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  }
+]

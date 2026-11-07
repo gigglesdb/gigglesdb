@@ -1,0 +1,7 @@
+{
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "inventory_sha256": "e32c4d4bc008e75fe6027f0dc23ad1e2e7e91f9551f30a03ff92fd3eb0768e5f",
+  "corpus_sha256": "f3a25eb0197add240a66165d1f60014d88d0bb75a989f44e7eac8562b57d2526",
+  "case_count": 255,
+  "observation": "Reference.query on owned pinned PG18.0; explicit SQL casts, no binary wire evidence."
+}

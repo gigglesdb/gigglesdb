@@ -1,0 +1,7 @@
+{
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "inventory_sha256": "e32c4d4bc008e75fe6027f0dc23ad1e2e7e91f9551f30a03ff92fd3eb0768e5f",
+  "corpus_sha256": "126fad4e502e4481a81f557d77e0e9d0dd27cb179a62b1d6de1def2d8333d731",
+  "case_count": 250,
+  "observation": "All expected values, column metadata and SQLSTATE observed using Reference.query; literal expansion, not pgwire."
+}

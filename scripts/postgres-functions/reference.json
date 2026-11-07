@@ -1,0 +1,7 @@
+{
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "inventory_sha256": "e32c4d4bc008e75fe6027f0dc23ad1e2e7e91f9551f30a03ff92fd3eb0768e5f",
+  "routine_count": 3413,
+  "server_version_num": 180000,
+  "source": "Fresh unmodified PostgreSQL 18.0 initdb catalog; inventory.sql; only default plpgsql extension installed."
+}

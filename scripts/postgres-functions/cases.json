@@ -1,0 +1,1476 @@
+[
+  {
+    "id": "abs-bigint-normal",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT abs(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-bigint-null",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "null",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT)",
+      "INSERT INTO fn_fixture VALUES(1,NULL)"
+    ],
+    "query": "SELECT abs(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-bigint-max",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT)",
+      "INSERT INTO fn_fixture VALUES(1,9223372036854775807)"
+    ],
+    "query": "SELECT abs(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          9223372036854775807
+        ]
+      ]
+    }
+  },
+  {
+    "id": "length-text-codepoints",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT length(txt) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          2
+        ]
+      ]
+    }
+  },
+  {
+    "id": "length-text-empty",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,'')"
+    ],
+    "query": "SELECT length(txt) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    }
+  },
+  {
+    "id": "lower-text-ascii",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT lower('HELLO') AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "hello"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "upper-text-ascii",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT upper('hello') AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "HELLO"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "substring-text-codepoints",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT substring(txt,1,1) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "e"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "count-star",
+    "routines": [
+      "pg_catalog.count()/a"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT count(*) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ]
+    }
+  },
+  {
+    "id": "count-star-empty",
+    "routines": [
+      "pg_catalog.count()/a"
+    ],
+    "kind": "boundary",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT)"
+    ],
+    "query": "SELECT count(*) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    }
+  },
+  {
+    "id": "min-bigint",
+    "routines": [
+      "pg_catalog.min(bigint)/a"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT min(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          -7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "max-bigint",
+    "routines": [
+      "pg_catalog.max(bigint)/a"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT max(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          -7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "sum-bigint-result-type",
+    "routines": [
+      "pg_catalog.sum(bigint)/a"
+    ],
+    "kind": "normal",
+    "setup": [
+      "CREATE TABLE fn_fixture (id BIGINT PRIMARY KEY,n BIGINT,txt TEXT)",
+      "INSERT INTO fn_fixture VALUES(1,-7,'é')"
+    ],
+    "query": "SELECT sum(n) AS v FROM fn_fixture",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "numeric"
+        }
+      ],
+      "rows": [
+        [
+          -7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-smallint-zero-cast",
+    "routines": [
+      "pg_catalog.abs(smallint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT abs(CAST(0 AS smallint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "smallint"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-smallint-negative-cast",
+    "routines": [
+      "pg_catalog.abs(smallint)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(CAST(-7 AS smallint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "smallint"
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-smallint-null-cast",
+    "routines": [
+      "pg_catalog.abs(smallint)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT abs(CAST(NULL AS smallint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "smallint"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-smallint-overflow",
+    "routines": [
+      "pg_catalog.abs(smallint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs(CAST('-32768' AS smallint)) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22003"
+    },
+    "expected_core_error": "Sql(Overflow)"
+  },
+  {
+    "id": "abs-integer-zero-cast",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT abs(CAST(0 AS integer)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-integer-negative-cast",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(CAST(-7 AS integer)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-integer-null-cast",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT abs(CAST(NULL AS integer)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-integer-overflow",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs(CAST('-2147483648' AS integer)) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22003"
+    },
+    "expected_core_error": "Sql(Overflow)"
+  },
+  {
+    "id": "abs-bigint-zero-cast",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT abs(CAST(0 AS bigint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-bigint-negative-cast",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(CAST(-7 AS bigint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-bigint-null-cast",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT abs(CAST(NULL AS bigint)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "abs-bigint-overflow",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs(CAST('-9223372036854775808' AS bigint)) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22003"
+    },
+    "expected_core_error": "Sql(Overflow)"
+  },
+  {
+    "id": "length-null-bound",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": null
+      }
+    ]
+  },
+  {
+    "id": "length-empty-bound",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          0
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": ""
+      }
+    ]
+  },
+  {
+    "id": "length-unicode-bound",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          5
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "é中😀é"
+      }
+    ]
+  },
+  {
+    "id": "length-bad-type",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length(TRUE) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "length-no-args",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length() AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "length-extra-arg",
+    "routines": [
+      "pg_catalog.length(bytea, name)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT length('x','y') AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "lower-null-bound",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": null
+      }
+    ]
+  },
+  {
+    "id": "lower-empty-bound",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          ""
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": ""
+      }
+    ]
+  },
+  {
+    "id": "lower-unicode-bound",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "é中😀é"
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "é中😀é"
+      }
+    ]
+  },
+  {
+    "id": "lower-bad-type",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT lower(TRUE) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "lower-no-args",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT lower() AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "lower-extra-arg",
+    "routines": [
+      "pg_catalog.lower(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT lower('x','y') AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "upper-null-bound",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": null
+      }
+    ]
+  },
+  {
+    "id": "upper-empty-bound",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          ""
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": ""
+      }
+    ]
+  },
+  {
+    "id": "upper-unicode-bound",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "é中😀É"
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "é中😀é"
+      }
+    ]
+  },
+  {
+    "id": "upper-bad-type",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT upper(TRUE) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "upper-no-args",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT upper() AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "upper-extra-arg",
+    "routines": [
+      "pg_catalog.upper(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT upper('x','y') AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "abs-bound-bigint",
+    "routines": [
+      "pg_catalog.abs(bigint)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs($1) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          9007199254740993
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "bigint",
+        "value": -9007199254740993
+      }
+    ]
+  },
+  {
+    "id": "abs-no-args",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs() AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "abs-extra-arg",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs(1,2) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "abs-bad-type",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT abs(TRUE) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "substring-zero",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring($1,0,2) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "id": "substring-negative",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring($1,-1,3) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "id": "substring-past-end",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring($1,20,3) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          ""
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "id": "substring-zero-length",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring($1,1,0) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          ""
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "abc"
+      }
+    ]
+  },
+  {
+    "id": "substring-unicode",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring($1,2,2) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "中😀"
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "é中😀"
+      }
+    ]
+  },
+  {
+    "id": "substring-null-0",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring(NULL,1,2) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "substring-null-1",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring('abc',NULL,2) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "substring-null-2",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT substring('abc',1,NULL) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "id": "substring-negative-length",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring('abc',1,-1) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22011"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "substring-two-args",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT substring('abc',2) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "bc"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "substring-bad-type",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring(TRUE,1,1) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    },
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "coalesce-null-text",
+    "routines": [],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT coalesce(CAST(NULL AS TEXT),CAST(NULL AS TEXT)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          null
+        ]
+      ]
+    },
+    "special_form": "coalesce"
+  },
+  {
+    "id": "coalesce-fallback",
+    "routines": [],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT coalesce(CAST(NULL AS BIGINT),CAST(7 AS BIGINT)) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ]
+    },
+    "special_form": "coalesce"
+  },
+  {
+    "id": "coalesce-first",
+    "routines": [],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT coalesce('first','second') AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "first"
+        ]
+      ]
+    },
+    "special_form": "coalesce"
+  },
+  {
+    "id": "coalesce-nested",
+    "routines": [],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT coalesce(lower(upper('Hello')),'other') AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ],
+      "rows": [
+        [
+          "hello"
+        ]
+      ]
+    },
+    "special_form": "coalesce"
+  },
+  {
+    "id": "coalesce-short-circuit",
+    "routines": [],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT coalesce(CAST(1 AS BIGINT),abs(CAST('-9223372036854775808' AS BIGINT))) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint"
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ]
+    },
+    "special_form": "coalesce"
+  },
+  {
+    "id": "coalesce-bad-type",
+    "routines": [],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT coalesce(1,TRUE) AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42804"
+    },
+    "special_form": "coalesce",
+    "expected_core_error": "Sql(Type)"
+  },
+  {
+    "id": "coalesce-no-args",
+    "routines": [],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT coalesce() AS v",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42601"
+    },
+    "special_form": "coalesce",
+    "expected_core_error": "Sql(Syntax)"
+  },
+  {
+    "id": "nested-length-lower-upper",
+    "routines": [
+      "pg_catalog.length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT length(lower(upper($1))) AS v",
+    "expected": {
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ],
+      "rows": [
+        [
+          5
+        ]
+      ]
+    },
+    "params": [
+      {
+        "type": "text",
+        "value": "Hello"
+      }
+    ]
+  }
+]

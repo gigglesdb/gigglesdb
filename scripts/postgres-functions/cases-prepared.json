@@ -1,0 +1,5292 @@
+[
+  {
+    "id": "abs",
+    "query": "SELECT abs($1) AS v",
+    "wire": [
+      "-2.5"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "c004000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.5"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "abs-null",
+    "query": "SELECT abs($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "lower",
+    "query": "SELECT lower($1) AS v",
+    "wire": [
+      "ABC"
+    ],
+    "core": [
+      "ABC"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "abc"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "lower-null",
+    "query": "SELECT lower($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "length",
+    "query": "SELECT length($1) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "length-null",
+    "query": "SELECT length($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "substring",
+    "query": "SELECT substring($1,2,2) AS v",
+    "wire": [
+      "abcd"
+    ],
+    "core": [
+      "abcd"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "bc"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "substring-null",
+    "query": "SELECT substring($1,2,2) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "binary",
+    "query": "SELECT octet_length(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "binary-null",
+    "query": "SELECT octet_length(CAST($1 AS bytea)) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "encode",
+    "query": "SELECT encode(CAST($1 AS bytea),'hex') AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "616263"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "encode-null",
+    "query": "SELECT encode(CAST($1 AS bytea),'hex') AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "numeric",
+    "query": "SELECT abs(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "-2.50"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-2.50"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.50"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "numeric-null",
+    "query": "SELECT abs(CAST($1 AS numeric)) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "float",
+    "query": "SELECT sqrt($1) AS v",
+    "wire": [
+      "4"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "4010000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "float-null",
+    "query": "SELECT sqrt($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "coalesce",
+    "query": "SELECT coalesce($1, $2) AS v",
+    "wire": [
+      "abc",
+      "fallback"
+    ],
+    "core": [
+      "abc",
+      "fallback"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25,
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "abc"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "coalesce-null",
+    "query": "SELECT coalesce($1, $2) AS v",
+    "wire": [
+      null,
+      "fallback"
+    ],
+    "core": [
+      null,
+      "fallback"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25,
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "fallback"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "reuse",
+    "query": "SELECT abs($1) AS a, abs($1) AS b",
+    "wire": [
+      "-2.5"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "c004000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "a",
+          "oid": 701,
+          "format": 0
+        },
+        {
+          "name": "b",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.5",
+          "2.5"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "nested",
+    "query": "SELECT length(lower($1)) AS v",
+    "wire": [
+      "ABC"
+    ],
+    "core": [
+      "ABC"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "cast-error",
+    "query": "SELECT CAST($1 AS integer) AS v",
+    "wire": [
+      "bad"
+    ],
+    "core": [
+      "bad"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        23
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22P02",
+      "message": "invalid input syntax for type integer: \"bad\""
+    }
+  },
+  {
+    "id": "context-order",
+    "setup": [
+      "CREATE TABLE f(i integer)"
+    ],
+    "query": "SELECT abs($1) AS v FROM f WHERE i=$1",
+    "wire": [
+      "2.5"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "4004000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-length-null-bound",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-length-empty-bound",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "wire": [
+      ""
+    ],
+    "core": [
+      ""
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-length-unicode-bound",
+    "setup": [],
+    "query": "SELECT length($1) AS v",
+    "wire": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "core": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "5"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-lower-null-bound",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-lower-empty-bound",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "wire": [
+      ""
+    ],
+    "core": [
+      ""
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-lower-unicode-bound",
+    "setup": [],
+    "query": "SELECT lower($1) AS v",
+    "wire": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "core": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u4e2d\ud83d\ude00e\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-upper-null-bound",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "wire": [
+      null
+    ],
+    "core": [
+      null
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-upper-empty-bound",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "wire": [
+      ""
+    ],
+    "core": [
+      ""
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-upper-unicode-bound",
+    "setup": [],
+    "query": "SELECT upper($1) AS v",
+    "wire": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "core": [
+      "\u00e9\u4e2d\ud83d\ude00e\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u4e2d\ud83d\ude00E\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-abs-bound-bigint",
+    "setup": [],
+    "query": "SELECT abs($1) AS v",
+    "wire": [
+      "-9007199254740993"
+    ],
+    "core": [
+      -9007199254740993
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "9.007199254740992e+15"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-substring-zero",
+    "setup": [],
+    "query": "SELECT substring($1,0,2) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-substring-negative",
+    "setup": [],
+    "query": "SELECT substring($1,-1,3) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-substring-past-end",
+    "setup": [],
+    "query": "SELECT substring($1,20,3) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-substring-zero-length",
+    "setup": [],
+    "query": "SELECT substring($1,1,0) AS v",
+    "wire": [
+      "abc"
+    ],
+    "core": [
+      "abc"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-substring-unicode",
+    "setup": [],
+    "query": "SELECT substring($1,2,2) AS v",
+    "wire": [
+      "\u00e9\u4e2d\ud83d\ude00"
+    ],
+    "core": [
+      "\u00e9\u4e2d\ud83d\ude00"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u4e2d\ud83d\ude00"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-nested-length-lower-upper",
+    "setup": [],
+    "query": "SELECT length(lower(upper($1))) AS v",
+    "wire": [
+      "Hello"
+    ],
+    "core": [
+      "Hello"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "5"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-\"left\"-4-parameter",
+    "setup": [],
+    "query": "SELECT left(CAST($1 AS text),3) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-\"right\"-16-parameter",
+    "setup": [],
+    "query": "SELECT right(CAST($1 AS text),3) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-bit_length-31-parameter",
+    "setup": [],
+    "query": "SELECT bit_length(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "64"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-btrim-40-parameter",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-btrim-47-parameter",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS text),'\u00e9') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-char_length-55-parameter",
+    "setup": [],
+    "query": "SELECT char_length(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "4"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-character_length-63-parameter",
+    "setup": [],
+    "query": "SELECT character_length(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "4"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-concat-69-parameter",
+    "setup": [],
+    "query": "SELECT concat(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-concat_ws-75-parameter",
+    "setup": [],
+    "query": "SELECT concat_ws(CAST($1 AS text),'\u00e9'::text) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-lpad-82-parameter",
+    "setup": [],
+    "query": "SELECT lpad(CAST($1 AS text),3) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-lpad-95-parameter",
+    "setup": [],
+    "query": "SELECT lpad(CAST($1 AS text),3,'\u754cx') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-ltrim-109-parameter",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-ltrim-116-parameter",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS text),'\u00e9') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-octet_length-128-parameter",
+    "setup": [],
+    "query": "SELECT octet_length(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "8"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-repeat-135-parameter",
+    "setup": [],
+    "query": "SELECT repeat(CAST($1 AS text),3) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301\u00e9\u754ce\u0301\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-replace-148-parameter",
+    "setup": [],
+    "query": "SELECT replace(CAST($1 AS text),'\u00e9','X') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "X\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-reverse-156-parameter",
+    "setup": [],
+    "query": "SELECT reverse(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u0301e\u754c\u00e9"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-rpad-163-parameter",
+    "setup": [],
+    "query": "SELECT rpad(CAST($1 AS text),3) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-rpad-176-parameter",
+    "setup": [],
+    "query": "SELECT rpad(CAST($1 AS text),3,'\u754cx') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-rtrim-190-parameter",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS text)) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-rtrim-197-parameter",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS text),'\u00e9') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\u00e9\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-split_part-205-parameter",
+    "setup": [],
+    "query": "SELECT split_part(CAST($1 AS text),'::',2) AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-starts_with-217-parameter",
+    "setup": [],
+    "query": "SELECT starts_with(CAST($1 AS text),'\u754c') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 16,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "f"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-strpos-224-parameter",
+    "setup": [],
+    "query": "SELECT strpos(CAST($1 AS text),'\u754c') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-translate-232-parameter",
+    "setup": [],
+    "query": "SELECT translate(CAST($1 AS text),'\u00e9','X') AS v",
+    "wire": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "core": [
+      "\u00e9\u754ce\u0301"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        25
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "X\u754ce\u0301"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-strings-abs-245-explicit-cast-binding",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS integer)) AS v",
+    "wire": [
+      "-7"
+    ],
+    "core": [
+      -7
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        23
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "7"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-4-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT substring(CAST($1 AS bytea),1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-18-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT substring(CAST($1 AS bytea),1,1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-33-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT bit_length(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "56"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-40-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x80ff010261"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-59-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT encode(CAST($1 AS bytea),'hex') AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 25,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0080ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-72-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT get_bit(CAST($1 AS bytea),1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-86-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT get_byte(CAST($1 AS bytea),1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "128"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-99-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT length(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "7"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-106-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT length(CAST($1 AS bytea),CAST('UTF8' AS name)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22021",
+      "message": "invalid byte sequence for encoding \"UTF8\": 0x00"
+    }
+  },
+  {
+    "id": "parameter-binary-113-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x80ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-119-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT octet_length(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "7"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-125-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT reverse(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x62610201ff8000"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-132-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS bytea),CAST('\\x0062' AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x0080ff010261"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-140-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT set_bit(CAST($1 AS bytea),1,1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x0280ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-159-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT set_byte(CAST($1 AS bytea),1,1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x0001ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-176-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT sha224(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x43802b54462192191822dfa91d076b686623ce22a6dca648f7e660bc"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-182-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT sha256(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\xcaf611fbb7847f73e368afd6e64b8da9d07051783009c1008fd993f00dbee15b"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-188-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT sha384(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x582a116cf283a7c3493c3ccee3b430b2ccd3ebc62cb9faf2cdf8b91f8196c71edc0b2426aee2cdd43c94ad0133d13a7e"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-194-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT sha512(CAST($1 AS bytea)) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x80271fcfb7cd50260077fe28002794c8d637bab64c83ac076928f23218569fd67cefd7ebe25de51ff892c271091242901c1bfdbc22fa65dfc0a1b2189116d4ba"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-201-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT substr(CAST($1 AS bytea),1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x0080ff01026162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-binary-215-primitive-text-cast",
+    "setup": [],
+    "query": "SELECT substr(CAST($1 AS bytea),1,1) AS v",
+    "wire": [
+      "\\x0080ff01026162"
+    ],
+    "core": [
+      "\\x0080ff01026162"
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        17
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 17,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "\\x00"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-21-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-22-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.0000000000000002"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-23-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "5e-324"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-24-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-46-typed-param",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567890.00001000"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-60-typed-bits-80000000",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS real)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "real",
+        "value": "80000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-61-typed-bits-3f800001",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS real)) AS v",
+    "wire": [
+      "1.0000001192092896"
+    ],
+    "core": [
+      {
+        "type": "real",
+        "value": "3f800001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.0000001"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-62-typed-bits-00000001",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS real)) AS v",
+    "wire": [
+      "1.401298464324817e-45"
+    ],
+    "core": [
+      {
+        "type": "real",
+        "value": "00000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1e-45"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-63-typed-bits-7f7fffff",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS real)) AS v",
+    "wire": [
+      "3.4028234663852886e+38"
+    ],
+    "core": [
+      {
+        "type": "real",
+        "value": "7f7fffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3.4028235e+38"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-85-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT cbrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-86-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT cbrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-87-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT cbrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7031839360032601e-108"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-88-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT cbrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "5.643803094122362e+102"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-102-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT ceil(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-103-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT ceil(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-104-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT ceil(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-105-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT ceil(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-119-typed-param",
+    "setup": [],
+    "query": "SELECT ceil(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567891"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-133-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT ceiling(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-134-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT ceiling(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-135-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT ceiling(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-136-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT ceiling(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-150-typed-param",
+    "setup": [],
+    "query": "SELECT ceiling(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567891"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-164-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT degrees(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-165-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT degrees(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "57.29577951308234"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-166-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT degrees(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.8e-322"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-167-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT degrees(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22003",
+      "message": "value out of range: overflow"
+    }
+  },
+  {
+    "id": "parameter-numeric-198-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT exp(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-199-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT exp(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.718281828459046"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-200-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT exp(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-201-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT exp(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22003",
+      "message": "value out of range: overflow"
+    }
+  },
+  {
+    "id": "parameter-numeric-215-typed-param",
+    "setup": [],
+    "query": "SELECT exp(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22003",
+      "message": "value overflows numeric format"
+    }
+  },
+  {
+    "id": "parameter-numeric-237-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT floor(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-238-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT floor(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-239-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT floor(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-240-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT floor(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-254-typed-param",
+    "setup": [],
+    "query": "SELECT floor(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567890"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-350-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT ln(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "2201E",
+      "message": "cannot take logarithm of zero"
+    }
+  },
+  {
+    "id": "parameter-numeric-351-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT ln(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.2204460492503128e-16"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-352-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT ln(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-744.4400719213812"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-353-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT ln(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "709.782712893384"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-367-typed-param",
+    "setup": [],
+    "query": "SELECT ln(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "43.959837789202521"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-381-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT log(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "2201E",
+      "message": "cannot take logarithm of zero"
+    }
+  },
+  {
+    "id": "parameter-numeric-382-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT log(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "9.64327466553287e-17"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-383-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT log(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-323.3062153431158"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-384-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT log(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "308.25471555991675"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-398-typed-param",
+    "setup": [],
+    "query": "SELECT log(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "19.091514977212700"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-429-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT log10(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "2201E",
+      "message": "cannot take logarithm of zero"
+    }
+  },
+  {
+    "id": "parameter-numeric-430-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT log10(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "9.64327466553287e-17"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-431-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT log10(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-323.3062153431158"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-432-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT log10(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "308.25471555991675"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-446-typed-param",
+    "setup": [],
+    "query": "SELECT log10(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "19.091514977212700"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-460-typed-param",
+    "setup": [],
+    "query": "SELECT min_scale(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "5"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-562-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT radians(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-563-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT radians(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0.0174532925199433"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-564-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT radians(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "error",
+      "sqlstate": "22003",
+      "message": "value out of range: underflow"
+    }
+  },
+  {
+    "id": "parameter-numeric-565-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT radians(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3.1375664143845866e+306"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-579-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT round(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-580-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT round(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-581-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT round(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-582-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT round(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-596-typed-param",
+    "setup": [],
+    "query": "SELECT round(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567890"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-633-typed-param",
+    "setup": [],
+    "query": "SELECT scale(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 23,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "8"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-647-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT sign(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-648-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT sign(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-649-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT sign(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-650-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT sign(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-664-typed-param",
+    "setup": [],
+    "query": "SELECT sign(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-678-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT sqrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-679-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT sqrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-680-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT sqrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "2.2227587494850775e-162"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-681-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT sqrt(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.3407807929942596e+154"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-695-typed-param",
+    "setup": [],
+    "query": "SELECT sqrt(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "3513641828.82014425"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-709-typed-param",
+    "setup": [],
+    "query": "SELECT trim_scale(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567890.00001"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-723-typed-bits-8000000000000000",
+    "setup": [],
+    "query": "SELECT trunc(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "-0.0"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "8000000000000000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "-0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-724-typed-bits-3ff0000000000001",
+    "setup": [],
+    "query": "SELECT trunc(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.0000000000000002"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "3ff0000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-725-typed-bits-0000000000000001",
+    "setup": [],
+    "query": "SELECT trunc(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "5e-324"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "0000000000000001"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-726-typed-bits-7fefffffffffffff",
+    "setup": [],
+    "query": "SELECT trunc(CAST($1 AS double precision)) AS v",
+    "wire": [
+      "1.7976931348623157e+308"
+    ],
+    "core": [
+      {
+        "type": "double precision",
+        "value": "7fefffffffffffff"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.7976931348623157e+308"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-740-typed-param",
+    "setup": [],
+    "query": "SELECT trunc(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "12345678901234567890.00001000"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "12345678901234567890.00001000"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "12345678901234567890"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-772-parameter-reuse-inference",
+    "setup": [],
+    "query": "SELECT round(abs(CAST($1 AS numeric)),2) AS v",
+    "wire": [
+      "-1.2500"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-1.2500"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.25"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-773-parameter-reuse-inference",
+    "setup": [],
+    "query": "SELECT abs($1) AS v",
+    "wire": [
+      "-1.2500"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-1.2500"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        701
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 701,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.25"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-774-parameter-reuse-inference",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS numeric)) AS v",
+    "wire": [
+      "-1.2500"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-1.2500"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "1.2500"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-775-parameter-reuse-inference",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS numeric))+round(CAST($1 AS numeric),2) AS v",
+    "wire": [
+      "-1.2500"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-1.2500"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0.0000"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  },
+  {
+    "id": "parameter-numeric-776-parameter-reuse-inference",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS numeric))+CAST($1 AS integer) AS v",
+    "wire": [
+      "-1.2500"
+    ],
+    "core": [
+      {
+        "type": "numeric",
+        "value": "-1.2500"
+      }
+    ],
+    "expected_pg": {
+      "parameterTypes": [
+        1700
+      ],
+      "resultTypes": [
+        {
+          "name": "v",
+          "oid": 1700,
+          "format": 0
+        }
+      ],
+      "status": "ok",
+      "rows": [
+        [
+          "0.2500"
+        ]
+      ],
+      "format": "PG text exact UTF8; numeric retained as text"
+    }
+  }
+]

@@ -1,0 +1,5701 @@
+[
+  {
+    "id": "strings-\"left\"-0-normal",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT left('é界é',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-1-null-0",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT left(CAST(NULL AS text),3) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-2-null-1",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT left('é界é',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-3-empty",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-4-parameter",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT left(CAST($1 AS text),3) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-5-nested",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(left('é界é',3)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-6-integer--2147483648",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('é界é',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-7-integer--3",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('é界é',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-8-integer-0",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('é界é',0) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-9-integer-1",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('é界é',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-10-integer-12",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT left('é界é',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"left\"-11-wrong-type",
+    "routines": [
+      "pg_catalog.\"left\"(text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT left(true ,3) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-\"right\"-12-normal",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT right('é界é',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-13-null-0",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT right(CAST(NULL AS text),3) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-14-null-1",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT right('é界é',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-15-empty",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-16-parameter",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT right(CAST($1 AS text),3) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-17-nested",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(right('é界é',3)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-18-integer--2147483648",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('é界é',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-19-integer--3",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('é界é',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "́"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-20-integer-0",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('é界é',0) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-21-integer-1",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('é界é',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "́"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-22-integer-12",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT right('é界é',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"right\"-23-wrong-type",
+    "routines": [
+      "pg_catalog.\"right\"(text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT right(true ,3) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-bit_length-24-normal",
+    "routines": [
+      "pg_catalog.bit_length(bit)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT bit_length(B'10101') AS v",
+    "expected": {
+      "rows": [
+        [
+          5
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-25-null-0",
+    "routines": [
+      "pg_catalog.bit_length(bit)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT bit_length(CAST(NULL AS bit)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-26-normal",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT bit_length(CAST('abc' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          24
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-27-null-0",
+    "routines": [
+      "pg_catalog.bit_length(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT bit_length(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-28-normal",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT bit_length('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          64
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-29-null-0",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT bit_length(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-30-empty",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT bit_length('') AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-31-parameter",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT bit_length(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          64
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-32-nested",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(bit_length('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          64
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-bit_length-33-wrong-type",
+    "routines": [
+      "pg_catalog.bit_length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT bit_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-btrim-34-normal",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim(CAST('abc' AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x6263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-35-null-0",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST(NULL AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-36-null-1",
+    "routines": [
+      "pg_catalog.btrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST('abc' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-37-normal",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-38-null-0",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-39-empty",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT btrim('') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-40-parameter",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-41-nested",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(btrim('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-42-wrong-type",
+    "routines": [
+      "pg_catalog.btrim(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT btrim(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-btrim-43-normal",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim('é界é','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-44-null-0",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim(CAST(NULL AS text),'é') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-45-null-1",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT btrim('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-46-empty",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT btrim('','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-47-parameter",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT btrim(CAST($1 AS text),'é') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-48-nested",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(btrim('é界é','é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-btrim-49-wrong-type",
+    "routines": [
+      "pg_catalog.btrim(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT btrim(true ,'é') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-char_length-50-normal",
+    "routines": [
+      "pg_catalog.char_length(character)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(CAST('é  ' AS character(3))) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-51-null-0",
+    "routines": [
+      "pg_catalog.char_length(character)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT char_length(CAST(NULL AS character)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-52-normal",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-53-null-0",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT char_length(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-54-empty",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT char_length('') AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-55-parameter",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-56-nested",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(char_length('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-char_length-57-wrong-type",
+    "routines": [
+      "pg_catalog.char_length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT char_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-character_length-58-normal",
+    "routines": [
+      "pg_catalog.character_length(character)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT character_length(CAST('é  ' AS character(3))) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-59-null-0",
+    "routines": [
+      "pg_catalog.character_length(character)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT character_length(CAST(NULL AS character)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-60-normal",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT character_length('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-61-null-0",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT character_length(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-62-empty",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT character_length('') AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-63-parameter",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT character_length(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-64-nested",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(character_length('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-character_length-65-wrong-type",
+    "routines": [
+      "pg_catalog.character_length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT character_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-concat-66-normal",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT concat('é'::text) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat-67-null-0",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT concat(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat-68-empty",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat('') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat-69-parameter",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT concat(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat-70-nested",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(concat('é'::text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-71-normal",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT concat_ws('é界é','é'::text) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-72-null-0",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT concat_ws(CAST(NULL AS text),'é'::text) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-73-null-1",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT concat_ws('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-74-empty",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat_ws('','é'::text) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-75-parameter",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT concat_ws(CAST($1 AS text),'é'::text) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-76-nested",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(concat_ws('é界é','é'::text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-77-wrong-type",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT concat_ws(true ,'é'::text) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-lpad-78-normal",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT lpad('é界é',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-79-null-0",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lpad(CAST(NULL AS text),3) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-80-null-1",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lpad('é界é',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-81-empty",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "   "
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-82-parameter",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT lpad(CAST($1 AS text),3) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-83-nested",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(lpad('é界é',3)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-84-integer--2147483648",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-85-integer--3",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-86-integer-0",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',0) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-87-integer-1",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-88-integer-12",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          "        é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-89-wrong-type",
+    "routines": [
+      "pg_catalog.lpad(text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT lpad(true ,3) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-lpad-90-normal",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT lpad('é界é',3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-91-null-0",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lpad(CAST(NULL AS text),3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-92-null-1",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lpad('é界é',CAST(NULL AS integer),'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-93-null-2",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT lpad('é界é',3,CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-94-empty",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('',3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "界x界"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-95-parameter",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT lpad(CAST($1 AS text),3,'界x') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-96-nested",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(lpad('é界é',3,'界x')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-97-integer--2147483648",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',-2147483648,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-98-integer--3",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',-3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-99-integer-0",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',0,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-100-integer-1",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',1,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-101-integer-12",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('é界é',12,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "界x界x界x界xé界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-102-wrong-type",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT lpad(true ,3,'界x') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-ltrim-103-normal",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim(CAST('abc' AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x6263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-104-null-0",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST(NULL AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-105-null-1",
+    "routines": [
+      "pg_catalog.ltrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST('abc' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-106-normal",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-107-null-0",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-108-empty",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT ltrim('') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-109-parameter",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-110-nested",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(ltrim('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-111-wrong-type",
+    "routines": [
+      "pg_catalog.ltrim(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT ltrim(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-ltrim-112-normal",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim('é界é','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-113-null-0",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim(CAST(NULL AS text),'é') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-114-null-1",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT ltrim('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-115-empty",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT ltrim('','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-116-parameter",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT ltrim(CAST($1 AS text),'é') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-117-nested",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(ltrim('é界é','é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-ltrim-118-wrong-type",
+    "routines": [
+      "pg_catalog.ltrim(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT ltrim(true ,'é') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-octet_length-119-normal",
+    "routines": [
+      "pg_catalog.octet_length(bit)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length(B'10101') AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-120-null-0",
+    "routines": [
+      "pg_catalog.octet_length(bit)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT octet_length(CAST(NULL AS bit)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-121-normal",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length(CAST('abc' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-122-null-0",
+    "routines": [
+      "pg_catalog.octet_length(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT octet_length(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-123-normal",
+    "routines": [
+      "pg_catalog.octet_length(character)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length(CAST('é  ' AS character(3))) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-124-null-0",
+    "routines": [
+      "pg_catalog.octet_length(character)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT octet_length(CAST(NULL AS character)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-125-normal",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          8
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-126-null-0",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT octet_length(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-127-empty",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT octet_length('') AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-128-parameter",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT octet_length(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          8
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-129-nested",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(octet_length('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          8
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-octet_length-130-wrong-type",
+    "routines": [
+      "pg_catalog.octet_length(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT octet_length(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-repeat-131-normal",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT repeat('é界é',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界éé界éé界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-132-null-0",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT repeat(CAST(NULL AS text),3) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-133-null-1",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT repeat('é界é',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-134-empty",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-135-parameter",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT repeat(CAST($1 AS text),3) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界éé界éé界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-136-nested",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(repeat('é界é',3)) AS v",
+    "expected": {
+      "rows": [
+        [
+          12
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-137-integer--2147483648",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('é界é',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-138-integer--3",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('é界é',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-139-integer-0",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('é界é',0) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-140-integer-1",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('é界é',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-141-integer-12",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT repeat('é界é',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界éé界éé界éé界éé界éé界éé界éé界éé界éé界éé界éé界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-repeat-142-wrong-type",
+    "routines": [
+      "pg_catalog.repeat(text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT repeat(true ,3) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-replace-143-normal",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT replace('é界é','é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          "X界X"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-144-null-0",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT replace(CAST(NULL AS text),'é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-145-null-1",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT replace('é界é',CAST(NULL AS text),'X') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-146-null-2",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT replace('é界é','é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-147-empty",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT replace('','é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-148-parameter",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT replace(CAST($1 AS text),'é','X') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "X界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-149-nested",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(replace('é界é','é','X')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-150-wrong-type",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT replace(true ,'é','X') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-reverse-151-normal",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT reverse(CAST('abc' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x636261"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-152-null-0",
+    "routines": [
+      "pg_catalog.reverse(bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT reverse(CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-153-normal",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT reverse('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "́e界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-154-null-0",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT reverse(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-155-empty",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT reverse('') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-156-parameter",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT reverse(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "́e界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-157-nested",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(reverse('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-reverse-158-wrong-type",
+    "routines": [
+      "pg_catalog.reverse(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT reverse(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-rpad-159-normal",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rpad('é界é',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-160-null-0",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rpad(CAST(NULL AS text),3) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-161-null-1",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rpad('é界é',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-162-empty",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('',3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "   "
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-163-parameter",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rpad(CAST($1 AS text),3) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-164-nested",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(rpad('é界é',3)) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-165-integer--2147483648",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-166-integer--3",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-167-integer-0",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',0) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-168-integer-1",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-169-integer-12",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é        "
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-170-wrong-type",
+    "routines": [
+      "pg_catalog.rpad(text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rpad(true ,3) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-rpad-171-normal",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rpad('é界é',3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-172-null-0",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rpad(CAST(NULL AS text),3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-173-null-1",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rpad('é界é',CAST(NULL AS integer),'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-174-null-2",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rpad('é界é',3,CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-175-empty",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('',3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "界x界"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-176-parameter",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rpad(CAST($1 AS text),3,'界x') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界e"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-177-nested",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(rpad('é界é',3,'界x')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-178-integer--2147483648",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',-2147483648,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-179-integer--3",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',-3,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-180-integer-0",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',0,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-181-integer-1",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',1,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-182-integer-12",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('é界é',12,'界x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é界x界x界x界x"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-183-wrong-type",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rpad(true ,3,'界x') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-rtrim-184-normal",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim(CAST('abc' AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          "\\x616263"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-185-null-0",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST(NULL AS bytea),CAST('a' AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-186-null-1",
+    "routines": [
+      "pg_catalog.rtrim(bytea, bytea)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST('abc' AS bytea),CAST(NULL AS bytea)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "bytea"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-187-normal",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim('é界é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-188-null-0",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-189-empty",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rtrim('') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-190-parameter",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS text)) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-191-nested",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(rtrim('é界é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-192-wrong-type",
+    "routines": [
+      "pg_catalog.rtrim(text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rtrim(true) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-rtrim-193-normal",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim('é界é','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-194-null-0",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim(CAST(NULL AS text),'é') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-195-null-1",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT rtrim('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-196-empty",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rtrim('','é') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-197-parameter",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT rtrim(CAST($1 AS text),'é') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "é界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-198-nested",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(rtrim('é界é','é')) AS v",
+    "expected": {
+      "rows": [
+        [
+          4
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rtrim-199-wrong-type",
+    "routines": [
+      "pg_catalog.rtrim(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT rtrim(true ,'é') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-split_part-200-normal",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "b"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-201-null-0",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT split_part(CAST(NULL AS text),'::',2) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-202-null-1",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c',CAST(NULL AS text),2) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-203-null-2",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',CAST(NULL AS integer)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-204-empty",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('','::',2) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-205-parameter",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT split_part(CAST($1 AS text),'::',2) AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-206-nested",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(split_part('a::b::c','::',2)) AS v",
+    "expected": {
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-207-integer--2147483648",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',-2147483648) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-208-integer--3",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',-3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-209-integer-0",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',0) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22023"
+    }
+  },
+  {
+    "id": "strings-split_part-210-integer-1",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-211-integer-12",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('a::b::c','::',12) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-212-wrong-type",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT split_part(true ,'::',2) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-starts_with-213-normal",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT starts_with('é界é','界') AS v",
+    "expected": {
+      "rows": [
+        [
+          false
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-214-null-0",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT starts_with(CAST(NULL AS text),'界') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-215-null-1",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT starts_with('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-216-empty",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT starts_with('','界') AS v",
+    "expected": {
+      "rows": [
+        [
+          false
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-217-parameter",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT starts_with(CAST($1 AS text),'界') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          false
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-218-nested",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT coalesce(starts_with('é界é','界'),false) AS v",
+    "expected": {
+      "rows": [
+        [
+          false
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "boolean"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-starts_with-219-wrong-type",
+    "routines": [
+      "pg_catalog.starts_with(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT starts_with(true ,'界') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-strpos-220-normal",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT strpos('é界é','界') AS v",
+    "expected": {
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-221-null-0",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT strpos(CAST(NULL AS text),'界') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-222-null-1",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT strpos('é界é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-223-empty",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT strpos('','界') AS v",
+    "expected": {
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-224-parameter",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT strpos(CAST($1 AS text),'界') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-225-nested",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(strpos('é界é','界')) AS v",
+    "expected": {
+      "rows": [
+        [
+          2
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-strpos-226-wrong-type",
+    "routines": [
+      "pg_catalog.strpos(text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT strpos(true ,'界') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-translate-227-normal",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT translate('é界é','é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          "X界X"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-228-null-0",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT translate(CAST(NULL AS text),'é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-229-null-1",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT translate('é界é',CAST(NULL AS text),'X') AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-230-null-2",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "null",
+    "setup": [],
+    "query": "SELECT translate('é界é','é',CAST(NULL AS text)) AS v",
+    "expected": {
+      "rows": [
+        [
+          null
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-231-empty",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT translate('','é','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-232-parameter",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT translate(CAST($1 AS text),'é','X') AS v",
+    "params": [
+      {
+        "type": "text",
+        "value": "é界é"
+      }
+    ],
+    "expected": {
+      "rows": [
+        [
+          "X界é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-233-nested",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT char_length(translate('é界é','é','X')) AS v",
+    "expected": {
+      "rows": [
+        [
+          3
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-234-wrong-type",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT translate(true ,'é','X') AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "42883"
+    }
+  },
+  {
+    "id": "strings-concat-235-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat('?',NULL,12,true,'') AS v",
+    "expected": {
+      "rows": [
+        [
+          "?12t"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat-236-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.concat(\"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat(NULL,NULL) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-237-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat_ws('?','?',NULL,12,'') AS v",
+    "expected": {
+      "rows": [
+        [
+          "??12?"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-concat_ws-238-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.concat_ws(text, \"any\")/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT concat_ws('',NULL,'a','b') AS v",
+    "expected": {
+      "rows": [
+        [
+          "ab"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-239-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('abc','',-1) AS v",
+    "expected": {
+      "rows": [
+        [
+          "abc"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-split_part-240-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.split_part(text, text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT split_part('abc','x',-2) AS v",
+    "expected": {
+      "rows": [
+        [
+          ""
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-lpad-241-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.lpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT lpad('?',5,'') AS v",
+    "expected": {
+      "rows": [
+        [
+          "?"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-rpad-242-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.rpad(text, integer, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT rpad('?',5,'') AS v",
+    "expected": {
+      "rows": [
+        [
+          "?"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-replace-243-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.replace(text, text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT replace('??','','x') AS v",
+    "expected": {
+      "rows": [
+        [
+          "??"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-translate-244-variadic-or-empty-boundary",
+    "routines": [
+      "pg_catalog.translate(text, text, text)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT translate('???','??','X') AS v",
+    "expected": {
+      "rows": [
+        [
+          "XXX"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-abs-245-explicit-cast-binding",
+    "routines": [
+      "pg_catalog.abs(integer)/f"
+    ],
+    "kind": "normal",
+    "setup": [],
+    "query": "SELECT abs(CAST($1 AS integer)) AS v",
+    "params": [
+      {
+        "type": "integer",
+        "value": -7
+      }
+    ],
+    "binding_evidence": "Explicit SQL cast fixes overload on both adapters; untyped legacy abs($1) expands a typed reference literal but core infers its own parameter type and is not pgwire-equivalent.",
+    "expected": {
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"substring\"-246-from-for",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring('é界abc' FROM 2 FOR 2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "界a"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"substring\"-247-from-for",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring('é界abc' FROM -1 FOR 3) AS v",
+    "expected": {
+      "rows": [
+        [
+          "é"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"substring\"-248-from-for",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer)/f"
+    ],
+    "kind": "boundary",
+    "setup": [],
+    "query": "SELECT substring('é界abc' FROM 2) AS v",
+    "expected": {
+      "rows": [
+        [
+          "界abc"
+        ]
+      ],
+      "status": "ok",
+      "columns": [
+        {
+          "name": "v",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  {
+    "id": "strings-\"substring\"-249-from-for",
+    "routines": [
+      "pg_catalog.\"substring\"(text, integer, integer)/f"
+    ],
+    "kind": "error",
+    "setup": [],
+    "query": "SELECT substring('abc' FROM 1 FOR -1) AS v",
+    "expected_core_error": "Sql(Type)",
+    "core_error_rationale": "Sql(Type) is the intended binding/evaluation contract; current Sql(Syntax) parser rejection remains a failure, not accepted compatibility. Core variant is independent of oracle SQLSTATE.",
+    "expected": {
+      "status": "error",
+      "sqlstate": "22011"
+    }
+  }
+]

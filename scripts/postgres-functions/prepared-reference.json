@@ -1,0 +1,8 @@
+{
+  "corpus_sha256": "6861ab84d3cd737abddec57a6764fff46e61720c5d4800e07eef211778ebdaaa",
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "count": 169,
+  "mode": "actual Parse0/Describe/Bind text; raw frame traces in target-dd68-prepared-oracle",
+  "verified": 0,
+  "denominator": 3413
+}

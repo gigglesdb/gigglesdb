@@ -1,0 +1,44 @@
+{
+  "files_sha256": {
+    "conformance.py": "caadfdec1e60a54f9847d1cc7168ecd8d2ac8ad8cdb13e24e141c8ec8a0d20f8",
+    "cases-strings.json": "40ce7d1300445c1beb130e001aaf044f1965d215cb6ab078a41c7382ceefed15",
+    "observe_strings.py": "6f42cc0b27335a6a47dae528120390f984b307a1487b38a778a95187e7ec79c8",
+    "test_strings.py": "5163c8a1482a229506bd0de65d47dbc4517f0a7cc313bbfd5621d938ed75ffe3",
+    "strings-reference.json": "e31c793da92f0a201ca5b77847e7de5f7bf39a9bdebba91a0b06e3b1c2f7d1ea",
+    "README.md": "f1272cddf7f058d707a55630a780d8986fdf8a906ac5e4531a211139d72d3361",
+    "cases.json": "30a9095f1fe9a7a2531f5e2f6a4b67d28b300da1ee2c9db7f15c3142e6522e12",
+    "postgres-18.0.json.gz": "52e5dab1d692ca73acbda2a57f0d13d435e9ec0a8fb16132c92c20f5c6e046b9",
+    ".runs/strings-combined-250/report.json": "7124c0c2cbd3d1435a6741c576a31167e12e387a2bb67bf0886189e7dc6bbd94",
+    ".runs/strings-tests-250.log": "721180a4fa841b843ff42aec5d154304beee50188097005555efc2158d9a8c4c"
+  },
+  "tests": {
+    "enabled": 34,
+    "passed": 34,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 45.739
+  },
+  "combined_run": {
+    "cases": 316,
+    "PASS": 21,
+    "FAIL": 295,
+    "ORACLE_ERROR": 0,
+    "SETUP_ERROR": 0,
+    "seed": {
+      "PASS": 21,
+      "FAIL": 45
+    },
+    "supplement": {
+      "PASS": 0,
+      "FAIL": 250
+    }
+  },
+  "supplement_canonical_sha256": "126fad4e502e4481a81f557d77e0e9d0dd27cb179a62b1d6de1def2d8333d731",
+  "limitations": [
+    "Supplied executable/source correspondence unverified; no claim about latest concurrent product source.",
+    "Typed literal reference expansion is not pgwire extended-protocol evidence.",
+    "Negative core variants independent of PostgreSQL SQLSTATE; Type versus Syntax mismatches remain failures.",
+    "Original66 preserved, including untyped abs parameter overload mismatch; explicit SQL cast counterpart added.",
+    "All results remain partial; full3413 denominator preserved."
+  ]
+}

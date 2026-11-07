@@ -1,0 +1,41 @@
+{
+  "enabled_tests": {
+    "run": 37,
+    "passed": 37,
+    "failed": 0,
+    "skipped": 0,
+    "exit": 0,
+    "seconds": 77.096
+  },
+  "original66_reference_pass": 66,
+  "live_inventory_pin": "matched",
+  "binary_case_count": 255,
+  "binary_signatures": 22,
+  "full_qualification": false,
+  "candidate_report_status": "STALE/UNVERIFIED: shared preexisting probe changed between runs; no stable source/build or per-case executable identity. Candidate counts are diagnostic only, not parallel implementation validation.",
+  "candidate_verdicts": {
+    "PASS": 199,
+    "FAIL": 56
+  },
+  "prior_probe_sha256": "faaf55c6cfd73b63d2a34459dbc62aef52736030e031c38ccfec1801deca4d0d",
+  "final_report_probe_sha256": "d1f665d6e336bffee59d6c1715ceedcad054908fc986120ff3a6ae2384b00c83",
+  "canonical_corpus_hashes": {
+    "cases.json": "f460405206585757ac37482c28dc81a71409baa538415dfdb238dd5c686857a1",
+    "cases-strings.json": "126fad4e502e4481a81f557d77e0e9d0dd27cb179a62b1d6de1def2d8333d731",
+    "cases-binary.json": "f3a25eb0197add240a66165d1f60014d88d0bb75a989f44e7eac8562b57d2526"
+  },
+  "files_sha256": {
+    "cases.json": "30a9095f1fe9a7a2531f5e2f6a4b67d28b300da1ee2c9db7f15c3142e6522e12",
+    "cases-strings.json": "40ce7d1300445c1beb130e001aaf044f1965d215cb6ab078a41c7382ceefed15",
+    "cases-binary.json": "fa6b266e4d22e67fd2932f1102a2e5a5cf138fb14413275ac6afb12e672e64e6",
+    "postgres-18.0.json.gz": "52e5dab1d692ca73acbda2a57f0d13d435e9ec0a8fb16132c92c20f5c6e046b9",
+    "reference.json": "dfd3a85ff5949b4ff4759ac69ddd75157170c4ecf7e30590543331b99d31aebc",
+    "binary-reference.json": "fd781a13670194d75644977d9f4fbe77fb76875d6196610c5ccae217160c6891",
+    "observe_binary.py": "51d84df1394c6d091b7ff896a2e0f0292a644d4ac0486a459c9eaecb91c8731b",
+    "test_binary.py": "06fa35d4ac2c73dde8d9d5bdb6315240ef71300abe0b375db02fa32d7ecbfcf6",
+    "README.md": "9190ea96003c172b16b4ed476c296a9d1d29e819d12075023346ac43185b5db3",
+    ".runs/binary-enabled-tests-final.log": "97f3ef35e3c21a9e7f07d5de2f2621cfa101b165df71817fce54ff3bcd26be1c",
+    ".runs/binary-stale-probe-final/report.json": "f4b51b13329dd784da8da4242d871f2ec0f8957378bd34ee3431205304057b1c",
+    ".runs/binary-stale-probe/report.json": "6784e9ae460df60f55e8f19b2d40e3d40965b1e9b0a0e5c18885d1bd0e38b5bc"
+  }
+}

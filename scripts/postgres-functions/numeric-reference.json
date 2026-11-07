@@ -1,0 +1,7 @@
+{
+  "image": "postgres@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c",
+  "inventory_sha256": "e32c4d4bc008e75fe6027f0dc23ad1e2e7e91f9551f30a03ff92fd3eb0768e5f",
+  "corpus_sha256": "6956b56ecd75ec08f57d57ad3bad6f0a143cd2489e9568444dad4f47258e6ded",
+  "case_count": 783,
+  "observation": "Owned pinned PG18; numeric text retains scale; float send exact IEEE bytes; lexical parameter expansion, no wire claim."
+}
