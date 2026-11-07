@@ -26,6 +26,10 @@ spaceId afterwards.
 
 Standing user instruction, recorded on 2026-11-07.
 
+Never use `codex exec resume --last`. Several agents run Codex on this machine,
+so `--last` can pick up another agent's session. Resume only by explicit
+session id, and prefer a fresh bounded brief.
+
 ## Archdocs space
 
 All GigglesDB design docs and related architecture documents must be bound to
