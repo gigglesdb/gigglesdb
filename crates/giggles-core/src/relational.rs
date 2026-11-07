@@ -1301,7 +1301,12 @@ impl Prepared {
             return Err(SqlError::StaleSchema);
         }
         if let Statement::InsertExpressions(values) = &self.statement {
-            return returning::validate_insert_constants(values, state, self.params);
+            return returning::validate_insert_constants(
+                values,
+                state,
+                self.params,
+                &self.parameter_types,
+            );
         }
         if let Statement::Query(q) = &self.statement {
             return q
@@ -1327,7 +1332,7 @@ impl Prepared {
             return insert.describe(state, self.params, &self.parameter_types);
         }
         if let Statement::InsertExpressions(values) = &self.statement {
-            return returning::describe_insert(values, state, self.params);
+            return returning::describe_insert(values, state, self.params, &self.parameter_types);
         }
         if let Statement::Query(q) = &self.statement {
             return q
@@ -1628,6 +1633,7 @@ impl Prepared {
             Statement::Query(_)
                 | Statement::Insert { .. }
                 | Statement::InsertMulti(_)
+                | Statement::InsertExpressions(_)
                 | Statement::Update { .. }
                 | Statement::UpdateExpressions { .. }
                 | Statement::Delete { .. }
@@ -2191,6 +2197,7 @@ impl Relational {
                 prepared.statement,
                 Statement::Insert { .. }
                     | Statement::InsertMulti(_)
+                    | Statement::InsertExpressions(_)
                     | Statement::Update { .. }
                     | Statement::UpdateExpressions { .. }
                     | Statement::Delete { .. }
@@ -2214,6 +2221,7 @@ impl Relational {
                 values,
                 self,
                 prepared.params,
+                &prepared.parameter_types,
                 params,
                 &mut cancel,
                 clock,

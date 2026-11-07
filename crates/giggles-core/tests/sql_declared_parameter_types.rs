@@ -311,10 +311,10 @@ fn declaration_length_checks_precede_statement_kind_and_nonqueries_ignore_types(
         .unwrap();
     assert_eq!(
         session.describe(&prepared).unwrap().parameters,
-        vec![DataType::Integer]
+        vec![DataType::Bytes]
     );
     session
-        .execute_prepared(&prepared, &[Value::Int(-2)], None)
+        .execute_prepared(&prepared, &[Value::Bytes(vec![1])], None)
         .unwrap();
 }
 

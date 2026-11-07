@@ -460,6 +460,9 @@ pub(super) fn plan_unique_conflict<'s>(
                     continue;
                 }
                 let final_value = value(&post, resolved, proposal, index);
+                if semantics == Semantics::Sql && column.not_null && *final_value == Value::Null {
+                    return Err(PlanError::Sql(SqlError::Null));
+                }
                 check(final_value, column)?;
                 charge_value(&mut remaining_row, final_value)?;
                 charge_value(&mut remaining_mutation, final_value)?;

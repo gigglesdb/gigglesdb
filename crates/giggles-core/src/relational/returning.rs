@@ -86,12 +86,21 @@ pub(super) fn describe_insert(
     values: &query::InsertExpressions,
     state: &Relational,
     count: usize,
+    declared: &[Option<DataType>],
 ) -> R<Description> {
     let Some(map) = &values.parameter_map else {
-        return values.describe(state, count);
+        return values.describe(state, count, declared);
     };
-    let body = values.describe(state, map.len())?;
+    let inputs = map
+        .iter()
+        .map(|n| declared.get(n - 1).cloned().flatten())
+        .collect::<Vec<_>>();
+    let body = values.describe(state, map.len(), &inputs)?;
     let mut seed = vec![None; count];
+    if declared.len() > count {
+        return Err(SqlError::Parameters);
+    }
+    seed[..declared.len()].clone_from_slice(declared);
     for (original, ty) in map.iter().zip(body.parameters) {
         *seed.get_mut(original - 1).ok_or(SqlError::Parameters)? = Some(ty);
     }
@@ -111,14 +120,24 @@ pub(super) fn validate_insert_constants(
     values: &query::InsertExpressions,
     state: &Relational,
     count: usize,
+    declared: &[Option<DataType>],
 ) -> R<()> {
-    values.validate_constants(state, values.parameter_map.as_ref().map_or(count, Vec::len))
+    if let Some(map) = &values.parameter_map {
+        let inputs = map
+            .iter()
+            .map(|n| declared.get(n - 1).cloned().flatten())
+            .collect::<Vec<_>>();
+        values.validate_constants(state, map.len(), &inputs)
+    } else {
+        values.validate_constants(state, count, declared)
+    }
 }
 
 pub(super) fn evaluate_insert(
     values: &query::InsertExpressions,
     state: &Relational,
     count: usize,
+    declared: &[Option<DataType>],
     params: &[Value],
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&super::clock::ExecutionClock>,
@@ -128,9 +147,13 @@ pub(super) fn evaluate_insert(
             .iter()
             .map(|n| params.get(n - 1).cloned().ok_or(SqlError::Parameters))
             .collect::<R<Vec<_>>>()?;
-        values.evaluate_clocked(state, inputs.len(), &inputs, cancel, clock)
+        let types = map
+            .iter()
+            .map(|n| declared.get(n - 1).cloned().flatten())
+            .collect::<Vec<_>>();
+        values.evaluate_clocked(state, inputs.len(), &types, &inputs, cancel, clock)
     } else {
-        values.evaluate_clocked(state, count, params, cancel, clock)
+        values.evaluate_clocked(state, count, declared, params, cancel, clock)
     }
 }
 

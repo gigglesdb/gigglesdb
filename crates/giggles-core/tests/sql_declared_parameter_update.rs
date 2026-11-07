@@ -750,3 +750,158 @@ fn integer_literal_comparisons_do_not_narrow_to_column_ranges() {
         ]
     );
 }
+
+#[test]
+fn declared_update_expressions_preserve_types_and_assignment_ranges() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,s SMALLINT,x TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO t(id,n,s,x) VALUES(1,1,1,'old')", &[], None)
+        .unwrap();
+    for (assignment, declared, input, expected) in [
+        ("n=$1+1", DataType::BigInt, 5, Value::Int(6)),
+        ("n=abs($1)", DataType::BigInt, -7, Value::Int(7)),
+        ("s=$1+1", DataType::Integer, 5, Value::Int(6)),
+        ("n=$1+1", DataType::SmallInt, 5, Value::Int(6)),
+        ("x=$1+1", DataType::Integer, 41, Value::Text("42".into())),
+        ("x=abs($1)", DataType::BigInt, -5, Value::Text("5".into())),
+    ] {
+        let prepared = session
+            .prepare(&format!("UPDATE t SET {assignment} WHERE id=1"))
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared]
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&prepared, &[Value::Int(input)], None)
+                .unwrap()
+                .affected,
+            1
+        );
+        let column = assignment.split('=').next().unwrap();
+        assert_eq!(
+            session
+                .execute(&format!("SELECT {column} FROM t WHERE id=1"), &[], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![expected]
+        );
+    }
+    for (assignment, declared, input) in [
+        ("n=$1+1", DataType::BigInt, 3_000_000_000),
+        ("n=abs($1)", DataType::BigInt, -3_000_000_000),
+        ("s=$1+1", DataType::Integer, 40_000),
+        ("n=$1+1", DataType::Integer, i64::from(i32::MAX)),
+    ] {
+        let before = session
+            .execute("SELECT * FROM t WHERE id=1", &[], None)
+            .unwrap();
+        let prepared = session
+            .prepare(&format!("UPDATE t SET {assignment} WHERE id=1"))
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared]
+        );
+        assert!(matches!(
+            session.execute_prepared(&prepared, &[Value::Int(input)], None),
+            Err(CoreError::Sql(SqlError::Overflow))
+        ));
+        assert_eq!(
+            session
+                .execute("SELECT * FROM t WHERE id=1", &[], None)
+                .unwrap(),
+            before
+        );
+    }
+    for (assignment, declared) in [("n=$1+1", DataType::Text), ("n=abs($1)", DataType::Bytes)] {
+        let prepared = session
+            .prepare(&format!("UPDATE t SET {assignment} WHERE id=1"))
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        // PG 18.6 gives 42883 for abs(bytea); GigglesDB maps scalar signature mismatches to 42804 (DD-0068 follow-up).
+        let expected = if declared == DataType::Bytes {
+            SqlError::Type
+        } else {
+            SqlError::UndefinedFunction
+        };
+        assert!(matches!(
+            session.describe(&prepared),
+            Err(CoreError::Sql(error)) if error == expected
+        ));
+    }
+    let inferred = session.prepare("UPDATE t SET n=$1+1 WHERE id=1").unwrap();
+    assert_eq!(
+        session.describe(&inferred).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+}
+
+#[test]
+fn null_update_assignments_are_not_null_violations_only_for_matched_rows() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,s SMALLINT,x TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO t(id,n) VALUES(1,10)", &[], None)
+        .unwrap();
+    let before = session.execute("SELECT * FROM t", &[], None).unwrap();
+    assert!(matches!(
+        session.execute("UPDATE t SET n=NULL WHERE id=1", &[], None),
+        Err(CoreError::Sql(SqlError::Null))
+    ));
+    assert_eq!(
+        session.execute("SELECT * FROM t", &[], None).unwrap(),
+        before
+    );
+    for declared in [None, Some(DataType::Integer), Some(DataType::BigInt)] {
+        let prepared = session.prepare("UPDATE t SET n=$1 WHERE id=1").unwrap();
+        let prepared = if let Some(ty) = declared.clone() {
+            prepared.with_parameter_types(&[Some(ty)]).unwrap()
+        } else {
+            prepared
+        };
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared.unwrap_or(DataType::Integer)]
+        );
+        assert!(matches!(
+            session.execute_prepared(&prepared, &[Value::Null], None),
+            Err(CoreError::Sql(SqlError::Null))
+        ));
+        assert_eq!(
+            session.execute("SELECT * FROM t", &[], None).unwrap(),
+            before
+        );
+    }
+    // PG 18.6 gives UPDATE 0 (NOT NULL is a post-image check); GigglesDB checks plain SET NULL before row lookup (follow-up).
+    assert!(matches!(
+        session.execute("UPDATE t SET n=NULL WHERE id=999", &[], None),
+        Err(CoreError::Sql(SqlError::Null))
+    ));
+    assert_eq!(
+        session.execute("SELECT * FROM t", &[], None).unwrap(),
+        before
+    );
+}

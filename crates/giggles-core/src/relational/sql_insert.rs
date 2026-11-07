@@ -391,13 +391,21 @@ fn infer_condition(
             infer_operand(left, right_type.as_ref(), table, parameters, declared)?;
             infer_operand(right, left_type.as_ref(), table, parameters, declared)?;
         }
-        Condition::Operand(operand) => infer_operand(
-            operand,
-            Some(&DataType::Boolean),
-            table,
-            parameters,
-            declared,
-        )?,
+        Condition::Operand(operand) => {
+            if let Operand::Value(Expr::Param(n)) = operand
+                && let Some(Some(ty)) = declared.get(n - 1)
+                && *ty != DataType::Boolean
+            {
+                return Err(SqlError::Type);
+            }
+            infer_operand(
+                operand,
+                Some(&DataType::Boolean),
+                table,
+                parameters,
+                declared,
+            )?;
+        }
         Condition::IsNull(operand, _) => infer_operand(operand, None, table, parameters, declared)?,
         Condition::Not(inner) => infer_condition(inner, table, parameters, declared)?,
         Condition::And(left, right) | Condition::Or(left, right) => {

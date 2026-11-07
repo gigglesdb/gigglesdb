@@ -251,7 +251,12 @@ impl InsertExpressions {
         }
         Ok(())
     }
-    fn bind(&self, state: &Relational, count: usize) -> R<BoundValues> {
+    fn bind(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<BoundValues> {
         let table = state.tables.get(&self.name).ok_or(SqlError::UnknownTable)?;
         self.admit_literals()?;
         if count > MAX_PARAMS || self.values.len() > MAX_COLUMNS {
@@ -271,6 +276,10 @@ impl InsertExpressions {
         }
         let no_columns = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
         let mut parameters = vec![None; count];
+        if declared.len() > count {
+            return Err(SqlError::Parameters);
+        }
+        parameters[..declared.len()].clone_from_slice(declared);
         for (value, index) in self.values.iter().zip(&indexes) {
             let expected = match value {
                 Scalar::Param(n) if parameters[n - 1].is_none() => {
@@ -306,16 +315,26 @@ impl InsertExpressions {
                 .collect::<R<_>>()?,
         })
     }
-    pub(in super::super) fn describe(&self, state: &Relational, count: usize) -> R<Description> {
-        let bound = self.bind(state, count)?;
+    pub(in super::super) fn describe(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<Description> {
+        let bound = self.bind(state, count, declared)?;
         Ok(Description {
             parameters: bound.parameters,
             typmods: vec![],
             columns: vec![],
         })
     }
-    pub(in super::super) fn validate_constants(&self, state: &Relational, count: usize) -> R<()> {
-        let bound = self.bind(state, count)?;
+    pub(in super::super) fn validate_constants(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<()> {
+        let bound = self.bind(state, count, declared)?;
         let mut budget = 0;
         for value in &bound.values {
             value.plan_constant(&mut budget)?;
@@ -326,11 +345,12 @@ impl InsertExpressions {
         &self,
         state: &Relational,
         count: usize,
+        declared: &[Option<DataType>],
         params: &[Value],
         cancel: &mut impl FnMut() -> bool,
         clock: Option<&crate::relational::clock::ExecutionClock>,
     ) -> R<Vec<Expr>> {
-        let mut bound = self.bind(state, count)?;
+        let mut bound = self.bind(state, count, declared)?;
         for value in &mut bound.values {
             value.attach_clock(clock);
         }

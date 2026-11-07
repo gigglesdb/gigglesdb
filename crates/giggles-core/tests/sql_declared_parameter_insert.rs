@@ -397,43 +397,339 @@ fn declared_conflict_set_assignments_and_guard_comparisons() {
 }
 
 #[test]
-fn declared_null_conflict_set_into_not_null_column_still_fails() {
-    // PG 18.6: PREPARE c(int8,int8,int8) ... ON CONFLICT DO UPDATE SET n=$3;
-    // EXECUTE c(1,5,NULL) gives 23502 and leaves the row unchanged.
-    // Known gap, which predates declared types: GigglesDB rejects the NULL
-    // with SqlError::Type (42804) whether or not $3 is declared. This pins
-    // that a declared parameter is rejected exactly like an undeclared one.
+fn declared_null_conflict_set_into_not_null_column_is_not_null_violation() {
     let admin = Admin::create(fresh(), Limits::default()).unwrap();
     let mut session = admin.sql_session();
     session
-        .execute("CREATE TABLE u(id INT PRIMARY KEY,n INT NOT NULL)", &[], None)
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,s SMALLINT,x TEXT)",
+            &[],
+            None,
+        )
         .unwrap();
     session
-        .execute("INSERT INTO u VALUES(1,10)", &[], None)
+        .execute("INSERT INTO t(id,n) VALUES(1,10)", &[], None)
         .unwrap();
-    let sql = "INSERT INTO u(id,n) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET n=$3";
-    let declared = session
-        .prepare(sql)
-        .unwrap()
-        .with_parameter_types(&[
-            Some(DataType::BigInt),
-            Some(DataType::BigInt),
-            Some(DataType::BigInt),
-        ])
-        .unwrap();
-    let undeclared = session.prepare(sql).unwrap();
-    for prepared in [&undeclared, &declared] {
+    let before = session.execute("SELECT * FROM t", &[], None).unwrap();
+    let sql = "INSERT INTO t(id,n) VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=$1";
+    for declared in [false, true] {
+        let prepared = session.prepare(sql).unwrap();
+        let prepared = if declared {
+            prepared
+                .with_parameter_types(&[Some(DataType::Integer)])
+                .unwrap()
+        } else {
+            prepared
+        };
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![DataType::Integer]
+        );
         assert!(matches!(
-            session.execute_prepared(prepared, &[Value::Int(1), Value::Int(5), Value::Null], None),
+            session.execute_prepared(&prepared, &[Value::Null], None),
+            Err(CoreError::Sql(SqlError::Null))
+        ));
+        assert_eq!(
+            session.execute("SELECT * FROM t", &[], None).unwrap(),
+            before
+        );
+    }
+    assert!(matches!(
+        session.execute(
+            "INSERT INTO t(id,n) VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=NULL",
+            &[],
+            None
+        ),
+        Err(CoreError::Sql(SqlError::Null))
+    ));
+    assert_eq!(
+        session.execute("SELECT * FROM t", &[], None).unwrap(),
+        before
+    );
+    let prepared = session
+        .prepare("INSERT INTO t(id,n) VALUES(9,1) ON CONFLICT(id) DO UPDATE SET n=$1")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Integer)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&prepared).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&prepared, &[Value::Null], None)
+            .unwrap()
+            .affected,
+        1
+    );
+    assert_eq!(
+        session
+            .execute("SELECT n FROM t WHERE id=9", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Int(1)]
+    );
+}
+
+#[test]
+fn declared_insert_expressions_preserve_types_and_assignment_ranges() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,s SMALLINT,x TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    for (sql, declared, input, column, expected) in [
+        (
+            "INSERT INTO t(id,n) VALUES(2,$1+1)",
+            DataType::BigInt,
+            5,
+            "n",
+            Value::Int(6),
+        ),
+        (
+            "INSERT INTO t(id,n) VALUES(3,abs($1))",
+            DataType::BigInt,
+            -9,
+            "n",
+            Value::Int(9),
+        ),
+        (
+            "INSERT INTO t(id,n) VALUES(4,abs($1::integer))",
+            DataType::BigInt,
+            -4,
+            "n",
+            Value::Int(4),
+        ),
+        (
+            "INSERT INTO t(id,n,x) VALUES(6,1,$1+1)",
+            DataType::Integer,
+            41,
+            "x",
+            Value::Text("42".into()),
+        ),
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![declared]
+        );
+        // Run failures before successful inserts so duplicate keys cannot hide them.
+        if sql.contains("VALUES(3,") || sql.contains("VALUES(4,") {
+            let input = if sql.contains("VALUES(3,") {
+                -3_000_000_000
+            } else {
+                3_000_000_000
+            };
+            assert!(matches!(
+                session.execute_prepared(&prepared, &[Value::Int(input)], None),
+                Err(CoreError::Sql(SqlError::Overflow))
+            ));
+            let id = if sql.contains("VALUES(3,") { 3 } else { 4 };
+            assert!(
+                session
+                    .execute(&format!("SELECT * FROM t WHERE id={id}"), &[], None)
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            session
+                .execute_prepared(&prepared, &[Value::Int(input)], None)
+                .unwrap()
+                .affected,
+            1
+        );
+        let id = if column == "x" {
+            6
+        } else if sql.contains("VALUES(2,") {
+            2
+        } else if sql.contains("VALUES(3,") {
+            3
+        } else {
+            4
+        };
+        assert_eq!(
+            session
+                .execute(&format!("SELECT {column} FROM t WHERE id={id}"), &[], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![expected]
+        );
+    }
+    for (sql, declared) in [
+        ("INSERT INTO t(id,n) VALUES(5,$1+1)", DataType::Text),
+        ("INSERT INTO t(id,n) VALUES(8,abs($1))", DataType::Bytes),
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared.clone())])
+            .unwrap();
+        // PG 18.6 gives 42883 for abs(bytea); GigglesDB maps scalar signature mismatches to 42804 (DD-0068 follow-up).
+        let expected = if declared == DataType::Bytes {
+            SqlError::Type
+        } else {
+            SqlError::UndefinedFunction
+        };
+        assert!(matches!(
+            session.describe(&prepared),
+            Err(CoreError::Sql(error)) if error == expected
+        ));
+    }
+    let prepared = session
+        .prepare("INSERT INTO t(id,n,s) VALUES(7,1,$1+1)")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Integer)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&prepared).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+    assert!(matches!(
+        session.execute_prepared(&prepared, &[Value::Int(40_000)], None),
+        Err(CoreError::Sql(SqlError::Overflow))
+    ));
+    assert!(
+        session
+            .execute("SELECT * FROM t WHERE id=7", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let inferred = session
+        .prepare("INSERT INTO t(id,n) VALUES(12,$1+1)")
+        .unwrap();
+    assert_eq!(
+        session.describe(&inferred).unwrap().parameters,
+        vec![DataType::Integer]
+    );
+    let remapped = session
+        .prepare("INSERT INTO t(id,n) VALUES(13,$2+1) RETURNING $1,n")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::Text), Some(DataType::BigInt)])
+        .unwrap();
+    let description = session.describe(&remapped).unwrap();
+    assert_eq!(
+        description.parameters,
+        vec![DataType::Text, DataType::BigInt]
+    );
+    assert_eq!(
+        description
+            .columns
+            .iter()
+            .map(|column| column.data_type.clone())
+            .collect::<Vec<_>>(),
+        vec![DataType::Text, DataType::Integer]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(
+                &remapped,
+                &[Value::Text("label".into()), Value::Int(40)],
+                None
+            )
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("label".into()), Value::Int(41)]
+    );
+}
+
+#[test]
+fn conflict_bare_parameter_guards_require_boolean() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,n INT NOT NULL,s SMALLINT,x TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO t(id,n) VALUES(1,10)", &[], None)
+        .unwrap();
+    let sql = "INSERT INTO t(id,n) VALUES(1,1) ON CONFLICT(id) DO UPDATE SET n=2 WHERE $1";
+    for declared in [
+        DataType::Integer,
+        DataType::BigInt,
+        DataType::Text,
+        DataType::Bytes,
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(declared)])
+            .unwrap();
+        assert!(matches!(
+            session.describe(&prepared),
             Err(CoreError::Sql(SqlError::Type))
         ));
         assert_eq!(
             session
-                .execute("SELECT n FROM u WHERE id=1", &[], None)
+                .execute("SELECT n FROM t WHERE id=1", &[], None)
                 .unwrap()
                 .rows[0]
                 .values,
             vec![Value::Int(10)]
+        );
+    }
+    for declared in [false, true] {
+        session
+            .execute("UPDATE t SET n=10 WHERE id=1", &[], None)
+            .unwrap();
+        let prepared = session.prepare(sql).unwrap();
+        let prepared = if declared {
+            prepared
+                .with_parameter_types(&[Some(DataType::Boolean)])
+                .unwrap()
+        } else {
+            prepared
+        };
+        assert_eq!(
+            session.describe(&prepared).unwrap().parameters,
+            vec![DataType::Boolean]
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&prepared, &[Value::Bool(false)], None)
+                .unwrap()
+                .affected,
+            0
+        );
+        assert_eq!(
+            session
+                .execute("SELECT n FROM t WHERE id=1", &[], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![Value::Int(10)]
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&prepared, &[Value::Bool(true)], None)
+                .unwrap()
+                .affected,
+            1
+        );
+        assert_eq!(
+            session
+                .execute("SELECT n FROM t WHERE id=1", &[], None)
+                .unwrap()
+                .rows[0]
+                .values,
+            vec![Value::Int(2)]
         );
     }
 }
