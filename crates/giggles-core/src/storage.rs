@@ -1,5 +1,6 @@
 use crate::*;
 mod catalog_inspection;
+mod drop_table;
 mod engine;
 mod format_policy;
 pub(crate) mod native_once;
@@ -614,6 +615,9 @@ impl Inner {
             tx.set_durability(Durability::Immediate).map_err(io)?;
             {
                 let mut t = tx.open_table(RECORDS).map_err(io)?;
+                if !values.contains_key(&vec![8]) {
+                    t.remove(&[8][..]).map_err(io)?;
+                }
                 for (k, v) in &values {
                     t.insert(k.as_slice(), v.as_slice()).map_err(io)?;
                 }

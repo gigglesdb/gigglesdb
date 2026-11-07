@@ -321,6 +321,17 @@ fn witness_work(row: &BaseRow<'_>, searches: usize) -> Result<usize> {
     mul(mul(bytes, 32)?, add(searches, 1)?)
 }
 impl Sidecar {
+    pub(crate) fn drop_table(&mut self, table: u64) {
+        self.descriptors.retain(|d| {
+            if d.table == table {
+                self.entries.remove(&d.id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     pub(crate) fn descriptors(&self) -> &[Descriptor] {
         &self.descriptors
     }

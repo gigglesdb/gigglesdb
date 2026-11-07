@@ -1482,6 +1482,18 @@ impl Value {
     }
 }
 impl Relational {
+    pub(crate) fn drop_table(&mut self, name: &str) -> R<bool> {
+        let Some(table) = self.tables.get(name) else {
+            return Ok(false);
+        };
+        let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+        self.rows.remove(&table.id);
+        self.secondary.drop_table(table.id);
+        self.tables.remove(name);
+        self.epoch = epoch;
+        Ok(true)
+    }
+
     pub(crate) fn contains_temporal(&self) -> bool {
         self.tables
             .values()
