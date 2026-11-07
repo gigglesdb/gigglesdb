@@ -266,8 +266,69 @@ The 100k recovery fixture uses bounded concurrent atomic creates with fsync
 disabled only for fixture setup; crash tests use fsync. Its timings describe
 journal recovery, not sequential durable-append throughput or 100k-row core
 materialization. A separate 1,100-row real-core test asserts export/restore is
-faster than replay and compares every audit row. The embedded core currently
-has a 16 MiB durable-state envelope and a 64 KiB row limit; transition preflight
-rejects unsupported inputs before the journal put. The dev profile retains
+faster than rebuilding and compares every current chunk row. The embedded core
+has a 16 MiB envelope and a 64 KiB row limit. The local profile admits at most
+12 MiB of conservatively estimated encoded state and 60 KiB of charged row
+payload, leaving headroom below both core limits. Budget rejection is typed
+(`BudgetExceeded`) and carries a stable `local-budget.*` blocker and remediation;
+coordinator admission runs before the authoritative journal put.
+
+Local audit rows and `Materialized.audit` contain only active original/current
+intents and the latest replay anchor. Completed effects and historical status
+must use `Journal::history_page_through(after, limit, verified_head)` to detect
+gaps against a stable head (at most 128 objects and a 1 MiB page target; a first large definition can exceed the target). `Journal::entry`
+reads a single historical record. Full audit history remains in the object-store
+journal. Never discard journal objects to reduce local projection size.
+
+Current-state budgets are 12,000 chunks / 4 MiB; 12,000 verifier leaf ranges /
+6 MiB; 1,024 verifier exceptions / 512 KiB; 64 active effects / 512 KiB of
+entries; 32 progress streams / 64 KiB; and 512 KiB each for the definition and
+saved privileges. Range deletion and exception resolution are explicit journal
+transitions. Completed split parents must be retired; retaining an entire
+bisection tree consumes the range budget. Definitions and privileges are split
+into UTF-8-safe 24 KiB fragments, avoiding a single oversized core row. `check`
+reports an oversized definition as a Critical capability blocker. A clone of
+Materialized contains only this bounded current state, capped at 16 MiB of JSON.
+The RW4 sizing test uses D2's exact row arithmetic with 10,000 chunks, 10,000
+current verifier ranges and the final markers from 14,400 ticks; a separate
+simulation applies all 43,200 marker events and proves history does not grow.
+
+The compact checkpoint format adds current verifier state and active-intent
+roots. Default recovery remains strict: both `load(true)` and `load(false)` /
+`scrub()` reject a P2 full-history checkpoint. `load(false)` is a full integrity
+scrub, not a legacy-format bypass. Do not remove checkpoint or index objects to
+make recovery proceed.
+
+An explicit maintenance rebuild is available when the complete raw journal is
+retained. This changes the physical store, so first stop every coordinator and
+arrange that the old journal/discovery prefixes cannot accept further writes.
+Preserve those objects and the old local cache as read-only evidence. Configure a replacement
+store with empty journal/discovery prefixes and the **same prefix and migration
+ID**; the unchanged journal namespace preserves peer effect idempotency keys.
+Then, using `old` and `replacement` Journal handles and a new local path:
+
+```rust,ignore
+let state = old.copy_entries_for_rebuild(&replacement).await?;
+let local = Local::rebuild(new_local_path, &state)?;
+local.checkpoint(&replacement).await?;
+```
+
+This explicitly ignores derived checkpoint contents and copies the gap-free,
+digest/ownership-validated raw entries byte-for-byte with create-only writes.
+It checks that raw history reaches the published discovery head. Missing raw
+history must be restored before rebuilding. A failed copy leaves the original
+unchanged and may leave an unactivated partial destination; retry with another
+empty store. Only after success should all coordinators be redirected to the
+replacement store and new local cache, followed by normal ownership acquisition.
+Never allow journal writers against both stores. This copies journal metadata
+only: it does not move buffer/data objects or rewrite definitions/references;
+those objects and their existing connector contracts must remain available.
+Ordinary checkpoint recovery and full
+scrub of the replacement are strict again; no automatic fallback is introduced.
+
+An open cache must match its supplied verified snapshot; `Local::open_journal`
+reopens a lagging current-format cache using paged prefix verification.
+`Local::recover` restores a current-format checkpoint and updates its rows to
+the verified journal head. The dev profile retains
 unoptimized code and debug assertions with debug symbols disabled, reducing
 mutation linking cost. No production or larger-scale qualification is claimed.

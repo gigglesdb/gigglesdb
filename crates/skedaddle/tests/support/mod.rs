@@ -179,3 +179,23 @@ pub fn s3_bucket(endpoint: &str, bucket: &str) -> Arc<dyn ObjectStore> {
             .unwrap(),
     )
 }
+
+/// Test fixture inspection only. Product callers consume one page at a time.
+pub async fn entries(j: &Journal) -> Vec<skedaddle::coordinator::journal::Entry> {
+    let mut result = Vec::new();
+    loop {
+        let page = j
+            .history_page(
+                result
+                    .last()
+                    .map_or(0, |e: &skedaddle::coordinator::journal::Entry| e.seq),
+                128,
+            )
+            .await
+            .unwrap();
+        if page.is_empty() {
+            return result;
+        }
+        result.extend(page);
+    }
+}

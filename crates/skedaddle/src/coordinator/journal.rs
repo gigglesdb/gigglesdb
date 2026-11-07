@@ -128,7 +128,6 @@ impl Checkpoint {
             || head.digest != self.journal_digest
             || head.epoch != self.state.epoch
             || head.coordinator_instance != self.state.owner
-            || self.state.audit.len() as u64 != self.seq
             || self.state.lifecycle.since_seq > self.seq
         {
             return Err(Error::RecoveryRequired(
@@ -139,18 +138,38 @@ impl Checkpoint {
     }
     fn validate_materialization(&self) -> Result<()> {
         self.validate()?;
-        // Publication and explicit scrubs prove the derived state. Recovery
-        // trusts the self-digested snapshot and never replays its old prefix.
-        let mut replay = Materialized::default();
-        for entry in self.state.audit.values() {
-            replay
-                .apply(entry)
-                .map_err(|e| Error::RecoveryRequired(format!("invalid checkpoint history: {e}")))?;
+        super::budget::state(&self.state)?;
+        super::local::projection(&self.state)?;
+        for (seq, entry) in &self.state.audit {
+            entry.validate()?;
+            if *seq != entry.seq
+                || *seq > self.seq
+                || (*seq != self.seq
+                    && !self.state.intent_roots.contains_key(seq)
+                    && !self.state.intent_roots.values().any(|root| root == seq))
+            {
+                return Err(Error::RecoveryRequired(
+                    "checkpoint contains a non-current entry".into(),
+                ));
+            }
         }
-        if replay != self.state {
-            return Err(Error::RecoveryRequired(
-                "checkpoint differs from its recorded transitions".into(),
-            ));
+        for (current, root) in &self.state.intent_roots {
+            if !self
+                .state
+                .audit
+                .get(root)
+                .is_some_and(|e| matches!(e.transition, Transition::Intent { .. }))
+                || !self.state.audit.get(current).is_some_and(|e| {
+                    matches!(
+                        e.transition,
+                        Transition::Intent { .. } | Transition::ResumeEffect { .. }
+                    )
+                })
+            {
+                return Err(Error::RecoveryRequired(
+                    "checkpoint active intent is incomplete".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -199,7 +218,6 @@ impl CheckpointHead {
 
 pub struct Recovery {
     pub checkpoint: Option<Checkpoint>,
-    pub tail: Vec<Entry>,
     pub state: Materialized,
 }
 
@@ -329,6 +347,185 @@ impl Journal {
             .await
     }
 
+    /// One validated historical object; callers never consult the local cache
+    /// for completed effects, audit history or historical status.
+    pub async fn entry(&self, seq: u64) -> Result<Entry> {
+        let bytes = self
+            .read(&self.entry_key(seq))
+            .await?
+            .ok_or_else(|| Error::RecoveryRequired(format!("journal entry {seq} is missing")))?;
+        let entry: Entry = decode(&bytes)?;
+        entry.validate()?;
+        if entry.seq != seq {
+            return Err(Error::RecoveryRequired("journal entry key differs".into()));
+        }
+        Ok(entry)
+    }
+
+    /// Keyset pagination, bounded by both object count and approximately 1 MiB.
+    /// The first entry may exceed that byte target (a normalized definition).
+    /// `after` is exclusive; an existing anchor authenticates the page chain.
+    pub async fn history_page(&self, after: u64, limit: usize) -> Result<Vec<Entry>> {
+        if limit == 0 || limit > 128 {
+            return Err(Error::TruncatedRead(
+                "journal page bound must be 1..=128".into(),
+            ));
+        }
+        let digest = if after == 0 {
+            String::new()
+        } else {
+            self.entry(after).await?.digest
+        };
+        self.page_from_anchor(after, limit, digest).await
+    }
+
+    async fn page_from_anchor(
+        &self,
+        after: u64,
+        limit: usize,
+        mut digest: String,
+    ) -> Result<Vec<Entry>> {
+        let mut page = Vec::new();
+        let mut total = 0;
+        for offset in 1..=limit as u64 {
+            let seq = after
+                .checked_add(offset)
+                .ok_or_else(|| Error::RecoveryRequired("journal seq exhausted".into()))?;
+            let Some(bytes) = self.read(&self.entry_key(seq)).await? else {
+                break;
+            };
+            if !page.is_empty() && total + bytes.len() > 1024 * 1024 {
+                break;
+            }
+            let entry: Entry = decode(&bytes)?;
+            entry.validate()?;
+            if entry.seq != seq || entry.prev_digest != digest {
+                return Err(Error::RecoveryRequired("journal page chain differs".into()));
+            }
+            total += bytes.len();
+            digest = entry.digest.clone();
+            page.push(entry);
+        }
+        Ok(page)
+    }
+
+    /// Audit/status pagination against a verified, stable head. An early gap
+    /// is an error, never an apparently complete historical response.
+    pub async fn history_page_through(
+        &self,
+        after: u64,
+        limit: usize,
+        through: u64,
+    ) -> Result<Vec<Entry>> {
+        if after > through {
+            return Err(Error::Rejected(
+                "history cursor is beyond the verified head".into(),
+            ));
+        }
+        if after == through {
+            if limit == 0 || limit > 128 {
+                return Err(Error::TruncatedRead(
+                    "journal page bound must be 1..=128".into(),
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        let mut page = self.history_page(after, limit).await?;
+        page.retain(|entry| entry.seq <= through);
+        let last = page.last().map_or(after, |entry| entry.seq);
+        let expected = after.saturating_add(limit as u64).min(through);
+        if last < expected && self.read(&self.entry_key(last + 1)).await?.is_none() {
+            return Err(Error::RecoveryRequired(format!(
+                "historical journal gap at {} before verified head {through}",
+                last + 1
+            )));
+        }
+        Ok(page)
+    }
+
+    /// Resolve an older journal's adoption of a pruned alias without retaining
+    /// its entire adoption chain in Materialized. New owners adopt the current
+    /// alias directly; full rebuild also accepts the older wire history.
+    pub(crate) async fn apply_entry(&self, state: &mut Materialized, entry: &Entry) -> Result<()> {
+        if let Transition::ResumeEffect { intent_seq } = entry.transition
+            && !state.intent_roots.contains_key(&intent_seq)
+        {
+            let prior = self.entry(intent_seq).await?;
+            let mut root = prior.clone();
+            loop {
+                match root.transition {
+                    Transition::Intent { .. } => break,
+                    Transition::ResumeEffect { intent_seq } if intent_seq < root.seq => {
+                        root = self.entry(intent_seq).await?
+                    }
+                    _ => {
+                        return Err(Error::RecoveryRequired(
+                            "invalid historical intent alias".into(),
+                        ));
+                    }
+                }
+            }
+            if state.audit.get(&root.seq) != Some(&root)
+                || !state.intent_roots.values().any(|seq| *seq == root.seq)
+            {
+                return Err(Error::Rejected(
+                    "adoption has no active original intent".into(),
+                ));
+            }
+            let mut next = state.clone();
+            next.intent_roots.retain(|_, seq| *seq != root.seq);
+            next.intent_roots.insert(intent_seq, root.seq);
+            next.audit.insert(intent_seq, prior);
+            next.apply(entry)?;
+            *state = next;
+            return Ok(());
+        }
+        state.apply(entry)
+    }
+
+    async fn verify_snapshot(&self, state: &Materialized) -> Result<()> {
+        let mut expected = if let Some(head) = self.latest_head().await? {
+            let saved = self.read_checkpoint(&head).await?;
+            if saved.seq == state.applied_seq {
+                if saved.state != *state {
+                    return Err(Error::RecoveryRequired(
+                        "checkpoint state differs at the same sequence".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            if saved.seq < state.applied_seq {
+                saved.state
+            } else {
+                Materialized::default()
+            }
+        } else {
+            Materialized::default()
+        };
+        while expected.applied_seq < state.applied_seq {
+            let page = self
+                .page_from_anchor(expected.applied_seq, 128, expected.digest.clone())
+                .await?;
+            if page.is_empty() {
+                return Err(Error::RecoveryRequired(
+                    "checkpoint prefix is incomplete".into(),
+                ));
+            }
+            for entry in page {
+                if entry.seq > state.applied_seq {
+                    break;
+                }
+                self.apply_entry(&mut expected, &entry).await?;
+            }
+        }
+        if expected != *state {
+            return Err(Error::RecoveryRequired(
+                "checkpoint differs from journal projection".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn checkpoint(&self, state: &Materialized) -> Result<()> {
         self.write_checkpoint(state, None).await
     }
@@ -342,6 +539,7 @@ impl Journal {
     async fn write_checkpoint(&self, state: &Materialized, archive: Option<String>) -> Result<()> {
         let cp = Checkpoint::new(state, archive)?;
         cp.validate_materialization()?;
+        self.verify_snapshot(state).await?;
         let anchor = self.read(&self.entry_key(cp.seq)).await?.ok_or_else(|| {
             Error::RecoveryRequired("checkpoint journal anchor missing during publication".into())
         })?;
@@ -440,7 +638,7 @@ impl Journal {
             .await?
             .ok_or_else(|| Error::RecoveryRequired("published checkpoint is missing".into()))?;
         let cp: Checkpoint = decode(&bytes)?;
-        cp.validate()?;
+        cp.validate_materialization()?;
         if cp.seq != head.seq
             || cp.digest != head.checkpoint_digest
             || cp.journal_digest != head.journal_digest
@@ -465,13 +663,101 @@ impl Journal {
     pub async fn load(&self, use_checkpoint: bool) -> Result<Materialized> {
         Ok(self.recover(use_checkpoint).await?.state)
     }
+
+    /// Explicit maintenance operation, never a recovery fallback. Stop all
+    /// writers and retire write access to the old journal prefixes before activating the
+    /// replacement. Both journal/discovery prefixes in the destination must be
+    /// empty, and its namespace must stay identical for peer idempotency keys.
+    /// Derived checkpoints are deliberately not decoded or copied. The complete
+    /// raw chain is validated and copied byte-for-byte with create-only puts;
+    /// source objects are never changed. A failed copy leaves evidence in the
+    /// unactivated destination; retry with another empty destination.
+    pub async fn copy_entries_for_rebuild(&self, destination: &Journal) -> Result<Materialized> {
+        if self.namespace() != destination.namespace() {
+            return Err(Error::Rejected(
+                "replacement must preserve the journal namespace and effect identity".into(),
+            ));
+        }
+        for prefix in [&destination.root, &destination.index] {
+            if destination
+                .store
+                .list(Some(prefix))
+                .try_next()
+                .await?
+                .is_some()
+            {
+                return Err(Error::Rejected(
+                    "replacement journal and checkpoint-index prefixes must be empty".into(),
+                ));
+            }
+        }
+        let published = self.latest_head().await?;
+        let mut last = 0;
+        let mut count = 0u64;
+        let mut listing = self.store.list(Some(&self.root));
+        while let Some(meta) = listing.try_next().await? {
+            let name = meta
+                .location
+                .filename()
+                .ok_or_else(|| Error::RecoveryRequired("journal key has no filename".into()))?;
+            if name.starts_with("checkpoint-") {
+                continue;
+            }
+            let seq = parse_seq(name.strip_suffix(".json").ok_or_else(|| {
+                Error::RecoveryRequired(format!("unexpected journal object {name}"))
+            })?)?;
+            if meta.location != self.entry_key(seq) {
+                return Err(Error::RecoveryRequired(
+                    "noncanonical raw journal key".into(),
+                ));
+            }
+            last = last.max(seq);
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::RecoveryRequired("journal seq exhausted".into()))?;
+        }
+        if published.is_some_and(|head| head.seq > last) {
+            return Err(Error::RecoveryRequired(
+                "raw journal ends before its published checkpoint; restore the complete raw history".into(),
+            ));
+        }
+        if count != last {
+            return Err(Error::RecoveryRequired(
+                "raw journal has a sequence gap".into(),
+            ));
+        }
+        let mut state = Materialized::default();
+        for seq in 1..=last {
+            let bytes = self.read(&self.entry_key(seq)).await?.ok_or_else(|| {
+                Error::RecoveryRequired("raw journal entry vanished during copy".into())
+            })?;
+            let entry: Entry = decode(&bytes)?;
+            if entry.seq != seq {
+                return Err(Error::RecoveryRequired(
+                    "entry sequence differs from its key".into(),
+                ));
+            }
+            self.apply_entry(&mut state, &entry).await?;
+            destination
+                .create(&destination.entry_key(seq), bytes)
+                .await?;
+        }
+        let next = last
+            .checked_add(1)
+            .ok_or_else(|| Error::RecoveryRequired("journal seq exhausted".into()))?;
+        if self.read(&self.entry_key(next)).await?.is_some() {
+            return Err(Error::RecoveryRequired(
+                "source advanced during copy; stop writers and retry with another empty destination".into(),
+            ));
+        }
+        Ok(state)
+    }
     /// Checkpoint recovery does not LIST the journal. Read N+1 upward by key until
     /// NotFound, starting the tail chain from the recorded checkpoint head digest.
     pub async fn recover(&self, use_checkpoint: bool) -> Result<Recovery> {
         if use_checkpoint && let Some(head) = self.latest_head().await? {
             let checkpoint = self.read_checkpoint(&head).await?;
             let mut state = checkpoint.state.clone();
-            let mut tail = vec![];
             loop {
                 let seq = state
                     .applied_seq
@@ -486,22 +772,18 @@ impl Journal {
                         "tail entry sequence differs from its key".into(),
                     ));
                 }
-                state
-                    .apply(&entry)
+                self.apply_entry(&mut state, &entry)
+                    .await
                     .map_err(|e| Error::RecoveryRequired(format!("journal tail at {seq}: {e}")))?;
-                tail.push(entry);
             }
             return Ok(Recovery {
                 checkpoint: Some(checkpoint),
-                tail,
                 state,
             });
         }
         let state = self.scrub().await?;
-        let tail = state.audit.values().cloned().collect();
         Ok(Recovery {
             checkpoint: None,
-            tail,
             state,
         })
     }
@@ -544,6 +826,8 @@ impl Journal {
             }
         }
         let mut state = Materialized::default();
+        // Checkpoints are compared to independently replayed state at their
+        // exact journal sequence; no historical Entries are retained.
         for (index, (seq, key)) in sequences.iter().enumerate() {
             if *seq != index as u64 + 1 {
                 return Err(Error::RecoveryRequired(format!(
@@ -560,27 +844,27 @@ impl Journal {
                     "entry sequence differs from its key".into(),
                 ));
             }
-            state
-                .apply(&entry)
+            self.apply_entry(&mut state, &entry)
+                .await
                 .map_err(|e| Error::RecoveryRequired(format!("journal replay at {seq}: {e}")))?;
-        }
-        for (seq, key) in checkpoints {
-            let bytes = self
-                .read(&key)
-                .await?
-                .ok_or_else(|| Error::RecoveryRequired("listed checkpoint vanished".into()))?;
-            let cp: Checkpoint = decode(&bytes)?;
-            cp.validate_materialization()?;
-            if cp.seq != seq
-                || !state
-                    .audit
-                    .get(&seq)
-                    .is_some_and(|e| e.digest == cp.journal_digest)
-            {
-                return Err(Error::RecoveryRequired(
-                    "checkpoint has no matching scrubbed journal anchor".into(),
-                ));
+            if let Some(key) = checkpoints.remove(seq) {
+                let bytes = self
+                    .read(&key)
+                    .await?
+                    .ok_or_else(|| Error::RecoveryRequired("listed checkpoint vanished".into()))?;
+                let cp: Checkpoint = decode(&bytes)?;
+                cp.validate_materialization()?;
+                if cp.seq != *seq || cp.state != state {
+                    return Err(Error::RecoveryRequired(
+                        "checkpoint differs from scrubbed journal projection".into(),
+                    ));
+                }
             }
+        }
+        if !checkpoints.is_empty() {
+            return Err(Error::RecoveryRequired(
+                "checkpoint has no matching scrubbed journal anchor".into(),
+            ));
         }
         if let Some(head) = checkpoint_head {
             if head.seq > state.applied_seq {

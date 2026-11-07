@@ -102,18 +102,18 @@ impl Coordinator {
         result
     }
     pub async fn refresh(&mut self) -> Result<()> {
-        let state = match self.journal.load(true).await {
+        let epoch = self.state().epoch;
+        let verified = match self.journal.load(true).await {
             Ok(state) => state,
             Err(error) => {
                 self.owns = false;
                 return Err(error);
             }
         };
-        if self.owns && (state.owner != self.instance || state.epoch != self.state().epoch) {
-            self.owns = false;
-        }
-        let result = self.local.replay(&state);
-        if result.is_err() {
+        let result = self.local.sync_verified(&verified, &self.journal).await;
+        if result.is_err()
+            || (self.owns && (self.state().owner != self.instance || self.state().epoch != epoch))
+        {
             self.owns = false;
         }
         result
@@ -222,36 +222,75 @@ impl Coordinator {
         if !self.owns {
             return Err(Error::LostOwnership);
         }
-        let intent = self
-            .state()
-            .audit
-            .get(&seq)
-            .cloned()
-            .ok_or_else(|| Error::Rejected("intent is missing".into()))?;
+        if seq == 0 || seq > self.state().applied_seq {
+            return Err(Error::Rejected("intent is missing".into()));
+        }
+        let intent = self.journal.entry(seq).await?;
+        if !matches!(
+            intent.transition,
+            Transition::Intent { .. } | Transition::ResumeEffect { .. }
+        ) {
+            return Err(Error::Rejected("not an effect intent".into()));
+        }
         if intent.epoch != self.state().epoch || intent.coordinator_instance != self.instance {
             return Err(Error::LostOwnership);
         }
-        if self.state().audit.values().any(
-            |e| matches!(e.transition,Transition::EffectCompleted{intent_seq} if intent_seq==seq),
-        ) {
+        let root = self.original_intent(seq).await?;
+        if self.effect_completed(root.seq).await? {
             return Ok(());
         }
         self.execute_intent(intent, run).await
     }
 
-    fn original_intent(&self, mut seq: u64) -> Result<Entry> {
+    async fn original_intent(&self, mut seq: u64) -> Result<Entry> {
+        if seq == 0 || seq > self.state().applied_seq {
+            return Err(Error::Rejected("intent is missing".into()));
+        }
         loop {
-            let entry = self
+            let entry = self.journal.entry(seq).await?;
+            if self
                 .state()
                 .audit
                 .get(&seq)
-                .ok_or_else(|| Error::Rejected("intent is missing".into()))?;
+                .is_some_and(|known| known != &entry)
+            {
+                return Err(Error::RecoveryRequired(
+                    "journal intent differs from retained active intent".into(),
+                ));
+            }
             match entry.transition {
-                Transition::Intent { .. } => return Ok(entry.clone()),
+                Transition::Intent { .. } => return Ok(entry),
                 Transition::ResumeEffect { intent_seq } if intent_seq < seq => seq = intent_seq,
                 _ => return Err(Error::Rejected("not an effect intent".into())),
             }
         }
+    }
+
+    async fn effect_completed(&self, root: u64) -> Result<bool> {
+        let mut after = root;
+        while after < self.state().applied_seq {
+            let page = self
+                .journal
+                .history_page_through(after, 128, self.state().applied_seq)
+                .await?;
+            if page.is_empty() {
+                return Err(Error::RecoveryRequired(
+                    "effect history is incomplete".into(),
+                ));
+            }
+            for entry in page {
+                if entry.seq > self.state().applied_seq {
+                    break;
+                }
+                after = entry.seq;
+                if let Transition::EffectCompleted { intent_seq } = entry.transition
+                    && self.original_intent(intent_seq).await?.seq == root
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Journal adoption before retrying an earlier owner's operation. Its original
@@ -268,15 +307,18 @@ impl Coordinator {
         if !self.owns {
             return Err(Error::LostOwnership);
         }
-        let root = self.original_intent(seq)?;
-        for entry in self.state().audit.values() {
-            if let Transition::EffectCompleted { intent_seq } = entry.transition
-                && self.original_intent(intent_seq)?.seq == root.seq
-            {
-                return Ok(());
-            }
+        let root = self.original_intent(seq).await?;
+        if self.effect_completed(root.seq).await? {
+            return Ok(());
         }
-        let prior = &self.state().audit[&seq];
+        let seq = self
+            .state()
+            .intent_roots
+            .iter()
+            .find(|(_, value)| **value == root.seq)
+            .map(|(seq, _)| *seq)
+            .ok_or_else(|| Error::Rejected("active intent is missing".into()))?;
+        let prior = self.journal.entry(seq).await?;
         if prior.epoch == self.state().epoch {
             return self.retry_effect(seq, run).await;
         }
@@ -294,7 +336,7 @@ impl Coordinator {
         if intent.epoch != self.state().epoch || intent.coordinator_instance != self.instance {
             return Err(Error::LostOwnership);
         }
-        let root = self.original_intent(intent.seq)?;
+        let root = self.original_intent(intent.seq).await?;
         let Transition::Intent { effect, payload } = root.transition else {
             return Err(Error::Rejected("not an effect intent".into()));
         };
@@ -471,7 +513,7 @@ mod tests {
             .effect(EffectKind::Fence, "intent".into(), |_| async { Ok(()) })
             .await
             .unwrap();
-        let old_intent = owner.state().audit[&2].clone();
+        let old_intent = owner.journal.entry(2).await.unwrap();
         owner.acquire().await.unwrap();
         assert!(matches!(
             owner

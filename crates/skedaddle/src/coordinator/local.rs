@@ -7,7 +7,7 @@ use giggles_core::{
     relational::{MAX_ROWS, Scan, SqlRow, Value as V},
 };
 
-use super::{Error, Materialized, Result, Transition, journal::Entry};
+use super::{Error, Materialized, Result, journal::Entry};
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE definition (version BIGINT PRIMARY KEY, digest TEXT NOT NULL, json TEXT NOT NULL)",
@@ -15,6 +15,8 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE journal_applied (id BIGINT PRIMARY KEY, seq BIGINT NOT NULL, digest TEXT NOT NULL)",
     "CREATE TABLE progress (stream TEXT PRIMARY KEY, marker TEXT NOT NULL, position TEXT NOT NULL)",
     "CREATE TABLE chunks (id TEXT PRIMARY KEY, table_name TEXT NOT NULL, range_lo TEXT NOT NULL, range_hi TEXT NOT NULL, state TEXT NOT NULL, low_wm TEXT, high_wm TEXT)",
+    "CREATE TABLE verifier_ranges (id TEXT PRIMARY KEY, json TEXT NOT NULL)",
+    "CREATE TABLE verifier_exceptions (id TEXT PRIMARY KEY, json TEXT NOT NULL)",
     "CREATE TABLE audit (seq BIGINT PRIMARY KEY, kind TEXT NOT NULL, json TEXT NOT NULL)",
     "CREATE TABLE fence_state (id TEXT PRIMARY KEY, db TEXT NOT NULL, role TEXT NOT NULL, saved_privileges_json TEXT NOT NULL)",
 ];
@@ -53,6 +55,8 @@ const TABLES: &[(&str, &[(&str, &str)])] = &[
             ("high_wm", "text"),
         ],
     ),
+    ("verifier_ranges", &[("id", "text"), ("json", "text")]),
+    ("verifier_exceptions", &[("id", "text"), ("json", "text")]),
     (
         "audit",
         &[("seq", "bigint"), ("kind", "text"), ("json", "text")],
@@ -151,17 +155,75 @@ impl Local {
                 "local store is ahead of the journal".into(),
             ));
         }
-        for entry in journal.audit.values().take(*seq as usize) {
-            local.state.apply(entry)?;
-        }
-        if &local.state.digest != digest {
+        if *seq as u64 != journal.applied_seq || digest != &journal.digest {
             return Err(Error::RecoveryRequired(
-                "local digest differs from journal".into(),
+                "local anchor differs; recover to a new path from the paged journal".into(),
             ));
         }
+        local.state = journal.clone();
         // Reconstruct an independent expected projection and compare every durable row.
         local.validate_rows(true)?;
         Ok(local)
+    }
+
+    /// Reopen a lagging cache by verifying its exact prefix through bounded
+    /// journal pages, then replay the remaining tail. No history clone is built.
+    pub async fn open_journal(
+        path: impl AsRef<Path>,
+        journal: &super::journal::Journal,
+    ) -> Result<Self> {
+        let verified = journal.load(true).await?;
+        let path = path.as_ref().to_path_buf();
+        super::scratch::check(&path)?;
+        let admin = Admin::open(&path, Limits::default())?;
+        let probe = Self {
+            admin,
+            state: Materialized::default(),
+            path: path.clone(),
+        };
+        probe.validate_schema()?;
+        let anchor = probe.read_collection("journal_applied", 1)?;
+        let seq = match anchor.as_slice() {
+            [SqlRow { values, .. }] => match values.as_slice() {
+                [V::Int(0), V::Int(seq), V::Text(_)] if *seq >= 0 => *seq as u64,
+                _ => return Err(Error::RecoveryRequired("invalid local anchor".into())),
+            },
+            _ => return Err(Error::RecoveryRequired("invalid local anchor count".into())),
+        };
+        drop(probe);
+        if seq > verified.applied_seq {
+            return Err(Error::RecoveryRequired(
+                "local store is ahead of journal".into(),
+            ));
+        }
+        if seq == verified.applied_seq {
+            return Self::open(path, &verified);
+        }
+        let mut prefix = Materialized::default();
+        while prefix.applied_seq < seq {
+            let page = journal
+                .history_page_through(prefix.applied_seq, 128, seq)
+                .await?;
+            for entry in page {
+                journal.apply_entry(&mut prefix, &entry).await?;
+            }
+        }
+        let mut local = Self::open(path, &prefix)?;
+        local.sync_verified(&verified, journal).await?;
+        Ok(local)
+    }
+
+    /// Conservative encoded envelope estimate, including 128 KiB catalog reserve.
+    pub fn estimate(state: &Materialized) -> Result<usize> {
+        super::budget::state(state)?;
+        Ok(128 * 1024
+            + projection(state)?
+                .values()
+                .flatten()
+                .map(|r| row_bytes(r))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .sum::<usize>())
     }
 
     pub fn state(&self) -> &Materialized {
@@ -221,96 +283,77 @@ impl Local {
         if entry.seq <= self.state.applied_seq {
             return self.state.apply(entry);
         }
-        let mut next = self.state.clone();
-        next.apply(entry)?;
+        let next = self.state.projected(entry)?;
+        self.replace_state(next, commit)
+    }
+
+    fn replace_state(&mut self, next: Materialized, commit: bool) -> Result<()> {
+        super::budget::state(&next)?;
+        let before = projection(&self.state)?;
+        let after = projection(&next)?;
+        let keyed = |tables: &std::collections::BTreeMap<&'static str, Vec<Vec<V>>>| {
+            tables
+                .iter()
+                .map(|(name, rows)| {
+                    (
+                        *name,
+                        rows.iter()
+                            .map(|row| {
+                                (
+                                    giggles_core::relational::encode_key(&row[..1]).expect("key"),
+                                    row.clone(),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before_keys = keyed(&before);
+        let after_keys = keyed(&after);
         let mut s = self.admin.sql_session();
         execute(&mut s, "BEGIN", &[])?;
         let result = (|| {
-            match &entry.transition {
-                Transition::Define { definition } => execute(
-                    &mut s,
-                    "INSERT INTO definition VALUES ($1,$2,$3)",
-                    &[
-                        num(u64::from(definition.definition_version))?,
-                        text(definition.canonical_digest()?),
-                        json(definition)?,
-                    ],
-                )?,
-                Transition::Progress {
-                    stream,
-                    marker,
-                    position,
-                } => upsert(
-                    &mut s,
-                    "progress",
-                    "stream",
-                    text(stream),
-                    &[text(marker), text(position)],
-                    &["marker", "position"],
-                )?,
-                Transition::Chunk { chunk } => {
-                    let id = serde_json::to_string(&(&chunk.table, &chunk.range_lo))?;
-                    upsert(
-                        &mut s,
-                        "chunks",
-                        "id",
-                        text(id),
-                        &[
-                            text(&chunk.table),
-                            text(&chunk.range_lo),
-                            text(&chunk.range_hi),
-                            text(&chunk.state),
-                            optional(&chunk.low_wm),
-                            optional(&chunk.high_wm),
-                        ],
-                        &[
-                            "table_name",
-                            "range_lo",
-                            "range_hi",
-                            "state",
-                            "low_wm",
-                            "high_wm",
-                        ],
-                    )?;
+            // Delete changed rows before insertions so replacement never needs
+            // space for two copies of a definition or privilege snapshot.
+            for (table, rows) in &before {
+                for row in rows {
+                    if after_keys[table]
+                        .get(&giggles_core::relational::encode_key(&row[..1]).expect("key"))
+                        != Some(row)
+                    {
+                        let key = TABLES
+                            .iter()
+                            .find(|(name, _)| name == table)
+                            .expect("table")
+                            .1[0]
+                            .0;
+                        execute(
+                            &mut s,
+                            &format!("DELETE FROM {table} WHERE {key}=$1"),
+                            &row[..1],
+                        )?;
+                    }
                 }
-                Transition::FenceState {
-                    db,
-                    role,
-                    saved_privileges_json,
-                } => upsert(
-                    &mut s,
-                    "fence_state",
-                    "id",
-                    json(&(db, role))?,
-                    &[text(db), text(role), text(saved_privileges_json)],
-                    &["db", "role", "saved_privileges_json"],
-                )?,
-                _ => {}
             }
-            let lc = &next.lifecycle;
-            execute(
-                &mut s,
-                "UPDATE lifecycle SET state=$1,since_seq=$2,authority=$3,blockers_json=$4 WHERE id=0",
-                &[
-                    label(&lc.state)?,
-                    num(lc.since_seq)?,
-                    label(&lc.authority)?,
-                    json(&lc.blockers)?,
-                ],
-            )?;
-            // The authoritative entry stays in object storage. Local audit retains
-            // the complete transition, avoiding duplicate timestamps and chain hashes.
-            let kind = kind(&entry.transition);
-            execute(
-                &mut s,
-                "INSERT INTO audit VALUES ($1,$2,$3)",
-                &[num(entry.seq)?, text(kind), json(&entry.transition)?],
-            )?;
-            execute(
-                &mut s,
-                "UPDATE journal_applied SET seq=$1,digest=$2 WHERE id=0",
-                &[num(entry.seq)?, text(&entry.digest)],
-            )?;
+            for (table, rows) in &after {
+                for row in rows {
+                    if before_keys[table]
+                        .get(&giggles_core::relational::encode_key(&row[..1]).expect("key"))
+                        != Some(row)
+                    {
+                        let params = (1..=row.len())
+                            .map(|n| format!("${n}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        execute(
+                            &mut s,
+                            &format!("INSERT INTO {table} VALUES ({params})"),
+                            row,
+                        )?;
+                    }
+                }
+            }
             if commit {
                 execute(&mut s, "COMMIT", &[])
             } else {
@@ -328,35 +371,83 @@ impl Local {
         Ok(())
     }
 
+    /// Compatibility entry point for an already verified current snapshot.
+    /// Missing intermediate anchors must be obtained through replay_journal.
     pub fn replay(&mut self, journal: &Materialized) -> Result<()> {
-        if self.state.applied_seq > journal.applied_seq {
+        if self.state.applied_seq == journal.applied_seq {
+            return if self.state == *journal {
+                Ok(())
+            } else {
+                Err(Error::RecoveryRequired(
+                    "local replay anchor differs from verified journal".into(),
+                ))
+            };
+        }
+        Err(Error::RecoveryRequired(
+            "replay requires paged journal entries".into(),
+        ))
+    }
+
+    /// Synchronize a snapshot whose authority and chain were verified by Journal.
+    pub(crate) async fn sync_verified(
+        &mut self,
+        state: &Materialized,
+        journal: &super::journal::Journal,
+    ) -> Result<()> {
+        if self.state.applied_seq > state.applied_seq {
             return Err(Error::RecoveryRequired(
-                "local store ahead of journal".into(),
+                "local store is ahead of journal".into(),
             ));
         }
-        let prior = self.state.applied_seq;
-        if prior > 0
-            && !journal
-                .audit
-                .get(&prior)
-                .is_some_and(|entry| entry.digest == self.state.digest)
+        if self.state.applied_seq == state.applied_seq {
+            return self.replay(state);
+        }
+        if self.state.applied_seq > 0
+            && journal.entry(self.state.applied_seq).await?.digest != self.state.digest
         {
             return Err(Error::RecoveryRequired(
-                "local replay anchor differs from verified journal".into(),
+                "local replay anchor differs from journal".into(),
             ));
         }
-        for (_, entry) in journal
-            .audit
-            .range((std::ops::Bound::Excluded(prior), std::ops::Bound::Unbounded))
-        {
-            self.apply(entry)?;
+        self.replace_state(state.clone(), true)
+    }
+
+    pub async fn replay_journal(&mut self, journal: &super::journal::Journal) -> Result<()> {
+        let verified = journal.load(true).await?;
+        if self.state.applied_seq > verified.applied_seq {
+            return Err(Error::RecoveryRequired(
+                "local store is ahead of journal".into(),
+            ));
+        }
+        if self.state.applied_seq > 0 {
+            let anchor = journal.entry(self.state.applied_seq).await?;
+            if anchor.digest != self.state.digest {
+                return Err(Error::RecoveryRequired(
+                    "local replay anchor differs from journal".into(),
+                ));
+            }
+        }
+        while self.state.applied_seq < verified.applied_seq {
+            let page = journal
+                .history_page_through(self.state.applied_seq, 128, verified.applied_seq)
+                .await?;
+            for entry in page {
+                let mut next = self.state.clone();
+                journal.apply_entry(&mut next, &entry).await?;
+                self.replace_state(next, true)?;
+            }
+        }
+        if self.state != verified {
+            return Err(Error::RecoveryRequired(
+                "replayed state differs from verified journal".into(),
+            ));
         }
         Ok(())
     }
 
     pub fn rebuild(path: impl AsRef<Path>, journal: &Materialized) -> Result<Self> {
         let mut local = Self::create(path)?;
-        local.replay(journal)?;
+        local.replace_state(journal.clone(), true)?;
         Ok(local)
     }
 
@@ -413,108 +504,22 @@ impl Local {
         Ok(rows)
     }
 
-    fn validate_rows(&self, validate_audit: bool) -> Result<()> {
-        if validate_audit {
-            let audit = self.read_collection("audit", 128)?;
-            if audit.len() as u64 != self.state.applied_seq {
-                return Err(Error::RecoveryRequired(
-                    "local audit has a gap or extra row".into(),
-                ));
-            }
-            for (row, entry) in audit.iter().zip(self.state.audit.values()) {
-                if row.values
-                    != [
-                        num(entry.seq)?,
-                        text(kind(&entry.transition)),
-                        json(&entry.transition)?,
-                    ]
-                {
-                    return Err(Error::RecoveryRequired(
-                        "local audit differs from journal".into(),
-                    ));
-                }
-            }
-        }
-        let lc = &self.state.lifecycle;
-        let lifecycle = self.read_collection("lifecycle", 128)?;
-        if lifecycle.len() != 1
-            || lifecycle[0].values
-                != [
-                    V::Int(0),
-                    label(&lc.state)?,
-                    num(lc.since_seq)?,
-                    label(&lc.authority)?,
-                    json(&lc.blockers)?,
-                ]
-        {
-            return Err(Error::RecoveryRequired(
-                "local lifecycle differs from journal".into(),
-            ));
-        }
-        let definitions = self.read_collection("definition", 128)?;
-        let expected = match &self.state.definition {
-            Some(d) => vec![vec![
-                num(u64::from(d.definition_version))?,
-                text(d.canonical_digest()?),
-                json(d)?,
-            ]],
-            None => vec![],
-        };
-        if definitions
-            .iter()
-            .map(|r| r.values.clone())
-            .collect::<Vec<_>>()
-            != expected
-        {
-            return Err(Error::RecoveryRequired(
-                "local definition differs from journal".into(),
-            ));
-        }
-        let mut expected = std::collections::BTreeMap::new();
-        expected.insert(
-            "progress",
-            self.state
-                .progress
+    fn validate_rows(&self, _validate_audit: bool) -> Result<()> {
+        for (name, expected) in projection(&self.state)? {
+            let largest = expected
                 .iter()
-                .map(|(stream, (marker, position))| {
-                    vec![text(stream), text(marker), text(position)]
-                })
-                .collect::<Vec<_>>(),
-        );
-        expected.insert(
-            "chunks",
-            self.state
-                .chunks
-                .iter()
-                .map(|(id, c)| {
-                    vec![
-                        text(id),
-                        text(&c.table),
-                        text(&c.range_lo),
-                        text(&c.range_hi),
-                        text(&c.state),
-                        optional(&c.low_wm),
-                        optional(&c.high_wm),
-                    ]
-                })
-                .collect(),
-        );
-        expected.insert(
-            "fence_state",
-            self.state
-                .fence_state
-                .iter()
-                .map(|(id, (db, role, p))| vec![text(id), text(db), text(role), text(p)])
-                .collect(),
-        );
-        for (name, expected) in expected {
-            if self
-                .read_collection(name, 128)?
+                .map(|row| row_bytes(row))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(1);
+            let page_size = (512 * 1024 / largest).clamp(1, 128);
+            let actual = self
+                .read_collection(name, page_size)?
                 .into_iter()
                 .map(|r| r.values)
-                .collect::<Vec<_>>()
-                != expected
-            {
+                .collect::<Vec<_>>();
+            if actual != expected {
                 return Err(Error::RecoveryRequired(format!(
                     "local {name} differs from journal"
                 )));
@@ -524,18 +529,161 @@ impl Local {
     }
 }
 
-fn kind(t: &Transition) -> &'static str {
-    match t {
-        Transition::Define { .. } => "define",
-        Transition::AcquireOwnership { .. } => "ownership",
-        Transition::Lifecycle { .. } => "lifecycle",
-        Transition::Progress { .. } => "progress",
-        Transition::Chunk { .. } => "chunk",
-        Transition::FenceState { .. } => "fence-state",
-        Transition::Intent { .. } => "intent",
-        Transition::ResumeEffect { .. } => "resume-effect",
-        Transition::EffectCompleted { .. } => "effect-completed",
+/// D2's exact fixed-int row-map accounting, plus a conservative 128 KiB
+/// reserve for catalog/envelope metadata (measured nine-table catalog < 4 KiB).
+fn row_bytes(values: &[V]) -> Result<usize> {
+    Ok(24
+        + giggles_core::relational::encode_key(&values[..1])
+            .map_err(giggles_core::CoreError::Sql)?
+            .len()
+        + values
+            .iter()
+            .map(|v| match v {
+                V::Text(s) => 12 + s.len(),
+                V::Bytes(b) => 12 + b.len(),
+                V::Int(_) => 12,
+                V::Bool(_) => 5,
+                V::Null => 4,
+            })
+            .sum::<usize>())
+}
+
+fn fragments(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(24 * 1024);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push(&rest[..end]);
+        rest = &rest[end..];
     }
+    if out.is_empty() {
+        out.push("");
+    }
+    out
+}
+
+pub(crate) fn projection(
+    state: &Materialized,
+) -> Result<std::collections::BTreeMap<&'static str, Vec<Vec<V>>>> {
+    use super::budget::{self, Budget};
+    let mut rows = TABLES
+        .iter()
+        .map(|(name, _)| (*name, Vec::new()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let lc = &state.lifecycle;
+    rows.get_mut("lifecycle").unwrap().push(vec![
+        V::Int(0),
+        label(&lc.state)?,
+        num(lc.since_seq)?,
+        label(&lc.authority)?,
+        json(&lc.blockers)?,
+    ]);
+    rows.get_mut("journal_applied").unwrap().push(vec![
+        V::Int(0),
+        num(state.applied_seq)?,
+        text(&state.digest),
+    ]);
+    if let Some(d) = &state.definition {
+        let encoded = serde_json::to_string(d)?;
+        let digest = d.canonical_digest()?;
+        for (part, fragment) in fragments(&encoded).into_iter().enumerate() {
+            rows.get_mut("definition").unwrap().push(vec![
+                num(part as u64)?,
+                text(&digest),
+                text(fragment),
+            ]);
+        }
+    }
+    for (id, (marker, position)) in &state.progress {
+        rows.get_mut("progress")
+            .unwrap()
+            .push(vec![text(id), text(marker), text(position)]);
+    }
+    for (id, c) in &state.chunks {
+        rows.get_mut("chunks").unwrap().push(vec![
+            text(id),
+            text(&c.table),
+            text(&c.range_lo),
+            text(&c.range_hi),
+            text(&c.state),
+            optional(&c.low_wm),
+            optional(&c.high_wm),
+        ]);
+    }
+    for (id, value) in &state.verifier_ranges {
+        rows.get_mut("verifier_ranges")
+            .unwrap()
+            .push(vec![text(id), json(value)?]);
+    }
+    for (id, value) in &state.verifier_exceptions {
+        rows.get_mut("verifier_exceptions")
+            .unwrap()
+            .push(vec![text(id), json(value)?]);
+    }
+    for (id, (db, role, saved)) in &state.fence_state {
+        for (part, fragment) in fragments(saved).into_iter().enumerate() {
+            rows.get_mut("fence_state").unwrap().push(vec![
+                json(&(id, part))?,
+                text(db),
+                text(role),
+                text(fragment),
+            ]);
+        }
+    }
+    for (seq, entry) in &state.audit {
+        let active = state.intent_roots.contains_key(seq)
+            || state.intent_roots.values().any(|root| root == seq);
+        rows.get_mut("audit").unwrap().push(vec![
+            num(*seq)?,
+            text(if active {
+                "active-intent"
+            } else {
+                "replay-anchor"
+            }),
+            if active {
+                json(entry)?
+            } else {
+                json(&(entry.epoch, &entry.coordinator_instance, &entry.digest))?
+            },
+        ]);
+    }
+    let mut total = 128 * 1024;
+    for (table, entries) in &mut rows {
+        let mut bytes = 0;
+        for row in entries.iter() {
+            let charged = row
+                .iter()
+                .map(|v| match v {
+                    V::Text(s) => s.len(),
+                    V::Bytes(b) => b.len(),
+                    _ => 9,
+                })
+                .sum();
+            budget::check(Budget::Row, charged, budget::ROW_BYTES)?;
+            bytes += row_bytes(row)?;
+        }
+        // Core orders by canonical primary key, which is also the paging cursor.
+        entries.sort_by_cached_key(|row| {
+            giggles_core::relational::encode_key(&row[..1]).expect("valid primary key")
+        });
+        match *table {
+            "chunks" => budget::check(Budget::Chunks, bytes, budget::CHUNK_BYTES)?,
+            "verifier_ranges" => {
+                budget::check(Budget::VerifierRanges, bytes, budget::VERIFIER_BYTES)?
+            }
+            "verifier_exceptions" => {
+                budget::check(Budget::VerifierExceptions, bytes, budget::EXCEPTION_BYTES)?
+            }
+            "progress" => budget::check(Budget::Progress, bytes, budget::PROGRESS_BYTES)?,
+            _ => {}
+        }
+        total += bytes;
+    }
+    budget::check(Budget::Envelope, total, budget::ENVELOPE_BYTES)?;
+    Ok(rows)
 }
 
 fn read_error(e: giggles_core::CoreError) -> Error {
@@ -545,46 +693,6 @@ fn read_error(e: giggles_core::CoreError) -> Error {
             Error::TruncatedRead("core refused the bounded result".into())
         }
         other => Error::Core(other),
-    }
-}
-
-fn upsert(
-    s: &mut SqlSession,
-    table: &str,
-    key: &str,
-    value: V,
-    fields: &[V],
-    columns: &[&str],
-) -> Result<()> {
-    let found = s.execute(
-        &format!("SELECT {key} FROM {table} WHERE {key}=$1"),
-        std::slice::from_ref(&value),
-        None,
-    )?;
-    let mut params = vec![value];
-    params.extend_from_slice(fields);
-    if found.rows.is_empty() {
-        let placeholders = (1..=params.len())
-            .map(|n| format!("${n}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        execute(
-            s,
-            &format!("INSERT INTO {table} VALUES ({placeholders})"),
-            &params,
-        )
-    } else {
-        let sets = columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{c}=${}", i + 2))
-            .collect::<Vec<_>>()
-            .join(",");
-        execute(
-            s,
-            &format!("UPDATE {table} SET {sets} WHERE {key}=$1"),
-            &params,
-        )
     }
 }
 
@@ -655,11 +763,61 @@ impl Local {
                     "local archive anchor differs from checkpoint".into(),
                 ));
             }
-            for entry in &recovery.tail {
-                local.apply(entry)?;
+            if local.state != recovery.state {
+                local.replace_state(recovery.state, true)?;
             }
             return Ok(local);
         }
         Self::rebuild(path, &recovery.state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_sql_error_rolls_back_deletions_and_anchor() {
+        let root = PathBuf::from(std::env::var_os("TEMP").expect("set task TEMP on J:"))
+            .join(format!("local-atomic-{}", uuid::Uuid::new_v4()));
+        assert!(root.starts_with("J:/gigglesdb-work"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut local = Local::create(root.join("db")).unwrap();
+        let owner = Entry::new(
+            local.state(),
+            super::super::Transition::AcquireOwnership { epoch: 1 },
+            "writer",
+        )
+        .unwrap();
+        local.apply(&owner).unwrap();
+        // Inject a real SQL primary-key conflict. The projection transaction
+        // first deletes its old anchor/audit rows, then this insertion fails.
+        local
+            .admin
+            .sql_session()
+            .execute(
+                "INSERT INTO audit VALUES (2,'fixture','conflicting row')",
+                &[],
+                None,
+            )
+            .unwrap();
+        let state = local.state().clone();
+        let audit = local.read_collection("audit", 2).unwrap();
+        let anchor = local.read_collection("journal_applied", 1).unwrap();
+        let entry = Entry::new(
+            &state,
+            super::super::Transition::Progress {
+                stream: "s".into(),
+                marker: "m".into(),
+                position: "p".into(),
+            },
+            "writer",
+        )
+        .unwrap();
+        assert!(matches!(local.apply(&entry), Err(Error::Core(_))));
+        assert_eq!(local.state(), &state);
+        assert_eq!(local.read_collection("audit", 2).unwrap(), audit);
+        assert_eq!(local.read_collection("journal_applied", 1).unwrap(), anchor);
+        assert!(local.read_collection("progress", 1).unwrap().is_empty());
     }
 }

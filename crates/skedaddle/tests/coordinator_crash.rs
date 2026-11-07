@@ -78,9 +78,18 @@ async fn crash_after_put_before_local_apply_replays() {
         .unwrap();
         let state = j.load(false).await.unwrap();
         assert_eq!(state.applied_seq, 2);
-        let mut local = Local::open(&local_path, &state).unwrap();
+        let prefix = if op == "put" {
+            let mut prefix = Materialized::default();
+            for entry in j.history_page_through(0, 1, 1).await.unwrap() {
+                prefix.apply(&entry).unwrap();
+            }
+            prefix
+        } else {
+            state.clone()
+        };
+        let mut local = Local::open(&local_path, &prefix).unwrap();
         assert_eq!(local.state().applied_seq, if op == "put" { 1 } else { 2 });
-        local.replay(&state).unwrap();
+        local.replay_journal(&j).await.unwrap();
         assert_eq!(local.state(), &state);
         if op.starts_with("effect") {
             assert_eq!(std::fs::read_dir(&effects).unwrap().count(), 1);
@@ -484,6 +493,8 @@ async fn rebuild_on_new_host_equals_original() {
         "chunks",
         "audit",
         "fence_state",
+        "verifier_ranges",
+        "verifier_exceptions",
     ] {
         let values = |local: &Local| {
             local

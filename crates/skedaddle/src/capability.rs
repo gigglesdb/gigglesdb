@@ -68,6 +68,20 @@ impl CapabilityReport {
     pub fn from_definition(definition: &MigrationDefinition) -> Result<Self, DefinitionError> {
         definition.ensure_valid()?;
         let mut items = Vec::new();
+        if let Err(crate::coordinator::Error::BudgetExceeded(blocker)) =
+            crate::coordinator::budget::preflight(definition)
+        {
+            items.push(item(
+                &blocker.id(),
+                ItemStatus::RequiresExternalChange,
+                Criticality::Critical,
+                &blocker.remediation,
+                format!(
+                    "Estimated normalized definition: {} bytes; local budget: {} bytes.",
+                    blocker.used, blocker.limit
+                ),
+            ));
+        }
         let unsupported: Vec<_> = [
             ("source", &definition.source),
             ("destination", &definition.destination),

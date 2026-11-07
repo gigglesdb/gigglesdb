@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
+pub mod budget;
 pub mod epoch;
 pub mod gcs;
 pub mod journal;
@@ -14,6 +15,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
+    BudgetExceeded(budget::Blocker),
     RecoveryRequired(String),
     Rejected(String),
     LostOwnership,
@@ -30,6 +32,14 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BudgetExceeded(b) => write!(
+                f,
+                "{}: {} exceeds {}; {}",
+                b.id(),
+                b.used,
+                b.limit,
+                b.remediation
+            ),
             Self::RecoveryRequired(s) => write!(
                 f,
                 "recovery-required: {s}; preserve evidence and restore a verified journal before resuming"
@@ -309,6 +319,28 @@ pub struct Chunk {
     pub high_wm: Option<String>,
 }
 
+/// Current verifier leaves only; split parents must be replaced, not retained.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierRange {
+    pub table: String,
+    pub range_lo: String,
+    pub range_hi: String,
+    pub source_lsn: String,
+    pub source_digest: String,
+    pub destination_digest: String,
+    pub state: String,
+    pub rows: u64,
+    pub retries: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierException {
+    pub range: String,
+    pub key: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Transition {
@@ -328,6 +360,14 @@ pub enum Transition {
     },
     Chunk {
         chunk: Chunk,
+    },
+    VerifierRange {
+        id: String,
+        range: Option<VerifierRange>,
+    },
+    VerifierException {
+        id: String,
+        exception: Option<VerifierException>,
     },
     FenceState {
         db: String,
@@ -359,11 +399,26 @@ pub struct Materialized {
     pub progress: BTreeMap<String, (String, String)>,
     pub chunks: BTreeMap<String, Chunk>,
     pub fence_state: BTreeMap<String, (String, String, String)>,
+    /// Active original/current intents and the latest replay anchor, never history.
     pub audit: BTreeMap<u64, journal::Entry>,
+    pub intent_roots: BTreeMap<u64, u64>,
+    pub verifier_ranges: BTreeMap<String, VerifierRange>,
+    pub verifier_exceptions: BTreeMap<String, VerifierException>,
 }
 
 impl Materialized {
     pub fn apply(&mut self, entry: &journal::Entry) -> Result<()> {
+        *self = self.projected(entry)?;
+        Ok(())
+    }
+    pub(crate) fn projected(&self, entry: &journal::Entry) -> Result<Self> {
+        let mut next = self.clone();
+        next.apply_inner(entry)?;
+        budget::state(&next)?;
+        local::projection(&next)?;
+        Ok(next)
+    }
+    fn apply_inner(&mut self, entry: &journal::Entry) -> Result<()> {
         entry.validate()?;
         if entry.seq <= self.applied_seq {
             return if self.audit.get(&entry.seq) == Some(entry) {
@@ -430,6 +485,21 @@ impl Materialized {
                             chunk.clone(),
                         );
                     }
+                    Transition::VerifierRange { id, range } => {
+                        if let Some(range) = range {
+                            self.verifier_ranges.insert(id.clone(), range.clone());
+                        } else {
+                            self.verifier_ranges.remove(id);
+                        }
+                    }
+                    Transition::VerifierException { id, exception } => {
+                        if let Some(exception) = exception {
+                            self.verifier_exceptions
+                                .insert(id.clone(), exception.clone());
+                        } else {
+                            self.verifier_exceptions.remove(id);
+                        }
+                    }
                     Transition::FenceState {
                         db,
                         role,
@@ -441,26 +511,30 @@ impl Materialized {
                         );
                     }
                     Transition::ResumeEffect { intent_seq } => {
-                        if !self.audit.get(intent_seq).is_some_and(|e| {
-                            e.epoch < self.epoch
-                                && matches!(
-                                    e.transition,
-                                    Transition::Intent { .. } | Transition::ResumeEffect { .. }
-                                )
-                        }) {
+                        if !self.intent_roots.contains_key(intent_seq)
+                            || !self.audit.get(intent_seq).is_some_and(|e| {
+                                e.epoch < self.epoch
+                                    && matches!(
+                                        e.transition,
+                                        Transition::Intent { .. } | Transition::ResumeEffect { .. }
+                                    )
+                            })
+                        {
                             return Err(Error::Rejected(
                                 "effect adoption requires an older intent".into(),
                             ));
                         }
                     }
                     Transition::EffectCompleted { intent_seq } => {
-                        if !self.audit.get(intent_seq).is_some_and(|e| {
-                            e.epoch == self.epoch
-                                && matches!(
-                                    e.transition,
-                                    Transition::Intent { .. } | Transition::ResumeEffect { .. }
-                                )
-                        }) {
+                        if !self.intent_roots.contains_key(intent_seq)
+                            || !self.audit.get(intent_seq).is_some_and(|e| {
+                                e.epoch == self.epoch
+                                    && matches!(
+                                        e.transition,
+                                        Transition::Intent { .. } | Transition::ResumeEffect { .. }
+                                    )
+                            })
+                        {
                             return Err(Error::Rejected(
                                 "effect completion has no intent in this epoch".into(),
                             ));
@@ -473,6 +547,26 @@ impl Materialized {
         }
         self.applied_seq = entry.seq;
         self.digest = entry.digest.clone();
+        match &entry.transition {
+            Transition::Intent { .. } => {
+                self.intent_roots.insert(entry.seq, entry.seq);
+            }
+            Transition::ResumeEffect { intent_seq } => {
+                let root = self
+                    .intent_roots
+                    .remove(intent_seq)
+                    .expect("validated active intent");
+                self.intent_roots.insert(entry.seq, root);
+            }
+            Transition::EffectCompleted { intent_seq } => {
+                self.intent_roots.remove(intent_seq);
+            }
+            _ => {}
+        }
+        self.audit.retain(|seq, _| {
+            self.intent_roots.contains_key(seq)
+                || self.intent_roots.values().any(|root| root == seq)
+        });
         self.audit.insert(entry.seq, entry.clone());
         Ok(())
     }

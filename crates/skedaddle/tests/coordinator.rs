@@ -7,8 +7,8 @@ async fn upstream_local_store_and_core_checkpoints_leave_no_scratch() {
     let j = support::journal(store, "cleanup");
     let state = support::history(&j, 3).await;
     // Successful retry and a losing create must both clean upstream staging.
-    j.put(&state.audit[&1]).await.unwrap();
-    let mut conflict = state.audit[&1].clone();
+    j.put(&j.entry(1).await.unwrap()).await.unwrap();
+    let mut conflict = j.entry(1).await.unwrap();
     conflict.coordinator_instance = "competitor".into();
     conflict.digest = independent_json_hash(serde_json::json!([
         conflict.seq,
@@ -1100,7 +1100,7 @@ async fn complete_projection_round_trips_and_preflight_rejects_oversize() {
         c.commit(Transition::FenceState {
             db: "source".into(),
             role: "app".into(),
-            saved_privileges_json: "\"".repeat(33_000)
+            saved_privileges_json: "x".repeat(budget::PRIVILEGE_BYTES + 1)
         })
         .await
         .is_err()
@@ -1300,17 +1300,16 @@ async fn truncated_read_is_error() {
 }
 
 #[tokio::test]
-async fn local_transaction_rolls_back_projection_and_sequence_on_audit_error() {
+async fn budget_rejection_preserves_projection_and_sequence() {
     let j = fresh_journal("atomic-failure");
     let state = history(&j, 1).await;
     let path = scratch("atomic-failure-db").join("db");
     let mut local = Local::rebuild(&path, &state).unwrap();
-    // Fits the fence_state row, but escaping pushes audit JSON over core's 64KiB
-    // row bound. This fails AFTER the projection write inside the transaction.
+    // Privilege admission fails before publication and preserves all current rows.
     let transition = Transition::FenceState {
         db: "source".into(),
         role: "app".into(),
-        saved_privileges_json: "\"".repeat(33_000),
+        saved_privileges_json: "x".repeat(budget::PRIVILEGE_BYTES + 1),
     };
     let entry = Entry::new(&state, transition, "writer").unwrap();
     assert!(local.apply(&entry).is_err());
@@ -1329,12 +1328,32 @@ async fn local_transaction_rolls_back_projection_and_sequence_on_audit_error() {
 #[tokio::test]
 async fn paging_exceeds_1024_without_losing_rows() {
     let j = fresh_journal("paging");
-    let state = history(&j, 1100).await;
+    let mut state = history(&j, 1).await;
+    for n in 0..1100 {
+        let e = Entry::new(
+            &state,
+            Transition::Chunk {
+                chunk: Chunk {
+                    table: "public.t".into(),
+                    range_lo: format!("{n:06}"),
+                    range_hi: format!("{:06}", n + 1),
+                    state: "done".into(),
+                    low_wm: None,
+                    high_wm: None,
+                },
+            },
+            "writer",
+        )
+        .unwrap();
+        j.put(&e).await.unwrap();
+        state.apply(&e).unwrap();
+    }
     let start = Instant::now();
-    let local = Local::rebuild(scratch("paging-db").join("db"), &state).unwrap();
+    let scrubbed = j.load(false).await.unwrap();
+    let local = Local::rebuild(scratch("paging-db").join("db"), &scrubbed).unwrap();
     let full_rebuild = start.elapsed();
-    let small = local.read_collection("audit", 37).unwrap();
-    let large = local.read_collection("audit", 1024).unwrap();
+    let small = local.read_collection("chunks", 37).unwrap();
+    let large = local.read_collection("chunks", 1024).unwrap();
     assert_eq!(small, large);
     assert_eq!(small.len(), 1100);
     local.checkpoint(&j).await.unwrap();
@@ -1350,7 +1369,7 @@ async fn paging_exceeds_1024_without_losing_rows() {
     assert_eq!(restored.state(), &state);
     assert_eq!(
         restored
-            .read_collection("audit", 1024)
+            .read_collection("chunks", 1024)
             .unwrap()
             .into_iter()
             .map(|r| r.values)
@@ -1363,12 +1382,9 @@ async fn paging_exceeds_1024_without_losing_rows() {
     seal_checkpoint_json(&mut cp);
     assert_eq!(cp["digest"], expected_digest);
     println!("core checkpoint: full={full_rebuild:?} checkpoint={checkpoint_rebuild:?}");
-    for (n, row) in small.iter().enumerate() {
-        assert_eq!(
-            row.values[0],
-            giggles_core::relational::Value::Int(n as i64 + 1)
-        );
-    }
+    let history = entries(&j).await;
+    assert_eq!(history.len(), 1101);
+    assert_eq!(local.read_collection("audit", 128).unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1390,6 +1406,7 @@ async fn journal_long_run() {
     // Build a complete, chained fixture, then publish using bounded concurrency.
     // This measures recovery, not sequential coordinator append throughput.
     let mut state = Materialized::default();
+    let mut fixture_entries = Vec::new();
     for n in 0..100_000 {
         let transition = if n == 0 {
             Transition::AcquireOwnership { epoch: 1 }
@@ -1398,8 +1415,9 @@ async fn journal_long_run() {
         };
         let entry = Entry::new(&state, transition, "writer").unwrap();
         state.apply(&entry).unwrap();
+        fixture_entries.push(entry);
     }
-    stream::iter(state.audit.values())
+    stream::iter(fixture_entries.iter())
         .map(|entry| j.put(entry))
         .buffer_unordered(32)
         .try_collect::<Vec<_>>()
@@ -1745,6 +1763,185 @@ fn seal_checkpoint_index_json(head: &mut serde_json::Value) {
     ]))
     .into();
 }
+
+#[tokio::test]
+async fn compact_verifier_state_and_active_intents_recover_equivalently() {
+    let j = fresh_journal("compact-current-state");
+    let mut c = coordinator(j.clone(), "bounded");
+    c.acquire().await.unwrap();
+    for n in 0..20 {
+        c.commit(Transition::VerifierRange {
+            id: n.to_string(),
+            range: Some(VerifierRange {
+                table: "public.t".into(),
+                range_lo: n.to_string(),
+                range_hi: (n + 1).to_string(),
+                source_lsn: "0/100".into(),
+                source_digest: "a".repeat(64),
+                destination_digest: "b".repeat(64),
+                state: "verified".into(),
+                rows: 100,
+                retries: 0,
+            }),
+        })
+        .await
+        .unwrap();
+        c.commit(Transition::VerifierException {
+            id: n.to_string(),
+            exception: Some(VerifierException {
+                range: n.to_string(),
+                key: "busy-key".into(),
+                reason: "busy".into(),
+            }),
+        })
+        .await
+        .unwrap();
+    }
+    c.commit(Transition::VerifierRange {
+        id: "0".into(),
+        range: None,
+    })
+    .await
+    .unwrap();
+    c.commit(Transition::VerifierException {
+        id: "0".into(),
+        exception: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        c.effect(EffectKind::Fence, "pending".into(), |_| async {
+            Err(Error::Rejected("injected pre-effect stop".into()))
+        })
+        .await
+        .is_err()
+    );
+    let pending = c.state().applied_seq;
+    let expected = c.state().clone();
+    assert_eq!(expected.audit.len(), 1);
+    c.checkpoint().await.unwrap();
+    assert_eq!(j.load(false).await.unwrap(), expected);
+    assert_eq!(j.load(true).await.unwrap(), expected);
+    let rebuilt = Local::rebuild(
+        scratch("compact-rebuilt").join("db"),
+        &j.load(false).await.unwrap(),
+    )
+    .unwrap();
+    let restored = Local::recover(scratch("compact-restored").join("db"), &j)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.state(), restored.state());
+    for table in ["audit", "verifier_ranges", "verifier_exceptions"] {
+        assert_eq!(
+            rebuilt
+                .read_collection(table, 2)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.values)
+                .collect::<Vec<_>>(),
+            restored
+                .read_collection(table, 2)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.values)
+                .collect::<Vec<_>>()
+        );
+    }
+    c.retry_effect(pending, |_| async { Ok(()) }).await.unwrap();
+    assert!(c.state().intent_roots.is_empty());
+    assert_eq!(c.state().audit.len(), 1);
+    assert_eq!(
+        j.history_page_through(0, 128, c.state().applied_seq)
+            .await
+            .unwrap()
+            .len(),
+        c.state().applied_seq as usize
+    );
+}
+
+#[tokio::test]
+async fn oversized_effect_returns_typed_blocker_before_journal_commit() {
+    let j = fresh_journal("typed-admission");
+    let mut c = coordinator(j.clone(), "bounded");
+    c.acquire().await.unwrap();
+    let before = c.state().clone();
+    let error = c
+        .effect(
+            EffectKind::Fence,
+            "x".repeat(budget::ROW_BYTES),
+            |_| async { panic!("oversized effect ran") },
+        )
+        .await
+        .unwrap_err();
+    let Error::BudgetExceeded(blocker) = error else {
+        panic!("expected typed budget blocker")
+    };
+    assert_eq!(blocker.budget, budget::Budget::Row);
+    assert!(!blocker.remediation.is_empty());
+    assert_eq!(c.state(), &before);
+    assert_eq!(j.load(false).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn lagging_cache_reopens_without_a_history_clone() {
+    let j = fresh_journal("lagging-bounded-cache");
+    let mut state = history(&j, 1).await;
+    let path = scratch("lagging-bounded-db").join("db");
+    drop(Local::rebuild(&path, &state).unwrap());
+    for n in 2..=6 {
+        let entry = Entry::new(&state, progress(n), "writer").unwrap();
+        j.put(&entry).await.unwrap();
+        state.apply(&entry).unwrap();
+    }
+    let reopened = Local::open_journal(path, &j).await.unwrap();
+    assert_eq!(reopened.state(), &state);
+    assert_eq!(reopened.state().audit.len(), 1);
+}
+
+#[tokio::test]
+async fn old_adoption_aliases_rebuild_without_retaining_the_chain() {
+    let j = fresh_journal("old-aliases");
+    let mut state = Materialized::default();
+    for transition in [
+        Transition::AcquireOwnership { epoch: 1 },
+        Transition::Intent {
+            effect: EffectKind::Fence,
+            payload: "original".into(),
+        },
+        Transition::AcquireOwnership { epoch: 2 },
+        Transition::ResumeEffect { intent_seq: 2 },
+        Transition::AcquireOwnership { epoch: 3 },
+        Transition::ResumeEffect { intent_seq: 4 },
+        Transition::AcquireOwnership { epoch: 4 },
+        Transition::ResumeEffect { intent_seq: 4 },
+    ] {
+        let entry = Entry::new(&state, transition, "writer").unwrap();
+        j.put(&entry).await.unwrap();
+        state = j.load(false).await.unwrap();
+    }
+    assert_eq!(state.audit.keys().copied().collect::<Vec<_>>(), [2, 8]);
+    assert_eq!(state.intent_roots.get(&8), Some(&2));
+    j.checkpoint(&state).await.unwrap();
+    assert_eq!(j.load(true).await.unwrap(), state);
+}
+
+#[tokio::test]
+async fn historical_pages_never_hide_a_gap_before_the_verified_head() {
+    let j = fresh_journal("history-gap");
+    let state = history(&j, 1).await;
+    let mut entry = Entry::new(&state, progress(3), "writer").unwrap();
+    entry.seq = 3;
+    independent_seal(&mut entry);
+    j.put(&entry).await.unwrap();
+    assert!(matches!(
+        j.history_page_through(0, 128, 3).await,
+        Err(Error::RecoveryRequired(_))
+    ));
+    assert!(matches!(
+        j.history_page(0, 0).await,
+        Err(Error::TruncatedRead(_))
+    ));
+}
 async fn put_json(store: &Arc<dyn ObjectStore>, key: &Path, value: &serde_json::Value) {
     store
         .put_opts(
@@ -1778,7 +1975,7 @@ async fn full_scrub_finds_corrupt_old_object_but_checkpoint_recovery_succeeds() 
         .unwrap();
     let store = fs_store(scratch("scrub-corrupt-prefix"));
     let j = journal(store.clone(), "migration");
-    for entry in expected.audit.values() {
+    for entry in entries(&original).await.iter() {
         let mut entry = entry.clone();
         if entry.seq == 2 {
             entry.transition = progress(999);
@@ -1887,7 +2084,7 @@ async fn checkpoint_validates_its_own_digest_and_state_without_an_anchor_object(
                 seal_checkpoint_json(&mut cp);
             }
             "audit-gap" => {
-                cp["state"]["audit"].as_object_mut().unwrap().remove("2");
+                cp["state"]["audit"].as_object_mut().unwrap().remove("6");
                 seal_checkpoint_json(&mut cp);
             }
             "audit-key" => {
@@ -1961,7 +2158,7 @@ async fn newest_checkpoint_failure_never_falls_back_and_tail_uses_recorded_head(
     let original = journal(original_store.clone(), "migration");
     let expected = history(&original, 6).await;
     let mut prior = Materialized::default();
-    for entry in expected.audit.values().take(3) {
+    for entry in entries(&original).await.iter().take(3) {
         prior.apply(entry).unwrap();
     }
     original.checkpoint(&prior).await.unwrap();
@@ -1975,7 +2172,7 @@ async fn newest_checkpoint_failure_never_falls_back_and_tail_uses_recorded_head(
     ] {
         let store = fs_store(scratch(mode));
         let j = journal(store.clone(), "migration");
-        for entry in expected.audit.values() {
+        for entry in entries(&original).await.iter() {
             let mut entry = entry.clone();
             if matches!(mode, "anchor-mismatch" | "orphan-anchor-mismatch") && entry.seq == 6 {
                 entry.transition = progress(999);
@@ -2068,7 +2265,7 @@ async fn checkpoint_discovery_uses_bounded_gets_and_no_listing() {
     let j = journal(counted.clone(), "migration");
     let state = history(&j, 64).await;
     let mut cp = Materialized::default();
-    for entry in state.audit.values() {
+    for entry in entries(&j).await.iter() {
         cp.apply(entry).unwrap();
         if cp.applied_seq % 8 == 0 {
             j.checkpoint(&cp).await.unwrap();
@@ -2081,9 +2278,183 @@ async fn checkpoint_discovery_uses_bounded_gets_and_no_listing() {
     assert!(gets <= 16, "discovery used {gets} GETs");
     // Publishing an older snapshot must not regress the discovery head.
     let mut old = Materialized::default();
-    for entry in state.audit.values().take(8) {
+    for entry in entries(&j).await.iter().take(8) {
         old.apply(entry).unwrap();
     }
     j.checkpoint(&old).await.unwrap();
     assert_eq!(j.load(true).await.unwrap(), state);
+}
+
+// Exact P2 checkpoint wire shape: all ten original Materialized fields, full
+// audit, no D3 fields, and the independently sealed P2 discovery-head format.
+async fn p2_legacy_fixture(
+    name: &str,
+    present: impl Fn(u64) -> bool,
+) -> (
+    std::path::PathBuf,
+    Arc<dyn ObjectStore>,
+    Journal,
+    Materialized,
+) {
+    let root = scratch(name);
+    let store = fs_store(&root);
+    let j = Journal::new(store.clone(), "p2", "fixture", Duration::from_secs(3)).unwrap();
+    let mut state = Materialized::default();
+    let mut audit = std::collections::BTreeMap::new();
+    for transition in [
+        Transition::AcquireOwnership { epoch: 1 },
+        Transition::Intent {
+            effect: EffectKind::BufferPublication,
+            payload: "published".into(),
+        },
+        Transition::EffectCompleted { intent_seq: 2 },
+        progress(4),
+        progress(5),
+        progress(6),
+    ] {
+        let entry = Entry::new(&state, transition, "writer").unwrap();
+        if present(entry.seq) {
+            // Pretty JSON also proves the copy preserves original raw bytes.
+            store
+                .put_opts(
+                    &j.entry_key(entry.seq),
+                    serde_json::to_vec_pretty(&entry).unwrap().into(),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+        }
+        state.apply(&entry).unwrap();
+        audit.insert(entry.seq, entry);
+    }
+    let mut legacy = serde_json::to_value(&state).unwrap();
+    for field in ["intent_roots", "verifier_ranges", "verifier_exceptions"] {
+        assert!(legacy.as_object_mut().unwrap().remove(field).is_some());
+    }
+    legacy["audit"] = serde_json::to_value(audit).unwrap();
+    assert_eq!(legacy.as_object().unwrap().len(), 10);
+    let mut cp =
+        serde_json::json!({"seq":state.applied_seq,"journal_digest":state.digest,"state":legacy});
+    seal_checkpoint_json(&mut cp);
+    let digest = cp["digest"].clone();
+    seal_checkpoint_json(&mut cp);
+    assert_eq!(cp["digest"], digest);
+    let head = checkpoint_index_json(&cp, 1);
+    put_json(&store, &j.checkpoint_key(6), &cp).await;
+    put_json(&store, &j.checkpoint_index_key(1), &head).await;
+    (root, store, j, state)
+}
+
+async fn stored_object_bytes(
+    store: &Arc<dyn ObjectStore>,
+) -> std::collections::BTreeMap<Path, Vec<u8>> {
+    use futures::TryStreamExt;
+    let mut listing = store.list(None);
+    let mut bytes = std::collections::BTreeMap::new();
+    while let Some(meta) = listing.try_next().await.unwrap() {
+        bytes.insert(
+            meta.location.clone(),
+            store
+                .get(&meta.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .to_vec(),
+        );
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn p2_checkpoint_requires_explicit_preserving_store_rebuild() {
+    let (root, store, original, expected) = p2_legacy_fixture("legacy-p2-source", |_| true).await;
+    println!("P2_LEGACY_SOURCE={}", root.display());
+    let before = stored_object_bytes(&store).await;
+    for checkpoint in [false, true] {
+        let error = original.load(checkpoint).await.unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired(_)));
+        assert!(error.to_string().contains("intent_roots"), "{error}");
+    }
+    let replacement_store = fs_store(scratch("legacy-p2-replacement"));
+    let replacement = Journal::new(
+        replacement_store.clone(),
+        "p2",
+        "fixture",
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(original.namespace(), replacement.namespace());
+    let copied = original
+        .copy_entries_for_rebuild(&replacement)
+        .await
+        .unwrap();
+    assert_eq!(copied, expected);
+    assert_eq!(copied.audit.len(), 1);
+    let raw = stored_object_bytes(&replacement_store).await;
+    assert_eq!(raw.len(), 6, "no derived checkpoint/index is copied");
+    for seq in 1..=6 {
+        assert_eq!(
+            raw[&replacement.entry_key(seq)],
+            before[&original.entry_key(seq)]
+        );
+    }
+    assert_eq!(replacement.load(false).await.unwrap(), expected);
+    let local = Local::rebuild(scratch("legacy-p2-new-local").join("db"), &copied).unwrap();
+    local.checkpoint(&replacement).await.unwrap();
+    assert_eq!(replacement.load(true).await.unwrap(), expected);
+    assert_eq!(replacement.scrub().await.unwrap(), expected);
+    let mut owner = Coordinator::observer(replacement, local, "migrated").unwrap();
+    assert_eq!(owner.acquire().await.unwrap(), 2);
+    owner
+        .resume_effect(2, |_| async { panic!("completed P2 effect was repeated") })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_object_bytes(&store).await,
+        before,
+        "original history, legacy checkpoint and discovery head remain byte-exact"
+    );
+    assert!(matches!(
+        original.load(true).await,
+        Err(Error::RecoveryRequired(_))
+    ));
+}
+
+#[tokio::test]
+async fn explicit_legacy_copy_rejects_incomplete_or_unsafe_destinations() {
+    for gap in [true, false] {
+        let (_, _, original, _) = p2_legacy_fixture("legacy-p2-incomplete", |seq| {
+            if gap { seq != 4 } else { seq <= 3 }
+        })
+        .await;
+        let store = fs_store(scratch("legacy-p2-incomplete-target"));
+        let replacement =
+            Journal::new(store.clone(), "p2", "fixture", Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            original.copy_entries_for_rebuild(&replacement).await,
+            Err(Error::RecoveryRequired(_))
+        ));
+        assert!(stored_object_bytes(&store).await.is_empty());
+    }
+    let (_, _, original, _) = p2_legacy_fixture("legacy-p2-target-guards", |_| true).await;
+    let store = fs_store(scratch("legacy-p2-renamed-target"));
+    let renamed = Journal::new(store.clone(), "p2", "different", Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        original.copy_entries_for_rebuild(&renamed).await,
+        Err(Error::Rejected(_))
+    ));
+    assert!(stored_object_bytes(&store).await.is_empty());
+    let occupied = Journal::new(store.clone(), "p2", "fixture", Duration::from_secs(3)).unwrap();
+    occupied
+        .put(&original.entry(1).await.unwrap())
+        .await
+        .unwrap();
+    let before = stored_object_bytes(&store).await;
+    assert!(matches!(
+        original.copy_entries_for_rebuild(&occupied).await,
+        Err(Error::Rejected(_))
+    ));
+    assert_eq!(stored_object_bytes(&store).await, before);
 }
