@@ -1031,7 +1031,10 @@ impl Admin {
                         limits,
                     );
                 }
-                _ => return Err(CoreError::Corrupt("incomplete v2 directory".into())),
+                engine::meta::DirClass::Legacy => {}
+                engine::meta::DirClass::Empty => {
+                    return Err(CoreError::Corrupt("incomplete v2 directory".into()));
+                }
             }
         }
         Self::attach(

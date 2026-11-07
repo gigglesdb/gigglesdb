@@ -20,6 +20,29 @@ fn legacy_reopens_without_classifying_unrelated_files() {
     fs::remove_dir_all(path).unwrap();
 }
 #[test]
+fn legacy_reopens_with_temporary_format_marker() {
+    let path = directory();
+    let admin = Admin::create(&path, Limits::default()).unwrap();
+    let before = admin.snapshot().unwrap();
+    drop(admin);
+    fs::write(path.join("GIGGLES_FORMAT.tmp"), b"").unwrap();
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    assert_eq!(admin.snapshot().unwrap(), before);
+    drop(admin);
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn temporary_format_marker_alone_is_corrupt() {
+    let path = directory();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("GIGGLES_FORMAT.tmp"), b"").unwrap();
+    assert!(matches!(
+        Admin::open(&path, Limits::default()),
+        Err(CoreError::Corrupt(_))
+    ));
+    fs::remove_dir_all(path).unwrap();
+}
+#[test]
 fn marker_without_rocksdb_is_corrupt() {
     let path = directory();
     fs::create_dir(&path).unwrap();
