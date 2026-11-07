@@ -8,6 +8,24 @@ agent coordinates work, investigates, reviews changes, and reports results.
 
 This is a standing project instruction from the user, recorded on 2026-11-06.
 
+## Keeping SOL worker context small
+
+Claude coordinators give each SOL worker (gpt-6.1-sol) a bounded task with:
+- a clear deliverable;
+- pointers to the relevant files and sections;
+- acceptance checks;
+- a stop condition.
+
+Give each worker only the context its task needs. Don't pass full coordinator
+history or whole specs, and don't ask for broad exploration or open-ended
+continuation. Workers return compact findings or results, then stop and wait
+for Claude's next bounded assignment. Required tests and project constraints
+still apply. A worker brief that may write to Archdocs must name spaceId
+5714972c-8f62-4f17-8ebc-b62fbf4420b9 explicitly and require checking the saved
+spaceId afterwards.
+
+Standing user instruction, recorded on 2026-11-07.
+
 ## Archdocs space
 
 All GigglesDB design docs and related architecture documents must be bound to
