@@ -105,12 +105,19 @@ fn pg_get_expr_wrong_types_arity_and_nonnull_deparser_stay_closed() {
         plan("SELECT pg_get_expr(proargdefaults,true) FROM pg_proc"),
         Err(Error::Type)
     ));
-    for args in ["proargdefaults", "proargdefaults,oid,true"] {
-        assert!(matches!(
-            plan(&format!("SELECT pg_get_expr({args}) FROM pg_proc")),
-            Err(Error::Unsupported)
-        ));
-    }
+    assert!(matches!(
+        plan("SELECT pg_get_expr(proargdefaults) FROM pg_proc"),
+        Err(Error::Unsupported)
+    ));
+    let p = plan("SELECT pg_get_expr(proargdefaults,oid,true) FROM pg_proc")
+        .unwrap()
+        .unwrap();
+    assert!(
+        execute(&p, &CatalogSnapshot::default(), &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     let p = plan("SELECT pg_get_expr('encoded'::text,23::oid) FROM pg_type WHERE oid=23")
         .unwrap()
         .unwrap();

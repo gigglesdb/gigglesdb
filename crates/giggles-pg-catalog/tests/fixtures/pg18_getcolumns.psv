@@ -1,0 +1,4 @@
+nspname|relname|attname|atttypid|attnotnull|atttypmod|attlen|typtypmod|attnum|attidentity|attgenerated|adsrc|description|typbasetype|typtype
+public|r0d_jdbc_items|id|23|t|-1|4|-1|1|||||0|b
+public|r0d_jdbc_items|name|25|f|-1|-1|-1|2|||||0|b
+(2 rows)

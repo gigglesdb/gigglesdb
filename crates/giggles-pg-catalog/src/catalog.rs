@@ -59,6 +59,14 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("relacl", T::AclItemArray),
             ("xmin", T::Xid),
             ("relpartbound", T::Text),
+            ("relchecks", T::Int2),
+            ("relhasrules", T::Bool),
+            ("relhastriggers", T::Bool),
+            ("relrowsecurity", T::Bool),
+            ("relforcerowsecurity", T::Bool),
+            ("reloftype", T::Oid),
+            ("relreplident", T::Char),
+            ("reltoastrelid", T::Oid),
         ],
         "pg_attribute" => &[
             ("attrelid", T::Oid),
@@ -101,6 +109,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("typispreferred", T::Bool),
             ("typacl", T::AclItemArray),
             ("typreceive", T::Oid),
+            ("typcollation", T::Oid),
         ],
         "pg_index" => &[
             ("indexrelid", T::Oid),
@@ -153,6 +162,8 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("connoinherit", T::Bool),
             ("conbin", T::Text),
             ("conexclop", T::OidArray),
+            ("conparentid", T::Oid),
+            ("conperiod", T::Bool),
         ],
         "pg_description" => &[
             ("objoid", T::Oid),
@@ -180,6 +191,12 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("datistemplate", T::Bool),
             ("datallowconn", T::Bool),
             ("datacl", T::AclItemArray),
+            ("encoding", T::Int4),
+            ("datlocprovider", T::Char),
+            ("datcollate", T::Text),
+            ("datctype", T::Text),
+            ("datlocale", T::Text),
+            ("daticurules", T::Text),
         ],
         "pg_user" => &[
             ("usename", T::Name),
@@ -291,6 +308,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("inhrelid", T::Oid),
             ("inhparent", T::Oid),
             ("inhseqno", T::Int4),
+            ("inhdetachpending", T::Bool),
         ],
         "pg_foreign_table" => &[
             ("ftrelid", T::Oid),
@@ -512,6 +530,27 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("evtenabled", T::Char),
             ("xmin", T::Xid),
         ],
+        "pg_statistic_ext" => &[
+            ("oid", T::Oid),
+            ("stxrelid", T::Oid),
+            ("stxnamespace", T::Oid),
+            ("stxname", T::Name),
+            ("stxkind", T::CharArray),
+            ("stxstattarget", T::Int2),
+        ],
+        "pg_publication" => &[
+            ("oid", T::Oid),
+            ("pubname", T::Name),
+            ("puballtables", T::Bool),
+        ],
+        "pg_publication_namespace" => &[("oid", T::Oid), ("pnpubid", T::Oid), ("pnnspid", T::Oid)],
+        "pg_publication_rel" => &[
+            ("oid", T::Oid),
+            ("prpubid", T::Oid),
+            ("prrelid", T::Oid),
+            ("prqual", T::PgNodeTree),
+            ("prattrs", T::Int2Vector),
+        ],
         _ => return None,
     }))
 }
@@ -726,6 +765,22 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             )
         })
         .collect();
+    // These absent features are queryable, but do not expand the established
+    // finite reflected pg_class/pg_type inventory.
+    for name in [
+        "pg_statistic_ext",
+        "pg_publication",
+        "pg_publication_namespace",
+        "pg_publication_rel",
+    ] {
+        all.insert(
+            name.into(),
+            Relation {
+                fields: schema(name).unwrap(),
+                rows: vec![],
+            },
+        );
+    }
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
@@ -737,6 +792,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         "pg_database",
         vec![I(16384), s("giggles"), I(10), B(false), B(true), N],
     );
+    add("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
     add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
     add("pg_user", vec![s("giggles"), I(10), B(false)]);
     // One certificate-bound presentation identity; PostgreSQL role management,
@@ -1161,6 +1217,46 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             (I(t), I(i)) => (*t, *i),
             _ => unreachable!(),
         });
+    // Append descriptor extensions here so established field positions remain stable.
+    for row in &mut all.get_mut("pg_class").unwrap().rows {
+        if row[2] == I(2200) {
+            row[10] = I(if row[3] == s("i") { 403 } else { 2 });
+        }
+        row.extend([
+            I(0),
+            B(false),
+            B(false),
+            B(false),
+            B(false),
+            I(0),
+            s(if row[3] == s("i") { "n" } else { "d" }),
+            I(0),
+        ]);
+    }
+    for row in &mut all.get_mut("pg_type").unwrap().rows {
+        let oid = match row[0] {
+            I(v) => v,
+            _ => 0,
+        };
+        row.push(I(match oid {
+            19 | 1003 => 950,
+            25 | 1009 => 100,
+            _ => 0,
+        }));
+    }
+    for row in &mut all.get_mut("pg_attribute").unwrap().rows {
+        row[11] = I(match row[2] {
+            I(19) => 950,
+            I(25) => 100,
+            _ => 0,
+        });
+    }
+    for row in &mut all.get_mut("pg_constraint").unwrap().rows {
+        row.extend([I(0), B(false)]);
+    }
+    for row in &mut all.get_mut("pg_database").unwrap().rows {
+        row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N]);
+    }
     let total: usize = all
         .values()
         .flat_map(|r| &r.rows)

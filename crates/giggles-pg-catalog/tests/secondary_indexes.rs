@@ -84,7 +84,10 @@ fn secondary_relations_keys_flags_and_primary_constraint() {
     assert_eq!(run("SELECT c.relname,a.attnum,a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relkind='i' ORDER BY c.oid,a.attnum").rows,vec![vec![s("t_pkey"),I(1),s("id")],vec![s("t_email_key"),I(1),s("email")],vec![s("t_ab_idx"),I(1),s("b")],vec![s("t_ab_idx"),I(2),s("a")]]);
     assert_eq!(
         run("SELECT oid,amname,amhandler,amtype FROM pg_am").rows,
-        vec![vec![I(403), s("btree"), I(330), s("i")]]
+        vec![
+            vec![I(2), s("heap"), I(3), s("t")],
+            vec![I(403), s("btree"), I(330), s("i")]
+        ]
     );
     assert!(
         run("SELECT relname FROM pg_class WHERE relname='hidden'")
@@ -148,12 +151,56 @@ fn indexes_via_supported_joins(sn: &CatalogSnapshot) -> ResultSet {
 }
 
 #[test]
-fn supplied_psql_query_tracks_left_join_planning_gap() {
-    // Known gap: track G join planning (LEFT JOIN predicate placement). Flip to an exact-row assertion when fixed.
-    assert!(matches!(
-        execute(&plan(PSQL).unwrap().unwrap(), &snapshot(), &[]),
-        Err(Error::Limit)
-    ));
+fn supplied_psql_query_returns_exact_postgres_rows() {
+    assert_eq!(
+        execute(&plan(PSQL).unwrap().unwrap(), &snapshot(), &[])
+            .unwrap()
+            .rows,
+        vec![
+            vec![
+                s("t_pkey"),
+                B(true),
+                B(true),
+                B(false),
+                B(true),
+                s("CREATE UNIQUE INDEX t_pkey ON t USING btree (id)"),
+                s("PRIMARY KEY (id)"),
+                s("p"),
+                B(false),
+                B(false),
+                B(false),
+                I(0)
+            ],
+            vec![
+                s("t_ab_idx"),
+                B(false),
+                B(false),
+                B(false),
+                B(true),
+                s("CREATE INDEX t_ab_idx ON t USING btree (b, a)"),
+                N,
+                N,
+                N,
+                N,
+                B(false),
+                I(0)
+            ],
+            vec![
+                s("t_email_key"),
+                B(false),
+                B(true),
+                B(false),
+                B(true),
+                s("CREATE UNIQUE INDEX t_email_key ON t USING btree (email)"),
+                N,
+                N,
+                N,
+                N,
+                B(false),
+                I(0)
+            ],
+        ]
+    );
 }
 
 #[test]
@@ -467,7 +514,7 @@ fn pg18_6_secondary_catalog_capture_matches() {
         assert_eq!(csv, golden, "PostgreSQL 18.6 capture: {capture_label}");
         if let Some(directory) = std::env::var_os("K2C_CAPTURE_DIR") {
             if name == "psql-indexes" {
-                std::fs::write(std::path::Path::new(&directory).join("giggles-psql-indexes_via_supported_joins.sql"), format!("-- Test-only merge by index name reconstructs the twelve captured columns. The exact psql LEFT JOIN query has a known planning gap.\n{SUPPORTED_INDEXES}\n{SUPPORTED_CONSTRAINTS}\n")).unwrap();
+                std::fs::write(std::path::Path::new(&directory).join("giggles-psql-indexes_via_supported_joins.sql"), format!("-- Test-only merge by index name reconstructs the twelve captured columns. This reconstruction preserves the original K2c capture path; the exact psql LEFT JOIN query is covered separately.\n{SUPPORTED_INDEXES}\n{SUPPORTED_CONSTRAINTS}\n")).unwrap();
             }
             std::fs::write(
                 std::path::Path::new(&directory).join(format!("giggles-{name}.csv")),

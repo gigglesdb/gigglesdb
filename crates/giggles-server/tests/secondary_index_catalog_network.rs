@@ -155,7 +155,7 @@ async fn secondary_indexes_pg_indexes_and_supported_inner_joins() {
 }
 
 #[tokio::test]
-async fn exact_psql_query_tracks_left_join_planning_gap() {
+async fn exact_psql_query_returns_postgres_rows() {
     let (_running, client) = fixture().await;
     let oid: u32 = client
         .query_one(
@@ -168,9 +168,76 @@ async fn exact_psql_query_tracks_left_join_planning_gap() {
     let exact = format!(
         "SELECT c2.relname, i.indisprimary, i.indisunique, i.indisclustered, i.indisvalid, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true), pg_catalog.pg_get_constraintdef(con.oid, true), contype, condeferrable, condeferred, i.indisreplident, c2.reltablespace FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) WHERE c.oid = '{oid}' AND c.oid = i.indrelid AND i.indexrelid = c2.oid ORDER BY i.indisprimary DESC, c2.relname;"
     );
-    // Known gap: track G join planning (LEFT JOIN predicate placement). Flip to an exact-row assertion when fixed.
-    let error = client.query(&exact, &[]).await.unwrap_err();
-    assert_eq!(error.code().unwrap().code(), "54000");
+    // psql's exact \d index query: rows as PostgreSQL 18 returns them (track G
+    // LEFT JOIN predicate placement, GD-0057 G1-b). CREATE UNIQUE INDEX makes no
+    // constraint, so only t_pkey has constraint columns.
+    let rows = client.query(&exact, &[]).await.unwrap();
+    let actual = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, bool>(1),
+                r.get::<_, bool>(2),
+                r.get::<_, bool>(3),
+                r.get::<_, bool>(4),
+                r.get::<_, String>(5),
+                r.get::<_, Option<String>>(6),
+                r.get::<_, Option<i8>>(7),
+                r.get::<_, Option<bool>>(8),
+                r.get::<_, Option<bool>>(9),
+                r.get::<_, bool>(10),
+                r.get::<_, u32>(11),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            (
+                "t_pkey".into(),
+                true,
+                true,
+                false,
+                true,
+                "CREATE UNIQUE INDEX t_pkey ON t USING btree (id)".into(),
+                Some("PRIMARY KEY (id)".into()),
+                Some(b'p' as i8),
+                Some(false),
+                Some(false),
+                false,
+                0,
+            ),
+            (
+                "t_ab_idx".into(),
+                false,
+                false,
+                false,
+                true,
+                "CREATE INDEX t_ab_idx ON t USING btree (a, b)".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+            ),
+            (
+                "t_email_key".into(),
+                false,
+                true,
+                false,
+                true,
+                "CREATE UNIQUE INDEX t_email_key ON t USING btree (email)".into(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

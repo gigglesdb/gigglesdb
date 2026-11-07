@@ -142,9 +142,17 @@ fn excluded_filters_and_join_shapes_keep_materialization() {
         "SELECT t.oid FROM pg_type t,pg_type e WHERE upper(t.typname)='INT4'",
         "SELECT t.oid FROM pg_type t,pg_type e WHERE 1/0=0",
     ] {
-        // The nontruth selective ON avoids the oversized cross product.
-        if sql.contains("ON t.oid=e.oid") {
+        // Preserved-side pushdown makes the LEFT JOIN result exact.
+        if sql.contains("LEFT JOIN") || sql.contains("ON t.oid=e.oid") {
             assert_eq!(run(sql, &[]).unwrap().rows, vec![vec![Value::Int(23)]]);
+        } else if sql == "SELECT t.oid FROM pg_type t,pg_type e WHERE upper(t.typname)='INT4'" {
+            // The pure predicate now pushes before comma-join materialization.
+            let same_snapshot = snapshot();
+            let types = plan("SELECT oid FROM pg_type").unwrap().unwrap();
+            let type_count = execute(&types, &same_snapshot, &[]).unwrap().rows.len();
+            let selected = plan(sql).unwrap().unwrap();
+            let result = execute(&selected, &same_snapshot, &[]).unwrap();
+            assert_eq!(result.rows, vec![vec![Value::Int(23)]; type_count]);
         } else {
             let result = run(sql, &[]);
             assert!(matches!(result, Err(Error::Limit)), "{sql}: {result:?}");
