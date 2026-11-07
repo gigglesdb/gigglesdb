@@ -27,9 +27,22 @@ Ordinary completed runs return 0 even with failures; infrastructure failures ret
 With `--server-bin`, the optional commit is an operator label; without a label,
 reports mark the supplied binary unverified. Without `--server-bin`, `--commit`
 defaults to HEAD and the harness resolves it to a full SHA and builds the committed
-source with `cargo build --locked --manifest-path <src>/crates/giggles-server/Cargo.toml --bin giggles-server` before starting Docker.
+source with `cargo build --locked --manifest-path <build-worktree>/crates/giggles-server/Cargo.toml --bin giggles-server` before starting Docker.
 `--build-root` defaults to `J:/gigglesdb-work/r0-harness/builds` and
 `--cargo-target` to `J:/gigglesdb-work/r0-harness/cargo-target`; K: is refused.
+`--build-worktree` defaults to `J:/gigglesdb-work/wt/r0-build`. It must resolve
+strictly beneath `J:/gigglesdb-work/wt/`, including when reusing a cached binary.
+This stable, harness-owned Git worktree is verified as registered to the source
+repository before use. The harness may force-check out the requested commit and
+run `git clean -ffdx` there: do not keep personal changes or artifacts in it.
+Reuse the same worktree and cargo target to preserve sccache path identity.
+A shared worktree lock serializes users even when their cargo targets differ;
+the target build lock also prevents concurrent builds sharing one cargo target.
+Each Cargo child sets `RUSTC_WRAPPER=J:/gigglesdb-work/tools/bin/sccache.exe`,
+`SCCACHE_DIR=J:/gigglesdb-work/sccache-cache`, `SCCACHE_CACHE_SIZE=100G`, and
+`CARGO_INCREMENTAL=0`. If sccache is unavailable, the build records that status
+and falls back to Cargo without a wrapper. Build metadata records sccache stats
+before and after the build and their delta when available.
 A per-commit cache verifies binary size and SHA-256 before reuse. An exclusive
 lock serializes builds, recovers stale owners, and times out on a live owner.
 Reports record resolved commit, cache hit/miss, build root and duration; build
@@ -349,8 +362,9 @@ Runs write their reports before deleting only their own `bin`, `data`, `tmp`,
 and `scratch_bytes_freed`. `--keep-scratch` retains those directories for debugging;
 `--keep` independently retains Docker objects. A failed server shutdown retains
 scratch. Cleanup refuses redirected parents, symlinks, junctions, and nested
-reparse points. Successful commit builds retain the executable, `build.json`, and
-`build.log`, while deleting their owned source export and temporary directory.
+reparse points. Successful commit builds retain the per-commit executable cache,
+`build.json`, and `build.log`, while deleting their owned temporary directory.
+The stable build worktree and cargo target survive for subsequent builds.
 Probe client metadata records `image_build_cache` and `image_build_duration_s`.
 
 ## H3c compiled driver probes
@@ -470,8 +484,10 @@ python -I -B compat/harness.py watch --seed-report J:/gigglesdb-work/<baseline>/
 `last_run_at`, and `last_report`. A missing state requires both seed arguments;
 the report's build commit must match, and its finished/start timestamp seeds the
 interval. Existing state takes precedence over seed arguments. `--state`,
-`--out-root`, `--build-root`, and `--cargo-target` override their J: defaults;
-output paths cannot be on K:.
+`--out-root`, `--build-root`, `--build-worktree`, and `--cargo-target` override
+their J: defaults; output paths cannot be on K:. The resolved build worktree is
+forwarded to both full and isolation runs and must remain beneath
+`J:/gigglesdb-work/wt/`.
 
 An unchanged commit, fewer than 60 minutes since the previous report, a diff
 without changes under `crates/` (excluding `crates/giggles-pg-conformance/`), or

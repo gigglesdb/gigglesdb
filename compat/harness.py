@@ -22,6 +22,7 @@ def parser():
     run = sub.add_parser('run')
     run.add_argument('--server-bin', type=Path)
     run.add_argument('--build-root', default='J:/gigglesdb-work/r0-harness/builds')
+    run.add_argument('--build-worktree', default='J:/gigglesdb-work/wt/r0-build')
     run.add_argument('--cargo-target', default='J:/gigglesdb-work/r0-harness/cargo-target')
     run.add_argument('--commit')
     run.add_argument('--out-root', default='J:/gigglesdb-work/r0-harness/runs')
@@ -40,7 +41,7 @@ def parser():
     observer.add_argument('--seed-report', type=Path)
     observer.add_argument('--seed-commit')
     observer.add_argument('--min-interval-minutes', type=float, default=60)
-    for flag in ('build-root', 'cargo-target', 'out-root'):
+    for flag in ('build-root', 'build-worktree', 'cargo-target', 'out-root'):
         observer.add_argument('--'+flag, default=run.get_default(flag.replace('-', '_')))
     return p
 
@@ -212,6 +213,7 @@ def _run(args, capture):
         root = util.output_root(args.out_root)
         build_root = util.output_root(args.build_root)
         cargo_target = util.output_root(args.cargo_target)
+        build_worktree = gigglesdb.validate_build_worktree(getattr(args, 'build_worktree', 'J:/gigglesdb-work/wt/r0-build'), Path(__file__).resolve().parent.parent)
     except ValueError as exc:
         print(str(exc), file=sys.stderr); return 2
     run_id = 'r0-'+datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
@@ -239,7 +241,7 @@ def _run(args, capture):
         env.update(POSTGRES_INITDB_ARGS=pinned['postgres']['initdb_args'], TZ=pinned['postgres']['tz'], PGTZ=pinned['postgres']['tz'])
         binary = args.server_bin
         if binary is None:
-            binary, build_meta = gigglesdb.prepare_build(Path(__file__).resolve().parent.parent, args.commit or 'HEAD', build_root, cargo_target, env)
+            binary, build_meta = gigglesdb.prepare_build(Path(__file__).resolve().parent.parent, args.commit or 'HEAD', build_root, cargo_target, env, build_worktree=build_worktree)
             data['build'].update(build_meta)
         engine.require('info',timeout=30)
         if not engine.image(pins.reference(pinned['postgres']), args.pull):
@@ -356,6 +358,7 @@ def run_once(argv=None, *, fail_if_build_busy=False):
         util.output_root(args.out_root)
         util.output_root(args.build_root)
         target = util.output_root(args.cargo_target)
+        gigglesdb.validate_build_worktree(args.build_worktree, Path(__file__).resolve().parent.parent)
         with watch.RunLock(target):
             if fail_if_build_busy and (target/'.gd-r0-build.lock').exists():
                 raise watch.LockBusy('another R0 build is active')

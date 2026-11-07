@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import threading
-import tarfile
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -56,24 +55,6 @@ def _stop_build(process, env):
         process.wait(timeout=30)
 
 
-def _extract_archive(repo, sha, source, env, log):
-    archive = subprocess.Popen(['git', '-C', str(repo), 'archive', '--format=tar', sha],
-        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log)
-    try:
-        with tarfile.open(fileobj=archive.stdout, mode='r|') as tar:
-            tar.extractall(source, filter='data')
-        # tarfile stops at end markers; git may still be writing record
-        # padding exceeding the Windows pipe capacity.
-        while archive.stdout.read(65536):
-            pass
-        if archive.wait(timeout=60) != 0:
-            raise RuntimeError('git archive failed')
-    finally:
-        archive.stdout.close()
-        if archive.poll() is None:
-            archive.kill(); archive.wait()
-
-
 def _cached(build_dir, sha):
     binary = build_dir/'giggles-server.exe'
     try:
@@ -90,8 +71,8 @@ def _cached(build_dir, sha):
 
 
 @contextlib.contextmanager
-def _build_lock(target, metadata, timeout=3600):
-    lock = target/'.gd-r0-build.lock'
+def _build_lock(target, metadata, timeout=3600, filename='.gd-r0-build.lock'):
+    lock = target/filename
     token = uuid.uuid4().hex
     deadline = time.monotonic() + timeout
     while True:
@@ -125,55 +106,137 @@ def _build_lock(target, metadata, timeout=3600):
             pass
 
 
-def _reset_source(build_dir):
-    source = build_dir/'src'
-    marker = build_dir/'.gd-source-owner'
-    if source.exists() or source.is_symlink():
-        if (not marker.is_file() or marker.read_text() != str(build_dir.resolve()) or
-                source.is_symlink() or source.resolve() != build_dir.resolve()/'src' or
-                _junction(source)):
-            raise ValueError('refusing to remove unowned or redirected build source')
-        # Refuse nested reparse points before recursive deletion as well.
+BUILD_WORKTREE = Path('J:/gigglesdb-work/wt/r0-build')
+SCCACHE = Path('J:/gigglesdb-work/tools/bin/sccache.exe')
+
+
+def validate_build_worktree(value, repo=None):
+    path = Path(value).absolute()
+    base = Path('J:/gigglesdb-work/wt').resolve()
+    if path.resolve() != path or not path.is_relative_to(base) or path == base:
+        raise ValueError('build worktree must be strictly under J:/gigglesdb-work/wt without redirects')
+    primary = Path(repo).resolve() if repo is not None else Path(__file__).resolve().parents[2]
+    if path == primary or path.is_relative_to(primary) or primary.is_relative_to(path):
+        raise ValueError('build worktree must not overlap the primary repository')
+    for ancestor in (path, *path.parents):
+        if ancestor.exists() and (ancestor.is_symlink() or _junction(ancestor) or
+                bool(getattr(ancestor.lstat(), 'st_file_attributes', 0) & 0x400)):
+            raise ValueError('refusing redirected build worktree')
+    return path
+
+
+def _registered_worktrees(repo, env):
+    result = command(['git', '-C', str(repo), 'worktree', 'list', '--porcelain'], env)
+    if result['exit'] != 0:
+        raise RuntimeError('cannot inspect registered git worktrees')
+    registered = {Path(line[9:]).resolve() for line in result['stdout'].splitlines()
+                  if line.startswith('worktree ')}
+    return registered
+
+
+def _verify_cached_worktree(repo, source, env):
+    if source.exists() and source not in _registered_worktrees(repo, env):
+        raise ValueError('refusing existing unregistered build worktree')
+
+
+def _prepare_worktree(repo, sha, source, env):
+    registered = _registered_worktrees(repo, env)
+    if source in registered:
+        if not source.is_dir():
+            raise ValueError('registered build worktree is missing')
+        # git clean must never traverse links or junctions supplied by another owner.
         for root, dirs, files in os.walk(source, followlinks=False):
             for name in dirs + files:
                 child = Path(root)/name
-                if child.is_symlink() or _junction(child):
-                    raise ValueError('refusing to remove redirected build source')
-        shutil.rmtree(source)
-    marker.write_text(str(build_dir.resolve()), encoding='utf-8')
-    source.mkdir()
-    return source
+                if child.is_symlink() or _junction(child) or bool(getattr(child.lstat(), 'st_file_attributes', 0) & 0x400):
+                    raise ValueError('refusing redirected build worktree contents')
+        commands = [ ['git', '-c', 'core.autocrlf=false', '-C', str(source), 'checkout', '--detach', '--force', sha],
+                     ['git', '-c', 'core.autocrlf=false', '-C', str(source), 'clean', '-ffdx'] ]
+    else:
+        if source.exists():
+            raise ValueError('refusing existing unregistered build worktree')
+        source.parent.mkdir(parents=True, exist_ok=True)
+        commands = [['git', '-c', 'core.autocrlf=false', '-C', str(repo), 'worktree', 'add', '--detach', str(source), sha]]
+    for args in commands:
+        result = command(args, env)
+        if result['exit'] != 0:
+            raise RuntimeError('git build worktree preparation failed: ' + args[5])
 
 
-def prepare_build(repo, ref, build_root, cargo_target, env):
+def _sccache_stats(env):
+    result = command([str(SCCACHE), '--show-stats', '--stats-format=json'], env)
+    if result['exit'] != 0:
+        return None
+    try:
+        value = json.loads(result['stdout'])
+        stats = value['stats']
+        return dict(raw=value, hits=sum(stats['cache_hits']['counts'].values()),
+                    misses=sum(stats['cache_misses']['counts'].values()))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _record_sccache(metadata, env, stage):
+    if metadata['sccache'] == 'unavailable':
+        return
+    value = _sccache_stats(env)
+    metadata['sccache_stats_' + stage] = value
+    if value is None:
+        metadata['sccache_stats_error'] = 'unable to read valid sccache JSON stats'
+    if stage == 'after':
+        before = metadata.get('sccache_stats_before')
+        if value is not None and before is not None:
+            metadata['sccache_hits_delta'] = value['hits'] - before['hits']
+            metadata['sccache_misses_delta'] = value['misses'] - before['misses']
+            metadata['sccache'] = dict(hits=metadata['sccache_hits_delta'], misses=metadata['sccache_misses_delta'])
+        else:
+            metadata['sccache'] = dict(hits=None, misses=None)
+
+
+def prepare_build(repo, ref, build_root, cargo_target, env, build_worktree=None):
     """Build an immutable commit, or return its verified cached executable."""
     build_root, target = output_root(build_root), output_root(cargo_target)
+    source = validate_build_worktree(BUILD_WORKTREE if build_worktree is None else build_worktree, repo)
+    if any(path == source or path.is_relative_to(source) or source.is_relative_to(path)
+           for path in (build_root, target)):
+        raise ValueError('build worktree must not overlap build outputs')
     sha = resolve_commit(repo, ref, env)
     build_dir = output_root(build_root/sha)
     if build_dir != build_root/sha:
         raise ValueError('build directory must not be redirected')
     metadata = dict(server_source='built-from-commit', build_identity='built-from-commit', commit=sha, resolved_commit=sha,
-                    build_root_dir=str(build_dir), build_cache='miss')
+                    build_root_dir=str(build_dir), build_worktree=str(source), build_cache='miss')
     cached = _cached(build_dir, sha)
     if cached:
+        _verify_cached_worktree(repo, source, env)
         return build_dir/'giggles-server.exe', dict(cached, build_cache='hit', build_duration_s=0)
     target.mkdir(parents=True, exist_ok=True)
+    source.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    with _build_lock(target, metadata):
+    with _build_lock(target, metadata), _build_lock(source.parent, metadata,
+            filename='.gd-r0-' + source.name + '-worktree.lock'):
         cached = _cached(build_dir, sha)
         if cached:
+            _verify_cached_worktree(repo, source, env)
             return build_dir/'giggles-server.exe', dict(cached, build_cache='hit', build_duration_s=0, **{k:v for k,v in metadata.items() if k == 'stale_build_locks'})
         build_dir.mkdir(parents=True, exist_ok=True)
         tmp = build_dir/'tmp'
         scratch.remove_children(build_dir, ('tmp',), keep=True)
         tmp.mkdir(exist_ok=True)
-        build_env = dict(env, CARGO_TARGET_DIR=str(target), TEMP=str(tmp), TMP=str(tmp))
+        build_env = dict(env, CARGO_TARGET_DIR=str(target), TEMP=str(tmp), TMP=str(tmp),
+                         SCCACHE_DIR='J:/gigglesdb-work/sccache-cache',
+                         SCCACHE_CACHE_SIZE='100G', CARGO_INCREMENTAL='0')
+        metadata['sccache'] = 'available' if SCCACHE.is_file() else 'unavailable'
+        if metadata['sccache'] == 'available':
+            build_env['RUSTC_WRAPPER'] = str(SCCACHE)
+        else:
+            build_env.pop('RUSTC_WRAPPER', None)
         log_path = build_dir/'build.log'
         metadata['build_log'] = str(log_path)
         try:
-            source = _reset_source(build_dir)
+            _prepare_worktree(repo, sha, source, build_env)
+            _record_sccache(metadata, build_env, 'before')
             with log_path.open('wb') as log:
-                _extract_archive(repo, sha, source, build_env, log)
                 process = subprocess.Popen(['cargo', 'build', '--locked', '--manifest-path',
                     str(source/'crates'/'giggles-server'/'Cargo.toml'), '--bin', 'giggles-server'],
                     cwd=source, env=build_env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -185,6 +248,7 @@ def prepare_build(repo, ref, build_root, cargo_target, env):
                     raise
                 if code:
                     raise RuntimeError('cargo build failed')
+            _record_sccache(metadata, build_env, 'after')
             binary = build_dir/'giggles-server.exe'
             shutil.copy2(target/'debug'/('giggles-server.exe' if os.name == 'nt' else 'giggles-server'), binary)
             versions = {}
@@ -196,18 +260,19 @@ def prepare_build(repo, ref, build_root, cargo_target, env):
             metadata.update(versions, binary_sha256=_digest(binary), binary_size=binary.stat().st_size,
                             built_at=utc(), profile='debug', build_duration_s=round(time.monotonic()-start, 3))
             metadata.update(sha256=metadata['binary_sha256'], size=metadata['binary_size'], duration_s=metadata['build_duration_s'])
-            marker = build_dir/'.gd-source-owner'
-            if marker.is_symlink() or not marker.is_file() or marker.read_text() != str(build_dir.resolve()):
-                raise ValueError('refusing to remove unowned build scratch')
-            metadata['build_scratch_cleanup'] = scratch.remove_children(build_dir, ('src', 'tmp'), _allowed=('src', 'tmp'))
+            metadata['build_scratch_cleanup'] = scratch.remove_children(build_dir, ('tmp',))
             temporary = build_dir/('build.json.' + uuid.uuid4().hex)
             temporary.write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
             temporary.replace(build_dir/'build.json')
             return binary, metadata
-        except Exception as exc:
+        except BaseException as exc:
+            _record_sccache(metadata, build_env, 'after')
+            metadata['build_scratch_cleanup'] = scratch.remove_children(build_dir, ('tmp',))
             metadata['build_duration_s'] = round(time.monotonic()-start, 3)
             if log_path.exists():
                 metadata['build_log_tail'] = log_path.read_text(encoding='utf-8', errors='replace').splitlines()[-30:]
+            if not isinstance(exc, Exception):
+                raise
             raise BuildError(str(exc), metadata) from exc
 
 def parse_banner(line, url):

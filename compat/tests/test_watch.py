@@ -69,12 +69,14 @@ class WatchTests(unittest.TestCase):
             (target/name).unlink()
 
     def test_regression_labels_and_atomic_baseline(self):
+        self.args.build_worktree = 'J:/gigglesdb-work/wt/h5c-watch-test'
         for outcome, label in [('FAIL','reproduces-in-isolation'), ('PASS','state-dependent (passes alone)'), ('UNTESTED','isolation-inconclusive')]:
             self.args.state.unlink(missing_ok=True)
             isolated = self.write('isolated.json', self.report(self.b, outcome))
             calls = []
             def runner(argv):
                 calls.append(argv)
+                self.assertEqual(str(watch.gigglesdb.validate_build_worktree(self.args.build_worktree)), argv[argv.index('--build-worktree')+1])
                 if len(calls) == 2:
                     self.assertEqual(self.b, json.loads(self.args.state.read_text())['last_run_commit'])
                     self.assertIn('--no-corpus', argv)
@@ -115,6 +117,22 @@ class WatchTests(unittest.TestCase):
         self.args.min_interval_minutes = 60
         self.args.seed_commit = self.b
         self.assertEqual(2, self.invoke(lambda _: self.fail('run')))
+
+    def test_invalid_build_worktree_rejected_before_runner(self):
+        for path in ('K:/source', 'J:/gigglesdb-work/outside-wt', 'J:/gigglesdb-work/wt'):
+            with self.subTest(path=path):
+                self.args.build_worktree = path
+                self.assertEqual(2, self.invoke(lambda _: self.fail('run'), self.a))
+
+    def test_cli_build_worktree_defaults_and_override(self):
+        for command in ('run', 'watch'):
+            self.assertEqual('J:/gigglesdb-work/wt/r0-build', harness.parser().parse_args([command]).build_worktree)
+            self.assertEqual('J:/gigglesdb-work/wt/custom', harness.parser().parse_args([command, '--build-worktree', 'J:/gigglesdb-work/wt/custom']).build_worktree)
+
+    def test_run_validates_worktree_before_inner_run(self):
+        with patch.object(harness, '_run') as inner, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual((2, None), harness.run_once(['run', '--build-worktree', 'K:/source']))
+            inner.assert_not_called()
 
     def test_lock_exclusion_and_ownership(self):
         with watch.RunLock(self.root):

@@ -8,7 +8,7 @@ import re
 import secrets
 import sys
 import tempfile
-from . import delta, util
+from . import delta, gigglesdb, util
 
 
 class LockBusy(RuntimeError):
@@ -87,6 +87,7 @@ def _run(args, runner, repo, env):
             raise ValueError('--min-interval-minutes must be positive and finite')
         state_path = util.output_root(args.state)
         target = util.output_root(args.cargo_target)
+        build_worktree = gigglesdb.validate_build_worktree(getattr(args, 'build_worktree', 'J:/gigglesdb-work/wt/r0-build'), repo)
         for value in (args.build_root, args.out_root):
             util.output_root(value)
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,7 +126,7 @@ def _run(args, runner, repo, env):
         if reason:
             print('watch: no-op: '+reason)
             return 0
-        base = ['run', '--commit', current, '--out-root', str(args.out_root), '--build-root', str(args.build_root), '--cargo-target', str(target)]
+        base = ['run', '--commit', current, '--out-root', str(args.out_root), '--build-root', str(args.build_root), '--build-worktree', str(build_worktree), '--cargo-target', str(target)]
         try:
             code, path = runner(base)
         except LockBusy:
