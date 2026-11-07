@@ -123,6 +123,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::DivisionByZero => 43,
                 relational::SqlError::InvalidEscapeSequence => 44,
                 relational::SqlError::InvalidTableDefinition => 45,
+                relational::SqlError::RestrictViolation => 46,
+                relational::SqlError::WrongObjectType => 47,
             }
         }
     };

@@ -1,6 +1,67 @@
 use super::*;
 use bincode::Options;
 
+#[test]
+fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
+    // SHA256: 83f6ae813171322a8c2d98e58511cdf92da1035832f003c17216d8dbf6e04479
+    const V1: &str = "0000000100000000000000000000000000000001000000000000000100000000000000010000000000000002000000000000000166000000010000000000000001000000000000000300000000000000040000000000000001000000000000000500000000000000000000000000000000000000000000000000";
+    // SHA256: d5d280c263193a875365740623adc86257553ef5de6226ad3ed0071344c2bb56
+    const V2: &str = "000000020000000000000000000000000000000100000000000000010000000000000001000000000000000200000000000000016600000001000000000000000100000000000000030000000000000004000000000000000100000000000000050000000000000000000000000200000000000000000000000000000000";
+    let bytes = |s: &str| {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut ext = CatalogExt::default();
+    ext.constraints.insert(
+        1,
+        vec![Constraint {
+            id: 2,
+            name: "f".into(),
+            kind: ConstraintKind::ForeignKey {
+                columns: vec![3],
+                ref_table: 4,
+                ref_columns: vec![5],
+                on_delete: Action::NoAction,
+                on_update: Action::NoAction,
+                not_valid: false,
+                deferral: Deferral::NotDeferrable,
+            },
+        }],
+    );
+    assert_eq!(codec().serialize(&ext).unwrap(), bytes(V1));
+    assert_eq!(codec().deserialize::<CatalogExt>(&bytes(V1)).unwrap(), ext);
+    if let ConstraintKind::ForeignKey { deferral, .. } =
+        &mut ext.constraints.get_mut(&1).unwrap()[0].kind
+    {
+        *deferral = Deferral::DeferrableDeferred;
+    }
+    ext.ext_version = 2;
+    assert_eq!(codec().serialize(&ext).unwrap(), bytes(V2));
+    assert_eq!(codec().deserialize::<CatalogExt>(&bytes(V2)).unwrap(), ext);
+    let mut noncanonical = bytes(V2);
+    // The final FK field is the four-byte deferral discriminant.
+    let at = noncanonical.len() - 20;
+    noncanonical[at..at + 4].fill(0);
+    assert!(
+        codec()
+            .deserialize::<CatalogExt>(&noncanonical)
+            .unwrap_err()
+            .to_string()
+            .contains("noncanonical")
+    );
+    let mut unknown = bytes(V1);
+    unknown[..4].copy_from_slice(&3u32.to_be_bytes());
+    assert!(
+        codec()
+            .deserialize::<CatalogExt>(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains(catalog_ext::UNSUPPORTED_CATALOG_EXT)
+    );
+}
+
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -111,9 +172,10 @@ fn catalog_ext_all_metadata_roundtrips_and_drop_cleans_owned_entries() {
                 on_delete: Action::Cascade,
                 on_update: Action::NoAction,
                 not_valid: false,
+                deferral: Deferral::NotDeferrable,
             },
         ),
-        ("t_pkey", ConstraintKind::PrimaryKey),
+        ("explicit_pkey", ConstraintKind::PrimaryKey),
     ] {
         state
             .add_constraint(
@@ -144,7 +206,7 @@ fn catalog_ext_all_metadata_roundtrips_and_drop_cleans_owned_entries() {
     let mut removed = state.clone();
     removed.set_column_identity(column, None).unwrap();
     removed.set_column_default(column, None).unwrap();
-    for name in ["positive", "parent", "t_pkey"] {
+    for name in ["positive", "parent", "explicit_pkey"] {
         removed.remove_constraint(table.id, name).unwrap();
     }
     removed.remove_sequence(seq).unwrap();
@@ -210,6 +272,7 @@ fn catalog_ext_foreign_keys_owned_sequences_and_ids_are_validated() {
                 on_delete: Action::NoAction,
                 on_update: Action::NoAction,
                 not_valid: false,
+                deferral: Deferral::NotDeferrable,
             },
         };
         let before = invalid.clone();
@@ -399,13 +462,17 @@ fn catalog_ext_incoming_foreign_key_drop_is_atomic() {
                     on_delete: Action::NoAction,
                     on_update: Action::NoAction,
                     not_valid: false,
+                    deferral: Deferral::NotDeferrable,
                 },
             },
         )
         .unwrap();
     state.validate().unwrap();
     let before = state.clone();
-    assert!(matches!(state.drop_table("t"), Err(SqlError::Unsupported)));
+    assert!(matches!(
+        state.drop_table("t"),
+        Err(SqlError::DependentObjects)
+    ));
     assert_eq!(state.tables, before.tables);
     assert_eq!(state.rows, before.rows);
     assert_eq!(state.ext, before.ext);

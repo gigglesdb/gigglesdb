@@ -1,0 +1,4 @@
+PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2), captured 2026-11-07.
+Source: J:/gigglesdb-work/e1-sql/evidence/e1-con/oracle-pg186-{extension,deparse}.{sql,txt}.
+SQL and psql output are literal captures; only CRLF normalized to LF.
+set-outside.txt: oracle-pg186-set-outside.txt in the same evidence directory.

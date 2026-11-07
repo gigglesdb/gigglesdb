@@ -535,7 +535,7 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
 pub(super) fn parse(p: &mut Parser, target: &DataType) -> R<String> {
     let value = expression(p, 0)?;
     if !matches!(p.tokens.get(p.at), Some(Token::Symbol(',' | ')')))
-        && !matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not" || w == "null" || w == "primary")
+        && !matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not" || w == "null" || w == "primary" || w == "references" || w == "check" || w == "constraint" || w == "unique")
     {
         return Err(SqlError::Unsupported);
     }

@@ -96,6 +96,7 @@ pub(super) fn indexes(
                 && table.primary_key.contains(&index)
                 && !matches!(value, Value::Default)
                 && state.column_identity(table.columns[index].id).is_none()
+                && !state.constraint_key_update_allowed(table.id)
             {
                 return Err(SqlError::Unsupported);
             }
@@ -256,6 +257,7 @@ impl<'a> Plan<'a> {
                     defaults::check_explicit(state, &table.columns[index])?;
                     if table.primary_key.contains(&index)
                         && state.column_identity(table.columns[index].id).is_none()
+                        && !state.constraint_key_update_allowed(table.id)
                     {
                         return Err(SqlError::Unsupported);
                     }

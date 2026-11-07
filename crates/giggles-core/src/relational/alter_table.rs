@@ -16,6 +16,10 @@ pub(super) enum Action {
     Default(String, Option<String>),
     NotNull(String, bool),
     Unique(Option<String>, Vec<String>),
+    PrimaryKey(Option<String>, Vec<String>),
+    Constraint(constraints::Definition),
+    Validate(String),
+    DropConstraint(String, bool),
 }
 impl AlterTable {
     pub fn sequence_dependencies(&self) -> Vec<Option<String>> {
@@ -33,6 +37,7 @@ impl AlterTable {
 pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
     p.need("alter")?;
     p.need("table")?;
+    p.word("only");
     // Keep relation policy out of parsing so syntax wins over lookup and authority.
     let first = raw_name(p)?;
     let (table, resolution_error) = if p.sym('.') {
@@ -58,7 +63,17 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
             } else {
                 None
             };
-            if p.word("unique") {
+            if p.word("check") {
+                Action::Constraint(constraints::parse_check(p, constraint)?)
+            } else if p.word("foreign") {
+                p.need("key")?;
+                let columns = raw_names(p)?;
+                p.need("references")?;
+                Action::Constraint(constraints::parse_foreign(p, constraint, columns)?)
+            } else if p.word("primary") {
+                p.need("key")?;
+                Action::PrimaryKey(constraint, raw_names(p)?)
+            } else if p.word("unique") {
                 Action::Unique(constraint, raw_names(p)?)
             } else {
                 if constraint.is_some() {
@@ -191,14 +206,19 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
             }
         } else if p.word("drop") {
             if p.word("constraint") {
-                return Err(SqlError::Unsupported);
+                let optional = p.word("if");
+                if optional {
+                    p.need("exists")?;
+                }
+                Action::DropConstraint(raw_name(p)?, optional)
+            } else {
+                p.word("column");
+                let optional = p.word("if");
+                if optional {
+                    p.need("exists")?;
+                }
+                Action::Drop(raw_name(p)?, optional)
             }
-            p.word("column");
-            let optional = p.word("if");
-            if optional {
-                p.need("exists")?;
-            }
-            Action::Drop(raw_name(p)?, optional)
         } else if p.word("rename") {
             if p.word("to") {
                 Action::RenameTable(raw_name(p)?)
@@ -234,7 +254,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
             } else {
                 return Err(SqlError::Syntax);
             }
-        } else if p.word("validate") || p.word("set") {
+        } else if p.word("validate") {
+            p.need("constraint")?;
+            Action::Validate(raw_name(p)?)
+        } else if p.word("set") {
             return Err(SqlError::Unsupported);
         } else {
             return Err(SqlError::Syntax);
@@ -254,7 +277,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         resolution_error,
     })
 }
-fn raw_names(p: &mut Parser) -> R<Vec<String>> {
+pub(super) fn raw_names(p: &mut Parser) -> R<Vec<String>> {
     p.punct('(')?;
     let mut names = vec![raw_name(p)?];
     while p.sym(',') {
@@ -263,7 +286,7 @@ fn raw_names(p: &mut Parser) -> R<Vec<String>> {
     p.punct(')')?;
     Ok(names)
 }
-fn raw_name(p: &mut Parser) -> R<String> {
+pub(super) fn raw_name(p: &mut Parser) -> R<String> {
     match p.tokens.get(p.at) {
         Some(Token::Word(value) | Token::QuotedIdent(value)) => {
             let value = ident::truncate(value, 63).to_owned();
@@ -307,6 +330,22 @@ pub(super) fn execute(
             .ok_or(SqlError::UnknownTable)?
             .clone();
         match action {
+            Action::PrimaryKey(explicit, columns) => constraint_primary_key::add(
+                &mut candidate,
+                &table,
+                explicit.as_deref(),
+                columns,
+                &mut *cancel,
+            )?,
+            Action::Constraint(definition) => {
+                constraints::install(&mut candidate, &table, definition, &mut *cancel)?
+            }
+            Action::Validate(name) => {
+                constraints::validate_named(&mut candidate, &table, name, &mut *cancel)?
+            }
+            Action::DropConstraint(name, optional) => {
+                constraints::drop_named(&mut candidate, &table, name, *optional)?
+            }
             Action::Add(column, typmod, default, semantic_error) => {
                 if let Some(error) = semantic_error {
                     return Err(error.clone());
@@ -402,6 +441,7 @@ pub(super) fn execute(
                 if candidate.relation_name_taken(new) {
                     return Err(SqlError::DuplicateTable);
                 }
+                constraint_primary_key::retain_name_before_rename(&mut candidate, &table)?;
                 candidate.tables.remove(&name);
                 name = new.clone();
                 table.name = name.clone();
@@ -430,34 +470,7 @@ pub(super) fn execute(
                 candidate.tables.insert(name.clone(), table.clone());
             }
             Action::Unique(explicit, columns) => {
-                let ids = columns
-                    .iter()
-                    .map(|column| position(&table, column).map(|at| table.columns[at].id))
-                    .collect::<R<Vec<_>>>()?;
-                if let Some(explicit) = explicit {
-                    ident::ident(explicit)?;
-                }
-                let index = explicit.clone().unwrap_or_else(|| {
-                    candidate.choose_constraint_name(
-                        &name,
-                        &columns.iter().map(String::as_str).collect::<Vec<_>>(),
-                        AutoName::Key,
-                    )
-                });
-                if candidate.relation_name_taken(&index) {
-                    return Err(SqlError::DuplicateTable);
-                }
-                if candidate.constraint_name_taken(table.id, &index) {
-                    return Err(SqlError::DuplicateObject);
-                }
-                candidate.create_secondary_index_populated_engine(
-                    &table,
-                    candidate.epoch,
-                    &index,
-                    &ids,
-                    true,
-                    &mut *cancel,
-                )?;
+                constraints::install_unique(&mut candidate, &table, explicit, columns, cancel)?;
             }
         }
     }

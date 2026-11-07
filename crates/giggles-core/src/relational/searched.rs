@@ -52,6 +52,7 @@ pub(super) fn route(
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&clock::ExecutionClock>,
     injected_source: Option<&dyn scan::RowSource>,
+    events: &mut Vec<constraints::Event>,
 ) -> R<SqlResult> {
     if expected.is_some() {
         return Err(SqlError::Unbounded);
@@ -100,6 +101,7 @@ pub(super) fn route(
                 row.values[index] = value;
             }
             row_check(table, &row.values)?;
+            state.check_insert_candidate(table, &row.values)?;
             let new_key = pk(table, &row.values)?;
             // Immediate uniqueness is checked in logical evaluation order. A later
             // matched row still occupies its key until that row is evaluated.
@@ -166,6 +168,13 @@ pub(super) fn route(
                 new: Some((key.as_slice(), row)),
             });
         }
+    }
+    for ((_, old), new) in matched.iter().zip(&postimages) {
+        events.push(constraints::Event {
+            table: table_id,
+            old: old.clone(),
+            new: Some(new.clone()),
+        });
     }
     let mut result =
         state.secondary_apply_batch_engine(state.epoch, &changes, next_version, cancel)?;

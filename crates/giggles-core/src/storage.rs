@@ -1579,6 +1579,7 @@ impl Executor {
 #[derive(Clone)]
 struct SqlSavepointState {
     staged: State,
+    deferral: relational::DeferralState,
 }
 struct SqlSavepoint {
     name: String,
@@ -1599,6 +1600,20 @@ fn snapshot_bytes(s: &State) -> Result<u64, CoreError> {
         })
         .ok_or(CoreError::Limit)
 }
+fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
+    let modes = u64::try_from(state.modes.len()).map_err(|_| CoreError::Limit)?;
+    let mut bytes = modes.checked_mul(9).ok_or(CoreError::Limit)?;
+    for keys in state.pending.values() {
+        bytes = bytes.checked_add(24).ok_or(CoreError::Limit)?;
+        for key in keys {
+            bytes = bytes
+                .checked_add(8)
+                .and_then(|n| n.checked_add(key.len() as u64))
+                .ok_or(CoreError::Limit)?;
+        }
+    }
+    Ok(bytes)
+}
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
@@ -1614,6 +1629,7 @@ pub struct SqlSession {
     pending_sequences: sequences::Pending,
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
+    deferral: relational::DeferralState,
 }
 mod complete_relation;
 pub(crate) use complete_relation::CompleteRelation;
@@ -1633,6 +1649,7 @@ impl Admin {
             pending_sequences: Default::default(),
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
+            deferral: Default::default(),
         }
     }
     /// Catalog preflight for logical archives which cannot preserve secondary indexes.
@@ -1670,7 +1687,7 @@ impl SqlSession {
         p: &relational::Prepared,
     ) -> Result<Vec<Option<String>>, CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
-        let dependencies =|s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
+        let dependencies = |s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
             Some(s) => dependencies(s),
             None => self.admin.inner.inspect(dependencies),
@@ -1685,7 +1702,7 @@ impl SqlSession {
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
-        let owners =|s: &State| {
+        let owners = |s: &State| {
             Ok(s.sql
                 .catalog_ext()
                 .sequences
@@ -2204,6 +2221,7 @@ impl SqlSession {
                                 .map(|(&id, d)| (id, d.incarnation))
                                 .collect();
                             self.staged = Some(s);
+                            self.deferral = Default::default();
                             self.transaction_id = Some(u128::from_be_bytes(token));
                             self.staged_revision = 0;
                         }
@@ -2228,7 +2246,9 @@ impl SqlSession {
                             return Err(CoreError::Sql(E::Limit));
                         }
                         // Byte budget across all live captures (54000 beyond it; nothing captured).
-                        let bytes = snapshot_bytes(staged)?;
+                        let bytes = snapshot_bytes(staged)?
+                            .checked_add(deferral_bytes(&self.deferral)?)
+                            .ok_or(CoreError::Limit)?;
                         let used = self.savepoints.iter().map(|mark| mark.bytes).sum::<u64>();
                         if used
                             .checked_add(bytes)
@@ -2240,6 +2260,7 @@ impl SqlSession {
                             name: name.to_owned(),
                             state: SqlSavepointState {
                                 staged: staged.clone(),
+                                deferral: self.deferral.clone(),
                             },
                             bytes,
                         });
@@ -2254,6 +2275,7 @@ impl SqlSession {
                         } else {
                             let SqlSavepointState {
                                 staged: mut restored,
+                                deferral,
                             } = self.savepoints[index].state.clone();
                             // Allocation and currval are nontransactional. Merge by
                             // incarnation/stamp, rather than restoring older counters.
@@ -2271,6 +2293,7 @@ impl SqlSession {
                                 .checked_add(1)
                                 .ok_or(CoreError::Sql(E::Overflow))?;
                             self.staged = Some(restored);
+                            self.deferral = deferral;
                             self.staged_revision = revision;
                             self.savepoints.truncate(index + 1);
                             self.aborted = false;
@@ -2297,6 +2320,13 @@ impl SqlSession {
                             .lock()
                             .map_err(|_| CoreError::Fenced)?,
                     );
+                    if let Err(error) = staged.sql.validate_deferred(&mut self.deferral, || {
+                        crate::cancellation::check().is_err()
+                    }) {
+                        // A deferred constraint rejection ends the transaction.
+                        self.rollback();
+                        return Err(CoreError::Sql(error));
+                    }
                     self.publish(staged)?;
                     self.rollback();
                 }
@@ -2338,13 +2368,36 @@ impl SqlSession {
             ))
         });
         let clock = context.as_ref();
-        let result = s.sql.execute_clocked(
-            p,
-            params,
-            expected_version,
-            || crate::cancellation::check().is_err(),
-            clock,
-        );
+        let mut deferral = self.deferral.clone();
+        let result = if let Some((names, deferred)) = p.set_constraints() {
+            // Outside a block PostgreSQL still resolves named constraints;
+            // ALL succeeds while the ephemeral mode change is discarded.
+            if !params.is_empty() || expected_version.is_some() {
+                return Err(CoreError::Sql(E::Parameters));
+            }
+            s.sql
+                .set_constraints(&mut deferral, names, deferred, || {
+                    crate::cancellation::check().is_err()
+                })
+                .map(|()| Default::default())
+        } else if self.staged.is_some() {
+            s.sql.execute_deferred(
+                p,
+                params,
+                expected_version,
+                || crate::cancellation::check().is_err(),
+                clock,
+                &mut deferral,
+            )
+        } else {
+            s.sql.execute_clocked(
+                p,
+                params,
+                expected_version,
+                || crate::cancellation::check().is_err(),
+                clock,
+            )
+        };
         // Refresh only counters in the accepted transaction snapshot, including
         // failed statements. Failed row/catalog mutations remain in local s.
         self.admin.inner.merge_live_sequences(&mut s)?;
@@ -2373,6 +2426,7 @@ impl SqlSession {
                     .ok_or(CoreError::Sql(E::Overflow))?;
             }
             self.staged = Some(s);
+            self.deferral = deferral;
         } else if !p.is_read() {
             self.publish(s)?;
         }
@@ -2417,6 +2471,7 @@ impl SqlSession {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.sequence_baseline.clear();
+        self.deferral = Default::default();
         self.savepoints.clear();
         self.aborted = false;
         self.transaction_id = None;
@@ -2581,6 +2636,48 @@ mod typed_session_tests {
             .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values, vec![V::Text("after".into())]);
+    }
+
+    #[test]
+    fn deferred_foreign_key_savepoint_restores_checks_and_modes() {
+        let (_admin, mut session, _) = fixture();
+        for sql in [
+            "CREATE TABLE deferred_parent (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE deferred_child (id BIGINT PRIMARY KEY, parent_id BIGINT, CONSTRAINT deferred_fk FOREIGN KEY (parent_id) REFERENCES deferred_parent (id) DEFERRABLE INITIALLY DEFERRED)",
+            "BEGIN",
+            "SAVEPOINT clean",
+            "INSERT INTO deferred_child VALUES (1, 99)",
+            "ROLLBACK TO clean",
+            "SET CONSTRAINTS deferred_fk IMMEDIATE",
+            "SAVEPOINT immediate",
+            "SET CONSTRAINTS deferred_fk DEFERRED",
+            "ROLLBACK TO immediate",
+        ] {
+            session.execute(sql, &[], None).unwrap();
+        }
+        assert_eq!(
+            session.execute("INSERT INTO deferred_child VALUES (2, 99)", &[], None),
+            Err(CoreError::Sql(relational::SqlError::ForeignKeyViolation))
+        );
+        session.execute("ROLLBACK TO immediate", &[], None).unwrap();
+        session.execute("COMMIT", &[], None).unwrap();
+        session.execute("BEGIN", &[], None).unwrap();
+        session
+            .execute("INSERT INTO deferred_child VALUES (3, 99)", &[], None)
+            .unwrap();
+        assert_eq!(
+            session.execute("COMMIT", &[], None),
+            Err(CoreError::Sql(relational::SqlError::ForeignKeyViolation))
+        );
+        assert!(!session.in_transaction());
+        assert!(!session.is_aborted());
+        assert!(
+            session
+                .execute("SELECT id FROM deferred_child LIMIT 10", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 
     #[test]

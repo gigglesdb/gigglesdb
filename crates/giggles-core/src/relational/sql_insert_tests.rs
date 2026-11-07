@@ -365,11 +365,11 @@ fn sql_insert_primary_update_excluded_existing_and_parameter() {
         1
     );
     assert_eq!(rows(&mut s)[0].values[3], Value::Int(40));
-    fail(
+    assert_eq!(run(
         &mut s,
         "INSERT INTO items (id,n) VALUES (1,1) ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id",
-        SqlError::Unsupported,
-    );
+    ).affected,1);
+    assert_eq!(rows(&mut s)[0].values[0],Value::Int(1));
     fail(
         &mut s,
         "INSERT INTO items (id,n) VALUES (1,1) ON CONFLICT (id) DO UPDATE SET n='wrong'",

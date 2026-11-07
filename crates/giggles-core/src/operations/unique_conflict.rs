@@ -79,6 +79,7 @@ pub(super) struct UniquePlan<'s> {
     pub(super) next_version: u64,
     pub(super) outcome: Outcome,
 }
+#[cfg(test)]
 impl UniquePlan<'_> {
     /// Borrowed view for BatchApply::apply.
     pub(super) fn batch(&self) -> Vec<crate::relational::BatchRowChange<'_>> {
@@ -435,7 +436,7 @@ pub(super) fn plan_unique_conflict<'s>(
             (Some((_, old)), BoundConflict::Update { values, .. }) => {
                 let mut evaluated = Vec::new();
                 for (index, expression) in values {
-                    if table.primary_key.contains(index) {
+                    if semantics == Semantics::Native && table.primary_key.contains(index) {
                         return Err(Error::Unsupported.into());
                     }
                     evaluated.push((
@@ -466,6 +467,12 @@ pub(super) fn plan_unique_conflict<'s>(
                 check(final_value, column)?;
                 charge_value(&mut remaining_row, final_value)?;
                 charge_value(&mut remaining_mutation, final_value)?;
+            }
+            if semantics == Semantics::Sql {
+                let values = (0..table.columns.len())
+                    .map(|column| value(&post, resolved, proposal, column).clone())
+                    .collect::<Vec<_>>();
+                src.check_insert_candidate(table, &values).map_err(sql)?;
             }
             // Equality is admitted only after the entire final row.
             if let Postimage::Update { values, changed } = &mut post {
@@ -522,11 +529,59 @@ pub(super) fn plan_unique_conflict<'s>(
         }
     }
     let mut order = (0..incoming.len()).collect::<Vec<_>>();
-    let key = |index: usize| {
-        resolved[index]
-            .winner
-            .map_or(resolved[index].key.as_slice(), |(key, _)| key)
-    };
+    let final_keys = (0..incoming.len())
+        .map(|index| {
+            if semantics == Semantics::Sql && postimages[index].changed() {
+                crate::relational::encode_key(
+                    &table
+                        .primary_key
+                        .iter()
+                        .map(|column| {
+                            value(
+                                &postimages[index],
+                                &resolved[index],
+                                &incoming[index],
+                                *column,
+                            )
+                            .clone()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(sql)
+            } else {
+                Ok(resolved[index]
+                    .winner
+                    .map_or(resolved[index].key.as_slice(), |(key, _)| key)
+                    .to_vec())
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, PlanError>>()?;
+    if semantics == Semantics::Sql {
+        let mut occupied = src
+            .secondary_access_engine(table, epoch, &mut *cancel)
+            .map_err(sql)?
+            .1
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for (index, post) in postimages.iter().enumerate() {
+            tick(cancel)?;
+            if !post.changed() {
+                continue;
+            }
+            let old_key = resolved[index].winner.map(|(key, _)| key);
+            if old_key != Some(final_keys[index].as_slice())
+                && occupied.contains(&final_keys[index])
+            {
+                return Err(PlanError::Sql(SqlError::Duplicate));
+            }
+            if let Some(old_key) = old_key {
+                occupied.remove(old_key);
+            }
+            occupied.insert(final_keys[index].clone());
+        }
+    }
+    let key = |index: usize| final_keys[index].as_slice();
     order.sort_by(|left, right| key(*left).cmp(key(*right)));
     for index in &order {
         tick(cancel)?;
@@ -677,6 +732,7 @@ type SqlPostimageProjection<'a> =
 
 impl Relational {
     /// SQL-only binding and publication; native planner semantics stay unchanged.
+    #[cfg(test)]
     pub(crate) fn sql_conflict_engine(
         &mut self,
         table: &TableDef,
@@ -688,6 +744,7 @@ impl Relational {
         self.sql_conflict_engine_projected(table, target, incoming, action, None, cancel)
     }
 
+    #[cfg(test)]
     pub(crate) fn sql_conflict_engine_projected(
         &mut self,
         table: &TableDef,
@@ -697,10 +754,41 @@ impl Relational {
         project: Option<&mut SqlPostimageProjection<'_>>,
         cancel: &mut dyn FnMut() -> bool,
     ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
+        self.sql_conflict_engine_captured(
+            table,
+            target,
+            incoming,
+            action,
+            project,
+            cancel,
+            &mut Vec::new(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "SQL conflict inputs plus statement-local referential events"
+    )]
+    pub(crate) fn sql_conflict_engine_captured(
+        &mut self,
+        table: &TableDef,
+        target: (Option<&[String]>, Option<&str>),
+        incoming: &[Vec<Value>],
+        action: &ConflictAction,
+        project: Option<&mut SqlPostimageProjection<'_>>,
+        cancel: &mut dyn FnMut() -> bool,
+        events: &mut Vec<crate::relational::ConstraintEvent>,
+    ) -> std::result::Result<crate::relational::SqlResult, SqlError> {
         if cancel() {
             return Err(SqlError::Aborted);
         }
         Self::sql_admit_conflict_input(table, incoming, action)?;
+        for values in incoming {
+            if cancel() {
+                return Err(SqlError::Aborted);
+            }
+            self.check_insert_candidate(table, values)?;
+        }
         if cancel() {
             return Err(SqlError::Aborted);
         }
@@ -745,7 +833,7 @@ impl Relational {
                 descriptor.table == table.id && descriptor.unique && descriptor.name == name
             }) {
                 Arbiter::Unique(descriptor)
-            } else if table.hidden_rowid().is_none() && name == format!("{}_pkey", table.name) {
+            } else if src.primary_key_constraint_name(table).as_deref() == Some(name) {
                 Arbiter::PrimaryKey
             } else {
                 return Err(SqlError::Unsupported);
@@ -770,7 +858,25 @@ impl Relational {
                 ConflictAction::Nothing => BoundConflict::Nothing,
                 ConflictAction::Update { guard, values } => BoundConflict::Update {
                     guard: binder.optional(guard)?,
-                    values: binder.expression_assignments(values)?,
+                    values: {
+                        if values.is_empty() || values.len() > crate::relational::MAX_COLUMNS {
+                            return Err(Error::Bind("assignments".into()));
+                        }
+                        let mut seen = BTreeSet::new();
+                        let mut assignments = Vec::new();
+                        for (name, expression) in values {
+                            let index = binder.field(name)?;
+                            if !seen.insert(index) {
+                                return Err(Error::Bind("duplicate assignment".into()));
+                            }
+                            let (expression, ty) = binder.expr(expression, 0)?;
+                            if ty.is_some() && ty != Some(colty(&table.columns[index])) {
+                                return Err(Error::Type);
+                            }
+                            assignments.push((index, expression));
+                        }
+                        assignments
+                    },
                 },
             })
         })()
@@ -810,12 +916,37 @@ impl Relational {
         };
         #[cfg(test)]
         Self::sql_insert_test_event(4);
-        let mut result = self.secondary_apply_batch_engine(
-            self.epoch,
-            &plan.batch(),
-            plan.next_version,
-            cancel,
-        )?;
+        // The publisher requires one immutable-key witness per physical key.
+        // Keep logical old/new associations in the plan for referential actions.
+        let mut physical = BTreeMap::new();
+        for change in &plan.changes {
+            if let Some((key, old)) = change.old {
+                physical.entry(key).or_insert((None, None)).0 = Some(old);
+            }
+            physical
+                .entry(change.new.0.as_slice())
+                .or_insert((None, None))
+                .1 = Some(&change.new.1);
+        }
+        let batch = physical
+            .into_iter()
+            .map(|(key, (old, new))| crate::relational::BatchRowChange {
+                table: table.id,
+                old: old.map(|row| (key, row)),
+                new: new.map(|row| (key, row)),
+            })
+            .collect::<Vec<_>>();
+        let mut result =
+            self.secondary_apply_batch_engine(self.epoch, &batch, plan.next_version, cancel)?;
+        for change in &plan.changes {
+            if let Some((_, old)) = change.old {
+                events.push(crate::relational::ConstraintEvent {
+                    table: change.table,
+                    old: old.clone(),
+                    new: Some(change.new.1.clone()),
+                });
+            }
+        }
         result.affected = plan.outcome.affected as u64;
         result.rows = returned;
         Ok(result)

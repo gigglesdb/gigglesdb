@@ -481,9 +481,6 @@ impl Insert {
             for (name, operand) in &update.sets {
                 let index = col(table, name)?;
                 defaults::check_explicit(state, &table.columns[index])?;
-                if !duplicate && table.primary_key.contains(&index) {
-                    return Err(SqlError::Unsupported);
-                }
                 if let Operand::Value(expression @ Expr::Param(n)) = operand
                     && declared.get(n - 1).is_some_and(Option::is_some)
                 {
@@ -838,7 +835,17 @@ pub(super) fn execute(
     clock: Option<&clock::ExecutionClock>,
     cancel: &mut dyn FnMut() -> bool,
 ) -> R<SqlResult> {
-    execute_declared(state, insert, params, expected, returning, clock, cancel, &[])
+    execute_declared(
+        state,
+        insert,
+        params,
+        expected,
+        returning,
+        clock,
+        cancel,
+        &[],
+        &mut Vec::new(),
+    )
 }
 
 #[expect(
@@ -854,6 +861,7 @@ pub(super) fn execute_declared(
     clock: Option<&clock::ExecutionClock>,
     cancel: &mut dyn FnMut() -> bool,
     declared: &[Option<DataType>],
+    events: &mut Vec<constraints::Event>,
 ) -> R<SqlResult> {
     if cancel() {
         return Err(SqlError::Aborted);
@@ -995,21 +1003,24 @@ pub(super) fn execute_declared(
             },
         };
         let mut result = if returning.is_some() {
-            state.sql_conflict_engine_projected(
+            state.sql_conflict_engine_captured(
                 &table,
                 (conflict.columns.as_deref(), conflict.constraint.as_deref()),
                 &incoming,
                 &action,
                 Some(&mut |source, rows| returning::project(returning, source, params, rows)),
                 cancel,
+                events,
             )?
         } else {
-            state.sql_conflict_engine(
+            state.sql_conflict_engine_captured(
                 &table,
                 (conflict.columns.as_deref(), conflict.constraint.as_deref()),
                 &incoming,
                 &action,
+                None,
                 cancel,
+                events,
             )?
         };
         let rows = std::mem::take(&mut result.rows);

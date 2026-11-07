@@ -2,8 +2,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
+#[cfg(test)]
+mod constraint_acceptance_tests;
+mod constraints;
+pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
 mod assign;
 pub(crate) mod clock;
+mod constraint_lookup;
+mod constraint_primary_key;
 mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
@@ -11,10 +17,10 @@ pub(crate) mod catalog_ext;
 use catalog_ext::*;
 mod ident;
 use ident::ident;
+mod like;
 mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
-mod like;
 mod query;
 use query::{TypmodSource, result_typmod};
 mod returning;
@@ -177,6 +183,11 @@ pub enum SqlError {
     DivisionByZero,
     InvalidEscapeSequence,
     InvalidTableDefinition,
+    /// 23001 restrict_violation: a RESTRICT referential action rejected the change immediately.
+    RestrictViolation,
+    /// 42809 wrong_object_type: an operation names an object of a kind that does not support it
+    /// (for example SET CONSTRAINTS on a non-deferrable constraint).
+    WrongObjectType,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +673,13 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    DropTable {
+        name: String,
+        optional: bool,
+        cascade: bool,
+        resolution_error: Option<SqlError>,
+    },
+    SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     CreateIndex(sql_index::CreateIndex),
     InsertMulti(sql_insert::Insert),
@@ -673,6 +691,8 @@ enum Statement {
         defaults: Vec<Option<String>>,
         sequences: Vec<Option<defaults::SequenceSpec>>,
         keys: Vec<String>,
+        constraints: Vec<constraints::Definition>,
+        primary_name: Option<String>,
     },
     InsertExpressions(query::InsertExpressions),
     Insert {
@@ -849,7 +869,58 @@ impl Parser {
         {
             return sql_index::parse(self).map(Statement::CreateIndex);
         }
-        let st = if self.word("create") {
+        let st = if self.word("drop") {
+            if !self.word("table") {
+                return Err(SqlError::Unsupported);
+            }
+            let optional = if self.word("if") {
+                self.need("exists")?;
+                true
+            } else {
+                false
+            };
+            let first = alter_table::raw_name(self)?;
+            let (name, resolution_error) = if self.sym('.') {
+                let name = alter_table::raw_name(self)?;
+                let error = if first != "public" {
+                    Some(SqlError::UnknownTable)
+                } else {
+                    ident::ident(&name).err()
+                };
+                (name, error)
+            } else {
+                let error = ident::ident(&first).err();
+                (first, error)
+            };
+            let cascade = self.word("cascade");
+            if !cascade {
+                self.word("restrict");
+            }
+            Statement::DropTable {
+                name,
+                optional,
+                cascade,
+                resolution_error,
+            }
+        } else if self.word("set") {
+            if !self.word("constraints") {
+                return Err(SqlError::Unsupported);
+            }
+            let mut names = vec![];
+            if !self.word("all") {
+                names.push(self.name()?);
+                while self.sym(',') {
+                    names.push(self.name()?);
+                }
+            }
+            let deferred = if self.word("deferred") {
+                true
+            } else {
+                self.need("immediate")?;
+                false
+            };
+            Statement::SetConstraints(names, deferred)
+        } else if self.word("create") {
             self.need("table")?;
             let name = self.create_table_name()?;
             self.punct('(')?;
@@ -857,13 +928,33 @@ impl Parser {
             let mut defaults = vec![];
             let mut sequences = vec![];
             let mut keys = vec![];
+            let mut constraints = vec![];
+            let mut primary_name = None;
             loop {
-                if self.word("primary") {
+                let constraint_name = if self.word("constraint") {
+                    Some(self.name()?)
+                } else {
+                    None
+                };
+                if self.word("check") {
+                    constraints.push(constraints::parse_check(self, constraint_name)?);
+                } else if self.word("foreign") {
+                    self.need("key")?;
+                    let cols = self.names()?;
+                    self.need("references")?;
+                    constraints.push(constraints::parse_foreign(self, constraint_name, cols)?);
+                } else if self.word("unique") {
+                    constraints.push(constraints::Definition::Unique {
+                        name: constraint_name,
+                        columns: self.names()?,
+                    });
+                } else if self.word("primary") {
                     self.need("key")?;
                     if !keys.is_empty() {
                         return Err(SqlError::Duplicate);
                     }
                     keys = self.names()?;
+                    primary_name = constraint_name;
                 } else {
                     let name = self.name()?;
                     let serial = if self.word("smallserial") || self.word("serial2") {
@@ -917,6 +1008,11 @@ impl Parser {
                     let mut default = None;
                     let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
                     loop {
+                        let column_constraint = if self.word("constraint") {
+                            Some(self.name()?)
+                        } else {
+                            None
+                        };
                         if self.word("generated") {
                             if sequence.is_some() || default.is_some() {
                                 return Err(SqlError::Syntax);
@@ -928,6 +1024,19 @@ impl Parser {
                                 return Err(SqlError::Syntax);
                             }
                             default = Some(defaults::parse(self, &data_type)?);
+                        } else if self.word("check") {
+                            constraints.push(constraints::parse_check(self, column_constraint)?);
+                        } else if self.word("unique") {
+                            constraints.push(constraints::Definition::Unique {
+                                name: column_constraint,
+                                columns: vec![name.clone()],
+                            });
+                        } else if self.word("references") {
+                            constraints.push(constraints::parse_foreign(
+                                self,
+                                column_constraint,
+                                vec![name.clone()],
+                            )?);
                         } else if self.word("not") {
                             self.need("null")?;
                             not_null = true;
@@ -938,6 +1047,7 @@ impl Parser {
                                 return Err(SqlError::Duplicate);
                             }
                             keys.push(name.clone());
+                            primary_name = column_constraint;
                         } else {
                             break;
                         }
@@ -963,6 +1073,8 @@ impl Parser {
                 sequences,
                 columns,
                 keys,
+                constraints,
+                primary_name,
             }
         } else if self.word("insert") {
             self.need("into")?;
@@ -1209,6 +1321,8 @@ impl Prepared {
                 sequences: vec![None; columns.len()],
                 columns,
                 keys,
+                constraints: vec![],
+                primary_name: None,
             },
             domain,
             state.epoch,
@@ -1553,6 +1667,7 @@ impl Prepared {
             Statement::CreateIndex(index) => Some(&index.table),
             Statement::InsertMulti(insert) => Some(&insert.table),
             Statement::Create { name, .. }
+            | Statement::DropTable { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
             | Statement::Update { name, .. }
@@ -1564,8 +1679,14 @@ impl Prepared {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Create { .. } | Statement::CreateIndex(_) | Statement::AlterTable(_)
+            Statement::Create { .. }
+                | Statement::CreateIndex(_)
+                | Statement::AlterTable(_)
+                | Statement::DropTable { .. }
         )
+    }
+    pub fn is_drop_table(&self) -> bool {
+        matches!(self.statement, Statement::DropTable { .. })
     }
     pub fn is_alter_table(&self) -> bool {
         matches!(self.statement, Statement::AlterTable(_))
@@ -1591,6 +1712,8 @@ impl Prepared {
                     "SELECT"
                 }
             }
+            Statement::DropTable { .. } => "DROP TABLE",
+            Statement::SetConstraints(..) => "SET CONSTRAINTS",
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
@@ -1816,6 +1939,24 @@ impl Prepared {
         };
         Ok(Some(alter_table::parse(&mut parser)?.table))
     }
+    /// Parse DROP ownership targets without consulting the catalog.
+    pub fn drop_table_target(sql: &str) -> R<Option<String>> {
+        let Ok(tokens) = lex(sql) else {
+            return Ok(None);
+        };
+        if !matches!(tokens.first(),Some(Token::Word(word)) if word == "drop") {
+            return Ok(None);
+        }
+        let mut parser = Parser {
+            tokens,
+            at: 0,
+            params: BTreeSet::new(),
+        };
+        match parser.parse()? {
+            Statement::DropTable { name, .. } => Ok(Some(name)),
+            _ => Ok(None),
+        }
+    }
     /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
     /// Parse failures and dependency-bearing queries keep their existing gateway path.
     pub fn rejects_unsupported_table_free_scalar(sql: &str) -> bool {
@@ -1823,6 +1964,80 @@ impl Prepared {
             matches!(&prepared.statement,
                 Statement::Query(query) if query.rejects_unsupported_table_free_scalar())
         })
+    }
+    /// Parse FK dependencies before binding or relation lookup.
+    pub fn constraint_references(sql: &str) -> R<Vec<String>> {
+        let tokens = lex(sql)?;
+        let mut references = vec![];
+        let own = if matches!(tokens.first(),Some(Token::Word(w)) if w=="create") {
+            tokens
+                .iter()
+                .position(|t| matches!(t,Token::Word(w) if w=="table"))
+                .and_then(|i| match tokens.get(i + 1) {
+                    Some(Token::Word(w) | Token::QuotedIdent(w)) => Some(w.clone()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        for (i, token) in tokens.iter().enumerate() {
+            if matches!(token,Token::Word(w) if w=="references") {
+                let mut at = i + 1;
+                let first = match tokens.get(at) {
+                    Some(Token::Word(w) | Token::QuotedIdent(w)) => w.clone(),
+                    _ => continue,
+                };
+                at += 1;
+                let name = if tokens.get(at) == Some(&Token::Symbol('.')) {
+                    match tokens.get(at + 1) {
+                        Some(Token::Word(w) | Token::QuotedIdent(w)) => w.clone(),
+                        _ => continue,
+                    }
+                } else {
+                    first
+                };
+                if own.as_ref() != Some(&name) {
+                    references.push(name);
+                }
+            }
+        }
+        Ok(references)
+    }
+    pub fn constraint_reference_tables(&self) -> Vec<String> {
+        let (definitions, own) = match &self.statement {
+            Statement::Create {
+                constraints, name, ..
+            } => (constraints.iter().collect::<Vec<_>>(), Some(name)),
+            Statement::AlterTable(alter) => (
+                alter
+                    .actions
+                    .iter()
+                    .filter_map(|a| {
+                        if let alter_table::Action::Constraint(d) = a {
+                            Some(d)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                None,
+            ),
+            _ => return vec![],
+        };
+        definitions
+            .into_iter()
+            .filter_map(|d| {
+                if let constraints::Definition::ForeignKey { parent, .. } = d {
+                    if Some(parent) != own {
+                        Some(parent.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
         assert_sql_frontend_allowed();
@@ -1853,6 +2068,13 @@ impl Prepared {
         {
             return Err(error.clone());
         }
+        if let Statement::DropTable {
+            resolution_error: Some(error),
+            ..
+        } = &statement
+        {
+            return Err(error.clone());
+        }
         let params = p.params.last().copied().unwrap_or(0);
         if p.params.len() != params {
             return Err(SqlError::Parameters);
@@ -1867,6 +2089,12 @@ impl Prepared {
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
+    pub(crate) fn set_constraints(&self) -> Option<(&[String], bool)> {
+        match &self.statement {
+            Statement::SetConstraints(names, deferred) => Some((names, *deferred)),
+            _ => None,
+        }
+    }
     pub fn savepoint_name(&self) -> Option<&str> {
         match &self.statement {
             Statement::Savepoint(name) | Statement::Release(name) | Statement::RollbackTo(name) => {
@@ -2055,7 +2283,18 @@ impl Value {
     }
 }
 impl Relational {
+    pub(super) fn constraint_key_update_allowed(&self, table_id: u64) -> bool {
+        self.ext.constraints.iter().any(|(child_id,constraints)| constraints.iter().any(|constraint| {
+            matches!(&constraint.kind,ConstraintKind::ForeignKey { ref_table, .. } if *child_id == table_id || *ref_table == table_id)
+        }))
+    }
+    pub(crate) fn primary_key_constraint_name(&self, table: &TableDef) -> Option<String> {
+        constraint_primary_key::primary_key_name(self, table)
+    }
     pub(crate) fn drop_table(&mut self, name: &str) -> R<bool> {
+        self.drop_table_with_actions(name, false)
+    }
+    fn drop_table_with_actions(&mut self, name: &str, cascade: bool) -> R<bool> {
         let Some(table) = self.tables.get(name) else {
             return Ok(false);
         };
@@ -2066,6 +2305,13 @@ impl Relational {
             ext.columns.remove(&column.id);
         }
         ext.constraints.remove(&table_id);
+        for constraints in ext.constraints.values_mut() {
+            let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
+            if !cascade && constraints.iter().any(incoming) {
+                return Err(SqlError::DependentObjects);
+            }
+            constraints.retain(|constraint| !incoming(constraint));
+        }
         ext.sequences
             .retain(|_, seq| !matches!(seq.owned_by, Some((id, _)) if id == table_id));
         Self::normalize_ext(&mut ext);
@@ -2228,6 +2474,90 @@ impl Relational {
         clock: Option<&clock::ExecutionClock>,
         injected_source: Option<&dyn scan::RowSource>,
     ) -> R<SqlResult> {
+        let adds_constraints = matches!(&prepared.statement,Statement::Create { constraints,.. } if !constraints.is_empty())
+            || matches!(&prepared.statement,Statement::AlterTable(alter) if alter.actions.iter().any(|a|matches!(a,alter_table::Action::Constraint(_))));
+        if self.ext.constraints.is_empty() && !adds_constraints {
+            return self.execute_statement_inner(
+                prepared,
+                params,
+                expected,
+                cancel,
+                clock,
+                injected_source,
+                &mut Vec::new(),
+            );
+        }
+        let mut deferred = DeferralState::default();
+        let mut candidate = self.clone();
+        let mut events = Vec::new();
+        let result = candidate.execute_statement_inner(
+            prepared,
+            params,
+            expected,
+            &mut cancel,
+            clock,
+            injected_source,
+            &mut events,
+        )?;
+        constraints::enforce(
+            &mut candidate,
+            self,
+            events,
+            &mut deferred,
+            &mut cancel,
+            clock,
+        )?;
+        candidate.validate_deferred(&mut deferred, &mut cancel)?;
+        *self = candidate;
+        Ok(result)
+    }
+    pub(crate) fn execute_deferred(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        mut cancel: impl FnMut() -> bool,
+        clock: Option<&clock::ExecutionClock>,
+        deferred: &mut DeferralState,
+    ) -> R<SqlResult> {
+        let mut candidate = self.clone();
+        let mut pending = deferred.clone();
+        let mut events = Vec::new();
+        let result = candidate.execute_statement_inner(
+            prepared,
+            params,
+            expected,
+            &mut cancel,
+            clock,
+            None,
+            &mut events,
+        )?;
+        constraints::enforce(
+            &mut candidate,
+            self,
+            events,
+            &mut pending,
+            &mut cancel,
+            clock,
+        )?;
+        *self = candidate;
+        *deferred = pending;
+        Ok(result)
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "statement inputs plus statement-local referential events"
+    )]
+    fn execute_statement_inner(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        mut cancel: impl FnMut() -> bool,
+        clock: Option<&clock::ExecutionClock>,
+        injected_source: Option<&dyn scan::RowSource>,
+        events: &mut Vec<constraints::Event>,
+    ) -> R<SqlResult> {
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -2370,6 +2700,7 @@ impl Relational {
                     clock,
                     &mut cancel,
                     &prepared.parameter_types,
+                    events,
                 );
             }
             Statement::AlterTable(alter) => {
@@ -2378,6 +2709,23 @@ impl Relational {
                 }
                 alter_table::execute(self, alter, clock, &mut cancel)?;
             }
+            Statement::DropTable {
+                name,
+                optional,
+                cascade,
+                resolution_error,
+            } => {
+                if let Some(error) = resolution_error {
+                    return Err(error.clone());
+                }
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                if !self.drop_table_with_actions(name, *cascade)? && !optional {
+                    return Err(SqlError::UnknownTable);
+                }
+            }
+            Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::CreateIndex(index) => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
@@ -2416,6 +2764,8 @@ impl Relational {
                 defaults,
                 sequences,
                 keys,
+                constraints,
+                primary_name,
             } => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
@@ -2470,7 +2820,31 @@ impl Relational {
                     c.id = allocate(&mut next_id)?;
                 }
                 let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                let chosen_primary =
+                    if keys.is_empty() {
+                        None
+                    } else {
+                        Some(primary_name.clone().unwrap_or_else(|| {
+                            self.choose_constraint_name(name, &[], AutoName::Pkey)
+                        }))
+                    };
                 defaults::install_create(self, t, defaults, sequences, typmods, next_id, epoch)?;
+                let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
+                if let Some(name) = chosen_primary {
+                    constraint_primary_key::record_name(self, &table, &name)?;
+                }
+                // Candidate keys must exist before self-referencing FKs bind,
+                // including UNIQUE declarations later in the CREATE body.
+                for definition in constraints.iter().filter(|definition| {
+                    matches!(definition, constraints::Definition::Unique { .. })
+                }) {
+                    constraints::install(self, &table, definition, &mut cancel)?;
+                }
+                for definition in constraints.iter().filter(|definition| {
+                    !matches!(definition, constraints::Definition::Unique { .. })
+                }) {
+                    constraints::install(self, &table, definition, &mut cancel)?;
+                }
             }
             Statement::Insert {
                 name,
@@ -2648,6 +3022,7 @@ impl Relational {
                             &mut cancel,
                             clock,
                             injected_source,
+                            events,
                         );
                     }
                 };
@@ -2668,10 +3043,16 @@ impl Relational {
                         row.values[i] = v;
                     }
                     row_check(t, &row.values)?;
+                    self.check_insert_candidate(t, &row.values)?;
                     let new_key = pk(t, &row.values)?;
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
                     returned_rows = returning::project(&returning, self, params, &[&row])?;
+                    events.push(constraints::Event {
+                        table: table_id,
+                        old: old.clone(),
+                        new: Some(row.clone()),
+                    });
                     // Witness ownership is admitted by secondary_admit_mutation before
                     // expression/row construction; stage checks its exact raw value.
                     result = if new_key == b.low {
@@ -2732,6 +3113,7 @@ impl Relational {
                             &mut cancel,
                             clock,
                             injected_source,
+                            events,
                         );
                     }
                 };

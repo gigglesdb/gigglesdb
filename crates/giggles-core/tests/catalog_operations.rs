@@ -438,6 +438,22 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
     assert_eq!(result.table.id, 3);
     assert_eq!(result.table.columns[0].id, 4);
     assert_eq!(result.catalog_epoch, 2);
+    // Frozen Q2 stores a PK name when PostgreSQL's 63-byte identifier limit
+    // truncates the table prefix. VALIDATE resolves persisted constraints, so
+    // this also witnesses that allocator id 5 belongs to that metadata.
+    let truncated_primary = format!("{}_pkey", "a".repeat(58));
+    assert_eq!(truncated_primary.len(), 63);
+    admin
+        .sql_session()
+        .execute(
+            &format!(
+                "ALTER TABLE {} VALIDATE CONSTRAINT {truncated_primary}",
+                "a".repeat(63)
+            ),
+            &[],
+            None,
+        )
+        .unwrap();
     let long_column = "b".repeat(63);
     let names = (0..MAX_COLUMNS)
         .map(|i| {
@@ -462,14 +478,14 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         created.table.primary_key,
         (0..MAX_COLUMNS).collect::<Vec<_>>()
     );
-    assert_eq!(created.table.id, 5);
+    assert_eq!(created.table.id, 6);
     let ids = created
         .table
         .columns
         .iter()
         .map(|c| c.id)
         .collect::<BTreeSet<_>>();
-    assert_eq!(ids, (6..70).collect::<BTreeSet<_>>());
+    assert_eq!(ids, (7..71).collect::<BTreeSet<_>>());
     for i in 3..MAX_TABLES {
         engine
             .execute_catalog(&create(&format!("table{i}")))

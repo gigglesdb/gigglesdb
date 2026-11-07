@@ -1145,11 +1145,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             },
             {
               "id": "schemas-fence06-example05",
@@ -1173,11 +1173,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             },
             {
               "id": "schemas-fence06-example07",
@@ -1201,11 +1201,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "This ALTER TABLE action is outside the bounded ALTER grammar, so parsing rejects the action before relation resolution.",
+              "reason": "The complete admitted ALTER TABLE statement parses before relation resolution. The deliveries relation name is reserved, so preparation rejects this source.",
               "features": [
                 "sql_online_schema_changes"
               ],
-              "prepare_error": "Unsupported"
+              "prepare_error": "Reserved"
             }
           ]
         },

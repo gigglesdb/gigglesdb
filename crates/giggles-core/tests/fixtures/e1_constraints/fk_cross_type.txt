@@ -1,0 +1,99 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                      version                                                       
+--------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+(1 row)
+
+CREATE TABLE p8(id bigint PRIMARY KEY);
+CREATE TABLE
+CREATE TABLE c4(id integer PRIMARY KEY REFERENCES p8(id) ON DELETE CASCADE);
+CREATE TABLE
+INSERT INTO p8 VALUES(1);
+INSERT 0 1
+INSERT INTO c4 VALUES(1);
+INSERT 0 1
+INSERT INTO c4 VALUES(2);
+DELETE FROM p8 WHERE id=1;
+ERROR:  23503: insert or update on table "c4" violates foreign key constraint "c4_id_fkey"
+DETAIL:  Key (id)=(2) is not present in table "p8".
+SCHEMA NAME:  public
+TABLE NAME:  c4
+CONSTRAINT NAME:  c4_id_fkey
+LOCATION:  ri_ReportViolation, ri_triggers.c:2772
+DELETE 1
+SELECT * FROM c4;
+ id 
+----
+(0 rows)
+
+CREATE TABLE r4(id integer PRIMARY KEY REFERENCES p8(id) ON DELETE RESTRICT);
+CREATE TABLE
+INSERT INTO p8 VALUES(3);
+INSERT 0 1
+INSERT INTO r4 VALUES(3);
+INSERT 0 1
+DELETE FROM p8 WHERE id=3;
+ERROR:  23001: update or delete on table "p8" violates RESTRICT setting of foreign key constraint "r4_id_fkey" on table "r4"
+DETAIL:  Key (id)=(3) is referenced from table "r4".
+SCHEMA NAME:  public
+TABLE NAME:  r4
+CONSTRAINT NAME:  r4_id_fkey
+LOCATION:  ri_ReportViolation, ri_triggers.c:2785
+CREATE TABLE pn(id numeric PRIMARY KEY);
+CREATE TABLE
+CREATE TABLE cn(id integer PRIMARY KEY REFERENCES pn(id) ON DELETE CASCADE);
+CREATE TABLE
+INSERT INTO pn VALUES(1),(1.5),(2147483648);
+INSERT 0 3
+INSERT INTO cn VALUES(1);
+INSERT 0 1
+INSERT INTO cn VALUES(2);
+ERROR:  23503: insert or update on table "cn" violates foreign key constraint "cn_id_fkey"
+DETAIL:  Key (id)=(2) is not present in table "pn".
+SCHEMA NAME:  public
+TABLE NAME:  cn
+CONSTRAINT NAME:  cn_id_fkey
+LOCATION:  ri_ReportViolation, ri_triggers.c:2772
+DELETE FROM pn WHERE id=1.5;
+DELETE 1
+DELETE FROM pn WHERE id=2147483648;
+DELETE 1
+DELETE FROM pn WHERE id=1;
+DELETE 1
+SELECT * FROM cn;
+ id 
+----
+(0 rows)
+
+CREATE TABLE pi(id integer PRIMARY KEY);
+CREATE TABLE
+CREATE TABLE ci(id numeric PRIMARY KEY REFERENCES pi(id) ON DELETE CASCADE);
+ERROR:  42804: foreign key constraint "ci_id_fkey" cannot be implemented
+DETAIL:  Key columns "id" of the referencing table and "id" of the referenced table are of incompatible types: numeric and integer.
+LOCATION:  ATAddForeignKeyConstraint, tablecmds.c:10440
+INSERT INTO pi VALUES(1);
+INSERT 0 1
+INSERT INTO ci VALUES(1.00);
+INSERT INTO ci VALUES(1.5);
+ERROR:  42P01: relation "ci" does not exist
+LINE 1: INSERT INTO ci VALUES(1.00);
+                    ^
+LOCATION:  parserOpenTable, parse_relation.c:1498
+DELETE FROM pi WHERE id=1;
+ERROR:  42P01: relation "ci" does not exist
+LINE 1: INSERT INTO ci VALUES(1.5);
+                    ^
+LOCATION:  parserOpenTable, parse_relation.c:1498
+DELETE 1
+SELECT * FROM ci;
+ERROR:  42P01: relation "ci" does not exist
+LINE 1: SELECT * FROM ci;
+                      ^
+LOCATION:  parserOpenTable, parse_relation.c:1498
+CREATE TABLE pt(id text PRIMARY KEY);
+CREATE TABLE
+CREATE TABLE ct(id integer CONSTRAINT incompatible REFERENCES pt(id));
+ERROR:  42804: foreign key constraint "incompatible" cannot be implemented
+DETAIL:  Key columns "id" of the referencing table and "id" of the referenced table are of incompatible types: integer and text.
+LOCATION:  ATAddForeignKeyConstraint, tablecmds.c:10440

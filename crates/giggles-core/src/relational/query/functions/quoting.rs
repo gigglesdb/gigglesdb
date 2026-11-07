@@ -31,6 +31,10 @@ use super::*;
 #[path = "quoting_keywords.rs"]
 mod keywords;
 
+pub(super) fn keyword_requires_quotes(name: &str) -> bool {
+    keywords::REQUIRES_QUOTES.binary_search(&name).is_ok()
+}
+
 type Signature = (Vec<Option<DataType>>, DataType);
 
 pub(super) fn known_name(name: &str) -> bool {
@@ -112,7 +116,7 @@ fn quote(name: &str, input: &str, budget: &mut usize) -> R<Value> {
             backslash |= byte == b'\\';
         }
     }
-    if safe && keywords::REQUIRES_QUOTES.binary_search(&input).is_ok() {
+    if safe && keyword_requires_quotes(input) {
         safe = false;
     }
     let delimiters = if identifier && safe { 0 } else { 2 };

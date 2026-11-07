@@ -416,14 +416,18 @@ fn bounded_rejections_and_column_limits() {
         "ALTER TABLE t DROP COLUMN id",
         "ALTER TABLE heap DROP COLUMN only_column",
         "ALTER TABLE t ALTER COLUMN v TYPE bigint",
-        "ALTER TABLE t ADD PRIMARY KEY(v)",
-        "ALTER TABLE t ADD CHECK(v>0)",
         "ALTER TABLE t DROP CONSTRAINT t_pkey",
-        "ALTER TABLE t ADD FOREIGN KEY(v) REFERENCES t(id)",
         "ALTER TABLE t ADD COLUMN serial_col serial",
     ] {
         error(&mut s, sql, SqlError::Unsupported);
     }
+    error(
+        &mut s,
+        "ALTER TABLE t ADD PRIMARY KEY(v)",
+        SqlError::InvalidTableDefinition,
+    );
+    run(&mut s, "ALTER TABLE t ADD CHECK(v>0)");
+    run(&mut s, "ALTER TABLE t ADD FOREIGN KEY(v) REFERENCES t(id)");
     error(
         &mut s,
         "ALTER TABLE t ADD COLUMN giggles_rowid int",

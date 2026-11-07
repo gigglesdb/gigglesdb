@@ -329,6 +329,30 @@ fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, 
     }
 }
 
+fn normalized_signature_types(name: &str, args: &[BoundScalar]) -> Vec<DataType> {
+    let mut types: Vec<_> = args.iter().map(|a| a.ty.clone()).collect();
+    let seconds = match (name, args.len()) {
+        ("make_time", 3) => Some(2),
+        ("make_timestamp" | "make_timestamptz", 6 | 7) => Some(5),
+        ("make_interval", 0..=7) => Some(6),
+        _ => None,
+    };
+    if let Some(seconds) = seconds {
+        for (i, ty) in types.iter_mut().enumerate() {
+            if i == seconds && number(ty) {
+                *ty = DataType::DoublePrecision;
+            } else if integer(ty) {
+                *ty = DataType::Integer;
+            }
+        }
+        if name == "make_interval" {
+            types.resize(7, DataType::Integer);
+            types[6] = DataType::DoublePrecision;
+        }
+    }
+    types
+}
+
 fn immutable_cast(from: &DataType, to: &DataType) -> bool {
     from == to
         || number(from) && number(to)
@@ -394,26 +418,7 @@ impl BoundScalar {
                         None => dependent = true,
                     }
                 }
-                let mut types: Vec<_> = args.iter().map(|a| a.ty.clone()).collect();
-                let seconds = match (name.as_str(), args.len()) {
-                    ("make_time", 3) => Some(2),
-                    ("make_timestamp" | "make_timestamptz", 6 | 7) => Some(5),
-                    ("make_interval", 0..=7) => Some(6),
-                    _ => None,
-                };
-                if let Some(seconds) = seconds {
-                    for (i, ty) in types.iter_mut().enumerate() {
-                        if i == seconds && number(ty) {
-                            *ty = DataType::DoublePrecision;
-                        } else if integer(ty) {
-                            *ty = DataType::Integer;
-                        }
-                    }
-                    if name == "make_interval" {
-                        types.resize(7, DataType::Integer);
-                        types[6] = DataType::DoublePrecision;
-                    }
-                }
+                let types = normalized_signature_types(name, args);
                 let Some((true, _strict)) = arithmetic::internal_name(name)
                     .then_some((true, true))
                     .or_else(|| signature(name, &types, &self.ty))
@@ -434,6 +439,37 @@ impl BoundScalar {
 }
 
 impl BoundScalar {
+    /// CHECK admits only routines and casts marked immutable by this binder's metadata.
+    pub(in super::super) fn constraint_immutable(&self) -> bool {
+        match &self.node {
+            Node::Literal(_) | Node::Column(..) => true,
+            Node::Param(_) | Node::Clock(..) | Node::Sequence(..) => false,
+            // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
+            // date/timestamp and time/interval pairs are immutable.
+            Node::CrossCompare(_, a, b, _) => {
+                a.constraint_immutable()
+                    && b.constraint_immutable()
+                    && ![&a.ty, &b.ty]
+                        .iter()
+                        .any(|ty| matches!(ty, DataType::TimestampTz | DataType::TimeTz))
+            }
+            Node::Cast(value) => {
+                value.constraint_immutable() && immutable_cast(&value.ty, &self.ty)
+            }
+            Node::Call(name, args) if name == "coalesce" => {
+                args.iter().all(Self::constraint_immutable)
+            }
+            Node::Call(name, args) => {
+                args.iter().all(Self::constraint_immutable)
+                    && arithmetic::internal_name(name)
+                        .then_some((true, true))
+                        .or_else(|| {
+                            signature(name, &normalized_signature_types(name, args), &self.ty)
+                        })
+                        .is_some_and(|(immutable, _)| immutable)
+            }
+        }
+    }
     pub(in super::super) fn insert_input_only(&self) -> bool {
         match &self.node {
             Node::Literal(_) | Node::Param(_) => true,
@@ -455,26 +491,7 @@ impl BoundScalar {
                 if !args.iter().all(Self::insert_input_only) {
                     return false;
                 }
-                let mut types: Vec<_> = args.iter().map(|value| value.ty.clone()).collect();
-                let seconds = match (name.as_str(), args.len()) {
-                    ("make_time", 3) => Some(2),
-                    ("make_timestamp" | "make_timestamptz", 6 | 7) => Some(5),
-                    ("make_interval", 0..=7) => Some(6),
-                    _ => None,
-                };
-                if let Some(seconds) = seconds {
-                    for (i, ty) in types.iter_mut().enumerate() {
-                        if i == seconds && number(ty) {
-                            *ty = DataType::DoublePrecision;
-                        } else if integer(ty) {
-                            *ty = DataType::Integer;
-                        }
-                    }
-                    if name == "make_interval" {
-                        types.resize(7, DataType::Integer);
-                        types[6] = DataType::DoublePrecision;
-                    }
-                }
+                let types = normalized_signature_types(name, args);
                 arithmetic::internal_name(name)
                     .then_some((true, true))
                     .or_else(|| signature(name, &types, &self.ty))
@@ -487,6 +504,57 @@ impl BoundScalar {
 #[cfg(test)]
 mod clock_metadata_tests {
     use super::*;
+
+    #[test]
+    fn check_immutability_normalizes_constructor_numeric_arguments() {
+        for (name, count, result, expected) in [
+            ("make_time", 3, DataType::Time, true),
+            ("make_timestamp", 6, DataType::Timestamp, true),
+            ("make_interval", 0, DataType::Interval, true),
+            ("make_interval", 7, DataType::Interval, true),
+            ("make_timestamptz", 6, DataType::TimestampTz, false),
+        ] {
+            let value = BoundScalar {
+                ty: result,
+                node: Node::Call(
+                    name.into(),
+                    (0..count)
+                        .map(|_| BoundScalar {
+                            ty: DataType::BigInt,
+                            node: Node::Literal(Value::Null),
+                        })
+                        .collect(),
+                ),
+            };
+            assert_eq!(value.constraint_immutable(), expected, "{name}/{count}");
+            assert_eq!(value.insert_input_only(), expected, "{name}/{count}");
+        }
+    }
+
+    #[test]
+    fn check_immutability_uses_overload_and_cast_metadata() {
+        let scalar = |ty| BoundScalar {
+            ty,
+            node: Node::Literal(Value::Null),
+        };
+        let cast = |from, to| BoundScalar {
+            ty: to,
+            node: Node::Cast(Box::new(scalar(from))),
+        };
+        assert!(cast(DataType::Integer, DataType::BigInt).constraint_immutable());
+        assert!(!cast(DataType::TimestampTz, DataType::Timestamp).constraint_immutable());
+        assert!(!cast(DataType::Timestamp, DataType::TimestampTz).constraint_immutable());
+        for (argument, expected) in [(DataType::Timestamp, true), (DataType::TimestampTz, false)] {
+            let extract = BoundScalar {
+                ty: DataType::Numeric,
+                node: Node::Call(
+                    "extract".into(),
+                    vec![scalar(DataType::Text), scalar(argument)],
+                ),
+            };
+            assert_eq!(extract.constraint_immutable(), expected);
+        }
+    }
 
     #[test]
     fn clock_overloads_are_stable_or_volatile_and_never_immutable() {
@@ -515,6 +583,7 @@ mod clock_metadata_tests {
                 ty,
                 node: Node::Clock(name.into(), -1, None),
             };
+            assert!(!value.constraint_immutable());
             assert_eq!(value.plan_constant(&mut 0).unwrap(), None);
         }
         assert_eq!(

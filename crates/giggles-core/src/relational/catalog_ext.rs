@@ -7,17 +7,12 @@ pub(crate) const MAX_EXT_COLUMNS: usize = MAX_TABLES * MAX_COLUMNS;
 pub(crate) const MAX_EXT_CONSTRAINTS: usize = MAX_EXT_COLUMNS;
 pub(crate) const MAX_EXT_SEQUENCES: usize = MAX_EXT_COLUMNS;
 const MAX_EXPR: usize = 65536;
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogExt {
-    #[serde(deserialize_with = "version")]
     pub(crate) ext_version: u32,
-    #[serde(deserialize_with = "column_map")]
     pub(crate) columns: BTreeMap<u64, ColumnExt>,
-    #[serde(deserialize_with = "constraint_map")]
     pub(crate) constraints: BTreeMap<u64, Vec<Constraint>>,
-    #[serde(deserialize_with = "sequence_map")]
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
-    #[serde(deserialize_with = "type_map")]
     pub(crate) types: BTreeMap<u64, TypeDef>,
 }
 impl Default for CatalogExt {
@@ -74,8 +69,208 @@ pub(crate) enum ConstraintKind {
         on_delete: Action,
         on_update: Action,
         not_valid: bool,
+        deferral: Deferral,
     },
     PrimaryKey,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) enum Deferral {
+    #[default]
+    NotDeferrable,
+    DeferrableImmediate,
+    DeferrableDeferred,
+}
+
+// The version-one DTO is frozen: adding a field to its ForeignKey variant
+// changes the bincode tuple layout, even with a serde default.
+#[derive(Serialize, Deserialize)]
+struct ConstraintV1 {
+    id: u64,
+    #[serde(deserialize_with = "name")]
+    name: String,
+    kind: ConstraintKindV1,
+}
+#[derive(Serialize, Deserialize)]
+enum ConstraintKindV1 {
+    Check {
+        #[serde(deserialize_with = "expression")]
+        expr: String,
+        not_valid: bool,
+    },
+    ForeignKey {
+        #[serde(deserialize_with = "ids")]
+        columns: Vec<u64>,
+        ref_table: u64,
+        #[serde(deserialize_with = "ids")]
+        ref_columns: Vec<u64>,
+        on_delete: Action,
+        on_update: Action,
+        not_valid: bool,
+    },
+    PrimaryKey,
+}
+impl From<ConstraintV1> for Constraint {
+    fn from(c: ConstraintV1) -> Self {
+        let kind = match c.kind {
+            ConstraintKindV1::Check { expr, not_valid } => {
+                ConstraintKind::Check { expr, not_valid }
+            }
+            ConstraintKindV1::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                on_delete,
+                on_update,
+                not_valid,
+            } => ConstraintKind::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                on_delete,
+                on_update,
+                not_valid,
+                deferral: Deferral::NotDeferrable,
+            },
+            ConstraintKindV1::PrimaryKey => ConstraintKind::PrimaryKey,
+        };
+        Self {
+            id: c.id,
+            name: c.name,
+            kind,
+        }
+    }
+}
+impl From<&Constraint> for ConstraintV1 {
+    fn from(c: &Constraint) -> Self {
+        let kind = match &c.kind {
+            ConstraintKind::Check { expr, not_valid } => ConstraintKindV1::Check {
+                expr: expr.clone(),
+                not_valid: *not_valid,
+            },
+            ConstraintKind::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                on_delete,
+                on_update,
+                not_valid,
+                ..
+            } => ConstraintKindV1::ForeignKey {
+                columns: columns.clone(),
+                ref_table: *ref_table,
+                ref_columns: ref_columns.clone(),
+                on_delete: on_delete.clone(),
+                on_update: on_update.clone(),
+                not_valid: *not_valid,
+            },
+            ConstraintKind::PrimaryKey => ConstraintKindV1::PrimaryKey,
+        };
+        Self {
+            id: c.id,
+            name: c.name.clone(),
+            kind,
+        }
+    }
+}
+impl CatalogExt {
+    fn has_deferrable(&self) -> bool {
+        self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { deferral, .. } if deferral != Deferral::NotDeferrable))
+    }
+}
+impl Serialize for CatalogExt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut out = serializer.serialize_tuple(5)?;
+        let version = if self.has_deferrable() { 2u32 } else { 1u32 };
+        out.serialize_element(&version)?;
+        out.serialize_element(&self.columns)?;
+        if version == 1 {
+            let legacy: BTreeMap<_, Vec<_>> = self
+                .constraints
+                .iter()
+                .map(|(id, cs)| (*id, cs.iter().map(ConstraintV1::from).collect()))
+                .collect();
+            out.serialize_element(&legacy)?;
+        } else {
+            out.serialize_element(&self.constraints)?;
+        }
+        out.serialize_element(&self.sequences)?;
+        out.serialize_element(&self.types)?;
+        out.end()
+    }
+}
+impl<'de> Deserialize<'de> for CatalogExt {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Columns(#[serde(deserialize_with = "column_map")] BTreeMap<u64, ColumnExt>);
+        #[derive(Deserialize)]
+        struct Sequences(#[serde(deserialize_with = "sequence_map")] BTreeMap<u64, SequenceDef>);
+        #[derive(Deserialize)]
+        struct Types(#[serde(deserialize_with = "type_map")] BTreeMap<u64, TypeDef>);
+        #[derive(Deserialize)]
+        struct LegacyConstraints(
+            #[serde(deserialize_with = "legacy_constraints")] Vec<ConstraintV1>,
+        );
+        fn legacy_constraints<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<Vec<ConstraintV1>, D::Error> {
+            bounded_vec::<D, ConstraintV1, MAX_EXT_CONSTRAINTS>(d)
+        }
+        #[derive(Deserialize)]
+        struct LegacyMap(
+            #[serde(deserialize_with = "legacy_map")] BTreeMap<u64, LegacyConstraints>,
+        );
+        fn legacy_map<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<u64, LegacyConstraints>, D::Error> {
+            bounded_map::<D, LegacyConstraints, MAX_TABLES>(d)
+        }
+        #[derive(Deserialize)]
+        struct CurrentMap(
+            #[serde(deserialize_with = "constraint_map")] BTreeMap<u64, Vec<Constraint>>,
+        );
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = CatalogExt;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("versioned catalog extension")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<CatalogExt, A::Error> {
+                macro_rules! next {
+                    ($t:ty) => {
+                        a.next_element::<$t>()?
+                            .ok_or_else(|| de::Error::custom("truncated catalog extension"))?
+                    };
+                }
+                let ext_version = next!(u32);
+                if !matches!(ext_version, 1 | 2) {
+                    return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
+                }
+                let columns = next!(Columns).0;
+                let constraints = if ext_version == 1 {
+                    next!(LegacyMap)
+                        .0
+                        .into_iter()
+                        .map(|(id, cs)| (id, cs.0.into_iter().map(Constraint::from).collect()))
+                        .collect()
+                } else {
+                    next!(CurrentMap).0
+                };
+                let out = CatalogExt {
+                    ext_version,
+                    columns,
+                    constraints,
+                    sequences: next!(Sequences).0,
+                    types: next!(Types).0,
+                };
+                if ext_version == 2 && !out.has_deferrable() {
+                    return Err(de::Error::custom("noncanonical catalog extension version"));
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(5, V)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)] // PostgreSQL's referential action names
@@ -103,13 +298,6 @@ pub(crate) struct SequenceDef {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum TypeDef {}
-fn version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
-    let v = u32::deserialize(d)?;
-    if v != 1 {
-        return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
-    }
-    Ok(v)
-}
 fn bounded_vec<'de, D, T, const N: usize>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -327,6 +515,12 @@ impl Relational {
     pub(crate) fn constraint_name_taken(&self, table: u64, name: &str) -> bool {
         self.table_constraints(table).iter().any(|c| c.name == name)
             || self
+                .tables
+                .values()
+                .find(|t| t.id == table)
+                .and_then(|t| constraint_primary_key::primary_key_name(self, t))
+                .is_some_and(|n| n == name)
+            || self
                 .secondary
                 .descriptors()
                 .iter()
@@ -363,6 +557,9 @@ impl Relational {
                 .values()
                 .flatten()
                 .any(|c| c.name == name)
+                || self.tables.values().any(|t| {
+                    constraint_primary_key::primary_key_name(self, t).is_some_and(|n| n == name)
+                })
                 || self
                     .secondary
                     .descriptors()
@@ -381,6 +578,7 @@ impl Relational {
     pub(super) fn normalize_ext(ext: &mut CatalogExt) {
         ext.columns.retain(|_, v| v != &ColumnExt::default());
         ext.constraints.retain(|_, v| !v.is_empty());
+        ext.ext_version = if ext.has_deferrable() { 2 } else { 1 };
     }
     pub(crate) fn validate_ext(&self) -> R<()> {
         self.validate_ext_candidate(&self.ext, self.next_id, None)
@@ -391,8 +589,11 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if ext.ext_version != 1 || !ext.types.is_empty() {
+        if !matches!(ext.ext_version, 1 | 2) || !ext.types.is_empty() {
             return Err(SqlError::Unsupported);
+        }
+        if (ext.ext_version == 2) != ext.has_deferrable() {
+            return Err(SqlError::Type);
         }
         if self.format != 1 {
             return Err(SqlError::Type);
@@ -536,7 +737,10 @@ impl Relational {
             Err(SqlError::Type)
         }
     }
-    fn mutate_ext(&mut self, f: impl FnOnce(&mut CatalogExt, &mut u64) -> R<()>) -> R<()> {
+    pub(super) fn mutate_ext(
+        &mut self,
+        f: impl FnOnce(&mut CatalogExt, &mut u64) -> R<()>,
+    ) -> R<()> {
         let mut ext = self.ext.clone();
         let mut next_id = self.next_id;
         f(&mut ext, &mut next_id)?;
@@ -576,7 +780,23 @@ impl Relational {
         })
     }
     pub(crate) fn add_constraint(&mut self, table: u64, c: Constraint) -> R<()> {
-        if self.constraint_name_taken(table, &c.name) {
+        // The metadata API may materialize the already implicit primary-key
+        // name (for example while importing a frozen extension DTO). It does
+        // not introduce a second logical constraint. SQL CREATE/ADD keeps the
+        // default implicit through constraint_primary_key::record_name.
+        let materializes_primary = matches!(c.kind, ConstraintKind::PrimaryKey)
+            && self.tables.values().any(|t| {
+                t.id == table && t.hidden_rowid().is_none() && c.name == format!("{}_pkey", t.name)
+            })
+            && !self.table_constraints(table).iter().any(|existing| {
+                existing.name == c.name || matches!(existing.kind, ConstraintKind::PrimaryKey)
+            })
+            && !self
+                .secondary
+                .descriptors()
+                .iter()
+                .any(|index| index.name == c.name);
+        if self.constraint_name_taken(table, &c.name) && !materializes_primary {
             return Err(SqlError::DuplicateObject);
         }
         self.mutate_ext(|ext, next_id| {

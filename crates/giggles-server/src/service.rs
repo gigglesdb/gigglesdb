@@ -169,6 +169,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::DivisionByZero) => "22012",
         CoreError::Sql(S::InvalidEscapeSequence) => "22025",
         CoreError::Sql(S::InvalidTableDefinition) => "42P16",
+        CoreError::Sql(S::RestrictViolation) => "23001",
+        CoreError::Sql(S::WrongObjectType) => "42809",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
@@ -633,6 +635,22 @@ impl Session {
             if let Some(table) = alter_target {
                 session.authorize_alter_table(&table)?;
             }
+            let drop_target = Prepared::drop_table_target(sql).map_err(|error| {
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })?;
+            if let Some(table) = drop_target {
+                session.authorize_alter_table(&table)?;
+            }
+            // REFERENCES requires ownership before binding can reveal whether
+            // the referenced relation, columns, or candidate key exist.
+            let references = Prepared::constraint_references(sql).map_err(|error| {
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })?;
+            for table in references {
+                session.authorize_alter_table(&table)?;
+            }
             session.authorize_sequence_sql(sql)?;
             let p = if matches!(&session.role, Role::Database { .. }) {
                 declared(
@@ -772,6 +790,9 @@ impl Session {
         Ok(())
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        for table in p.constraint_reference_tables() {
+            self.authorize_alter_table(&table)?;
+        }
         self.authorize_sequences(&p.sequences())?;
         if p.sequence_only() {
             return Ok(());
@@ -789,7 +810,7 @@ impl Session {
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 true
-            } else if p.is_alter_table() {
+            } else if p.is_alter_table() || p.is_drop_table() {
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
                 let name_at_commit = self.sql.table_authority_name(table)?;
                 self.service
@@ -891,6 +912,7 @@ impl Session {
             let result = result?;
             if p.is_ddl()
                 && !p.is_alter_table()
+                && !p.is_drop_table()
                 && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
             {
                 session

@@ -22,6 +22,10 @@ mod pg18_routines;
 mod planning;
 mod position;
 mod quoting;
+
+pub(super) fn keyword_requires_quotes(name: &str) -> bool {
+    quoting::keyword_requires_quotes(name)
+}
 mod substring_order;
 mod temporal;
 mod text;

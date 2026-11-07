@@ -140,6 +140,34 @@ fn legacy_writers_preserve_record_maps() {
     }
 }
 #[test]
+fn add_primary_key_clears_heap_bit_only_after_last_heap() {
+    use crate::relational::Prepared;
+    let mut state = empty(17);
+    for (sql, heap_expected) in [
+        ("CREATE TABLE a(id INT)", true),
+        ("CREATE TABLE b(id INT)", true),
+        ("ALTER TABLE a ADD CONSTRAINT positive CHECK(id>0)", true),
+        ("ALTER TABLE a ADD PRIMARY KEY(id)", true),
+        ("ALTER TABLE b ADD PRIMARY KEY(id)", false),
+    ] {
+        let prepared = Prepared::parse(sql, 17, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+        let actual = records(&state).unwrap();
+        let metadata: Metadata = decode(&actual[&vec![0]]).unwrap();
+        let bits = if metadata.format == 53 {
+            u64::from_be_bytes(actual[&vec![10]].as_slice().try_into().unwrap())
+        } else {
+            format_policy::legacy_version_to_bits(metadata.format).unwrap()
+        };
+        assert_eq!(bits & 32 != 0, heap_expected, "{sql}");
+        assert_eq!(state.sql.contains_heap(), heap_expected, "{sql}");
+        let reopened = from_records(actual.clone()).unwrap();
+        assert_eq!(reopened.sql.contains_heap(), heap_expected, "{sql}");
+        assert_eq!(records(&reopened).unwrap(), actual);
+    }
+}
+
+#[test]
 fn export_refuses_role_bootstrap_bits_without_panicking() {
     assert!(matches!(
         export_allowed(ROLE_BOOTSTRAP | 64),
@@ -219,6 +247,7 @@ fn catalog_ext_records_roundtrip_gate_bits_and_restore_legacy() {
                 on_delete: Action::Restrict,
                 on_update: Action::SetDefault,
                 not_valid: true,
+                deferral: crate::relational::catalog_ext::Deferral::NotDeferrable,
             },
         ),
         (3, "t_pkey", ConstraintKind::PrimaryKey),
@@ -324,6 +353,18 @@ fn catalog_ext_wire_errors_distinguish_corrupt_and_unsupported() {
     ext.ext_version = 2;
     assert!(matches!(
         from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
+        Err(CoreError::Corrupt(_))
+    ));
+    ext.ext_version = 3;
+    // Exercise the relational decoder itself, before format-53 content policy:
+    // unknown extensions retain Unsupported on the older namespace-5 path.
+    let unknown_records = catalog_ext_raw_records(encode(&ext).unwrap());
+    assert!(matches!(
+        decode_relational(&unknown_records[&vec![5]]),
+        Err(CoreError::Unsupported)
+    ));
+    assert!(matches!(
+        from_records(unknown_records),
         Err(CoreError::Unsupported)
     ));
     let mut ext = empty_ext();

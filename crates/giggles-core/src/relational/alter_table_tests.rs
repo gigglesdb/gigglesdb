@@ -65,6 +65,7 @@ fn drop_rejects_foreign_key_source_and_non_primary_target_columns_atomically() {
                     on_delete: catalog_ext::Action::NoAction,
                     on_update: catalog_ext::Action::NoAction,
                     not_valid: false,
+                    deferral: Deferral::NotDeferrable,
                 },
             },
         )
@@ -176,7 +177,7 @@ fn hidden_rowid_rejection_follows_complete_parse_and_table_lookup() {
 }
 
 #[test]
-fn unsupported_add_constraints_keep_bounded_rejection() {
+fn supported_add_constraints_are_admitted_before_resolution() {
     for target in ["t", "missing", "deliveries"] {
         for action in [
             "ADD CHECK(v>0)",
@@ -184,11 +185,7 @@ fn unsupported_add_constraints_keep_bounded_rejection() {
             "ADD FOREIGN KEY(v) REFERENCES parent(v)",
         ] {
             let sql = format!("ALTER TABLE {target} {action}");
-            assert_eq!(
-                Prepared::alter_table_target(&sql),
-                Err(SqlError::Unsupported),
-                "{sql}"
-            );
+            assert!(Prepared::alter_table_target(&sql).is_ok(), "{sql}");
         }
     }
 }

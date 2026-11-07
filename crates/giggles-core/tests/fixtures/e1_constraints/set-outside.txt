@@ -1,0 +1,10 @@
+\set VERBOSITY verbose
+SET CONSTRAINTS ALL DEFERRED;
+SET CONSTRAINTS
+SET CONSTRAINTS absent IMMEDIATE;
+WARNING:  25P01: SET CONSTRAINTS can only be used in transaction blocks
+LOCATION:  CheckTransactionBlock, xact.c:3745
+WARNING:  25P01: SET CONSTRAINTS can only be used in transaction blocks
+LOCATION:  CheckTransactionBlock, xact.c:3745
+ERROR:  42704: constraint "absent" does not exist
+LOCATION:  AfterTriggerSetState, trigger.c:5915

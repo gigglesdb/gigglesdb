@@ -3127,3 +3127,9 @@ mod deferred_routine_only_tests {
         }
     }
 }
+
+mod constraints;
+pub(super) use constraints::{
+    constraint_check, constraint_deparse, constraint_key, constraint_key_supported,
+    constraint_types_compatible, constraint_validate,
+};

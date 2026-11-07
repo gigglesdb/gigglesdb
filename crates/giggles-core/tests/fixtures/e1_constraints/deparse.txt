@@ -1,0 +1,60 @@
+\set VERBOSITY verbose
+SET search_path=public;
+SET
+CREATE TABLE deparse(id int PRIMARY KEY,n int,s text,t timestamp);
+CREATE TABLE
+ALTER TABLE deparse ADD CHECK(n IS NULL OR abs(n)>0);
+ALTER TABLE
+ALTER TABLE deparse ADD CHECK(lower(s) <> 'x');
+ALTER TABLE
+ALTER TABLE deparse ADD CHECK(n BETWEEN 1 AND 4);
+ALTER TABLE
+ALTER TABLE deparse ADD CHECK(NOT (n=2));
+ALTER TABLE
+ALTER TABLE deparse ADD CHECK(n::bigint > 0);
+ALTER TABLE
+ALTER TABLE deparse ADD CHECK(length(s)>0);
+ALTER TABLE
+SELECT conname,pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='deparse'::regclass ORDER BY conname;
+       conname       |         pg_get_constraintdef          
+---------------------+---------------------------------------
+ deparse_id_not_null | NOT NULL id
+ deparse_n_check     | CHECK (((n IS NULL) OR (abs(n) > 0)))
+ deparse_n_check1    | CHECK (((n >= 1) AND (n <= 4)))
+ deparse_n_check2    | CHECK ((NOT (n = 2)))
+ deparse_n_check3    | CHECK (((n)::bigint > 0))
+ deparse_pkey        | PRIMARY KEY (id)
+ deparse_s_check     | CHECK ((lower(s) <> 'x'::text))
+ deparse_s_check1    | CHECK ((length(s) > 0))
+(8 rows)
+
+SELECT oid::regprocedure,provolatile FROM pg_proc WHERE oid IN ('abs(integer)'::regprocedure,'lower(text)'::regprocedure,'now()'::regprocedure,'clock_timestamp()'::regprocedure,'nextval(regclass)'::regprocedure,'timestamptz(timestamp without time zone)'::regprocedure) ORDER BY oid::regprocedure::text;
+                   oid                    | provolatile 
+------------------------------------------+-------------
+ abs(integer)                             | i
+ clock_timestamp()                        | v
+ lower(text)                              | i
+ nextval(regclass)                        | v
+ now()                                    | s
+ timestamptz(timestamp without time zone) | s
+(6 rows)
+
+ALTER TABLE deparse ADD CONSTRAINT bad CHECK((SELECT true));
+ERROR:  0A000: cannot use subquery in check constraint
+LOCATION:  transformSubLink, parse_expr.c:1883
+ALTER TABLE deparse ADD CONSTRAINT bad CHECK(sum(n)>0);
+CREATE TABLE composite(a int,b int,PRIMARY KEY(a,b));
+ERROR:  42803: aggregate functions are not allowed in check constraints
+LOCATION:  check_agglevels_and_constraints, parse_agg.c:597
+CREATE TABLE
+CREATE TABLE composite_child(a int,b int,FOREIGN KEY(a,b) REFERENCES composite(a,b) MATCH SIMPLE ON DELETE CASCADE);
+CREATE TABLE
+INSERT INTO composite_child VALUES(NULL,99),(99,NULL),(NULL,NULL);
+INSERT 0 3
+INSERT INTO composite_child VALUES(99,99);
+ERROR:  23503: insert or update on table "composite_child" violates foreign key constraint "composite_child_a_b_fkey"
+DETAIL:  Key (a, b)=(99, 99) is not present in table "composite".
+SCHEMA NAME:  public
+TABLE NAME:  composite_child
+CONSTRAINT NAME:  composite_child_a_b_fkey
+LOCATION:  ri_ReportViolation, ri_triggers.c:2772
