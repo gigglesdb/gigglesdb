@@ -1,0 +1,29 @@
+{
+  "date": "2026-11-06",
+  "design": "GD-0049 S5 / D13",
+  "object_store_version": "0.14.2",
+  "s4_images_lock_edited": false,
+  "recommended_s3": {
+    "ref": "quay.io/thanos/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+    "reason": "800 create/update race trials and 1203 immediate GET/LIST checks passed, with all losing writes returning expected precondition errors. Historical mirror, not an upstream-maintained community distribution. Retain current pin for local correctness testing."
+  },
+  "seaweed": {
+    "ref": "chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860",
+    "version": "4.50",
+    "result": "800 trials: exactly one observed success each, 1203 visibility checks passed. 2225 Generic timeouts among N16 losers at a 2-second timeout, zero retries, four independent trials concurrently. Keep as optional compatibility fixture, not the default S4 replacement."
+  },
+  "aistor": {
+    "ref": "quay.io/minio/aistor/minio@sha256:107cf2014a9583c74c11e3cdbd6903d89c2244355886b89ce532f4ecae9c23f3",
+    "result": "Official current distribution is available and digest-pinnable; bucket creation returns AccessDenied 403 without license. Not usable as an unattended fixture with the available inputs."
+  },
+  "gcs": {
+    "ref": "fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef",
+    "version": "1.56.1",
+    "result": "Unqualified for D13 with object_store 0.14.2: plain XML conditional PUT returns Generic/HTTP400 invalid uploadType. 7200 race attempts, zero successes. Keep pin only for other emulator functionality; mark manifest-chain conditional writes unqualified locally pending a compatible emulator or opt-in real GCS test."
+  },
+  "local": {
+    "result": "Atomic create passes with two cleanup statements omitted to preserve all staging files. 400 trials and 402 GET/LIST pairs, zero violations. Conditional update returns NotImplemented; D13 should rely on create-only chain entries."
+  },
+  "archdocs_writes": false,
+  "required_archdocs_space_if_ever_written": "5714972c-8f62-4f17-8ebc-b62fbf4420b9"
+}

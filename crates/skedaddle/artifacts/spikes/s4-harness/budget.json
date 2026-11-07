@@ -1,0 +1,10 @@
+{
+  "base_budget_bytes": 4294967296,
+  "sampled_peak_run_volume_growth_bytes": 1252000000,
+  "evidence_cap_bytes": 52428800,
+  "margin_bytes": 2147483648,
+  "cold_images_inspect_bytes": 462473067,
+  "cold_images_system_df_growth_bytes_rounded": 1188000000,
+  "missing_image_size_multiplier": 3,
+  "derivation": "Peak Docker volumes 9.647GB - baseline 8.395GB = 1.252GB; add 50MiB evidence and 2GiB margin, round upward to 4GiB. Add 3x inspect Size for missing images (observed full-manifest system-df image growth 1.188GB vs inspect total 0.462473067GB). Both C: and Docker VM must meet the same budget."
+}

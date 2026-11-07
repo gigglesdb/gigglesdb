@@ -1,0 +1,18 @@
+[package]
+name = "s2-fencing"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+postgres-protocol = "=0.6.12"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde_json = "1"
+md-5 = "0.11"

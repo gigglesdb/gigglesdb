@@ -1,0 +1,44 @@
+{
+  "minio/minio:latest": {
+    "tag": "minio/minio:latest",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Error response from daemon: pull access denied for minio/minio, repository does not exist or may require 'docker login'\n"
+  },
+  "quay.io/minio/minio:latest": {
+    "tag": "quay.io/minio/minio:latest",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Error response from daemon: failed to resolve reference \"quay.io/minio/minio:latest\": unexpected status from HEAD request to https://quay.io/v2/minio/minio/manifests/latest: 401 UNAUTHORIZED\n"
+  },
+  "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z": {
+    "tag": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+    "exit": 1,
+    "stdout": "",
+    "stderr": "Error response from daemon: failed to resolve reference \"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z\": unexpected status from HEAD request to https://quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z: 401 UNAUTHORIZED\n"
+  },
+  "quay.io/minio/aistor/minio:latest": {
+    "tag": "quay.io/minio/aistor/minio:latest",
+    "exit": 0,
+    "stdout": "latest: Pulling from minio/aistor/minio\n861751831664: Pulling fs layer\n5d4f4e6f62a1: Pulling fs layer\nda14c4968b86: Pulling fs layer\n8de3ed5a472f: Pulling fs layer\n227bdb4b4505: Pulling fs layer\n4964e5de0fad: Pulling fs layer\n7083a0963e3f: Pulling fs layer\n10a98c23356c: Pulling fs layer\n62864d1db349: Pulling fs layer\n861751831664: Download complete\n227bdb4b4505: Download complete\n7083a0963e3f: Download complete\n62864d1db349: Download complete\nda14c4968b86: Download complete\n4964e5de0fad: Download complete\n10a98c23356c: Download complete\n5d4f4e6f62a1: Download complete\n8de3ed5a472f: Download complete\nDigest: sha256:107cf2014a9583c74c11e3cdbd6903d89c2244355886b89ce532f4ecae9c23f3\nStatus: Downloaded newer image for quay.io/minio/aistor/minio:latest\nquay.io/minio/aistor/minio:latest\n",
+    "stderr": "",
+    "ref": "quay.io/minio/aistor/minio@sha256:107cf2014a9583c74c11e3cdbd6903d89c2244355886b89ce532f4ecae9c23f3",
+    "size_bytes": 130659442,
+    "id": "sha256:107cf2014a9583c74c11e3cdbd6903d89c2244355886b89ce532f4ecae9c23f3",
+    "volumes": {
+      "/data": {}
+    }
+  },
+  "chrislusf/seaweedfs:latest": {
+    "tag": "chrislusf/seaweedfs:latest",
+    "exit": 0,
+    "stdout": "latest: Pulling from chrislusf/seaweedfs\nce2e96d9d9d5: Pulling fs layer\nebf76511efed: Pulling fs layer\n494b45a659f6: Pulling fs layer\n4df09bf324eb: Pulling fs layer\nf23495bba788: Pulling fs layer\na2489761d7f7: Pulling fs layer\na51b4a944271: Pulling fs layer\n2836f7bdab4a: Pulling fs layer\n4f4fb700ef54: Pulling fs layer\n7b229517ed22: Pulling fs layer\n4f4fb700ef54: Already exists\nce2e96d9d9d5: Download complete\nebf76511efed: Download complete\nf23495bba788: Download complete\na2489761d7f7: Download complete\n7b229517ed22: Download complete\na51b4a944271: Download complete\n494b45a659f6: Download complete\n4df09bf324eb: Download complete\n2836f7bdab4a: Download complete\nDigest: sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860\nStatus: Downloaded newer image for chrislusf/seaweedfs:latest\ndocker.io/chrislusf/seaweedfs:latest\n",
+    "stderr": "",
+    "ref": "chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860",
+    "size_bytes": 197111284,
+    "id": "sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860",
+    "volumes": {
+      "/data": {}
+    }
+  }
+}diff --git a/crates/skedaddle/licenses/Miniflux-2.0.3-LICENSE b/crates/skedaddle/licenses/Miniflux-2.0.3-LICENSE

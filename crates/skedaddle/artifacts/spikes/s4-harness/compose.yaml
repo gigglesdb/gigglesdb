@@ -1,0 +1,95 @@
+name: skedaddle-${RUN_ID:?run through run.ps1 or run.sh}
+x-common: &common
+  labels:
+    skedaddle.test: ${RUN_ID}
+  restart: "no"
+  logging:
+    driver: json-file
+    options: {max-size: 2m, max-file: "2"}
+  networks: [test]
+services:
+  pg:
+    <<: *common
+    image: ${PG_IMAGE}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: skedaddle
+      POSTGRES_DB: skedaddle
+    command: [postgres, -c, wal_level=logical, -c, max_slot_wal_keep_size=256MB, -c, max_wal_size=256MB, -c, min_wal_size=64MB, -c, logical_decoding_work_mem=64kB, -c, max_replication_slots=8, -c, max_wal_senders=8, -c, logging_collector=off, -c, log_destination=stderr, -c, checkpoint_timeout=30s]
+    volumes: ["pgdata:${PG_VOLUME_TARGET}"]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d skedaddle]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    mem_limit: 768m
+  pgbouncer:
+    <<: *common
+    image: ${PGBOUNCER_IMAGE}
+    environment:
+      DB_HOST: pg
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: skedaddle
+      DB_NAME: skedaddle
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "30"
+      DEFAULT_POOL_SIZE: "5"
+    depends_on:
+      pg: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -h 127.0.0.1 -p 5432 -U postgres -d skedaddle]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  toxiproxy:
+    <<: *common
+    image: ${TOXIPROXY_IMAGE}
+    healthcheck:
+      test: [CMD, /toxiproxy-cli, -host, 'http://127.0.0.1:8474', list]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  minio:
+    <<: *common
+    image: ${MINIO_IMAGE}
+    command: [server, /data, --console-address, ':9001']
+    environment:
+      MINIO_ROOT_USER: skedaddle
+      MINIO_ROOT_PASSWORD: skedaddle-secret
+    volumes: [miniodata:/data]
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:9000/minio/health/live]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  gcs:
+    <<: *common
+    image: ${GCS_IMAGE}
+    command: [-scheme, http, -port, '4443', -backend, filesystem, -filesystem-root, /storage]
+    volumes: [gcsdata:/storage]
+    healthcheck:
+      test: [CMD-SHELL, wget -q -O - http://127.0.0.1:4443/storage/v1/b]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  probe:
+    <<: *common
+    image: ${PROBE_IMAGE}
+    command: [sleep, '2147483647']
+    healthcheck:
+      test: [CMD, 'true']
+      interval: 5s
+      timeout: 2s
+      retries: 3
+volumes:
+  pgdata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+  miniodata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+  gcsdata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+networks:
+  test:
+    labels: {skedaddle.test: '${RUN_ID}'}

@@ -1,0 +1,60 @@
+{
+  "as_of": "2026-11-06",
+  "ga_postgres": 18,
+  "ga_source": "https://www.postgresql.org/support/versioning/",
+  "pg19_source": "https://www.postgresql.org/about/news/postgresql-19-rc-1-released-3409/",
+  "pg19_status": "RC1; GA planned 2026-11-19, NOT GA as of 2026-11-06",
+  "images": {
+    "pg16": {
+      "tag": "postgres:16-alpine",
+      "ref": "postgres@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139",
+      "size_bytes": 116087053,
+      "id": "sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139"
+    },
+    "pg17": {
+      "tag": "postgres:17-alpine",
+      "ref": "postgres@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac",
+      "size_bytes": 117214862,
+      "id": "sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac"
+    },
+    "pg18": {
+      "tag": "postgres:18-alpine",
+      "ref": "postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395",
+      "size_bytes": 120090937,
+      "id": "sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395"
+    },
+    "probe": {
+      "tag": "busybox:1.37.0",
+      "ref": "busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec",
+      "size_bytes": 2222118,
+      "id": "sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
+    },
+    "minio": {
+      "tag": "quay.io/thanos/minio:RELEASE.2025-09-07T16-13-09Z",
+      "ref": "quay.io/thanos/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "size_bytes": 62245347,
+      "id": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    },
+    "gcs": {
+      "tag": "fsouza/fake-gcs-server:latest",
+      "ref": "fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef",
+      "size_bytes": 25435029,
+      "id": "sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
+    },
+    "toxiproxy": {
+      "tag": "ghcr.io/shopify/toxiproxy:latest",
+      "ref": "ghcr.io/shopify/toxiproxy@sha256:5d3dae09bc185dcc5ff6cf43abf6062a4a720aff0c4306a471e773acdcd107aa",
+      "size_bytes": 9322149,
+      "id": "sha256:5d3dae09bc185dcc5ff6cf43abf6062a4a720aff0c4306a471e773acdcd107aa"
+    },
+    "pgbouncer": {
+      "tag": "edoburu/pgbouncer:latest",
+      "ref": "edoburu/pgbouncer@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d",
+      "size_bytes": 9855572,
+      "id": "sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d"
+    }
+  },
+  "docker_hub_source": "https://hub.docker.com/_/postgres",
+  "pgbouncer_source": "https://github.com/edoburu/docker-pgbouncer/releases",
+  "pgbouncer_reason": "Maintained Alpine image; upstream release activity and minimal footprint"
+}

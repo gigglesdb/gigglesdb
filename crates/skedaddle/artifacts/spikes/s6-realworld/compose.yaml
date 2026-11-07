@@ -1,0 +1,81 @@
+name: skedaddle-${RUN_ID}
+x-app: &app
+  labels: {skedaddle.test: '${RUN_ID}'}
+  restart: 'no'
+  logging:
+    driver: json-file
+    options: {max-size: 2m, max-file: '2'}
+  networks: [test]
+services:
+  pg:
+    extends: {file: ../s4-harness/compose.yaml, service: pg}
+  fixture:
+    <<: *app
+    image: ${PROBE_IMAGE}
+    command: [sh, -ec, 'mkdir -p /fixture; exec httpd -f -p 8081 -h /fixture']
+  miniflux-old:
+    <<: *app
+    image: ${MINIFLUX_OLD_IMAGE}
+    environment: &miniflux-env
+      DATABASE_URL: postgres://postgres:skedaddle@pg:5432/skedaddle?sslmode=disable
+      RUN_MIGRATIONS: '1'
+      CREATE_ADMIN: '1'
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: s6-local-admin-password
+      POLLING_FREQUENCY: '1'
+      CLEANUP_FREQUENCY: '1'
+      POLLING_PARSING_ERROR_LIMIT: '10'
+      FETCHER_ALLOW_PRIVATE_NETWORKS: '1'
+      LOG_LEVEL: debug
+    ports: ['127.0.0.1::8080']
+    depends_on: {pg: {condition: service_healthy}, fixture: {condition: service_started}}
+    mem_limit: 256m
+  miniflux-new:
+    <<: *app
+    image: ${MINIFLUX_NEW_IMAGE}
+    profiles: [upgrade]
+    environment:
+      <<: *miniflux-env
+      CREATE_ADMIN: '0'
+    ports: ['127.0.0.1::8080']
+    depends_on: {pg: {condition: service_healthy}, fixture: {condition: service_started}}
+    mem_limit: 256m
+  gitea:
+    <<: *app
+    image: ${GITEA_IMAGE}
+    profiles: [candidates]
+    environment:
+      GITEA__database__DB_TYPE: postgres
+      GITEA__database__HOST: pg:5432
+      GITEA__database__NAME: gitea
+      GITEA__database__USER: postgres
+      GITEA__database__PASSWD: skedaddle
+      GITEA__database__SSL_MODE: disable
+      GITEA__security__INSTALL_LOCK: 'true'
+      GITEA__server__DISABLE_SSH: 'true'
+      GITEA__service__DISABLE_REGISTRATION: 'true'
+      GITEA__log__MODE: console
+    volumes: [giteadata:/data]
+    ports: ['127.0.0.1::3000']
+    depends_on: {pg: {condition: service_healthy}}
+    mem_limit: 512m
+  keycloak:
+    <<: *app
+    image: ${KEYCLOAK_IMAGE}
+    profiles: [candidates]
+    command: [start-dev, --db=postgres, --db-url=jdbc:postgresql://pg:5432/keycloak, --db-username=postgres, --db-password=skedaddle, --http-enabled=true, --hostname-strict=false]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: s6-local-admin-password
+      JAVA_OPTS_KC_HEAP: '-Xms128m -Xmx384m'
+    ports: ['127.0.0.1::8080']
+    depends_on: {pg: {condition: service_healthy}}
+    mem_limit: 768m
+volumes:
+  pgdata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+  giteadata:
+    labels: {skedaddle.test: '${RUN_ID}'}
+networks:
+  test:
+    labels: {skedaddle.test: '${RUN_ID}'}

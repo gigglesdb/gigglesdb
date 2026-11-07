@@ -1,0 +1,45 @@
+services:
+  pg:
+    ports: ["127.0.0.1::5432"]
+    command: [postgres, -c, wal_level=logical, -c, max_slot_wal_keep_size=256MB, -c, max_wal_size=256MB, -c, min_wal_size=64MB, -c, logical_decoding_work_mem=64kB, -c, max_replication_slots=8, -c, max_wal_senders=8, -c, max_prepared_transactions=10, -c, logging_collector=off, -c, log_destination=stderr, -c, checkpoint_timeout=30s]
+  pgbouncer:
+    ports: ["127.0.0.1::5432"]
+    environment:
+      DB_USER: s2_pool_t
+      DB_PASSWORD: app
+      SERVER_TLS_SSLMODE: require
+      SERVER_LOGIN_RETRY: "1"
+      QUERY_WAIT_TIMEOUT: "3"
+      SERVER_CONNECT_TIMEOUT: "2"
+      POOL_MODE: transaction
+  poolsession:
+    image: ${PGBOUNCER_IMAGE}
+    labels: {skedaddle.test: '${RUN_ID}'}
+    restart: "no"
+    logging:
+      driver: json-file
+      options: {max-size: 2m, max-file: "2"}
+    networks: [test]
+    ports: ["127.0.0.1::5432"]
+    environment:
+      DB_HOST: pg
+      DB_PORT: "5432"
+      DB_USER: s2_pool_s
+      DB_PASSWORD: app
+      DB_NAME: skedaddle
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: session
+      MAX_CLIENT_CONN: "30"
+      DEFAULT_POOL_SIZE: "5"
+      SERVER_TLS_SSLMODE: require
+      SERVER_LOGIN_RETRY: "1"
+      QUERY_WAIT_TIMEOUT: "3"
+      SERVER_CONNECT_TIMEOUT: "2"
+    depends_on:
+      pg: {condition: service_healthy}
+  minio:
+    profiles: [s2-unused]
+  gcs:
+    profiles: [s2-unused]
+  toxiproxy:
+    profiles: [s2-unused]

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>S6 deterministic feed</title><link>https://example.org/s6</link><description>Local bounded HTTP fixture</description>
+<item><guid>entry-alpha</guid><title>Alpha</title><link>https://example.org/s6/alpha</link><description>First entry</description><pubDate>Fri, 06 Nov 2026 12:00:00 GMT</pubDate></item>
+<item><guid>entry-beta</guid><title>Beta</title><link>https://example.org/s6/beta</link><description>Second entry</description><pubDate>Fri, 06 Nov 2026 12:01:00 GMT</pubDate></item>
+<item><guid>entry-gamma</guid><title>Gamma</title><link>https://example.org/s6/gamma</link><description>Third entry</description><pubDate>Fri, 06 Nov 2026 12:02:00 GMT</pubDate></item>
+</channel></rss>

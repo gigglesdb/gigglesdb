@@ -1,0 +1,9 @@
+services:
+  pg:
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+  toxiproxy:
+    ports:
+      - '127.0.0.1::8474'
+      - '127.0.0.1::5433'
+      - '127.0.0.1::4444'
