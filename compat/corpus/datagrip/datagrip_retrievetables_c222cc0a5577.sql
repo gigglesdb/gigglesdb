@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveTables.sql#datagrip_RetrieveTables sha256:c222cc0a5577
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveTables.sql#datagrip_RetrieveTables
 -- source-sha256: c222cc0a5577e0fb796939dbb123c2eff24451bc172b5c531df83ae82c4930ba
 -- parameters: $1=2200 (literal public namespace OID).

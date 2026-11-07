@@ -3,7 +3,7 @@
 -- title: datagrip_full_schema_object_acls.sql#datagrip_full_schema_object_acls sha256:13ed14e3b27d
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_full_schema_object_acls.sql#datagrip_full_schema_object_acls
 -- source-sha256: 13ed14e3b27d6edaee9824585e99c8c4b84d11339e1efca1819c4efda1700714
 -- parameters: $1=2200, $2=2200, $3=2200 (literal public namespace OID).

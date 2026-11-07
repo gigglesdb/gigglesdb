@@ -119,7 +119,7 @@ def render(item):
     parameters = list(dict.fromkeys(re.findall(parameter_pattern, item['sql'])))
     sql = re.sub(parameter_pattern, '2200', item['sql'])
     expectation = PG18_UNTESTED.get(item['sha'])
-    lines = [MARKER, f'-- case: {name}', f'-- title: {Path(item["source"]).name}#{item["case"]} sha256:{item["sha"][:12]}', '-- owner: G', '-- expect: ' + ('untested ' + expectation if expectation else 'compatible'), '-- compare: shape', f'-- source: {item["source"]}#{item["case"]}', f'-- source-sha256: {item["sha"]}']
+    lines = [MARKER, f'-- case: {name}', f'-- title: {Path(item["source"]).name}#{item["case"]} sha256:{item["sha"][:12]}', '-- owner: G', '-- expect: ' + ('untested ' + expectation if expectation else 'compatible'), '-- compare: header', f'-- source: {item["source"]}#{item["case"]}', f'-- source-sha256: {item["sha"]}']
     if parameters:
         lines.append('-- parameters: ' + ', '.join(token + '=2200' for token in parameters) + ' (literal public namespace OID).')
     lines += [f'CREATE TABLE {table} (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);', f'CREATE INDEX {name}_body ON {table} (body);']

@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveConstraints.sql#datagrip_RetrieveConstraints sha256:9df0a4e5953e
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveConstraints.sql#datagrip_RetrieveConstraints
 -- source-sha256: 9df0a4e5953e2b9eb05e5d7104cb5c549160a4c54584dd333ad82df5b477d615
 -- parameters: $1=2200 (literal public namespace OID).

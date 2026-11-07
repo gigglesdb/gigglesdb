@@ -3,7 +3,7 @@
 -- title: app-expanded-queries.json#dg_App_RetrieveColumns sha256:70d694dc074e
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/app-expanded-queries.json#dg_App_RetrieveColumns
 -- source-sha256: 70d694dc074e404daf5a93f85a4483140df613924c1c15441f310ce4858c154d
 -- parameters: :schema_id=2200 (literal public namespace OID).

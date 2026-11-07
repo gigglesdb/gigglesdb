@@ -3,7 +3,7 @@
 -- title: datagrip_languages.sql#datagrip_languages sha256:a3dec296b733
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_languages.sql#datagrip_languages
 -- source-sha256: a3dec296b73336524c7c0e39ae386a9438e6b26df743d84ad99f85f8fd454e99
 CREATE TABLE r0c_datagrip_languages_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

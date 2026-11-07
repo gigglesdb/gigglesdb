@@ -9,6 +9,7 @@ from .checks import OWNERS, normalize
 
 UNSUPPORTED_STATES = frozenset({'0A000', '42601', '42883', '42704'})
 OUTCOMES = ('COMPATIBLE', 'UNSUPPORTED', 'DIVERGENT', 'INTENTIONAL', 'UNTESTED', 'HARNESS_ERROR')
+COMPARISONS = ('full', 'shape', 'header')
 
 
 def _scan(line, quote=None, terminators=None):
@@ -105,7 +106,7 @@ def parse_case(path, area=None):
         raise ValueError(f'{path}: invalid expectation (reason required)')
     warnings = []
     comparison = headers.get('compare', 'full')
-    if comparison not in ('full', 'shape'):
+    if comparison not in COMPARISONS:
         raise ValueError(f'{path}: unsupported compare header')
     for statement in statements:
         for m in re.finditer(r'\bCREATE\s+(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)', statement['sql'], re.I):
@@ -197,7 +198,7 @@ def _shape(record):
 
 
 def statement_difference(pg, giggles, compare='full'):
-    if compare not in ('full', 'shape'):
+    if compare not in COMPARISONS:
         raise ValueError('unsupported comparison: ' + compare)
     p, g = pg['sqlstate'], giggles['sqlstate']
     if 'CONNECTION_LOST' in (p, g):
@@ -207,7 +208,12 @@ def statement_difference(pg, giggles, compare='full'):
             return 'pg_error_only'
         return 'sqlstate_differs'
     if p == g:
-        equal = (_shape(pg) == _shape(giggles) if compare == 'shape' else normalize('\n'.join(pg['output_lines'])) == normalize('\n'.join(giggles['output_lines'])))
+        if compare == 'header':
+            equal = _shape(pg)[0] == _shape(giggles)[0]
+        elif compare == 'shape':
+            equal = _shape(pg) == _shape(giggles)
+        else:
+            equal = normalize('\n'.join(pg['output_lines'])) == normalize('\n'.join(giggles['output_lines']))
         return None if p != '00000' or equal else 'result_differs'
     if p == '00000':
         return 'giggles_error'
@@ -224,6 +230,8 @@ def compare_case(case, pg, giggles):
         giggles['reason'] = 'client timed out'
     result = {k: case.get(k) for k in ('id', 'area', 'title', 'owner', 'expect', 'reason', 'warnings', 'source')}
     result['compare'] = case.get('compare', 'full')
+    result['row_counts'] = [dict(index=stmt['index'], pg=p.get('row_count'), giggles=g.get('row_count'))
+                            for stmt, p, g in zip(case['statements'], pg.get('records', []), giggles.get('records', []))]
     result.update(outcome='COMPATIBLE', first_divergence=None, stale_expectation=False, pg=pg, giggles=giggles, differences=[], harness_errors=[])
     if case['expect'] == 'untested':
         result['outcome'] = 'UNTESTED'

@@ -1,0 +1,13 @@
+CREATE TABLE r0p_users (id integer PRIMARY KEY, email text NOT NULL, active boolean, created timestamptz);
+CREATE TABLE r0p_orders (id bigint PRIMARY KEY, user_id integer, total_cents bigint, note text);
+CREATE TABLE r0p_blobs (id integer PRIMARY KEY, data bytea);
+CREATE INDEX r0p_orders_user_id ON r0p_orders(user_id);
+INSERT INTO r0p_users VALUES (1, 'alice@example.test', true, '2024-01-02 03:04:05+00');
+INSERT INTO r0p_users VALUES (2, 'bob@example.test', false, '2024-02-03 04:05:06+00');
+INSERT INTO r0p_users VALUES (3, 'carol@example.test', NULL, NULL);
+INSERT INTO r0p_orders VALUES (101, 1, 1250, 'first order');
+INSERT INTO r0p_orders VALUES (102, 2, 0, NULL);
+INSERT INTO r0p_orders VALUES (103, 1, 922337203685477580, 'quote '' and newline');
+INSERT INTO r0p_blobs VALUES (1, '\x0001ff');
+INSERT INTO r0p_blobs VALUES (2, '\x');
+INSERT INTO r0p_blobs VALUES (3, NULL);

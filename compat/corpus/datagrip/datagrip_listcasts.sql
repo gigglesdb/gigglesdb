@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_ListCasts sha256:e27b41ad5978
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_ListCasts
 -- source-sha256: e27b41ad59786a076cecfc4e396d0a69d68ce6aa3da45a4e9496458746210d61
 CREATE TABLE r0c_datagrip_listcasts_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

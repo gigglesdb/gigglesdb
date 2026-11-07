@@ -51,7 +51,13 @@ class DataGripTests(unittest.TestCase):
             with self.subTest(case=item['id']):
                 text = gen.render(item)
                 self.assertIn('-- owner: G\n', text)
-                self.assertIn('-- compare: shape\n', text)
+                self.assertIn('-- compare: header\n', text)
+                # A CRLF checkout (core.autocrlf or git archive) may convert
+                # line endings; the generator's content contract is LF-normalized.
+                checked_in = (gen.OUT / (item['id'] + '.sql')).read_bytes().replace(b'\r\n', b'\n')
+                self.assertEqual(checked_in, text.encode('utf-8'))
+                self.assertFalse(checked_in.startswith(b'\xef\xbb\xbf'))
+                self.assertNotIn(b'\r', checked_in)
                 self.assertIn(f'-- source: {item["source"]}#{item["case"]}\n', text)
                 self.assertIn(item['sha'][:12], text)
                 self.assertEqual(text.count('\nCREATE TABLE '), 1)

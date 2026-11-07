@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_RetrieveAccessMethods sha256:adacca7f2fe6
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_RetrieveAccessMethods
 -- source-sha256: adacca7f2fe622ace6dfabd37a6fcd12a0f7c7f0d9937b055dc842e5fa116b42
 CREATE TABLE r0c_datagrip_retrieveaccessmethods_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

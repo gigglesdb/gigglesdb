@@ -42,6 +42,7 @@ class ShapeOwnerTests(unittest.TestCase):
         defaults = harness.parser().parse_args(['run'])
         self.assertTrue({'DD-0068', 'unowned'} <= harness.parse_owners(defaults.owners))
         self.assertEqual(self.parse()['compare'], 'full')
+        self.assertEqual(self.parse('-- compare: header\n')['compare'], 'header')
         sql = '/* semicolon ;\n nested /* ; */ comment */\nSELECT 1 /* ; */; -- trailing ;\n'
         case = self.parse('-- compare: shape\n-- source: DataGrip capture\n', sql)
         self.assertEqual(case['compare'], 'shape')
@@ -51,6 +52,38 @@ class ShapeOwnerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.parse('-- compare: '+mode+'\n')
 
+    def test_header_compares_logical_names_only(self):
+        p = self.record(['"a,b","line', 'name"', '1,2', '@@R0 ROW_COUNT 123'], 123)
+        g = self.record(['"a,b","line', 'name"', '9,8', '@@R0 ROW_COUNT 3'], 3)
+        self.assertIsNone(corpus.statement_difference(p, g, 'header'))
+        self.assertEqual(corpus.statement_difference(p, g, 'shape'), 'result_differs')
+        self.assertEqual(corpus.statement_difference(p, g, 'full'), 'result_differs')
+        self.assertEqual(corpus.statement_difference(p, self.record(['a,b', '9,8'], 3), 'header'), 'result_differs')
+        self.assertEqual(corpus.statement_difference(p, dict(g, sqlstate='42601'), 'header'), 'giggles_error')
+        self.assertIsNone(corpus.statement_difference(dict(p, sqlstate='42601'), dict(g, sqlstate='42601'), 'header'))
+        self.assertEqual(corpus.statement_difference(dict(p, sqlstate='42601'), dict(g, sqlstate='42883'), 'header'), 'sqlstate_differs')
+        self.assertIsNone(corpus.statement_difference(self.record([], 0), self.record(['@@R0 ROW_COUNT 3'], 3), 'header'))
+        self.assertIsNone(corpus.statement_difference(self.record(['CREATE TABLE'], 0), self.record(['CREATE TABLE'], 3), 'header'))
+        self.assertEqual(corpus.statement_difference(self.record(['UPDATE 1']), self.record(['UPDATE 2']), 'header'), 'result_differs')
+        with self.assertRaises(ValueError):
+            corpus.statement_difference(p, g, 'HEADER')
+
+    def test_compatible_header_preserves_informational_row_counts(self):
+        case = self.parse('-- compare: header\n', 'SELECT 1;\nSELECT 2;')
+        def transcript(counts):
+            return corpus.parse_transcript(''.join(
+                f'@@R0 BEGIN {index}\nname\nvalue\n@@R0 END {index} 00000 {count}\n'
+                for index, count in enumerate(counts, 1)), case['statements'])
+        result = corpus.compare_case(case, transcript([123, 0]), transcript([3, 1]))
+        self.assertEqual(result['outcome'], 'COMPATIBLE')
+        self.assertIsNone(result['first_divergence'])
+        self.assertEqual(result['row_counts'], [dict(index=1, pg=123, giggles=3), dict(index=2, pg=0, giggles=1)])
+        self.assertEqual(result['pg']['records'][0]['row_count'], 123)
+        self.assertEqual(result['giggles']['records'][0]['row_count'], 3)
+        text = '\n'.join(report.differential_markdown(dict(cases=[result])))
+        self.assertIn('Row counts (informational)', text)
+        self.assertIn('PG [123, 0]; Giggles [3, 1]', text)
+
     def test_report_unowned_and_compatible_shape(self):
         cases = [dict(id='shape_case', owner='unowned', outcome='COMPATIBLE', compare='shape'),
                  dict(id='failure', owner='unowned', outcome='DIVERGENT', compare='full')]
@@ -59,9 +92,13 @@ class ShapeOwnerTests(unittest.TestCase):
         self.assertNotIn('### unowned', text)
         self.assertIn('shape_case | unowned | compare: shape | COMPATIBLE', text)
         data = dict(run_id='x', started_at='', finished_at='', summary=dict(clients={}),
-                    checks=[dict(client='psql', id='x', owner='unowned', outcome='FAIL')],
+                    checks=[dict(client='psql', id='x', owner='unowned', outcome='FAIL',
+                                 first_error='ERROR: unsupported statement',
+                                 first_failing_statement='CREATE TABLE example (id bigint);')],
                     failures_by_owner={'unowned':['psql/x']})
         self.assertIn('### Unowned (needs an owner)', report.markdown(data))
+        self.assertIn('First GigglesDB error:\n```text\nERROR: unsupported statement\n```', report.markdown(data))
+        self.assertIn('First failing statement:\n```sql\nCREATE TABLE example (id bigint);\n```', report.markdown(data))
 
     def test_manifest_and_corpus_owners(self):
         import json

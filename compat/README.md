@@ -458,3 +458,57 @@ cases by their exact stable identities, reports improvements, regressions,
 added/removed records and other changes, and includes PASS-count and pass-rate
 percentage-point deltas. Owner and error changes appear as other changes.
 Exit status is 0 without regressions, 3 with regressions, or 2 for invalid input.
+
+## One-iteration main watcher
+
+```powershell
+python -I -B compat/harness.py watch --seed-report J:/gigglesdb-work/<baseline>/report.json --seed-commit <full-baseline-SHA>
+```
+
+`watch` resolves `main` once and exits. Its default state is
+`J:/gigglesdb-work/r0-harness/watch/state.json`, containing `last_run_commit`,
+`last_run_at`, and `last_report`. A missing state requires both seed arguments;
+the report's build commit must match, and its finished/start timestamp seeds the
+interval. Existing state takes precedence over seed arguments. `--state`,
+`--out-root`, `--build-root`, and `--cargo-target` override their J: defaults;
+output paths cannot be on K:.
+
+An unchanged commit, fewer than 60 minutes since the previous report, a diff
+without changes under `crates/` (excluding `crates/giggles-pg-conformance/`), or
+an active harness/build lock produces a successful no-op. Change the positive,
+finite interval with `--min-interval-minutes`. Compatibility harness changes
+alone do not trigger a run. All runs, including `--server-bin` runs, hold a
+run-wide `.gd-r0-run.lock` in the cargo target; the watcher also honors
+`.gd-r0-build.lock`. Locks are not removed by competing invocations.
+
+A qualifying change runs all registered clients and corpus cases at the exact
+resolved commit, saves the full report as the new baseline atomically, and
+writes `delta-<old7>-<new7>.md` beside state. Regressed clients run once each in
+isolation without corpus; regressed corpus cases run individually with psql and
+checks disabled. Delta entries and `REGRESSION` console lines identify
+`reproduces-in-isolation`, `state-dependent (passes alone)`, or
+`isolation-inconclusive`, and link the isolated report evidence. Regression
+output includes `git log --oneline <old>..<new> -- crates`. The original full
+run determines exit 3 even if isolation passes; no regression/no-op exits 0,
+and invalid state or infrastructure failure exits 2. Isolation never replaces
+the full report baseline.
+
+DataGrip's 36 generated header comparison cases compare column headers only.
+Result row counts remain informational in `row_counts` and do not determine
+header compatibility.
+
+## pg_dump qualification
+
+The registered `pg_dump` client runs seven checks: fixture application, schema
+dump execution, schema restore into PostgreSQL, normalized schema equivalence,
+data dump execution, full restore into PostgreSQL, and PostgreSQL-source dump
+restore into GigglesDB. Dumps use pinned client binaries, plain SQL,
+`--no-owner`, and `--no-privileges`. The independent source fixture uses `r0q_`
+tables in `r0_src`, validates its dump by restoring into a separate PostgreSQL
+database, then checks GigglesDB's restored rows against the source.
+
+Schema normalization drops comments, SET prologue lines, blank lines, trailing
+whitespace, and PostgreSQL 18's random `\restrict`/`\unrestrict` guard tokens.
+SQL definitions remain intact. Each check keeps raw artifacts and records its
+PostgreSQL baseline: a failed baseline is `HARNESS_ERROR`; a failed GigglesDB
+operation against a working baseline is `FAIL`.

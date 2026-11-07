@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveExistentTables.sql#datagrip_RetrieveExistentTables sha256:38c1901282c3
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveExistentTables.sql#datagrip_RetrieveExistentTables
 -- source-sha256: 38c1901282c3eaa7322991752810066030a13188870c246af8b28db411895f48
 -- parameters: $1=2200 (literal public namespace OID).

@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveColumns.sql#datagrip_RetrieveColumns sha256:dceb66d8c64d
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveColumns.sql#datagrip_RetrieveColumns
 -- source-sha256: dceb66d8c64d4dc3cab5dcb8eec751622f10c2ce259411c7a48ff9d36cb8e108
 -- parameters: $1=2200 (literal public namespace OID).

@@ -3,7 +3,7 @@
 -- title: datagrip_event_triggers.sql#datagrip_event_triggers sha256:2a12f8115db1
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_event_triggers.sql#datagrip_event_triggers
 -- source-sha256: 2a12f8115db18ff54de46fec4f1a2473a5b8d5e64c9d2a799ab0ac9da9a38a60
 CREATE TABLE r0c_datagrip_event_triggers_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

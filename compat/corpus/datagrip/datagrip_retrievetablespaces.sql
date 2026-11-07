@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_RetrieveTablespaces sha256:cf7eb19af49c
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_RetrieveTablespaces
 -- source-sha256: cf7eb19af49c41106336c99bda52cb1db41b71038a6c312aceb767fbf895c146
 CREATE TABLE r0c_datagrip_retrievetablespaces_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

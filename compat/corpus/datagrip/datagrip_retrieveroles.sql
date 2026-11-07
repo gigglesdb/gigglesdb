@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_RetrieveRoles sha256:d2c91bcaf2b3
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_RetrieveRoles
 -- source-sha256: d2c91bcaf2b389a2b23b65162cf63f789c1d0f781609c7c9d943dea2bf0dcd8b
 CREATE TABLE r0c_datagrip_retrieveroles_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

@@ -31,12 +31,18 @@ def redact(value, secrets=()):
                 value = value.replace(secret, '[REDACTED]')
     return value
 
-def command(args, env, timeout=60, input=None):
+def command(args, env, timeout=60, input=None, preserve_newlines=False):
     import time
     start = time.monotonic()
     try:
-        p = subprocess.run(args, input=input, text=True, encoding='utf-8', errors='replace', capture_output=True, env=env, timeout=timeout)
-        return dict(exit=p.returncode, stdout=p.stdout, stderr=p.stderr, timed_out=False, duration_ms=round((time.monotonic()-start)*1000))
+        if preserve_newlines:
+            p = subprocess.run(args, input=input.encode('utf-8') if isinstance(input, str) else input,
+                               capture_output=True, env=env, timeout=timeout)
+            stdout, stderr = p.stdout.decode('utf-8', 'replace'), p.stderr.decode('utf-8', 'replace')
+        else:
+            p = subprocess.run(args, input=input, text=True, encoding='utf-8', errors='replace', capture_output=True, env=env, timeout=timeout)
+            stdout, stderr = p.stdout, p.stderr
+        return dict(exit=p.returncode, stdout=stdout, stderr=stderr, timed_out=False, duration_ms=round((time.monotonic()-start)*1000))
     except subprocess.TimeoutExpired as e:
         def decode(v):
             return v.decode('utf-8', 'replace') if isinstance(v, bytes) else (v or '')

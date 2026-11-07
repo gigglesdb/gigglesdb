@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_RetrieveForeignDataWrappers sha256:a87f59249c2d
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_RetrieveForeignDataWrappers
 -- source-sha256: a87f59249c2d1e16b08e7a20f7b36d0ed23cb883f5ce27bda98de077ca27a871
 CREATE TABLE r0c_datagrip_retrieveforeigndatawrappers_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

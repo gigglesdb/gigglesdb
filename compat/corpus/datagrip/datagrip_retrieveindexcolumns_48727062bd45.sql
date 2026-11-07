@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveIndexColumns.sql#datagrip_RetrieveIndexColumns sha256:48727062bd45
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveIndexColumns.sql#datagrip_RetrieveIndexColumns
 -- source-sha256: 48727062bd45d80888f2b1bf15189b8b2783e6576ed4fa219c6d0ded17715fc7
 -- parameters: $1=2200 (literal public namespace OID).

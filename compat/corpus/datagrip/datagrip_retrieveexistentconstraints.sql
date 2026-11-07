@@ -3,7 +3,7 @@
 -- title: app-expanded-queries.json#dg_App_RetrieveExistentConstraints sha256:21519045d4f3
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/app-expanded-queries.json#dg_App_RetrieveExistentConstraints
 -- source-sha256: 21519045d4f3c8c7bc20e3e17814f029765ae038370e14e66bad7599062223c7
 -- parameters: :schema_id=2200 (literal public namespace OID).

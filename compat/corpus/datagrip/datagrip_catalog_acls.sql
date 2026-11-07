@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_SchemaForeignACL sha256:29995a6946a2
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_SchemaForeignACL
 -- source-sha256: 29995a6946a247183c1f8390709217bed2ea9875b1c289c85e991a9096f54109
 CREATE TABLE r0c_datagrip_catalog_acls_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

@@ -10,7 +10,7 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util
+from compat_lib import checks, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util, watch
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -35,6 +35,13 @@ def parser():
     run.add_argument('--keep-scratch', action='store_true')
     for flag in ('pull','keep','strict'):
         run.add_argument('--'+flag, action='store_true')
+    observer = sub.add_parser('watch')
+    observer.add_argument('--state', type=Path, default=Path('J:/gigglesdb-work/r0-harness/watch/state.json'))
+    observer.add_argument('--seed-report', type=Path)
+    observer.add_argument('--seed-commit')
+    observer.add_argument('--min-interval-minutes', type=float, default=60)
+    for flag in ('build-root', 'cargo-target', 'out-root'):
+        observer.add_argument('--'+flag, default=run.get_default(flag.replace('-', '_')))
     return p
 
 def setup_client(engine, client, client_pin, args, data, password):
@@ -93,7 +100,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
         item = {key:case.get(key) for key in ('area','id','title','owner','expect','reason','source')}
         item['compare'] = case.get('compare', 'full')
         item.update(outcome='UNTESTED', pg=None, giggles=None, first_divergence=None,
-                    warnings=case.get('warnings', []), stale_expectation=False)
+                    warnings=case.get('warnings', []), stale_expectation=False, row_counts=[])
         if case['expect'] != 'untested':
             item['reason'] = reason if not available else 'client has no session runner'
     else:
@@ -121,7 +128,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     item = util.redact(item,[password])
     (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
     summary_keys = ('area','id','title','owner','expect','reason','outcome','compare','source',
-                    'first_divergence','warnings','stale_expectation','artifact_dir','harness_errors')
+                    'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors')
     data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
 
 
@@ -194,10 +201,7 @@ def corpus_matches(case, pattern):
     return any(fnmatch.fnmatch(value, pattern) for value in values)
 
 
-def main(argv=None):
-    args = parser().parse_args(argv)
-    if args.action == 'delta':
-        return delta.run(args.old, args.new, args.out)
+def _run(args, capture):
     try:
         parse_owners(args.owners)
     except ValueError as exc:
@@ -213,6 +217,7 @@ def main(argv=None):
     run_id = 'r0-'+datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
     run = root/run_id
     run.mkdir(parents=True)
+    capture.append(run/'report.json')
     env = util.child_env(run)
     password = secrets.token_urlsafe(30)
     env.update(POSTGRES_PASSWORD=password, PGPASSWORD=password, POSTGRES_INITDB_ARGS='--locale=C.UTF-8 --encoding=UTF8', TZ='UTC', PGTZ='UTC')
@@ -246,6 +251,9 @@ def main(argv=None):
         data['build'].update(server.meta)
         for client in selected:
             registration = psql_client.REGISTRY[client]
+            if registration.get('run_client'):
+                registration['run_client'](engine,client,registration,args,data,run,network,pg_host,port,password)
+                continue
             if registration.get('kind') == 'probe':
                 if args.no_checks:
                     data['clients'][client] = dict(available=False, version=None, reason='checks disabled')
@@ -331,6 +339,47 @@ def main(argv=None):
     failed_checks = any(c['outcome'] in ('FAIL','HARNESS_ERROR') for c in data['checks'])
     failed_corpus = any(c['outcome'] in ('UNSUPPORTED','DIVERGENT','HARNESS_ERROR') for c in data['differential']['cases'])
     return 1 if args.strict and (failed_checks or failed_corpus) else 0
+
+def run_once(argv=None, *, fail_if_build_busy=False):
+    args = parser().parse_args(argv)
+    capture = []
+    try:
+        try:
+            parse_owners(args.owners)
+        except ValueError as exc:
+            parser().error(str(exc))
+        if not math.isfinite(args.client_timeout) or args.client_timeout <= 0:
+            parser().error('--client-timeout must be positive')
+        selected = [name.strip() for name in args.clients.split(',') if name.strip()]
+        if not selected or any(name not in psql_client.REGISTRY for name in selected):
+            parser().error('--clients must contain registered client names')
+        util.output_root(args.out_root)
+        util.output_root(args.build_root)
+        target = util.output_root(args.cargo_target)
+        with watch.RunLock(target):
+            if fail_if_build_busy and (target/'.gd-r0-build.lock').exists():
+                raise watch.LockBusy('another R0 build is active')
+            code = _run(args, capture)
+        return code, capture[0] if capture else None
+    except watch.LockBusy:
+        raise
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2, capture[0] if capture else None
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if args.action == 'delta':
+        return delta.run(args.old, args.new, args.out)
+    if args.action == 'watch':
+        return watch.run(args, lambda argv: run_once(argv, fail_if_build_busy=True), Path(__file__).resolve().parent.parent)
+    try:
+        return run_once(argv)[0]
+    except watch.LockBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
 
 if __name__ == '__main__':
     raise SystemExit(main())

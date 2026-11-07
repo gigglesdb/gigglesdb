@@ -3,7 +3,7 @@
 -- title: datagrip_flat_comments.sql#datagrip_flat_comments sha256:3aa36507c523
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_flat_comments.sql#datagrip_flat_comments
 -- source-sha256: 3aa36507c523d1ae91a089f6631485f19d80062e95f40acec38990b33047e438
 -- parameters: $1=2200, $2=2200, $3=2200, $4=2200, $5=2200, $6=2200, $7=2200, $8=2200, $9=2200, $10=2200, $11=2200 (literal public namespace OID).

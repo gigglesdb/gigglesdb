@@ -3,7 +3,7 @@
 -- title: datagrip_superuser.sql#datagrip_superuser sha256:fd6d0fc6798a
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_superuser.sql#datagrip_superuser
 -- source-sha256: fd6d0fc6798a6d3bf0349d345ca7e9ce5dab45268345424cf19ee5226acdd947
 CREATE TABLE r0c_datagrip_superuser_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

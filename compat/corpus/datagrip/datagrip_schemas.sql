@@ -3,7 +3,7 @@
 -- title: datagrip_schemas.sql#datagrip_schemas sha256:c4a26b438845
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_schemas.sql#datagrip_schemas
 -- source-sha256: c4a26b438845d4b584680e7428d1f398d22835010810ff244d9fbb8f759b8ae6
 CREATE TABLE r0c_datagrip_schemas_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

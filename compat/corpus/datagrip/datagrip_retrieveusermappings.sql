@@ -3,7 +3,7 @@
 -- title: latest-expanded-queries.json#dg_Batch_RetrieveUserMappings sha256:5b3890fbf57a
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-conformance/probes/datagrip-2026.2.5/latest-expanded-queries.json#dg_Batch_RetrieveUserMappings
 -- source-sha256: 5b3890fbf57a18342911cebae67bc118f263150293407ab19588bc8349749f14
 CREATE TABLE r0c_datagrip_retrieveusermappings_app (id bigint PRIMARY KEY, body text, flag boolean, small smallint, num integer, data bytea);

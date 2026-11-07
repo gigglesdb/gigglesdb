@@ -3,7 +3,7 @@
 -- title: datagrip_RetrieveIndices.sql#datagrip_RetrieveIndices sha256:8e659477d09d
 -- owner: G
 -- expect: compatible
--- compare: shape
+-- compare: header
 -- source: crates/giggles-pg-catalog/tests/fixtures/datagrip_RetrieveIndices.sql#datagrip_RetrieveIndices
 -- source-sha256: 8e659477d09de326976e7de66b07b0172fffda2dcc3bf77d5e1662f643e8ba9b
 -- parameters: $1=2200 (literal public namespace OID).
