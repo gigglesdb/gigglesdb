@@ -76,6 +76,42 @@ else's uncommitted edits gets your hunks merged in, or is left alone and
 reported. A stale K: copy reads as a revert of your commit. End every commit message with the
 required Co-Authored-By trailer, and never push.
 
+## Ownership of giggles-core SQL files
+
+Agreed by DD-0068 on 2026-11-07, at the user's request, to speed up feature work.
+
+- `relational.rs` and `relational/query.rs` (the parser, planning and execution
+  dispatch) are co-owned by E1 (GD-0059) and E3 (GD-0058). They commit changes
+  there without a DD-0068 pre-release.
+- DD-0068 keeps pre-release authority over:
+  - its scalar/function layer: `relational/query/functions*.rs`,
+    `query/functions/**`, the scalar types and coercion, and the closed-set
+    error goldens;
+  - persisted-format surfaces, wherever they live: Relational's serialized
+    fields and its namespace-5 encoders and decoders (`LegacyNamespace5`,
+    `StatementNamespace5`, the format-first decode, `catalog_ext.rs` wire
+    encoding and `ext_version`), the `validate()` format and ext rules, the
+    index codec revision rules, `format_policy.rs` and the feature-bit mapping.
+    Any change to the bytes written or accepted needs pre-release; refactors
+    that only change in-memory representation don't.
+  - DD-0068's test files, which are behaviour tripwires: the
+    `crates/giggles-core/tests/sql_*.rs` files DD-0068 published,
+    `quoted_routines.rs`, `table_free_classification.rs`,
+    `sql_character_adversarial.rs`, `relational/query/aggregate_tests.rs`, the
+    DD-0068 server `*_network.inc` files (including
+    `routing_rejection_network.inc`), `qualified_routine_network.rs`,
+    `declared_parameter_network.rs`, `tests/fixtures/dd68/*` and
+    `scripts/postgres-functions/`. Any edit to these files, including changing
+    an expected result, needs pre-release.
+- A co-owned change that breaks a DD-0068 test either gets fixed, or goes to
+  DD-0068 before landing with the expectation change and its PG18 basis.
+- Co-owned changes that alter error codes or scalar semantics, and any change
+  that touches the order of authorization before classification (E939, even
+  with no test change), get a same-day heads-up to DD-0068 after landing. The
+  heads-up gives the commit SHA, the diff path and the SQLSTATEs or semantics
+  affected, and is copied into DD-0068's work log. A DD-0068 follow-up fix goes
+  to the front of the commit queue.
+
 ## Shared compile cache (sccache)
 
 Every cargo command sets these environment variables:
