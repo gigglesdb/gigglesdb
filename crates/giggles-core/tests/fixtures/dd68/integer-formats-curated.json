@@ -1,0 +1,3350 @@
+{
+  "original_raw": 123,
+  "additional_encounter": 27,
+  "eligible": 138,
+  "known_gaps": 12,
+  "metadata": {
+    "version": "180000",
+    "encoding": "UTF8",
+    "functions": [
+      {
+        "oid": "6330",
+        "name": "to_bin",
+        "args": "23",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      },
+      {
+        "oid": "6331",
+        "name": "to_bin",
+        "args": "20",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      },
+      {
+        "oid": "6332",
+        "name": "to_oct",
+        "args": "23",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      },
+      {
+        "oid": "6333",
+        "name": "to_oct",
+        "args": "20",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      },
+      {
+        "oid": "2089",
+        "name": "to_hex",
+        "args": "23",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      },
+      {
+        "oid": "2090",
+        "name": "to_hex",
+        "args": "20",
+        "result": "25",
+        "volatile": "i",
+        "strict": true
+      }
+    ]
+  },
+  "cases": [
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(0)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(15)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(16)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "10000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(255)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(256)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "100000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(2147483647)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "10000000000000000000000000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111110"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-1::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-1::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "10000000000000000000000000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(9223372036854775807)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "111111111111111111111111111111111111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-9223372036854775808)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1000000000000000000000000000000000000000000000000000000000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(-1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(NULL::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(NULL::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(NULL::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin('15')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(1::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(numeric) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(1::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(real) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(1::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(double precision) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(boolean) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_bin(decode('01','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(bytea) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_bin($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_bin($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_bin($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_bin($1::smallint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_bin($1::integer)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_bin()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin() does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_bin(1,2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(integer, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_bin(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_bin($1,1)",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(unknown, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Parameters",
+      "gap_reason": "existing wrong arity unresolved child parameter model"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.to_bin(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.\"to_bin\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"to_bin\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"TO_BIN\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function TO_BIN(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT public.to_bin(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function public.to_bin(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(0)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(15)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "f"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(16)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "10"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(255)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(256)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "100"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(2147483647)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "7fffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "80000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "fffffffe"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-1::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-1::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffffffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "80000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(9223372036854775807)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "7fffffffffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-9223372036854775808)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "8000000000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(-1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(NULL::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(NULL::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(NULL::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex('15')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(1::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(numeric) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(1::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(real) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(1::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(double precision) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(boolean) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_hex(decode('01','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(bytea) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_hex($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_hex($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_hex($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffffffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_hex($1::smallint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_hex($1::integer)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_hex()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex() does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_hex(1,2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(integer, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_hex(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_hex($1,1)",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(unknown, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Parameters",
+      "gap_reason": "existing wrong arity unresolved child parameter model"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.to_hex(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.\"to_hex\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"to_hex\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"TO_HEX\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function TO_HEX(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT public.to_hex(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function public.to_hex(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(0)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(15)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "17"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(16)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "20"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(255)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "377"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(256)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "400"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(2147483647)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "17777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "20000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777776"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-1::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-1::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1777777777777777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(2147483648)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "20000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(9223372036854775807)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "777777777777777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-9223372036854775808)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1000000000000000000000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(-1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(1::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(NULL::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(NULL::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(NULL::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct('15')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(1::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(numeric) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(1::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(real) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(1::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(double precision) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(boolean) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "value-type",
+      "query": "SELECT to_oct(decode('01','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(bytea) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_oct($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_oct($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_oct($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1777777777777777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_oct($1::smallint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(smallint) is not unique"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "param",
+      "query": "SELECT to_oct($1::integer)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_oct()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct() does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_oct(1,2)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(integer, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_oct(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "arity",
+      "query": "SELECT to_oct($1,1)",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(unknown, integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Parameters",
+      "gap_reason": "existing wrong arity unresolved child parameter model"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.to_oct(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.\"to_oct\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"to_oct\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"TO_OCT\"(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function TO_OCT(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT public.to_oct(-1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function public.to_oct(integer) does not exist"
+      },
+      "stage": "parse",
+      "eligible": false,
+      "known_gap_core": "Unsupported",
+      "gap_reason": "existing namespace/unknown quoted routine profile"
+    },
+    {
+      "query": "SELECT $1::integer,to_bin($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "int4",
+            "oid": 23,
+            "format": 0
+          },
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "-1",
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin($1),$1::integer",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin($1) WHERE $1::integer=1",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin($1::integer),to_bin($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "11111111111111111111111111111111",
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin($1::bigint),to_bin($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_bin",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "11111111111111111111111111111111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin($1),to_bin($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_bin(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin(missing::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_bin('bad'::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "22P02",
+        "message": "invalid input syntax for type integer: \"bad\""
+      },
+      "eligible": false,
+      "known_gap_core": "Type",
+      "gap_reason": "existing invalid integer literal syntax classification22P02"
+    },
+    {
+      "query": "SELECT to_bin(NULL::text)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_bin(text) does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT $1::integer,to_oct($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "int4",
+            "oid": 23,
+            "format": 0
+          },
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "-1",
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct($1),$1::integer",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct($1) WHERE $1::integer=1",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct($1::integer),to_oct($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "37777777777",
+            "1777777777777777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct($1::bigint),to_oct($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_oct",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "1777777777777777777777",
+            "37777777777"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct($1),to_oct($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_oct(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct(missing::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_oct('bad'::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "22P02",
+        "message": "invalid input syntax for type integer: \"bad\""
+      },
+      "eligible": false,
+      "known_gap_core": "Type",
+      "gap_reason": "existing invalid integer literal syntax classification22P02"
+    },
+    {
+      "query": "SELECT to_oct(NULL::text)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_oct(text) does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT $1::integer,to_hex($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "int4",
+            "oid": 23,
+            "format": 0
+          },
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "-1",
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex($1),$1::integer",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex($1) WHERE $1::integer=1",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex($1::integer),to_hex($1::bigint)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffff",
+            "ffffffffffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex($1::bigint),to_hex($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          20
+        ],
+        "resultTypes": [
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          },
+          {
+            "name": "to_hex",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ffffffffffffffff",
+            "ffffffff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex($1),to_hex($1::integer)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42725",
+        "message": "function to_hex(unknown) is not unique"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex(missing::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    },
+    {
+      "query": "SELECT to_hex('bad'::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "22P02",
+        "message": "invalid input syntax for type integer: \"bad\""
+      },
+      "eligible": false,
+      "known_gap_core": "Type",
+      "gap_reason": "existing invalid integer literal syntax classification22P02"
+    },
+    {
+      "query": "SELECT to_hex(NULL::text)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function to_hex(text) does not exist"
+      },
+      "eligible": true,
+      "known_gap_core": null,
+      "gap_reason": null
+    }
+  ]
+}

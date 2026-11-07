@@ -1,0 +1,2611 @@
+{
+  "cases": [
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        ""
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        ""
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            ""
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "A"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "65"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "A"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "abc"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "abc"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u00e9"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "233"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u00e9"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00e9"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u20ac"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "8364"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u20ac"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u20ac"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\ud83d\ude00"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "128512"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\ud83d\ude00"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\ud83d\ude00"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "e\u0301"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "101"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "e\u0301"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "E\u0301"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u00e9HELLO"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "233"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u00e9HELLO"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00e9Hello"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u00e9cole"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "233"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u00e9cole"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00e9Cole"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "HELLO\u00c9WORLD"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "72"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "HELLO\u00c9WORLD"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Hello\u00c9World"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u00c4\u00d6\u00dc \u00df \u03a9\u03a3 \u01c5"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "196"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u00c4\u00d6\u00dc \u00df \u03a9\u03a3 \u01c5"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00c4\u00d6\u00dc \u00df \u03a9\u03a3 \u01c5"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "istanbul I\u0130\u0131i"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "105"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "istanbul I\u0130\u0131i"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Istanbul I\u0130\u0131I"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "abc123DEF 123ABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "abc123DEF 123ABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc123def 123abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "foo_bar foo-bar foo.bar"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "102"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "foo_bar foo-bar foo.bar"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Foo_Bar Foo-Bar Foo.Bar"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "o\u2019NEILL o'NEILL"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "111"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "o\u2019NEILL o'NEILL"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "O\u2019Neill O'Neill"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "a\u0301BC Z"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "a\u0301BC Z"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A\u0301Bc Z"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\u4e2d\u6587abc \u65e5\u672c\u8a9eABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "20013"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\u4e2d\u6587abc \u65e5\u672c\u8a9eABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u4e2d\u6587Abc \u65e5\u672c\u8a9eAbc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "a\tb\nc\rd"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "a\tb\nc\rd"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A\tB\nC\rD"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-text",
+      "query": "SELECT ascii($1)",
+      "params": [
+        "\ud801\udc00ABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "66560"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-text",
+      "query": "SELECT initcap($1)",
+      "params": [
+        "\ud801\udc00ABC"
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\ud801\udc00Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "-2147483648"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "22023",
+        "message": "character number must be positive"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "-1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "22023",
+        "message": "character number must be positive"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "0"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "null character not permitted"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "1"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u0001"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "65"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "127"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u007f"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "128"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u0080"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "255"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00ff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "256"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u0100"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "55295"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\ud7ff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "55296"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character not valid for encoding: 55296"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "56319"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character not valid for encoding: 56319"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "56320"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character not valid for encoding: 56320"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "57343"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character not valid for encoding: 57343"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "57344"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\ue000"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "1114111"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\udbff\udfff"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "1114112"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character too large for encoding: 1114112"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "chr-int",
+      "query": "SELECT chr($1)",
+      "params": [
+        "2147483647"
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "requested character too large for encoding: 2147483647"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii('65')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "54"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(smallint) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(integer) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(bigint) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(numeric) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(real) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(65::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(double precision) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(boolean) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-type",
+      "query": "SELECT ascii(decode('41','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(bytea) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-arity",
+      "query": "SELECT ascii()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii() does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-arity",
+      "query": "SELECT ascii('a','b')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(unknown, unknown) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "ascii-namespace",
+      "query": "SELECT pg_catalog.ascii('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-namespace",
+      "query": "SELECT \"ascii\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-namespace",
+      "query": "SELECT \"ASCII\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ASCII(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+    },
+    {
+      "kind": "ascii-namespace",
+      "query": "SELECT pg_catalog.\"ascii\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "ascii-namespace",
+      "query": "SELECT \"pg_catalog\".\"ascii\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "97"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap('65')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "65"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(smallint) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(integer) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(bigint) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(numeric) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(real) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(65::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(double precision) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(boolean) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-type",
+      "query": "SELECT initcap(decode('41','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(bytea) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-arity",
+      "query": "SELECT initcap()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap() does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-arity",
+      "query": "SELECT initcap('a','b')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function initcap(unknown, unknown) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "initcap-namespace",
+      "query": "SELECT pg_catalog.initcap('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-namespace",
+      "query": "SELECT \"initcap\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-namespace",
+      "query": "SELECT \"INITCAP\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function INITCAP(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+    },
+    {
+      "kind": "initcap-namespace",
+      "query": "SELECT pg_catalog.\"initcap\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "initcap-namespace",
+      "query": "SELECT \"pg_catalog\".\"initcap\"('aBC')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(NULL)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr('65')",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::smallint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::integer)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::bigint)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(bigint) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::numeric)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(numeric) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::real)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(real) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(65::double precision)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(double precision) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(true)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(boolean) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-type",
+      "query": "SELECT chr(decode('41','hex'))",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(bytea) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-arity",
+      "query": "SELECT chr()",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr() does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-arity",
+      "query": "SELECT chr('a','b')",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(unknown, unknown) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "chr-namespace",
+      "query": "SELECT pg_catalog.chr(65)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-namespace",
+      "query": "SELECT \"chr\"(65)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-namespace",
+      "query": "SELECT \"CHR\"(65)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function CHR(integer) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "known_gap_reason": "Existing unknown quoted routine error profile0A000 differs from PG42883"
+    },
+    {
+      "kind": "chr-namespace",
+      "query": "SELECT pg_catalog.\"chr\"(65)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "chr-namespace",
+      "query": "SELECT \"pg_catalog\".\"chr\"(65)",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "A"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "unresolved",
+      "query": "SELECT chr($1)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          23
+        ],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "strict",
+      "query": "SELECT ascii($1)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ascii",
+            "oid": 23,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "strict",
+      "query": "SELECT initcap($1)",
+      "params": [
+        null
+      ],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "initcap",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute"
+    },
+    {
+      "kind": "immutable-empty",
+      "query": "SELECT chr(0) WHERE FALSE",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "null character not permitted"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "immutable-limit",
+      "query": "SELECT chr(0) LIMIT 0",
+      "params": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "chr",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "error",
+        "sqlstate": "54000",
+        "message": "null character not permitted"
+      },
+      "stage": "bind"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT chr(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT ascii(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT initcap(missing,1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT chr(true,missing)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT chr(abs(missing),1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT ascii(chr(-1),1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function ascii(text, integer) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT chr('bad',1)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function chr(unknown, integer) does not exist"
+      },
+      "stage": "parse"
+    },
+    {
+      "kind": "mixed-priority",
+      "query": "SELECT ascii(1::boolean,missing)",
+      "params": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse"
+    }
+  ],
+  "excluded": [
+    {
+      "query": "SELECT json_build_object('version',current_setting('server_version_num'),'encoding',current_setting('server_encoding'),'lc_ctype',current_setting('lc_ctype'),'lc_collate',current_setting('lc_collate'),'functions',(SELECT json_agg(json_build_object('oid',oid,'name',proname,'args',proargtypes::text,'result',prorettype,'volatile',provolatile,'strict',proisstrict)) FROM pg_proc WHERE pronamespace='pg_catalog'::regnamespace AND proname IN ('ascii','chr','initcap')))",
+      "kind": "metadata",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT public.ascii('aBC')",
+      "kind": "ascii-namespace",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT public.initcap('aBC')",
+      "kind": "initcap-namespace",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT public.chr(65)",
+      "kind": "chr-namespace",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT ascii($1)",
+      "kind": "NUL-input",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT initcap($1)",
+      "kind": "NUL-input-initcap",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    },
+    {
+      "query": "SELECT chr('bad')",
+      "kind": "bad-cast",
+      "reason": "metadata attempt or preexisting namespace/text admission/literal cast gap; not in matched corpus"
+    }
+  ],
+  "matched_case_count": 117,
+  "known_gap_case_count": 3
+}

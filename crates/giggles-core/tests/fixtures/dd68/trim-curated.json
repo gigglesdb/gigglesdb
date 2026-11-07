@@ -1,0 +1,2561 @@
+{
+  "raw_denominator": 112,
+  "substring_proposal_only": 7,
+  "additional_keyword": 4,
+  "eligible": 93,
+  "known_gaps": 16,
+  "cases": [
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(FROM '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH FROM '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING FROM '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc  "
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(TRAILING FROM '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "  abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'x' FROM 'xxabxx')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING 'x' FROM 'xxabxx')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abxx"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(TRAILING 'x' FROM 'xxabxx')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "xxab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('x' FROM 'xxabxx')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('xxabxx','x')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'xxabxx','x')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING 'xxabxx','x')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abxx"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(TRAILING 'xxabxx','x')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "xxab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(FROM 'xxabxx','x')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "ab"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'x' FROM 'xxabxx','y')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(unknown, unknown, unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING 'x' FROM 'xxabxx','y')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.ltrim(unknown, unknown, unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('a','b','c')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(unknown, unknown, unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc  "
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(TRAILING '  abc  ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "  abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(NULL FROM 'abc')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('x' FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('' FROM 'abc')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('abc' FROM '')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            ""
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 1 FROM 'abc')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(unknown, integer) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(1)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(integer) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM()",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(FROM)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING FROM)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'x' FROM)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'x' 'abc')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"'abc'\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH FROM 'a' FROM 'b')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('a' FROM 'b' FROM 'c')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(TRAILING LEADING FROM 'a')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"LEADING\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'a',)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \")\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM('a',FROM 'b')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH missing FROM 'abc')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(BOTH 'a' FROM missing)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42703",
+        "message": "column \"missing\" does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM(LEADING NULL FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "text-syntax",
+      "query": "SELECT TRIM((CAST(' x ' AS text)))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "x"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT trim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "x"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT trim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "a"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"trim\"(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function trim(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"trim\"('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"TRIM\"(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function TRIM(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"TRIM\"('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.trim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.trim(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.trim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.\"trim\"(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.trim(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.\"trim\"('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"pg_catalog\".\"trim\"(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.trim(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT \"pg_catalog\".\"trim\"('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT public.trim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function public.trim(unknown) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT public.trim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": "Unsupported",
+      "eligible": false
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.btrim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "x"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.btrim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.ltrim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "x "
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.ltrim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.rtrim(' x ')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            " x"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "namespace",
+      "query": "SELECT pg_catalog.rtrim('x' FROM 'xxa')",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"FROM\""
+      },
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(bytea) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(decode('202061622020','hex'),decode('20','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x6162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(decode('20','hex') FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x6162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(NULL FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(decode('20','hex') FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(BOTH decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.btrim(bytea) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(BOTH decode('202061622020','hex'),decode('20','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x6162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(BOTH decode('20','hex') FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x6162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(BOTH NULL FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(BOTH decode('20','hex') FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(LEADING decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.ltrim(bytea) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(LEADING decode('202061622020','hex'),decode('20','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x61622020"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(LEADING decode('20','hex') FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x61622020"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(LEADING NULL FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(LEADING decode('20','hex') FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(TRAILING decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42883",
+        "message": "function pg_catalog.rtrim(bytea) does not exist"
+      },
+      "stage": "parse",
+      "known_gap_core": "Type",
+      "eligible": false
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(TRAILING decode('202061622020','hex'),decode('20','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x20206162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(TRAILING decode('20','hex') FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\\x20206162"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(TRAILING NULL FROM decode('202061622020','hex'))",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "bytes",
+      "query": "SELECT TRIM(TRAILING decode('20','hex') FROM NULL)",
+      "params": [],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 17,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM($1)",
+      "params": [
+        "  abc  "
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM($1)",
+      "params": [
+        null
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "xy",
+        "xyabcxy"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(LEADING $1 FROM $2)",
+      "params": [
+        "xy",
+        "xyabcxy"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abcxy"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(TRAILING $1 FROM $2)",
+      "params": [
+        "xy",
+        "xyabcxy"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "xyabc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        null,
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(LEADING $1 FROM $2)",
+      "params": [
+        null,
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(TRAILING $1 FROM $2)",
+      "params": [
+        null,
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "x",
+        null
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(LEADING $1 FROM $2)",
+      "params": [
+        "x",
+        null
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(TRAILING $1 FROM $2)",
+      "params": [
+        "x",
+        null
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "",
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(LEADING $1 FROM $2)",
+      "params": [
+        "",
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "ltrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "param",
+      "query": "SELECT TRIM(TRAILING $1 FROM $2)",
+      "params": [
+        "",
+        "abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "rtrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "\u00e9",
+        "\u00e9\u00e9abc\u00e9"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "\ud83d\ude00",
+        "\ud83d\ude00x\ud83d\ude00"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "x"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "e\u0301",
+        "\u0301eX\u0301e"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "X"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "ab",
+        "abbaXbaba"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "X"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        "",
+        "\u00e9abc"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\u00e9abc"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "unicode",
+      "query": "SELECT TRIM(BOTH $1 FROM $2)",
+      "params": [
+        " ",
+        "\t a \n"
+      ],
+      "setup": [],
+      "observation": {
+        "parameterTypes": [
+          25,
+          25
+        ],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "\t a \n"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "row",
+      "query": "SELECT TRIM(BOTH 'x' FROM label) FROM trim_input ORDER BY id",
+      "params": [],
+      "setup": [
+        "CREATE TEMP TABLE trim_input(id integer,label text)",
+        "INSERT INTO trim_input VALUES(1,'xxAbxx'),(2,NULL)"
+      ],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Ab"
+          ],
+          [
+            null
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "row",
+      "query": "SELECT MIN(TRIM(LEADING 'x' FROM label)) FROM trim_input",
+      "params": [],
+      "setup": [
+        "CREATE TEMP TABLE trim_input(id integer,label text)",
+        "INSERT INTO trim_input VALUES(1,'xxAbxx'),(2,NULL)"
+      ],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "min",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "Abxx"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "kind": "row",
+      "query": "SELECT TRIM(label) FROM trim_input WHERE TRIM('x' FROM label)='Ab' ORDER BY TRIM(label)",
+      "params": [],
+      "setup": [
+        "CREATE TEMP TABLE trim_input(id integer,label text)",
+        "INSERT INTO trim_input VALUES(1,'xxAbxx'),(2,NULL)"
+      ],
+      "observation": {
+        "parameterTypes": [],
+        "resultTypes": [
+          {
+            "name": "btrim",
+            "oid": 25,
+            "format": 0
+          }
+        ],
+        "status": "ok",
+        "rows": [
+          [
+            "xxAbxx"
+          ]
+        ],
+        "format": "PG text exact UTF8; numeric retained as text"
+      },
+      "stage": "execute",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "query": "SELECT TRIM(FROM from)",
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"from\""
+      },
+      "kind": "keyword-position",
+      "params": [],
+      "setup": [],
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "query": "SELECT TRIM(FROM both)",
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"both\""
+      },
+      "kind": "keyword-position",
+      "params": [],
+      "setup": [],
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "query": "SELECT TRIM(FROM leading)",
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"leading\""
+      },
+      "kind": "keyword-position",
+      "params": [],
+      "setup": [],
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    },
+    {
+      "query": "SELECT TRIM(FROM trailing)",
+      "observation": {
+        "parameterTypes": null,
+        "resultTypes": null,
+        "status": "error",
+        "sqlstate": "42601",
+        "message": "syntax error at or near \"trailing\""
+      },
+      "kind": "keyword-position",
+      "params": [],
+      "setup": [],
+      "stage": "parse",
+      "known_gap_core": null,
+      "eligible": true
+    }
+  ]
+}

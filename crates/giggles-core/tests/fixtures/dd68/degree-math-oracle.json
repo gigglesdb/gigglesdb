@@ -1,0 +1,1725 @@
+[
+  {
+    "function": "sind",
+    "args": [
+      "-720"
+    ],
+    "expression": "sind('-720'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-360"
+    ],
+    "expression": "sind('-360'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-270"
+    ],
+    "expression": "sind('-270'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-180"
+    ],
+    "expression": "sind('-180'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-90"
+    ],
+    "expression": "sind('-90'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-60"
+    ],
+    "expression": "sind('-60'::float8)",
+    "text": "-0.8660254037844387",
+    "hex": "bfebb67ae8584cab"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-45"
+    ],
+    "expression": "sind('-45'::float8)",
+    "text": "-0.7071067811865475",
+    "hex": "bfe6a09e667f3bcc"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-30"
+    ],
+    "expression": "sind('-30'::float8)",
+    "text": "-0.5",
+    "hex": "bfe0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-1"
+    ],
+    "expression": "sind('-1'::float8)",
+    "text": "-0.017452406437283515",
+    "hex": "bf91df0b2b89dd1f"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "-0"
+    ],
+    "expression": "sind('-0'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "0"
+    ],
+    "expression": "sind('0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "1"
+    ],
+    "expression": "sind('1'::float8)",
+    "text": "0.017452406437283515",
+    "hex": "3f91df0b2b89dd1f"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "15"
+    ],
+    "expression": "sind('15'::float8)",
+    "text": "0.2588190451025208",
+    "hex": "3fd0907dc1930691"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "30"
+    ],
+    "expression": "sind('30'::float8)",
+    "text": "0.5",
+    "hex": "3fe0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "45"
+    ],
+    "expression": "sind('45'::float8)",
+    "text": "0.7071067811865475",
+    "hex": "3fe6a09e667f3bcc"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "60"
+    ],
+    "expression": "sind('60'::float8)",
+    "text": "0.8660254037844387",
+    "hex": "3febb67ae8584cab"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "89"
+    ],
+    "expression": "sind('89'::float8)",
+    "text": "0.9998476951563913",
+    "hex": "3feffec097f5af8a"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "90"
+    ],
+    "expression": "sind('90'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "91"
+    ],
+    "expression": "sind('91'::float8)",
+    "text": "0.9998476951563913",
+    "hex": "3feffec097f5af8a"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "120"
+    ],
+    "expression": "sind('120'::float8)",
+    "text": "0.8660254037844387",
+    "hex": "3febb67ae8584cab"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "180"
+    ],
+    "expression": "sind('180'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "270"
+    ],
+    "expression": "sind('270'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "360"
+    ],
+    "expression": "sind('360'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "1e308"
+    ],
+    "expression": "sind('1e308'::float8)",
+    "text": "-0.898794046299167",
+    "hex": "bfecc2ebbb5638ca"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "1e-300"
+    ],
+    "expression": "sind('1e-300'::float8)",
+    "text": "1.7453292519943298e-302",
+    "hex": "0147f00f350a8dde"
+  },
+  {
+    "function": "sind",
+    "args": [
+      "NaN"
+    ],
+    "expression": "sind('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-720"
+    ],
+    "expression": "cosd('-720'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-360"
+    ],
+    "expression": "cosd('-360'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-270"
+    ],
+    "expression": "cosd('-270'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-180"
+    ],
+    "expression": "cosd('-180'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-90"
+    ],
+    "expression": "cosd('-90'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-60"
+    ],
+    "expression": "cosd('-60'::float8)",
+    "text": "0.5",
+    "hex": "3fe0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-45"
+    ],
+    "expression": "cosd('-45'::float8)",
+    "text": "0.7071067811865475",
+    "hex": "3fe6a09e667f3bcc"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-30"
+    ],
+    "expression": "cosd('-30'::float8)",
+    "text": "0.8660254037844387",
+    "hex": "3febb67ae8584cab"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-1"
+    ],
+    "expression": "cosd('-1'::float8)",
+    "text": "0.9998476951563913",
+    "hex": "3feffec097f5af8a"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "-0"
+    ],
+    "expression": "cosd('-0'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "0"
+    ],
+    "expression": "cosd('0'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "1"
+    ],
+    "expression": "cosd('1'::float8)",
+    "text": "0.9998476951563913",
+    "hex": "3feffec097f5af8a"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "15"
+    ],
+    "expression": "cosd('15'::float8)",
+    "text": "0.9659258262890683",
+    "hex": "3feee8dd4748bf15"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "30"
+    ],
+    "expression": "cosd('30'::float8)",
+    "text": "0.8660254037844387",
+    "hex": "3febb67ae8584cab"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "45"
+    ],
+    "expression": "cosd('45'::float8)",
+    "text": "0.7071067811865475",
+    "hex": "3fe6a09e667f3bcc"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "60"
+    ],
+    "expression": "cosd('60'::float8)",
+    "text": "0.5",
+    "hex": "3fe0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "89"
+    ],
+    "expression": "cosd('89'::float8)",
+    "text": "0.017452406437283515",
+    "hex": "3f91df0b2b89dd1f"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "90"
+    ],
+    "expression": "cosd('90'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "91"
+    ],
+    "expression": "cosd('91'::float8)",
+    "text": "-0.017452406437283515",
+    "hex": "bf91df0b2b89dd1f"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "120"
+    ],
+    "expression": "cosd('120'::float8)",
+    "text": "-0.5",
+    "hex": "bfe0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "180"
+    ],
+    "expression": "cosd('180'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "270"
+    ],
+    "expression": "cosd('270'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "360"
+    ],
+    "expression": "cosd('360'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "1e308"
+    ],
+    "expression": "cosd('1e308'::float8)",
+    "text": "0.43837114678907746",
+    "hex": "3fdc0e45dabe05c9"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "1e-300"
+    ],
+    "expression": "cosd('1e-300'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cosd",
+    "args": [
+      "NaN"
+    ],
+    "expression": "cosd('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-720"
+    ],
+    "expression": "tand('-720'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-360"
+    ],
+    "expression": "tand('-360'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-270"
+    ],
+    "expression": "tand('-270'::float8)",
+    "text": "Infinity",
+    "hex": "7ff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-180"
+    ],
+    "expression": "tand('-180'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-90"
+    ],
+    "expression": "tand('-90'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-60"
+    ],
+    "expression": "tand('-60'::float8)",
+    "text": "-1.7320508075688774",
+    "hex": "bffbb67ae8584cab"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-45"
+    ],
+    "expression": "tand('-45'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-30"
+    ],
+    "expression": "tand('-30'::float8)",
+    "text": "-0.5773502691896257",
+    "hex": "bfe279a74590331c"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-1"
+    ],
+    "expression": "tand('-1'::float8)",
+    "text": "-0.01745506492821759",
+    "hex": "bf91dfbd9410a423"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "-0"
+    ],
+    "expression": "tand('-0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "0"
+    ],
+    "expression": "tand('0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "1"
+    ],
+    "expression": "tand('1'::float8)",
+    "text": "0.01745506492821759",
+    "hex": "3f91dfbd9410a423"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "15"
+    ],
+    "expression": "tand('15'::float8)",
+    "text": "0.26794919243112275",
+    "hex": "3fd126145e9ecd57"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "30"
+    ],
+    "expression": "tand('30'::float8)",
+    "text": "0.5773502691896257",
+    "hex": "3fe279a74590331c"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "45"
+    ],
+    "expression": "tand('45'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "60"
+    ],
+    "expression": "tand('60'::float8)",
+    "text": "1.7320508075688774",
+    "hex": "3ffbb67ae8584cab"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "89"
+    ],
+    "expression": "tand('89'::float8)",
+    "text": "57.28996163075942",
+    "hex": "404ca51d76749a70"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "90"
+    ],
+    "expression": "tand('90'::float8)",
+    "text": "Infinity",
+    "hex": "7ff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "91"
+    ],
+    "expression": "tand('91'::float8)",
+    "text": "-57.28996163075942",
+    "hex": "c04ca51d76749a70"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "120"
+    ],
+    "expression": "tand('120'::float8)",
+    "text": "-1.7320508075688774",
+    "hex": "bffbb67ae8584cab"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "180"
+    ],
+    "expression": "tand('180'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "270"
+    ],
+    "expression": "tand('270'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "360"
+    ],
+    "expression": "tand('360'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "1e308"
+    ],
+    "expression": "tand('1e308'::float8)",
+    "text": "-2.050303841579296",
+    "hex": "c0006705b35391e7"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "1e-300"
+    ],
+    "expression": "tand('1e-300'::float8)",
+    "text": "1.7453292519943298e-302",
+    "hex": "0147f00f350a8dde"
+  },
+  {
+    "function": "tand",
+    "args": [
+      "NaN"
+    ],
+    "expression": "tand('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-720"
+    ],
+    "expression": "cotd('-720'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-360"
+    ],
+    "expression": "cotd('-360'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-270"
+    ],
+    "expression": "cotd('-270'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-180"
+    ],
+    "expression": "cotd('-180'::float8)",
+    "text": "Infinity",
+    "hex": "7ff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-90"
+    ],
+    "expression": "cotd('-90'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-60"
+    ],
+    "expression": "cotd('-60'::float8)",
+    "text": "-0.5773502691896257",
+    "hex": "bfe279a74590331c"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-45"
+    ],
+    "expression": "cotd('-45'::float8)",
+    "text": "-1",
+    "hex": "bff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-30"
+    ],
+    "expression": "cotd('-30'::float8)",
+    "text": "-1.7320508075688774",
+    "hex": "bffbb67ae8584cab"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-1"
+    ],
+    "expression": "cotd('-1'::float8)",
+    "text": "-57.28996163075942",
+    "hex": "c04ca51d76749a70"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "-0"
+    ],
+    "expression": "cotd('-0'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "0"
+    ],
+    "expression": "cotd('0'::float8)",
+    "text": "Infinity",
+    "hex": "7ff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "1"
+    ],
+    "expression": "cotd('1'::float8)",
+    "text": "57.28996163075942",
+    "hex": "404ca51d76749a70"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "15"
+    ],
+    "expression": "cotd('15'::float8)",
+    "text": "3.7320508075688767",
+    "hex": "400ddb3d742c2654"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "30"
+    ],
+    "expression": "cotd('30'::float8)",
+    "text": "1.7320508075688774",
+    "hex": "3ffbb67ae8584cab"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "45"
+    ],
+    "expression": "cotd('45'::float8)",
+    "text": "1",
+    "hex": "3ff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "60"
+    ],
+    "expression": "cotd('60'::float8)",
+    "text": "0.5773502691896257",
+    "hex": "3fe279a74590331c"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "89"
+    ],
+    "expression": "cotd('89'::float8)",
+    "text": "0.01745506492821759",
+    "hex": "3f91dfbd9410a423"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "90"
+    ],
+    "expression": "cotd('90'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "91"
+    ],
+    "expression": "cotd('91'::float8)",
+    "text": "-0.01745506492821759",
+    "hex": "bf91dfbd9410a423"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "120"
+    ],
+    "expression": "cotd('120'::float8)",
+    "text": "-0.5773502691896257",
+    "hex": "bfe279a74590331c"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "180"
+    ],
+    "expression": "cotd('180'::float8)",
+    "text": "-Infinity",
+    "hex": "fff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "270"
+    ],
+    "expression": "cotd('270'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "360"
+    ],
+    "expression": "cotd('360'::float8)",
+    "text": "Infinity",
+    "hex": "7ff0000000000000"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "1e308"
+    ],
+    "expression": "cotd('1e308'::float8)",
+    "text": "-0.48773258856586144",
+    "hex": "bfdf3702bf455cf4"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "1e-300"
+    ],
+    "expression": "cotd('1e-300'::float8)",
+    "text": "5.729577951308231e+301",
+    "hex": "7e95638a23f1bc64"
+  },
+  {
+    "function": "cotd",
+    "args": [
+      "NaN"
+    ],
+    "expression": "cotd('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "-1"
+    ],
+    "expression": "asind('-1'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "-0.9"
+    ],
+    "expression": "asind('-0.9'::float8)",
+    "text": "-64.15806723683288",
+    "hex": "c0500a1dc60b310b"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "-0.5"
+    ],
+    "expression": "asind('-0.5'::float8)",
+    "text": "-30",
+    "hex": "c03e000000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "-0"
+    ],
+    "expression": "asind('-0'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "0"
+    ],
+    "expression": "asind('0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "0.1"
+    ],
+    "expression": "asind('0.1'::float8)",
+    "text": "5.739170477266786",
+    "hex": "4016f4e91b081e44"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "0.5"
+    ],
+    "expression": "asind('0.5'::float8)",
+    "text": "30",
+    "hex": "403e000000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "0.9"
+    ],
+    "expression": "asind('0.9'::float8)",
+    "text": "64.15806723683288",
+    "hex": "40500a1dc60b310b"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "1"
+    ],
+    "expression": "asind('1'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "asind",
+    "args": [
+      "NaN"
+    ],
+    "expression": "asind('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "-1"
+    ],
+    "expression": "acosd('-1'::float8)",
+    "text": "180",
+    "hex": "4066800000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "-0.9"
+    ],
+    "expression": "acosd('-0.9'::float8)",
+    "text": "154.1580672368329",
+    "hex": "4063450ee3059886"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "-0.5"
+    ],
+    "expression": "acosd('-0.5'::float8)",
+    "text": "120",
+    "hex": "405e000000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "-0"
+    ],
+    "expression": "acosd('-0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "0"
+    ],
+    "expression": "acosd('0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "0.1"
+    ],
+    "expression": "acosd('0.1'::float8)",
+    "text": "84.26082952273322",
+    "hex": "405510b16e4f7e1c"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "0.5"
+    ],
+    "expression": "acosd('0.5'::float8)",
+    "text": "60",
+    "hex": "404e000000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "0.9"
+    ],
+    "expression": "acosd('0.9'::float8)",
+    "text": "25.841932763167122",
+    "hex": "4039d788e7d33bd4"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "1"
+    ],
+    "expression": "acosd('1'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "acosd",
+    "args": [
+      "NaN"
+    ],
+    "expression": "acosd('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "-1"
+    ],
+    "expression": "atand('-1'::float8)",
+    "text": "-45",
+    "hex": "c046800000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "-0.9"
+    ],
+    "expression": "atand('-0.9'::float8)",
+    "text": "-41.98721249581666",
+    "hex": "c044fe5cfaa3de17"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "-0.5"
+    ],
+    "expression": "atand('-0.5'::float8)",
+    "text": "-26.565051177077986",
+    "hex": "c03a90a731a61dc3"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "-0"
+    ],
+    "expression": "atand('-0'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "0"
+    ],
+    "expression": "atand('0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "0.1"
+    ],
+    "expression": "atand('0.1'::float8)",
+    "text": "5.710593137499643",
+    "hex": "4016d7a5ba394ac0"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "0.5"
+    ],
+    "expression": "atand('0.5'::float8)",
+    "text": "26.565051177077986",
+    "hex": "403a90a731a61dc3"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "0.9"
+    ],
+    "expression": "atand('0.9'::float8)",
+    "text": "41.98721249581666",
+    "hex": "4044fe5cfaa3de17"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "1"
+    ],
+    "expression": "atand('1'::float8)",
+    "text": "45",
+    "hex": "4046800000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "NaN"
+    ],
+    "expression": "atand('NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "Infinity"
+    ],
+    "expression": "atand('Infinity'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "-Infinity"
+    ],
+    "expression": "atand('-Infinity'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atand",
+    "args": [
+      "1e308"
+    ],
+    "expression": "atand('1e308'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "-Infinity"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'-Infinity'::float8)",
+    "text": "-135",
+    "hex": "c060e00000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "-1"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'-1'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "-0"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'-0'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "0"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'0'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "1"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'1'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "Infinity"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'Infinity'::float8)",
+    "text": "-45",
+    "hex": "c046800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-Infinity",
+      "NaN"
+    ],
+    "expression": "atan2d('-Infinity'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "-Infinity"
+    ],
+    "expression": "atan2d('-1'::float8,'-Infinity'::float8)",
+    "text": "-180",
+    "hex": "c066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "-1"
+    ],
+    "expression": "atan2d('-1'::float8,'-1'::float8)",
+    "text": "-135",
+    "hex": "c060e00000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "-0"
+    ],
+    "expression": "atan2d('-1'::float8,'-0'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "0"
+    ],
+    "expression": "atan2d('-1'::float8,'0'::float8)",
+    "text": "-90",
+    "hex": "c056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "1"
+    ],
+    "expression": "atan2d('-1'::float8,'1'::float8)",
+    "text": "-45",
+    "hex": "c046800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "Infinity"
+    ],
+    "expression": "atan2d('-1'::float8,'Infinity'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-1",
+      "NaN"
+    ],
+    "expression": "atan2d('-1'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "-Infinity"
+    ],
+    "expression": "atan2d('-0'::float8,'-Infinity'::float8)",
+    "text": "-180",
+    "hex": "c066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "-1"
+    ],
+    "expression": "atan2d('-0'::float8,'-1'::float8)",
+    "text": "-180",
+    "hex": "c066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "-0"
+    ],
+    "expression": "atan2d('-0'::float8,'-0'::float8)",
+    "text": "-180",
+    "hex": "c066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "0"
+    ],
+    "expression": "atan2d('-0'::float8,'0'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "1"
+    ],
+    "expression": "atan2d('-0'::float8,'1'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "Infinity"
+    ],
+    "expression": "atan2d('-0'::float8,'Infinity'::float8)",
+    "text": "-0",
+    "hex": "8000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "-0",
+      "NaN"
+    ],
+    "expression": "atan2d('-0'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "-Infinity"
+    ],
+    "expression": "atan2d('0'::float8,'-Infinity'::float8)",
+    "text": "180",
+    "hex": "4066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "-1"
+    ],
+    "expression": "atan2d('0'::float8,'-1'::float8)",
+    "text": "180",
+    "hex": "4066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "-0"
+    ],
+    "expression": "atan2d('0'::float8,'-0'::float8)",
+    "text": "180",
+    "hex": "4066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "0"
+    ],
+    "expression": "atan2d('0'::float8,'0'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "1"
+    ],
+    "expression": "atan2d('0'::float8,'1'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "Infinity"
+    ],
+    "expression": "atan2d('0'::float8,'Infinity'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "0",
+      "NaN"
+    ],
+    "expression": "atan2d('0'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "-Infinity"
+    ],
+    "expression": "atan2d('1'::float8,'-Infinity'::float8)",
+    "text": "180",
+    "hex": "4066800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "-1"
+    ],
+    "expression": "atan2d('1'::float8,'-1'::float8)",
+    "text": "135",
+    "hex": "4060e00000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "-0"
+    ],
+    "expression": "atan2d('1'::float8,'-0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "0"
+    ],
+    "expression": "atan2d('1'::float8,'0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "1"
+    ],
+    "expression": "atan2d('1'::float8,'1'::float8)",
+    "text": "45",
+    "hex": "4046800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "Infinity"
+    ],
+    "expression": "atan2d('1'::float8,'Infinity'::float8)",
+    "text": "0",
+    "hex": "0000000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "1",
+      "NaN"
+    ],
+    "expression": "atan2d('1'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "-Infinity"
+    ],
+    "expression": "atan2d('Infinity'::float8,'-Infinity'::float8)",
+    "text": "135",
+    "hex": "4060e00000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "-1"
+    ],
+    "expression": "atan2d('Infinity'::float8,'-1'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "-0"
+    ],
+    "expression": "atan2d('Infinity'::float8,'-0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "0"
+    ],
+    "expression": "atan2d('Infinity'::float8,'0'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "1"
+    ],
+    "expression": "atan2d('Infinity'::float8,'1'::float8)",
+    "text": "90",
+    "hex": "4056800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "Infinity"
+    ],
+    "expression": "atan2d('Infinity'::float8,'Infinity'::float8)",
+    "text": "45",
+    "hex": "4046800000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "Infinity",
+      "NaN"
+    ],
+    "expression": "atan2d('Infinity'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "-Infinity"
+    ],
+    "expression": "atan2d('NaN'::float8,'-Infinity'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "-1"
+    ],
+    "expression": "atan2d('NaN'::float8,'-1'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "-0"
+    ],
+    "expression": "atan2d('NaN'::float8,'-0'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "0"
+    ],
+    "expression": "atan2d('NaN'::float8,'0'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "1"
+    ],
+    "expression": "atan2d('NaN'::float8,'1'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "Infinity"
+    ],
+    "expression": "atan2d('NaN'::float8,'Infinity'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  },
+  {
+    "function": "atan2d",
+    "args": [
+      "NaN",
+      "NaN"
+    ],
+    "expression": "atan2d('NaN'::float8,'NaN'::float8)",
+    "text": "NaN",
+    "hex": "7ff8000000000000"
+  }
+]

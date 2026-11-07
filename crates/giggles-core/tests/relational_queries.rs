@@ -608,6 +608,13 @@ fn stable_sort_null_order_and_global_limit() {
             vec![V::Int(2)]
         ]
     );
+    assert_eq!(
+        vals(run(
+            &mut s,
+            "SELECT j.id FROM jobs j ORDER BY j.wage ASC NULLS FIRST LIMIT 3"
+        )),
+        vec![vec![V::Int(1)], vec![V::Int(2)], vec![V::Int(3)]]
+    );
     assert!(
         run(&mut s, "SELECT COUNT(*) FROM jobs LIMIT 0")
             .rows

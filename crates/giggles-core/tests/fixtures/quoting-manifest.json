@@ -1,0 +1,177 @@
+{
+  "qualification": "Bounded quote_ident(text),quote_literal(text),quote_nullable(text) default quote_all_identifiers=off only; no full function/DD68 completion",
+  "baseline_corpus": {
+    "total": 697,
+    "classes": {
+      "parity": 634,
+      "inherited_unknown_parameter_gap": 9,
+      "scoped_gap": 51,
+      "inherited_mixed_priority_gap": 3
+    },
+    "success_values_text_NULL_OID": 591,
+    "error_contract_interpretations": 43,
+    "not_697_PG_parity_matches": true,
+    "scope_gaps": {
+      "nontext_ANYELEMENT": 44,
+      "quote_all_identifiers_on": 1,
+      "namespace": 6,
+      "unknown_arity": 9,
+      "mixed_priority": 3
+    },
+    "raw_pg_observations_unchanged": true,
+    "extra_authorized_TLS_mixed_PG_state": "42703",
+    "extra_authorized_TLS_mixed_probe": "J:\\gigglesdb-work\\dd68-quoting-functions-20261106\\authorized-mixed-priority-pg.json"
+  },
+  "tests": {
+    "core": 4,
+    "private": 2,
+    "TLS": 3,
+    "failed": 0,
+    "ignored": 0
+  },
+  "source_pin": "source-v3 core/private; source-v4 TLS differs ONLYnewauthority-control .inc; all core/model/types compiled-input bytes identical. Not latest global workspace after subsequent TRIM work.",
+  "source_file_count": 776,
+  "owned_new_live_sha256": {
+    "crates/giggles-core/src/relational/query/functions/quoting.rs": "f3dfd15882dcfd8dc3c49d24782a9d18397a408301dce4906d3ee4f172388793",
+    "crates/giggles-core/src/relational/query/functions/quoting_keywords.rs": "f0333ba8060fb75cec6f8fa52047eca7700b5b01ea668303a1ba4436a7aa17f6",
+    "crates/giggles-core/tests/sql_quoting_functions.rs": "a15872f30ad9a959e289516a18824d65bca2e10f9c14c6a6919794454a64ebfb",
+    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4e8f8a7689f89438f0b7988e8e74d53a885e47443ed4016753d50143432ba9fa",
+    "crates/giggles-server/tests/quoting_functions_network.inc": "8b9a03acff68a3d209a6f17878300496057dc2c7272fe5fdc310bba870f74df4"
+  },
+  "upstream": {
+    "tag": "REL_18_0",
+    "sources": [
+      {
+        "path": "src/backend/utils/adt/quote.c",
+        "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_0/src/backend/utils/adt/quote.c",
+        "sha256": "8a490d71f35fd048d886e05887328a64e6ab004e8bad91a24945e73035a096a6"
+      },
+      {
+        "path": "src/backend/utils/adt/ruleutils.c",
+        "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_0/src/backend/utils/adt/ruleutils.c",
+        "sha256": "a6a616102bc6d77e303472db766639c100b88d03035560d0be974350be8a6fc1"
+      },
+      {
+        "path": "src/include/parser/kwlist.h",
+        "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_0/src/include/parser/kwlist.h",
+        "sha256": "fdcdf3694513cba63b4016f63032472b686e381bb35f17c5d645bc2f6f1dac16"
+      },
+      {
+        "path": "COPYRIGHT",
+        "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_0/COPYRIGHT",
+        "sha256": "5ed3ce5c9373dff7f98b1fae7a6c7ccd98df7d734d46d24c1bcebf1240be8307"
+      }
+    ]
+  },
+  "quote_metadata": {
+    "parameterTypes": [],
+    "resultTypes": [
+      {
+        "name": "oid",
+        "oid": 26,
+        "format": 0
+      },
+      {
+        "name": "proname",
+        "oid": 19,
+        "format": 0
+      },
+      {
+        "name": "proargtypes",
+        "oid": 25,
+        "format": 0
+      },
+      {
+        "name": "prorettype",
+        "oid": 26,
+        "format": 0
+      },
+      {
+        "name": "proisstrict",
+        "oid": 16,
+        "format": 0
+      },
+      {
+        "name": "provolatile",
+        "oid": 18,
+        "format": 0
+      }
+    ],
+    "status": "ok",
+    "rows": [
+      [
+        "1282",
+        "quote_ident",
+        "25",
+        "25",
+        "t",
+        "i"
+      ],
+      [
+        "1283",
+        "quote_literal",
+        "25",
+        "25",
+        "t",
+        "i"
+      ],
+      [
+        "1285",
+        "quote_literal",
+        "2283",
+        "25",
+        "t",
+        "s"
+      ],
+      [
+        "1289",
+        "quote_nullable",
+        "25",
+        "25",
+        "f",
+        "i"
+      ],
+      [
+        "1290",
+        "quote_nullable",
+        "2283",
+        "25",
+        "f",
+        "s"
+      ]
+    ],
+    "format": "PG text exact UTF8; numeric retained as text"
+  },
+  "raw_main_sha256": "7fe7cac78ca450561c6909581e2653ecf57396b8f234fbf737869ccd559fdc67",
+  "raw_priority_sha256": "004045f70ec2e222bb4cbc04c6951a6f68c69cf477ca6a9a38d1ca6887513a9c",
+  "supplemental_authorized_PG_probe_sha256": "6e63b30c5f18484fc12f61fe1f623a08d54247119d99800b1151806f39b125d2",
+  "main_probe_count": 673,
+  "priority_probe_count": 24,
+  "supplemental_authorized_probe_count": 1,
+  "phase_profiles": {
+    "default_text_and_NULL": "actualTLSparameter/resultOID25, text/binarybyte/nullframes",
+    "unsupported_nontext_ANYELEMENT": "actualTLSParse0A000, not undefinedsignature",
+    "inherited_untyped_wrongarity": "actualTLSParse42804 vsPG42883",
+    "missing_no_FROM": "actualTLSauthority42501, not a PG parity comparison",
+    "authorized_mixed_missing": "actualTLSParse42804 vsactualPG42703",
+    "resource_expansion": "actualTLSBind54000 inclWHEREFALSE/LIMIT0, Giggles cap notPGerrorparity"
+  },
+  "resource_scope": "Module borrowed inputs, upfront inputlen cap, exact UTF8 expansion and sharedbyteadmission before soleoutputString allocation; fixed bounded scans. Existing caller parameter/result copies not a new allocator-proof claim.",
+  "limitations": [
+    "63declaredscope/profile controls are NOT exactPGmatches:44nontextANYELEMENT,1nondefaultquote_all_identifiers,6namespace,9untypedarity,3mixedpriority",
+    "634commensurate Core observations partition591successful text/NULL/OID and43errorcontracts; mappedCorestates are adapterinterpretations, actualwire evidence is the selectedTLScontrols",
+    "FixedPG18/defaultidentifierGUC/validPGtext domain only; no custom session/formatters/otherpatch/locale-general claim",
+    "776localcapturedsourcefiles and3testexecutable pre/post replay guards only; no global buildscript/compiler/externalregistry/allocator hermeticity claim",
+    "No stage/commit/push/delete or immutablehistoricaltest changes"
+  ],
+  "evidence_receipt": "J:\\gigglesdb-work\\dd68-quoting-functions-20261106\\receipt-final.json",
+  "evidence_receipt_sha256": "9dab15159ce1cbb169a3c8566b080c43fc4064304f3bbc98eb558a29a8695126",
+  "qualified_source_hash_evidence": "J:\\gigglesdb-work\\dd68-quoting-functions-20261106\\source-v4-before.json",
+  "explicit_nonempty_sha256": {
+    "crates/giggles-core/src/relational/query/functions/quoting.rs": "f3dfd15882dcfd8dc3c49d24782a9d18397a408301dce4906d3ee4f172388793",
+    "crates/giggles-core/src/relational/query/functions/quoting_keywords.rs": "f0333ba8060fb75cec6f8fa52047eca7700b5b01ea668303a1ba4436a7aa17f6",
+    "crates/giggles-core/tests/sql_quoting_functions.rs": "a15872f30ad9a959e289516a18824d65bca2e10f9c14c6a6919794454a64ebfb",
+    "crates/giggles-core/tests/fixtures/quoting-pg18.json": "4e8f8a7689f89438f0b7988e8e74d53a885e47443ed4016753d50143432ba9fa",
+    "crates/giggles-server/tests/quoting_functions_network.inc": "8b9a03acff68a3d209a6f17878300496057dc2c7272fe5fdc310bba870f74df4"
+  }
+}
