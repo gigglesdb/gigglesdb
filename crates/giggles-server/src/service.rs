@@ -167,6 +167,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidForeignKey) => "42830",
         CoreError::Sql(S::InvalidSchema) => "3F000",
         CoreError::Sql(S::DivisionByZero) => "22012",
+        CoreError::Sql(S::InvalidEscapeSequence) => "22025",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",

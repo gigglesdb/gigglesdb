@@ -121,6 +121,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidForeignKey => 41,
                 relational::SqlError::InvalidSchema => 42,
                 relational::SqlError::DivisionByZero => 43,
+                relational::SqlError::InvalidEscapeSequence => 44,
             }
         }
     };

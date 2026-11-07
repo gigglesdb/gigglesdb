@@ -12,6 +12,7 @@ use ident::ident;
 mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
+mod like;
 mod query;
 use query::{TypmodSource, result_typmod};
 mod returning;
@@ -170,6 +171,7 @@ pub enum SqlError {
     InvalidForeignKey,
     InvalidSchema,
     DivisionByZero,
+    InvalidEscapeSequence,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

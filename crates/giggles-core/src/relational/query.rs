@@ -75,6 +75,13 @@ enum Filter {
     Scalar(Scalar),
     Compare(Scalar, String, Scalar),
     Null(Scalar, bool),
+    Like {
+        value: Scalar,
+        pattern: Scalar,
+        escape: Option<Scalar>,
+        insensitive: bool,
+        negated: bool,
+    },
     Not(Box<Filter>),
     Logic(Box<Filter>, bool, Box<Filter>),
 }
@@ -82,6 +89,13 @@ enum BoundFilter {
     Scalar(BoundScalar),
     Compare(BoundScalar, String, BoundScalar),
     Null(BoundScalar, bool),
+    Like {
+        value: BoundScalar,
+        pattern: BoundScalar,
+        escape: Option<BoundScalar>,
+        insensitive: bool,
+        negated: bool,
+    },
     Not(Box<BoundFilter>),
     Logic(Box<BoundFilter>, bool, Box<BoundFilter>),
 }
@@ -142,7 +156,7 @@ impl Filter {
             match scalar {
                 Ok(a) => {
                     let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
-                        && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between");
+                        && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
                     if not {
                         p.at += 1;
                     }
@@ -150,6 +164,20 @@ impl Filter {
                         let not = p.word("not");
                         p.need("null")?;
                         Self::Null(a, not)
+                    } else if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike") {
+                        let insensitive = p.word("ilike");
+                        if !insensitive {
+                            p.need("like")?;
+                        }
+                        let pattern = Scalar::parse(p, depth + 1)?;
+                        let escape = if p.word("escape") {
+                            Some(Scalar::parse(p, depth + 1)?)
+                        } else {
+                            None
+                        };
+                        Self::Like {
+                            value: a, pattern, escape, insensitive, negated: not,
+                        }
                     } else if p.word("in") {
                         p.punct('(')?;
                         if p.sym(')') {
@@ -285,6 +313,17 @@ impl Filter {
                 }
                 Ok(())
             }
+            Self::Like { value, pattern, escape, .. } => {
+                for a in [Some(value), Some(pattern), escape.as_ref()].into_iter().flatten() {
+                    let expected = if matches!(a, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some)) {
+                        None
+                    } else {
+                        Some(&DataType::Text)
+                    };
+                    a.infer(expected, params, resolve, tables)?;
+                }
+                Ok(())
+            }
             Self::Not(a) => a.infer(params, resolve, tables),
             Self::Logic(a, _, b) => {
                 a.infer(params, resolve, tables)?;
@@ -373,6 +412,16 @@ impl Filter {
                 }
                 BoundFilter::Compare(av, op.clone(), bv)
             }
+            Self::Like { value, pattern, escape, insensitive, negated } => {
+                let text = |a: &Scalar| {
+                    let bound = bind(a)?;
+                    if bound.ty != DataType::Text && !matches!(a, Scalar::Literal(Value::Null)) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    Ok(bound)
+                };
+                BoundFilter::Like { value: text(value)?, pattern: text(pattern)?, escape: escape.as_ref().map(text).transpose()?, insensitive: *insensitive, negated: *negated }
+            }
             Self::Not(a) => BoundFilter::Not(Box::new(a.bind(params, resolve, tables)?)),
             Self::Logic(a, and, b) => BoundFilter::Logic(
                 Box::new(a.bind(params, resolve, tables)?),
@@ -415,6 +464,25 @@ impl BoundFilter {
                     _ => None,
                 })
             }
+            Self::Like { value, pattern, escape, insensitive, negated } => {
+                let pattern = pattern.plan_constant(budget)?;
+                let escape = match escape {
+                    Some(a) => a.plan_constant(budget)?,
+                    None => Some(Value::Text("\\".into())),
+                };
+                if pattern == Some(Value::Null) || escape == Some(Value::Null) {
+                    return Ok(Some(None));
+                }
+                let escape = match (&pattern, &escape) {
+                    (Some(pattern), Some(escape)) => parse_like_escape(pattern, escape)?,
+                    _ => None,
+                };
+                let value = value.plan_constant(budget)?;
+                match (value, pattern, escape) {
+                    (Some(value), Some(pattern), Some(escape)) => Ok(Some(eval_like(value, pattern, escape, *insensitive, *negated, budget)?)),
+                    _ => Ok(None),
+                }
+            }
             Self::Not(a) => Ok(a.plan_constant(budget)?.map(|a| a.map(|v| !v))),
             Self::Logic(a, and, b) => {
                 let a = a.plan_constant(budget)?;
@@ -444,6 +512,15 @@ impl BoundFilter {
                 _ => return Err(SqlError::Type),
             },
             Self::Null(a, n) => Some((a.eval(row, params, bytes)? == Value::Null) != *n),
+            Self::Like { value, pattern, escape, insensitive, negated } => {
+                let pattern = pattern.eval(row, params, bytes)?;
+                let escape = match escape { Some(a) => a.eval(row, params, bytes)?, None => Value::Text("\\".into()) };
+                let Some(escape) = parse_like_escape(&pattern, &escape)? else {
+                    return Ok(None);
+                };
+                let value = value.eval(row, params, bytes)?;
+                eval_like(value, pattern, escape, *insensitive, *negated, bytes)?
+            }
             Self::Compare(a, op, b) => {
                 let a = a.eval(row, params, bytes)?;
                 let b = b.eval(row, params, bytes)?;
@@ -900,6 +977,7 @@ impl Query {
             match f {
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
+                Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
@@ -934,6 +1012,7 @@ impl Query {
             match f {
                 Filter::Scalar(s) | Filter::Null(s, _) => s.has_undefined_routine(),
                 Filter::Compare(a, _, b) => a.has_undefined_routine() || b.has_undefined_routine(),
+                Filter::Like { value, pattern, escape, .. } => value.has_undefined_routine() || pattern.has_undefined_routine() || escape.as_ref().is_some_and(Scalar::has_undefined_routine),
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) || filter(b),
             }
@@ -965,6 +1044,7 @@ impl Query {
             match f {
                 Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
                 Filter::Compare(a, _, b) => operand(a) && operand(b),
+                Filter::Like { value, pattern, escape, .. } => operand(value) && operand(pattern) && escape.as_ref().is_none_or(operand),
                 Filter::Not(f) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
@@ -2049,6 +2129,13 @@ impl BoundFilter {
                 a.attach_clock(clock);
                 b.attach_clock(clock);
             }
+            Self::Like { value, pattern, escape, .. } => {
+                value.attach_clock(clock);
+                pattern.attach_clock(clock);
+                if let Some(a) = escape {
+                    a.attach_clock(clock);
+                }
+            }
             Self::Not(a) => a.attach_clock(clock),
             Self::Logic(a, _, b) => {
                 a.attach_clock(clock);
@@ -2076,4 +2163,24 @@ impl BoundQuery<'_> {
         }
         self
     }
+}
+
+fn parse_like_escape(pattern: &Value, escape: &Value) -> R<Option<super::like::Escape>> {
+    if *pattern == Value::Null || *escape == Value::Null {
+        return Ok(None);
+    }
+    let (Value::Text(_), Value::Text(escape)) = (pattern, escape) else {
+        return Err(SqlError::UndefinedFunction);
+    };
+    Ok(Some(super::like::Escape::parse(escape)?))
+}
+
+fn eval_like(value: Value, pattern: Value, escape: super::like::Escape, insensitive: bool, negated: bool, work: &mut usize) -> R<Option<bool>> {
+    if value == Value::Null {
+        return Ok(None);
+    }
+    let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {
+        return Err(SqlError::UndefinedFunction);
+    };
+    Ok(Some(super::like::like(&value, &pattern, escape, insensitive, work)? != negated))
 }
