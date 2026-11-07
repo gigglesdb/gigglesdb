@@ -95,7 +95,7 @@ impl MetadataBudget {
 }
 
 fn check_table_shape(table: &TableDef) -> Result<()> {
-    if table.columns.len() > MAX_COLUMNS || table.primary_key.len() > MAX_COLUMNS {
+    if table.logical_columns().count() > MAX_COLUMNS || table.primary_key.len() > MAX_COLUMNS {
         return Err(Error::Limit);
     }
     Ok(())
@@ -131,13 +131,15 @@ fn admit(
             // Table ID and the lengths of its columns and primary-key vectors.
             budget.charge(8 + 8 + 8)?;
             budget.name(&table.name)?;
-            for column in &table.columns {
+            for column in table.logical_columns() {
                 crate::cancellation::check().map_err(core)?;
                 budget.charge(8 + 1 + 1)?;
                 budget.name(&column.name)?;
             }
-            for _ in &table.primary_key {
-                budget.charge(8)?;
+            if table.hidden_rowid().is_none() {
+                for _ in &table.primary_key {
+                    budget.charge(8)?;
+                }
             }
         }
     }
@@ -174,17 +176,30 @@ impl Engine {
                             .map(|table| TableSummary {
                                 id: table.id,
                                 name: table.name.clone(),
-                                column_count: table.columns.len(),
-                                primary_key_columns: table.primary_key.len(),
+                                column_count: table.logical_columns().count(),
+                                primary_key_columns: if table.hidden_rowid().is_some() {
+                                    0
+                                } else {
+                                    table.primary_key.len()
+                                },
                             })
                             .collect(),
                     ),
-                    InspectionRequest::Table { table } => InspectionResult::Table(
-                        tables
+                    InspectionRequest::Table { table } => {
+                        let table = tables
                             .get(table)
-                            .ok_or_else(|| Error::Bind("table".into()))?
-                            .clone(),
-                    ),
+                            .ok_or_else(|| Error::Bind("table".into()))?;
+                        InspectionResult::Table(TableDef {
+                            id: table.id,
+                            name: table.name.clone(),
+                            columns: table.logical_columns().cloned().collect(),
+                            primary_key: if table.hidden_rowid().is_some() {
+                                vec![]
+                            } else {
+                                table.primary_key.clone()
+                            },
+                        })
+                    }
                 };
                 Ok(InspectionOutcome {
                     contract_version: ENGINE_CONTRACT_VERSION,

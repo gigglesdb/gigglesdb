@@ -114,6 +114,7 @@ fn legacy(column: &ColumnDef) -> bool {
 }
 struct Resolved<'s> {
     key: Vec<u8>,
+    rowid: Option<(usize, Value)>,
     winner: Option<(&'s [u8], &'s SqlRow)>,
     arbiters: Vec<Option<Vec<u8>>>,
 }
@@ -137,7 +138,11 @@ fn value<'a>(
     index: usize,
 ) -> &'a Value {
     match post {
-        Postimage::Insert => &incoming[index],
+        Postimage::Insert => resolved
+            .rowid
+            .as_ref()
+            .filter(|(column, _)| *column == index)
+            .map_or(&incoming[index], |(_, value)| value),
         Postimage::Update { values, .. } => {
             values.iter().find(|(column, _)| *column == index).map_or(
                 &resolved.winner.expect("update winner").1.values[index],
@@ -165,13 +170,19 @@ pub(super) fn plan_unique_conflict<'s>(
     if incoming.len() > crate::relational::MAX_ROWS {
         return Err(Error::Limit.into());
     }
+    let hidden_rowid = table.hidden_rowid();
     let mut remaining_input = MAX_INSERT_BYTES;
     for row in incoming {
         if row.len() != table.columns.len() {
             return Err(Error::Type.into());
         }
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
-        for (value, column) in row.iter().zip(&table.columns) {
+        for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
+            if hidden_rowid == Some(index) {
+                charge_value(&mut remaining_row, &Value::Int(0))?;
+                charge_value(&mut remaining_input, &Value::Int(0))?;
+                continue;
+            }
             check(value, column)?;
             charge_value(&mut remaining_row, value)?;
             charge_value(&mut remaining_input, value)?;
@@ -200,9 +211,13 @@ pub(super) fn plan_unique_conflict<'s>(
     {
         return Err(Error::Unsupported.into());
     }
+    if hidden_rowid.is_some() && matches!(arbiter, Arbiter::PrimaryKey) {
+        debug_assert!(false, "heap primary key cannot be a SQL arbiter");
+        return Err(Error::Unsupported.into());
+    }
     let sidecar = src.secondary_state_engine(&mut *cancel).map_err(sql)?;
     let mut targets = Vec::new();
-    let include_pk = !matches!(arbiter, Arbiter::Unique(_));
+    let include_pk = hidden_rowid.is_none() && !matches!(arbiter, Arbiter::Unique(_));
     match arbiter {
         Arbiter::Unique(target) => {
             let descriptor = sidecar
@@ -312,16 +327,21 @@ pub(super) fn plan_unique_conflict<'s>(
             }
             tuples.push(tuple);
         }
-        let key = crate::relational::encode_key(
-            &table
-                .primary_key
-                .iter()
-                .map(|index| row[*index].clone())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(sql)?;
+        let key = if hidden_rowid.is_some() {
+            Vec::new()
+        } else {
+            crate::relational::encode_key(
+                &table
+                    .primary_key
+                    .iter()
+                    .map(|index| row[*index].clone())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(sql)?
+        };
         resolved.push(Resolved {
             key,
+            rowid: None,
             winner,
             arbiters: tuples,
         });
@@ -346,7 +366,10 @@ pub(super) fn plan_unique_conflict<'s>(
         {
             return Err(Error::DuplicateTarget.into());
         }
-        if resolved.winner.is_none() && !inserts.insert(resolved.key.as_slice()) {
+        if hidden_rowid.is_none()
+            && resolved.winner.is_none()
+            && !inserts.insert(resolved.key.as_slice())
+        {
             return Err(Error::DuplicateTarget.into());
         }
     }
@@ -430,6 +453,11 @@ pub(super) fn plan_unique_conflict<'s>(
         if !matches!(post, Postimage::Skip) {
             let mut remaining_row = crate::relational::MAX_ROW_BYTES;
             for (index, column) in table.columns.iter().enumerate() {
+                if hidden_rowid == Some(index) && matches!(post, Postimage::Insert) {
+                    charge_value(&mut remaining_row, &Value::Int(0))?;
+                    charge_value(&mut remaining_mutation, &Value::Int(0))?;
+                    continue;
+                }
                 let final_value = value(&post, resolved, proposal, index);
                 check(final_value, column)?;
                 charge_value(&mut remaining_row, final_value)?;
@@ -463,6 +491,32 @@ pub(super) fn plan_unique_conflict<'s>(
     if source_rows.checked_add(sql_inserts).ok_or(Error::Limit)? > crate::relational::MAX_ROWS {
         return Err(Error::Limit.into());
     }
+    let mut next_version = src.next_version_engine();
+    let mut versions = vec![0; incoming.len()];
+    if let Some(column) = hidden_rowid {
+        // Existing winners retain key-order version allocation. Fresh insert rowids
+        // exceed every existing key, so allocate those next in input order.
+        let mut updates = (0..incoming.len())
+            .filter(|index| matches!(postimages[*index], Postimage::Update { changed: true, .. }))
+            .collect::<Vec<_>>();
+        updates.sort_by_key(|index| resolved[*index].winner.expect("update winner").0);
+        for index in updates {
+            tick(cancel)?;
+            versions[index] = next_version;
+            next_version = next_version.checked_add(1).ok_or(Error::Overflow)?;
+        }
+        for (index, post) in postimages.iter().enumerate() {
+            tick(cancel)?;
+            if matches!(post, Postimage::Insert) {
+                let rowid = i64::try_from(next_version).map_err(|_| sql(SqlError::Overflow))?;
+                versions[index] = next_version;
+                next_version = next_version.checked_add(1).ok_or(Error::Overflow)?;
+                resolved[index].rowid = Some((column, Value::Int(rowid)));
+                resolved[index].key =
+                    crate::relational::encode_key(&[Value::Int(rowid)]).map_err(sql)?;
+            }
+        }
+    }
     let mut order = (0..incoming.len()).collect::<Vec<_>>();
     let key = |index: usize| {
         resolved[index]
@@ -470,10 +524,11 @@ pub(super) fn plan_unique_conflict<'s>(
             .map_or(resolved[index].key.as_slice(), |(key, _)| key)
     };
     order.sort_by(|left, right| key(*left).cmp(key(*right)));
-    let mut next_version = src.next_version_engine();
-    let mut versions = vec![0; incoming.len()];
     for index in &order {
         tick(cancel)?;
+        if hidden_rowid.is_some() && postimages[*index].changed() {
+            continue;
+        }
         if postimages[*index].changed() {
             versions[*index] = next_version;
             next_version = next_version.checked_add(1).ok_or(Error::Overflow)?;
@@ -624,7 +679,7 @@ impl Relational {
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        Self::sql_admit_conflict_input(table.columns.len(), incoming, action)?;
+        Self::sql_admit_conflict_input(table, incoming, action)?;
         if cancel() {
             return Err(SqlError::Aborted);
         }
@@ -669,7 +724,7 @@ impl Relational {
                 descriptor.table == table.id && descriptor.unique && descriptor.name == name
             }) {
                 Arbiter::Unique(descriptor)
-            } else if name == format!("{}_pkey", table.name) {
+            } else if table.hidden_rowid().is_none() && name == format!("{}_pkey", table.name) {
                 Arbiter::PrimaryKey
             } else {
                 return Err(SqlError::Unsupported);

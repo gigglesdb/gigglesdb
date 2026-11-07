@@ -376,3 +376,18 @@ fn direct_tree_input_limits_and_native_identifiers_remain_enforced() {
     });
     assert!(sql_rows(&admin).is_empty());
 }
+
+#[test]
+fn sql_created_heap_native_language_maps_unsupported_and_keyed_read_succeeds() {
+    let (admin, engine) = fixture();
+    admin.sql_session().execute("CREATE TABLE heap (id BIGINT, state TEXT)", &[], None).unwrap();
+    admin.sql_session().execute("INSERT INTO heap VALUES (1, 'ready')", &[], None).unwrap();
+    with_sql_parser_forbidden(|| {
+        for text in ["heap where id=1", "insert heap set id=2,state=\"ready\"", "update heap where id=1 set state=\"done\""] {
+            assert_eq!(engine.prepare_bound_text(text, &Bindings::new()).err(), Some(Error::Unsupported), "{text}");
+            assert_eq!(run(&engine, text), Err(Error::Unsupported), "{text}");
+        }
+        assert!(run(&engine, "items where id=1").is_ok());
+    });
+    assert_eq!(admin.sql_session().execute("SELECT * FROM heap", &[], None).unwrap().columns, ["id", "state"]);
+}

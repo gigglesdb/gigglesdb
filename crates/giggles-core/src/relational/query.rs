@@ -1090,6 +1090,9 @@ impl Query {
                     }
                     for (source, t) in tables.iter().enumerate() {
                         for (column, d) in t.columns.iter().enumerate() {
+                            if t.hidden_rowid() == Some(column) {
+                                continue;
+                            }
                             let mut d = d.clone();
                             if source > 0 && self.joins[source - 1].left {
                                 d.not_null = false;

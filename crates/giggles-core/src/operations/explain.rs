@@ -120,6 +120,9 @@ impl Engine {
                 let table = tables
                     .get(table)
                     .ok_or_else(|| Error::Bind("table".into()))?;
+                if table.hidden_rowid().is_some() {
+                    return Err(Error::Unsupported);
+                }
                 admit(
                     table,
                     if projection.is_empty() {

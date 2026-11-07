@@ -40,6 +40,49 @@ fn backup_roundtrip_and_retained_stage() {
     assert_eq!(c.list().unwrap().len(), 2);
 }
 #[test]
+fn heap_backup_refuses_manifest_and_retains_unpublished_snapshot() {
+    for populated in [false, true] {
+        let root = fresh("heap-refusal");
+        let catalog_root = root.join("catalog");
+        std::fs::create_dir(&catalog_root).unwrap();
+        let a = giggles_core::Admin::create(root.join("db"), giggles_core::Limits::default())
+            .unwrap();
+        let mut session = a.sql_session();
+        session
+            .execute("CREATE TABLE heap (body TEXT)", &[], None)
+            .unwrap();
+        if populated {
+            session
+                .execute("INSERT INTO heap VALUES ('stored')", &[], None)
+                .unwrap();
+        }
+        let c = Catalog::open(&catalog_root, OpsLimits::default()).unwrap();
+        // Core accepts the heap export; the ops manifest's [1, 2, 3] policy rejects it.
+        let error = c.backup(&a, &id()).unwrap_err();
+        assert!(matches!(error, OpsError::Invalid), "{error:?}");
+        assert_eq!(error.code(), "invalid");
+        assert!(!catalog_root.join("backup-1.json").exists());
+        let entries = c.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let stage = match &entries[0] {
+            CatalogEntry::Incomplete { stage } => catalog_root.join(stage),
+            entry => panic!("unexpected published heap backup: {entry:?}"),
+        };
+        let snapshot = stage.join("snapshot.gdb");
+        let bytes = std::fs::read(&snapshot).unwrap();
+        assert_eq!(&bytes[..8], b"GDEXP001");
+        let version = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert!((27..=52).contains(&version), "heap envelope {version}");
+        giggles_core::Admin::verify_export(&snapshot).unwrap();
+        assert!(stage.join("incomplete.json").exists());
+        assert!(!stage.join("manifest.json").exists());
+        drop(session);
+        drop(a);
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+#[test]
 fn duplicate_backup_preserves_original() {
     let (root, c, a) = fixture();
     let m = c.backup(&a, &id()).unwrap();

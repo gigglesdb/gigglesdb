@@ -522,7 +522,7 @@ impl Session {
                 .sql
                 .prepare(&format!("SELECT * FROM {} LIMIT 1", table.name))?;
             let description = self.sql.describe(&prepared)?;
-            if description.columns != table.columns {
+            if description.columns != table.logical_columns().cloned().collect::<Vec<_>>() {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
         }
@@ -930,6 +930,32 @@ mod lifecycle_tests {
             service.role_session("missing"),
             Err(CoreError::Policy(Error::Authentication))
         ));
+    }
+    #[test]
+    fn database_catalog_snapshot_accepts_heap_created_by_sql_session() {
+        let (service, _) = fixture();
+        service
+            .admin
+            .roles()
+            .create(roles::NewRole {
+                name: "owner".into(),
+                login: true,
+                superuser: true,
+                ..roles::NewRole::default()
+            })
+            .unwrap();
+        let mut owner = service.role_session("owner").unwrap();
+        owner
+            .execute_sql("CREATE TABLE heap (body TEXT)", &[])
+            .unwrap();
+        let catalog = service.admin.catalog().unwrap();
+        assert!(catalog.1.iter().any(|table| table.hidden_rowid().is_some()));
+        // K2c snapshots also carry index metadata; compare the epoch and tables.
+        let tables = |(epoch, tables, _indexes)| (epoch, tables);
+        assert_eq!(tables(owner.catalog_snapshot().unwrap()), catalog);
+        owner.execute_sql("BEGIN", &[]).unwrap();
+        assert_eq!(tables(owner.catalog_snapshot().unwrap()), catalog);
+        owner.execute_sql("ROLLBACK", &[]).unwrap();
     }
     #[test]
     fn database_catalog_snapshot_checks_transaction_schema_and_aborted_state() {

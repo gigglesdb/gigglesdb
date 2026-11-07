@@ -114,9 +114,159 @@ pub(super) fn temporal_base(version: u32) -> Option<(u32, bool)> {
     }
 }
 
+/// Heap is the outermost envelope, independent of the temporal and base families.
+pub(super) fn heap_version(base: u32, heap: bool) -> Option<u32> {
+    match (base, heap) {
+        (1..=26, true) => Some(base + 26),
+        (1..=26, false) => Some(base),
+        _ => None,
+    }
+}
+pub(super) fn heap_base(version: u32) -> Option<(u32, bool)> {
+    match version {
+        1..=26 => Some((version, false)),
+        27..=52 => Some((version - 26, true)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn heap_wrapping_does_not_authorize_legacy_namespaces() {
+        use super::super::*;
+        for version in [1, 2, 27, 28] {
+            let mut r = records(&empty(17)).unwrap();
+            let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
+            m.format = version;
+            r.insert(vec![0], encode(&m).unwrap());
+            if version == 1 || version == 27 { r.remove(&vec![5]); }
+            if version <= 2 {
+                assert!(from_records(r.clone()).is_ok());
+                // A malformed accounting record must be rejected as a namespace,
+                // without reaching its payload decoder on either legacy base.
+                r.insert(key(6, &[1]), vec![255]);
+                assert!(matches!(from_records(r), Err(CoreError::Corrupt(message))
+                    if message == "unknown record namespace or key length"));
+            } else {
+                assert!(matches!(from_records(r), Err(CoreError::Corrupt(message))
+                    if message == "heap format mismatch"));
+            }
+        }
+    }
+
+    #[test]
+    fn heap_metadata_presence_and_feature_families_roundtrip() {
+        use super::super::*;
+        use crate::relational::Prepared;
+        for heap in [false, true] {
+            for typed in [false, true] {
+                for temporal in [false, true] {
+                    for native in [false, true] {
+                        for (indexed, applications) in [(false, false), (true, false), (false, true)] {
+                            let mut s = empty(123);
+                            let pk = if heap { "" } else { " PRIMARY KEY" };
+                            let extra = if temporal { ",d DATE" } else { "" };
+                            let numeric = if typed { ",n NUMERIC" } else { "" };
+                            let sql = format!("CREATE TABLE t(id BIGINT{pk},tag TEXT{extra}{numeric})");
+                            let p = Prepared::parse(&sql, 123, s.sql.epoch).unwrap();
+                            s.sql.execute(&p, &[], None).unwrap();
+                            if indexed {
+                                let t = s.sql.tables["t"].clone();
+                                s.sql.secondary_configure_test(t.id, "by_tag", &[t.columns[1].id], || false).unwrap();
+                            }
+                            if native { s.native_outcomes = Some(Default::default()); }
+                            if applications { s.applications = Some(Default::default()); }
+                            let r = records(&s).unwrap();
+                            let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
+                            let f = Features { typed_scalars: typed, native_outcomes: native };
+                            let base = if applications { f.version_application(true) } else { f.version_with(indexed) };
+                            assert_eq!(m.format, base + if temporal { 12 } else { 0 } + if heap { 26 } else { 0 });
+                            assert_eq!(envelope_family(m.format).unwrap(), (f, indexed, applications, temporal, heap));
+                            let restored = from_records(r.clone()).unwrap();
+                            assert_eq!(restored.sql, s.sql);
+                            assert_eq!(records(&restored).unwrap(), r);
+                            let mut forged = r.clone();
+                            m.format = if heap { m.format - 26 } else { m.format + 26 };
+                            forged.insert(vec![0], encode(&m).unwrap());
+                            assert!(matches!(from_records(forged), Err(CoreError::Corrupt(message)) if message == "heap format mismatch"));
+                            // Heap must not weaken the existing index/application refusal.
+                            if indexed {
+                                s.applications = Some(Default::default());
+                                assert!(matches!(records(&s), Err(CoreError::Unsupported)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn heap_wrapper_is_finite_and_composes_after_temporal() {
+        for base in 1..=26 {
+            assert_eq!(heap_version(base, false), Some(base));
+            assert_eq!(heap_version(base, true), Some(base + 26));
+            assert_eq!(heap_base(base), Some((base, false)));
+            assert_eq!(heap_base(base + 26), Some((base, true)));
+            assert!(temporal_base(base + 26).is_none());
+            assert!(Features::read(base + 26).is_none());
+            assert!(Features::read_with(base + 26).is_none());
+            assert!(Features::read_application(base + 26).is_none());
+        }
+        for invalid in [0, 27, 52, 53, u32::MAX] {
+            assert_eq!(heap_version(invalid, false), None);
+            assert_eq!(heap_version(invalid, true), None);
+        }
+        for invalid in [0, 53, u32::MAX] {
+            assert_eq!(heap_base(invalid), None);
+        }
+        for typed_scalars in [false, true] {
+            for native_outcomes in [false, true] {
+                let f = Features { typed_scalars, native_outcomes };
+                for (indexed, applications) in [(false, false), (true, false), (false, true)] {
+                    let base = if applications { f.version_application(true) } else { f.version_with(indexed) };
+                    for temporal in [false, true] {
+                        for heap in [false, true] {
+                            let v = heap_version(temporal_version(base, temporal).unwrap(), heap).unwrap();
+                            assert_eq!(super::super::envelope_family(v).unwrap(),
+                                (f, indexed, applications, temporal, heap));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preheap_envelope_gate_rejects_before_relational_decode() {
+        use super::super::*;
+        fn old_reader(r: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), CoreError> {
+            let m: Metadata = decode(&r[&vec![0]])?;
+            let (base, _) = temporal_base(m.format).ok_or(CoreError::Unsupported)?;
+            secondary_index::family(base)?;
+            let _: crate::relational::Relational = decode(&r[&vec![5]])?;
+            Ok(())
+        }
+        for version in 27..=52 {
+            let mut r = records(&empty(17)).unwrap();
+            let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
+            m.format = version;
+            r.insert(vec![0], encode(&m).unwrap());
+            r.insert(vec![5], vec![255]);
+            assert!(matches!(old_reader(&r), Err(CoreError::Unsupported)));
+        }
+        for version in [53, u32::MAX] {
+            let mut r = records(&empty(17)).unwrap();
+            let mut m: Metadata = decode(&r[&vec![0]]).unwrap();
+            m.format = version;
+            r.insert(vec![0], encode(&m).unwrap());
+            r.insert(vec![5], vec![255]);
+            assert!(matches!(from_records(r), Err(CoreError::Unsupported)));
+        }
+    }
+
     #[test]
     fn temporal_index_nonkey_typed_native_matrix_preserves_paired_records() {
         use super::super::*;
@@ -174,7 +324,7 @@ mod tests {
             assert_eq!(temporal_base(base), Some((base, false)));
             assert_eq!(temporal_version(base, false), Some(base));
         }
-        for v in [0, 27, u32::MAX] {
+        for v in [0, 53, u32::MAX] {
             assert_eq!(temporal_base(v), None);
         }
         for v in [0, 1, 2, 15, u32::MAX] {

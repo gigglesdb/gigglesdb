@@ -66,6 +66,15 @@ impl From<&TableDef> for TableIdentity {
 }
 
 impl TableIdentity {
+    fn is_heap(&self) -> bool {
+        self.primary_key.len() == 1
+            && self.columns.get(self.primary_key[0]).is_some_and(|column| {
+                column.name == crate::relational::HIDDEN_ROWID
+                    && column.data_type == DataType::BigInt
+                    && column.not_null
+            })
+    }
+
     fn definition(&self) -> TableDef {
         TableDef {
             id: self.id,
@@ -296,6 +305,9 @@ fn validate_structure(
         return Err(CoreError::Unsupported);
     }
     let table = &descriptor.table;
+    if table.is_heap() {
+        return Err(CoreError::Unsupported);
+    }
     if table.id == 0
         || table.name.is_empty()
         || table.columns.is_empty()
@@ -371,6 +383,7 @@ fn classify_source(state: &crate::storage::State) -> Result<Metadata, CoreError>
             .as_ref()
             .is_some_and(|ledger| !ledger.is_empty_readonly())
         || state.sql.tables.len() != 1
+        || state.sql.contains_heap()
     {
         return Err(CoreError::Unsupported);
     }
@@ -552,6 +565,9 @@ pub(in crate::storage::replica) fn project_admitted<'a>(
 fn primitive_preflight(request: &ProjectionRequest) -> Result<(), CoreError> {
     let d = &request.descriptor;
     let t = &d.table;
+    if t.is_heap() {
+        return Err(CoreError::Unsupported);
+    }
     if t.columns.is_empty()
         || t.columns.len() > 8
         || t.primary_key.is_empty()

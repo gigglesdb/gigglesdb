@@ -291,7 +291,7 @@ fn predicate(p: &mut Parser, table: &str, depth: usize) -> R<Condition> {
 
 fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
     let indexes = if insert.columns.is_empty() {
-        (0..table.columns.len()).collect::<Vec<_>>()
+        table.logical_offsets()
     } else {
         insert
             .columns
@@ -654,7 +654,7 @@ fn admit_engine_expression(
 impl Relational {
     /// Re-admit the full owned proposals before the immutable planner snapshot.
     pub(crate) fn sql_admit_conflict_input(
-        arity: usize,
+        table: &TableDef,
         incoming: &[Vec<Value>],
         action: &ConflictAction,
     ) -> R<()> {
@@ -662,8 +662,9 @@ impl Relational {
             return Err(SqlError::Limit);
         }
         let mut admission = InputAdmission::default();
+        let logical_width = table.logical_columns().count();
         for row in incoming {
-            if row.len() > MAX_COLUMNS || row.len() != arity {
+            if logical_width > MAX_COLUMNS || row.len() != table.columns.len() {
                 return Err(SqlError::Type);
             }
             admission.row();
@@ -732,17 +733,19 @@ pub(super) fn execute(
         .ok_or(SqlError::UnknownTable)?;
     // With no column list, actual table width can only be checked after the
     // borrowed raw admission; this still precedes every input-sized copy.
+    let logical_width = table.logical_columns().count();
     if insert.columns.is_empty()
         && insert
             .rows
             .iter()
-            .any(|row| row.len() != table.columns.len())
+            .any(|row| row.len() != logical_width)
     {
         return Err(SqlError::Type);
     }
     #[cfg(test)]
     Relational::sql_insert_test_event(0);
     let table = table.clone();
+    let hidden_rowid = table.hidden_rowid();
     let indexes = indexes(insert, &table)?;
     #[cfg(test)]
     Relational::sql_insert_test_event(1);
@@ -757,7 +760,22 @@ pub(super) fn execute(
             row[*index] = resolved_value(expression, params, &table.columns[*index].data_type)?;
         }
         Relational::secondary_admit_values(row.iter())?;
-        row_check(&table, &row)?;
+        if let Some(hidden) = hidden_rowid {
+            // The NULL placeholder has the same fixed byte budget as its future Int.
+            // Skip only its check until a version supplies the hidden rowid.
+            let mut size = 0usize;
+            for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
+                if index != hidden {
+                    check(value, column)?;
+                }
+                size = size.checked_add(value_bytes(value)).ok_or(SqlError::Limit)?;
+            }
+            if size > MAX_ROW_BYTES {
+                return Err(SqlError::Limit);
+            }
+        } else {
+            row_check(&table, &row)?;
+        }
         for value in &row {
             total = total
                 .checked_add(value_bytes(value))
@@ -803,14 +821,29 @@ pub(super) fn execute(
             cancel,
         );
     }
-    let mut proposed = incoming
-        .into_iter()
-        .map(|values| Ok((pk(&table, &values)?, SqlRow { values, version: 0 })))
-        .collect::<R<Vec<_>>>()?;
-    proposed.sort_by(|left, right| left.0.cmp(&right.0));
     let mut next_version = state.next_version_engine();
-    for (_, row) in &mut proposed {
-        row.version = allocate(&mut next_version)?;
+    let mut proposed = if let Some(hidden) = hidden_rowid {
+        incoming
+            .into_iter()
+            .map(|mut values| {
+                let version = allocate(&mut next_version)?;
+                values[hidden] = Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
+                Ok((pk(&table, &values)?, SqlRow { values, version }))
+            })
+            .collect::<R<Vec<_>>>()?
+    } else {
+        let mut proposed = incoming
+            .into_iter()
+            .map(|values| Ok((pk(&table, &values)?, SqlRow { values, version: 0 })))
+            .collect::<R<Vec<_>>>()?;
+        proposed.sort_by(|left, right| left.0.cmp(&right.0));
+        for (_, row) in &mut proposed {
+            row.version = allocate(&mut next_version)?;
+        }
+        proposed
+    };
+    if hidden_rowid.is_some() {
+        proposed.sort_by(|left, right| left.0.cmp(&right.0));
     }
     let changes = proposed
         .iter()

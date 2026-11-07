@@ -61,6 +61,50 @@ fn reject_definition(admin: &Admin, engine: &Engine, request: &CatalogRequest, e
 }
 
 #[test]
+fn native_index_prepare_and_execute_reject_empty_and_populated_heaps() {
+    for populated in [false, true] {
+        let (_, admin, engine) = database();
+        let mut sql = admin.sql_session();
+        sql.execute("CREATE TABLE heap_items (value BIGINT)", &[], None)
+            .unwrap();
+        if populated {
+            sql.execute("INSERT INTO heap_items VALUES (1)", &[], None)
+                .unwrap();
+        }
+        let request = CatalogRequest::CreateIndex {
+            table: "heap_items".into(),
+            name: "heap_value".into(),
+            columns: vec!["value".into()],
+        };
+        assert_eq!(engine.prepare_catalog_bound(&request).unwrap_err(), Error::Unsupported);
+        assert_eq!(engine.execute_catalog(&request), Err(Error::Unsupported));
+        let unique = giggles_core::operations::UniqueIndexRequest {
+            table: "heap_items".into(),
+            name: "heap_unique_value".into(),
+            columns: vec!["value".into()],
+        };
+        assert_eq!(engine.prepare_unique_index_bound(&unique).unwrap_err(), Error::Unsupported);
+        assert_eq!(engine.execute_unique_index(&unique), Err(Error::Unsupported));
+    }
+    let (_, _, engine) = database();
+    engine.execute_catalog(&create("keyed_items")).unwrap();
+    let request = CatalogRequest::CreateIndex {
+        table: "keyed_items".into(),
+        name: "keyed_id".into(),
+        columns: vec!["id".into()],
+    };
+    let bound = engine.prepare_catalog_bound(&request).unwrap();
+    engine.execute_catalog_bound(&bound).unwrap();
+    let unique = giggles_core::operations::UniqueIndexRequest {
+        table: "keyed_items".into(),
+        name: "keyed_unique_id".into(),
+        columns: vec!["id".into()],
+    };
+    let bound = engine.prepare_unique_index_bound(&unique).unwrap();
+    engine.execute_unique_index_bound(&bound).unwrap();
+}
+
+#[test]
 fn catalog_creation_shares_sql_metadata_and_type_constraints() {
     let (_, admin, engine) = database();
     let request = CatalogRequest::CreateTable {

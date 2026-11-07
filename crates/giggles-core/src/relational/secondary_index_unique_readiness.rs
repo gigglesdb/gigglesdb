@@ -238,7 +238,7 @@ fn metadata<'a, F: FnMut() -> bool>(
         ids.push(t.id);
         for (i, c) in t.columns.iter().enumerate() {
             meter.checkpoint()?;
-            ident(&c.name)?;
+            t.validate_column_ident(i)?;
             if c.id == 0
                 || c.id >= state.next_id
                 || ids.contains(&c.id)

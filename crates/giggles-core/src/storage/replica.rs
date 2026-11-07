@@ -28,7 +28,10 @@ fn replica_state_with_cancel(
         return Err(CoreError::Limit);
     }
     let state = from_records_with_cancel(decode(bytes)?, cancel)?;
-    if state.native_outcomes.is_some() || state.sql.has_secondary_indexes_engine() {
+    if state.native_outcomes.is_some()
+        || state.sql.has_secondary_indexes_engine()
+        || state.sql.contains_heap()
+    {
         return Err(CoreError::Unsupported);
     }
     if encode(&records(&state)?)? != bytes {
@@ -190,7 +193,11 @@ impl Image {
         tx.commit().map_err(io)?;
         let a = Admin::attach(db, Limits::default())?;
         let reply = work(&a)?;
-        let image = Self(encode(&records(&a.inner.read()?)?)?);
+        let state = a.inner.read()?;
+        if state.sql.contains_heap() {
+            return Err(CoreError::Unsupported);
+        }
+        let image = Self(encode(&records(&state)?)?);
         Ok((image, reply))
     }
     fn evaluate_admin(&self, a: &Admin, command: &Command) -> Result<Reply, CoreError> {
@@ -400,4 +407,44 @@ fn native_task(
             _ => "42501",
         }),
     })
+}
+
+#[cfg(test)]
+mod heap_gate_tests {
+    use super::*;
+
+    #[test]
+    fn heap_replica_and_restricted_projection_are_explicitly_unsupported() {
+        for command in [
+            AdminCommand::Sql {
+                sql: "CREATE TABLE t(id BIGINT)".into(),
+                params: vec![],
+                expected_version: None,
+            },
+            AdminCommand::SqlBatch {
+                statements: vec![local::SqlInput {
+                    sql: "CREATE TABLE t(id BIGINT)".into(),
+                    params: vec![],
+                    expected_version: None,
+                }],
+            },
+        ] {
+            let image = Image::new(123).unwrap();
+            let command = Command::Admin(serde_json::to_vec(&command).unwrap());
+            assert!(matches!(image.evaluate(&command), Err(CoreError::Unsupported)));
+        }
+        let mut state = empty(123);
+        let p = relational::Prepared::parse("CREATE TABLE t(id BIGINT)", 123, state.sql.epoch).unwrap();
+        state.sql.execute(&p, &[], None).unwrap();
+        let bytes = encode(&records(&state).unwrap()).unwrap();
+        assert!(matches!(Image::from_bytes(bytes.clone()), Err(CoreError::Unsupported)));
+        // Deserialize can bypass Image::from_bytes; all image entry points recheck.
+        let image = Image(bytes);
+        assert!(matches!(image.snapshot(), Err(CoreError::Unsupported)));
+        let limits = projected_admission::SourceAdmissionLimits::default();
+        let mut budget = projected_admission::SourceBudget::new(projected_admission::SourceAdmissionLimits::default());
+        assert!(matches!(projected_admission::admit_projected_source(
+            &image, &limits, &mut budget, &mut || false
+        ), Err(CoreError::Unsupported)));
+    }
 }

@@ -374,6 +374,9 @@ pub(super) fn bind_transaction(
                     .iter()
                     .find(|table| table.name == name)
                     .ok_or_else(|| Error::Bind("table".into()))?;
+                if table.hidden_rowid().is_some() {
+                    return Err(Error::Unsupported);
+                }
                 binder.table = Some(table);
                 binder.allow_fields = true;
                 let operation = binder.bind(request)?;

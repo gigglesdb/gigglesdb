@@ -41,6 +41,9 @@ impl Relational {
                 return Err(SqlError::Type);
             }
             unique(table.primary_key.iter())?;
+            if table.hidden_rowid().is_some() {
+                return Err(SqlError::Unsupported);
+            }
             let mut ids = BTreeSet::from([table.id]);
             for column in &table.columns {
                 tick(cancel)?;
@@ -123,6 +126,26 @@ impl Relational {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_projector_seams_reject_before_visiting_or_key_encoding() {
+        let mut state = Relational::default();
+        let create = Prepared::parse("CREATE TABLE h (a BIGINT)", 1, state.epoch).unwrap();
+        state.execute(&create, &[], None).unwrap();
+        let table = &state.tables["h"];
+        assert_eq!(
+            state.with_complete_table_engine(
+                table.id,
+                || false,
+                |_, _| { panic!("heap projector callback must be unreachable") }
+            ),
+            Err::<(), _>(SqlError::Unsupported)
+        );
+        assert_eq!(
+            state.canonical_pk_engine(table.id, &[Value::Int(1)], || false),
+            Err(SqlError::Unsupported)
+        );
+    }
 
     fn fixture(data_type: DataType) -> Relational {
         let table = TableDef {

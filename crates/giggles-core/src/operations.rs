@@ -13,6 +13,9 @@ mod case_tests;
 mod catalog;
 pub(crate) mod state_adapter;
 use state_adapter::Context;
+
+#[cfg(test)]
+mod heap_native_tests;
 mod explain;
 mod secondary_selector;
 pub use explain::*;
@@ -554,6 +557,9 @@ fn bind_request(
         .into_iter()
         .find(|table| table.name == table_name)
         .ok_or_else(|| Error::Bind("table".into()))?;
+    if table.hidden_rowid().is_some() {
+        return Err(Error::Unsupported);
+    }
     let mut binder = Binder {
         table: Some(&table),
         allow_fields: true,

@@ -241,8 +241,11 @@ impl Drop for Transaction {
         self.0.rollback();
     }
 }
-fn table(t: TableDef) -> Table {
-    Table {
+fn table(t: TableDef) -> Result<Table> {
+    if t.hidden_rowid().is_some() {
+        return Err(Error::Core(CoreError::Sql(relational::SqlError::Unsupported)));
+    }
+    Ok(Table {
         name: t.name,
         columns: t
             .columns
@@ -254,7 +257,7 @@ fn table(t: TableDef) -> Table {
             })
             .collect(),
         primary_key: t.primary_key,
-    }
+    })
 }
 
 pub fn capture(admin: &Admin, bounds: Bounds) -> Result<Archive> {
@@ -285,7 +288,7 @@ pub fn capture_with_hook(admin: &Admin, bounds: Bounds, hook: Hook<'_>) -> Resul
     }
     drop(legacy);
     hook(Point::Snapshot)?;
-    let tables: Vec<Table> = before.1.into_iter().map(table).collect();
+    let tables = before.1.into_iter().map(table).collect::<Result<Vec<_>>>()?;
     let mut archive = Archive {
         tables,
         rows: Vec::new(),

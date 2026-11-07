@@ -233,7 +233,9 @@ fn state_format(s: &State) -> Result<u32, CoreError> {
     } else {
         features.version_with(indexed)
     };
-    format_policy::temporal_version(base, contains_temporal(s)?).ok_or(CoreError::Unsupported)
+    let temporal = format_policy::temporal_version(base, contains_temporal(s)?)
+        .ok_or(CoreError::Unsupported)?;
+    format_policy::heap_version(temporal, s.sql.contains_heap()).ok_or(CoreError::Unsupported)
 }
 fn contains_temporal(s: &State) -> Result<bool, CoreError> {
     Ok(s.sql.contains_temporal()
@@ -245,10 +247,11 @@ fn contains_temporal(s: &State) -> Result<bool, CoreError> {
             None => false,
         })
 }
-fn envelope_family(version: u32) -> Result<(format_policy::Features, bool, bool, bool), CoreError> {
-    let (base, temporal) = format_policy::temporal_base(version).ok_or(CoreError::Unsupported)?;
+fn envelope_family(version: u32) -> Result<(format_policy::Features, bool, bool, bool, bool), CoreError> {
+    let (base, heap) = format_policy::heap_base(version).ok_or(CoreError::Unsupported)?;
+    let (base, temporal) = format_policy::temporal_base(base).ok_or(CoreError::Unsupported)?;
     let (features, indexed, applications) = secondary_index::family(base)?;
-    Ok((features, indexed, applications, temporal))
+    Ok((features, indexed, applications, temporal, heap))
 }
 fn envelope_bound(values: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), CoreError> {
     // Fixed-int map encoding: 8-byte count and two 8-byte lengths per entry.
@@ -281,7 +284,8 @@ fn from_records_with_cancel(
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    let (features, indexed, applications, temporal) = envelope_family(m.format)?;
+    let (features, indexed, applications, temporal, heap) = envelope_family(m.format)?;
+    let (base_version, _) = format_policy::heap_base(m.format).ok_or(CoreError::Unsupported)?;
     secondary_index::gate(&records, indexed, applications)?;
     let mut s = empty(m.domain);
     match records.get(&vec![9]) {
@@ -307,13 +311,16 @@ fn from_records_with_cancel(
         }
     }
     match records.get(&vec![5]) {
-        Some(v) if m.format >= 2 => s.sql = decode(v)?,
-        None if m.format == 1 => {}
+        Some(v) if base_version >= 2 => s.sql = decode(v)?,
+        None if base_version == 1 => {}
         _ => {
             return Err(CoreError::Corrupt(
                 "relational format/namespace mismatch".into(),
             ));
         }
+    }
+    if s.sql.contains_heap() != heap {
+        return Err(CoreError::Corrupt("heap format mismatch".into()));
     }
     if !features.typed_scalars
         && (s.sql.contains_typed()
@@ -340,7 +347,7 @@ fn from_records_with_cancel(
             Ok(u64::from_be_bytes(b.try_into().expect("length")))
         };
         match k.first() {
-            Some(6) if k.len() == 9 && m.format >= FORMAT => {
+            Some(6) if k.len() == 9 && base_version >= FORMAT => {
                 s.accounting.insert(TaskId(num(1)?), decode(&v)?);
             }
             Some(0) if k.len() == 1 => {}
@@ -2328,6 +2335,38 @@ pub(crate) fn crash_now() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zero_row_heap_metadata_is_persisted_and_reopened() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        for (ddl, heap, format) in [
+            ("CREATE TABLE t(id BIGINT)", true, 29),
+            ("CREATE TABLE t(id BIGINT PRIMARY KEY)", false, 3),
+        ] {
+            let path = fresh("heap-zero-row-format");
+            let _cleanup = Cleanup(path.clone());
+            {
+                let admin = Admin::create(&path, Limits::default()).unwrap();
+                admin.sql_session().execute(ddl, &[], None).unwrap();
+            }
+            let admin = Admin::open(&path, Limits::default()).unwrap();
+            let tx = admin.inner.db.begin_read().unwrap();
+            let table = tx.open_table(RECORDS).unwrap();
+            let metadata: Metadata =
+                decode(table.get(&[0u8][..]).unwrap().unwrap().value()).unwrap();
+            assert_eq!(metadata.format, format);
+            let sql: relational::Relational =
+                decode(table.get(&[5u8][..]).unwrap().unwrap().value()).unwrap();
+            assert_eq!(sql.tables.len(), 1);
+            assert_eq!(sql.contains_heap(), heap);
+            assert!(sql.rows_empty_engine());
+        }
+    }
+
     #[test]
     fn accounting_format_migration_future_versions_and_corruption_fail_closed() {
         let mut state = empty(9);

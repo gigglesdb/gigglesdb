@@ -169,6 +169,9 @@ impl Context for SnapshotContext {
 
 // Only equality conjunctions containing every primary-key field exactly once.
 fn point_filter(expression: &Expr, table: &TableDef, seen: &mut BTreeSet<usize>) -> Result<()> {
+    if table.hidden_rowid().is_some() {
+        return Err(Error::Unsupported);
+    }
     match expression {
         Expr::And(left, right) => {
             point_filter(left, table, seen)?;

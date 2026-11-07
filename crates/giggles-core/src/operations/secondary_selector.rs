@@ -32,6 +32,9 @@ fn terms<'a>(b: &'a Bound, out: &mut Vec<(usize, Compare, &'a Value)>) -> Option
     }
 }
 pub(super) fn choose<'a>(table: &TableDef, filter: &'a Bound) -> Option<Choice<'a>> {
+    if table.hidden_rowid().is_some() {
+        return None;
+    }
     let mut ts = Vec::new();
     terms(filter, &mut ts)?;
     let mut equal = Vec::new();
@@ -131,6 +134,9 @@ pub(super) fn read(
     filter: &Bound,
     fallback: Vec<SqlRow>,
 ) -> Result<Vec<SqlRow>> {
+    if table.hidden_rowid().is_some() {
+        return Err(Error::Unsupported);
+    }
     let Some(choice) = choose(table, filter) else {
         return Ok(fallback);
     };

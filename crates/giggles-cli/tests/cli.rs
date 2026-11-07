@@ -509,6 +509,30 @@ fn schema_mode_quit() {
     assert!(!text.contains("INVALID"));
 }
 #[test]
+fn schema_hides_heap_rowid_and_primary_key() {
+    let f = fixture();
+    let db = f.join("db");
+    success(run(
+        &db,
+        true,
+        &["--stdin"],
+        b"CREATE TABLE heap (body TEXT); CREATE TABLE keyed (id BIGINT PRIMARY KEY);",
+    ));
+    let r = run(&db, false, &["--repl"], b".schema\n.quit\n");
+    code(&r, 0);
+    assert!(!String::from_utf8_lossy(&r.stdout).contains("giggles_rowid"));
+    let schema: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    let tables = schema["catalog"]["tables"].as_array().unwrap();
+    let heap = tables.iter().find(|table| table["name"] == "heap").unwrap();
+    assert_eq!(heap["columns"].as_array().unwrap().len(), 1);
+    assert_eq!(heap["columns"][0]["name"], "body");
+    assert_eq!(heap["primary_key"], serde_json::json!([]));
+    let keyed = tables.iter().find(|table| table["name"] == "keyed").unwrap();
+    assert_eq!(keyed["columns"].as_array().unwrap().len(), 1);
+    assert_eq!(keyed["columns"][0]["name"], "id");
+    assert_eq!(keyed["primary_key"], serde_json::json!([0]));
+}
+#[test]
 fn unsafe_metacommand_rejected() {
     let f = fixture();
     let db = f.join("db");

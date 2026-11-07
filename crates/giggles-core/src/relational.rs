@@ -65,6 +65,9 @@ pub(crate) fn assert_sql_frontend_allowed() {
 }
 
 #[cfg(test)]
+mod heap_tests;
+
+#[cfg(test)]
 mod parser_trap_tests {
     use super::*;
 
@@ -190,6 +193,50 @@ pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<usize>,
+}
+
+pub const HIDDEN_ROWID: &str = "giggles_rowid";
+
+impl TableDef {
+    /// Recognize the persisted heap marker without trusting catalog offsets.
+    pub fn hidden_rowid(&self) -> Option<usize> {
+        let [index] = self.primary_key.as_slice() else {
+            return None;
+        };
+        self.columns
+            .get(*index)
+            .filter(|column| {
+                column.name == HIDDEN_ROWID
+                    && column.data_type == DataType::BigInt
+                    && column.not_null
+            })
+            .map(|_| *index)
+    }
+
+    pub fn logical_columns(&self) -> impl Iterator<Item = &ColumnDef> + '_ {
+        let hidden = self.hidden_rowid();
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| Some(*index) != hidden)
+            .map(|(_, column)| column)
+    }
+
+    pub(crate) fn logical_offsets(&self) -> Vec<usize> {
+        let hidden = self.hidden_rowid();
+        (0..self.columns.len())
+            .filter(|index| Some(*index) != hidden)
+            .collect()
+    }
+
+    // Existing catalog names may bypass ident only for the exact heap marker.
+    fn validate_column_ident(&self, index: usize) -> R<()> {
+        if self.hidden_rowid() == Some(index) {
+            Ok(())
+        } else {
+            ident(&self.columns[index].name)
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlRow {
@@ -864,8 +911,8 @@ pub(crate) fn validate_create_definition(
     if columns.is_empty() || columns.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    if keys.is_empty() {
-        return Err(SqlError::Unbounded);
+    if keys.is_empty() && columns.len() == MAX_COLUMNS {
+        return Err(SqlError::Limit);
     }
     unique(columns.iter().map(|column| &column.name))?;
     unique(keys)?;
@@ -920,6 +967,14 @@ impl Prepared {
         }
         if keys.len() > MAX_COLUMNS {
             return Err(SqlError::Limit);
+        }
+        if keys.is_empty() {
+            // Preserve the native CREATE error and its original precedence.
+            ident(&name)?;
+            if columns.is_empty() || columns.len() > MAX_COLUMNS {
+                return Err(SqlError::Limit);
+            }
+            return Err(SqlError::Unbounded);
         }
         validate_create_definition(&name, &columns, &keys)?;
         for key in &keys {
@@ -984,6 +1039,9 @@ impl Prepared {
         domain: u128,
         state: &Relational,
     ) -> R<Self> {
+        if table.hidden_rowid().is_some() {
+            return Err(SqlError::Unsupported);
+        }
         Relational::secondary_admit_values(values.iter())?;
         Self::engine_table(table, state)?;
         row_check(table, &values)?;
@@ -1005,6 +1063,9 @@ impl Prepared {
         state: &Relational,
     ) -> R<Self> {
         Self::engine_table(table, state)?;
+        if table.hidden_rowid().is_some() {
+            return Err(SqlError::Unsupported);
+        }
         if sets.is_empty() {
             return Err(SqlError::Unsupported);
         }
@@ -1046,6 +1107,9 @@ impl Prepared {
         state: &Relational,
     ) -> R<Self> {
         Self::engine_table(table, state)?;
+        if table.hidden_rowid().is_some() {
+            return Err(SqlError::Unsupported);
+        }
         let predicates = Self::engine_key(table, key)?;
         Ok(Self::engine(
             Statement::Delete {
@@ -1105,7 +1169,7 @@ impl Prepared {
                     ..
                 } => {
                     let indexes = if names.is_empty() {
-                        (0..t.columns.len()).collect::<Vec<_>>()
+                        t.logical_offsets()
                     } else {
                         names.iter().map(|n| col(t, n)).collect::<R<Vec<_>>>()?
                     };
@@ -1122,6 +1186,9 @@ impl Prepared {
                     limit,
                     ..
                 } => {
+                    if t.hidden_rowid().is_some() {
+                        return Err(SqlError::Unsupported);
+                    }
                     columns = if projection.is_empty() {
                         t.columns.clone()
                     } else {
@@ -1218,6 +1285,9 @@ impl Prepared {
             .tables
             .get(&scan.table)
             .ok_or(SqlError::UnknownTable)?;
+        if t.hidden_rowid().is_some() {
+            return Err(SqlError::Unsupported);
+        }
         if scan.prefix.len() > t.primary_key.len()
             || scan.limit > MAX_ROWS
             || scan.projection.len() > MAX_COLUMNS
@@ -1489,6 +1559,12 @@ impl Relational {
         Ok(true)
     }
 
+    pub(crate) fn contains_heap(&self) -> bool {
+        self.tables
+            .values()
+            .any(|table| table.hidden_rowid().is_some())
+    }
+
     pub(crate) fn contains_temporal(&self) -> bool {
         self.tables
             .values()
@@ -1517,6 +1593,9 @@ impl Relational {
     /// Read only the version of one exact primary key from the staged relation.
     pub(crate) fn row_version_engine(&self, table: &TableDef, key: &[Value]) -> R<u64> {
         Prepared::engine_table(table, self)?;
+        if table.hidden_rowid().is_some() {
+            return Err(SqlError::Unsupported);
+        }
         if key.len() != table.primary_key.len() {
             return Err(SqlError::Unbounded);
         }
@@ -1554,8 +1633,8 @@ impl Relational {
             }
             unique(t.columns.iter().map(|c| &c.name))?;
             unique(t.primary_key.iter())?;
-            for c in &t.columns {
-                ident(&c.name)?;
+            for (index, c) in t.columns.iter().enumerate() {
+                t.validate_column_ident(index)?;
                 if c.id == 0 || c.id >= self.next_id || !ids.insert(c.id) {
                     return Err(SqlError::Type);
                 }
@@ -1741,6 +1820,15 @@ impl Relational {
                     columns: columns.clone(),
                     primary_key: vec![],
                 };
+                if keys.is_empty() {
+                    t.primary_key.push(t.columns.len());
+                    t.columns.push(ColumnDef {
+                        id: 0,
+                        name: HIDDEN_ROWID.into(),
+                        data_type: DataType::BigInt,
+                        not_null: true,
+                    });
+                }
                 for key in keys {
                     let i = col(&t, key)?;
                     t.primary_key.push(i);
@@ -1765,7 +1853,7 @@ impl Relational {
                 }
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let indexes = if columns.is_empty() {
-                    (0..t.columns.len()).collect::<Vec<_>>()
+                    t.logical_offsets()
                 } else {
                     columns.iter().map(|c| col(t, c)).collect::<R<Vec<_>>>()?
                 };
@@ -1787,6 +1875,15 @@ impl Relational {
                         v.value(params)?
                     };
                 }
+                let mut next_version = self.next_version;
+                let heap_version = if let Some(index) = t.hidden_rowid() {
+                    let version = allocate(&mut next_version)?;
+                    row[index] =
+                        Value::Int(i64::try_from(version).map_err(|_| SqlError::Overflow)?);
+                    Some(version)
+                } else {
+                    None
+                };
                 row_check(t, &row)?;
                 let key = pk(t, &row)?;
                 let table_id = t.id;
@@ -1794,8 +1891,10 @@ impl Relational {
                 if rows.contains_key(&key) {
                     return Err(SqlError::Duplicate);
                 }
-                let mut next_version = self.next_version;
-                let version = allocate(&mut next_version)?;
+                let version = match heap_version {
+                    Some(version) => version,
+                    None => allocate(&mut next_version)?,
+                };
                 let row = SqlRow {
                     values: row,
                     version,
@@ -1822,6 +1921,9 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
+                if t.hidden_rowid().is_some() {
+                    return Err(SqlError::Unsupported);
+                }
                 let b = bounds(t, predicates, params)?;
                 let limit = match limit {
                     Some(e) => match e.value(params)? {

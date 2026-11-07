@@ -145,7 +145,7 @@ impl InsertExpressions {
             return Err(SqlError::Limit);
         }
         let indexes = if self.columns.is_empty() {
-            (0..table.columns.len()).collect::<Vec<_>>()
+            table.logical_offsets()
         } else {
             self.columns
                 .iter()

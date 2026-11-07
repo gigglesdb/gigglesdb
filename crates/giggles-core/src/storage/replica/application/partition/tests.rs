@@ -75,6 +75,41 @@ fn limits() -> ProjectionLimits {
 }
 
 #[test]
+fn heap_partition_projection_rejects_before_output_and_keyed_projection_works() {
+    let keyed = source();
+    let keyed_image = image(&keyed);
+    let mut keyed_request = request_for(&keyed, &keyed_image);
+    keyed_request.limits.rows = 64;
+    keyed_request.descriptor.limits = keyed_request.limits;
+    let projection = project(&keyed_image, &keyed_request).unwrap();
+    validate_projection(projection.as_untrusted(), &keyed_request.descriptor).unwrap();
+    primitive_preflight(&keyed_request).unwrap();
+
+    let mut heap = storage::empty(123);
+    let create = Prepared::parse("CREATE TABLE items (value BIGINT)", 123, heap.sql.epoch).unwrap();
+    heap.sql.execute(&create, &[], None).unwrap();
+    let heap_image = Image(storage::encode(&storage::records(&heap).unwrap()).unwrap());
+    let mut heap_request = keyed_request.clone();
+    heap_request.descriptor.table = TableIdentity::from(&heap.sql.tables["items"]);
+    heap_request.descriptor.source_digest = Sha256::digest(heap_image.bytes()).into();
+    assert!(matches!(project(&heap_image, &heap_request), Err(CoreError::Unsupported)));
+    assert_eq!(primitive_preflight(&heap_request), Err(CoreError::Unsupported));
+    assert!(matches!(
+        project_decoded(&heap, &heap_request, &mut ProjectionMode::Ordinary, &mut || false),
+        Err(CoreError::Unsupported)
+    ));
+    // A forged keyed commitment cannot cause heap source metadata disclosure.
+    assert!(matches!(
+        project_decoded(&heap, &keyed_request, &mut ProjectionMode::Ordinary, &mut || false),
+        Err(CoreError::Unsupported)
+    ));
+    assert!(matches!(
+        validate_projection(projection.as_untrusted(), &heap_request.descriptor),
+        Err(CoreError::Unsupported)
+    ));
+}
+
+#[test]
 fn unknown_fields_are_rejected_at_every_descriptor_nesting() {
     let baseline = serde_json::to_value(descriptor()).unwrap();
     for pointer in ["", "/table", "/table/columns/0", "/metadata", "/homes"] {

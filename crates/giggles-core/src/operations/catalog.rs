@@ -181,6 +181,9 @@ fn bind_catalog(
             .iter()
             .find(|t| t.name == *table)
             .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+        if table.hidden_rowid().is_some() {
+            return Err(Error::Unsupported);
+        }
         for name in columns.iter().map(String::as_str).chain(
             table
                 .primary_key

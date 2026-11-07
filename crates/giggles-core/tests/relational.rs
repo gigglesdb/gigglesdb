@@ -410,10 +410,10 @@ fn strict_rejection_matrix_and_resource_bounds() {
     for q in [
         "UPDATE safe SET n=1",
         "DELETE FROM safe",
-        "CREATE TABLE nopk (id BIGINT)",
     ] {
         err(&mut s, q, E::Unbounded);
     }
+    run(&mut s, "CREATE TABLE nopk (id BIGINT)");
     for q in [
         "CREATE TABLE deliveries (id BIGINT PRIMARY KEY)",
         "CREATE TABLE giggles_state (id BIGINT PRIMARY KEY)",

@@ -88,6 +88,39 @@ fn version(outcome: &Outcome) -> u64 {
     out.rows[0].version
 }
 #[test]
+fn application_read_and_guarded_write_reject_heap_images() {
+    let (keyed, read, _) = fixture();
+    let (_, outcome) = keyed.evaluate_application(&read).unwrap().unwrap();
+    let keyed_write = write(&keyed, &read, 2, version(&outcome), Value::Int(11));
+    assert!(matches!(
+        keyed.evaluate_application(&keyed_write).unwrap().unwrap().1,
+        Outcome::Success(_)
+    ));
+    let mut heap = empty(123);
+    let create = Prepared::parse("CREATE TABLE items (n BIGINT)", 123, heap.sql.epoch).unwrap();
+    heap.sql.execute(&create, &[], None).unwrap();
+    heap.applications = state(&keyed).applications;
+    let table = &heap.sql.tables["items"];
+    assert!(table.hidden_rowid().is_some());
+    let mut heap_read = read;
+    heap_read.body.table = table.id;
+    heap_read.body.catalog_epoch = heap.sql.epoch;
+    let mut heap_write = heap_read.clone();
+    heap_write.identity.operation = 2;
+    heap_write.body.operation = Operation::GuardedWrite {
+        key: vec![Value::Int(1)],
+        expected_version: 1,
+        assignments: vec![(table.columns[0].id, Value::Int(11))],
+    };
+    // Raw canonical bytes exercise the public entry even when the replica
+    // format gate rejects heaps before application table admission.
+    let heap = Image(encode(&records(&heap).unwrap()).unwrap());
+    for command in [heap_read, heap_write] {
+        assert_eq!(heap.evaluate_application(&command), Err(CoreError::Unsupported));
+    }
+}
+
+#[test]
 fn successful_read_cas_and_exact_replay_reopened_image() {
     let (original, read, _) = fixture();
     let before = original.bytes().to_vec();

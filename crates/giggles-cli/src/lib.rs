@@ -541,6 +541,14 @@ impl Runner {
                     ".quit" => return self.finish(),
                     ".schema" => {
                         let (epoch, tables) = admin.catalog().map_err(sql)?;
+                        let tables = tables.into_iter().map(|mut table| {
+                            let heap = table.hidden_rowid().is_some();
+                            table.columns = table.logical_columns().cloned().collect();
+                            if heap {
+                                table.primary_key.clear();
+                            }
+                            table
+                        }).collect::<Vec<_>>();
                         writeln!(output, "{}", serde_json::json!({"version":1,"catalog":{"epoch":epoch,"tables":tables}})).map_err(io_error)?;
                     }
                     ".mode json" => self.mode = OutputMode::Json,

@@ -90,6 +90,38 @@ fn export_no_clobber() {
     assert_eq!(std::fs::read(p.join("copy")).unwrap(), b"sentinel");
 }
 #[test]
+fn heap_capture_and_export_are_unsupported_before_archive_output() {
+    let (p, a) = populated("heap-unsupported");
+    let mut session = a.sql_session();
+    session.execute("CREATE TABLE heap (body TEXT)", &[], None).unwrap();
+    for populated in [false, true] {
+        if populated {
+            session.execute("INSERT INTO heap VALUES ('body')", &[], None).unwrap();
+        }
+        assert!(matches!(
+            capture(&a, Bounds::default()),
+            Err(Error::Core(giggles_core::CoreError::Sql(
+                giggles_core::relational::SqlError::Unsupported
+            )))
+        ));
+        let mut points = Vec::new();
+        assert!(matches!(
+            export_with_hook(&a, p.join("copy"), Bounds::default(), &mut |point| {
+                points.push(point);
+                Ok(())
+            }),
+            Err(Error::Core(giggles_core::CoreError::Sql(
+                giggles_core::relational::SqlError::Unsupported
+            )))
+        ));
+        assert_eq!(points, vec![Point::CatalogBefore, Point::Snapshot]);
+        assert!(!p.join("copy").exists());
+        assert!(!std::fs::read_dir(&p).unwrap().any(|entry| {
+            entry.unwrap().path().extension().is_some_and(|ext| ext == "staging")
+        }));
+    }
+}
+#[test]
 fn import_no_clobber() {
     let (p, a) = populated("no-clobber-import");
     export(&a, p.join("copy"), Bounds::default()).unwrap();

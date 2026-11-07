@@ -36,6 +36,9 @@ impl SqlSession {
         if staged.sql.tables.get(&table.name) != Some(table) {
             return Err(CoreError::Sql(SqlError::StaleSchema));
         }
+        if table.hidden_rowid().is_some() {
+            return Err(CoreError::Sql(SqlError::Unsupported));
+        }
         Ok(Snapshot {
             domain: staged.view.domain,
             epoch: staged.sql.epoch,
@@ -189,6 +192,55 @@ mod tests {
             })
             .unwrap()
             .rows
+    }
+
+    #[test]
+    fn heap_complete_relations_and_typed_session_wrappers_are_unsupported() {
+        let (_, mut session, keyed) = fixture(0, 1);
+        session
+            .execute("CREATE TABLE heap_items (note TEXT)", &[], None)
+            .unwrap();
+        let heap = session
+            .catalog_engine()
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|table| table.name == "heap_items")
+            .unwrap();
+        with_sql_parser_forbidden(|| {
+            session.begin_engine().unwrap();
+            let complete = session.complete_table_engine(&keyed).unwrap();
+            assert!(session.consume_complete_engine(complete, &keyed).unwrap().is_empty());
+            assert!(matches!(
+                session.complete_table_engine(&heap),
+                Err(CoreError::Sql(SqlError::Unsupported))
+            ));
+            assert!(session.is_aborted());
+            session.rollback();
+            for operation in 0..4 {
+                session.begin_engine().unwrap();
+                let result = match operation {
+                    0 => session.insert_engine(&heap, vec![]).map(|_| ()),
+                    1 => session.update_engine(&heap, vec![], vec![], 1).map(|_| ()),
+                    2 => session.delete_engine(&heap, vec![], 1).map(|_| ()),
+                    _ => session.row_version_engine(&heap, &[]).map(|_| ()),
+                };
+                assert_eq!(result, Err(CoreError::Sql(SqlError::Unsupported)));
+                session.rollback();
+            }
+            session.begin_engine().unwrap();
+            session
+                .insert_engine(&keyed, vec![V::Int(7), V::Int(1), V::Text("one".into())])
+                .unwrap();
+            let key = vec![V::Int(7), V::Int(1)];
+            let version = session.row_version_engine(&keyed, &key).unwrap();
+            session
+                .update_engine(&keyed, key.clone(), vec![(2, V::Text("two".into()))], version)
+                .unwrap();
+            let version = session.row_version_engine(&keyed, &key).unwrap();
+            session.delete_engine(&keyed, key, version).unwrap();
+            session.rollback();
+        });
     }
 
     #[test]

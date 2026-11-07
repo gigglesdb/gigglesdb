@@ -396,6 +396,9 @@ impl super::super::Image {
             Ok(v) => v,
             Err(e) => return Ok(Err(e)),
         };
+        if table.hidden_rowid().is_some() {
+            return Err(CoreError::Unsupported);
+        }
         let key = (command.body.domain, command.identity.clone());
         if let Some(retained) = ledger.outcomes.get(&key) {
             return Ok(if retained.body == command.body {
