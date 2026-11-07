@@ -115,14 +115,28 @@ pub(crate) const CANCEL_POLL_ROWS: u64 = 64;
 pub(crate) struct Meter<'c> {
     cancel: &'c mut dyn FnMut() -> bool,
     rows: u64,
+    every: u64,
 }
 impl<'c> Meter<'c> {
     pub(crate) fn new(cancel: &'c mut dyn FnMut() -> bool) -> Self {
-        Self { cancel, rows: 0 }
+        Self {
+            cancel,
+            rows: 0,
+            every: CANCEL_POLL_ROWS,
+        }
+    }
+    /// Poll cancel before every input row. SQL aggregates keep DD-0068's fence
+    /// contract: entry, every input row, then a final normal-success fence.
+    pub(crate) fn per_row(cancel: &'c mut dyn FnMut() -> bool) -> Self {
+        Self {
+            cancel,
+            rows: 0,
+            every: 1,
+        }
     }
     pub(crate) fn tick(&mut self) -> R<()> {
         self.rows = self.rows.checked_add(1).ok_or(SqlError::Limit)?;
-        if self.rows.is_multiple_of(CANCEL_POLL_ROWS) && (self.cancel)() {
+        if self.rows.is_multiple_of(self.every) && (self.cancel)() {
             return Err(SqlError::Aborted);
         }
         Ok(())

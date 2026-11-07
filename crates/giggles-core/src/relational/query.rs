@@ -1401,7 +1401,11 @@ impl BoundQuery<'_> {
             scan::KeyRange::from_bounds(bounds)
         };
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
-        let mut meter = scan::Meter::new(cancel);
+        let mut meter = if self.aggregate {
+            scan::Meter::per_row(cancel)
+        } else {
+            scan::Meter::new(cancel)
+        };
         let mut filter_work = 0;
         let filtered = scan::filtered(input, &mut meter, |r| {
             let mut row = Tuple {
