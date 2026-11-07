@@ -44,7 +44,7 @@
   {
     "id": "update_delete_params",
     "title": "Update delete params",
-    "owner": "E1",
+    "owner": "E3",
     "expect_error": false
   },
   {
@@ -68,7 +68,7 @@
   {
     "id": "savepoint",
     "title": "Savepoint",
-    "owner": "D",
+    "owner": "unowned",
     "expect_error": false
   },
   {
@@ -86,13 +86,13 @@
   {
     "id": "param_no_from_aggregate",
     "title": "Param no from aggregate",
-    "owner": "E3",
+    "owner": "DD-0068",
     "expect_error": false
   },
   {
     "id": "copy_from_stdin",
     "title": "Copy from stdin",
-    "owner": "D",
+    "owner": "unowned",
     "expect_error": false
   },
   {

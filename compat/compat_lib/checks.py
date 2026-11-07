@@ -9,7 +9,7 @@ def _trailing_ws(text):
 
 NORMALIZERS = {'crlf': lambda text: text.replace('\r\n','\n'), 'trailing-ws': _trailing_ws}
 NORMALIZATION_RULES = list(NORMALIZERS)
-OWNERS = {'A','B','C','D','E1','E2','E3','F','G','H'}
+OWNERS = {'A','B','C','D','E1','E2','E3','F','G','H','DD-0068','unowned'}
 CLIENT_ENV = {'PGTZ', 'PGOPTIONS', 'PGAPPNAME', 'PGCLIENTENCODING', 'PGDATESTYLE'}
 
 def validate_env(env):

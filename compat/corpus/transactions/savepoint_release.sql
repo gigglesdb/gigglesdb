@@ -1,6 +1,6 @@
 -- case: savepoint_release
 -- title: Release a savepoint and commit its changes
--- owner: D
+-- owner: unowned
 -- expect: compatible
 
 CREATE TABLE r0c_savepoint_release_t (id integer PRIMARY KEY);

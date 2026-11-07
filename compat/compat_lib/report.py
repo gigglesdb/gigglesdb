@@ -43,9 +43,12 @@ def differential_markdown(differential):
     lines = ['', '## Differential SQL', '', differential_table(differential.get('summary', {})),
              '', '## Differential failures by owning track']
     cases = differential.get('cases', [])
+    lines += ['', '| Case | Owner | Comparison | Outcome |', '| --- | --- | --- | --- |']
+    for case in cases:
+        lines.append('| ' + ' | '.join(str(value).replace('|', '\\|') for value in (case['id'], case['owner'], 'compare: '+case.get('compare', 'full'), case['outcome'])) + ' |')
     owners = sorted({case['owner'] for case in cases if case['outcome'] in ('UNSUPPORTED','DIVERGENT','INTENTIONAL','HARNESS_ERROR')})
     for owner in owners:
-        lines += ['', '### '+owner]
+        lines += ['', '### '+('Unowned (needs an owner)' if owner == 'unowned' else owner)]
         for case in cases:
             if case['owner'] != owner or case['outcome'] not in ('UNSUPPORTED','DIVERGENT','INTENTIONAL','HARNESS_ERROR'):
                 continue
@@ -84,7 +87,7 @@ def markdown(report):
         lines.append('| '+' | '.join(str(item[k]).replace('|','\\|') for k in ('client','id','owner','outcome'))+' |')
     lines += ['', '## Failures by owning track']
     for owner, failures in report['failures_by_owner'].items():
-        lines += ['', f'### {owner}', ', '.join(failures)]
+        lines += ['', '### '+('Unowned (needs an owner)' if owner == 'unowned' else owner), ', '.join(failures)]
         for check in report['checks']:
             if check['client']+'/'+check['id'] in failures:
                 lines += ['', f"{check['client']}/{check['id']}", '```diff', '\n'.join(check.get('diff_excerpt', [])), '```']

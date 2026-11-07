@@ -1,6 +1,6 @@
 -- case: update_set_expression
 -- title: Update set expression
--- owner: E1
+-- owner: E3
 -- expect: compatible
 CREATE TABLE r0c_update_set_expression_t (id int PRIMARY KEY, score int, name text);
 INSERT INTO r0c_update_set_expression_t VALUES (1, 10, 'alpha');

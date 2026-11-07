@@ -92,7 +92,8 @@ Add a check under `compat/checks/<client>/*.sql` with unique safe ID and headers
 SELECT 1 AS one;
 ```
 
-Owners are A, B, C, D, E1, E2, E3, F, G or H. An optional
+Owners are A, B, C, D, E1, E2, E3, F, G, H, DD-0068 or unowned.
+Unowned failures appear under `Unowned (needs an owner)` in both report lanes. An optional
 `-- status: untested explanation` records a deliberately unexecuted check.
 Repeatable `-- env: KEY=VALUE` headers pass client environment to both databases
 for that check only. Allowed keys are PGTZ, PGOPTIONS, PGAPPNAME,
@@ -378,7 +379,7 @@ probe directory without a host language toolchain.
 
 ## H3d selection and oracle diagnostics
 
-`--owners E1,H` selects owners from A, B, C, D, E1, E2, E3, F, G, H.
+`--owners E1,H` selects owners from A, B, C, D, E1, E2, E3, F, G, H, DD-0068, unowned.
 The owner filter is ANDed with `--checks` and `--corpus`; invalid or empty
 owner selections fail before starting infrastructure. Corpus filtering happens
 before sessions run. Driver probes still execute and validate their full manifest,
@@ -398,3 +399,62 @@ passwords and PostgreSQL URLs, and caps final stored bytes at 20 MiB, including
 a truncation marker. Required application attribution overrides any check
 `PGAPPNAME` header: `r0:psql:<check-id>`, `r0:corpus:<area>/<case-id>`, and
 `r0:<registered-client>` for probes, including `r0:npgsql-notypes`.
+
+## H5a ownership and shape comparisons
+
+Corpus cases accept `-- compare: full` (default) or `-- compare: shape`,
+and optional `-- source: ...` provenance metadata. Shape comparison requires
+equal SQLSTATEs; successful statements compare the first logical CSV record
+(column names, including quoted multiline names) and framed ROW_COUNT, ignoring
+row values. Command-only statements compare their first output record (the
+command tag); empty output has no header. Equal error SQLSTATEs compare equal.
+Every case's comparison mode appears in JSON and the Markdown case table,
+including compatible cases. Existing full comparison behavior is unchanged.
+
+Parameterized update/delete probes and update_set_expression belong to E3.
+No-FROM aggregate probes belong to DD-0068. Savepoints and COPY/binary import
+probes are unowned; pgx simple execution remains D with the GD-0055 reference.
+
+## DataGrip captured SQL corpus
+
+Regenerate the 36 DataGrip cases with:
+
+```powershell
+python -I -B compat/tools/gen_datagrip_corpus.py
+```
+
+The default destination is the committed `compat/corpus/datagrip` source
+directory. Use `--out J:/gigglesdb-work/<unique-task>/datagrip` to review an
+independent export. Set TEMP, TMP and CARGO_TARGET_DIR to that task's J: paths
+before running commands.
+
+The generator reads two capture JSON files and `datagrip_*.sql` fixtures,
+verifies JSON `sha256`/`expanded_sha256` identities, and globally deduplicates
+the SQL UTF-8 bytes after stripping a leading BOM and normalizing CRLF to LF.
+This applies to fixture SQL and embedded JSON SQL strings before checking the
+stored `sha256`/`expanded_sha256` (which must describe the LF-normalized value),
+deduplicating, naming, and writing cases. Generated files always use LF.
+Stable IDs use the captured family/name, adding a hash suffix for collisions.
+Each case creates its own primary-key fixture table and body index, declares
+owner G, `compare: shape`, and source provenance. Captured SQL retains its
+comments and literals; multiple statements become separate line-terminated
+chunks. Only unexpanded `:schema_id` and `$N` parameters are replaced by literal
+2200, the public namespace OID; captured literal OIDs and names stay intact.
+
+PostgreSQL 18 qualification can identify obsolete captured SQL. Such cases
+remain in the corpus with a reasoned `expect: untested` override keyed by their
+source SHA-256 in `PG18_UNTESTED`, so regeneration preserves the decision.
+Shape-compatible catalog results qualify column names and counts only.
+
+## Offline report deltas
+
+```powershell
+python -I -B compat/harness.py delta OLD.json NEW.json --out J:/gigglesdb-work/<unique-task>/delta.md
+```
+
+`delta` reads existing report JSON without starting infrastructure, prints
+Markdown, and optionally writes it with `--out`. It matches checks and corpus
+cases by their exact stable identities, reports improvements, regressions,
+added/removed records and other changes, and includes PASS-count and pass-rate
+percentage-point deltas. Owner and error changes appear as other changes.
+Exit status is 0 without regressions, 3 with regressions, or 2 for invalid input.

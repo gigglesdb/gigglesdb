@@ -1,6 +1,6 @@
 -- case: savepoint_rollback_to
 -- title: Roll back changes after a savepoint
--- owner: D
+-- owner: unowned
 -- expect: compatible
 
 CREATE TABLE r0c_savepoint_rollback_to_t (id integer PRIMARY KEY);

@@ -44,7 +44,7 @@
     {
         "id":  "update_delete_params",
         "title":  "Update and delete with parameters",
-        "owner":  "E1",
+        "owner":  "E3",
         "expect_error":  false
     },
     {
@@ -68,7 +68,7 @@
     {
         "id":  "savepoint",
         "title":  "Rollback to savepoint and commit",
-        "owner":  "D",
+        "owner":  "unowned",
         "expect_error":  false
     },
     {
@@ -86,11 +86,11 @@
     {
         "id":  "param_no_from_aggregate",
         "title":  "Count and parameter max without FROM",
-        "owner":  "E3",
+        "owner":  "DD-0068",
         "expect_error":  false
     },
     {
-        "title":  "Parameterized point with simple execution mode",
+        "title":  "Parameterized point with simple execution mode (GD-0055)",
         "id":  "exec_mode_simple",
         "owner":  "D",
         "expect_error":  false
@@ -104,7 +104,7 @@
     {
         "title":  "CopyFrom rows and point reads",
         "id":  "copy_from",
-        "owner":  "D",
+        "owner":  "unowned",
         "expect_error":  false
     },
     {

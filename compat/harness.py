@@ -10,11 +10,15 @@ import fnmatch
 import json
 import math
 import secrets
-from compat_lib import checks, corpus, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util
+from compat_lib import checks, corpus, delta, docker, gigglesdb, oracle, pins, probes, psql_client, report, scratch, util
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='action', required=True)
+    comparison = sub.add_parser('delta')
+    comparison.add_argument('old', type=Path)
+    comparison.add_argument('new', type=Path)
+    comparison.add_argument('--out', type=Path)
     run = sub.add_parser('run')
     run.add_argument('--server-bin', type=Path)
     run.add_argument('--build-root', default='J:/gigglesdb-work/r0-harness/builds')
@@ -86,7 +90,8 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     (directory/'script.sql').write_text(script, encoding='utf-8')
     runner = psql_client.REGISTRY[client].get('run_session')
     if case['expect'] == 'untested' or not available or runner is None:
-        item = {key:case.get(key) for key in ('area','id','title','owner','expect','reason')}
+        item = {key:case.get(key) for key in ('area','id','title','owner','expect','reason','source')}
+        item['compare'] = case.get('compare', 'full')
         item.update(outcome='UNTESTED', pg=None, giggles=None, first_divergence=None,
                     warnings=case.get('warnings', []), stale_expectation=False)
         if case['expect'] != 'untested':
@@ -115,7 +120,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     item['artifact_dir'] = str(directory)
     item = util.redact(item,[password])
     (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
-    summary_keys = ('area','id','title','owner','expect','reason','outcome',
+    summary_keys = ('area','id','title','owner','expect','reason','outcome','compare','source',
                     'first_divergence','warnings','stale_expectation','artifact_dir','harness_errors')
     data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
 
@@ -191,6 +196,8 @@ def corpus_matches(case, pattern):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.action == 'delta':
+        return delta.run(args.old, args.new, args.out)
     try:
         parse_owners(args.owners)
     except ValueError as exc:

@@ -1,6 +1,8 @@
 """Pure parsing and differential comparison for the statement corpus."""
 import re
 import copy
+import csv
+import io
 from pathlib import Path
 
 from .checks import OWNERS, normalize
@@ -10,9 +12,24 @@ OUTCOMES = ('COMPATIBLE', 'UNSUPPORTED', 'DIVERGENT', 'INTENTIONAL', 'UNTESTED',
 
 
 def _scan(line, quote=None, terminators=None):
-    """Return SQL before its line comment and the continuing quote state."""
+    """Return SQL with comments masked and the continuing lexical state."""
     i = 0
+    code = list(line)
     while i < len(line):
+        if isinstance(quote, int):
+            if line.startswith('/*', i):
+                quote += 1
+                code[i:i+2] = '  '
+                i += 2
+            elif line.startswith('*/', i):
+                quote -= 1
+                quote = quote or None
+                code[i:i+2] = '  '
+                i += 2
+            else:
+                code[i] = ' '
+                i += 1
+            continue
         if quote:
             if line.startswith(quote, i):
                 if quote in ("'", '"') and line.startswith(quote * 2, i):
@@ -25,7 +42,12 @@ def _scan(line, quote=None, terminators=None):
             i += 1
             continue
         if line.startswith('--', i):
-            return line[:i], quote
+            return ''.join(code[:i]), quote
+        if line.startswith('/*', i):
+            quote = 1
+            code[i:i+2] = '  '
+            i += 2
+            continue
         if line[i] == '\\':
             raise ValueError('psql backslash commands are forbidden')
         if line[i] == ';' and terminators is not None:
@@ -39,7 +61,7 @@ def _scan(line, quote=None, terminators=None):
                 i += len(quote)
                 continue
         i += 1
-    return line, quote
+    return ''.join(code), quote
 
 
 def parse_case(path, area=None):
@@ -53,19 +75,21 @@ def parse_case(path, area=None):
                     raise ValueError(f'{path}: misplaced @error')
                 pending = True
             else:
-                m = re.fullmatch(r'\s*--\s*(case|title|owner|expect):\s*(.*?)\s*', line)
+                m = re.fullmatch(r'\s*--\s*(case|title|owner|expect|compare|source):\s*(.*?)\s*', line)
                 if m:
                     if statements or parts or m[1] in headers:
                         raise ValueError(f'{path}: misplaced or duplicate header')
                     headers[m[1]] = m[2]
+                elif parts:
+                    parts.append(line.rstrip())
             continue
         terminators = []
         code, quote = _scan(line, quote, terminators)
         if terminators and (len(terminators) != 1 or code[terminators[0] + 1:].strip()):
             raise ValueError(f'{path}: one SQL command per line-terminated chunk is required')
-        if code.strip():
-            parts.append(code.rstrip())
-        if not quote and code.rstrip().endswith(';'):
+        if code.strip() or parts or quote or line.lstrip().startswith('/*'):
+            parts.append(line.rstrip())
+        if not quote and terminators:
             statements.append(dict(index=len(statements) + 1, sql='\n'.join(parts), expected_error=pending))
             parts, pending = [], False
     if parts or quote or pending:
@@ -80,11 +104,14 @@ def parse_case(path, area=None):
     if not expectation or expectation[0] not in ('compatible', 'intentional', 'untested') or (expectation[0] == 'compatible' and len(expectation) != 1) or (expectation[0] != 'compatible' and len(expectation) != 2):
         raise ValueError(f'{path}: invalid expectation (reason required)')
     warnings = []
+    comparison = headers.get('compare', 'full')
+    if comparison not in ('full', 'shape'):
+        raise ValueError(f'{path}: unsupported compare header')
     for statement in statements:
         for m in re.finditer(r'\bCREATE\s+(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)', statement['sql'], re.I):
             if headers['case'].lower() not in m[1].lower():
                 warnings.append(f"statement {statement['index']}: CREATE TABLE {m[1]} does not contain case id")
-    return dict(id=headers['case'], title=headers['title'], owner=headers['owner'], expect=expectation[0], reason=expectation[1] if len(expectation) > 1 else '', area=area or path.parent.name, path=str(path), statements=statements, warnings=warnings)
+    return dict(id=headers['case'], title=headers['title'], owner=headers['owner'], compare=comparison, source=headers.get('source', ''), expect=expectation[0], reason=expectation[1] if len(expectation) > 1 else '', area=area or path.parent.name, path=str(path), statements=statements, warnings=warnings)
 
 
 def discover_cases(root, glob='**/*.sql'):
@@ -158,7 +185,20 @@ def parse_transcript(stdout, statements, server='giggles', stderr=''):
     return dict(records=records, valid=invalid is None, reason=invalid, server=server)
 
 
-def statement_difference(pg, giggles):
+def _shape(record):
+    # csv.reader consumes a logical record, including quoted multiline names.
+    # For command-only output its first record is the command tag; empty output
+    # has no header. ROW_COUNT always comes from the framed protocol metadata.
+    lines = record['output_lines']
+    if lines and re.fullmatch(r'@@R0 ROW_COUNT \d+', lines[-1]):
+        lines = lines[:-1]
+    header = next(csv.reader(io.StringIO('\n'.join(lines))), None)
+    return header, record.get('row_count')
+
+
+def statement_difference(pg, giggles, compare='full'):
+    if compare not in ('full', 'shape'):
+        raise ValueError('unsupported comparison: ' + compare)
     p, g = pg['sqlstate'], giggles['sqlstate']
     if 'CONNECTION_LOST' in (p, g):
         if p == '00000':
@@ -167,7 +207,8 @@ def statement_difference(pg, giggles):
             return 'pg_error_only'
         return 'sqlstate_differs'
     if p == g:
-        return None if p != '00000' or normalize('\n'.join(pg['output_lines'])) == normalize('\n'.join(giggles['output_lines'])) else 'result_differs'
+        equal = (_shape(pg) == _shape(giggles) if compare == 'shape' else normalize('\n'.join(pg['output_lines'])) == normalize('\n'.join(giggles['output_lines'])))
+        return None if p != '00000' or equal else 'result_differs'
     if p == '00000':
         return 'giggles_error'
     if g == '00000':
@@ -181,7 +222,8 @@ def compare_case(case, pg, giggles):
         giggles['records'][-1]['sqlstate'] = 'CONNECTION_LOST'
         giggles['valid'] = False
         giggles['reason'] = 'client timed out'
-    result = {k: case.get(k) for k in ('id', 'area', 'title', 'owner', 'expect', 'reason', 'warnings')}
+    result = {k: case.get(k) for k in ('id', 'area', 'title', 'owner', 'expect', 'reason', 'warnings', 'source')}
+    result['compare'] = case.get('compare', 'full')
     result.update(outcome='COMPATIBLE', first_divergence=None, stale_expectation=False, pg=pg, giggles=giggles, differences=[], harness_errors=[])
     if case['expect'] == 'untested':
         result['outcome'] = 'UNTESTED'
@@ -193,7 +235,7 @@ def compare_case(case, pg, giggles):
         if (p['sqlstate'] != '00000') != stmt['expected_error'] or p['sqlstate'] == 'CONNECTION_LOST':
             harness = True
             result['harness_errors'].append(dict(reason='PostgreSQL connection lost' if p['sqlstate'] == 'CONNECTION_LOST' else ('expected PostgreSQL error did not occur' if stmt['expected_error'] else 'unexpected PostgreSQL error: ' + p['sqlstate']), index=stmt['index'], sql=stmt['sql']))
-        kind = statement_difference(p, g)
+        kind = statement_difference(p, g, result['compare'])
         if kind:
             detail = dict(index=stmt['index'], kind=kind, sql=stmt['sql'], pg=dict(sqlstate=p['sqlstate'], output_excerpt='\n'.join(p['output_lines'])[:2000]), giggles=dict(sqlstate=g['sqlstate'], output_excerpt='\n'.join(g['output_lines'])[:2000], stderr_first_line=g.get('stderr_first_line', '')))
             result['differences'].append(detail)

@@ -44,7 +44,7 @@
     {
         "id":  "update_delete_params",
         "title":  "Update and delete with parameters",
-        "owner":  "E1",
+        "owner":  "E3",
         "expect_error":  false
     },
     {
@@ -68,7 +68,7 @@
     {
         "id":  "savepoint",
         "title":  "Rollback to savepoint and commit",
-        "owner":  "D",
+        "owner":  "unowned",
         "expect_error":  false
     },
     {
@@ -86,7 +86,7 @@
     {
         "id":  "param_no_from_aggregate",
         "title":  "Count and parameter max without FROM",
-        "owner":  "E3",
+        "owner":  "DD-0068",
         "expect_error":  false
     },
     {
