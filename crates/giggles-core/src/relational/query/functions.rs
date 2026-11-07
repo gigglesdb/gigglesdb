@@ -776,6 +776,7 @@ impl Scalar {
                                     if temporal::known_name(name)
                                         || character::known_name(name)
                                         || name == "md5"
+                                        || name == "strpos" && a.ty == DataType::Bytes
                                     {
                                         SqlError::UndefinedFunction
                                     } else {
@@ -1925,6 +1926,18 @@ impl Scalar {
                 integer_formats::argument_type(ty.as_ref())?;
             }
             Self::Call(n, args) => {
+                if n == "strpos" {
+                    // Reject the missing bytea overload before text inference
+                    // turns a declared argument into a parameter-type conflict.
+                    for arg in args {
+                        if arg
+                            .bind(resolve, tables, parameters)
+                            .is_ok_and(|a| a.ty == DataType::Bytes)
+                        {
+                            return Err(SqlError::UndefinedFunction);
+                        }
+                    }
+                }
                 let common = if n == "coalesce" {
                     args.iter().find_map(|a| match a {
                         Self::Cast(_, t) => Some(t.clone()),

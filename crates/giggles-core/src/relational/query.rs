@@ -1343,6 +1343,21 @@ impl Query {
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
+        let declared_bytea_projection = parameters.contains(&Some(DataType::Bytes))
+            && !self.explain
+            && self.sources.is_empty()
+            && self.joins.is_empty()
+            && self.predicates.is_empty()
+            && self.filter.is_none()
+            && self.group().is_empty()
+            && self.having().is_none()
+            && self.offset().is_none()
+            && self.order.is_empty()
+            && self.limit.is_none()
+            && self
+                .items
+                .iter()
+                .all(|(item, _)| matches!(item, Item::Scalar(Scalar::Param(_))));
         unique(self.sources.iter().map(|s| &s.alias))?;
         let tables = self
             .sources
@@ -1540,6 +1555,15 @@ impl Query {
             .any(|n| parameters.get(n - 1).is_some_and(Option::is_some))
         {
             return Err(SqlError::AmbiguousParameter);
+        }
+        // Only a plain projection seeded with bytea needs the catalog fallback's
+        // text default. Inferred bytea and other query shapes keep their errors.
+        if declared_bytea_projection {
+            for (item, _) in &self.items {
+                if let Item::Scalar(Scalar::Param(n)) = item {
+                    parameters[*n - 1].get_or_insert(DataType::Text);
+                }
+            }
         }
         let mut columns = vec![];
         let mut aliases = BTreeSet::new();

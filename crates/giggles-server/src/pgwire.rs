@@ -371,6 +371,10 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
         }
     }
     match (ty, b.len()) {
+        (DataType::Boolean, 0)
+        | (DataType::SmallInt, 0..2)
+        | (DataType::Integer, 0..4)
+        | (DataType::BigInt, 0..8) => Err("08P01"),
         (DataType::Boolean, 1) if b[0] <= 1 => Ok(Value::Bool(b[0] != 0)),
         (DataType::SmallInt, 2) => Ok(Value::Int(i16::from_be_bytes(b.try_into().unwrap()).into())),
         (DataType::Integer, 4) => Ok(Value::Int(i32::from_be_bytes(b.try_into().unwrap()).into())),
@@ -551,6 +555,65 @@ fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_c
         other => other.map_err(catalog_wire::error),
     }
 }
+
+fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
+    if declared == 0 || declared == oid(ty) {
+        return Some(ty.clone());
+    }
+    match (ty, declared) {
+        (DataType::Text, 1043) => Some(DataType::Text),
+        (DataType::SmallInt | DataType::Integer | DataType::BigInt, 21) => Some(DataType::SmallInt),
+        (DataType::SmallInt | DataType::Integer | DataType::BigInt, 23) => Some(DataType::Integer),
+        (DataType::SmallInt | DataType::Integer | DataType::BigInt, 20) => Some(DataType::BigInt),
+        _ => None,
+    }
+}
+
+fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Plan, Description)> {
+    let mut declared = oids
+        .iter()
+        .map(|o| (*o == 17).then_some(DataType::Bytes))
+        .collect::<Vec<_>>();
+    let prepared = core(session.prepare_with_parameter_types(sql, &declared))?;
+    let description = core(session.describe(&prepared))?;
+    if oids.len() > description.parameters.len() {
+        return Err("08P01");
+    }
+    let rejected_text = oids
+        .iter()
+        .zip(&description.parameters)
+        .enumerate()
+        .filter_map(|(i, (o, ty))| (*o == 25 && sql_declared_type(ty, *o).is_none()).then_some(i))
+        .collect::<Vec<_>>();
+    if session.role.is_sql() && !rejected_text.is_empty() {
+        for &i in &rejected_text {
+            declared[i] = Some(DataType::Text);
+        }
+        let was_aborted = session.is_aborted();
+        let retry =
+            core(session.prepare_with_parameter_types(sql, &declared)).and_then(|reprepared| {
+                core(session.describe(&reprepared)).map(|redescribed| (reprepared, redescribed))
+            });
+        match retry {
+            Ok((reprepared, redescribed))
+                if oids.len() <= redescribed.parameters.len()
+                    && rejected_text
+                        .iter()
+                        .all(|i| redescribed.parameters[*i] == DataType::Text)
+                    && oids
+                        .iter()
+                        .zip(&redescribed.parameters)
+                        .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
+            {
+                return Ok((Plan::Sql(Box::new(reprepared)), redescribed));
+            }
+            Err(error) if !was_aborted && session.is_aborted() => return Err(error),
+            _ => {}
+        }
+    }
+    Ok((Plan::Sql(Box::new(prepared)), description))
+}
+
 #[derive(Clone)]
 enum Plan {
     Empty,
@@ -826,7 +889,7 @@ impl State {
                     return Err("54000");
                 }
                 core(session.authorize_sequence_sql(&sql))?;
-                let (p, mut d) = if let Some(stmt) = crate::auth::statements::parse(&sql) {
+                let (mut p, mut d) = if let Some(stmt) = crate::auth::statements::parse(&sql) {
                     (
                         Plan::Admin(stmt),
                         Description {
@@ -917,13 +980,7 @@ impl State {
                     (Plan::Catalog(Box::new(plan), fields, epoch), d)
                 } else {
                     self.diagnostic.phase = "application prepare";
-                    let declared_types = oids
-                        .iter()
-                        .map(|oid| (*oid == 17).then_some(DataType::Bytes))
-                        .collect::<Vec<_>>();
-                    let p = core(session.prepare_with_parameter_types(&sql, &declared_types))?;
-                    let d = core(session.describe(&p))?;
-                    (Plan::Sql(Box::new(p)), d)
+                    prepare_declared_sql(session, &sql, &oids)?
                 };
                 if n > d.parameters.len() {
                     return Err("08P01");
@@ -934,6 +991,42 @@ impl State {
                     }
                     _ => d.parameters.iter().map(oid).collect(),
                 };
+                // Retry only the catalog declaration mismatch that would otherwise be
+                // 0A000. Keep catalog validation and successful numeric overrides intact.
+                if let Plan::Catalog(plan, _, _) = &p {
+                    let mismatch = oids.iter().zip(&parameter_oids).any(|(o, inferred)| {
+                        *o != 0
+                            && o != inferred
+                            && !(plan.allows_numeric_input_override()
+                                && matches!(*o, 20 | 21 | 23 | 26)
+                                && matches!(*inferred, 20 | 21 | 23 | 26))
+                    });
+                    if session.role.is_sql()
+                        && mismatch
+                        && oids
+                            .iter()
+                            .all(|o| *o == 0 || catalog_wire::parameter_type(*o).is_ok())
+                    {
+                        let was_aborted = session.is_aborted();
+                        match prepare_declared_sql(session, &sql, &oids) {
+                            Ok((application, description))
+                                if oids.len() <= description.parameters.len()
+                                    && oids
+                                        .iter()
+                                        .zip(&description.parameters)
+                                        .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
+                            {
+                                p = application;
+                                d = description;
+                                parameter_oids = d.parameters.iter().map(oid).collect();
+                            }
+                            Err(error) if !was_aborted && session.is_aborted() => {
+                                return Err(error);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 self.diagnostic.phase = "parameter type declaration";
                 for (i, (o, t)) in oids.into_iter().zip(&mut d.parameters).enumerate() {
                     if matches!(p, Plan::Catalog(..)) {
@@ -963,19 +1056,7 @@ impl State {
                         if !matches!(p, Plan::Sql(_)) {
                             return Err("0A000");
                         }
-                        *t = match (&*t, o) {
-                            (DataType::Text, 1043) => DataType::Text,
-                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 21) => {
-                                DataType::SmallInt
-                            }
-                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 23) => {
-                                DataType::Integer
-                            }
-                            (DataType::SmallInt | DataType::Integer | DataType::BigInt, 20) => {
-                                DataType::BigInt
-                            }
-                            _ => return Err("0A000"),
-                        };
+                        *t = sql_declared_type(t, o).ok_or("0A000")?;
                     }
                     if o != 0 {
                         parameter_oids[i] = o;

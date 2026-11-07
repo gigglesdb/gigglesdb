@@ -212,7 +212,8 @@ async fn prepared_task_range_signed_maximum_and_binary_malformed_widths() {
         .await;
         assert!(has_code(&pg_sync(&mut s).await, expected));
     }
-    for width in [0usize, 1, 7, 9] {
+    // PG18: short binary integer input is 08P01 (insufficient data), long is 22P03.
+    for (width, code) in [(0usize, "08P01"), (1, "08P01"), (7, "08P01"), (9, "22P03")] {
         let values = [
             Some(id(4900)),
             Some(id(42)),
@@ -239,7 +240,7 @@ async fn prepared_task_range_signed_maximum_and_binary_malformed_widths() {
         }
         b.extend(0u16.to_be_bytes());
         pg_send(&mut s, b'B', &b).await;
-        assert!(has_code(&pg_sync(&mut s).await, "22P03"));
+        assert!(has_code(&pg_sync(&mut s).await, code));
     }
     assert_eq!(f.admin.snapshot().unwrap(), before);
     assert_eq!(f.admin.authority_metadata().unwrap(), clock);
@@ -679,6 +680,37 @@ async fn prepared_task_typed_malformed_null_oid_count_grammar_and_recovery_corpu
     drop(s);
     drop(c);
     conn.await.unwrap();
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_session_declared_bytea_bare_parameter_keeps_catalog_rejection() {
+    let f = Fixture::new().await;
+    let mut s = raw_task(&f).await;
+    pg_send(&mut s, b'P', &parse_oids("", "SELECT $1", &[17])).await;
+    pg_send(&mut s, b'D', b"S\0").await;
+    let rejected = pg_sync(&mut s).await;
+    // Task sessions are rejected at catalog planning (42501) before any F4 retry.
+    assert!(has_code(&rejected, "42501"), "{rejected:?}");
+    assert!(
+        !rejected.iter().any(|frame| frame.0 == b'1'),
+        "unexpected ParseComplete: {rejected:?}"
+    );
+
+    pg_send(&mut s, b'P', &parse("k", KEY)).await;
+    let prepared = pg_sync(&mut s).await;
+    assert!(!has_code(&prepared, "25P02"), "{prepared:?}");
+    assert!(!prepared.iter().any(|frame| frame.0 == b'E'), "{prepared:?}");
+    assert!(
+        prepared.iter().any(|frame| frame.0 == b'1'),
+        "missing ParseComplete: {prepared:?}"
+    );
+    pg_send(&mut s, b'B', &key_bind("p", "k", u64::MAX, 0)).await;
+    pg_send(&mut s, b'E', &execute("p", 0)).await;
+    let succeeded = pg_sync(&mut s).await;
+    assert!(!has_code(&succeeded, "25P02"), "{succeeded:?}");
+    assert_eq!(row_response(&succeeded).code, "committed", "{succeeded:?}");
+    drop(s);
     f.stop().await;
 }
 

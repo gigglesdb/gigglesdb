@@ -422,20 +422,34 @@ async fn bytea_consumers_excluded_path_controls() {
         report.push(serde_json::json!({"id":id,"query":query,"parameter_oid":oid,"format":format,"parse_describe":bytea_frames_json(&prep),"bind_execute":bytea_frames_json(&frames),"pg_match_claim":if id=="text_binary_nul_preserved" {"excluded preserved profile gap"}else{"excluded-path preservation control"}}));
         bytea_close(&mut raw).await;
     }
-    // Keep this SQL identity separate from the explicit source-Text cast cases.
-    let declaration_gap = bytea_prepare(
+    let declared_text = bytea_prepare(
         &mut raw,
         "SELECT $1::bytea::text, encode($1::bytea,'hex')",
         &[25],
     )
     .await;
-    assert_eq!(bytea_code(&declaration_gap).as_deref(), Some("0A000"));
-    assert!(
-        !declaration_gap
-            .iter()
-            .any(|x| matches!(x.0, b'1' | b'2' | b't' | b'T' | b'D'))
+    assert_eq!(bytea_code(&declared_text), None, "{declared_text:?}");
+    assert!(declared_text.iter().any(|x| x.0 == b'1'));
+    assert_eq!(
+        bytea_oids(&declared_text),
+        (Some(vec![25]), Some(vec![25, 25]))
     );
-    report.push(serde_json::json!({"id":"declared25_implicit_bytea_gap","query":"SELECT $1::bytea::text, encode($1::bytea,'hex')","parameter_oid":25,"pg_state":null,"pg_phase":"execute","profile_state":"0A000","profile_phase":"parse","pg_match_claim":"declaration-profile gap; explicit source-Text cast is separate SQL","parse_describe":bytea_frames_json(&declaration_gap)}));
+    let mut cycles = vec![];
+    for (input, text, hex) in [
+        ("abc", "\\x616263", "616263"),
+        ("\\x0102", "\\x0102", "0102"),
+    ] {
+        let frames = bytea_cycle(&mut raw, &[Some(input.as_bytes().to_vec())], 0).await;
+        assert_eq!(bytea_code(&frames), None, "{frames:?}");
+        assert!(frames.iter().any(|x| x.0 == b'2'));
+        assert_eq!(
+            bytea_rows(&frames),
+            vec![vec![Some(text.to_owned()), Some(hex.to_owned())]]
+        );
+        cycles.push(bytea_frames_json(&frames));
+    }
+    report.push(serde_json::json!({"id":"declared25_text_to_bytea_cast","query":"SELECT $1::bytea::text, encode($1::bytea,'hex')","parameter_oid":25,"pg_state":null,"pg_phase":"execute","profile_state":null,"profile_phase":"execute","pg_match_claim":"matches PG18 (DD-0068 F4)","parse_describe":bytea_frames_json(&declared_text),"bind_execute":cycles}));
+    bytea_close(&mut raw).await;
     if let Ok(path) = std::env::var("DD68_BYTEA_EXCLUDED_REPORT") {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }

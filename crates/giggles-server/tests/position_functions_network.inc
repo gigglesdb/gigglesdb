@@ -28,12 +28,6 @@ const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
         "GD-0001 Q8 (open): public.<fn> is rejected by application authority before lookup (fd4fc26). PG18: 42883.",
     ),
     (
-        65,
-        Some("42804"),
-        "parse",
-        "strpos is text-only; bytea arguments report the generic type mismatch 42804. PG18: 42883 (no bytea overload).",
-    ),
-    (
         71,
         Some("42501"),
         "parse",

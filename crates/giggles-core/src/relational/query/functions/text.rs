@@ -314,6 +314,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strpos_bytea_is_an_undefined_function() {
+        let state = Relational::default();
+        for (sql, types) in [
+            (
+                "SELECT strpos($1,$2)",
+                vec![Some(DataType::Bytes), Some(DataType::Bytes)],
+            ),
+            (
+                "SELECT strpos($1,$2)",
+                vec![Some(DataType::Bytes), Some(DataType::Text)],
+            ),
+            (
+                "SELECT strpos($1,$2)",
+                vec![Some(DataType::Text), Some(DataType::Bytes)],
+            ),
+            ("SELECT strpos($1,$2)", vec![Some(DataType::Bytes)]),
+            ("SELECT strpos($1::bytea, 'a')", vec![]),
+            ("SELECT strpos('a', $1::bytea)", vec![]),
+            ("SELECT strpos('a'::bytea, 'a'::bytea)", vec![]),
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch)
+                .unwrap()
+                .with_parameter_types(&types)
+                .unwrap();
+            assert!(
+                matches!(prepared.describe(&state), Err(SqlError::UndefinedFunction)),
+                "{sql}, {types:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_bytea_bare_projection_preserves_types_and_names() {
+        let mut state = Relational::default();
+        for (sql, declarations, parameters, types) in [
+            (
+                "SELECT $1",
+                vec![Some(DataType::Bytes)],
+                vec![Value::Bytes(vec![1, 2, 3])],
+                vec![DataType::Bytes],
+            ),
+            (
+                "SELECT $1, $2",
+                vec![Some(DataType::Bytes), None],
+                vec![Value::Bytes(vec![1, 2, 3]), Value::Text("hello".into())],
+                vec![DataType::Bytes, DataType::Text],
+            ),
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch)
+                .unwrap()
+                .with_parameter_types(&declarations)
+                .unwrap();
+            let description = prepared.describe(&state).unwrap();
+            assert_eq!(description.parameters, types);
+            assert_eq!(
+                description
+                    .columns
+                    .iter()
+                    .map(|c| c.data_type.clone())
+                    .collect::<Vec<_>>(),
+                types
+            );
+            assert!(description.columns.iter().all(|c| c.name == "?column?"));
+            assert_eq!(
+                state
+                    .execute(&prepared, &parameters, None)
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|row| row.values)
+                    .collect::<Vec<_>>(),
+                vec![parameters]
+            );
+        }
+        let inferred = Prepared::parse("SELECT $1::bytea, $2", 1, state.epoch).unwrap();
+        assert!(matches!(
+            inferred.describe(&state),
+            Err(SqlError::Parameters)
+        ));
+    }
+
+    #[test]
+    fn declared_text_bytea_cast_decodes_input_and_preserves_errors() {
+        let mut state = Relational::default();
+        let prepared = Prepared::parse("SELECT $1::bytea", 1, state.epoch)
+            .unwrap()
+            .with_parameter_types(&[Some(DataType::Text)])
+            .unwrap();
+        let description = prepared.describe(&state).unwrap();
+        assert_eq!(description.parameters, vec![DataType::Text]);
+        assert_eq!(description.columns[0].data_type, DataType::Bytes);
+        for (input, output) in [("abc", &b"abc"[..]), ("A", &b"A"[..]), (r"\x41", &b"A"[..])] {
+            assert_eq!(
+                state
+                    .execute(&prepared, &[Value::Text(input.into())], None)
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|row| row.values)
+                    .collect::<Vec<_>>(),
+                vec![vec![Value::Bytes(output.to_vec())]]
+            );
+        }
+        for (input, error) in [
+            (r"\x4", SqlError::InvalidParameterValue),
+            (r"\xzz", SqlError::InvalidParameterValue),
+            (r"\zz", SqlError::InvalidTextRepresentation),
+        ] {
+            assert_eq!(
+                state.execute(&prepared, &[Value::Text(input.into())], None),
+                Err(error)
+            );
+        }
+    }
+
+    #[test]
     fn concat_reserves_exact_bytes_once_and_rejects_atomically() {
         for (name, args, expected) in [
             (

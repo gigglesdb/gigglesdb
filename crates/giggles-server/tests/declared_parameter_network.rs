@@ -114,6 +114,7 @@ struct Response {
     errors: Vec<String>,
     parameters: Vec<u32>,
     columns: Vec<Vec<u32>>,
+    column_names: Vec<Vec<String>>,
     rows: Vec<Vec<Option<Vec<u8>>>>,
     commands: Vec<String>,
 }
@@ -168,6 +169,7 @@ async fn query(
         errors: vec![],
         parameters: vec![],
         columns: vec![],
+        column_names: vec![],
         rows: vec![],
         commands: vec![],
     };
@@ -203,8 +205,11 @@ async fn query(
                 let count = u16::from_be_bytes(body[..2].try_into().unwrap());
                 let mut at = 2;
                 let mut types = vec![];
+                let mut names = vec![];
                 for _ in 0..count {
-                    at += body[at..].iter().position(|byte| *byte == 0).unwrap() + 1;
+                    let end = at + body[at..].iter().position(|byte| *byte == 0).unwrap();
+                    names.push(std::str::from_utf8(&body[at..end]).unwrap().to_owned());
+                    at = end + 1;
                     types.push(u32::from_be_bytes(
                         body[at + 6..at + 10].try_into().unwrap(),
                     ));
@@ -212,6 +217,7 @@ async fn query(
                 }
                 assert_eq!(at, body.len());
                 response.columns.push(types);
+                response.column_names.push(names);
             }
             b'D' => {
                 let count = u16::from_be_bytes(body[..2].try_into().unwrap());
@@ -388,6 +394,12 @@ async fn undeclared_and_text_position_keep_text_semantics() {
 #[tokio::test]
 async fn explicit_bytea_casts_and_bare_parameter_catalog_routing() {
     let fixture = Fixture::new().await;
+    let response = query(&fixture, "SELECT $1", &[], false, &[Some(br"\x010203")]).await;
+    response.success(&[25], 25, Some(br"\x010203"));
+    assert_eq!(
+        response.column_names,
+        vec![vec!["?column?"], vec!["?column?"]]
+    );
     for oids in [&[][..], &[0, 0][..], &[17, 17][..]] {
         let response = query(
             &fixture,
@@ -402,12 +414,61 @@ async fn explicit_bytea_casts_and_bare_parameter_catalog_routing() {
     for binary in [false, true] {
         let value: &[u8] = if binary { &[1, 2, 3] } else { br"\x010203" };
         let response = query(&fixture, "SELECT $1", &[17], binary, &[Some(value)]).await;
-        // The unchanged catalog keepalive route fixes this bare parameter as
-        // text, so its existing wire declaration policy rejects OID 17.
-        assert_eq!(response.errors, ["0A000"], "{response:?}");
-        assert!(!response.tags.contains(&b'1'), "{response:?}");
-        assert!(response.parameters.is_empty(), "{response:?}");
-        assert!(response.columns.is_empty(), "{response:?}");
+        response.success(&[17], 17, Some(br"\x010203"));
+        assert_eq!(
+            response.column_names,
+            vec![vec!["?column?"], vec!["?column?"]]
+        );
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn mixed_declared_bytea_and_unknown_bare_parameters() {
+    let fixture = Fixture::new().await;
+    let response = query(
+        &fixture,
+        "SELECT $1, $2",
+        &[17, 0],
+        false,
+        &[Some(br"\x010203"), Some(b"hello")],
+    )
+    .await;
+    assert!(response.errors.is_empty(), "{response:?}");
+    assert_eq!(response.parameters, [17, 25], "{response:?}");
+    assert_eq!(
+        response.columns,
+        vec![vec![17, 25], vec![17, 25]],
+        "{response:?}"
+    );
+    assert_eq!(
+        response.column_names,
+        vec![vec!["?column?", "?column?"], vec!["?column?", "?column?"]]
+    );
+    assert_eq!(
+        response.rows,
+        vec![vec![Some(br"\x010203".to_vec()), Some(b"hello".to_vec())]],
+        "{response:?}"
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn text_declared_parameter_cast_to_bytea() {
+    let fixture = Fixture::new().await;
+    for (input, output) in [
+        (&b"abc"[..], &br"\x616263"[..]),
+        (b"A", br"\x41"),
+        (br"\x41", br"\x41"),
+    ] {
+        let response = query(&fixture, "SELECT $1::bytea", &[25], false, &[Some(input)]).await;
+        response.success(&[25], 17, Some(output));
+    }
+    for (input, error) in [(&br"\x4"[..], "22023"), (&br"\zz"[..], "22P02")] {
+        let response = query(&fixture, "SELECT $1::bytea", &[25], false, &[Some(input)]).await;
+        assert_eq!(response.errors, [error], "{response:?}");
+        assert_eq!(response.parameters, [25], "{response:?}");
+        assert_eq!(response.columns, vec![vec![17], vec![17]], "{response:?}");
         assert!(response.rows.is_empty(), "{response:?}");
     }
     fixture.stop().await;
@@ -434,11 +495,34 @@ async fn declared_bytea_strpos_rejects_missing_overload() {
             [Some(br"\x010203"), Some(br"\x02")]
         };
         let response = query(&fixture, "SELECT strpos($1,$2)", &[17, 17], binary, &values).await;
-        // Preserve the binder's existing text-argument type rejection.
-        assert_eq!(response.errors, ["42804"], "{response:?}");
+        assert_eq!(response.errors, ["42883"], "{response:?}");
         assert!(!response.tags.contains(&b'1'), "{response:?}");
         assert!(response.rows.is_empty(), "{response:?}");
     }
+    for oids in [&[17, 25][..], &[25, 17][..], &[17][..]] {
+        let response = query(
+            &fixture,
+            "SELECT strpos($1,$2)",
+            oids,
+            false,
+            &[Some(br"\x01"), Some(b"a")],
+        )
+        .await;
+        assert_eq!(response.errors, ["42883"], "{response:?}");
+        assert!(!response.tags.contains(&b'1'), "{response:?}");
+        assert!(response.rows.is_empty(), "{response:?}");
+    }
+    let response = query(
+        &fixture,
+        "SELECT strpos($1::bytea, 'a')",
+        &[],
+        false,
+        &[Some(br"\x01")],
+    )
+    .await;
+    assert_eq!(response.errors, ["42883"], "{response:?}");
+    assert!(!response.tags.contains(&b'1'), "{response:?}");
+    assert!(response.rows.is_empty(), "{response:?}");
     fixture.stop().await;
 }
 
@@ -456,6 +540,152 @@ async fn overlong_oid_declarations_keep_protocol_error() {
         let response = query(&fixture, sql, oids, false, &values).await;
         assert_eq!(response.errors, ["08P01"], "{response:?}");
         assert!(!response.tags.contains(&b'1'), "{response:?}");
+        assert!(response.rows.is_empty(), "{response:?}");
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn short_binary_integer_parameters_are_protocol_errors() {
+    let fixture = Fixture::new().await;
+    for (sql, oid, length, code) in [
+        ("SELECT $1::int4", 23, 1, "08P01"),
+        ("SELECT $1::int4", 23, 0, "08P01"),
+        ("SELECT $1::int4", 23, 5, "22P03"),
+        ("SELECT $1::int2", 21, 1, "08P01"),
+        ("SELECT $1::int2", 21, 3, "22P03"),
+        ("SELECT $1::int8", 20, 7, "08P01"),
+        ("SELECT $1::int8", 20, 9, "22P03"),
+        ("SELECT $1::bool", 16, 0, "08P01"),
+        ("SELECT $1::bool", 16, 2, "22P03"),
+    ] {
+        let bytes = vec![0; length];
+        let response = query(&fixture, sql, &[oid], true, &[Some(&bytes)]).await;
+        assert_eq!(response.errors, [code], "{response:?}");
+        assert!(response.tags.contains(&b'1'), "{response:?}");
+        assert!(!response.tags.contains(&b'2'), "{response:?}");
+        assert!(response.rows.is_empty(), "{response:?}");
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn declared_int8_cast_to_int4_out_of_range_keeps_execute_type_error() {
+    // Known gap (DD-0068 F4 follow-up): PG18 reports 22003 at Bind for an explicit/assignment narrowing of a declared int8; GigglesDB reports 42804 at Execute.
+    let fixture = Fixture::new().await;
+    for (sql, oid, value) in [
+        ("SELECT $1::int4", 20, &b"2147483648"[..]),
+        ("SELECT $1::int2", 20, &b"40000"[..]),
+        ("SELECT $1::int2", 23, &b"40000"[..]),
+        ("SELECT $1::int4+0", 20, &b"2147483648"[..]),
+    ] {
+        let response = query(&fixture, sql, &[oid], false, &[Some(value)]).await;
+        assert_eq!(response.errors, ["42804"], "{response:?}");
+        assert!(response.tags.contains(&b'1'), "{response:?}");
+        assert!(response.tags.contains(&b'2'), "{response:?}");
+        assert!(response.rows.is_empty(), "{response:?}");
+    }
+    let binary = 2147483648i64.to_be_bytes();
+    let response = query(&fixture, "SELECT $1::int4", &[20], true, &[Some(&binary)]).await;
+    assert_eq!(response.errors, ["42804"], "{response:?}");
+    assert!(response.tags.contains(&b'1'), "{response:?}");
+    assert!(response.tags.contains(&b'2'), "{response:?}");
+    assert!(response.rows.is_empty(), "{response:?}");
+    let response = query(
+        &fixture,
+        "SELECT $1::int4",
+        &[20],
+        false,
+        &[Some(b"2147483647")],
+    )
+    .await;
+    response.success(&[20], 23, Some(b"2147483647"));
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn owner_catalog_declared_bytea_retry_preserves_transaction() {
+    let f = Fixture::new().await;
+    let mut stream = f.connect().await;
+    send(&mut stream, b'Q', b"BEGIN\0").await;
+    assert_eq!(read(&mut stream).await, (b'C', b"BEGIN\0".to_vec()));
+    assert_eq!(read(&mut stream).await, (b'Z', b"T".to_vec()));
+
+    let mut parse = vec![0];
+    cstr("SELECT $1", &mut parse);
+    parse.extend(1u16.to_be_bytes());
+    parse.extend(17u32.to_be_bytes());
+    send(&mut stream, b'P', &parse).await;
+    send(&mut stream, b'S', &[]).await;
+    assert_eq!(read(&mut stream).await, (b'1', vec![]));
+    assert_eq!(read(&mut stream).await, (b'Z', b"T".to_vec()));
+
+    send(&mut stream, b'Q', b"SELECT 1\0").await;
+    assert_eq!(read(&mut stream).await.0, b'T');
+    assert_eq!(
+        read(&mut stream).await,
+        (b'D', vec![0, 1, 0, 0, 0, 1, b'1'])
+    );
+    assert_eq!(read(&mut stream).await, (b'C', b"SELECT 1\0".to_vec()));
+    assert_eq!(read(&mut stream).await, (b'Z', b"T".to_vec()));
+    send(&mut stream, b'Q', b"COMMIT\0").await;
+    assert_eq!(read(&mut stream).await, (b'C', b"COMMIT\0".to_vec()));
+    assert_eq!(read(&mut stream).await, (b'Z', b"I".to_vec()));
+    drop(stream);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn declared_wider_integer_comparison_against_narrow_column_matches_pg18() {
+    let fixture = Fixture::new().await;
+    let mut stream = fixture.connect().await;
+    for sql in [
+        "CREATE TABLE t(id integer primary key, s smallint, n integer)",
+        "INSERT INTO t VALUES (1, 1, 1), (2, 2, 2)",
+    ] {
+        let mut body = vec![];
+        cstr(sql, &mut body);
+        send(&mut stream, b'Q', &body).await;
+        loop {
+            let (tag, body) = read(&mut stream).await;
+            assert_ne!(tag, b'E', "{sql}: {body:?}");
+            if tag == b'Z' {
+                break;
+            }
+        }
+    }
+    drop(stream);
+    for (sql, oid, value) in [
+        // Known gap: PG18 succeeds at Execute with no rows and ParameterDescription [20].
+        (
+            "SELECT id FROM t WHERE s = $1 ORDER BY id",
+            20,
+            &b"100000"[..],
+        ),
+        // Known gap: PG18 succeeds at Execute with rows 1, 2 and ParameterDescription [20].
+        (
+            "SELECT id FROM t WHERE n < $1 ORDER BY id",
+            20,
+            &b"1099511627776"[..],
+        ),
+        // Known gap: PG18 succeeds at Execute with no rows and ParameterDescription [20].
+        (
+            "SELECT id FROM t WHERE n = $1 ORDER BY id",
+            20,
+            &b"1099511627776"[..],
+        ),
+        // Known gap: PG18 succeeds at Execute with rows 1, 2 and ParameterDescription [23].
+        (
+            "SELECT id FROM t WHERE s < $1 ORDER BY id",
+            23,
+            &b"100000"[..],
+        ),
+    ] {
+        let response = query(&fixture, sql, &[oid], false, &[Some(value)]).await;
+        assert_eq!(response.errors, ["42804"], "{response:?}");
+        assert!(response.tags.contains(&b'1'), "{response:?}");
+        assert!(response.tags.contains(&b'2'), "{response:?}");
+        assert_eq!(response.parameters, [oid], "{response:?}");
         assert!(response.rows.is_empty(), "{response:?}");
     }
     fixture.stop().await;

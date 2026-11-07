@@ -53,6 +53,12 @@ const OVERLAY_WIRE_DEVIATIONS: &[(usize, Option<&str>, &str, &str)] = &[
 ];
 const OVERLAY_ADVERSARIAL_DEVIATIONS: &[(&str, Option<&str>, &str, &str)] = &[
     (
+        "overlay_int8_outside_int4",
+        Some("42804"),
+        "execute",
+        "Known gap (DD-0068 F4 follow-up): declared int8 narrowed by ::int4 is type-checked at Execute (42804); PG18 reports 22003 at Bind.",
+    ),
+    (
         "overlay_min_min",
         None,
         "execute",
@@ -102,9 +108,9 @@ const OVERLAY_ADVERSARIAL_DEVIATIONS: &[(&str, Option<&str>, &str, &str)] = &[
     ),
     (
         "overlay_cast_order",
-        Some("0A000"),
-        "parse",
-        "CAST of a text-declared parameter to int4 is rejected as unsupported at Parse. PG18: 22P02 at Bind.",
+        Some("22P02"),
+        "execute",
+        "Parameter-dependent cast evaluation runs at Execute; PG18 custom planning reports 22P02 at Bind.",
     ),
 ];
 
@@ -122,7 +128,10 @@ fn overlay_assert_case(
     let (code, expected_stage) = deviation
         .map(|(code, stage, rationale)| {
             assert!(!rationale.is_empty());
-            (code.map_or_else(|| pg["sqlstate"].clone(), |code| serde_json::json!(code)), stage)
+            (
+                code.map_or_else(|| pg["sqlstate"].clone(), |code| serde_json::json!(code)),
+                stage,
+            )
         })
         .unwrap_or_else(|| (pg["sqlstate"].clone(), pg["stage"].as_str().unwrap()));
     assert_eq!(actual["sqlstate"], code, "{case}: {actual}");
@@ -232,13 +241,11 @@ async fn overlay_adversarial_cases_match_pg18() {
     let mut raw = raw_pg(&f).await;
     let corpus: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/dd68/overlay-adversarial-cases.json")).unwrap();
-    assert_eq!(corpus["cases"].as_array().unwrap().len(), 40);
+    assert_eq!(corpus["cases"].as_array().unwrap().len(), 42);
     let mut exercised = BTreeSet::new();
     let mut total = 0;
-    // Exclusions: null_short_binary_int sends a one-byte binary int4: Giggles
-    // 22P03 at Bind vs PG18 08P01 (insufficient data left in message).
-    // overlay_int8_outside_int4 declares int8 $3, casts ::int4, value 2147483648:
-    // Giggles 42804 at Execute vs PG18 22003 at Bind.
+    // Include short binary integer input and declared int8-to-int4 overflow;
+    // only parameter-dependent cast timing differs from PG18 below.
     for case in corpus["cases"].as_array().unwrap() {
         let id = case["id"].as_str().unwrap();
         let query = case["query"].as_str().unwrap();
@@ -313,7 +320,7 @@ async fn overlay_adversarial_cases_match_pg18() {
         );
         total += 1;
     }
-    assert_eq!(total, 40);
+    assert_eq!(total, 42);
     assert_eq!(
         exercised,
         OVERLAY_ADVERSARIAL_DEVIATIONS.iter().map(|d| d.0).collect()
@@ -321,7 +328,7 @@ async fn overlay_adversarial_cases_match_pg18() {
     pg_send(&mut raw, b'X', &[]).await;
     drop(raw);
     f.stop().await;
-    println!("OVERLAY 40 wire observations passed");
+    println!("OVERLAY 42 wire observations passed");
 }
 #[tokio::test]
 async fn overlay_authority_bind_failure_portal_and_transaction_controls() {

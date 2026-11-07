@@ -100,12 +100,13 @@ fn position_curated_pg18_core_results_metadata_and_exact_error_contracts() {
                 "parse",
                 SqlError::UndefinedFunction,
             )),
+            // PG18: 42883, no bytea strpos overload (DD-0068 F4)
             65 => Some((
                 "SELECT strpos('abc'::bytea,'b'::bytea)",
                 "error",
                 Some("42883"),
                 "parse",
-                SqlError::Type,
+                SqlError::UndefinedFunction,
             )),
             71 => Some((
                 "SELECT max(position('b' IN 'abc'))",

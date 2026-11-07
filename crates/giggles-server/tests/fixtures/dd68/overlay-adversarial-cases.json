@@ -1293,6 +1293,50 @@
    }
   },
   {
+   "id": "null_short_binary_int",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "00"
+    },
+    {
+     "hex": "00000001"
+    }
+   ],
+   "parameter_formats": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "08P01",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
    "id": "null_nul_text",
    "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
    "declared_oids": [
@@ -1367,6 +1411,47 @@
      25,
      25,
      23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_int8_outside_int4",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    20,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "32313437343833363438"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     20,
      23
     ],
     "result_oids": [
