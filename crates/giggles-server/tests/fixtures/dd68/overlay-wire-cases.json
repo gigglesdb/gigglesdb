@@ -1,0 +1,3029 @@
+{
+ "source": {
+  "oracle": "dd68-overlay-functions-20261106/qualification-01/oracle.json",
+  "sha256": "cbe3940b7b752849ac6a395b564ca84c547d12686fc6cc79578ded126ca28fbc",
+  "server": "PostgreSQL 18.6"
+ },
+ "cases": [
+  {
+   "index": 0,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000fe7958cf09f9982f09f998265cc815a"
+    ],
+    "rows_binary": [
+     "00010000000fe7958cf09f9982f09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 1,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000c61e7958cf09f998265cc815a"
+    ],
+    "rows_binary": [
+     "00010000000c61e7958cf09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 2,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001261c3a9f09f998265cc815ae7958cf09f9982"
+    ],
+    "rows_binary": [
+     "00010000001261c3a9f09f998265cc815ae7958cf09f9982"
+    ]
+   }
+  },
+  {
+   "index": 3,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 0)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 4,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM -1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 5,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 6,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 7,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 1 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000012e7958cf09f998261c3a9f09f998265cc815a"
+    ],
+    "rows_binary": [
+     "000100000012e7958cf09f998261c3a9f09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 8,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2 FOR -1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ],
+    "rows_binary": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 9,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2 FOR -3)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ],
+    "rows_binary": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 10,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2 FOR -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ],
+    "rows_binary": [
+     "00010000001361e7958cf09f998261c3a9f09f998265cc815a"
+    ]
+   }
+  },
+  {
+   "index": 11,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2147483647 FOR 1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 12,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 2147483647 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001261c3a9f09f998265cc815ae7958cf09f9982"
+    ],
+    "rows_binary": [
+     "00010000001261c3a9f09f998265cc815ae7958cf09f9982"
+    ]
+   }
+  },
+  {
+   "index": 13,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 1 FOR 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 14,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 3 FOR 2147483645)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 15,
+   "query": "SELECT OVERLAY('aé🙂éZ' PLACING '界🙂' FROM 3 FOR 2147483644)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000a61c3a9e7958cf09f9982"
+    ],
+    "rows_binary": [
+     "00010000000a61c3a9e7958cf09f9982"
+    ]
+   }
+  },
+  {
+   "index": 16,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 17,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 18,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 19,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 0)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 20,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM -1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 21,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 22,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 23,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 1 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 24,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2 FOR -1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 25,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2 FOR -3)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 26,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2 FOR -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 27,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2147483647 FOR 1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 28,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 2147483647 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 29,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 1 FOR 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 30,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 3 FOR 2147483645)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 31,
+   "query": "SELECT OVERLAY('' PLACING 'X' FROM 3 FOR 2147483644)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000158"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 32,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000a5c783030666536326666"
+    ],
+    "rows_binary": [
+     "00010000000400fe62ff"
+    ]
+   }
+  },
+  {
+   "index": 33,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000a5c783631303066656666"
+    ],
+    "rows_binary": [
+     "0001000000046100feff"
+    ]
+   }
+  },
+  {
+   "index": 34,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78363130303632666630306665"
+    ],
+    "rows_binary": [
+     "000100000006610062ff00fe"
+    ]
+   }
+  },
+  {
+   "index": 35,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 0)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 36,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM -1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 37,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 38,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 39,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 1 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78303066653631303036326666"
+    ],
+    "rows_binary": [
+     "00010000000600fe610062ff"
+    ]
+   }
+  },
+  {
+   "index": 40,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2 FOR -1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c783631303066653631303036326666"
+    ],
+    "rows_binary": [
+     "0001000000076100fe610062ff"
+    ]
+   }
+  },
+  {
+   "index": 41,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2 FOR -3)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c783631303066653631303036326666"
+    ],
+    "rows_binary": [
+     "0001000000076100fe610062ff"
+    ]
+   }
+  },
+  {
+   "index": 42,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2 FOR -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c783631303066653631303036326666"
+    ],
+    "rows_binary": [
+     "0001000000076100fe610062ff"
+    ]
+   }
+  },
+  {
+   "index": 43,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2147483647 FOR 1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 44,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 2147483647 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78363130303632666630306665"
+    ],
+    "rows_binary": [
+     "000100000006610062ff00fe"
+    ]
+   }
+  },
+  {
+   "index": 45,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 1 FOR 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 46,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 3 FOR 2147483645)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 47,
+   "query": "SELECT OVERLAY('\\x610062ff'::bytea PLACING '\\x00fe'::bytea FROM 3 FOR 2147483644)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000a5c783631303030306665"
+    ],
+    "rows_binary": [
+     "000100000004610000fe"
+    ]
+   }
+  },
+  {
+   "index": 48,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 49,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 50,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 51,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 0)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 52,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM -1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 53,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 54,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 55,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 1 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 56,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2 FOR -1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 57,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2 FOR -3)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 58,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2 FOR -2147483648)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 59,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2147483647 FOR 1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 60,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 2147483647 FOR 0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 61,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 1 FOR 2147483647)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 62,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 3 FOR 2147483645)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 63,
+   "query": "SELECT OVERLAY('\\x'::bytea PLACING '\\x58'::bytea FROM 3 FOR 2147483644)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000045c783538"
+    ],
+    "rows_binary": [
+     "00010000000158"
+    ]
+   }
+  },
+  {
+   "index": 64,
+   "query": "SELECT overlay('\\xaf67'::bytea,'\\x71'::bytea,2,9)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000065c7861663731"
+    ],
+    "rows_binary": [
+     "000100000002af71"
+    ]
+   }
+  },
+  {
+   "index": 65,
+   "query": "SELECT overlay('́a🙂界界🙂界界','á',-1,-9)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 66,
+   "query": "SELECT overlay('\\x492e2a0f5ba0b6be3f13'::bytea,'\\x48'::bytea,6,5)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78343932653261306635623438"
+    ],
+    "rows_binary": [
+     "000100000006492e2a0f5b48"
+    ]
+   }
+  },
+  {
+   "index": 67,
+   "query": "SELECT overlay('🙂','é界éaa',-2,-10)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 68,
+   "query": "SELECT overlay('\\xf6399813'::bytea,'\\x73de'::bytea,6,1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78663633393938313337336465"
+    ],
+    "rows_binary": [
+     "000100000006f639981373de"
+    ]
+   }
+  },
+  {
+   "index": 69,
+   "query": "SELECT overlay('🙂','🙂',11,-9)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000008f09f9982f09f9982"
+    ],
+    "rows_binary": [
+     "000100000008f09f9982f09f9982"
+    ]
+   }
+  },
+  {
+   "index": 70,
+   "query": "SELECT overlay('\\xcaea2b44cc'::bytea,'\\x31200ef8af'::bytea,8,-11)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000205c78636165613262343463633331323030656638616663616561326234346363"
+    ],
+    "rows_binary": [
+     "00010000000fcaea2b44cc31200ef8afcaea2b44cc"
+    ]
+   }
+  },
+  {
+   "index": 71,
+   "query": "SELECT overlay('́a🙂界','aé',8,-1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000dcc8161f09f9982e7958c61c3a9"
+    ],
+    "rows_binary": [
+     "00010000000dcc8161f09f9982e7958c61c3a9"
+    ]
+   }
+  },
+  {
+   "index": 72,
+   "query": "SELECT overlay('\\x09'::bytea,'\\x4cd5'::bytea,1,6)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000065c7834636435"
+    ],
+    "rows_binary": [
+     "0001000000024cd5"
+    ]
+   }
+  },
+  {
+   "index": 73,
+   "query": "SELECT overlay('🙂界é界🙂éé','',12,-1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000014f09f9982e7958cc3a9e7958cf09f9982c3a9c3a9"
+    ],
+    "rows_binary": [
+     "000100000014f09f9982e7958cc3a9e7958cf09f9982c3a9c3a9"
+    ]
+   }
+  },
+  {
+   "index": 74,
+   "query": "SELECT overlay('\\xeee6fb78658c5ea09501'::bytea,'\\xf6d6a6fa'::bytea,-1,5)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 75,
+   "query": "SELECT overlay('a界🙂a界́é界é界界','界é界',5,10)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001161e7958cf09f998261e7958cc3a9e7958c"
+    ],
+    "rows_binary": [
+     "00010000001161e7958cf09f998261e7958cc3a9e7958c"
+    ]
+   }
+  },
+  {
+   "index": 76,
+   "query": "SELECT overlay('\\xd034'::bytea,'\\x7ea9e813'::bytea,7,15)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78643033343765613965383133"
+    ],
+    "rows_binary": [
+     "000100000006d0347ea9e813"
+    ]
+   }
+  },
+  {
+   "index": 77,
+   "query": "SELECT overlay('aéaééé界界界界é','́🙂',3,14)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000961c3a9cc81f09f9982"
+    ],
+    "rows_binary": [
+     "00010000000961c3a9cc81f09f9982"
+    ]
+   }
+  },
+  {
+   "index": 78,
+   "query": "SELECT overlay('\\x19bd'::bytea,'\\x7de502'::bytea,13,6)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000c5c7831396264376465353032"
+    ],
+    "rows_binary": [
+     "00010000000519bd7de502"
+    ]
+   }
+  },
+  {
+   "index": 79,
+   "query": "SELECT overlay('a🙂́é界a界́éá','🙂́a界',8,-13)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000003161f09f9982cc81c3a9e7958c61e7958cf09f9982cc8161e7958c61f09f9982cc81c3a9e7958c61e7958ccc81c3a961cc81"
+    ],
+    "rows_binary": [
+     "00010000003161f09f9982cc81c3a9e7958c61e7958cf09f9982cc8161e7958c61f09f9982cc81c3a9e7958c61e7958ccc81c3a961cc81"
+    ]
+   }
+  },
+  {
+   "index": 80,
+   "query": "SELECT overlay('\\xc1d67cfcc090c659cc21'::bytea,'\\x3479a1'::bytea,3,11)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000c5c7863316436333437396131"
+    ],
+    "rows_binary": [
+     "000100000005c1d63479a1"
+    ]
+   }
+  },
+  {
+   "index": 81,
+   "query": "SELECT overlay('🙂','界',13,-15)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000bf09f9982e7958cf09f9982"
+    ],
+    "rows_binary": [
+     "00010000000bf09f9982e7958cf09f9982"
+    ]
+   }
+  },
+  {
+   "index": 82,
+   "query": "SELECT overlay('\\x5dd2b8c91198124c3c75'::bytea,'\\x66'::bytea,14,11)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000185c7835646432623863393131393831323463336337353636"
+    ],
+    "rows_binary": [
+     "00010000000b5dd2b8c91198124c3c7566"
+    ]
+   }
+  },
+  {
+   "index": 83,
+   "query": "SELECT overlay('a🙂aé界🙂éa界','́界界',15,-2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000001d61f09f998261c3a9e7958cf09f9982c3a961e7958ccc81e7958ce7958c"
+    ],
+    "rows_binary": [
+     "00010000001d61f09f998261c3a9e7958cf09f9982c3a961e7958ccc81e7958ce7958c"
+    ]
+   }
+  },
+  {
+   "index": 84,
+   "query": "SELECT overlay('\\xb85b033f134526d997'::bytea,'\\x79'::bytea,7,8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c786238356230333366313334353739"
+    ],
+    "rows_binary": [
+     "000100000007b85b033f134579"
+    ]
+   }
+  },
+  {
+   "index": 85,
+   "query": "SELECT overlay('́́界aé🙂界','ééa',2,-15)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000018cc81c3a9c3a961cc81cc81e7958c61c3a9f09f9982e7958c"
+    ],
+    "rows_binary": [
+     "000100000018cc81c3a9c3a961cc81cc81e7958c61c3a9f09f9982e7958c"
+    ]
+   }
+  },
+  {
+   "index": 86,
+   "query": "SELECT overlay('\\xee08079c96cc7727c4'::bytea,'\\x89c04d'::bytea,8,10)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000165c786565303830373963393663633737383963303464"
+    ],
+    "rows_binary": [
+     "00010000000aee08079c96cc7789c04d"
+    ]
+   }
+  },
+  {
+   "index": 87,
+   "query": "SELECT overlay('́🙂éa界🙂é́́a','界é',11,-10)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000033cc81f09f9982c3a961e7958cf09f9982c3a9cc81cc8161e7958cc3a9cc81f09f9982c3a961e7958cf09f9982c3a9cc81cc8161"
+    ],
+    "rows_binary": [
+     "000100000033cc81f09f9982c3a961e7958cf09f9982c3a9cc81cc8161e7958cc3a9cc81f09f9982c3a961e7958cf09f9982c3a9cc81cc8161"
+    ]
+   }
+  },
+  {
+   "index": 88,
+   "query": "SELECT overlay('\\xc3019228de90'::bytea,'\\x'::bytea,11,-12)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000001a5c78633330313932323864653930633330313932323864653930"
+    ],
+    "rows_binary": [
+     "00010000000cc3019228de90c3019228de90"
+    ]
+   }
+  },
+  {
+   "index": 89,
+   "query": "SELECT overlay('á','a界aé🙂',5,15)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000e61cc8161e7958c61c3a9f09f9982"
+    ],
+    "rows_binary": [
+     "00010000000e61cc8161e7958c61c3a9f09f9982"
+    ]
+   }
+  },
+  {
+   "index": 90,
+   "query": "SELECT overlay('\\xe6cdf136e090f3040c'::bytea,'\\xfe'::bytea,12,-1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000165c786536636466313336653039306633303430636665"
+    ],
+    "rows_binary": [
+     "00010000000ae6cdf136e090f3040cfe"
+    ]
+   }
+  },
+  {
+   "index": 91,
+   "query": "SELECT overlay('🙂aaaáá','́́',5,7)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000bf09f9982616161cc81cc81"
+    ],
+    "rows_binary": [
+     "00010000000bf09f9982616161cc81cc81"
+    ]
+   }
+  },
+  {
+   "index": 92,
+   "query": "SELECT overlay('\\x7ceecb8ab904'::bytea,'\\x80c56454ef'::bytea,2,15)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000e5c78376338306335363435346566"
+    ],
+    "rows_binary": [
+     "0001000000067c80c56454ef"
+    ]
+   }
+  },
+  {
+   "index": 93,
+   "query": "SELECT overlay('é́🙂🙂','é́',15,0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000010c3a9cc81f09f9982f09f9982c3a9cc81"
+    ],
+    "rows_binary": [
+     "000100000010c3a9cc81f09f9982f09f9982c3a9cc81"
+    ]
+   }
+  },
+  {
+   "index": 94,
+   "query": "SELECT overlay('\\x95ce5aaa816b88cd'::bytea,'\\xb203'::bytea,-1,-1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 95,
+   "query": "SELECT overlay('é́','界́',3,2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000009c3a9cc81e7958ccc81"
+    ],
+    "rows_binary": [
+     "000100000009c3a9cc81e7958ccc81"
+    ]
+   }
+  },
+  {
+   "index": 96,
+   "query": "SELECT overlay('\\x584ae0a2'::bytea,'\\x'::bytea,14,-12)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c783538346165306132346165306132"
+    ],
+    "rows_binary": [
+     "000100000007584ae0a24ae0a2"
+    ]
+   }
+  },
+  {
+   "index": 97,
+   "query": "SELECT overlay('界́aa','界aa',15,-5)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000ce7958ccc816161e7958c6161"
+    ],
+    "rows_binary": [
+     "00010000000ce7958ccc816161e7958c6161"
+    ]
+   }
+  },
+  {
+   "index": 98,
+   "query": "SELECT overlay('\\xae'::bytea,'\\x41580a982b'::bytea,0,4)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 99,
+   "query": "SELECT overlay('界aá','',8,8)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000007e7958c6161cc81"
+    ],
+    "rows_binary": [
+     "000100000007e7958c6161cc81"
+    ]
+   }
+  },
+  {
+   "index": 100,
+   "query": "SELECT overlay('\\x979a3de5'::bytea,'\\xab6fea1b'::bytea,15,4)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000125c7839373961336465356162366665613162"
+    ],
+    "rows_binary": [
+     "000100000008979a3de5ab6fea1b"
+    ]
+   }
+  },
+  {
+   "index": 101,
+   "query": "SELECT overlay('é界界🙂é🙂🙂🙂éé','aa🙂éa',13,-6)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000033c3a9e7958ce7958cf09f9982c3a9f09f9982f09f9982f09f9982c3a9c3a96161f09f9982c3a961f09f9982f09f9982c3a9c3a9"
+    ],
+    "rows_binary": [
+     "000100000033c3a9e7958ce7958cf09f9982c3a9f09f9982f09f9982f09f9982c3a9c3a96161f09f9982c3a961f09f9982f09f9982c3a9c3a9"
+    ]
+   }
+  },
+  {
+   "index": 102,
+   "query": "SELECT overlay('\\x5ddddf7cfec5883cdc'::bytea,'\\x76a6'::bytea,9,-11)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000285c783564646464663763666563353838336337366136356464646466376366656335383833636463"
+    ],
+    "rows_binary": [
+     "0001000000135ddddf7cfec5883c76a65ddddf7cfec5883cdc"
+    ]
+   }
+  },
+  {
+   "index": 103,
+   "query": "SELECT overlay('🙂á','',2,-3)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000bf09f9982f09f998261cc81"
+    ],
+    "rows_binary": [
+     "00010000000bf09f9982f09f998261cc81"
+    ]
+   }
+  },
+  {
+   "index": 104,
+   "query": "SELECT overlay($1 PLACING $2 FROM $3)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 105,
+   "query": "SELECT overlay($1,$2,$3,$4)",
+   "params": [
+    "abc",
+    "X",
+    "2",
+    "-1"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001000000056158616263"
+    ],
+    "rows_binary": [
+     "0001000000056158616263"
+    ]
+   }
+  },
+  {
+   "index": 106,
+   "query": "SELECT \"overlay\"($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 107,
+   "query": "SELECT pg_catalog.overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 108,
+   "query": "SELECT pg_catalog.\"overlay\"($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 109,
+   "query": "SELECT overlay($1::text,$2,$3::smallint)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     21
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 110,
+   "query": "SELECT overlay($1,$2,$3::bigint)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 111,
+   "query": "SELECT overlay($1,$2,$1)",
+   "params": [
+    "abc",
+    "X"
+   ],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42P08",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 112,
+   "query": "SELECT overlay($1,$2,$3),$1::bytea",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25,
+     17
+    ],
+    "rows_text": [
+     "000200000003615863000000085c78363136323633"
+    ],
+    "rows_binary": [
+     "00020000000361586300000003616263"
+    ]
+   }
+  },
+  {
+   "index": 113,
+   "query": "SELECT overlay(overlay($1,$2,$3),$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 114,
+   "query": "SELECT overlay($1,$2,$3,$4::integer)",
+   "params": [
+    "abc",
+    "X",
+    "2",
+    "-1"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001000000056158616263"
+    ],
+    "rows_binary": [
+     "0001000000056158616263"
+    ]
+   }
+  },
+  {
+   "index": 115,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    null,
+    "X",
+    "0"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 116,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    null,
+    "0"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 117,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    null
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 118,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "0"
+   ],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 119,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "2147483648"
+   ],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 120,
+   "query": "SELECT overlay($1,$2,$3)",
+   "params": [
+    "abc",
+    "X",
+    "x"
+   ],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 121,
+   "query": "SELECT overlay($1,$2::bytea,$3)",
+   "params": [
+    "\\x610062ff",
+    "\\x00fe",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     17,
+     17,
+     23
+    ],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000a5c783631303066656666"
+    ],
+    "rows_binary": [
+     "0001000000046100feff"
+    ]
+   }
+  },
+  {
+   "index": 122,
+   "query": "SELECT overlay($1::bytea,$2,$3)",
+   "params": [
+    "\\x610062ff",
+    "\\x00fe",
+    "2"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     17,
+     17,
+     23
+    ],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "00010000000a5c783631303066656666"
+    ],
+    "rows_binary": [
+     "0001000000046100feff"
+    ]
+   }
+  },
+  {
+   "index": 123,
+   "query": "SELECT overlay($1::bytea,$2::bytea,$3,$4)",
+   "params": [
+    "\\x610062ff",
+    "\\x00fe",
+    "2",
+    "-1"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     17,
+     17,
+     23,
+     23
+    ],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001000000105c783631303066653631303036326666"
+    ],
+    "rows_binary": [
+     "0001000000076100fe610062ff"
+    ]
+   }
+  },
+  {
+   "index": 124,
+   "query": "SELECT overlay()",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 125,
+   "query": "SELECT overlay(1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 126,
+   "query": "SELECT overlay(TRUE,'X',2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 127,
+   "query": "SELECT overlay('a'::text,'X'::bytea,1)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 128,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM 2 FOR -1)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001000000056158616263"
+    ],
+    "rows_binary": [
+     "0001000000056158616263"
+    ]
+   }
+  },
+  {
+   "index": 129,
+   "query": "SELECT \"OVERLAY\"('abc','X',2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 130,
+   "query": "SELECT \"overlay\"('abc' PLACING 'X' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 131,
+   "query": "SELECT pg_catalog.overlay('abc' PLACING 'X' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 132,
+   "query": "SELECT overlay('abc' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 133,
+   "query": "SELECT overlay('abc' PLACING 'X' FOR 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 134,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM 2 FOR)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 135,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM 2,3)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 136,
+   "query": "SELECT overlay($3 PLACING $1 FROM $2)",
+   "params": [
+    "X",
+    "2",
+    "abc"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     23,
+     25
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 137,
+   "query": "SELECT overlay($3,$1,$2,$4)",
+   "params": [
+    "X",
+    "2",
+    "abc",
+    "-1"
+   ],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [
+     25,
+     23,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001000000056158616263"
+    ],
+    "rows_binary": [
+     "0001000000056158616263"
+    ]
+   }
+  },
+  {
+   "index": 138,
+   "query": "SELECT overlay('abc'::bytea,'\\xgg',2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "22023",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 139,
+   "query": "SELECT overlay('abc' PLACING FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 140,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 141,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM FOR 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 142,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM 2 FOR PLACING)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 143,
+   "query": "SELECT overlay('abc' PLACING 'from' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001000000056166726f6d"
+    ],
+    "rows_binary": [
+     "0001000000056166726f6d"
+    ]
+   }
+  },
+  {
+   "index": 144,
+   "query": "SELECT overlay('abc' PLACING 'for' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000461666f72"
+    ],
+    "rows_binary": [
+     "00010000000461666f72"
+    ]
+   }
+  },
+  {
+   "index": 145,
+   "query": "SELECT overlay('abc' PLACING 'placing' FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "00010000000861706c6163696e67"
+    ],
+    "rows_binary": [
+     "00010000000861706c6163696e67"
+    ]
+   }
+  },
+  {
+   "index": 146,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM '2' FOR '1')",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 147,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM \"for\")",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42703",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 148,
+   "query": "SELECT overlay('abc' PLACING \"from\" FROM 2)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42703",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 149,
+   "query": "SELECT overlay('abc' PLACING 'X' FROM \"placing\")",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42703",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 150,
+   "query": "SELECT overlay('abc','X',2::smallint,1::smallint)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "000100000003615863"
+    ],
+    "rows_binary": [
+     "000100000003615863"
+    ]
+   }
+  },
+  {
+   "index": 151,
+   "query": "SELECT overlay('abc','X',2::bigint)",
+   "params": [],
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows_text": [],
+    "rows_binary": []
+   }
+  },
+  {
+   "index": 152,
+   "query": "SELECT overlay('abc','X',2,NULL)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 153,
+   "query": "SELECT overlay(NULL,'X',0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 154,
+   "query": "SELECT overlay('abc',NULL,0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "index": 155,
+   "query": "SELECT overlay(NULL::bytea,'X'::bytea,0)",
+   "params": [],
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "ok",
+    "parameter_oids": [],
+    "result_oids": [
+     17
+    ],
+    "rows_text": [
+     "0001ffffffff"
+    ],
+    "rows_binary": [
+     "0001ffffffff"
+    ]
+   }
+  }
+ ]
+}

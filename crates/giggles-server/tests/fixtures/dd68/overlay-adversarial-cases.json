@@ -1,0 +1,1454 @@
+{
+ "source": {
+  "oracle": "dd68-overlay-functions-20261106/qualification-01/adversarial-oracle.json",
+  "sha256": "8988b008b90c3321d263ae64aa7bf3132f5c55913fd34730a76c82d286a94017",
+  "server": "PostgreSQL 18.6"
+ },
+ "cases": [
+  {
+   "id": "overlay_min_min",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_min_max",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_max_max",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "32313437343833363437"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_max_min",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "32313437343833363437"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000d61626364656658616263646566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_max_zero",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "32313437343833363437"
+    },
+    {
+     "hex": "30"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000761626364656658"
+    ]
+   }
+  },
+  {
+   "id": "overlay_one_min",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "31"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000758616263646566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_one_max",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "31"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_zero_max",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "30"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_zero_min",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "30"
+    },
+    {
+     "hex": "2d32313437343833363438"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22011",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_negative_count",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "33"
+    },
+    {
+     "hex": "2d32"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "000100000009616258616263646566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_negative_to_zero",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "33"
+    },
+    {
+     "hex": "2d33"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "000100000009616258616263646566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_zero_count",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "33"
+    },
+    {
+     "hex": "30"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000761625863646566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_ordinary",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263646566"
+    },
+    {
+     "hex": "58"
+    },
+    {
+     "hex": "33"
+    },
+    {
+     "hex": "32"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "0001000000056162586566"
+    ]
+   }
+  },
+  {
+   "id": "overlay_unicode",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "4165cc81f09f98805a"
+    },
+    {
+     "hex": "f09fa68a"
+    },
+    {
+     "hex": "33"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000b4165f09fa68af09f98805a"
+    ]
+   }
+  },
+  {
+   "id": "overlay_empty_source",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": ""
+    },
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "31"
+    },
+    {
+     "hex": "2d32"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000178"
+    ]
+   }
+  },
+  {
+   "id": "overlay_empty_replacement",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": ""
+    },
+    {
+     "hex": "32"
+    },
+    {
+     "hex": "2d31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000461616263"
+    ]
+   }
+  },
+  {
+   "id": "overlay_past_end",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "39"
+    },
+    {
+     "hex": "2d38"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000761626378616263"
+    ]
+   }
+  },
+  {
+   "id": "overlay_default_unicode",
+   "query": "SELECT overlay($1 PLACING $2 FROM $3)",
+   "declared_oids": [
+    25,
+    25,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "4165cc81f09f98805a"
+    },
+    {
+     "hex": "f09f988078"
+    },
+    {
+     "hex": "32"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000b41f09f988078f09f98805a"
+    ]
+   }
+  },
+  {
+   "id": "overlay_null_0",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "30"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_null_1",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    null,
+    {
+     "hex": "30"
+    },
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_null_2",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "78"
+    },
+    null,
+    {
+     "hex": "32313437343833363437"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_null_3",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "30"
+    },
+    null
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_null_invalid_constant_0",
+   "query": "SELECT \"overlay\"(NULL::text,CAST('bad' AS int4)::text,0::int4,2147483647::int4)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_null_invalid_constant_1",
+   "query": "SELECT \"overlay\"('abc'::text,NULL::text,'bad'::int4,2147483647::int4)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_null_invalid_constant_2",
+   "query": "SELECT \"overlay\"('abc'::text,'X'::text,NULL::int4,'bad'::int4)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_null_invalid_constant_3",
+   "query": "SELECT \"overlay\"(CAST('bad' AS int4)::text,'X'::text,0::int4,NULL::int4)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_binary_nul_ff",
+   "query": "SELECT pg_catalog.overlay($1,$2,$3,$4)",
+   "declared_oids": [
+    17,
+    17,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "00ff00ff"
+    },
+    {
+     "hex": "ff00"
+    },
+    {
+     "hex": "00000002"
+    },
+    {
+     "hex": "ffffffff"
+    }
+   ],
+   "parameter_formats": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "result_format": 1,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     17,
+     17,
+     23,
+     23
+    ],
+    "result_oids": [
+     17
+    ],
+    "rows": [
+     "00010000000700ff0000ff00ff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_binary_null_start",
+   "query": "SELECT pg_catalog.overlay($1,$2,$3,$4)",
+   "declared_oids": [
+    17,
+    17,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "00ff"
+    },
+    {
+     "hex": "58"
+    },
+    null,
+    {
+     "hex": "80000000"
+    }
+   ],
+   "parameter_formats": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "result_format": 1,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     17,
+     17,
+     23,
+     23
+    ],
+    "result_oids": [
+     17
+    ],
+    "rows": [
+     "0001ffffffff"
+    ]
+   }
+  },
+  {
+   "id": "overlay_comma",
+   "query": "SELECT overlay('abc','x',2,1)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "000100000003617863"
+    ]
+   }
+  },
+  {
+   "id": "overlay_upper",
+   "query": "SELECT \"OVERLAY\"('abc','x',2,1)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_column",
+   "query": "SELECT overlay(v PLACING 'x' FROM 2 FOR 1) FROM (VALUES ('abc')) q(v)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "000100000003617863"
+    ]
+   }
+  },
+  {
+   "id": "overlay_repeated",
+   "query": "SELECT overlay($1 PLACING $1 FROM $2 FOR $2)",
+   "declared_oids": [
+    25,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "32"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "00010000000461616263"
+    ]
+   }
+  },
+  {
+   "id": "overlay_cast_order",
+   "query": "SELECT overlay(CAST($1 AS int4)::text PLACING CAST($2 AS int4)::text FROM $3 FOR $4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    {
+     "hex": "736f757263655f626164"
+    },
+    {
+     "hex": "7265706c6163656d656e745f626164"
+    },
+    {
+     "hex": "30"
+    },
+    {
+     "hex": "30"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "null_bad_start",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "626164"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "null_overflow_start",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "32313437343833363438"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22003",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "null_nul_text",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "7800"
+    },
+    {
+     "hex": "31"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22021",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "null_invalid_utf8",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    23,
+    23
+   ],
+   "parameters": [
+    null,
+    {
+     "hex": "ff"
+    },
+    {
+     "hex": "31"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [
+    1,
+    1,
+    0,
+    0
+   ],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22021",
+    "stage": "bind",
+    "parameter_oids": [
+     25,
+     25,
+     23,
+     23
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_int2_declared",
+   "query": "SELECT overlay($1::text PLACING $2::text FROM $3::int4 FOR $4::int4)",
+   "declared_oids": [
+    25,
+    25,
+    21,
+    21
+   ],
+   "parameters": [
+    {
+     "hex": "616263"
+    },
+    {
+     "hex": "78"
+    },
+    {
+     "hex": "32"
+    },
+    {
+     "hex": "31"
+    }
+   ],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "ok",
+    "sqlstate": null,
+    "stage": "execute",
+    "parameter_oids": [
+     25,
+     25,
+     21,
+     21
+    ],
+    "result_oids": [
+     25
+    ],
+    "rows": [
+     "000100000003617863"
+    ]
+   }
+  },
+  {
+   "id": "overlay_bad_const_before_null",
+   "query": "SELECT overlay('abc' PLACING NULL::text FROM CAST('start_bad' AS int4) FOR 1)",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  },
+  {
+   "id": "overlay_bad_count_before_null",
+   "query": "SELECT overlay(NULL::text PLACING 'x' FROM 0 FOR CAST('count_bad' AS int4))",
+   "declared_oids": [],
+   "parameters": [],
+   "parameter_formats": [],
+   "result_format": 0,
+   "pg": {
+    "status": "error",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "parameter_oids": null,
+    "result_oids": null,
+    "rows": []
+   }
+  }
+ ]
+}

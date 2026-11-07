@@ -1,0 +1,986 @@
+{
+ "source": {
+  "policy": "dd68-position-functions-20261106/control-policy-next-consumer-v4.json",
+  "sha256": "10ddb8d377d9ef257b076febe7182ce265f857ae6dd8fc8727868a619ad5ccc4",
+  "order_oracle": "dd68-position-functions-20261106/oracle/order-supplement.json",
+  "order_sha256": "2fa065937a2a8f63fc73444b78aaa96b0763b95fe01ff6076b66e89082cfbd0d"
+ },
+ "cases": [
+  {
+   "index": 0,
+   "query": "SELECT position('😀' IN body) FROM app WHERE id=1",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "00010000000133"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 1,
+   "query": "SELECT position(decode('00ff','hex') IN data) FROM app WHERE id=1",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "00010000000132"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 2,
+   "query": "SELECT max(position('😀' IN body)),count(position('😀' IN body)) FROM app",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "000200000001330000000131"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23,
+    20
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 3,
+   "query": "SELECT max(position('b' IN 'abc'))",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 4,
+   "query": "SELECT position('x' IN body) FROM other",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 5,
+   "query": "SELECT position(missing IN 'abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 6,
+   "query": "SELECT \"POSITION\"('abc','b')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 7,
+   "query": "SELECT pg_catalog.position('abc','b')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "00010000000132"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 8,
+   "query": "SELECT \"position\"('abc','b')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "00010000000132"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 9,
+   "query": "SELECT public.position('abc','b')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "GD-0001 Q8 (open): public.<fn> is rejected by application authority before lookup (fd4fc26). PG18: 42883."
+  },
+  {
+   "index": 10,
+   "query": "SELECT position('b','abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42601",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 11,
+   "query": "SELECT \"position\"()",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 12,
+   "query": "SELECT position(TRUE IN 'abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42883",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 13,
+   "query": "SELECT position(NULL IN 'abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 1,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "D",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [
+    "0001ffffffff"
+   ],
+   "expected_parameter_oids": [],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 14,
+   "query": "SELECT position(NULL IN CAST('bad' AS int4)::text)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 15,
+   "query": "SELECT position(CAST('bad' AS int4)::text IN NULL)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 16,
+   "query": "SELECT position(CAST($2::text AS int4)::text IN CAST($1::text AS int4)::text)",
+   "params": [
+    "2147483648",
+    "needle_bad"
+   ],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22003",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [
+    25,
+    25
+   ],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Parameter-dependent cast evaluation runs at Execute; PG18 custom planning reports the same SQLSTATE at Bind.",
+   "pg18": {
+    "sqlstate": "22003",
+    "stage": "bind"
+   }
+  },
+  {
+   "index": 17,
+   "query": "SELECT position(CAST($2::text AS int4)::text IN CAST($1::text AS int4)::text)",
+   "params": [
+    "source_bad",
+    "2147483648"
+   ],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [
+    25,
+    25
+   ],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Parameter-dependent cast evaluation runs at Execute; PG18 custom planning reports the same SQLSTATE at Bind.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "bind"
+   }
+  },
+  {
+   "index": 18,
+   "query": "SELECT position(CAST($2::text AS int4)::text IN CAST($1::text AS int4)::text)",
+   "params": [
+    null,
+    "needle_bad"
+   ],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [
+    25,
+    25
+   ],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Parameter-dependent cast evaluation runs at Execute; PG18 custom planning reports the same SQLSTATE at Bind.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "bind"
+   }
+  },
+  {
+   "index": 19,
+   "query": "SELECT position(CAST($2::text AS int4)::text IN CAST($1::text AS int4)::text)",
+   "params": [
+    "source_bad",
+    null
+   ],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [
+    25,
+    25
+   ],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Parameter-dependent cast evaluation runs at Execute; PG18 custom planning reports the same SQLSTATE at Bind.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "bind"
+   }
+  },
+  {
+   "index": 20,
+   "query": "SELECT position(CAST('needle_bad' AS int4)::text IN CAST('2147483648' AS int4)::text)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22003",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind.",
+   "pg18": {
+    "sqlstate": "22003",
+    "stage": "parse"
+   }
+  },
+  {
+   "index": 21,
+   "query": "SELECT position(CAST('2147483648' AS int4)::text IN CAST('source_bad' AS int4)::text)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "parse"
+   }
+  },
+  {
+   "index": 22,
+   "query": "SELECT position(NULL::text IN CAST('source_bad' AS int4)::text)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "parse"
+   }
+  },
+  {
+   "index": 23,
+   "query": "SELECT position(CAST('needle_bad' AS int4)::text IN NULL::text)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim.",
+   "pg18": {
+    "sqlstate": "22P02",
+    "stage": "parse"
+   }
+  },
+  {
+   "index": 24,
+   "query": "INSERT INTO app(id,num) VALUES(2,position({huge} IN 'x'))",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "54000",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 25,
+   "query": "INSERT INTO app(id,num) VALUES(2,position('x' IN {huge}))",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "54000",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 26,
+   "query": "INSERT INTO app(id,num) VALUES(1,position('b' IN 'abc'))",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "23505",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [],
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 27,
+   "query": "INSERT INTO app(id,num) VALUES(1,2)",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "23505",
+    "stage": "execute",
+    "tags": [
+     "2",
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [],
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 28,
+   "query": null,
+   "params": null,
+   "control": "bad-bytea-no-portal",
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "22023",
+    "stage": "bind",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "34000",
+    "stage": "execute",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_bind_complete": false,
+   "expected_prepared": {
+    "data_rows": 0,
+    "error_responses": 0,
+    "ready": "I",
+    "sqlstate": null,
+    "stage": "parse",
+    "tags": [
+     "1",
+     "Z"
+    ]
+   },
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 29,
+   "query": "INSERT INTO app(id,num) VALUES(2,position('😀' IN 'aé😀z'))",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 0,
+    "ready": "T",
+    "sqlstate": null,
+    "stage": "execute",
+    "tags": [
+     "2",
+     "C",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [],
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 30,
+   "query": "SELECT position($1 IN $2::bytea)",
+   "params": [
+    "\\xgg",
+    "\\x00"
+   ],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "E",
+    "sqlstate": "22023",
+    "stage": "bind",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": [
+    17,
+    17
+   ],
+   "expected_result_oids": [
+    23
+   ],
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 31,
+   "query": "SELECT position('b' IN 'abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "E",
+    "sqlstate": "25P02",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed exact bounded control outcome; source-order dynamic cast phases remain distinct from PG Bind."
+  },
+  {
+   "index": 32,
+   "query": "SELECT position('b' IN 'abc')",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 33,
+   "query": "SELECT position('b' IN body) FROM app",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  },
+  {
+   "index": 34,
+   "query": "SELECT position('b' IN body) FROM app",
+   "params": [],
+   "control": null,
+   "expected_actual": {
+    "data_rows": 0,
+    "error_responses": 1,
+    "ready": "I",
+    "sqlstate": "42501",
+    "stage": "parse",
+    "tags": [
+     "E",
+     "Z"
+    ]
+   },
+   "expected_absent": null,
+   "expected_bind_complete": null,
+   "expected_prepared": null,
+   "expected_rows": [],
+   "expected_parameter_oids": null,
+   "expected_result_oids": null,
+   "note": "Observed inherited authorization/profile control; no PG parity claim."
+  }
+ ]
+}

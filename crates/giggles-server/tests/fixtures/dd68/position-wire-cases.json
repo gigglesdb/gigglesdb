@@ -1,0 +1,3351 @@
+{
+ "source": {
+  "oracle": "dd68-position-functions-20261106/oracle/curated-v2.json",
+  "sha256": "1ce6f4068bfd1dd9c5dec60eff9c24575d82759613512525bdf7c9bd6a028de3",
+  "binary_oracle": "dd68-position-functions-20261106/oracle/binary-supplement.json",
+  "binary_sha256": "ada73fbb816a254efae78a7204f7265070f92ee25ac13fe319d35a157d3e34d4",
+  "server": "PostgreSQL 18.6"
+ },
+ "cases": [
+  {
+   "id": 0,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "b",
+    "abc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "abc",
+    "b"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "😀",
+    "aé😀z"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000133"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000003"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "aé😀z",
+    "😀"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000133"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000003"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "z",
+    "aé😀z"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000134"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000004"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "aé😀z",
+    "z"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000134"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000004"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "é",
+    "éé"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000133"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000003"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "éé",
+    "é"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000133"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000003"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "́",
+    "éé"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "éé",
+    "́"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "",
+    "abc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "abc",
+    ""
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "",
+    ""
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "",
+    ""
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "a",
+    ""
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "",
+    "a"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "aaa",
+    "aaaaaa"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "aaaaaa",
+    "aaa"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "b",
+    "aBc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "aBc",
+    "b"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "query": "SELECT POSITION($1 IN $2)",
+   "params": [
+    "abc",
+    "ab"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 21,
+   "query": "SELECT \"position\"($1,$2)",
+   "params": [
+    "ab",
+    "abc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x00ff",
+    "\\x1000ff20"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x1000ff20",
+    "\\x00ff"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x00",
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 25,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x00",
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x80ff",
+    "\\x0080ff"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 27,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x0080ff",
+    "\\x80ff"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 28,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x",
+    "\\x"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 29,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x",
+    "\\x"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 30,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x00",
+    "\\x"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 31,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x",
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 32,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x11",
+    "\\x1111"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 33,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x1111",
+    "\\x11"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 34,
+   "query": "SELECT POSITION($1 IN $2::bytea)",
+   "params": [
+    "\\x1122",
+    "\\x0011"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 35,
+   "query": "SELECT pg_catalog.position($1::bytea,$2::bytea)",
+   "params": [
+    "\\x0011",
+    "\\x1122"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000130"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000000"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 36,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    null,
+    "abc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 37,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "a",
+    null
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 38,
+   "query": "SELECT position(NULL IN NULL)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 39,
+   "query": "SELECT position(NULL::bytea IN NULL)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 40,
+   "query": "SELECT position($1 IN $1::bytea)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 41,
+   "query": "SELECT position($1::bytea IN $1)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 42,
+   "query": "SELECT position($1::text IN $1::bytea)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 43,
+   "query": "SELECT position($1::bytea IN $1::text)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 44,
+   "query": "SELECT position(chr(0) IN NULL::text)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 45,
+   "query": "SELECT position(NULL IN chr(0))",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 46,
+   "query": "SELECT position($1 IN chr(0))",
+   "params": [
+    null
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 47,
+   "query": "SELECT position(chr(0) IN $1)",
+   "params": [
+    null
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 48,
+   "query": "SELECT POSITION('b' IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 49,
+   "query": "SELECT pg_catalog.position('abc','b')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 50,
+   "query": "SELECT \"pg_catalog\".\"position\"('abc','b')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 51,
+   "query": "SELECT \"POSITION\"('abc','b')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 52,
+   "query": "SELECT public.position('abc','b')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 53,
+   "query": "SELECT position('b','abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 54,
+   "query": "SELECT position()",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 55,
+   "query": "SELECT position('b')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 56,
+   "query": "SELECT position('b' IN)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 57,
+   "query": "SELECT position(IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 58,
+   "query": "SELECT position('b' IN 'abc','d')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 59,
+   "query": "SELECT position('b' IN 'abc' IN 'def')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 60,
+   "query": "SELECT \"position\"('b' IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 61,
+   "query": "SELECT pg_catalog.position('b' IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 62,
+   "query": "SELECT position(1 IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 63,
+   "query": "SELECT position(true IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 64,
+   "query": "SELECT position('a'::bytea IN 'abc'::text)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 65,
+   "query": "SELECT strpos('abc'::bytea,'b'::bytea)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 66,
+   "query": "SELECT position(chr(0)::bytea IN NULL::bytea)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "54000",
+     "stage": "bind",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 67,
+   "query": "SELECT position('invalid' IN NULL::bytea)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 68,
+   "query": "SELECT position('\\xgg' IN NULL::bytea)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "22023",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "22023",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 69,
+   "query": "SELECT position('1' IN position('a' IN 'abc')::text)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 70,
+   "query": "SELECT position('b' IN substring('abcd' FROM 2 FOR 2))",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 71,
+   "query": "SELECT max(position('b' IN 'abc'))",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 72,
+   "query": "SELECT position(max('b') IN 'abc')",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 73,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "b",
+    "abc"
+   ],
+   "oids": [
+    25,
+    25
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 74,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "\\x00",
+    "\\x1000"
+   ],
+   "oids": [
+    17,
+    17
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 75,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "1",
+    "abc"
+   ],
+   "oids": [
+    23,
+    25
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 76,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "a",
+    "\\x61"
+   ],
+   "oids": [
+    25,
+    17
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 77,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "\\x61",
+    "abc"
+   ],
+   "oids": [
+    17,
+    25
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 78,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "\\x80",
+    "\\x0080"
+   ],
+   "oids": [
+    0,
+    17
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 79,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "\\x80",
+    "\\x0080"
+   ],
+   "oids": [
+    17,
+    0
+   ],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 80,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "00ff",
+    "1000ff"
+   ],
+   "oids": [
+    17,
+    17
+   ],
+   "binary_inputs": true,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 81,
+   "query": "SELECT position($1 IN $2::bytea)",
+   "params": [
+    "\\xgg",
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "22023",
+     "stage": "bind",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "22023",
+     "stage": "bind",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 82,
+   "query": "SELECT position($1 IN $2)",
+   "params": [
+    "\u0000",
+    "abc"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "22021",
+     "stage": "bind",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "22021",
+     "stage": "bind",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 87,
+   "query": "SELECT position(*)",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 88,
+   "query": "SELECT max(position(*))",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42601",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 89,
+   "query": "SELECT max(position(count(*) IN 'abc'))",
+   "params": [],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "42883",
+     "stage": "parse",
+     "parameter_oids": null,
+     "result_oids": null,
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": 90,
+   "query": "SELECT position($1::bytea IN $1)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  },
+  {
+   "id": 91,
+   "query": "SELECT position($1 IN $1::bytea)",
+   "params": [
+    "\\x00"
+   ],
+   "oids": [],
+   "binary_inputs": false,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000131"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000001"
+     ]
+    }
+   ]
+  }
+ ],
+ "binary_input_cases": [
+  {
+   "id": "explicit_binary_bytea",
+   "query": "SELECT position($1::bytea IN $2::bytea)",
+   "params": [
+    "00ff",
+    "1000ff20"
+   ],
+   "oids": [
+    17,
+    17
+   ],
+   "binary_inputs": true,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000132"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000002"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "explicit_binary_text",
+   "query": "SELECT position($1::text IN $2::text)",
+   "params": [
+    "f09f9880",
+    "61c3a9f09f98807a"
+   ],
+   "oids": [
+    25,
+    25
+   ],
+   "binary_inputs": true,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000133"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "00010000000400000003"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "invalid_binary_utf8",
+   "query": "SELECT position($1::text IN $2::text)",
+   "params": [
+    "ff",
+    "616263"
+   ],
+   "oids": [
+    25,
+    25
+   ],
+   "binary_inputs": true,
+   "pg": [
+    {
+     "status": "error",
+     "sqlstate": "22021",
+     "stage": "bind",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    },
+    {
+     "status": "error",
+     "sqlstate": "22021",
+     "stage": "bind",
+     "parameter_oids": [
+      25,
+      25
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "id": "null_binary_bytea",
+   "query": "SELECT position($1::bytea IN $2::bytea)",
+   "params": [
+    null,
+    "1000ff20"
+   ],
+   "oids": [
+    17,
+    17
+   ],
+   "binary_inputs": true,
+   "pg": [
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    },
+    {
+     "status": "ok",
+     "sqlstate": null,
+     "stage": "execute",
+     "parameter_oids": [
+      17,
+      17
+     ],
+     "result_oids": [
+      23
+     ],
+     "rows": [
+      "0001ffffffff"
+     ]
+    }
+   ]
+  }
+ ]
+}

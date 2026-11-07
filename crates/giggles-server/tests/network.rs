@@ -3084,10 +3084,12 @@ include!("trim_syntax_network.inc");
 include!("substring_order_network.inc");
 include!("degree_math_network.inc");
 include!("md5_functions_network.inc");
+include!("overlay_functions_observe_network.inc");
 include!("quoting_functions_network.inc");
 include!("integer_input_network.inc");
 include!("integer_cast_network.inc");
 include!("insert_functions_network.inc");
+include!("position_functions_network.inc");
 include!("bytea_input_network.inc");
 
 include!("routing_planning_network.inc");
