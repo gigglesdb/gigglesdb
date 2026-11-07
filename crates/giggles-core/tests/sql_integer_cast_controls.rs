@@ -83,8 +83,9 @@ fn pg18_integer_cast_preexisting_pipeline_controls() {
         }
         report.push(serde_json::json!({"id":id,"query":sql,"metadata":format!("{described:?}"),"expected":format!("{expected:?}"),"actual":format!("{actual:?}")}));
     }
-    let path = std::env::var("INTEGER_CAST_REPORT").unwrap();
-    std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    if let Some(path) = std::env::var_os("INTEGER_CAST_REPORT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
     println!(
         "integer_cast_controls={}, differences={differences}",
         report.len()
