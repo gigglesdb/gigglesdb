@@ -250,7 +250,7 @@
   "core_sql_cases": [
     {"id":"typed_point","sql":"SELECT title, active FROM app WHERE id=$1","params":[{"Int":1}],"rows":[[{"Text":"first"},{"Bool":true}]],"error":null,"reason":"A full primary-key equality may omit LIMIT; parameters retain their scalar types."},
     {"id":"bounded_scan","sql":"SELECT id FROM app ORDER BY id DESC LIMIT 2","params":[],"rows":[[{"Int":2}],[{"Int":1}]],"error":null,"reason":"Finite key-ordered scan."},
-    {"id":"unbounded_read","sql":"SELECT * FROM app","params":[],"rows":[],"error":"Unbounded","reason":"A non-point scan must declare a bounded limit."},
+    {"id":"unbounded_read","sql":"SELECT * FROM app","params":[],"rows":[[{"Int":1},{"Text":"first"},{"Bool":true}],[{"Int":2},{"Text":"second"},{"Bool":false}]],"error":null,"reason":"A full scan without LIMIT streams every row in primary-key order (GD-0058 B2, 1ca74e2)."},
     {"id":"unbounded_delete","sql":"DELETE FROM app","params":[],"rows":[],"error":"Unbounded","reason":"SQL DELETE requires full primary-key equality."},
     {"id":"reserved_repair_table","sql":"CREATE TABLE deliveries (id BIGINT PRIMARY KEY)","params":[],"rows":[],"error":"Reserved","reason":"Finite repair tables do not become generic application relations."},
     {"id":"comment","sql":"SELECT * FROM app -- comment","params":[],"rows":[],"error":"Unsupported","reason":"The current embedded lexer rejects comments."},
