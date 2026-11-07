@@ -515,7 +515,7 @@ fn core<T>(r: Result<T, CoreError>) -> R<T> {
 }
 fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_catalog::Plan>> {
     diagnostic.phase = "catalog planning";
-    match giggles_pg_catalog::plan(sql) {
+    match giggles_pg_catalog::plan_gateway(sql) {
         // Preserve the finite application grammar's own diagnostics (for
         // example COPY rejection). Core still parses and authorizes the entire
         // original statement; no failed catalog plan is executed as metadata.
@@ -1110,6 +1110,9 @@ impl State {
                 })?;
                 if bound.checked_add(parameter_bytes).ok_or("54000")? > MAX_RESPONSE {
                     return Err("54000");
+                }
+                if let Plan::Sql(p) = &s.p {
+                    core(session.sql.validate_immutable_constants(p))?;
                 }
                 self.portals.insert(
                     name,

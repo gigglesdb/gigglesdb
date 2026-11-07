@@ -27,7 +27,7 @@
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
 mod engine;
-pub use engine::{Plan, describe, execute, execute_with_startup, plan};
+pub use engine::{Plan, describe, execute, execute_with_startup, plan, plan_gateway};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {

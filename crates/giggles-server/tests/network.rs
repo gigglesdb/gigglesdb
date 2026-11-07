@@ -3053,3 +3053,10 @@ async fn installed_datagrip_detection_and_startup_queries() {
     conn.await.unwrap();
     f.stop().await;
 }
+
+include!("routing_planning_network.inc");
+
+mod text_nul_network {
+    use super::*;
+    include!("text_nul_network.inc");
+}

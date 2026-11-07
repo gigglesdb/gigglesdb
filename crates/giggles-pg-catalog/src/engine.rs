@@ -168,6 +168,16 @@ fn binary(l: E, op: Op, r: E) -> E {
 
 /// Parse/classify structurally. No snapshot or authority is cached in a plan.
 pub fn plan(sql: &str) -> R<Option<Plan>> {
+    plan_inner(sql, false)
+}
+
+/// Classify a gateway query, reserving implicit catalog evaluation for literal
+/// keepalives. Other scalars must pass the core binder and gateway authority.
+pub fn plan_gateway(sql: &str) -> R<Option<Plan>> {
+    plan_inner(sql, true)
+}
+
+fn plan_inner(sql: &str, gateway: bool) -> R<Option<Plan>> {
     if sql.len() > MAX_SQL {
         return Err(Error::Limit);
     }
@@ -218,6 +228,8 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     }
     struct Scan {
         catalog: bool,
+        explicit_catalog: bool,
+        core_scalar: bool,
         user: bool,
         nodes: usize,
         depth: usize,
@@ -245,7 +257,8 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
                 _ => false,
             };
             if is_catalog {
-                self.catalog = true
+                self.catalog = true;
+                self.explicit_catalog = true;
             } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="unnest" || n=="pg_available_extension_versions" || self.ctes.contains(n))
             {
                 self.user = true
@@ -253,6 +266,10 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
             ControlFlow::Continue(())
         }
         fn pre_visit_expr(&mut self, e: &A) -> ControlFlow<Error> {
+            // Implicit catalog context is reserved for literal keepalives.
+            // The core binder owns other scalar expressions and proves its
+            // supported calls before the gateway grants table-free authority.
+            self.core_scalar |= !matches!(e, A::Value(_) | A::Nested(_));
             self.nodes += 1;
             self.depth += 1;
             if self.nodes > 4096 || self.depth > 48 {
@@ -262,14 +279,17 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
                 && let Ok(n) = function(&f.name)
                 && matches!(
                     n.as_str(),
-                    "current_database"
+                    "version"
+                        | "pg_postmaster_start_time"
+                        | "current_database"
                         | "current_schema"
                         | "current_user"
                         | "session_user"
                         | "current_schemas"
                 )
             {
-                self.catalog = true
+                self.catalog = true;
+                self.explicit_catalog = true;
             }
             ControlFlow::Continue(())
         }
@@ -296,6 +316,8 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     }
     let mut scan = Scan {
         catalog: false,
+        explicit_catalog: false,
+        core_scalar: false,
         user: false,
         nodes: 0,
         depth: 0,
@@ -313,6 +335,10 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     }
     if scan.user {
         return Err(Error::MixedRelations);
+    }
+    // Without explicit catalog context the core binder owns scalar semantics.
+    if gateway && scan.core_scalar && !scan.explicit_catalog {
+        return Ok(None);
     }
     let a::Statement::Query(q) = &statements[0] else {
         return Err(Error::Mutation);

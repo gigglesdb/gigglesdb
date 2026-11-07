@@ -148,7 +148,9 @@ fn exact_jdbc_typeinfo() {
     ] {
         assert!(r.rows.contains(&vec![s(name), i(oid)]));
     }
-    assert!(!r.rows.iter().any(|r| r[0] == s("numeric")));
+    for (name, oid) in [("numeric", 1700), ("float4", 700), ("float8", 701)] {
+        assert!(r.rows.contains(&vec![s(name), i(oid)]));
+    }
 }
 #[test]
 fn exact_jdbc_typecache() {
@@ -756,5 +758,24 @@ fn postgres_int2vector_lower_bound_differs_from_arrays() {
     assert_eq!(
         r.rows,
         vec![vec![i(2), i(1), Value::Null, i(0), i(1), Value::Null, i(2)]]
+    );
+}
+
+
+#[test]
+fn temporal_catalog_identity_width_and_category() {
+    let result = run(
+        "SELECT oid, typname, typlen, typcategory FROM pg_catalog.pg_type WHERE oid IN (1082,1083,1266,1114,1184,1186) ORDER BY oid",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![i(1082), s("date"), i(4), s("D")],
+            vec![i(1083), s("time"), i(8), s("D")],
+            vec![i(1114), s("timestamp"), i(8), s("D")],
+            vec![i(1184), s("timestamptz"), i(8), s("D")],
+            vec![i(1186), s("interval"), i(16), s("T")],
+            vec![i(1266), s("timetz"), i(12), s("D")],
+        ]
     );
 }
