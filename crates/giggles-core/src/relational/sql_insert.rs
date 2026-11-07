@@ -404,8 +404,9 @@ impl Insert {
             }
         }
         if let Some(returning) = &self.returning {
-            let (columns, parameters) = returning.describe(state, parameters)?;
+            let (columns, parameters, typmods) = returning.describe(state, parameters)?;
             return Ok(Description {
+                typmods,
                 columns,
                 parameters,
             });
@@ -415,6 +416,7 @@ impl Insert {
                 .into_iter()
                 .map(|ty| ty.ok_or(SqlError::Parameters))
                 .collect::<R<Vec<_>>>()?,
+            typmods: vec![],
             columns: vec![],
         })
     }

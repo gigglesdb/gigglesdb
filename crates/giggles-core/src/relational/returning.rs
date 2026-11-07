@@ -20,9 +20,16 @@ impl Returning {
         &self,
         state: &Relational,
         seed: Vec<Option<DataType>>,
-    ) -> R<(Vec<ColumnDef>, Vec<DataType>)> {
-        let description = self.query.bind_seeded(state, seed)?.description();
-        Ok((description.columns, description.parameters))
+    ) -> R<(Vec<ColumnDef>, Vec<DataType>, Vec<i32>)> {
+        let description = self
+            .query
+            .bind_projection_seeded(state, seed)?
+            .description(state);
+        Ok((
+            description.columns,
+            description.parameters,
+            description.typmods,
+        ))
     }
 
     pub(super) fn project(
@@ -83,12 +90,13 @@ pub(super) fn describe_insert(
     for (original, ty) in map.iter().zip(body.parameters) {
         *seed.get_mut(original - 1).ok_or(SqlError::Parameters)? = Some(ty);
     }
-    let (columns, parameters) = values
+    let (columns, parameters, typmods) = values
         .returning
         .as_ref()
         .ok_or(SqlError::Unsupported)?
         .describe(state, seed)?;
     Ok(Description {
+        typmods,
         columns,
         parameters,
     })

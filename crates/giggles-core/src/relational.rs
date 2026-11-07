@@ -11,6 +11,7 @@ mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
+use query::{TypmodSource, result_typmod};
 mod returning;
 mod scan;
 use returning::Returning;
@@ -617,6 +618,7 @@ enum Statement {
     Create {
         name: String,
         columns: Vec<ColumnDef>,
+        typmods: Vec<Option<i32>>,
         keys: Vec<String>,
     },
     InsertExpressions(query::InsertExpressions),
@@ -843,6 +845,7 @@ impl Parser {
             self.punct(')')?;
             Statement::Create {
                 name,
+                typmods: vec![None; columns.len()],
                 columns,
                 keys,
             }
@@ -954,7 +957,9 @@ pub struct Prepared {
 pub struct Description {
     pub parameters: Vec<DataType>,
     pub columns: Vec<ColumnDef>,
+    pub typmods: Vec<i32>,
 }
+
 /// Native ordered access compiled through the same binder and transaction path.
 #[derive(Debug, Clone)]
 pub struct Scan {
@@ -1066,6 +1071,7 @@ impl Prepared {
         Ok(Self::engine(
             Statement::Create {
                 name,
+                typmods: vec![None; columns.len()],
                 columns,
                 keys,
             },
@@ -1221,8 +1227,8 @@ impl Prepared {
         }
         if let Statement::Query(q) = &self.statement {
             return q
-                .bind(state, self.params, &self.parameter_types)
-                .map(|b| b.description());
+                .bind_description(state, self.params, &self.parameter_types)
+                .map(|b| b.description(state));
         }
         if let Statement::UpdateExpressions {
             name,
@@ -1318,8 +1324,9 @@ impl Prepared {
             }
         }
         if let Some(returning) = self.returning() {
-            let (columns, parameters) = returning.describe(state, params)?;
+            let (columns, parameters, typmods) = returning.describe(state, params)?;
             return Ok(Description {
+                typmods,
                 columns,
                 parameters,
             });
@@ -1329,6 +1336,10 @@ impl Prepared {
                 .into_iter()
                 .map(|t| t.ok_or(SqlError::Parameters))
                 .collect::<R<Vec<_>>>()?,
+            typmods: columns
+                .iter()
+                .map(|c| result_typmod(state, TypmodSource::Column(c)))
+                .collect(),
             columns,
         })
     }
@@ -1957,12 +1968,13 @@ impl Relational {
             Statement::Create {
                 name,
                 columns,
+                typmods,
                 keys,
             } => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                if self.tables.contains_key(name) {
+                if self.relation_name_taken(name) {
                     return Err(SqlError::DuplicateTable);
                 }
                 if self.tables.len() >= MAX_TABLES
@@ -1975,6 +1987,15 @@ impl Relational {
                 for column in columns {
                     if !column_names.insert(&column.name) {
                         return Err(SqlError::DuplicateColumn);
+                    }
+                }
+                if typmods.len() != columns.len() {
+                    return Err(SqlError::InvalidParameterValue);
+                }
+                for (column, typmod) in columns.iter().zip(typmods) {
+                    if let Some(typmod) = typmod {
+                        validate_typmod(&column.data_type, *typmod)
+                            .map_err(|_| SqlError::InvalidParameterValue)?;
                     }
                 }
                 validate_create_definition(name, columns, keys)?;
@@ -2003,10 +2024,18 @@ impl Relational {
                     c.id = allocate(&mut next_id)?;
                 }
                 let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                // Typmods were validated above against these exact column types, so the ext
+                // update cannot fail; no whole-catalog clone is needed for atomicity.
+                for (column, typmod) in t.columns.iter().zip(typmods) {
+                    if let Some(typmod) = typmod {
+                        self.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
+                    }
+                }
                 self.next_id = next_id;
                 self.epoch = epoch;
                 self.rows.insert(t.id, BTreeMap::new());
                 self.tables.insert(name.clone(), t);
+                debug_assert!(self.validate_ext().is_ok());
             }
             Statement::Insert {
                 name,
@@ -2307,3 +2336,11 @@ mod arithmetic_lexer_tests {
 
 #[cfg(test)]
 mod catalog_ext_tests;
+
+#[cfg(test)]
+mod describe_create_tests;
+#[cfg(test)]
+mod catalog_names_tests;
+
+#[cfg(test)]
+mod catalog_typmods_tests;

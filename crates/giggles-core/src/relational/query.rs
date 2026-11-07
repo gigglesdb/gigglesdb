@@ -6,6 +6,29 @@ mod insert_values;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
 
+pub(super) enum TypmodSource<'a> {
+    Column(&'a ColumnDef),
+    Scalar(&'a functions::BoundScalar),
+    Other,
+}
+
+pub(super) fn result_typmod(state: &Relational, source: TypmodSource<'_>) -> i32 {
+    match source {
+        TypmodSource::Column(column) => {
+            if column.id == 0 {
+                -1
+            } else {
+                state.column_typmod(column.id)
+            }
+        }
+        TypmodSource::Scalar(_value) => {
+            // E2a-1: Cast(_, ty, typmod) → typmod; later CASE/COALESCE/UNION when all arms agree.
+            -1
+        }
+        TypmodSource::Other => -1,
+    }
+}
+
 // Syntax node budget for INSERT expressions and IN/BETWEEN lowering; not a scan work cap.
 const MAX_WORK: usize = 4096;
 const MAX_SOURCES: usize = 8;
@@ -873,6 +896,23 @@ impl Query {
         count: usize,
         declared: &[Option<DataType>],
     ) -> R<BoundQuery<'a>> {
+        self.bind_declared(state, count, declared, false)
+    }
+    pub(super) fn bind_description<'a>(
+        &'a self,
+        state: &'a Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<BoundQuery<'a>> {
+        self.bind_declared(state, count, declared, true)
+    }
+    fn bind_declared<'a>(
+        &'a self,
+        state: &'a Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+        classify_plain_columns: bool,
+    ) -> R<BoundQuery<'a>> {
         if count > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
@@ -881,12 +921,27 @@ impl Query {
         }
         let mut parameters = vec![None; count];
         parameters[..declared.len()].clone_from_slice(declared);
-        self.bind_seeded(state, parameters)
+        self.bind_seeded_inner(state, parameters, classify_plain_columns)
     }
     pub(super) fn bind_seeded<'a>(
         &'a self,
         state: &'a Relational,
+        parameters: Vec<Option<DataType>>,
+    ) -> R<BoundQuery<'a>> {
+        self.bind_seeded_inner(state, parameters, false)
+    }
+    pub(super) fn bind_projection_seeded<'a>(
+        &'a self,
+        state: &'a Relational,
+        parameters: Vec<Option<DataType>>,
+    ) -> R<BoundQuery<'a>> {
+        self.bind_seeded_inner(state, parameters, true)
+    }
+    fn bind_seeded_inner<'a>(
+        &'a self,
+        state: &'a Relational,
         mut parameters: Vec<Option<DataType>>,
+        classify_plain_columns: bool,
     ) -> R<BoundQuery<'a>> {
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
@@ -1069,22 +1124,27 @@ impl Query {
             match item {
                 Item::Scalar(e) => {
                     let e = e.bind(&resolve, &tables, &parameters)?;
-                    let d = if let Item::Scalar(Scalar::Column(c)) = item {
+                    let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
                         let c = resolve(c, tables.len())?;
                         let mut d = tables[c.source].columns[c.column].clone();
                         if c.source > 0 && self.joins[c.source - 1].left {
                             d.not_null = false;
                         }
-                        d
+                        (Some(c), d)
                     } else {
-                        ColumnDef {
+                        let d = ColumnDef {
                             id: 0,
                             name: e.name().into(),
                             data_type: e.ty.clone(),
                             not_null: false,
-                        }
+                        };
+                        (None, d)
                     };
-                    push(BoundItem::Scalar(e), d);
+                    let item = match source_column {
+                        Some(column) if classify_plain_columns => BoundItem::Column(column),
+                        _ => BoundItem::Scalar(e),
+                    };
+                    push(item, d);
                 }
                 Item::Aggregate(a, c) => {
                     if matches!(a, Aggregate::Count)
@@ -1357,9 +1417,26 @@ impl BoundQuery<'_> {
         }
         Ok(())
     }
-    pub(super) fn description(&self) -> Description {
+    pub(super) fn description(&self, state: &Relational) -> Description {
         Description {
             parameters: self.parameters.clone(),
+            typmods: if self.query.explain {
+                vec![result_typmod(state, TypmodSource::Other)]
+            } else {
+                self.items
+                    .iter()
+                    .map(|item| {
+                        let source = match item {
+                            BoundItem::Column(column) => TypmodSource::Column(
+                                &self.tables[column.source].columns[column.column],
+                            ),
+                            BoundItem::Scalar(value) => TypmodSource::Scalar(value),
+                            BoundItem::Aggregate(..) => TypmodSource::Other,
+                        };
+                        result_typmod(state, source)
+                    })
+                    .collect()
+            },
             columns: if self.query.explain {
                 vec![ColumnDef {
                     id: 0,

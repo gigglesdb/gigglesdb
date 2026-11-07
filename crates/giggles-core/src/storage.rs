@@ -1442,6 +1442,19 @@ impl Admin {
         self.inner
             .inspect(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
     }
+    /// Read column typmods and their catalog epoch from one committed snapshot.
+    pub fn catalog_typmods(&self) -> Result<(u64, BTreeMap<u64, i32>), CoreError> {
+        self.inner.inspect(|s| {
+            let typmods = s
+                .sql
+                .catalog_ext()
+                .columns
+                .iter()
+                .filter_map(|(&id, column)| column.typmod.map(|typmod| (id, typmod)))
+                .collect();
+            Ok((s.sql.epoch, typmods))
+        })
+    }
 }
 impl SqlSession {
     /// Resolve metadata only. Never executes, stages, charges or publishes SQL.

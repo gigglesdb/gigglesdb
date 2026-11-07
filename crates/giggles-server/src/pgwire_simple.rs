@@ -120,6 +120,7 @@ impl State {
             let response = session.handle_received(req, received);
             let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
             let d = Description {
+                typmods: vec![-1],
                 parameters: vec![],
                 columns: vec![giggles_core::relational::ColumnDef {
                     id: 0,

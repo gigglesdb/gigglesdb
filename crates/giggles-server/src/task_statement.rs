@@ -78,6 +78,7 @@ impl TaskStatement {
             }
         };
         Description {
+            typmods: vec![-1],
             parameters,
             columns: vec![ColumnDef {
                 id: 0,

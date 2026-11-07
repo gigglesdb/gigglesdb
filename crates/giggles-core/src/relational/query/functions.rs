@@ -46,7 +46,7 @@ pub(super) enum Scalar {
     Call(String, Vec<Scalar>),
     SubstringOrder([Box<Scalar>; 3]),
 }
-pub(super) struct BoundScalar {
+pub(in crate::relational) struct BoundScalar {
     pub(super) ty: DataType,
     node: Node,
 }

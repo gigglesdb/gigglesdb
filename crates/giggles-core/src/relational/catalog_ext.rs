@@ -263,7 +263,104 @@ pub(crate) fn validate_typmod(ty: &DataType, t: i32) -> R<()> {
     };
     if valid { Ok(()) } else { Err(SqlError::Type) }
 }
+/// Suffixes used by PostgreSQL's automatically selected constraint names.
+#[derive(Clone, Copy)]
+pub(crate) enum AutoName {
+    Key,
+    Pkey,
+    Check,
+    Fkey,
+}
+
+// Match makeObjectName: reserve separators and label, then balance byte lengths
+// before clipping each identifier at a UTF-8 boundary.
+fn constraint_object_name(table: &str, columns: &str, label: &str) -> String {
+    let mut table_len = table.len();
+    let mut columns_len = columns.len();
+    let overhead = label.len() + 1 + usize::from(!columns.is_empty());
+    while table_len + columns_len + overhead > 63 {
+        if table_len > columns_len {
+            table_len -= 1;
+        } else {
+            columns_len -= 1;
+        }
+    }
+    while !table.is_char_boundary(table_len) {
+        table_len -= 1;
+    }
+    while !columns.is_char_boundary(columns_len) {
+        columns_len -= 1;
+    }
+    if columns.is_empty() {
+        format!("{}_{}", &table[..table_len], label)
+    } else {
+        format!(
+            "{}_{}_{}",
+            &table[..table_len],
+            &columns[..columns_len],
+            label
+        )
+    }
+}
+
 impl Relational {
+    pub(crate) fn relation_name_taken(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+            || self.secondary.descriptors().iter().any(|d| d.name == name)
+            || self.sequence_by_name(name).is_some()
+    }
+
+    pub(crate) fn constraint_name_taken(&self, table: u64, name: &str) -> bool {
+        self.table_constraints(table).iter().any(|c| c.name == name)
+            || self
+                .secondary
+                .descriptors()
+                .iter()
+                .any(|d| d.table == table && d.unique && d.name == name)
+    }
+
+    pub(crate) fn choose_constraint_name(
+        &self,
+        table: &str,
+        columns: &[&str],
+        kind: AutoName,
+    ) -> String {
+        let (suffix, relation) = match kind {
+            AutoName::Key => ("key", true),
+            AutoName::Pkey => ("pkey", true),
+            AutoName::Check => ("check", false),
+            AutoName::Fkey => ("fkey", false),
+        };
+        let columns = if matches!(kind, AutoName::Pkey) {
+            String::new()
+        } else {
+            columns.join("_")
+        };
+        for attempt in 0u64.. {
+            let label = if attempt == 0 {
+                suffix.to_owned()
+            } else {
+                format!("{suffix}{attempt}")
+            };
+            let name = constraint_object_name(table, &columns, &label);
+            let constraint_taken = self
+                .ext
+                .constraints
+                .values()
+                .flatten()
+                .any(|c| c.name == name)
+                || self
+                    .secondary
+                    .descriptors()
+                    .iter()
+                    .any(|d| d.unique && d.name == name);
+            if !constraint_taken && (!relation || !self.relation_name_taken(&name)) {
+                return name;
+            }
+        }
+        unreachable!("bounded catalog cannot exhaust constraint names")
+    }
+
     pub(crate) fn catalog_ext(&self) -> &CatalogExt {
         &self.ext
     }
@@ -464,6 +561,9 @@ impl Relational {
         })
     }
     pub(crate) fn add_constraint(&mut self, table: u64, c: Constraint) -> R<()> {
+        if self.constraint_name_taken(table, &c.name) {
+            return Err(SqlError::DuplicateObject);
+        }
         self.mutate_ext(|ext, next_id| {
             if c.id != *next_id {
                 return Err(SqlError::Type);

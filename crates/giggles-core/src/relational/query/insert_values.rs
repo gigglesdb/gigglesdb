@@ -246,6 +246,7 @@ impl InsertExpressions {
         let bound = self.bind(state, count)?;
         Ok(Description {
             parameters: bound.parameters,
+            typmods: vec![],
             columns: vec![],
         })
     }

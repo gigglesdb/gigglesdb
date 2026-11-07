@@ -453,6 +453,7 @@ impl Session {
     pub fn describe(&mut self, p: &Prepared) -> Result<relational::Description, CoreError> {
         if p.is_ddl() {
             return Ok(relational::Description {
+                typmods: vec![],
                 parameters: vec![],
                 columns: vec![],
             });

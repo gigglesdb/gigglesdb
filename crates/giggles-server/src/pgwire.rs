@@ -667,6 +667,7 @@ fn inspect(
     let (name, value) = show.value(settings);
     Ok((
         Description {
+            typmods: vec![-1],
             parameters: vec![],
             columns: vec![giggles_core::relational::ColumnDef {
                 id: 0,
@@ -808,6 +809,7 @@ impl State {
                     (
                         Plan::Admin(stmt),
                         Description {
+                            typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
                         },
@@ -816,6 +818,7 @@ impl State {
                     (
                         Plan::Empty,
                         Description {
+                            typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
                         },
@@ -827,6 +830,7 @@ impl State {
                     (
                         Plan::Control(command),
                         Description {
+                            typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
                         },
@@ -845,6 +849,7 @@ impl State {
                     (
                         Plan::Settings(settings),
                         Description {
+                            typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
                         },
@@ -876,6 +881,7 @@ impl State {
                     let fields =
                         giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
                     let d = Description {
+                        typmods: vec![-1; fields.len()],
                         parameters: vec![DataType::Text; plan.parameter_count()],
                         columns: fields
                             .iter()

@@ -80,7 +80,7 @@ pub(super) fn describe(
             &mut parameters,
         )?;
     }
-    let (columns, parameters) = if let Some(returning) = returning {
+    let (columns, parameters, _typmods) = if let Some(returning) = returning {
         returning.describe(state, parameters)?
     } else {
         (
@@ -89,9 +89,14 @@ pub(super) fn describe(
                 .into_iter()
                 .map(|ty| ty.ok_or(SqlError::Parameters))
                 .collect::<R<Vec<_>>>()?,
+            vec![],
         )
     };
     Ok(Description {
+        typmods: columns
+            .iter()
+            .map(|c| result_typmod(state, TypmodSource::Column(c)))
+            .collect(),
         columns,
         parameters,
     })

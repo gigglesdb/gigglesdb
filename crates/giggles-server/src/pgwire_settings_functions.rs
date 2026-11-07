@@ -14,6 +14,7 @@ pub(super) fn parse(
 }
 pub(super) fn description(function: &crate::pg_settings::Function) -> Description {
     Description {
+        typmods: vec![-1],
         parameters: vec![],
         columns: vec![giggles_core::relational::ColumnDef {
             id: 0,
