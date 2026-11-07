@@ -1309,7 +1309,7 @@ impl Prepared {
             return Err(SqlError::StaleSchema);
         }
         if let Statement::InsertMulti(insert) = &self.statement {
-            return insert.describe(state, self.params);
+            return insert.describe(state, self.params, &self.parameter_types);
         }
         if let Statement::InsertExpressions(values) = &self.statement {
             return returning::describe_insert(values, state, self.params);
@@ -1376,7 +1376,13 @@ impl Prepared {
                         return Err(SqlError::Type);
                     }
                     for (i, e) in indexes.into_iter().zip(values) {
-                        bind(e, &t.columns[i].data_type)?;
+                        infer_mutation_parameter(
+                            e,
+                            &t.columns[i].data_type,
+                            &mut params,
+                            &self.parameter_types,
+                            true,
+                        )?;
                     }
                 }
                 Statement::Select {
@@ -1574,7 +1580,7 @@ impl Prepared {
             },
         })
     }
-    /// Declare input types for SELECT, UPDATE and DELETE before type inference.
+    /// Declare input types for SELECT, INSERT VALUES, UPDATE and DELETE before type inference.
     /// A shorter slice or `None` entries leave the corresponding inputs inferred.
     /// Other statement kinds retain their existing parameter inference.
     pub fn with_parameter_types(mut self, types: &[Option<DataType>]) -> R<Self> {
@@ -1588,6 +1594,8 @@ impl Prepared {
         if matches!(
             self.statement,
             Statement::Query(_)
+                | Statement::Insert { .. }
+                | Statement::InsertMulti(_)
                 | Statement::Update { .. }
                 | Statement::UpdateExpressions { .. }
                 | Statement::Delete { .. }
@@ -2111,7 +2119,9 @@ impl Relational {
         if prepared.parameter_types.iter().any(Option::is_some)
             && matches!(
                 prepared.statement,
-                Statement::Update { .. }
+                Statement::Insert { .. }
+                    | Statement::InsertMulti(_)
+                    | Statement::Update { .. }
                     | Statement::UpdateExpressions { .. }
                     | Statement::Delete { .. }
             )
@@ -2168,7 +2178,7 @@ impl Relational {
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
             Statement::InsertMulti(insert) => {
-                return sql_insert::execute(
+                return sql_insert::execute_declared(
                     self,
                     insert,
                     params,
@@ -2176,6 +2186,7 @@ impl Relational {
                     &returning,
                     clock,
                     &mut cancel,
+                    &prepared.parameter_types,
                 );
             }
             Statement::CreateIndex(index) => {
@@ -2304,6 +2315,9 @@ impl Relational {
                         || matches!(v, Expr::Literal(_)) && t.columns[*i].data_type.is_temporal()
                     {
                         query::coerce(v.value(params)?, &t.columns[*i].data_type)?
+                    } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
+                    {
+                        assign::plain_value(v, &t.columns[*i], &prepared.parameter_types, params)?
                     } else {
                         v.value(params)?
                     };

@@ -259,3 +259,92 @@ fn delete_excess_declarations_and_undeclared_inference_are_unchanged() {
         3
     );
 }
+
+#[test]
+fn reversed_delete_comparisons_honor_declared_types() {
+    let mut session = fixture();
+    let point = session
+        .prepare("DELETE FROM t WHERE $1=id")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::BigInt)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&point).unwrap().parameters,
+        vec![DataType::BigInt]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&point, &[Value::Int(3_000_000_000)], None)
+            .unwrap()
+            .affected,
+        0
+    );
+    let searched = session
+        .prepare("DELETE FROM t WHERE $1<id AND id<3 RETURNING id")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::BigInt)])
+        .unwrap();
+    let description = session.describe(&searched).unwrap();
+    assert_eq!(description.parameters, vec![DataType::BigInt]);
+    assert_eq!(description.columns[0].data_type, DataType::Integer);
+    let result = session
+        .execute_prepared(&searched, &[Value::Int(1)], None)
+        .unwrap();
+    assert_eq!(result.affected, 1);
+    assert_eq!(result.rows[0].values, vec![Value::Int(2)]);
+    let before = session
+        .execute("SELECT * FROM t ORDER BY id", &[], None)
+        .unwrap();
+    for sql in ["DELETE FROM t WHERE $1=id", "DELETE FROM t WHERE id=$1"] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(DataType::Text)])
+            .unwrap();
+        assert!(
+            matches!(
+                session.describe(&prepared),
+                Err(CoreError::Sql(SqlError::UndefinedFunction))
+            ),
+            "describe {sql}"
+        );
+        assert!(
+            matches!(
+                session.execute_prepared(&prepared, &[Value::Text("1".into())], None),
+                Err(CoreError::Sql(SqlError::UndefinedFunction))
+            ),
+            "execute {sql}"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT * FROM t ORDER BY id", &[], None)
+                .unwrap(),
+            before,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn delete_out_of_range_integer_literals_match_no_rows() {
+    let mut session = fixture();
+    let before = session
+        .execute("SELECT * FROM t ORDER BY id", &[], None)
+        .unwrap();
+    for sql in [
+        "DELETE FROM t WHERE id=3000000000",
+        "DELETE FROM t WHERE id=3000000000 RETURNING id",
+        "DELETE FROM t WHERE id > -3000000000 AND id<0",
+    ] {
+        let result = session.execute(sql, &[], None).unwrap();
+        assert_eq!(result.affected, 0, "{sql}");
+        assert!(result.rows.is_empty(), "{sql}");
+        assert_eq!(
+            session
+                .execute("SELECT * FROM t ORDER BY id", &[], None)
+                .unwrap(),
+            before,
+            "{sql}"
+        );
+    }
+}

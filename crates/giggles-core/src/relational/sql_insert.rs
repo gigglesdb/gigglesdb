@@ -359,11 +359,17 @@ fn infer_operand(
     expected: Option<&DataType>,
     table: &TableDef,
     parameters: &mut [Option<DataType>],
+    declared: &[Option<DataType>],
 ) -> R<()> {
     match operand {
         Operand::Value(expression) => {
             if let Some(expected) = expected {
-                infer_value(expression, expected, parameters)?;
+                if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
+                {
+                    infer_mutation_parameter(expression, expected, parameters, declared, false)?;
+                } else {
+                    infer_value(expression, expected, parameters)?;
+                }
             }
         }
         Operand::Field(_, name) => {
@@ -376,22 +382,27 @@ fn infer_condition(
     condition: &Condition,
     table: &TableDef,
     parameters: &mut [Option<DataType>],
+    declared: &[Option<DataType>],
 ) -> R<()> {
     match condition {
         Condition::Compare(left, _, right) => {
             let left_type = operand_type(left, table)?;
             let right_type = operand_type(right, table)?;
-            infer_operand(left, right_type.as_ref(), table, parameters)?;
-            infer_operand(right, left_type.as_ref(), table, parameters)?;
+            infer_operand(left, right_type.as_ref(), table, parameters, declared)?;
+            infer_operand(right, left_type.as_ref(), table, parameters, declared)?;
         }
-        Condition::Operand(operand) => {
-            infer_operand(operand, Some(&DataType::Boolean), table, parameters)?
-        }
-        Condition::IsNull(operand, _) => infer_operand(operand, None, table, parameters)?,
-        Condition::Not(inner) => infer_condition(inner, table, parameters)?,
+        Condition::Operand(operand) => infer_operand(
+            operand,
+            Some(&DataType::Boolean),
+            table,
+            parameters,
+            declared,
+        )?,
+        Condition::IsNull(operand, _) => infer_operand(operand, None, table, parameters, declared)?,
+        Condition::Not(inner) => infer_condition(inner, table, parameters, declared)?,
         Condition::And(left, right) | Condition::Or(left, right) => {
-            infer_condition(left, table, parameters)?;
-            infer_condition(right, table, parameters)?;
+            infer_condition(left, table, parameters, declared)?;
+            infer_condition(right, table, parameters, declared)?;
         }
     }
     Ok(())
@@ -419,19 +430,30 @@ impl Insert {
         }
         Ok(dependencies)
     }
-    pub(super) fn describe(&self, state: &Relational, count: usize) -> R<Description> {
+    pub(super) fn describe(
+        &self,
+        state: &Relational,
+        count: usize,
+        declared: &[Option<DataType>],
+    ) -> R<Description> {
         let table = state
             .tables
             .get(&self.table)
             .ok_or(SqlError::UnknownTable)?;
         let indexes = indexes(self, table)?;
         let mut parameters = vec![None; count];
+        if declared.len() > count {
+            return Err(SqlError::Parameters);
+        }
+        parameters[..declared.len()].clone_from_slice(declared);
         for row in &self.rows {
             for (expression, index) in row.iter().zip(&indexes) {
-                infer_value(
+                infer_mutation_parameter(
                     expression,
                     &table.columns[*index].data_type,
                     &mut parameters,
+                    declared,
+                    true,
                 )?;
             }
         }
@@ -450,12 +472,25 @@ impl Insert {
                 if table.primary_key.contains(&index) {
                     return Err(SqlError::Unsupported);
                 }
-                infer_operand(
-                    operand,
-                    Some(&table.columns[index].data_type),
-                    table,
-                    &mut parameters,
-                )?;
+                if let Operand::Value(expression @ Expr::Param(n)) = operand
+                    && declared.get(n - 1).is_some_and(Option::is_some)
+                {
+                    infer_mutation_parameter(
+                        expression,
+                        &table.columns[index].data_type,
+                        &mut parameters,
+                        declared,
+                        true,
+                    )?;
+                } else {
+                    infer_operand(
+                        operand,
+                        Some(&table.columns[index].data_type),
+                        table,
+                        &mut parameters,
+                        declared,
+                    )?;
+                }
                 if let Operand::Value(expression @ Expr::Literal(_)) = operand {
                     let value = resolved_value(expression, &[], &table.columns[index].data_type)?;
                     let mut column = table.columns[index].clone();
@@ -469,7 +504,7 @@ impl Insert {
                 }
             }
             if let Some(guard) = &update.guard {
-                infer_condition(guard, table, &mut parameters)?;
+                infer_condition(guard, table, &mut parameters, declared)?;
             }
         }
         if let Some(returning) = &self.returning {
@@ -775,6 +810,7 @@ impl Relational {
     }
 }
 
+#[cfg(test)]
 pub(super) fn execute(
     state: &mut Relational,
     insert: &Insert,
@@ -783,6 +819,23 @@ pub(super) fn execute(
     returning: &Option<returning::Plan<'_>>,
     clock: Option<&clock::ExecutionClock>,
     cancel: &mut dyn FnMut() -> bool,
+) -> R<SqlResult> {
+    execute_declared(state, insert, params, expected, returning, clock, cancel, &[])
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "statement inputs plus clock, cancel and client-declared parameter types"
+)]
+pub(super) fn execute_declared(
+    state: &mut Relational,
+    insert: &Insert,
+    params: &[Value],
+    expected: Option<u64>,
+    returning: &Option<returning::Plan<'_>>,
+    clock: Option<&clock::ExecutionClock>,
+    cancel: &mut dyn FnMut() -> bool,
+    declared: &[Option<DataType>],
 ) -> R<SqlResult> {
     if cancel() {
         return Err(SqlError::Aborted);
@@ -849,7 +902,12 @@ pub(super) fn execute(
         let mut row = defaults::row(state, &table, &supplied, clock)?;
         for ((expression, index), default) in values.iter().zip(&indexes).zip(row_defaults) {
             if !replaced(*index, *default) {
-                row[*index] = resolved_value(expression, params, &table.columns[*index].data_type)?;
+                row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
+                {
+                    assign::plain_value(expression, &table.columns[*index], declared, params)?
+                } else {
+                    resolved_value(expression, params, &table.columns[*index].data_type)?
+                };
             }
         }
         Relational::secondary_admit_values(row.iter())?;
@@ -897,12 +955,22 @@ pub(super) fn execute(
                         let index = col(&table, name)?;
                         Ok((
                             name.clone(),
-                            lower_operand(
-                                operand,
-                                &table,
-                                params,
-                                Some(&table.columns[index].data_type),
-                            )?,
+                            if let Operand::Value(expression @ Expr::Param(n)) = operand
+                                && declared.get(n - 1).is_some_and(Option::is_some)
+                            {
+                                let mut column = table.columns[index].clone();
+                                column.not_null = false;
+                                operations::Expr::Value(operations::ValueExpr::Literal(
+                                    assign::plain_value(expression, &column, declared, params)?,
+                                ))
+                            } else {
+                                lower_operand(
+                                    operand,
+                                    &table,
+                                    params,
+                                    Some(&table.columns[index].data_type),
+                                )?
+                            },
                         ))
                     })
                     .collect::<R<Vec<_>>>()?,

@@ -296,13 +296,14 @@ fn declaration_length_checks_precede_statement_kind_and_nonqueries_ignore_types(
         .unwrap()
         .with_parameter_types(&[Some(DataType::Bytes)])
         .unwrap();
-    assert_eq!(
-        session.describe(&prepared).unwrap().parameters,
-        vec![DataType::Integer]
-    );
-    session
-        .execute_prepared(&prepared, &[Value::Int(1)], None)
-        .unwrap();
+    assert!(matches!(
+        session.describe(&prepared),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
+    assert!(matches!(
+        session.execute_prepared(&prepared, &[Value::Int(1)], None),
+        Err(CoreError::Sql(SqlError::Type))
+    ));
     let prepared = session
         .prepare("INSERT INTO declared_inputs VALUES(abs($1::integer))")
         .unwrap()

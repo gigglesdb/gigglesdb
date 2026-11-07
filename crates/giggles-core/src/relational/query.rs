@@ -353,6 +353,7 @@ impl Filter {
     ) -> R<()> {
         match self {
             Self::Compare(Scalar::Column(column), _, Scalar::Param(n))
+            | Self::Compare(Scalar::Param(n), _, Scalar::Column(column))
                 if declared.get(n - 1).is_some_and(Option::is_some) =>
             {
                 let column = resolve(column, 0)?;
@@ -1455,6 +1456,16 @@ impl Query {
                 }
                 slot.get_or_insert_with(|| ty.clone());
             } else if let Expr::Literal(v) = e {
+                if let Value::Int(value) = v
+                    && match ty {
+                        DataType::SmallInt => i16::try_from(*value).is_err(),
+                        DataType::Integer => i32::try_from(*value).is_err(),
+                        _ => false,
+                    }
+                {
+                    // Keep out-of-range integer comparisons in the full filter.
+                    return Ok(false);
+                }
                 check(
                     v,
                     &ColumnDef {

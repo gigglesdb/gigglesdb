@@ -600,14 +600,153 @@ fn undeclared_mutation_column_conflicts_and_integer_key_fallback() {
     let literal = session
         .prepare("UPDATE t SET n=9 WHERE id=3000000000")
         .unwrap();
-    assert!(matches!(
-        session.execute_prepared(&literal, &[], None),
-        Err(CoreError::Sql(SqlError::Type))
-    ));
+    assert_eq!(
+        session
+            .execute_prepared(&literal, &[], None)
+            .unwrap()
+            .affected,
+        0
+    );
     assert_eq!(
         session
             .execute("SELECT * FROM t ORDER BY id", &[], None)
             .unwrap(),
         before
+    );
+}
+
+#[test]
+fn reversed_update_comparisons_honor_declared_types() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,s TEXT)", &[], None)
+        .unwrap();
+    session
+        .execute("INSERT INTO t VALUES(1,'one'),(2,'two')", &[], None)
+        .unwrap();
+    let prepared = session
+        .prepare("UPDATE t SET s='r' WHERE $1=id")
+        .unwrap()
+        .with_parameter_types(&[Some(DataType::BigInt)])
+        .unwrap();
+    assert_eq!(
+        session.describe(&prepared).unwrap().parameters,
+        vec![DataType::BigInt]
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&prepared, &[Value::Int(3_000_000_000)], None)
+            .unwrap()
+            .affected,
+        0
+    );
+    assert_eq!(
+        session
+            .execute_prepared(&prepared, &[Value::Int(1)], None)
+            .unwrap()
+            .affected,
+        1
+    );
+    assert_eq!(
+        session
+            .execute("SELECT s FROM t WHERE id=1", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("r".into())]
+    );
+    for sql in [
+        "UPDATE t SET s='bad' WHERE $1=id",
+        "UPDATE t SET s='bad' WHERE id=$1",
+    ] {
+        let prepared = session
+            .prepare(sql)
+            .unwrap()
+            .with_parameter_types(&[Some(DataType::Bytes)])
+            .unwrap();
+        assert!(
+            matches!(
+                session.describe(&prepared),
+                Err(CoreError::Sql(SqlError::UndefinedFunction))
+            ),
+            "describe {sql}"
+        );
+        assert!(
+            matches!(
+                session.execute_prepared(&prepared, &[Value::Bytes(vec![1])], None),
+                Err(CoreError::Sql(SqlError::UndefinedFunction))
+            ),
+            "execute {sql}"
+        );
+    }
+    assert_eq!(
+        session
+            .execute("SELECT s FROM t WHERE id=1", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Value::Text("r".into())]
+    );
+}
+
+#[test]
+fn integer_literal_comparisons_do_not_narrow_to_column_ranges() {
+    let admin = Admin::create(fresh(), Limits::default()).unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE t(id INT PRIMARY KEY,b SMALLINT,s TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO t VALUES(1,1,'one'),(2,2,'two'),(3,3,'three')",
+            &[],
+            None,
+        )
+        .unwrap();
+    for sql in [
+        "UPDATE t SET s='bad' WHERE id=3000000000",
+        "UPDATE t SET s='bad' WHERE id=3000000000 RETURNING id",
+    ] {
+        let result = session.execute(sql, &[], None).unwrap();
+        assert_eq!(result.affected, 0, "{sql}");
+        assert!(result.rows.is_empty(), "{sql}");
+    }
+    assert!(
+        session
+            .execute("SELECT * FROM t WHERE id=3000000000", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    for (sql, expected) in [
+        ("SELECT count(*) FROM t WHERE id<3000000000", 3),
+        ("SELECT count(*) FROM t WHERE b=40000", 0),
+        ("SELECT count(*) FROM t WHERE id>3000000000", 0),
+        ("SELECT count(*) FROM t WHERE id<>3000000000", 3),
+    ] {
+        assert_eq!(
+            session.execute(sql, &[], None).unwrap().rows[0].values,
+            vec![Value::Int(expected)],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        session
+            .execute("SELECT s FROM t ORDER BY id", &[], None)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("one".into())],
+            vec![Value::Text("two".into())],
+            vec![Value::Text("three".into())]
+        ]
     );
 }

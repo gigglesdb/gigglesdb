@@ -55,15 +55,15 @@ pub(super) fn indexes(
     Ok(indexes)
 }
 
-fn plain_value(
+pub(super) fn plain_value(
     value: &Expr,
     column: &ColumnDef,
-    prepared: &Prepared,
+    declared_types: &[Option<DataType>],
     params: &[super::Value],
 ) -> R<super::Value> {
     let mut bound = value.value(params)?;
     if let Expr::Param(n) = value
-        && let Some(Some(declared)) = prepared.parameter_types.get(n - 1)
+        && let Some(Some(declared)) = declared_types.get(n - 1)
     {
         check(
             &bound,
@@ -207,7 +207,12 @@ impl<'a> Plan<'a> {
                     {
                         return Err(SqlError::Unsupported);
                     }
-                    let value = plain_value(value, &table.columns[index], prepared, params)?;
+                    let value = plain_value(
+                        value,
+                        &table.columns[index],
+                        &prepared.parameter_types,
+                        params,
+                    )?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
@@ -246,7 +251,12 @@ impl<'a> Plan<'a> {
                         clock.cloned(),
                     ),
                     Value::Plain(value) => {
-                        let value = plain_value(value, &table.columns[index], prepared, params)?;
+                        let value = plain_value(
+                            value,
+                            &table.columns[index],
+                            &prepared.parameter_types,
+                            params,
+                        )?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(
