@@ -7,6 +7,7 @@ pub(crate) fn value_bytes(value: &Value) -> Result<usize> {
     let extra = match value {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
+        Value::Numeric(v) => v.to_string().len(),
         Value::Array(values) | Value::Record(values) => {
             values.iter().try_fold(0usize, |sum, v| {
                 sum.checked_add(value_bytes(v)?).ok_or("54000")
@@ -64,6 +65,15 @@ pub(crate) fn snapshot(
                             C::BigInt => P::BigInt,
                             C::Text => P::Text,
                             C::Bytes => P::Bytes,
+                            C::Numeric => P::Numeric,
+                            C::Real => P::Real,
+                            C::DoublePrecision => P::DoublePrecision,
+                            C::Date => P::Date,
+                            C::Time => P::Time,
+                            C::TimeTz => P::TimeTz,
+                            C::Timestamp => P::Timestamp,
+                            C::TimestampTz => P::TimestampTz,
+                            C::Interval => P::Interval,
                         },
                     })
                     .collect(),
@@ -94,6 +104,9 @@ pub(crate) fn parameter_type(oid: u32) -> Result<PgType> {
         23 => PgType::Int4,
         25 | 1043 => PgType::Text,
         26 => PgType::Oid,
+        1700 => PgType::Numeric,
+        700 => PgType::Float4,
+        701 => PgType::Float8,
         1005 => PgType::Int2Array,
         1007 => PgType::Int4Array,
         1016 => PgType::Int8Array,
@@ -180,6 +193,9 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         PgType::Int8 => T::BigInt,
         PgType::Text | PgType::Name | PgType::Char => T::Text,
         PgType::Bytea => T::Bytes,
+        PgType::Numeric => T::Numeric,
+        PgType::Float4 => T::Real,
+        PgType::Float8 => T::DoublePrecision,
         _ => return Err("0A000"),
     };
     if (ty == PgType::Char && (bytes.len() > 1 || (format == 1 && bytes.is_empty())))
@@ -196,6 +212,15 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         V::Int(v) => Value::Int(v),
         V::Text(v) => Value::Text(v),
         V::Bytes(v) => Value::Bytes(v),
+        V::Numeric(v) => Value::Numeric(v),
+        V::Float4(v) => Value::Float4(v),
+        V::Float8(v) => Value::Float8(v),
+        V::Date(_)
+        | V::Time(_)
+        | V::TimeTz(_)
+        | V::Timestamp(_)
+        | V::TimestampTz(_)
+        | V::Interval(_) => return Err("0A000"),
     })
 }
 
@@ -231,6 +256,14 @@ pub(crate) fn description(fields: &[Field], formats: &[u16], out: &mut Vec<u8>) 
 }
 
 pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Vec<u8>>> {
+    encode_with_extra(value, ty, format, 0)
+}
+fn encode_with_extra(
+    value: &Value,
+    ty: PgType,
+    format: u16,
+    extra: i32,
+) -> Result<Option<Vec<u8>>> {
     if format > 1 {
         return Err("08P01");
     }
@@ -238,6 +271,31 @@ pub(crate) fn encode(value: &Value, ty: PgType, format: u16) -> Result<Option<Ve
         return Ok(None);
     }
     let bytes = match (value, ty) {
+        (Value::Numeric(v), PgType::Numeric) => {
+            if format == 1 {
+                v.to_binary()
+            } else {
+                v.to_string().into_bytes()
+            }
+        }
+        (Value::Float4(v), PgType::Float4) => {
+            if format == 1 {
+                v.to_binary().to_vec()
+            } else {
+                v.to_text_with_extra_float_digits(extra)
+                    .map_err(|_| "22003")?
+                    .into_bytes()
+            }
+        }
+        (Value::Float8(v), PgType::Float8) => {
+            if format == 1 {
+                v.to_binary().to_vec()
+            } else {
+                v.to_text_with_extra_float_digits(extra)
+                    .map_err(|_| "22003")?
+                    .into_bytes()
+            }
+        }
         (Value::Bool(v), PgType::Bool) => {
             if format == 0 {
                 if *v { b"t".to_vec() } else { b"f".to_vec() }
@@ -429,6 +487,7 @@ pub(crate) fn retained_bytes(result: &ResultSet) -> Result<usize> {
 }
 
 pub(crate) fn rows(
+    extra: i32,
     result: &ResultSet,
     formats: &[u16],
     start: usize,
@@ -442,7 +501,7 @@ pub(crate) fn rows(
         }
         let mut bytes = (row.len() as u16).to_be_bytes().to_vec();
         for (i, (value, field)) in row.iter().zip(&result.fields).enumerate() {
-            match encode(value, field.data_type, pgwire::format_at(formats, i))? {
+            match encode_with_extra(value, field.data_type, pgwire::format_at(formats, i), extra)? {
                 None => bytes.extend((-1i32).to_be_bytes()),
                 Some(value) => {
                     bytes.extend((value.len() as i32).to_be_bytes());

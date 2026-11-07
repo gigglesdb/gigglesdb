@@ -5,7 +5,9 @@
 use super::*;
 use crate::local::{AdminCommand, Reply};
 
+pub mod application;
 pub mod protected;
+mod projected_admission;
 
 /// Opaque, validated canonical kernel image; not an export that revokes authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -14,12 +16,23 @@ pub struct Image(Vec<u8>);
 // Image derives Deserialize for existing integrations, so every decoding entry
 // must check namespace support even when callers bypass Image::from_bytes.
 fn replica_state(bytes: &[u8]) -> Result<State, CoreError> {
+    replica_state_with_cancel(bytes, &mut || crate::cancellation::check().is_err())
+}
+// Shares the complete bounded canonical decoder; never resets or reads ambient
+// cancellation on behalf of trusted pure projection callers.
+fn replica_state_with_cancel(
+    bytes: &[u8],
+    cancel: &mut impl FnMut() -> bool,
+) -> Result<State, CoreError> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(CoreError::Limit);
     }
-    let state = from_records(decode(bytes)?)?;
-    if state.native_outcomes.is_some() {
+    let state = from_records_with_cancel(decode(bytes)?, cancel)?;
+    if state.native_outcomes.is_some() || state.sql.has_secondary_indexes_engine() {
         return Err(CoreError::Unsupported);
+    }
+    if encode(&records(&state)?)? != bytes {
+        return Err(CoreError::Corrupt("noncanonical image".into()));
     }
     Ok(state)
 }
@@ -60,10 +73,17 @@ pub enum Command {
         upper: u64,
         action: TaskAction,
     },
+    /// Internal application intent; claims alone confer no authority.
+    Application(application::Command),
+    /// Trusted owner input only. Never expose through a remote dispatch path.
+    ApplicationOwner(application::OwnerCommand),
 }
 impl Command {
     /// Validate the closed command grammar before it can enter a durable log.
     pub fn validate(&self) -> Result<(), CoreError> {
+        if let Self::Application(command) = self {
+            command.validate()?;
+        }
         if let Self::Admin(input) = self {
             if input.len() > local::MAX_INPUT {
                 return Err(CoreError::Limit);
@@ -129,6 +149,23 @@ impl Image {
     /// The Admin handle is constructed and destroyed here; it never escapes.
     pub fn evaluate(&self, command: &Command) -> Result<(Self, Reply), CoreError> {
         command.validate()?;
+        if let Command::Application(application) = command {
+            return match self.evaluate_application(application)? {
+                Ok((image, outcome)) => {
+                    Ok((image, Reply::ok(serde_json::to_value(outcome).map_err(io)?)))
+                }
+                Err(error) => Ok((
+                    self.clone(),
+                    Reply::ok(serde_json::to_value(error).map_err(io)?),
+                )),
+            };
+        }
+        if let Command::ApplicationOwner(owner) = command {
+            return Ok((
+                self.evaluate_application_owner(owner)?,
+                Reply::ok(serde_json::json!({"authorized": true})),
+            ));
+        }
         self.with_admin(|a| self.evaluate_admin(a, command))
     }
     // Share the real storage/Executor path with trusted protected staging.
@@ -158,6 +195,9 @@ impl Image {
     }
     fn evaluate_admin(&self, a: &Admin, command: &Command) -> Result<Reply, CoreError> {
         let reply = match command {
+            Command::Application(_) | Command::ApplicationOwner(_) => {
+                return Err(CoreError::Unsupported);
+            }
             Command::ValidateRelease {
                 task,
                 principal,

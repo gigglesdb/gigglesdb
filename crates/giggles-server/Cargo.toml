@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-pg-catalog = { path = "../giggles-pg-catalog" }
 giggles-core = { path = "../giggles-core" }
 tokio = { version = "1", features = ["full"] }

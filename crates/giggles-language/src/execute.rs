@@ -94,6 +94,7 @@ impl Engine {
         self.execute(&parse_with_version(text, self.version)?, bindings)
     }
     pub fn execute(&self, stmt: &Statement, bindings: &Bindings) -> Result<Outcome> {
+        validate_numeric_bindings(bindings)?;
         let request = lower_checked(stmt, self.version)?;
         self.inner
             .execute(&request, bindings)
@@ -114,6 +115,7 @@ impl Engine {
     /// require preparing another handle. The existing [`Engine::execute`] API
     /// continues binding and executing in a single transaction.
     pub fn prepare_bound(&self, stmt: &Statement, bindings: &Bindings) -> Result<BoundOperation> {
+        validate_numeric_bindings(bindings)?;
         let request = lower_checked(stmt, self.version)?;
         let inner = self
             .inner
@@ -158,6 +160,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
+        validate_numeric_bindings(bindings)?;
         let transaction = lower_transaction_checked(transaction, self.version)?;
         self.inner
             .execute_transaction(&transaction, bindings)
@@ -178,6 +181,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<BoundTransaction> {
+        validate_numeric_bindings(bindings)?;
         let transaction = lower_transaction_checked(transaction, self.version)?;
         Ok(BoundTransaction {
             inner: self
@@ -390,6 +394,39 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize) -> Result<()> {
         pending.extend(values.iter().map(|(_, expr)| (expr, 0)));
     }
     let stmt = parts.statement;
+    // Check typed values at their AST locations, never by serialized key names.
+    // Exhaustive matching makes new statement variants require an admission review.
+    match stmt {
+        Statement::Insert { values, .. } | Statement::Update { values, .. } => {
+            for (_, value) in values {
+                validate_native_value(value)?;
+            }
+            if let Statement::Update {
+                intent: Intent::Many { cap },
+                ..
+            } = stmt
+            {
+                validate_native_value(cap)?;
+            }
+        }
+        Statement::Read { limit, .. } | Statement::ReadExpressions { limit, .. } => {
+            if let Some(value) = limit {
+                validate_native_value(value)?;
+            }
+        }
+        Statement::Delete { cap, .. } => {
+            if let Some(value) = cap {
+                validate_native_value(value)?;
+            }
+        }
+        Statement::UpdateExpressions {
+            intent: Intent::Many { cap },
+            ..
+        }
+        | Statement::InsertMany { cap, .. } => validate_native_value(cap)?,
+        Statement::UpdateExpressions { .. } | Statement::InsertExpressions { .. } => (),
+        Statement::Returning { .. } | Statement::OnConflict { .. } => unreachable!(),
+    }
     match stmt {
         Statement::Read {
             filter: Some(e), ..
@@ -482,6 +519,7 @@ fn validate_nodes(mut pending: Vec<(&Expr, usize)>, nodes: &mut usize) -> Result
             return Err(Error::Limit);
         }
         match e {
+            Expr::Value(value) => validate_native_value(value)?,
             Expr::Compare(a, _, b)
             | Expr::And(a, b)
             | Expr::Or(a, b)
@@ -510,7 +548,7 @@ fn validate_nodes(mut pending: Vec<(&Expr, usize)>, nodes: &mut usize) -> Result
                 }
                 pending.extend(else_expr.iter().map(|expr| (expr.as_ref(), d + 1)));
             }
-            _ => (),
+            Expr::Field(_) | Expr::Local(_) | Expr::ConflictField { .. } => (),
         }
     }
     Ok(())
@@ -664,6 +702,25 @@ pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
     serde_json::to_writer(Budget(MAX_INPUT), stmt).map_err(|_| Error::Limit)
 }
 
+fn validate_native_value(value: &ValueExpr) -> Result<()> {
+    match value {
+        ValueExpr::Parameter(_) => Ok(()),
+        ValueExpr::Literal(value) => match value {
+            Value::Numeric(_)
+            | Value::Float4(_)
+            | Value::Float8(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::TimeTz(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval(_) => Err(Error::Unsupported),
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Text(_) | Value::Bytes(_) => {
+                Ok(())
+            }
+        },
+    }
+}
 fn identifier(name: &str, version: LanguageVersion) -> Result<String> {
     if parser::semantic_identifier(name, version) {
         Ok(name.to_owned())
@@ -1152,5 +1209,52 @@ pub(crate) fn error(error: operations::Error) -> Error {
         operations::Error::RequirementFailed => Error::RequirementFailed,
         operations::Error::DuplicateTarget => Error::DuplicateTarget,
         operations::Error::PlanRequired => Error::PlanRequired,
+    }
+}
+
+pub(crate) fn validate_numeric_bindings(bindings: &Bindings) -> Result<()> {
+    for v in bindings.values() {
+        match v {
+            Value::Numeric(_)
+            | Value::Float4(_)
+            | Value::Float8(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::TimeTz(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval(_) => {
+                return Err(Error::Unsupported);
+            }
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Text(_) | Value::Bytes(_) => (),
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod numeric_profile_tests {
+    use super::*;
+    #[test]
+    fn old_profiles_reject_new_inputs_but_transport_is_lossless() {
+        use giggles_core::relational::{Float4, Float8, Numeric};
+        let values = [
+            Value::Numeric(Numeric::parse("9007199254740993.00100").unwrap()),
+            Value::Float4(Float4::from_bits(0x7fc01234)),
+            Value::Float8(Float8::from_bits(0x8000000000000000)),
+        ];
+        for v in values {
+            assert!(matches!(
+                validate_numeric_bindings(&Bindings::from([("x".into(), v.clone())])),
+                Err(Error::Unsupported)
+            ));
+            assert!(matches!(
+                validate_native_value(&ValueExpr::Literal(v.clone())),
+                Err(Error::Unsupported)
+            ));
+            let bytes = serde_json::to_vec(&v).unwrap();
+            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        }
+        assert!(validate_size(&ValueExpr::Literal(Value::Text("Numeric".into()))).is_ok());
     }
 }

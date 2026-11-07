@@ -167,6 +167,51 @@ fn escape(text: &str) -> String {
 }
 fn cell(value: &Value) -> String {
     match value {
+        Value::Date(v) => format!(
+            "Date(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::Time(v) => format!(
+            "Time(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::TimeTz(v) => format!(
+            "TimeTz(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::Timestamp(v) => format!(
+            "Timestamp(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::TimestampTz(v) => format!(
+            "TimestampTz(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::Interval(v) => format!(
+            "Interval(pg={})",
+            v.to_binary()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        Value::Numeric(v) => format!("NUMERIC({v})"),
+        Value::Float4(v) => format!("REAL(bits={:08x})", v.to_bits()),
+        Value::Float8(v) => format!("DOUBLE PRECISION(bits={:016x})", v.to_bits()),
         Value::Null => "NULL".into(),
         Value::Bool(v) => v.to_string(),
         Value::Int(v) => v.to_string(),
@@ -180,6 +225,31 @@ fn cell(value: &Value) -> String {
             s
         }
     }
+}
+
+#[test]
+fn numeric_display_preserves_scale_signed_zero_and_nan_payload() {
+    use giggles_core::relational::{Float4, Float8, Numeric};
+    assert_eq!(
+        cell(&Value::Numeric(Numeric::parse("1.00100").unwrap())),
+        "NUMERIC(1.00100)"
+    );
+    assert_eq!(
+        cell(&Value::Float4(Float4::from_bits(0x80000000))),
+        "REAL(bits=80000000)"
+    );
+    assert_eq!(
+        cell(&Value::Float4(Float4::from_bits(0x7fc01234))),
+        "REAL(bits=7fc01234)"
+    );
+    assert_eq!(
+        cell(&Value::Float8(Float8::from_bits(0x8000000000000000))),
+        "DOUBLE PRECISION(bits=8000000000000000)"
+    );
+    assert_eq!(
+        cell(&Value::Float8(Float8::from_bits(0x7ff8000000001234))),
+        "DOUBLE PRECISION(bits=7ff8000000001234)"
+    );
 }
 /// Render one result; JSON envelopes retain native types and row versions.
 pub fn render_result(result: &SqlResult, mode: OutputMode) -> String {

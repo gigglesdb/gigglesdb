@@ -1,7 +1,24 @@
 //! Bounded trusted relational subset. This module grants no task authority.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+mod numeric;
+mod projector_inspection;
+pub(crate) mod projector_reconstruction;
 mod query;
+// Candidate codec/read APIs await later internal release.
+#[allow(dead_code)]
+pub(crate) mod secondary_index;
+pub(crate) mod secondary_index_access;
+mod secondary_index_adapter;
+pub(crate) use secondary_index_adapter::BatchRowChange;
+mod secondary_index_catalog;
+mod secondary_index_unique_readiness;
+pub(crate) mod secondary_unique_lookup;
+pub(crate) use giggles_pg_types::temporal::Time;
+pub use giggles_pg_types::temporal::{
+    Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
+};
+pub use giggles_pg_types::{Float4, Float8, Numeric};
 
 pub const MAX_SQL: usize = 64 * 1024;
 pub const MAX_ROWS: usize = 1024;
@@ -68,7 +85,14 @@ pub(crate) fn value_bytes(v: &Value) -> usize {
     match v {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
-        _ => 9,
+        Value::Numeric(n) => n.to_string().len(),
+        Value::Float4(_) => 4,
+        Value::Float8(_) => 8,
+        Value::Date(_) => 4,
+        Value::Time(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
+        Value::TimeTz(_) => 12,
+        Value::Interval(_) => 16,
+        Value::Null | Value::Bool(_) | Value::Int(_) => 9,
     }
 }
 fn payload_bound<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
@@ -101,6 +125,18 @@ pub enum SqlError {
     Transaction,
     Aborted,
     Overflow,
+    UndefinedFunction,
+    InvalidParameterValue,
+    InvalidDatetimeFormat,
+    DatetimeFieldOverflow,
+    IntervalFieldOverflow,
+    AmbiguousFunction,
+    GroupingError,
+    IndeterminateDatatype,
+    AmbiguousParameter,
+    InvalidTextRepresentation,
+    SubstringError,
+    CharacterNotInRepertoire,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +146,15 @@ pub enum Value {
     Int(i64),
     Text(String),
     Bytes(Vec<u8>),
+    Numeric(#[serde(with = "crate::pg_serde::numeric")] Numeric),
+    Float4(#[serde(with = "crate::pg_serde::real")] Float4),
+    Float8(#[serde(with = "crate::pg_serde::double")] Float8),
+    Date(#[serde(with = "crate::pg_serde::date")] Date),
+    Time(#[serde(with = "crate::pg_serde::time")] Time),
+    TimeTz(#[serde(with = "crate::pg_serde::timetz")] TimeTz),
+    Timestamp(#[serde(with = "crate::pg_serde::timestamp")] Timestamp),
+    TimestampTz(#[serde(with = "crate::pg_serde::timestamptz")] TimestampTz),
+    Interval(#[serde(with = "crate::pg_serde::interval")] Interval),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -119,6 +164,15 @@ pub enum DataType {
     BigInt,
     Text,
     Bytes,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDef {
@@ -145,7 +199,7 @@ pub struct SqlResult {
     pub rows: Vec<SqlRow>,
     pub affected: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct Relational {
     format: u32,
     pub generation: u64,
@@ -154,6 +208,8 @@ pub(crate) struct Relational {
     next_version: u64,
     pub tables: BTreeMap<String, TableDef>,
     rows: BTreeMap<u64, BTreeMap<Vec<u8>, SqlRow>>,
+    #[serde(skip, default)]
+    secondary: secondary_index::Sidecar,
 }
 impl Default for Relational {
     fn default() -> Self {
@@ -165,6 +221,7 @@ impl Default for Relational {
             next_version: 1,
             tables: BTreeMap::new(),
             rows: BTreeMap::new(),
+            secondary: secondary_index::Sidecar::default(),
         }
     }
 }
@@ -214,7 +271,16 @@ fn check(v: &Value, c: &ColumnDef) -> R<()> {
         };
     }
     let yes = match (&c.data_type, v) {
-        (DataType::Boolean, Value::Bool(_))
+        (DataType::Date, Value::Date(_))
+        | (DataType::Time, Value::Time(_))
+        | (DataType::TimeTz, Value::TimeTz(_))
+        | (DataType::Timestamp, Value::Timestamp(_))
+        | (DataType::TimestampTz, Value::TimestampTz(_))
+        | (DataType::Interval, Value::Interval(_))
+        | (DataType::Numeric, Value::Numeric(_))
+        | (DataType::Real, Value::Float4(_))
+        | (DataType::DoublePrecision, Value::Float8(_))
+        | (DataType::Boolean, Value::Bool(_))
         | (DataType::BigInt, Value::Int(_))
         | (DataType::Text, Value::Text(_))
         | (DataType::Bytes, Value::Bytes(_)) => true,
@@ -231,13 +297,7 @@ fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     let mut size = 0usize;
     for (v, c) in values.iter().zip(&t.columns) {
         check(v, c)?;
-        size = size
-            .checked_add(match v {
-                Value::Text(s) => s.len(),
-                Value::Bytes(b) => b.len(),
-                _ => 9,
-            })
-            .ok_or(SqlError::Limit)?;
+        size = size.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
     }
     if size > MAX_ROW_BYTES {
         return Err(SqlError::Limit);
@@ -253,6 +313,24 @@ pub fn encode_key(values: &[Value]) -> R<Vec<u8>> {
     let mut out = Vec::new();
     for v in values {
         match v {
+            Value::Date(_)
+            | Value::Time(_)
+            | Value::TimeTz(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval(_) => return Err(SqlError::Unsupported),
+            Value::Numeric(n) => {
+                out.push(5);
+                numeric::key(n, &mut out);
+            }
+            Value::Float4(n) => {
+                out.push(6);
+                out.extend(numeric::float_key(n.value() as f64).to_be_bytes());
+            }
+            Value::Float8(n) => {
+                out.push(7);
+                out.extend(numeric::float_key(n.value()).to_be_bytes());
+            }
             Value::Null => out.push(0),
             Value::Bool(b) => {
                 out.push(1);
@@ -299,6 +377,7 @@ fn pk(t: &TableDef, v: &[Value]) -> R<Vec<u8>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     Word(String),
+    QuotedIdent(String),
     String(String),
     Number(String),
     Param(usize),
@@ -343,6 +422,35 @@ fn lex(s: &str) -> R<Vec<Token>> {
             out.push(Token::String(
                 String::from_utf8(v).map_err(|_| SqlError::Syntax)?,
             ));
+        } else if c == b'"' {
+            i += 1;
+            let mut v = Vec::new();
+            let mut closed = false;
+            while i < b.len() {
+                if b[i] == 0 {
+                    return Err(SqlError::Syntax);
+                }
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        v.push(b'"');
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    v.push(b[i]);
+                    i += 1;
+                }
+            }
+            // Input, decoded allocation, total scan work and token count retain SQL bounds.
+            if !closed || v.is_empty() {
+                return Err(SqlError::Syntax);
+            }
+            out.push(Token::QuotedIdent(
+                String::from_utf8(v).map_err(|_| SqlError::Syntax)?,
+            ));
         } else if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
             i += 1;
@@ -356,6 +464,21 @@ fn lex(s: &str) -> R<Vec<Token>> {
             i += 1;
             while i < b.len() && b[i].is_ascii_digit() {
                 i += 1;
+            }
+            if b.get(i) == Some(&b'.') {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            if b.get(i).is_some_and(|c| *c == b'e' || *c == b'E') {
+                i += 1;
+                if b.get(i).is_some_and(|c| *c == b'+' || *c == b'-') {
+                    i += 1;
+                }
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
             out.push(Token::Number(s[start..i].into()));
         } else if c == b'$' {
@@ -371,7 +494,7 @@ fn lex(s: &str) -> R<Vec<Token>> {
                 return Err(SqlError::Parameters);
             }
             out.push(Token::Param(n));
-        } else if b"(),*;.".contains(&c) {
+        } else if b"(),*;.:".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
         } else if b"=<>".contains(&c) {
@@ -417,6 +540,7 @@ enum Statement {
         columns: Vec<ColumnDef>,
         keys: Vec<String>,
     },
+    InsertExpressions(query::InsertExpressions),
     Insert {
         name: String,
         columns: Vec<String>,
@@ -497,7 +621,10 @@ impl Parser {
                 Expr::Param(n)
             }
             Token::String(s) => Expr::Literal(Value::Text(s)),
-            Token::Number(n) => Expr::Literal(Value::Int(n.parse().map_err(|_| SqlError::Type)?)),
+            Token::Number(n) => Expr::Literal(match n.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => Value::Numeric(Numeric::parse(&n).map_err(|_| SqlError::Type)?),
+            }),
             Token::Word(s) if s == "true" || s == "false" => {
                 Expr::Literal(Value::Bool(s == "true"))
             }
@@ -560,6 +687,27 @@ impl Parser {
                         DataType::Integer
                     } else if self.word("bigint") {
                         DataType::BigInt
+                    } else if self.word("numeric") || self.word("decimal") {
+                        DataType::Numeric
+                    } else if self.word("real") || self.word("float4") {
+                        DataType::Real
+                    } else if self.word("double") {
+                        self.need("precision")?;
+                        DataType::DoublePrecision
+                    } else if self.word("float8") {
+                        DataType::DoublePrecision
+                    } else if self.word("date") {
+                        DataType::Date
+                    } else if self.word("time") {
+                        DataType::Time
+                    } else if self.word("timetz") {
+                        DataType::TimeTz
+                    } else if self.word("timestamp") {
+                        DataType::Timestamp
+                    } else if self.word("timestamptz") {
+                        DataType::TimestampTz
+                    } else if self.word("interval") {
+                        DataType::Interval
                     } else if self.word("text") {
                         DataType::Text
                     } else if self.word("bytea") || self.word("bytes") {
@@ -748,6 +896,12 @@ pub(crate) fn validate_create_definition(
     }
     for key in keys {
         ident(key)?;
+        if columns
+            .iter()
+            .any(|column| column.name == *key && column.data_type.is_temporal())
+        {
+            return Err(SqlError::Unsupported);
+        }
         if !columns.iter().any(|column| column.name == *key) {
             return Err(SqlError::UnknownColumn);
         }
@@ -852,6 +1006,7 @@ impl Prepared {
         domain: u128,
         state: &Relational,
     ) -> R<Self> {
+        Relational::secondary_admit_values(values.iter())?;
         Self::engine_table(table, state)?;
         row_check(table, &values)?;
         Ok(Self::engine(
@@ -881,6 +1036,7 @@ impl Prepared {
         if key.len() != table.primary_key.len() {
             return Err(SqlError::Unbounded);
         }
+        Relational::secondary_admit_values(key.iter().chain(sets.iter().map(|(_, value)| value)))?;
         payload_bound(key.iter().chain(sets.iter().map(|(_, value)| value)))?;
         let predicates = Self::engine_key(table, key)?;
         unique(sets.iter().map(|(index, _)| index))?;
@@ -922,9 +1078,24 @@ impl Prepared {
             state.epoch,
         ))
     }
+    pub(crate) fn validate_immutable_constants(&self, state: &Relational) -> R<()> {
+        if self.epoch != state.epoch {
+            return Err(SqlError::StaleSchema);
+        }
+        if let Statement::InsertExpressions(values) = &self.statement {
+            return values.validate_constants(state, self.params);
+        }
+        if let Statement::Query(q) = &self.statement {
+            return q.bind(state, self.params)?.validate_immutable_constants();
+        }
+        Ok(())
+    }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
+        }
+        if let Statement::InsertExpressions(values) = &self.statement {
+            return values.describe(state, self.params);
         }
         if let Statement::Query(q) = &self.statement {
             return q.bind(state, self.params).map(|b| b.description());
@@ -1014,7 +1185,14 @@ impl Prepared {
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
-            Statement::Query(q) => Some(q.target()),
+            Statement::Query(q) => {
+                if q.is_table_free() {
+                    None
+                } else {
+                    Some(q.target())
+                }
+            }
+            Statement::InsertExpressions(values) => Some(&values.name),
             Statement::Create { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
@@ -1036,7 +1214,7 @@ impl Prepared {
                 }
             }
             Statement::Create { .. } => "CREATE TABLE",
-            Statement::Insert { .. } => "INSERT",
+            Statement::Insert { .. } | Statement::InsertExpressions(_) => "INSERT",
             Statement::Select { .. } => "SELECT",
             Statement::Update { .. } => "UPDATE",
             Statement::Delete { .. } => "DELETE",
@@ -1119,6 +1297,11 @@ impl Prepared {
         // Try the established grammar first, including identifiers named min/count.
         let statement = match p.parse() {
             Ok(statement) => statement,
+            Err(_) if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "insert") => {
+                p.at = 0;
+                p.params.clear();
+                Statement::InsertExpressions(query::InsertExpressions::parse(&mut p)?)
+            }
             Err(error) => {
                 if !matches!(p.tokens.first(), Some(Token::Word(w)) if w == "select" || w == "explain")
                 {
@@ -1272,7 +1455,54 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         point: false,
     })
 }
+impl DataType {
+    pub fn is_temporal(&self) -> bool {
+        matches!(
+            self,
+            Self::Date
+                | Self::Time
+                | Self::TimeTz
+                | Self::Timestamp
+                | Self::TimestampTz
+                | Self::Interval
+        )
+    }
+}
+impl Value {
+    pub fn is_temporal(&self) -> bool {
+        matches!(
+            self,
+            Self::Date(_)
+                | Self::Time(_)
+                | Self::TimeTz(_)
+                | Self::Timestamp(_)
+                | Self::TimestampTz(_)
+                | Self::Interval(_)
+        )
+    }
+}
 impl Relational {
+    pub(crate) fn contains_temporal(&self) -> bool {
+        self.tables
+            .values()
+            .any(|t| t.columns.iter().any(|c| c.data_type.is_temporal()))
+            || self
+                .rows
+                .values()
+                .flat_map(|r| r.values())
+                .any(|r| r.values.iter().any(Value::is_temporal))
+    }
+    pub(crate) fn contains_typed(&self) -> bool {
+        self.tables.values().any(|t| {
+            t.columns.iter().any(|c| {
+                matches!(
+                    c.data_type,
+                    DataType::Numeric | DataType::Real | DataType::DoublePrecision
+                )
+            })
+        })
+    }
+
     /// Check all relation row maps without scanning or cloning their values.
     pub(crate) fn rows_empty_engine(&self) -> bool {
         self.rows.values().all(BTreeMap::is_empty)
@@ -1339,6 +1569,9 @@ impl Relational {
                 }
             }
         }
+        if self.has_secondary_indexes_engine() {
+            self.secondary_validate_engine(|| crate::cancellation::check().is_err())?;
+        }
         Ok(())
     }
     pub(crate) fn execute(
@@ -1347,22 +1580,100 @@ impl Relational {
         params: &[Value],
         expected: Option<u64>,
     ) -> R<SqlResult> {
+        self.execute_with_cancel(prepared, params, expected, || {
+            crate::cancellation::check().is_err()
+        })
+    }
+    pub(crate) fn execute_with_cancel(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        mut cancel: impl FnMut() -> bool,
+    ) -> R<SqlResult> {
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
         if params.len() != prepared.params || params.len() > MAX_PARAMS {
             return Err(SqlError::Parameters);
         }
+        if matches!(
+            prepared.statement,
+            Statement::Insert { .. }
+                | Statement::InsertExpressions(_)
+                | Statement::Update { .. }
+                | Statement::Delete { .. }
+        ) {
+            self.secondary_admit_mutation(&mut cancel)?;
+        }
+        if matches!(
+            prepared.statement,
+            Statement::Insert { .. }
+                | Statement::InsertExpressions(_)
+                | Statement::Update { .. }
+                | Statement::Delete { .. }
+        ) {
+            let mut source_values = Vec::new();
+            match &prepared.statement {
+                Statement::Insert { values, .. } => {
+                    for e in values {
+                        if let Expr::Literal(v) = e {
+                            source_values.push(v);
+                        }
+                    }
+                }
+                Statement::Update { sets, .. } => {
+                    for (_, e) in sets {
+                        if let Expr::Literal(v) = e {
+                            source_values.push(v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Self::secondary_admit_values(params.iter())?;
+            Self::secondary_admit_values(source_values.iter().copied())?;
+            payload_bound(source_values.into_iter())?;
+            if let Statement::InsertExpressions(values) = &prepared.statement {
+                values.admit_literals()?;
+            }
+        }
         // Bound parameters even if a statement affects no rows.
         payload_bound(params.iter())?;
+        // Normalize expression outputs after mutation input admission.
+        let normalized;
+        let prepared = if let Statement::InsertExpressions(values) = &prepared.statement {
+            if expected.is_some() {
+                return Err(SqlError::Unsupported);
+            }
+            if cancel() {
+                return Err(SqlError::Aborted);
+            }
+            let output = values.evaluate(self, prepared.params, params, &mut cancel)?;
+            normalized = Prepared {
+                domain: prepared.domain,
+                epoch: prepared.epoch,
+                transaction: prepared.transaction,
+                params: prepared.params,
+                statement: Statement::Insert {
+                    name: values.name.clone(),
+                    columns: values.columns.clone(),
+                    values: output,
+                },
+            };
+            &normalized
+        } else {
+            prepared
+        };
         let mut result = SqlResult::default();
         match &prepared.statement {
             Statement::Query(q) => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                return q.bind(self, prepared.params)?.execute(self, params);
+                return q.bind(self, prepared.params)?.execute(self, params, &mut cancel);
             }
+            Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
             Statement::Create {
                 name,
                 columns,
@@ -1381,8 +1692,9 @@ impl Relational {
                     return Err(SqlError::Limit);
                 }
                 validate_create_definition(name, columns, keys)?;
+                let mut next_id = self.next_id;
                 let mut t = TableDef {
-                    id: allocate(&mut self.next_id)?,
+                    id: allocate(&mut next_id)?,
                     name: name.clone(),
                     columns: columns.clone(),
                     primary_key: vec![],
@@ -1393,9 +1705,11 @@ impl Relational {
                     t.columns[i].not_null = true;
                 }
                 for c in &mut t.columns {
-                    c.id = allocate(&mut self.next_id)?;
+                    c.id = allocate(&mut next_id)?;
                 }
-                self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                let epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                self.next_id = next_id;
+                self.epoch = epoch;
                 self.rows.insert(t.id, BTreeMap::new());
                 self.tables.insert(name.clone(), t);
             }
@@ -1419,23 +1733,38 @@ impl Relational {
                 }
                 let mut row = vec![Value::Null; t.columns.len()];
                 for (i, v) in indexes.iter().zip(values) {
-                    row[*i] = v.value(params)?;
+                    row[*i] = if matches!(v, Expr::Literal(_))
+                        && matches!(
+                            t.columns[*i].data_type,
+                            DataType::Numeric | DataType::Real | DataType::DoublePrecision
+                        )
+                        || matches!(v, Expr::Literal(_)) && t.columns[*i].data_type.is_temporal()
+                    {
+                        query::coerce(v.value(params)?, &t.columns[*i].data_type)?
+                    } else {
+                        v.value(params)?
+                    };
                 }
                 row_check(t, &row)?;
                 let key = pk(t, &row)?;
-                let rows = self.rows.get_mut(&t.id).ok_or(SqlError::UnknownTable)?;
+                let table_id = t.id;
+                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
                 if rows.contains_key(&key) {
                     return Err(SqlError::Duplicate);
                 }
-                let version = allocate(&mut self.next_version)?;
-                rows.insert(
-                    key,
-                    SqlRow {
-                        values: row,
-                        version,
-                    },
-                );
-                result.affected = 1;
+                let mut next_version = self.next_version;
+                let version = allocate(&mut next_version)?;
+                let row = SqlRow {
+                    values: row,
+                    version,
+                };
+                result = self.secondary_apply_statement(
+                    table_id,
+                    None,
+                    Some((&key, &row)),
+                    next_version,
+                    &mut cancel,
+                )?;
             }
             Statement::Select {
                 name,
@@ -1546,20 +1875,40 @@ impl Relational {
                     })
                     .collect::<R<Vec<_>>>()?;
                 unique(indexes.iter().map(|(i, _)| i))?;
-                let rows = self.rows.get_mut(&t.id).ok_or(SqlError::UnknownTable)?;
-                let row = rows.get_mut(&b.low);
+                let table_id = t.id;
+                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
+                let old = rows.get(&b.low);
                 if let Some(want) = expected
-                    && row.as_ref().is_none_or(|r| r.version != want)
+                    && old.is_none_or(|r| r.version != want)
                 {
                     return Err(SqlError::Version);
                 }
-                if let Some(row) = row {
+                if let Some(old) = old {
+                    let mut row = old.clone();
                     for (i, v) in indexes {
                         row.values[i] = v;
                     }
                     row_check(t, &row.values)?;
-                    row.version = allocate(&mut self.next_version)?;
-                    result.affected = 1;
+                    let mut next_version = self.next_version;
+                    row.version = allocate(&mut next_version)?;
+                    // Witness cloning is admitted by secondary_admit_mutation before
+                    // expression/row construction; stage checks its exact raw value.
+                    let old = old.clone();
+                    result = self.secondary_apply_statement(
+                        table_id,
+                        Some((&b.low, &old)),
+                        Some((&b.low, &row)),
+                        next_version,
+                        &mut cancel,
+                    )?;
+                } else {
+                    result = self.secondary_apply_statement(
+                        table_id,
+                        None,
+                        None,
+                        self.next_version,
+                        &mut cancel,
+                    )?;
                 }
             }
             Statement::Delete { name, predicates } => {
@@ -1568,13 +1917,22 @@ impl Relational {
                 if !b.point {
                     return Err(SqlError::Unbounded);
                 }
-                let rows = self.rows.get_mut(&t.id).ok_or(SqlError::UnknownTable)?;
+                let table_id = t.id;
+                let rows = self.rows.get(&table_id).ok_or(SqlError::UnknownTable)?;
+                let old = rows.get(&b.low);
                 if let Some(want) = expected
-                    && rows.get(&b.low).is_none_or(|r| r.version != want)
+                    && old.is_none_or(|r| r.version != want)
                 {
                     return Err(SqlError::Version);
                 }
-                result.affected = u64::from(rows.remove(&b.low).is_some());
+                let old = old.cloned();
+                result = self.secondary_apply_statement(
+                    table_id,
+                    old.as_ref().map(|r| (b.low.as_slice(), r)),
+                    None,
+                    self.next_version,
+                    &mut cancel,
+                )?;
             }
             _ => return Err(SqlError::Transaction),
         }

@@ -1,6 +1,10 @@
 //! Private syntax, binding and bounded physical execution. No persisted types.
 use super::*;
 use std::cmp::Ordering;
+mod functions;
+mod insert_values;
+use functions::{BoundScalar, Scalar};
+pub(super) use insert_values::InsertExpressions;
 
 const MAX_WORK: usize = 4096;
 const MAX_SOURCES: usize = 8;
@@ -24,8 +28,8 @@ enum Aggregate {
 }
 #[derive(Debug, Clone)]
 enum Item {
-    Column(ColumnRef),
-    Aggregate(Aggregate, Option<ColumnRef>),
+    Aggregate(Aggregate, Option<Scalar>),
+    Scalar(Scalar),
     Star,
 }
 #[derive(Debug, Clone)]
@@ -40,8 +44,296 @@ pub(super) struct Query {
     joins: Vec<Join>,
     items: Vec<(Item, Option<String>)>,
     predicates: Vec<(ColumnRef, String, Expr)>,
-    order: Vec<(ColumnRef, bool)>,
+    filter: Option<Filter>,
+    order: Vec<(Scalar, bool, bool)>,
     limit: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+enum Filter {
+    Scalar(Scalar),
+    Compare(Scalar, String, Scalar),
+    Null(Scalar, bool),
+    Not(Box<Filter>),
+    Logic(Box<Filter>, bool, Box<Filter>),
+}
+enum BoundFilter {
+    Scalar(BoundScalar),
+    Compare(BoundScalar, String, BoundScalar),
+    Null(BoundScalar, bool),
+    Not(Box<BoundFilter>),
+    Logic(Box<BoundFilter>, bool, Box<BoundFilter>),
+}
+impl Filter {
+    fn parse(p: &mut Parser, precedence: usize, depth: usize) -> R<Self> {
+        if depth > 32 {
+            return Err(SqlError::Limit);
+        }
+        let mut f = if p.word("not") {
+            Self::Not(Box::new(Self::parse(p, 3, depth + 1)?))
+        } else {
+            // Parenthesized scalar operands and boolean groups share a prefix.
+            let start = p.at;
+            let params = p.params.clone();
+            let scalar = Scalar::parse(p, depth);
+            match scalar {
+                Ok(a) => {
+                    if p.word("is") {
+                        let not = p.word("not");
+                        p.need("null")?;
+                        Self::Null(a, not)
+                    } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
+                        if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
+                            return Err(SqlError::Unsupported);
+                        }
+                        p.at += 1;
+                        Self::Compare(a, op, Scalar::parse(p, depth + 1)?)
+                    } else {
+                        Self::Scalar(a)
+                    }
+                }
+                Err(e) => {
+                    p.at = start;
+                    p.params = params;
+                    if !p.sym('(') {
+                        return Err(e);
+                    }
+                    let f = Self::parse(p, 0, depth + 1)?;
+                    p.punct(')')?;
+                    f
+                }
+            }
+        };
+        loop {
+            let and = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "and");
+            let or = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "or");
+            let level = if and {
+                2
+            } else if or {
+                1
+            } else {
+                break;
+            };
+            if level <= precedence {
+                break;
+            }
+            p.at += 1;
+            f = Self::Logic(
+                Box::new(f),
+                and,
+                Box::new(Self::parse(p, level, depth + 1)?),
+            );
+        }
+        Ok(f)
+    }
+    fn bounds(&self, out: &mut Vec<(ColumnRef, String, Expr)>) {
+        match self {
+            Self::Logic(a, true, b) => {
+                a.bounds(out);
+                b.bounds(out);
+            }
+            Self::Compare(Scalar::Column(c), op, b)
+                if ["=", "<", "<=", ">", ">="].contains(&op.as_str()) =>
+            {
+                let e = match b {
+                    Scalar::Param(n) => Expr::Param(*n),
+                    Scalar::Literal(v) => Expr::Literal(v.clone()),
+                    _ => return,
+                };
+                out.push((c.clone(), op.clone(), e));
+            }
+            _ => {}
+        }
+    }
+    fn infer(
+        &self,
+        params: &mut [Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<()> {
+        match self {
+            Self::Scalar(a) => a.infer(Some(&DataType::Boolean), params, resolve, tables),
+            Self::Null(a, _) => a.infer(None, params, resolve, tables),
+            Self::Compare(a, _, b) => {
+                a.infer(None, params, resolve, tables)?;
+                b.infer(None, params, resolve, tables)?;
+                if let Ok(bound) = a.bind(resolve, tables, params)
+                    && !matches!(b, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
+                {
+                    b.infer(Some(&bound.ty), params, resolve, tables)?;
+                }
+                if let Ok(bound) = b.bind(resolve, tables, params)
+                    && !matches!(a, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
+                {
+                    a.infer(Some(&bound.ty), params, resolve, tables)?;
+                }
+                Ok(())
+            }
+            Self::Not(a) => a.infer(params, resolve, tables),
+            Self::Logic(a, _, b) => {
+                a.infer(params, resolve, tables)?;
+                b.infer(params, resolve, tables)
+            }
+        }
+    }
+    fn bind(
+        &self,
+        params: &[Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<BoundFilter> {
+        let bind = |a: &Scalar| a.bind(resolve, tables, params);
+        Ok(match self {
+            Self::Scalar(a) => {
+                let a = if matches!(a, Scalar::Literal(Value::Null)) {
+                    bind(&Scalar::Cast(Box::new(a.clone()), DataType::Boolean))?
+                } else {
+                    bind(a)?
+                };
+                if a.ty != DataType::Boolean {
+                    return Err(SqlError::Type);
+                }
+                BoundFilter::Scalar(a)
+            }
+            Self::Null(a, n) => BoundFilter::Null(bind(a)?, *n),
+            Self::Compare(a, op, b) => {
+                let mut av = bind(a)?;
+                let mut bv = bind(b)?;
+                let unknown =
+                    |a: &Scalar| matches!(a, Scalar::Literal(Value::Null | Value::Text(_)));
+                if av.ty != bv.ty {
+                    if unknown(a) {
+                        av = bind(&Scalar::Cast(Box::new(a.clone()), bv.ty.clone()))?;
+                    } else if unknown(b) {
+                        bv = bind(&Scalar::Cast(Box::new(b.clone()), av.ty.clone()))?;
+                    } else if matches!(
+                        av.ty,
+                        DataType::SmallInt | DataType::Integer | DataType::BigInt
+                    ) && matches!(
+                        bv.ty,
+                        DataType::SmallInt | DataType::Integer | DataType::BigInt
+                    ) {
+                    } else if let Some(ty) = functions::comparison_type(&av.ty, &bv.ty) {
+                        // Rebind syntax, never clone authority-bearing bound nodes.
+                        if av.ty != ty {
+                            av = bind(&Scalar::Cast(Box::new(a.clone()), ty.clone()))?;
+                        }
+                        if bv.ty != ty {
+                            bv = bind(&Scalar::Cast(Box::new(b.clone()), ty))?;
+                        }
+                    } else {
+                        return Err(SqlError::Type);
+                    }
+                }
+                BoundFilter::Compare(av, op.clone(), bv)
+            }
+            Self::Not(a) => BoundFilter::Not(Box::new(a.bind(params, resolve, tables)?)),
+            Self::Logic(a, and, b) => BoundFilter::Logic(
+                Box::new(a.bind(params, resolve, tables)?),
+                *and,
+                Box::new(b.bind(params, resolve, tables)?),
+            ),
+        })
+    }
+}
+impl BoundFilter {
+    /// Immutable planning only: outer None is dependent; inner None is SQL NULL.
+    fn plan_constant(&self, budget: &mut usize) -> R<Option<Option<bool>>> {
+        let boolean = |value| match value {
+            Value::Bool(v) => Ok(Some(v)),
+            Value::Null => Ok(None),
+            _ => Err(SqlError::Type),
+        };
+        match self {
+            Self::Scalar(a) => a.plan_constant(budget)?.map(boolean).transpose(),
+            Self::Null(a, not) => Ok(a
+                .plan_constant(budget)?
+                .map(|v| Some((v == Value::Null) != *not))),
+            Self::Compare(a, op, b) => {
+                let a = a.plan_constant(budget)?;
+                let b = b.plan_constant(budget)?;
+                Ok(match (a, b) {
+                    (Some(Value::Null), Some(_)) | (Some(_), Some(Value::Null)) => Some(None),
+                    (Some(a), Some(b)) => {
+                        let c = cmp(&a, &b);
+                        Some(Some(match op.as_str() {
+                            "=" => c == Ordering::Equal,
+                            "<>" | "!=" => c != Ordering::Equal,
+                            "<" => c == Ordering::Less,
+                            "<=" => c != Ordering::Greater,
+                            ">" => c == Ordering::Greater,
+                            ">=" => c != Ordering::Less,
+                            _ => unreachable!(),
+                        }))
+                    }
+                    _ => None,
+                })
+            }
+            Self::Not(a) => Ok(a.plan_constant(budget)?.map(|a| a.map(|v| !v))),
+            Self::Logic(a, and, b) => {
+                let a = a.plan_constant(budget)?;
+                if a == Some(Some(!*and)) {
+                    return Ok(a);
+                }
+                let b = b.plan_constant(budget)?;
+                if b == Some(Some(!*and)) {
+                    return Ok(b);
+                }
+                Ok(match (a, b) {
+                    (Some(a), Some(b)) => Some(if a.is_none() || b.is_none() {
+                        None
+                    } else {
+                        Some(*and)
+                    }),
+                    _ => None,
+                })
+            }
+        }
+    }
+    fn eval(&self, row: &Tuple, params: &[Value], bytes: &mut usize) -> R<Option<bool>> {
+        Ok(match self {
+            Self::Scalar(a) => match a.eval(row, params, bytes)? {
+                Value::Bool(b) => Some(b),
+                Value::Null => None,
+                _ => return Err(SqlError::Type),
+            },
+            Self::Null(a, n) => Some((a.eval(row, params, bytes)? == Value::Null) != *n),
+            Self::Compare(a, op, b) => {
+                let a = a.eval(row, params, bytes)?;
+                let b = b.eval(row, params, bytes)?;
+                if a == Value::Null || b == Value::Null {
+                    None
+                } else {
+                    let c = cmp(&a, &b);
+                    Some(match op.as_str() {
+                        "=" => c == Ordering::Equal,
+                        "<>" | "!=" => c != Ordering::Equal,
+                        "<" => c == Ordering::Less,
+                        "<=" => c != Ordering::Greater,
+                        ">" => c == Ordering::Greater,
+                        ">=" => c != Ordering::Less,
+                        _ => unreachable!(),
+                    })
+                }
+            }
+            Self::Not(a) => a.eval(row, params, bytes)?.map(|b| !b),
+            Self::Logic(a, and, b) => {
+                let a = a.eval(row, params, bytes)?;
+                if a == Some(!*and) {
+                    a
+                } else {
+                    let b = b.eval(row, params, bytes)?;
+                    if b == Some(!*and) {
+                        b
+                    } else if a.is_none() || b.is_none() {
+                        None
+                    } else {
+                        Some(*and)
+                    }
+                }
+            }
+        })
+    }
 }
 
 impl Parser {
@@ -76,6 +368,12 @@ impl Query {
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         let explain = p.word("explain");
         p.need("select")?;
+        // Subqueries remain outside this bounded relational grammar.
+        if p.tokens[p.at..].windows(2).any(
+            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
+        ) {
+            return Err(SqlError::Unsupported);
+        }
         let mut items = Vec::new();
         loop {
             let item = if p.sym('*') {
@@ -102,12 +400,12 @@ impl Query {
                         }
                         None
                     } else {
-                        Some(p.column_ref()?)
+                        Some(Scalar::parse_aggregate_argument(p, 0)?)
                     };
                     p.punct(')')?;
                     Item::Aggregate(a, c)
                 } else {
-                    Item::Column(p.column_ref()?)
+                    Item::Scalar(Scalar::parse(p, 0)?)
                 }
             };
             let alias = if p.word("as") { Some(p.name()?) } else { None };
@@ -119,8 +417,10 @@ impl Query {
                 break;
             }
         }
-        p.need("from")?;
-        let mut sources = vec![p.source()?];
+        let mut sources = vec![];
+        if p.word("from") {
+            sources.push(p.source()?);
+        }
         let mut joins = vec![];
         loop {
             let left = if p.word("left") {
@@ -156,33 +456,38 @@ impl Query {
             }
             joins.push(Join { left, equalities });
         }
+        let filter = if p.word("where") {
+            Some(Filter::parse(p, 0, 0)?)
+        } else {
+            None
+        };
         let mut predicates = vec![];
-        if p.word("where") {
-            loop {
-                let c = p.column_ref()?;
-                let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() else {
-                    return Err(SqlError::Syntax);
-                };
-                p.at += 1;
-                if !["=", "<", "<=", ">", ">="].contains(&op.as_str()) {
-                    return Err(SqlError::Unsupported);
-                }
-                predicates.push((c, op, p.expr()?));
-                if !p.word("and") {
-                    break;
-                }
-            }
+        if let Some(f) = &filter {
+            f.bounds(&mut predicates);
         }
         let mut order = vec![];
         if p.word("order") {
             p.need("by")?;
             loop {
-                let c = p.column_ref()?;
+                let c = Scalar::parse(p, 0)?;
                 let desc = p.word("desc");
                 if !desc {
                     p.word("asc");
                 }
-                order.push((c, desc));
+                let nulls_first = if p.word("nulls") {
+                    if p.word("first") {
+                        true
+                    } else {
+                        p.need("last")?;
+                        false
+                    }
+                } else {
+                    desc
+                };
+                order.push((c, desc, nulls_first));
+                if order.len() > MAX_COLUMNS {
+                    return Err(SqlError::Limit);
+                }
                 if !p.sym(',') {
                     break;
                 }
@@ -203,12 +508,172 @@ impl Query {
             joins,
             items,
             predicates,
+            filter,
             order,
             limit,
         })
     }
+    /// Positive proof for the current bounded AST. Unknown calls keep a target.
+    /// No stored functions, subqueries or CTEs are admitted by this proof.
+    pub(super) fn is_table_free(&self) -> bool {
+        fn scalar(s: &Scalar) -> bool {
+            match s {
+                Scalar::Literal(_) | Scalar::Param(_) => true,
+                Scalar::Column(_) => false,
+                Scalar::Cast(s, _) => scalar(s),
+                Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
+                Scalar::Call(name, args) => {
+                    matches!(
+                        name.as_str(),
+                        "abs"
+                            | "coalesce"
+                            | "pi"
+                            | "lower"
+                            | "upper"
+                            | "md5"
+                            | "overlay"
+                            | "ascii"
+                            | "chr"
+                            | "initcap"
+                            | "quote_ident"
+                            | "quote_literal"
+                            | "quote_nullable"
+                            | "to_hex"
+                            | "to_bin"
+                            | "to_oct"
+                            | "length"
+                            | "char_length"
+                            | "character_length"
+                            | "octet_length"
+                            | "bit_length"
+                            | "reverse"
+                            | "starts_with"
+                            | "strpos"
+                            | "position"
+                            | "repeat"
+                            | "left"
+                            | "right"
+                            | "replace"
+                            | "translate"
+                            | "lpad"
+                            | "rpad"
+                            | "btrim"
+                            | "ltrim"
+                            | "rtrim"
+                            | "split_part"
+                            | "concat"
+                            | "concat_ws"
+                            | "substring"
+                            | "substr"
+                            | "encode"
+                            | "decode"
+                            | "get_byte"
+                            | "get_bit"
+                            | "set_byte"
+                            | "set_bit"
+                            | "sha224"
+                            | "sha256"
+                            | "sha384"
+                            | "sha512"
+                            | "ceil"
+                            | "ceiling"
+                            | "floor"
+                            | "round"
+                            | "trunc"
+                            | "sign"
+                            | "sqrt"
+                            | "exp"
+                            | "ln"
+                            | "log"
+                            | "log10"
+                            | "power"
+                            | "scale"
+                            | "min_scale"
+                            | "trim_scale"
+                            | "factorial"
+                            | "div"
+                            | "mod"
+                            | "gcd"
+                            | "lcm"
+                            | "cbrt"
+                            | "radians"
+                            | "degrees"
+                            | "sin"
+                            | "cos"
+                            | "tan"
+                            | "cot"
+                            | "asin"
+                            | "acos"
+                            | "atan"
+                            | "atan2"
+                            | "sind"
+                            | "cosd"
+                            | "tand"
+                            | "cotd"
+                            | "asind"
+                            | "acosd"
+                            | "atand"
+                            | "atan2d"
+                            | "sinh"
+                            | "cosh"
+                            | "tanh"
+                            | "asinh"
+                            | "acosh"
+                            | "atanh"
+                            | "date_part"
+                            | "extract"
+                            | "isfinite"
+                            | "date_trunc"
+                            | "date_bin"
+                            | "age"
+                            | "timezone"
+                            | "make_date"
+                            | "make_time"
+                            | "make_timestamp"
+                            | "make_timestamptz"
+                            | "make_interval"
+                            | "justify_days"
+                            | "justify_hours"
+                            | "justify_interval"
+                    ) && args.iter().all(scalar)
+                }
+            }
+        }
+        fn filter(f: &Filter) -> bool {
+            match f {
+                Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
+                Filter::Compare(a, _, b) => scalar(a) && scalar(b),
+                Filter::Not(f) => filter(f),
+                Filter::Logic(a, _, b) => filter(a) && filter(b),
+            }
+        }
+        // Exhaustive destructuring forces review when dependency-bearing AST changes.
+        let Self {
+            explain,
+            sources,
+            joins,
+            items,
+            predicates,
+            filter: predicate,
+            order,
+            limit,
+        } = self;
+        !explain
+            && sources.is_empty()
+            && joins.is_empty()
+            && predicates.is_empty()
+            && items.iter().all(|(item, _)| match item {
+                Item::Scalar(s) => scalar(s),
+                Item::Aggregate(_, _) | Item::Star => false,
+            })
+            && predicate.as_ref().is_none_or(filter)
+            && order.iter().all(|(s, _, _)| scalar(s))
+            && limit.as_ref().is_none_or(|e| match e {
+                Expr::Literal(_) | Expr::Param(_) => true,
+            })
+    }
     pub(super) fn target(&self) -> &str {
-        if self.sources.iter().all(|s| s.name == self.sources[0].name) {
+        if !self.sources.is_empty() && self.sources.iter().all(|s| s.name == self.sources[0].name) {
             &self.sources[0].name
         } else {
             // Existing table-limited gateways must not authorize only the first source.
@@ -276,6 +741,99 @@ impl Query {
             });
         }
         let mut items = vec![];
+        let mut parameters = vec![None; count];
+        let mut unresolved_count_parameters = Vec::new();
+        for (item, _) in &self.items {
+            match item {
+                Item::Scalar(e) => e.infer(None, &mut parameters, &resolve, &tables)?,
+                Item::Aggregate(a, Some(e)) => {
+                    e.reject_nested_aggregate()?;
+                    if matches!(a, Aggregate::Count)
+                        && let Scalar::Param(n) = e
+                        && parameters.get(n - 1).is_none_or(Option::is_none)
+                    {
+                        unresolved_count_parameters.push(*n);
+                    }
+                    if matches!(a, Aggregate::Sum) && e.aggregate_unknown(&parameters) {
+                        return Err(SqlError::AmbiguousFunction);
+                    }
+                    let expected = if matches!(a, Aggregate::Min | Aggregate::Max)
+                        && e.aggregate_unknown(&parameters)
+                    {
+                        Some(&DataType::Text)
+                    } else {
+                        None
+                    };
+                    e.infer(expected, &mut parameters, &resolve, &tables)?;
+                }
+                _ => {}
+            }
+        }
+        if let Some(f) = &self.filter {
+            f.infer(&mut parameters, &resolve, &tables)?;
+        }
+        for (e, _, _) in &self.order {
+            e.infer(None, &mut parameters, &resolve, &tables)?;
+        }
+        let mut bind_expr = |e: &Expr, ty: &DataType| -> R<bool> {
+            if let Expr::Param(n) = e {
+                let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                if let Some(old) = slot.as_ref().filter(|old| *old != ty) {
+                    if functions::comparison_type(old, ty).is_some() {
+                        // Mixed numeric comparisons run in the full filter. A
+                        // converted column key can round and miss matching rows.
+                        return Ok(false);
+                    }
+                    return Err(SqlError::Type);
+                }
+                *slot = Some(ty.clone());
+            } else if let Expr::Literal(v) = e {
+                check(
+                    v,
+                    &ColumnDef {
+                        id: 0,
+                        name: String::new(),
+                        data_type: ty.clone(),
+                        not_null: false,
+                    },
+                )?;
+            }
+            Ok(true)
+        };
+        let mut predicates = vec![];
+        for (c, op, e) in &self.predicates {
+            let c = resolve(c, tables.len())?;
+            if bind_expr(e, &tables[c.source].columns[c.column].data_type)? {
+                predicates.push((c, op.as_str(), e));
+            }
+        }
+        if let Some(e) = &self.limit {
+            // LIMIT accepts the integer widths by implicit widening. Keep an
+            // input type already fixed by the SELECT list.
+            if let Expr::Param(n) = e {
+                let ty = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                match ty {
+                    Some(
+                        DataType::SmallInt
+                        | DataType::Integer
+                        | DataType::BigInt
+                        | DataType::Numeric
+                        | DataType::Real
+                        | DataType::DoublePrecision,
+                    ) => {}
+                    None => *ty = Some(DataType::BigInt),
+                    _ => return Err(SqlError::Type),
+                }
+            } else {
+                bind_expr(e, &DataType::BigInt)?;
+            }
+        }
+        if unresolved_count_parameters
+            .iter()
+            .any(|n| parameters.get(n - 1).is_some_and(Option::is_some))
+        {
+            return Err(SqlError::AmbiguousParameter);
+        }
         let mut columns = vec![];
         let mut aliases = BTreeSet::new();
         for (item, alias) in &self.items {
@@ -292,26 +850,71 @@ impl Query {
                 columns.push(column);
             };
             match item {
-                Item::Column(c) => {
-                    let c = resolve(c, tables.len())?;
-                    let mut d = tables[c.source].columns[c.column].clone();
-                    if c.source > 0 && self.joins[c.source - 1].left {
-                        d.not_null = false;
-                    }
-                    push(BoundItem::Column(c), d);
+                Item::Scalar(e) => {
+                    let e = e.bind(&resolve, &tables, &parameters)?;
+                    let d = if let Item::Scalar(Scalar::Column(c)) = item {
+                        let c = resolve(c, tables.len())?;
+                        let mut d = tables[c.source].columns[c.column].clone();
+                        if c.source > 0 && self.joins[c.source - 1].left {
+                            d.not_null = false;
+                        }
+                        d
+                    } else {
+                        ColumnDef {
+                            id: 0,
+                            name: e.name().into(),
+                            data_type: e.ty.clone(),
+                            not_null: false,
+                        }
+                    };
+                    push(BoundItem::Scalar(e), d);
                 }
                 Item::Aggregate(a, c) => {
-                    let c = c.as_ref().map(|c| resolve(c, tables.len())).transpose()?;
-                    let ty = c.map(|c| tables[c.source].columns[c.column].data_type.clone());
+                    if matches!(a, Aggregate::Count)
+                        && let Some(Scalar::Param(n)) = c
+                        && parameters.get(n - 1).is_none_or(Option::is_none)
+                    {
+                        return Err(SqlError::IndeterminateDatatype);
+                    }
+                    let legacy_column = matches!(c, Some(Scalar::Column(_)));
+                    let c = c
+                        .as_ref()
+                        .map(|e| e.bind(&resolve, &tables, &parameters))
+                        .transpose()?;
+                    let ty = c.as_ref().map(|e| e.ty.clone());
                     if matches!(a, Aggregate::Sum)
                         && !matches!(
                             ty,
-                            Some(DataType::SmallInt | DataType::Integer | DataType::BigInt)
+                            Some(
+                                DataType::SmallInt
+                                    | DataType::Integer
+                                    | DataType::BigInt
+                                    | DataType::Numeric
+                                    | DataType::Real
+                                    | DataType::DoublePrecision
+                            )
                         )
                     {
-                        return Err(SqlError::Type);
+                        return Err(if legacy_column {
+                            SqlError::Type
+                        } else {
+                            SqlError::UndefinedFunction
+                        });
                     }
-                    let data_type = if matches!(a, Aggregate::Count | Aggregate::Sum) {
+                    if !legacy_column
+                        && matches!(a, Aggregate::Min | Aggregate::Max)
+                        && matches!(ty, Some(DataType::Boolean | DataType::Bytes))
+                    {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    let data_type = if matches!(a, Aggregate::Sum) {
+                        match ty {
+                            Some(DataType::BigInt | DataType::Numeric) => DataType::Numeric,
+                            Some(DataType::Real) => DataType::Real,
+                            Some(DataType::DoublePrecision) => DataType::DoublePrecision,
+                            _ => DataType::BigInt,
+                        }
+                    } else if matches!(a, Aggregate::Count) {
                         DataType::BigInt
                     } else {
                         ty.ok_or(SqlError::Type)?
@@ -333,6 +936,9 @@ impl Query {
                     );
                 }
                 Item::Star => {
+                    if tables.is_empty() {
+                        return Err(SqlError::Unsupported);
+                    }
                     if alias.is_some() {
                         return Err(SqlError::Unsupported);
                     }
@@ -353,48 +959,24 @@ impl Query {
         }
         let aggregate = items.iter().any(|i| matches!(i, BoundItem::Aggregate(..)));
         if aggregate
-            && (items.iter().any(|i| matches!(i, BoundItem::Column(_))) || !self.order.is_empty())
+            && (items.iter().any(|i| !matches!(i, BoundItem::Aggregate(..)))
+                || !self.order.is_empty())
         {
             return Err(SqlError::Unsupported);
         }
-        let mut parameters = vec![None; count];
-        let mut bind_expr = |e: &Expr, ty: &DataType| -> R<()> {
-            if let Expr::Param(n) = e {
-                let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
-                if slot.as_ref().is_some_and(|old| old != ty) {
-                    return Err(SqlError::Type);
-                }
-                *slot = Some(ty.clone());
-            } else if let Expr::Literal(v) = e {
-                check(
-                    v,
-                    &ColumnDef {
-                        id: 0,
-                        name: String::new(),
-                        data_type: ty.clone(),
-                        not_null: false,
-                    },
-                )?;
-            }
-            Ok(())
-        };
-        let mut predicates = vec![];
-        for (c, op, e) in &self.predicates {
-            let c = resolve(c, tables.len())?;
-            bind_expr(e, &tables[c.source].columns[c.column].data_type)?;
-            predicates.push((c, op.as_str(), e));
-        }
-        if let Some(e) = &self.limit {
-            bind_expr(e, &DataType::BigInt)?;
-        }
-        let parameters = parameters
-            .into_iter()
-            .map(|p| p.ok_or(SqlError::Parameters))
-            .collect::<R<Vec<_>>>()?;
+        let filter = self
+            .filter
+            .as_ref()
+            .map(|f| f.bind(&parameters, &resolve, &tables))
+            .transpose()?;
         let order = self
             .order
             .iter()
-            .map(|(c, d)| Ok((resolve(c, tables.len())?, *d)))
+            .map(|(e, d, n)| Ok((e.bind(&resolve, &tables, &parameters)?, *d, *n)))
+            .collect::<R<Vec<_>>>()?;
+        let parameters = parameters
+            .into_iter()
+            .map(|p| p.ok_or(SqlError::Parameters))
             .collect::<R<Vec<_>>>()?;
         Ok(BoundQuery {
             query: self,
@@ -404,6 +986,7 @@ impl Query {
             columns,
             parameters,
             predicates,
+            filter,
             order,
             aggregate,
         })
@@ -416,8 +999,9 @@ struct BoundColumn {
     column: usize,
 }
 enum BoundItem {
+    Scalar(BoundScalar),
     Column(BoundColumn),
-    Aggregate(Aggregate, Option<BoundColumn>),
+    Aggregate(Aggregate, Option<BoundScalar>),
 }
 struct BoundJoin {
     left: bool,
@@ -432,7 +1016,8 @@ pub(super) struct BoundQuery<'a> {
     columns: Vec<ColumnDef>,
     parameters: Vec<DataType>,
     predicates: Vec<(BoundColumn, &'a str, &'a Expr)>,
-    order: Vec<(BoundColumn, bool)>,
+    filter: Option<BoundFilter>,
+    order: Vec<(BoundScalar, bool, bool)>,
     aggregate: bool,
 }
 struct Tuple {
@@ -449,10 +1034,20 @@ fn cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
+        (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
+        (Value::Float4(a), Value::Float4(b)) => a.cmp(b),
+        (Value::Float8(a), Value::Float8(b)) => a.cmp(b),
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::TimeTz(a), Value::TimeTz(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
+        (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+
         _ => unreachable!("binder enforces scalar types"),
     }
 }
@@ -485,6 +1080,29 @@ fn fits(rows: &[Tuple]) -> R<()> {
     Ok(())
 }
 impl BoundQuery<'_> {
+    pub(super) fn validate_immutable_constants(&self) -> R<()> {
+        let mut budget = 0;
+        for item in &self.items {
+            match item {
+                BoundItem::Scalar(value) => {
+                    value.plan_constant(&mut budget)?;
+                }
+                BoundItem::Aggregate(_, Some(value)) if self.parameters.is_empty() => {
+                    value.plan_constant(&mut budget)?;
+                }
+                _ => {}
+            }
+        }
+        for (value, _, _) in &self.order {
+            value.plan_constant(&mut budget)?;
+        }
+        if self.parameters.is_empty()
+            && let Some(filter) = &self.filter
+        {
+            filter.plan_constant(&mut budget)?;
+        }
+        Ok(())
+    }
     pub(super) fn description(&self) -> Description {
         Description {
             parameters: self.parameters.clone(),
@@ -500,7 +1118,15 @@ impl BoundQuery<'_> {
             },
         }
     }
-    pub(super) fn execute(&self, state: &Relational, params: &[Value]) -> R<SqlResult> {
+    pub(super) fn execute(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<SqlResult> {
+        if self.aggregate && cancel() {
+            return Err(SqlError::Aborted);
+        }
         for (v, ty) in params.iter().zip(&self.parameters) {
             check(
                 v,
@@ -519,6 +1145,46 @@ impl BoundQuery<'_> {
             },
             None => MAX_ROWS,
         };
+        if self.tables.is_empty() {
+            if self.aggregate || self.query.explain {
+                return Err(SqlError::Unsupported);
+            }
+            let mut result = SqlResult {
+                columns: self.columns.iter().map(|c| c.name.clone()).collect(),
+                rows: vec![],
+                affected: 0,
+            };
+            if limit != 0 {
+                let row = Tuple {
+                    values: vec![],
+                    version: 0,
+                };
+                let mut work = 0;
+                if let Some(f) = &self.filter
+                    && f.eval(&row, params, &mut work)? != Some(true)
+                {
+                    return Ok(result);
+                }
+                for (e, _, _) in &self.order {
+                    e.eval(&row, params, &mut work)?;
+                }
+                let mut output = 0;
+                let values = self
+                    .items
+                    .iter()
+                    .map(|i| match i {
+                        BoundItem::Scalar(e) => {
+                            let v = e.eval(&row, params, &mut work)?;
+                            charge(&mut output, &v)?;
+                            Ok(v)
+                        }
+                        _ => Err(SqlError::Unsupported),
+                    })
+                    .collect::<R<Vec<_>>>()?;
+                result.rows.push(SqlRow { values, version: 0 });
+            }
+            return Ok(result);
+        }
         let empty_input = self
             .predicates
             .iter()
@@ -631,48 +1297,74 @@ impl BoundQuery<'_> {
             }
             rows = next;
         }
-        let predicates = self
-            .predicates
-            .iter()
-            .map(|(c, op, e)| Ok((*c, *op, e.value(params)?)))
-            .collect::<R<Vec<_>>>()?;
-        rows.retain(|r| {
-            predicates.iter().all(|(c, op, v)| {
-                let a = r.get(*c);
-                if *a == Value::Null || *v == Value::Null {
-                    return false;
-                }
-                let ord = cmp(a, v);
-                match *op {
-                    "=" => ord == Ordering::Equal,
-                    "<" => ord == Ordering::Less,
-                    "<=" => ord != Ordering::Greater,
-                    ">" => ord == Ordering::Greater,
-                    ">=" => ord != Ordering::Less,
-                    _ => false,
-                }
-            })
-        });
-        rows.sort_by(|a, b| {
-            for (c, desc) in &self.order {
-                let ord = cmp(a.get(*c), b.get(*c));
+        let mut filtered = vec![];
+        let mut filter_work = 0;
+        for row in rows {
+            if match &self.filter {
+                Some(f) => f.eval(&row, params, &mut filter_work)? == Some(true),
+                None => true,
+            } {
+                filtered.push(row);
+            }
+        }
+        let rows = filtered;
+        // Evaluate each key exactly once, before entering the infallible comparator.
+        // Charge retained keys separately from evaluator temporary allocations.
+        let mut key_bytes = 0;
+        let mut key_work = 0;
+        let mut keyed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut keys = Vec::with_capacity(self.order.len());
+            for (e, _, _) in &self.order {
+                let value = e.eval(&row, params, &mut key_work)?;
+                charge(&mut key_bytes, &value)?;
+                keys.push(value);
+            }
+            keyed.push((row, keys));
+        }
+        keyed.sort_by(|(_, a), (_, b)| {
+            for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
+                let ord = match (a, b) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => {
+                        if *first {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (_, Value::Null) => {
+                        if *first {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    _ => {
+                        let ord = cmp(a, b);
+                        if *desc { ord.reverse() } else { ord }
+                    }
+                };
                 if ord != Ordering::Equal {
-                    return if *desc { ord.reverse() } else { ord };
+                    return ord;
                 }
             }
             Ordering::Equal
         });
+        let rows = keyed.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
         let mut result = SqlResult {
             columns: self.columns.iter().map(|c| c.name.clone()).collect(),
             rows: vec![],
             affected: 0,
         };
         let mut result_bytes = 0usize;
+        let mut scalar_work_bytes = 0usize;
         if self.aggregate {
             let values = self
                 .items
                 .iter()
-                .map(|item| {
+                .enumerate()
+                .map(|(index, item)| {
                     let BoundItem::Aggregate(a, c) = item else {
                         unreachable!()
                     };
@@ -682,7 +1374,14 @@ impl BoundQuery<'_> {
                         Value::Null
                     };
                     for row in &rows {
-                        let v = c.map(|c| row.get(c));
+                        if cancel() {
+                            return Err(SqlError::Aborted);
+                        }
+                        let evaluated = c
+                            .as_ref()
+                            .map(|e| e.eval(row, params, &mut scalar_work_bytes))
+                            .transpose()?;
+                        let v = evaluated.as_ref();
                         if v == Some(&Value::Null) {
                             continue;
                         }
@@ -693,14 +1392,71 @@ impl BoundQuery<'_> {
                                 }
                             }
                             Aggregate::Sum => {
-                                let Some(Value::Int(n)) = v else {
-                                    return Err(SqlError::Type);
+                                let v = v.ok_or(SqlError::Type)?;
+                                value = match self.columns[index].data_type {
+                                    DataType::Numeric => functions::aggregate_numeric_add(
+                                        value,
+                                        evaluated.ok_or(SqlError::Type)?,
+                                        &mut scalar_work_bytes,
+                                    )?,
+                                    DataType::Real => {
+                                        let Value::Float4(n) = v else {
+                                            return Err(SqlError::Type);
+                                        };
+                                        let sum = if let Value::Float4(old) = value {
+                                            let sum = old.value() + n.value();
+                                            if sum.is_infinite()
+                                                && old.value().is_finite()
+                                                && n.value().is_finite()
+                                            {
+                                                return Err(SqlError::Overflow);
+                                            }
+                                            sum
+                                        } else {
+                                            n.value()
+                                        };
+                                        Value::Float4(Float4::from_bits(sum.to_bits()))
+                                    }
+                                    DataType::DoublePrecision => {
+                                        let Value::Float8(n) = v else {
+                                            return Err(SqlError::Type);
+                                        };
+                                        let sum = if let Value::Float8(old) = value {
+                                            let sum = old.value() + n.value();
+                                            if sum.is_infinite()
+                                                && old.value().is_finite()
+                                                && n.value().is_finite()
+                                            {
+                                                return Err(SqlError::Overflow);
+                                            }
+                                            sum
+                                        } else {
+                                            n.value()
+                                        };
+                                        Value::Float8(Float8::from_bits(sum.to_bits()))
+                                    }
+                                    DataType::BigInt => {
+                                        let Value::Int(n) = v else {
+                                            return Err(SqlError::Type);
+                                        };
+                                        Value::Int(if let Value::Int(old) = value {
+                                            old.checked_add(*n).ok_or(SqlError::Overflow)?
+                                        } else {
+                                            *n
+                                        })
+                                    }
+                                    DataType::Boolean
+                                    | DataType::SmallInt
+                                    | DataType::Integer
+                                    | DataType::Text
+                                    | DataType::Bytes
+                                    | DataType::Date
+                                    | DataType::Time
+                                    | DataType::TimeTz
+                                    | DataType::Timestamp
+                                    | DataType::TimestampTz
+                                    | DataType::Interval => return Err(SqlError::Type),
                                 };
-                                value = Value::Int(match value {
-                                    Value::Int(old) => crate::scalar::add(old, *n)
-                                        .map_err(|_| SqlError::Overflow)?,
-                                    _ => *n,
-                                });
                             }
                             Aggregate::Min | Aggregate::Max => {
                                 let v = v.ok_or(SqlError::Type)?;
@@ -710,7 +1466,7 @@ impl BoundQuery<'_> {
                                     || (matches!(a, Aggregate::Max)
                                         && cmp(v, &value) == Ordering::Greater)
                                 {
-                                    value = v.clone();
+                                    value = evaluated.ok_or(SqlError::Type)?;
                                 }
                             }
                         }
@@ -726,6 +1482,11 @@ impl BoundQuery<'_> {
                     .items
                     .iter()
                     .map(|i| {
+                        if let BoundItem::Scalar(e) = i {
+                            let value = e.eval(&row, params, &mut scalar_work_bytes)?;
+                            charge(&mut result_bytes, &value)?;
+                            return Ok(value);
+                        }
                         let BoundItem::Column(c) = i else {
                             unreachable!()
                         };
@@ -741,7 +1502,15 @@ impl BoundQuery<'_> {
                 });
             }
         }
+        if self.aggregate && cancel() {
+            return Err(SqlError::Aborted);
+        }
         result.rows.truncate(limit);
         Ok(result)
     }
 }
+
+pub(super) fn coerce(v: Value, t: &DataType) -> R<Value> {
+    functions::cast_value(v, t, &mut 0)
+}
+

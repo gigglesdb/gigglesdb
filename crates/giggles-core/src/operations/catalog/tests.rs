@@ -19,7 +19,7 @@ pub(super) fn before_publish() {
         }
     });
 }
-fn with_publish_hook<T>(hook: impl FnMut() + 'static, work: impl FnOnce() -> T) -> T {
+pub(super) fn with_publish_hook<T>(hook: impl FnMut() + 'static, work: impl FnOnce() -> T) -> T {
     struct Restore(Option<PublishHook>);
     impl Drop for Restore {
         fn drop(&mut self) {

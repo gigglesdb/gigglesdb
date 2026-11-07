@@ -164,6 +164,7 @@ pub(crate) fn validate_outcome(query: &OutcomeQuery, version: LanguageVersion) -
 }
 
 fn validate_bindings(bindings: &Bindings) -> Result<()> {
+    execute::validate_numeric_bindings(bindings)?;
     if bindings.len() > MAX_BINDINGS {
         return Err(Error::Limit);
     }
@@ -173,7 +174,16 @@ fn validate_bindings(bindings: &Bindings) -> Result<()> {
         let bytes = match value {
             Value::Text(text) => text.len(),
             Value::Bytes(bytes) => bytes.len(),
-            _ => 9,
+            Value::Numeric(n) => n.to_string().len(),
+            Value::Date(_) => 4,
+            Value::Time(_) => 8,
+            Value::TimeTz(_) => 12,
+            Value::Timestamp(_) => 8,
+            Value::TimestampTz(_) => 8,
+            Value::Interval(_) => 16,
+            Value::Float4(_) => 4,
+            Value::Float8(_) => 8,
+            Value::Null | Value::Bool(_) | Value::Int(_) => 9,
         };
         remaining = remaining.checked_sub(bytes).ok_or(Error::Limit)?;
     }

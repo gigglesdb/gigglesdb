@@ -119,6 +119,35 @@ pub fn decode_value(value: proto::Value) -> Result<Value, ApiError> {
         P::IntValue(v) => Value::Int(v),
         P::TextValue(v) => Value::Text(v),
         P::BytesValue(v) => Value::Bytes(v),
+        P::NumericValue(v) => Value::Numeric(
+            giggles_pg_types::Numeric::parse(&v).map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::Float4Bits(v) => Value::Float4(giggles_pg_types::Float4::from_bits(v)),
+        P::DateBinary(v) => Value::Date(
+            giggles_core::relational::Date::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::TimeBinary(v) => Value::Time(
+            giggles_core::relational::PgTime::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::TimetzBinary(v) => Value::TimeTz(
+            giggles_core::relational::TimeTz::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::TimestampBinary(v) => Value::Timestamp(
+            giggles_core::relational::Timestamp::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::TimestamptzBinary(v) => Value::TimestampTz(
+            giggles_core::relational::TimestampTz::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::IntervalBinary(v) => Value::Interval(
+            giggles_core::relational::Interval::from_binary(&v)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        P::Float8Bits(v) => Value::Float8(giggles_pg_types::Float8::from_bits(v)),
     })
 }
 
@@ -178,6 +207,15 @@ pub fn encode_value(value: Value) -> proto::Value {
             Value::Int(v) => P::IntValue(v),
             Value::Text(v) => P::TextValue(v),
             Value::Bytes(v) => P::BytesValue(v),
+            Value::Numeric(v) => P::NumericValue(v.to_string()),
+            Value::Float4(v) => P::Float4Bits(v.to_bits()),
+            Value::Date(v) => P::DateBinary(v.to_binary().to_vec()),
+            Value::Time(v) => P::TimeBinary(v.to_binary().to_vec()),
+            Value::TimeTz(v) => P::TimetzBinary(v.to_binary().to_vec()),
+            Value::Timestamp(v) => P::TimestampBinary(v.to_binary().to_vec()),
+            Value::TimestampTz(v) => P::TimestamptzBinary(v.to_binary().to_vec()),
+            Value::Interval(v) => P::IntervalBinary(v.to_binary().to_vec()),
+            Value::Float8(v) => P::Float8Bits(v.to_bits()),
         }),
     }
 }

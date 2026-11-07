@@ -566,7 +566,7 @@ fn format_three_bytes_are_frozen_and_format_four_requires_native_namespace() {
         Err(CoreError::Corrupt(_))
     ));
     let mut future = native.clone();
-    future.get_mut(&vec![0]).unwrap()[..4].copy_from_slice(&5u32.to_be_bytes());
+    future.get_mut(&vec![0]).unwrap()[..4].copy_from_slice(&99u32.to_be_bytes());
     assert!(matches!(from_records(future), Err(CoreError::Unsupported)));
     assert_eq!(
         NativeOutcomes::from_bytes(&2u16.to_be_bytes()).err(),

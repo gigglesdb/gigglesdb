@@ -94,6 +94,18 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::Transaction => 14,
                 relational::SqlError::Aborted => 15,
                 relational::SqlError::Overflow => 16,
+                relational::SqlError::UndefinedFunction => 17,
+                relational::SqlError::InvalidParameterValue => 18,
+                relational::SqlError::InvalidDatetimeFormat => 19,
+                relational::SqlError::DatetimeFieldOverflow => 20,
+                relational::SqlError::IntervalFieldOverflow => 21,
+                relational::SqlError::AmbiguousFunction => 22,
+                relational::SqlError::GroupingError => 23,
+                relational::SqlError::IndeterminateDatatype => 24,
+                relational::SqlError::AmbiguousParameter => 25,
+                relational::SqlError::InvalidTextRepresentation => 26,
+                relational::SqlError::SubstringError => 27,
+                relational::SqlError::CharacterNotInRepertoire => 28,
             }
         }
     };

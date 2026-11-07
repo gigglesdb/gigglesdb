@@ -151,6 +151,15 @@ impl BoundLocal {
             DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
             DataType::Text => Ty::Text,
             DataType::Bytes => Ty::Bytes,
+            DataType::Numeric => Ty::Numeric,
+            DataType::Real => Ty::Real,
+            DataType::DoublePrecision => Ty::DoublePrecision,
+            DataType::Date => Ty::Date,
+            DataType::Time => Ty::Time,
+            DataType::TimeTz => Ty::TimeTz,
+            DataType::Timestamp => Ty::Timestamp,
+            DataType::TimestampTz => Ty::TimestampTz,
+            DataType::Interval => Ty::Interval,
         }
     }
     fn value<'a>(&self, locals: &'a [Outcome]) -> Result<Cow<'a, Value>> {
@@ -315,6 +324,15 @@ fn scalar_description(bound: &Bound, ty: Option<Ty>) -> EmitDescription {
             Ty::Int => DataType::BigInt,
             Ty::Text => DataType::Text,
             Ty::Bytes => DataType::Bytes,
+            Ty::Numeric => DataType::Numeric,
+            Ty::Real => DataType::Real,
+            Ty::DoublePrecision => DataType::DoublePrecision,
+            Ty::Date => DataType::Date,
+            Ty::Time => DataType::Time,
+            Ty::TimeTz => DataType::TimeTz,
+            Ty::Timestamp => DataType::Timestamp,
+            Ty::TimestampTz => DataType::TimestampTz,
+            Ty::Interval => DataType::Interval,
         }),
     };
     EmitDescription::Scalar {

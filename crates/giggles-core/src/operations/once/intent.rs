@@ -186,6 +186,15 @@ impl Writer {
             DataType::BigInt => 3,
             DataType::Text => 4,
             DataType::Bytes => 5,
+            DataType::Numeric => 6,
+            DataType::Real => 7,
+            DataType::DoublePrecision => 8,
+            DataType::Date => 9,
+            DataType::Time => 10,
+            DataType::TimeTz => 11,
+            DataType::Timestamp => 12,
+            DataType::TimestampTz => 13,
+            DataType::Interval => 14,
         })
     }
     fn columns(&mut self, columns: &[ColumnDef]) -> OnceResult<()> {
@@ -203,6 +212,42 @@ impl Writer {
     }
     fn value(&mut self, value: &Value) -> OnceResult<()> {
         match value {
+            Value::Date(n) => {
+                self.tag(8)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::Time(n) => {
+                self.tag(9)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::TimeTz(n) => {
+                self.tag(10)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::Timestamp(n) => {
+                self.tag(11)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::TimestampTz(n) => {
+                self.tag(12)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::Interval(n) => {
+                self.tag(13)?;
+                self.bytes(&n.to_binary())
+            }
+            Value::Numeric(n) => {
+                self.tag(5)?;
+                self.blob(n.to_string().as_bytes())
+            }
+            Value::Float4(n) => {
+                self.tag(6)?;
+                self.bytes(&n.to_bits().to_be_bytes())
+            }
+            Value::Float8(n) => {
+                self.tag(7)?;
+                self.bytes(&n.to_bits().to_be_bytes())
+            }
             Value::Null => self.tag(0),
             Value::Bool(value) => {
                 self.tag(1)?;

@@ -117,10 +117,29 @@ pub enum Cell {
     Int(String),
     Text(String),
     Bytes(String),
+    Numeric(String),
+    Float4(u32),
+    Float8(u64),
+    Date(String),
+    Time(String),
+    TimeTz(String),
+    Timestamp(String),
+    TimestampTz(String),
+    Interval(String),
 }
 impl Cell {
     pub fn from_value(v: Value) -> Self {
         match v {
+            Value::Date(v) => Self::Date(format::hex(&v.to_binary())),
+            Value::Time(v) => Self::Time(format::hex(&v.to_binary())),
+            Value::TimeTz(v) => Self::TimeTz(format::hex(&v.to_binary())),
+            Value::Timestamp(v) => Self::Timestamp(format::hex(&v.to_binary())),
+            Value::TimestampTz(v) => Self::TimestampTz(format::hex(&v.to_binary())),
+            Value::Interval(v) => Self::Interval(format::hex(&v.to_binary())),
+
+            Value::Numeric(v) => Self::Numeric(v.to_string()),
+            Value::Float4(v) => Self::Float4(v.to_bits()),
+            Value::Float8(v) => Self::Float8(v.to_bits()),
             Value::Null => Self::Null,
             Value::Bool(v) => Self::Bool(v),
             Value::Int(v) => Self::Int(v.to_string()),
@@ -130,6 +149,40 @@ impl Cell {
     }
     pub fn to_value(&self) -> Result<Value> {
         Ok(match self {
+            Self::Date(v) => Value::Date(
+                relational::Date::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("Date binary"))?,
+            ),
+            Self::Time(v) => Value::Time(
+                relational::PgTime::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("Time binary"))?,
+            ),
+            Self::TimeTz(v) => Value::TimeTz(
+                relational::TimeTz::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("TimeTz binary"))?,
+            ),
+            Self::Timestamp(v) => Value::Timestamp(
+                relational::Timestamp::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("Timestamp binary"))?,
+            ),
+            Self::TimestampTz(v) => Value::TimestampTz(
+                relational::TimestampTz::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("TimestampTz binary"))?,
+            ),
+            Self::Interval(v) => Value::Interval(
+                relational::Interval::from_binary(&format::unhex(v)?)
+                    .map_err(|_| invalid("Interval binary"))?,
+            ),
+
+            Self::Numeric(v) => {
+                let n = relational::Numeric::parse(v).map_err(|_| invalid("numeric"))?;
+                if n.to_string() != *v {
+                    return Err(invalid("noncanonical numeric"));
+                }
+                Value::Numeric(n)
+            }
+            Self::Float4(v) => Value::Float4(relational::Float4::from_bits(*v)),
+            Self::Float8(v) => Value::Float8(relational::Float8::from_bits(*v)),
             Self::Null => Value::Null,
             Self::Bool(v) => Value::Bool(*v),
             Self::Text(v) => Value::Text(v.clone()),
@@ -160,7 +213,7 @@ pub struct Report {
 impl Archive {
     fn report(&self, bytes: &[u8]) -> Report {
         Report {
-            profile: "giggles-logical-v1".into(),
+            profile: format::profile(&self.tables).1.into(),
             sha256: format::hash(bytes),
             tables: self.tables.len(),
             rows: self.rows.iter().map(Vec::len).sum(),

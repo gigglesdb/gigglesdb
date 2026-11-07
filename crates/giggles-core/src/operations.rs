@@ -11,7 +11,10 @@ pub use crate::relational::{SqlRow, Value};
 #[cfg(test)]
 mod case_tests;
 mod catalog;
+pub(crate) mod state_adapter;
+use state_adapter::Context;
 mod explain;
+mod secondary_selector;
 pub use explain::*;
 mod inspection;
 pub mod once;
@@ -19,6 +22,7 @@ pub mod once;
 mod scalar_tests;
 mod session;
 mod transaction;
+mod unique_conflict;
 mod upsert;
 #[cfg(test)]
 mod upsert_tests;
@@ -540,7 +544,7 @@ fn validate_bindings(bindings: &Bindings) -> Result<()> {
     Ok(())
 }
 fn bind_request(
-    session: &mut SqlSession,
+    session: &mut impl Context,
     request: &Request,
     bindings: &Bindings,
 ) -> Result<(TableDef, Operation)> {
@@ -758,6 +762,15 @@ enum Ty {
     Int,
     Text,
     Bytes,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 fn unify_type(left: Option<Ty>, right: Option<Ty>) -> Result<Option<Ty>> {
     if left.is_some() && right.is_some() && left != right {
@@ -772,6 +785,15 @@ fn ty(v: &Value) -> Option<Ty> {
         Value::Int(_) => Some(Ty::Int),
         Value::Text(_) => Some(Ty::Text),
         Value::Bytes(_) => Some(Ty::Bytes),
+        Value::Numeric(_) => Some(Ty::Numeric),
+        Value::Float4(_) => Some(Ty::Real),
+        Value::Float8(_) => Some(Ty::DoublePrecision),
+        Value::Date(_) => Some(Ty::Date),
+        Value::Time(_) => Some(Ty::Time),
+        Value::TimeTz(_) => Some(Ty::TimeTz),
+        Value::Timestamp(_) => Some(Ty::Timestamp),
+        Value::TimestampTz(_) => Some(Ty::TimestampTz),
+        Value::Interval(_) => Some(Ty::Interval),
     }
 }
 fn colty(c: &ColumnDef) -> Ty {
@@ -780,6 +802,15 @@ fn colty(c: &ColumnDef) -> Ty {
         DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
         DataType::Text => Ty::Text,
         DataType::Bytes => Ty::Bytes,
+        DataType::Numeric => Ty::Numeric,
+        DataType::Real => Ty::Real,
+        DataType::DoublePrecision => Ty::DoublePrecision,
+        DataType::Date => Ty::Date,
+        DataType::Time => Ty::Time,
+        DataType::TimeTz => Ty::TimeTz,
+        DataType::Timestamp => Ty::Timestamp,
+        DataType::TimestampTz => Ty::TimestampTz,
+        DataType::Interval => Ty::Interval,
     }
 }
 fn check(v: &Value, c: &ColumnDef) -> Result<()> {
@@ -1176,6 +1207,15 @@ impl Binder<'_> {
                         Ty::Int => DataType::BigInt,
                         Ty::Text => DataType::Text,
                         Ty::Bytes => DataType::Bytes,
+                        Ty::Numeric => DataType::Numeric,
+                        Ty::Real => DataType::Real,
+                        Ty::DoublePrecision => DataType::DoublePrecision,
+                        Ty::Date => DataType::Date,
+                        Ty::Time => DataType::Time,
+                        Ty::TimeTz => DataType::TimeTz,
+                        Ty::Timestamp => DataType::Timestamp,
+                        Ty::TimestampTz => DataType::TimestampTz,
+                        Ty::Interval => DataType::Interval,
                     },
                     not_null: !expression.nullable(self.table),
                 },
@@ -1562,6 +1602,9 @@ fn compare(a: &Value, b: &Value) -> Ordering {
         (Value::Null, _) => Ordering::Greater,
         (_, Value::Null) => Ordering::Less,
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
+        (Value::Float4(a), Value::Float4(b)) => a.cmp(b),
+        (Value::Float8(a), Value::Float8(b)) => a.cmp(b),
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
@@ -1779,10 +1822,10 @@ impl Bound {
         Ok(*self.eval(&row.values)? == Value::Bool(true))
     }
 }
-fn matching_rows(rows: Vec<SqlRow>, filter: &Bound) -> Result<Vec<SqlRow>> {
+fn matching_rows(s: &impl Context, rows: Vec<SqlRow>, filter: &Bound) -> Result<Vec<SqlRow>> {
     let mut matches = Vec::new();
     for row in rows {
-        crate::cancellation::check().map_err(core)?;
+        s.checkpoint().map_err(core)?;
         if filter.accepts(&row)? {
             matches.push(row);
         }
@@ -1821,11 +1864,11 @@ fn project_returning<'a>(
         })
         .collect()
 }
-fn run(
-    s: &mut SqlSession,
+fn run<C: Context>(
+    s: &mut C,
     t: &TableDef,
     op: Operation,
-    input: CompleteRelation,
+    input: C::Input,
     mut retained: Option<&mut usize>,
 ) -> Result<Outcome> {
     op.check_input_cap()?;
@@ -1841,7 +1884,7 @@ fn run(
     } = op
     {
         return upsert::run(
-            s,
+            s.session()?,
             t,
             upsert::Plan {
                 columns,
@@ -1862,7 +1905,7 @@ fn run(
     }
     let op = match op {
         Operation::InsertExpressions { values, returning } => {
-            crate::cancellation::check().map_err(core)?;
+            s.checkpoint().map_err(core)?;
             let evaluated = values
                 .iter()
                 .map(|value| value.eval(&[]))
@@ -1887,7 +1930,15 @@ fn run(
             returning,
             ..
         } => {
-            return insert_many(s, t, columns, proposed, returning, rows, retained);
+            return insert_many(
+                s.session()?,
+                t,
+                columns,
+                proposed,
+                returning,
+                rows,
+                retained,
+            );
         }
         Operation::InsertExpressions { .. } | Operation::Upsert { .. } => {
             return Err(Error::Unsupported);
@@ -1898,7 +1949,8 @@ fn run(
             limit,
             projection,
         } => {
-            let mut rows = matching_rows(rows, &filter)?;
+            let rows = secondary_selector::read(s, t, &filter, rows)?;
+            let mut rows = matching_rows(s, rows, &filter)?;
             sort(&mut rows, &order);
             out.matched = rows.len();
             out.complete = rows.len() <= limit;
@@ -1907,7 +1959,7 @@ fn run(
                 .map(|i| t.columns[*i].name.clone())
                 .collect();
             for row in rows.iter().take(limit) {
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 for index in &projection {
                     charge_retained(&mut retained, &row.values[*index])?;
                 }
@@ -1927,7 +1979,7 @@ fn run(
             limit,
             projection,
         } => {
-            let mut rows = matching_rows(rows, &filter)?;
+            let mut rows = matching_rows(s, rows, &filter)?;
             sort(&mut rows, &order);
             out.matched = rows.len();
             out.complete = rows.len() <= limit;
@@ -1937,7 +1989,7 @@ fn run(
                 .collect();
             let mut remaining = crate::relational::MAX_RESULT_BYTES;
             for (index, row) in rows.iter().enumerate() {
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 let mut values = Vec::new();
                 for item in &projection {
                     let value = item.expression.eval(&row.values)?;
@@ -1959,7 +2011,7 @@ fn run(
         }
         Operation::Insert { values, returning } => {
             let key = if let Some(projection) = &returning {
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 let mut remaining_row = crate::relational::MAX_ROW_BYTES;
                 for (value, column) in values.iter().zip(&t.columns) {
                     check(value, column)?;
@@ -2003,7 +2055,7 @@ fn run(
             selection,
             returning,
         } => {
-            let mut matches = matching_rows(rows, &filter)?;
+            let mut matches = matching_rows(s, rows, &filter)?;
             // Cardinality is checked before guards and before staging any write.
             match &selection {
                 Selection::One => {
@@ -2034,7 +2086,7 @@ fn run(
             }
             out.matched = matches.len();
             for row in &matches {
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 if !guard.accepts(row)? {
                     return Err(Error::ConditionFailed);
                 }
@@ -2043,7 +2095,7 @@ fn run(
             let computed = matches!(&sets, Some(Assignments::Expressions(_)));
             let mut remaining_mutation = MAX_MUTATION_BYTES;
             for row in &matches {
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 let evaluated = match &sets {
                     Some(Assignments::Values(values)) => Some(
                         values
@@ -2102,7 +2154,7 @@ fn run(
                 let mut remaining = crate::relational::MAX_RESULT_BYTES;
                 let mut projected = Vec::new();
                 for (row, evaluated, _) in &work {
-                    crate::cancellation::check().map_err(core)?;
+                    s.checkpoint().map_err(core)?;
                     let post = |index| {
                         evaluated
                             .as_ref()
@@ -2134,7 +2186,7 @@ fn run(
             // Every candidate has passed guards and expression evaluation;
             // computed updates also passed final-row checks and their budget.
             // No mutation is staged before this complete preflight succeeds.
-            crate::cancellation::check().map_err(core)?;
+            s.checkpoint().map_err(core)?;
             let claimed_key = if returning.is_none() && matches!(selection, Selection::Claim(_)) {
                 out.columns = t.columns.iter().map(|c| c.name.clone()).collect();
                 matches.first().map(|row| {
@@ -2150,7 +2202,7 @@ fn run(
                 if !changed {
                     continue;
                 }
-                crate::cancellation::check().map_err(core)?;
+                s.checkpoint().map_err(core)?;
                 let key = t
                     .primary_key
                     .iter()

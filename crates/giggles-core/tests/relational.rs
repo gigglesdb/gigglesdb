@@ -409,15 +409,14 @@ fn strict_rejection_matrix_and_resource_bounds() {
     ] {
         err(&mut s, q, E::Reserved);
     }
+    run(&mut s, "CREATE TABLE decimals (id DECIMAL PRIMARY KEY)");
     for q in [
-        "CREATE TABLE decimals (id DECIMAL PRIMARY KEY)",
         "CREATE TABLE timestamps (id TIMESTAMPTZ PRIMARY KEY)",
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
         "SELECT * FROM public.safe LIMIT 1",
         "SELECT * FROM safe -- hi",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
-        "SELECT * FROM safe WHERE id=1 OR id=2",
         "SELECT * FROM safe ORDER BY n LIMIT 1",
         "INSERT INTO safe VALUES(1,1),(2,2)",
         "UPDATE safe SET n=n+1 WHERE id=1",
@@ -450,6 +449,22 @@ fn strict_rejection_matrix_and_resource_bounds() {
         CoreError::Sql(E::Limit)
     );
     assert!(run(&mut s, "SELECT * FROM safe WHERE id=1").rows.is_empty());
+    assert!(
+        run(&mut s, "SELECT * FROM safe WHERE id=1 OR id=2")
+            .rows
+            .is_empty()
+    );
+    run(&mut s, "INSERT INTO safe VALUES(1,10)");
+    run(&mut s, "INSERT INTO safe VALUES(2,20)");
+    run(&mut s, "INSERT INTO safe VALUES(3,30)");
+    assert_eq!(
+        run(&mut s, "SELECT id FROM safe WHERE id=1 OR id=2 ORDER BY id")
+            .rows
+            .into_iter()
+            .map(|r| r.values)
+            .collect::<Vec<_>>(),
+        vec![vec![V::Int(1)], vec![V::Int(2)]]
+    );
 }
 #[test]
 fn shared_repair_generation_conflicts_and_authority_stays_finite() {

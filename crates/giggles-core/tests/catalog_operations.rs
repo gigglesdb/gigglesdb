@@ -476,7 +476,9 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
     );
     assert_eq!(engine.execute_catalog(&request), Err(Error::PlanRequired));
     assert_eq!(digest(&admin), before);
-    let CatalogRequest::CreateTable { table, columns, .. } = &mut request;
+    let CatalogRequest::CreateTable { table, columns, .. } = &mut request else {
+        panic!("expected CreateTable request");
+    };
     *table = "mutated".into();
     columns[0].data_type = DataType::Text;
     admin

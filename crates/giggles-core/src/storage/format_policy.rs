@@ -1,0 +1,323 @@
+//! DD68 envelope policy for independent typed scalar, native outcome and index features.
+//! Presence of typed schema/receipt descriptions counts even with no typed rows.
+//! Never derive native presence from the numeric ordering of version numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Features {
+    pub typed_scalars: bool,
+    pub native_outcomes: bool,
+}
+
+impl Features {
+    // 7..=10 remain reserved for GD42 secondary indexes. Application namespace
+    // presence has its own outer gate, rejected by all pre-application readers.
+    pub fn version_application(self, applications: bool) -> u32 {
+        if applications {
+            self.version() + 8
+        } else {
+            self.version()
+        }
+    }
+    pub fn read_application(version: u32) -> Option<(Self, bool)> {
+        match version {
+            11..=14 => Self::read(version - 8).map(|f| (f, true)),
+            _ => Self::read(version).map(|f| (f, false)),
+        }
+    }
+    /// Explicit opt-in for secondary-index envelopes; existing writers stay at 3..=6.
+    /// GD42 must derive this flag from namespace 8 payload presence, including
+    /// empty descriptor payloads, and validate flag/payload agreement on read.
+    /// This policy neither inspects payloads nor enables index persistence.
+    #[allow(dead_code)] // Staged API: GD42 owns persistence adoption.
+    pub fn version_with(self, secondary_indexes: bool) -> u32 {
+        match (self.typed_scalars, self.native_outcomes, secondary_indexes) {
+            (_, _, false) => self.version(),
+            (false, false, true) => 7,
+            (false, true, true) => 8,
+            (true, false, true) => 9,
+            (true, true, true) => 10,
+        }
+    }
+
+    /// Parse all three flags explicitly. The tuple is (scalar/native features,
+    /// secondary indexes). GD42 must validate namespace 8 presence, including
+    /// empty descriptors, against the returned index flag before accepting data.
+    /// Legacy `read` deliberately continues to reject index envelopes.
+    #[allow(dead_code)] // Staged API: GD42 owns persistence adoption.
+    pub fn read_with(version: u32) -> Option<(Self, bool)> {
+        let features = match version {
+            7 => Self {
+                typed_scalars: false,
+                native_outcomes: false,
+            },
+            8 => Self {
+                typed_scalars: false,
+                native_outcomes: true,
+            },
+            9 => Self {
+                typed_scalars: true,
+                native_outcomes: false,
+            },
+            10 => Self {
+                typed_scalars: true,
+                native_outcomes: true,
+            },
+            _ => return Self::read(version).map(|features| (features, false)),
+        };
+        Some((features, true))
+    }
+
+    pub fn version(self) -> u32 {
+        match (self.typed_scalars, self.native_outcomes) {
+            (false, false) => 3,
+            (false, true) => 4,
+            (true, false) => 5,
+            (true, true) => 6,
+        }
+    }
+    pub fn read(version: u32) -> Option<Self> {
+        match version {
+            1..=3 => Some(Self {
+                typed_scalars: false,
+                native_outcomes: false,
+            }),
+            4 => Some(Self {
+                typed_scalars: false,
+                native_outcomes: true,
+            }),
+            5 => Some(Self {
+                typed_scalars: true,
+                native_outcomes: false,
+            }),
+            6 => Some(Self {
+                typed_scalars: true,
+                native_outcomes: true,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Temporal envelopes wrap a legal explicit base family. Legacy entry points
+/// keep their exact acceptance sets; callers must unwrap before family dispatch.
+pub(super) fn temporal_version(base: u32, temporal: bool) -> Option<u32> {
+    match (base, temporal) {
+        (3..=14, true) => Some(base + 12),
+        (1..=14, false) => Some(base),
+        _ => None,
+    }
+}
+pub(super) fn temporal_base(version: u32) -> Option<(u32, bool)> {
+    match version {
+        1..=14 => Some((version, false)),
+        15..=26 => Some((version - 12, true)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn temporal_index_nonkey_typed_native_matrix_preserves_paired_records() {
+        use super::super::*;
+        use crate::relational::Prepared;
+        for typed in [false, true] {
+            for native in [false, true] {
+                for rows in [false, true] {
+                    let mut s = empty(123);
+                    let create = if typed {
+                        "CREATE TABLE t(id BIGINT PRIMARY KEY,tag TEXT,d DATE,n NUMERIC)"
+                    } else {
+                        "CREATE TABLE t(id BIGINT PRIMARY KEY,tag TEXT,d DATE)"
+                    };
+                    let p = Prepared::parse(create, 123, s.sql.epoch).unwrap();
+                    s.sql.execute(&p, &[], None).unwrap();
+                    if rows {
+                        let insert = if typed {
+                            "INSERT INTO t VALUES(1,'a','2000-01-01',1.25)"
+                        } else {
+                            "INSERT INTO t VALUES(1,'a','2000-01-01')"
+                        };
+                        let p = Prepared::parse(insert, 123, s.sql.epoch).unwrap();
+                        s.sql.execute(&p, &[], None).unwrap();
+                    }
+                    let t = s.sql.tables["t"].clone();
+                    s.sql
+                        .secondary_configure_test(t.id, "by_tag", &[t.columns[1].id], || false)
+                        .unwrap();
+                    if native {
+                        s.native_outcomes = Some(Default::default());
+                    }
+                    let r = records(&s).unwrap();
+                    let m: Metadata = decode(&r[&vec![0]]).unwrap();
+                    assert_eq!(m.format, 19 + u32::from(native) + 2 * u32::from(typed));
+                    assert!(r.contains_key(&vec![5]) && r.contains_key(&vec![8]));
+                    let restored = from_records(r.clone()).unwrap();
+                    assert_eq!(restored.sql, s.sql);
+                    assert_eq!(records(&restored).unwrap(), r);
+                    s.applications = Some(Default::default());
+                    assert!(matches!(records(&s), Err(CoreError::Unsupported)));
+                }
+            }
+        }
+    }
+    #[test]
+    fn temporal_wrapper_has_independent_finite_base_map() {
+        for base in 3..=14 {
+            assert_eq!(temporal_version(base, true), Some(base + 12));
+            assert_eq!(temporal_base(base + 12), Some((base, true)));
+            assert!(Features::read(base + 12).is_none());
+            assert!(Features::read_with(base + 12).is_none());
+            assert!(Features::read_application(base + 12).is_none());
+        }
+        for base in 1..=14 {
+            assert_eq!(temporal_base(base), Some((base, false)));
+            assert_eq!(temporal_version(base, false), Some(base));
+        }
+        for v in [0, 27, u32::MAX] {
+            assert_eq!(temporal_base(v), None);
+        }
+        for v in [0, 1, 2, 15, u32::MAX] {
+            assert_eq!(temporal_version(v, true), None);
+        }
+    }
+
+    #[test]
+    fn all_three_flags_have_fixed_unique_versions() {
+        let cases = [
+            (false, false, false, 3),
+            (false, true, false, 4),
+            (true, false, false, 5),
+            (true, true, false, 6),
+            (false, false, true, 7),
+            (false, true, true, 8),
+            (true, false, true, 9),
+            (true, true, true, 10),
+        ];
+        let mut versions = std::collections::BTreeSet::new();
+        for (typed_scalars, native_outcomes, indexes, version) in cases {
+            let features = Features {
+                typed_scalars,
+                native_outcomes,
+            };
+            assert_eq!(features.version_with(indexes), version);
+            assert!(versions.insert(version));
+            assert_eq!(Features::read_with(version), Some((features, indexes)));
+            if !indexes {
+                assert_eq!(features.version(), version);
+                assert_eq!(Features::read(version), Some(features));
+            }
+        }
+        for version in [1, 2] {
+            assert_eq!(
+                Features::read_with(version),
+                Some((
+                    Features {
+                        typed_scalars: false,
+                        native_outcomes: false,
+                    },
+                    false
+                ))
+            );
+        }
+        for version in [0, 11, u32::MAX] {
+            assert_eq!(Features::read_with(version), None);
+            assert_eq!(Features::read(version), None);
+        }
+    }
+
+    #[test]
+    fn frozen_preindex_entrypoint_rejects_index_versions_before_payload() {
+        for version in 7..=10 {
+            assert_eq!(Features::read(version), None);
+            let mut records = super::super::records(&super::super::empty(17)).unwrap();
+            let mut metadata: super::super::Metadata =
+                super::super::decode(&records[&vec![0]]).unwrap();
+            metadata.format = version;
+            records.insert(vec![0], super::super::encode(&metadata).unwrap());
+            // Freeze the actual preindex family gate before any payload decode.
+            records.insert(vec![5], vec![255]);
+            records.insert(vec![7], vec![255]);
+            assert!(matches!(
+                frozen_preindex_reader(records),
+                Err(super::super::CoreError::Unsupported)
+            ));
+        }
+        fn frozen_preindex_reader(
+            records: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        ) -> Result<(), super::super::CoreError> {
+            let metadata: super::super::Metadata = super::super::decode(&records[&vec![0]])?;
+            Features::read_application(metadata.format)
+                .ok_or(super::super::CoreError::Unsupported)?;
+            let _: crate::relational::Relational = super::super::decode(&records[&vec![5]])?;
+            Ok(())
+        }
+    }
+    #[test]
+    fn independent_features_and_legacy_reads() {
+        for typed_scalars in [false, true] {
+            for native_outcomes in [false, true] {
+                let f = Features {
+                    typed_scalars,
+                    native_outcomes,
+                };
+                assert_eq!(Features::read(f.version()), Some(f));
+            }
+        }
+        for version in [1, 2, 3] {
+            assert_eq!(
+                Features::read(version),
+                Some(Features {
+                    typed_scalars: false,
+                    native_outcomes: false
+                })
+            );
+        }
+        for version in [0, 7, u32::MAX] {
+            assert_eq!(Features::read(version), None);
+        }
+    }
+    #[test]
+    fn old_reader_rejects_typed_envelope_before_payload() {
+        for native_outcomes in [false, true] {
+            let version = Features {
+                typed_scalars: true,
+                native_outcomes,
+            }
+            .version();
+            // Existing reader's complete acceptance set. Payload need never decode.
+            assert!(![1, 2, 3, 4].contains(&version));
+            // Exercise the current reader: a corrupt relational payload must
+            // never be consulted for a future envelope version.
+            let mut records = super::super::records(&super::super::empty(17)).unwrap();
+            let mut metadata: super::super::Metadata =
+                super::super::decode(records.get(&vec![0]).unwrap()).unwrap();
+            metadata.format = version;
+            // Frozen pre-DD68 acceptance gate, before touching either payload.
+            fn legacy_reader(
+                records: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+            ) -> Result<(), super::super::CoreError> {
+                let m: super::super::Metadata = super::super::decode(&records[&vec![0]])?;
+                if ![1, 2, 3, 4].contains(&m.format) {
+                    return Err(super::super::CoreError::Unsupported);
+                }
+                let _: crate::relational::Relational = super::super::decode(&records[&vec![5]])?;
+                Ok(())
+            }
+            records.insert(vec![0], super::super::encode(&metadata).unwrap());
+            records.insert(vec![5], vec![255]);
+            records.insert(vec![7], vec![255]);
+            assert!(matches!(
+                legacy_reader(&records),
+                Err(super::super::CoreError::Unsupported)
+            ));
+            metadata.format = version + 100;
+            records.insert(vec![0], super::super::encode(&metadata).unwrap());
+            records.insert(vec![5], vec![255]);
+            assert!(matches!(
+                super::super::from_records(records),
+                Err(super::super::CoreError::Unsupported)
+            ));
+        }
+    }
+}

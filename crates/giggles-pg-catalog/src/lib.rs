@@ -21,7 +21,7 @@
 //! have a 4096-node / 16-level / 4 MiB limit. Exceeding a limit returns no result.
 //!
 //! This is a finite virtual catalog, not a PostgreSQL server: application types
-//! are only the six `ScalarType` variants. Catalog arrays, vectors, and rowtype
+//! are the fifteen `ScalarType` variants. Catalog arrays, vectors, and rowtype
 //! identities do not grant additional application SQL types. No PostgreSQL MVCC
 //! tuple exists (`xmin` is NULL); transaction IDs, general timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
@@ -37,6 +37,15 @@ pub enum ScalarType {
     BigInt,
     Text,
     Bytes,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -83,6 +92,9 @@ pub enum PgType {
     AclItemArray,
     Xid,
     Record,
+    Numeric,
+    Float4,
+    Float8,
 }
 impl PgType {
     pub fn oid(self) -> u32 {
@@ -110,14 +122,17 @@ impl PgType {
             Self::AclItemArray => 1034,
             Self::Xid => 28,
             Self::Record => 2249,
+            Self::Numeric => 1700,
+            Self::Float4 => 700,
+            Self::Float8 => 701,
         }
     }
     pub fn type_size(self) -> i16 {
         match self {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
-            Self::Int4 | Self::Oid | Self::Xid => 4,
-            Self::Int8 => 8,
+            Self::Int4 | Self::Oid | Self::Xid | Self::Float4 => 4,
+            Self::Int8 | Self::Float8 => 8,
             Self::Name => 64,
             _ => -1,
         }
@@ -149,6 +164,9 @@ pub enum Value {
     Bytes(Vec<u8>),
     Array(Vec<Value>),
     Record(Vec<Value>),
+    Numeric(giggles_pg_types::Numeric),
+    Float4(giggles_pg_types::Float4),
+    Float8(giggles_pg_types::Float8),
 }
 impl Value {
     pub(crate) fn bytes(&self) -> usize {
@@ -156,6 +174,8 @@ impl Value {
             Self::Null => 4,
             Self::Bool(_) => 1,
             Self::Int(_) => 20,
+            Self::Numeric(v) => v.to_string().len(),
+            Self::Float4(_) | Self::Float8(_) => 32,
             // Includes quoting/escaping when the value is nested in a PG text array.
             Self::Text(s) => s.len() * 2 + 8,
             Self::Bytes(b) => b.len() * 2 + 6,

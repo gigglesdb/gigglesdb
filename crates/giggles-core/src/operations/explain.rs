@@ -13,6 +13,11 @@ pub enum ReadExplainStage {
     InMemoryOrder,
     FieldProjection,
     OutputPage,
+    /// Additional access after the complete input admission above; no avoided
+    /// full materialization or estimated cost is claimed.
+    SecondaryIndexCandidates {
+        index_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +116,7 @@ impl Engine {
         validate_bindings(bindings)?;
         let configured = self.admin.explain_limits_engine();
         self.admin
-            .inspect_catalog_engine(|domain, epoch, tables| {
+            .inspect_secondary_catalog_engine(|domain, epoch, tables, descriptors| {
                 let table = tables
                     .get(table)
                     .ok_or_else(|| Error::Bind("table".into()))?;
@@ -135,6 +140,7 @@ impl Engine {
                     remaining_value_bytes: MAX_BOUND_VALUE_BYTES,
                 };
                 let Operation::Read {
+                    filter: bound_filter,
                     order,
                     limit,
                     projection,
@@ -147,6 +153,22 @@ impl Engine {
                     return Err(Error::Bind("parameters".into()));
                 }
                 crate::cancellation::check().map_err(core)?;
+                let mut stages = vec![
+                    ReadExplainStage::WholeStateSnapshot,
+                    ReadExplainStage::BoundedCompleteTableMaterialization,
+                    ReadExplainStage::ReversePrimaryKeyCompletenessCertification,
+                ];
+                if let Some(id) = secondary_selector::choose(table, &bound_filter)
+                    .and_then(|choice| choice.descriptor(table, descriptors))
+                {
+                    stages.push(ReadExplainStage::SecondaryIndexCandidates { index_id: id });
+                }
+                stages.extend([
+                    ReadExplainStage::InMemoryFilter,
+                    ReadExplainStage::InMemoryOrder,
+                    ReadExplainStage::FieldProjection,
+                    ReadExplainStage::OutputPage,
+                ]);
                 Ok(ReadExplainOutcome {
                     contract_version: ENGINE_CONTRACT_VERSION,
                     database_domain: domain,
@@ -165,15 +187,7 @@ impl Engine {
                         })
                         .collect(),
                     has_filter: filter.is_some(),
-                    stages: vec![
-                        ReadExplainStage::WholeStateSnapshot,
-                        ReadExplainStage::BoundedCompleteTableMaterialization,
-                        ReadExplainStage::ReversePrimaryKeyCompletenessCertification,
-                        ReadExplainStage::InMemoryFilter,
-                        ReadExplainStage::InMemoryOrder,
-                        ReadExplainStage::FieldProjection,
-                        ReadExplainStage::OutputPage,
-                    ],
+                    stages,
                     limits: ReadExplainLimits {
                         input_rows: MAX_ROWS,
                         output_rows: limit,

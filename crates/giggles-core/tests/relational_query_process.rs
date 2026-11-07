@@ -48,7 +48,7 @@ fn persistent_reopen_join_aggregate_json() {
     );
     assert_eq!(r["rows"][0]["version"], 0);
     let r=c.call(Some(json!({"command":"sql","sql":"SELECT COUNT(*),SUM(e.amount) FROM entries e JOIN owners o ON o.id=e.owner","params":[]})),0,0);
-    assert_eq!(r["rows"][0]["values"], json!([{"Int":2},{"Int":9}]));
+    assert_eq!(r["rows"][0]["values"], json!([{"Int":2},{"Numeric":"9"}]));
     let r=c.call(Some(json!({"command":"sql","sql":"EXPLAIN SELECT e.id FROM entries e JOIN owners o ON o.id=e.owner","params":[]})),0,0);
     assert!(
         r["rows"][0]["values"][0]["Text"]

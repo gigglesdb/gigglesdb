@@ -1467,6 +1467,9 @@ fn cast_type(n: &str) -> R<PgType> {
         "int" | "integer" | "int4" => PgType::Int4,
         "bigint" | "int8" => PgType::Int8,
         "oid" => PgType::Oid,
+        "numeric" | "decimal" => PgType::Numeric,
+        "real" | "float4" => PgType::Float4,
+        "double precision" | "float8" => PgType::Float8,
         "int[]" | "integer[]" | "int4[]" => PgType::Int4Array,
         "oid[]" => PgType::OidArray,
         "text" | "varchar" | "character varying" => PgType::Text,
@@ -2661,6 +2664,12 @@ fn format_type(oid: i64, rows: &[Vec<Value>]) -> R<String> {
         20 => "bigint".into(),
         21 => "smallint".into(),
         23 => "integer".into(),
+        700 => "real".into(),
+        701 => "double precision".into(),
+        1083 => "time without time zone".into(),
+        1266 => "time with time zone".into(),
+        1114 => "timestamp without time zone".into(),
+        1184 => "timestamp with time zone".into(),
         18 => "\"char\"".into(),
         _ => {
             let name = text(r[1].clone())?;
@@ -2688,6 +2697,25 @@ fn cast(v: Value, t: PgType) -> R<Value> {
             B(b) => b.to_string(),
             _ => return Err(Error::Type),
         })),
+        PgType::Numeric | PgType::Float4 | PgType::Float8 => {
+            match (t, &v) {
+                (PgType::Numeric, Value::Numeric(_))
+                | (PgType::Float4, Value::Float4(_))
+                | (PgType::Float8, Value::Float8(_)) => return Ok(v),
+                _ => {}
+            }
+            let text = match v {
+                S(s) => s,
+                I(i) => i.to_string(),
+                _ => return Err(Error::Type),
+            };
+            match t {
+                PgType::Numeric => giggles_pg_types::Numeric::parse(&text).map(Value::Numeric),
+                PgType::Float4 => giggles_pg_types::Float4::parse(&text).map(Value::Float4),
+                _ => giggles_pg_types::Float8::parse(&text).map(Value::Float8),
+            }
+            .map_err(|_| Error::Type)
+        }
         PgType::Bool => match v {
             B(b) => Ok(B(b)),
             S(s) => match s.as_str() {

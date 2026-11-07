@@ -102,6 +102,27 @@ fn bad() -> CoreError {
     CoreError::Corrupt("native outcome invariant".into())
 }
 impl NativeOutcomes {
+    pub(super) fn contains_temporal(&self) -> Result<bool, CoreError> {
+        for e in self.entries.values() {
+            if let Some(b) = &e.record.result
+                && crate::operations::once::outcome::contains_temporal(b)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub(super) fn contains_typed(&self) -> Result<bool, CoreError> {
+        for e in self.entries.values() {
+            if let Some(b) = &e.record.result
+                && crate::operations::once::outcome::contains_typed(b)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn validate(&self) -> Result<(), CoreError> {
         if self.version != LEDGER_VERSION {
             return Err(CoreError::Unsupported);

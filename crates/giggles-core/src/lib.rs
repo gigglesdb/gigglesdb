@@ -3,6 +3,7 @@ mod accounting;
 mod types;
 pub use accounting::{TaskAccounting, TaskResources};
 pub use types::*;
+pub mod pg_serde;
 mod policy;
 mod scalar;
 mod storage;

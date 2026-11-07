@@ -1,8 +1,13 @@
 use crate::*;
 mod catalog_inspection;
+mod format_policy;
 pub(crate) mod native_once;
+pub(crate) mod operation_adapter;
 pub mod replica;
 pub mod roles;
+mod secondary_index;
+mod secondary_index_catalog;
+mod unique_batch_bridge;
 use bincode::Options;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
@@ -19,6 +24,7 @@ use std::{
 };
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_v1");
 const FORMAT: u32 = 3;
+#[cfg(test)]
 const NATIVE_FORMAT: u32 = 4;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"GDEXP001";
@@ -116,6 +122,7 @@ fn recovery(
 }
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub(crate) struct State {
+    pub applications: Option<replica::application::Ledger>,
     pub accounting: BTreeMap<TaskId, TaskAccounting>,
     pub native_outcomes: Option<native_once::NativeOutcomes>,
     pub sql: relational::Relational,
@@ -135,6 +142,7 @@ struct Metadata {
 }
 fn empty(domain: u128) -> State {
     State {
+        applications: None,
         accounting: BTreeMap::new(),
         native_outcomes: None,
         sql: Default::default(),
@@ -159,18 +167,28 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
     k
 }
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    let format = state_format(s)?;
     let mut out = BTreeMap::new();
+    if let Some(ledger) = &s.applications {
+        out.insert(vec![9], ledger.bytes()?);
+    }
     if let Some(ledger) = &s.native_outcomes {
         out.insert(vec![7], ledger.to_bytes()?);
     }
     for (task, account) in &s.accounting {
         out.insert(key(6, &[task.0]), encode(account)?);
     }
-    out.insert(vec![5], encode(&s.sql)?);
+    if s.sql.has_secondary_indexes_engine() {
+        let (base, payload) = secondary_index::persist(&s.sql)?;
+        out.insert(vec![5], base);
+        out.insert(vec![8], payload);
+    } else {
+        out.insert(vec![5], encode(&s.sql)?);
+    }
     out.insert(
         vec![0],
         encode(&Metadata {
-            format: state_format(s),
+            format,
             domain: s.view.domain,
             schema: s.view.schema,
             last_time: s.last_time,
@@ -193,12 +211,40 @@ fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     envelope_bound(&out)?;
     Ok(out)
 }
-fn state_format(s: &State) -> u32 {
-    if s.native_outcomes.is_some() {
-        NATIVE_FORMAT
-    } else {
-        FORMAT
+fn state_format(s: &State) -> Result<u32, CoreError> {
+    let indexed = s.sql.has_secondary_indexes_engine();
+    if indexed && s.applications.is_some() {
+        return Err(CoreError::Unsupported);
     }
+    let features = format_policy::Features {
+        typed_scalars: s.sql.contains_typed()
+            || s.applications.as_ref().is_some_and(|a| a.contains_typed())
+            || s.native_outcomes
+                .as_ref()
+                .is_some_and(|n| n.contains_typed().unwrap_or(true)),
+        native_outcomes: s.native_outcomes.is_some(),
+    };
+    let base = if s.applications.is_some() {
+        features.version_application(true)
+    } else {
+        features.version_with(indexed)
+    };
+    format_policy::temporal_version(base, contains_temporal(s)?).ok_or(CoreError::Unsupported)
+}
+fn contains_temporal(s: &State) -> Result<bool, CoreError> {
+    Ok(s.sql.contains_temporal()
+        || s.applications
+            .as_ref()
+            .is_some_and(|a| a.contains_temporal())
+        || match &s.native_outcomes {
+            Some(n) => n.contains_temporal()?,
+            None => false,
+        })
+}
+fn envelope_family(version: u32) -> Result<(format_policy::Features, bool, bool, bool), CoreError> {
+    let (base, temporal) = format_policy::temporal_base(version).ok_or(CoreError::Unsupported)?;
+    let (features, indexed, applications) = secondary_index::family(base)?;
+    Ok((features, indexed, applications, temporal))
 }
 fn envelope_bound(values: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), CoreError> {
     // Fixed-int map encoding: 8-byte count and two 8-byte lengths per entry.
@@ -217,21 +263,39 @@ fn envelope_bound(values: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(), CoreError> 
     Ok(())
 }
 fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError> {
+    from_records_with_cancel(records, &mut || crate::cancellation::check().is_err())
+}
+// Keep canonical validation in one body. Trusted pure callers supply their own
+// cancellation policy; ordinary storage callers retain the ambient wrapper.
+fn from_records_with_cancel(
+    records: BTreeMap<Vec<u8>, Vec<u8>>,
+    cancel: &mut impl FnMut() -> bool,
+) -> Result<State, CoreError> {
     envelope_bound(&records)?;
     let m: Metadata = decode(
         records
             .get(&vec![0])
             .ok_or_else(|| CoreError::Corrupt("missing metadata".into()))?,
     )?;
-    if ![1, 2, FORMAT, NATIVE_FORMAT].contains(&m.format) {
-        return Err(CoreError::Unsupported);
-    }
+    let (features, indexed, applications, temporal) = envelope_family(m.format)?;
+    secondary_index::gate(&records, indexed, applications)?;
     let mut s = empty(m.domain);
+    match records.get(&vec![9]) {
+        Some(v) if applications => {
+            s.applications = Some(replica::application::Ledger::from_bytes(v)?)
+        }
+        None if !applications => {}
+        _ => {
+            return Err(CoreError::Corrupt(
+                "application format/namespace mismatch".into(),
+            ));
+        }
+    }
     match records.get(&vec![7]) {
-        Some(v) if m.format == NATIVE_FORMAT => {
+        Some(v) if features.native_outcomes => {
             s.native_outcomes = Some(native_once::NativeOutcomes::from_bytes(v)?);
         }
-        None if m.format != NATIVE_FORMAT => {}
+        None if !features.native_outcomes => {}
         _ => {
             return Err(CoreError::Corrupt(
                 "native format/namespace mismatch".into(),
@@ -247,10 +311,23 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             ));
         }
     }
+    if !features.typed_scalars
+        && (s.sql.contains_typed()
+            || s.applications.as_ref().is_some_and(|a| a.contains_typed())
+            || s.native_outcomes
+                .as_ref()
+                .is_some_and(|n| n.contains_typed().unwrap_or(true)))
+    {
+        return Err(CoreError::Corrupt("typed format mismatch".into()));
+    }
+    if contains_temporal(&s)? != temporal {
+        return Err(CoreError::Corrupt("temporal format mismatch".into()));
+    }
     s.view.schema = m.schema;
     s.last_time = m.last_time;
     s.next_approval = m.next_approval;
     s.origin = m.origin;
+    let mut index_payload = None;
     for (k, v) in records {
         let num = |at: usize| -> Result<u64, CoreError> {
             let b = k
@@ -264,7 +341,9 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
             }
             Some(0) if k.len() == 1 => {}
             Some(5) if k.len() == 1 => {}
-            Some(7) if k.len() == 1 && m.format == NATIVE_FORMAT => {}
+            Some(7) if k.len() == 1 && features.native_outcomes => {}
+            Some(9) if k.len() == 1 && applications => {}
+            Some(8) if k.len() == 1 && indexed => index_payload = Some(v),
             Some(1) if k.len() == 17 => {
                 s.view.rows.insert(
                     Key {
@@ -293,9 +372,22 @@ fn from_records(records: BTreeMap<Vec<u8>, Vec<u8>>) -> Result<State, CoreError>
         }
     }
     validate(&s)?;
+    if let Some(payload) = index_payload {
+        let pending = secondary_index::pending(&payload, cancel)?;
+        s.sql
+            .secondary_restore_engine(pending, &mut *cancel)
+            .map_err(|error| secondary_index::sql_error_with_cancel(error, cancel))?;
+    }
+    if cancel() {
+        return Err(CoreError::Cancelled);
+    }
     Ok(s)
 }
 fn validate(s: &State) -> Result<(), CoreError> {
+    state_format(s)?;
+    if let Some(ledger) = &s.applications {
+        ledger.validate()?;
+    }
     if let Some(ledger) = &s.native_outcomes {
         ledger.validate()?;
     }
@@ -911,7 +1003,7 @@ impl Admin {
         let path = path.as_ref();
         let (format, payload) = self
             .inner
-            .inspect(|s| Ok((state_format(s), encode(&records(s)?)?)))?;
+            .inspect(|s| Ok((state_format(s)?, encode(&records(s)?)?)))?;
         let digest: [u8; 32] = Sha256::digest(&payload).into();
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(io)?;
@@ -955,9 +1047,10 @@ impl Admin {
         let mut header = [0u8; 52];
         f.read_exact(&mut header).map_err(io)?;
         if &header[..8] != MAGIC
-            || ![1, 2, FORMAT, NATIVE_FORMAT].contains(&u32::from_be_bytes(
+            || envelope_family(u32::from_be_bytes(
                 header[8..12].try_into().expect("length"),
             ))
+            .is_err()
         {
             return Err(CoreError::Unsupported);
         }
@@ -1008,6 +1101,9 @@ impl Admin {
         getrandom::fill(&mut bytes).map_err(io)?;
         s.view.domain = u128::from_be_bytes(bytes);
         s.origin = Some(old);
+        if let Some(ledger) = &mut s.applications {
+            ledger.revoke_all();
+        }
         for t in s.view.tasks.values_mut() {
             t.revoked = true;
         }
@@ -1292,6 +1388,15 @@ impl Admin {
             staged_revision: 0,
         }
     }
+    /// Catalog preflight for logical archives which cannot preserve secondary indexes.
+    pub fn logical_export_catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
+        self.inner.inspect(|s| {
+            if s.sql.has_secondary_indexes_engine() {
+                return Err(CoreError::Unsupported);
+            }
+            Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()))
+        })
+    }
     pub fn catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
         self.inner
             .inspect(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
@@ -1316,6 +1421,37 @@ impl SqlSession {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
                 p.describe(&s.sql).map_err(CoreError::Sql)
+            };
+            if let Some(s) = &self.staged {
+                describe(s)
+            } else {
+                self.admin.inner.inspect(describe)
+            }
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    /// Validate dependency-free immutable projection/order constants without executing SQL.
+    pub fn validate_immutable_constants(
+        &mut self,
+        p: &relational::Prepared,
+    ) -> Result<(), CoreError> {
+        relational::assert_sql_frontend_allowed();
+        let result = (|| {
+            if self.aborted && p.control() != Some("rollback") {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if p.transaction.is_some() && p.transaction != self.transaction_id {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            let describe = |s: &State| {
+                if p.domain != s.view.domain {
+                    return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                }
+                p.validate_immutable_constants(&s.sql)
+                    .map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
                 describe(s)

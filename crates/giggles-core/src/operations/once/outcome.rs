@@ -137,6 +137,15 @@ enum Kind {
     BigInt,
     Text,
     Bytes,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 impl Kind {
     fn tag(self) -> u8 {
@@ -147,6 +156,15 @@ impl Kind {
             Self::BigInt => 3,
             Self::Text => 4,
             Self::Bytes => 5,
+            Self::Numeric => 6,
+            Self::Real => 7,
+            Self::DoublePrecision => 8,
+            Self::Date => 9,
+            Self::Time => 10,
+            Self::TimeTz => 11,
+            Self::Timestamp => 12,
+            Self::TimestampTz => 13,
+            Self::Interval => 14,
         }
     }
     fn parse(tag: u8) -> Checked<Self> {
@@ -157,6 +175,16 @@ impl Kind {
             3 => Self::BigInt,
             4 => Self::Text,
             5 => Self::Bytes,
+            6 => Self::Numeric,
+            7 => Self::Real,
+            8 => Self::DoublePrecision,
+            9 => Self::Date,
+            10 => Self::Time,
+            11 => Self::TimeTz,
+            12 => Self::Timestamp,
+            13 => Self::TimestampTz,
+            14 => Self::Interval,
+
             _ => return Err(Fault::Invalid),
         })
     }
@@ -168,6 +196,15 @@ impl Kind {
             DataType::BigInt => Self::BigInt,
             DataType::Text => Self::Text,
             DataType::Bytes => Self::Bytes,
+            DataType::Numeric => Self::Numeric,
+            DataType::Real => Self::Real,
+            DataType::DoublePrecision => Self::DoublePrecision,
+            DataType::Date => Self::Date,
+            DataType::Time => Self::Time,
+            DataType::TimeTz => Self::TimeTz,
+            DataType::Timestamp => Self::Timestamp,
+            DataType::TimestampTz => Self::TimestampTz,
+            DataType::Interval => Self::Interval,
         }
     }
     fn data_type(self) -> DataType {
@@ -178,6 +215,15 @@ impl Kind {
             Self::BigInt => DataType::BigInt,
             Self::Text => DataType::Text,
             Self::Bytes => DataType::Bytes,
+            Self::Numeric => DataType::Numeric,
+            Self::Real => DataType::Real,
+            Self::DoublePrecision => DataType::DoublePrecision,
+            Self::Date => DataType::Date,
+            Self::Time => DataType::Time,
+            Self::TimeTz => DataType::TimeTz,
+            Self::Timestamp => DataType::Timestamp,
+            Self::TimestampTz => DataType::TimestampTz,
+            Self::Interval => DataType::Interval,
         }
     }
 }
@@ -195,6 +241,15 @@ enum Shape {
     Int(i64),
     Text,
     Bytes,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Interval,
 }
 fn check_type(shape: Shape, column: Option<Column<'_>>) -> Checked<()> {
     let Some(column) = column else {
@@ -202,7 +257,16 @@ fn check_type(shape: Shape, column: Option<Column<'_>>) -> Checked<()> {
     };
     invalid(match (shape, column.kind) {
         (Shape::Null, _) => !column.not_null,
-        (Shape::Boolean, Kind::Boolean)
+        (Shape::Date, Kind::Date)
+        | (Shape::Time, Kind::Time)
+        | (Shape::TimeTz, Kind::TimeTz)
+        | (Shape::Timestamp, Kind::Timestamp)
+        | (Shape::TimestampTz, Kind::TimestampTz)
+        | (Shape::Interval, Kind::Interval)
+        | (Shape::Numeric, Kind::Numeric)
+        | (Shape::Real, Kind::Real)
+        | (Shape::DoublePrecision, Kind::DoublePrecision)
+        | (Shape::Boolean, Kind::Boolean)
         | (Shape::Text, Kind::Text)
         | (Shape::Bytes, Kind::Bytes) => true,
         (Shape::Int(n), Kind::SmallInt) => i16::try_from(n).is_ok(),
@@ -403,10 +467,57 @@ impl<S: Sink> Writer<S> {
             Value::Int(n) => (Shape::Int(*n), 9),
             Value::Text(text) => (Shape::Text, text.len()),
             Value::Bytes(bytes) => (Shape::Bytes, bytes.len()),
+            Value::Numeric(n) => (Shape::Numeric, n.to_string().len()),
+            Value::Float4(_) => (Shape::Real, 4),
+            Value::Float8(_) => (Shape::DoublePrecision, 8),
+            Value::Date(_) => (Shape::Date, 4),
+            Value::Time(_) => (Shape::Time, 8),
+            Value::TimeTz(_) => (Shape::TimeTz, 12),
+            Value::Timestamp(_) => (Shape::Timestamp, 8),
+            Value::TimestampTz(_) => (Shape::TimestampTz, 8),
+            Value::Interval(_) => (Shape::Interval, 16),
         };
         check_type(shape, column)?;
         charge(&mut self.remaining_values, bytes)?;
         match value {
+            Value::Date(n) => {
+                self.u8(8)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::Time(n) => {
+                self.u8(9)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::TimeTz(n) => {
+                self.u8(10)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::Timestamp(n) => {
+                self.u8(11)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::TimestampTz(n) => {
+                self.u8(12)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::Interval(n) => {
+                self.u8(13)?;
+                self.sink.write(&n.to_binary())
+            }
+            Value::Numeric(n) => {
+                let t = n.to_string();
+                self.u8(5)?;
+                self.u32(t.len())?;
+                self.sink.write(t.as_bytes())
+            }
+            Value::Float4(n) => {
+                self.u8(6)?;
+                self.sink.write(&n.to_bits().to_be_bytes())
+            }
+            Value::Float8(n) => {
+                self.u8(7)?;
+                self.sink.write(&n.to_bits().to_be_bytes())
+            }
             Value::Null => self.u8(0),
             Value::Bool(b) => {
                 self.u8(1)?;
@@ -660,6 +771,8 @@ struct Reader<'a> {
     offset: usize,
     remaining_values: usize,
     build: bool,
+    typed: bool,
+    temporal: bool,
 }
 // Keep only slices into the validated input between schema and value parsing.
 // A transaction never needs a 64-by-64 descriptor array on the stack.
@@ -700,8 +813,16 @@ impl<'a> Reader<'a> {
             bytes,
             offset: 0,
             remaining_values: MAX_RESULT_BYTES,
+            typed: false,
+            temporal: false,
             build,
         }
+    }
+    fn kind(&mut self) -> Checked<Kind> {
+        let tag = self.u8()?;
+        self.typed |= (6..=8).contains(&tag);
+        self.temporal |= (9..=14).contains(&tag);
+        Kind::parse(tag)
     }
     fn take(&mut self, len: usize) -> Checked<&'a [u8]> {
         let end = self.offset.checked_add(len).ok_or(Fault::Invalid)?;
@@ -763,7 +884,7 @@ impl<'a> Reader<'a> {
             values[index] = Some(Column {
                 id,
                 name,
-                kind: Kind::parse(self.u8()?)?,
+                kind: self.kind()?,
                 not_null: self.boolean()?,
             });
         }
@@ -773,7 +894,7 @@ impl<'a> Reader<'a> {
         Ok(match self.u8()? {
             0 => {
                 let kind = if self.boolean()? {
-                    Some(Kind::parse(self.u8()?)?)
+                    Some(self.kind()?)
                 } else {
                     None
                 };
@@ -821,7 +942,10 @@ impl<'a> Reader<'a> {
         ))
     }
     fn value(&mut self, column: Option<Column<'_>>) -> Checked<Option<Value>> {
-        match self.u8()? {
+        let tag = self.u8()?;
+        self.typed |= (5..=7).contains(&tag);
+        self.temporal |= (8..=13).contains(&tag);
+        match tag {
             0 => {
                 check_type(Shape::Null, column)?;
                 charge(&mut self.remaining_values, 9)?;
@@ -860,6 +984,79 @@ impl<'a> Reader<'a> {
                 } else {
                     None
                 })
+            }
+            5 => {
+                let len = self.u32()?;
+                invalid(len <= giggles_pg_types::MAX_TEXT)?;
+                charge(&mut self.remaining_values, len)?;
+                let t = std::str::from_utf8(self.take(len)?).map_err(|_| Fault::Invalid)?;
+                invalid(crate::pg_serde::canonical_numeric_text(t))?;
+                check_type(Shape::Numeric, column)?;
+                Ok(if self.build {
+                    Some(Value::Numeric(
+                        crate::relational::Numeric::parse(t).map_err(|_| Fault::Invalid)?,
+                    ))
+                } else {
+                    None
+                })
+            }
+            6 => {
+                charge(&mut self.remaining_values, 4)?;
+                let b = u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| Fault::Invalid)?);
+                check_type(Shape::Real, column)?;
+                Ok(self
+                    .build
+                    .then_some(Value::Float4(crate::relational::Float4::from_bits(b))))
+            }
+            7 => {
+                charge(&mut self.remaining_values, 8)?;
+                let b = u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| Fault::Invalid)?);
+                check_type(Shape::DoublePrecision, column)?;
+                Ok(self
+                    .build
+                    .then_some(Value::Float8(crate::relational::Float8::from_bits(b))))
+            }
+            8 => {
+                charge(&mut self.remaining_values, 4)?;
+                check_type(Shape::Date, column)?;
+                let value = crate::relational::Date::from_binary(self.take(4)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::Date(value)))
+            }
+            9 => {
+                charge(&mut self.remaining_values, 8)?;
+                check_type(Shape::Time, column)?;
+                let value = crate::relational::Time::from_binary(self.take(8)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::Time(value)))
+            }
+            10 => {
+                charge(&mut self.remaining_values, 12)?;
+                check_type(Shape::TimeTz, column)?;
+                let value = crate::relational::TimeTz::from_binary(self.take(12)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::TimeTz(value)))
+            }
+            11 => {
+                charge(&mut self.remaining_values, 8)?;
+                check_type(Shape::Timestamp, column)?;
+                let value = crate::relational::Timestamp::from_binary(self.take(8)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::Timestamp(value)))
+            }
+            12 => {
+                charge(&mut self.remaining_values, 8)?;
+                check_type(Shape::TimestampTz, column)?;
+                let value = crate::relational::TimestampTz::from_binary(self.take(8)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::TimestampTz(value)))
+            }
+            13 => {
+                charge(&mut self.remaining_values, 16)?;
+                check_type(Shape::Interval, column)?;
+                let value = crate::relational::Interval::from_binary(self.take(16)?)
+                    .map_err(|_| Fault::Invalid)?;
+                Ok(self.build.then_some(Value::Interval(value)))
             }
             _ => Err(Fault::Invalid),
         }
@@ -1050,7 +1247,7 @@ impl<'a> Reader<'a> {
             None
         })
     }
-    fn result(mut self) -> Checked<Option<(OnceDescription, BusinessResult)>> {
+    fn result(&mut self) -> Checked<Option<(OnceDescription, BusinessResult)>> {
         if self.bytes.len() > MAX_ONCE_RESULT_BYTES {
             return Err(Fault::Bound);
         }
@@ -1082,6 +1279,17 @@ impl<'a> Reader<'a> {
             None
         })
     }
+}
+
+pub(crate) fn contains_temporal(bytes: &[u8]) -> Result<bool, CoreError> {
+    let mut reader = Reader::new(bytes, false);
+    reader.result().map_err(corrupt)?;
+    Ok(reader.temporal)
+}
+pub(crate) fn contains_typed(bytes: &[u8]) -> Result<bool, CoreError> {
+    let mut reader = Reader::new(bytes, false);
+    reader.result().map_err(corrupt)?;
+    Ok(reader.typed)
 }
 
 #[cfg(test)]
@@ -1117,6 +1325,15 @@ mod tests {
             Value::Int(_) => Some(DataType::BigInt),
             Value::Text(_) => Some(DataType::Text),
             Value::Bytes(_) => Some(DataType::Bytes),
+            Value::Numeric(_) => Some(DataType::Numeric),
+            Value::Float4(_) => Some(DataType::Real),
+            Value::Float8(_) => Some(DataType::DoublePrecision),
+            Value::Date(_) => Some(DataType::Date),
+            Value::Time(_) => Some(DataType::Time),
+            Value::TimeTz(_) => Some(DataType::TimeTz),
+            Value::Timestamp(_) => Some(DataType::Timestamp),
+            Value::TimestampTz(_) => Some(DataType::TimestampTz),
+            Value::Interval(_) => Some(DataType::Interval),
         }
     }
     fn fixture_description(result: &BusinessResult) -> OnceDescription {

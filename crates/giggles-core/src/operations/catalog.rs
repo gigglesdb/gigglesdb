@@ -1,5 +1,7 @@
 //! Finite catalog intents over the same typed storage engine as SQL.
 use super::*;
+mod unique;
+pub use unique::*;
 
 /// An unallocated column definition. Stable IDs are assigned only by execution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,18 +10,68 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub not_null: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum CatalogRequest {
     CreateTable {
         table: String,
         columns: Vec<ColumnSpec>,
         primary_key: Vec<String>,
     },
+    /// Exact flat names, nonunique ascending plain-column keys only.
+    CreateIndex {
+        table: String,
+        name: String,
+        columns: Vec<String>,
+    },
+}
+// Preserve the legacy CreateTable decoder while requiring exact new index
+// requests. Unknown options must never disappear during raw request decoding.
+impl<'de> Deserialize<'de> for CatalogRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Index {
+            table: String,
+            name: String,
+            columns: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        enum Wire {
+            CreateTable {
+                table: String,
+                columns: Vec<ColumnSpec>,
+                primary_key: Vec<String>,
+            },
+            CreateIndex(Index),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::CreateTable {
+                table,
+                columns,
+                primary_key,
+            } => Self::CreateTable {
+                table,
+                columns,
+                primary_key,
+            },
+            Wire::CreateIndex(Index {
+                table,
+                name,
+                columns,
+            }) => Self::CreateIndex {
+                table,
+                name,
+                columns,
+            },
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogOutcome {
     pub catalog_epoch: u64,
     pub table: TableDef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_id: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundCatalogDescription {
@@ -58,11 +110,31 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
         .collect()
 }
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
+    if let CatalogRequest::CreateIndex {
+        table,
+        name,
+        columns,
+    } = request
+    {
+        if columns.is_empty() || columns.len() > crate::relational::MAX_COLUMNS {
+            return Err(Error::Limit);
+        }
+        if !identifier(table) || !identifier(name) || columns.iter().any(|c| !identifier(c)) {
+            return Err(Error::Bind("identifier".into()));
+        }
+        if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
+            return Err(Error::Bind("duplicate column".into()));
+        }
+        return validate_size(request);
+    }
     let CatalogRequest::CreateTable {
         table,
         columns,
         primary_key,
-    } = request;
+    } = request
+    else {
+        unreachable!()
+    };
     // Reject caller-owned collections before serialization or definition copies.
     if columns.len() > crate::relational::MAX_COLUMNS
         || primary_key.len() > crate::relational::MAX_COLUMNS
@@ -104,7 +176,46 @@ fn bind_catalog(
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
     let (_, tables) = session.catalog_engine().map_err(core)?;
-    let CatalogRequest::CreateTable { table, .. } = request;
+    if let CatalogRequest::CreateIndex { table, columns, .. } = request {
+        let table = tables
+            .iter()
+            .find(|t| t.name == *table)
+            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+        for name in columns.iter().map(String::as_str).chain(
+            table
+                .primary_key
+                .iter()
+                .map(|p| table.columns[*p].name.as_str()),
+        ) {
+            let column = table
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))?;
+            if !matches!(
+                column.data_type,
+                DataType::Boolean
+                    | DataType::SmallInt
+                    | DataType::Integer
+                    | DataType::BigInt
+                    | DataType::Text
+                    | DataType::Bytes
+            ) {
+                return Err(Error::Unsupported);
+            }
+        }
+        return Ok(BoundCatalogOperation {
+            description: BoundCatalogDescription {
+                contract_version: ENGINE_CONTRACT_VERSION,
+                database_domain,
+                catalog_epoch,
+                request: request.clone(),
+            },
+        });
+    }
+    let CatalogRequest::CreateTable { table, .. } = request else {
+        unreachable!()
+    };
     if tables.iter().any(|existing| existing.name == *table) {
         return Err(core(CoreError::Sql(SqlError::Duplicate)));
     }
@@ -158,6 +269,18 @@ impl Engine {
         &self,
         bind: impl FnOnce(&mut SqlSession) -> Result<BoundCatalogOperation>,
     ) -> Result<CatalogOutcome> {
+        self.execute_catalog_plan_with_index_creator(bind, SqlSession::create_index_engine)
+    }
+    fn execute_catalog_plan_with_index_creator(
+        &self,
+        bind: impl FnOnce(&mut SqlSession) -> Result<BoundCatalogOperation>,
+        create_index: impl FnOnce(
+            &mut SqlSession,
+            &TableDef,
+            &str,
+            &[u64],
+        ) -> std::result::Result<u64, CoreError>,
+    ) -> Result<CatalogOutcome> {
         let mut session = self.admin.sql_session();
         session.begin_engine().map_err(core)?;
         let staged = (|| {
@@ -165,26 +288,60 @@ impl Engine {
             if !session.catalog_empty_engine().map_err(core)? {
                 return Err(Error::PlanRequired);
             }
-            let CatalogRequest::CreateTable {
+            let index_id;
+            let table_name;
+            if let CatalogRequest::CreateIndex {
                 table,
+                name,
                 columns,
-                primary_key,
-            } = &prepared.description.request;
-            session
-                .create_table_engine(
-                    table.clone(),
-                    columns_for_create(columns),
-                    primary_key.clone(),
-                )
-                .map_err(core)?;
+            } = &prepared.description.request
+            {
+                let (_, tables) = session.catalog_engine().map_err(core)?;
+                let definition = tables
+                    .iter()
+                    .find(|t| t.name == *table)
+                    .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+                let ids = columns
+                    .iter()
+                    .map(|name| {
+                        definition
+                            .columns
+                            .iter()
+                            .find(|c| c.name == *name)
+                            .map(|c| c.id)
+                            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                index_id = Some(create_index(&mut session, definition, name, &ids).map_err(core)?);
+                table_name = table;
+            } else {
+                let CatalogRequest::CreateTable {
+                    table,
+                    columns,
+                    primary_key,
+                } = &prepared.description.request
+                else {
+                    unreachable!()
+                };
+                session
+                    .create_table_engine(
+                        table.clone(),
+                        columns_for_create(columns),
+                        primary_key.clone(),
+                    )
+                    .map_err(core)?;
+                table_name = table;
+                index_id = None;
+            }
             let (catalog_epoch, tables) = session.catalog_engine().map_err(core)?;
             let table = tables
                 .into_iter()
-                .find(|created| created.name == *table)
+                .find(|created| created.name == *table_name)
                 .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
             Ok(CatalogOutcome {
                 catalog_epoch,
                 table,
+                index_id,
             })
         })();
         let outcome = match staged {

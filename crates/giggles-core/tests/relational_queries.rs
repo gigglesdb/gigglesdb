@@ -309,7 +309,7 @@ fn aggregates_empty_null_negative_duplicate_and_join() {
         vec![vec![
             V::Int(4),
             V::Int(3),
-            V::Int(-19),
+            V::Numeric(giggles_core::relational::Numeric::parse("-19").unwrap()),
             V::Int(-8),
             V::Int(-3)
         ]]
@@ -320,7 +320,10 @@ fn aggregates_empty_null_negative_duplicate_and_join() {
             &mut s,
             "SELECT COUNT(*),SUM(j.wage) FROM jobs j JOIN people p ON p.id=j.person"
         )),
-        vec![vec![V::Int(3), V::Int(-19)]]
+        vec![vec![
+            V::Int(3),
+            V::Numeric(giggles_core::relational::Numeric::parse("-19").unwrap())
+        ]]
     );
     assert!(run(&mut s, q).rows.iter().all(|r| r.version == 0));
 }
@@ -331,10 +334,16 @@ fn checked_sum_overflow_and_group_rejection() {
     for (id, w) in [(1, i64::MAX), (2, 1)] {
         run(&mut s, &format!("INSERT INTO jobs VALUES({id},NULL,{w})"));
     }
-    err(
-        &mut s,
-        "SELECT SUM(j.wage) FROM jobs j LIMIT 0",
-        E::Overflow,
+    assert!(
+        run(&mut s, "SELECT SUM(j.wage) FROM jobs j LIMIT 0")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        vals(run(&mut s, "SELECT SUM(j.wage) FROM jobs j")),
+        vec![vec![V::Numeric(
+            giggles_core::relational::Numeric::parse("9223372036854775808").unwrap()
+        )]]
     );
     err(&mut s, "SELECT j.id,COUNT(*) FROM jobs j", E::Unsupported);
     err(
@@ -588,7 +597,7 @@ fn stable_sort_null_order_and_global_limit() {
             &mut s,
             "SELECT j.id FROM jobs j ORDER BY j.wage ASC LIMIT 3"
         )),
-        vec![vec![V::Int(1)], vec![V::Int(2)], vec![V::Int(3)]]
+        vec![vec![V::Int(2)], vec![V::Int(3)], vec![V::Int(4)]]
     );
     assert_eq!(
         vals(run(
@@ -596,10 +605,10 @@ fn stable_sort_null_order_and_global_limit() {
             "SELECT j.id FROM jobs j ORDER BY j.wage DESC,j.id DESC LIMIT 4"
         )),
         vec![
+            vec![V::Int(1)],
             vec![V::Int(4)],
             vec![V::Int(3)],
-            vec![V::Int(2)],
-            vec![V::Int(1)]
+            vec![V::Int(2)]
         ]
     );
     assert!(
@@ -712,6 +721,11 @@ fn aggregate_names_are_identifiers_unless_followed_by_parenthesis() {
             &mut s,
             "SELECT COUNT(*),SUM(sum),MIN(min),MAX(max) FROM metrics"
         )),
-        vec![vec![V::Int(1), V::Int(10), V::Int(11), V::Int(12)]]
+        vec![vec![
+            V::Int(1),
+            V::Numeric(giggles_core::relational::Numeric::parse("10").unwrap()),
+            V::Int(11),
+            V::Int(12)
+        ]]
     );
 }

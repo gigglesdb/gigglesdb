@@ -380,6 +380,15 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
         ScalarType::BigInt => (20, "int8", 8, 1016),
         ScalarType::Text => (25, "text", -1, 1009),
         ScalarType::Bytes => (17, "bytea", -1, 1001),
+        ScalarType::Numeric => (1700, "numeric", -1, 1231),
+        ScalarType::Real => (700, "float4", 4, 1021),
+        ScalarType::DoublePrecision => (701, "float8", 8, 1022),
+        ScalarType::Date => (1082, "date", 4, 1182),
+        ScalarType::Time => (1083, "time", 8, 1183),
+        ScalarType::TimeTz => (1266, "timetz", 12, 1270),
+        ScalarType::Timestamp => (1114, "timestamp", 8, 1115),
+        ScalarType::TimestampTz => (1184, "timestamptz", 8, 1185),
+        ScalarType::Interval => (1186, "interval", 16, 1187),
     }
 }
 pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>> {
@@ -544,6 +553,15 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ScalarType::BigInt,
         ScalarType::Text,
         ScalarType::Bytes,
+        ScalarType::Numeric,
+        ScalarType::Real,
+        ScalarType::DoublePrecision,
+        ScalarType::Date,
+        ScalarType::Time,
+        ScalarType::TimeTz,
+        ScalarType::Timestamp,
+        ScalarType::TimestampTz,
+        ScalarType::Interval,
     ] {
         let (oid, name, len, array) = scalar(ty);
         add("pg_type", type_row(oid, name, len, 0, array, false));
@@ -773,8 +791,12 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             "A"
         } else if oid == 16 {
             "B"
-        } else if matches!(oid, 20 | 21 | 23 | 26) {
+        } else if matches!(oid, 20 | 21 | 23 | 26 | 700 | 701 | 1700) {
             "N"
+        } else if matches!(oid, 1082 | 1083 | 1266 | 1114 | 1184) {
+            "D"
+        } else if oid == 1186 {
+            "T"
         } else if matches!(oid, 17 | 28 | 1033) {
             "U"
         } else if oid == 18 {

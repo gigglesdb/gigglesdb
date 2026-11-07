@@ -521,7 +521,9 @@ fn sql_sum_and_expression_rejections_keep_existing_contract() {
             .unwrap()
             .rows[0]
             .values,
-        [V::Int(-5)]
+        [V::Numeric(
+            giggles_core::relational::Numeric::parse("-5").unwrap()
+        )]
     );
     let before = rows(&admin);
     for source in [
@@ -543,15 +545,20 @@ fn sql_sum_and_expression_rejections_keep_existing_contract() {
     )
     .unwrap();
     let before = rows(&admin);
-    for source in [
-        "SELECT SUM(n.n) FROM numbers n",
-        "SELECT SUM(n.n) FROM numbers n LIMIT 0",
-    ] {
-        assert_eq!(
-            sql.execute(source, &[], None),
-            Err(CoreError::Sql(SqlError::Overflow)),
-            "{source}"
-        );
-    }
+    assert_eq!(
+        sql.execute("SELECT SUM(n.n) FROM numbers n", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        [V::Numeric(
+            giggles_core::relational::Numeric::parse("9223372036854775809").unwrap()
+        )]
+    );
+    assert!(
+        sql.execute("SELECT SUM(n.n) FROM numbers n LIMIT 0", &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     assert_eq!(rows(&admin), before);
 }

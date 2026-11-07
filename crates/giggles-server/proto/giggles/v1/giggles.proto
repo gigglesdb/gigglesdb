@@ -46,6 +46,16 @@ message Value {
     sint64 int_value = 3;
     string text_value = 4;
     bytes bytes_value = 5;
+    string numeric_value = 6;
+    fixed32 float4_bits = 7;
+    fixed64 float8_bits = 8;
+    bytes date_binary = 9;
+    bytes time_binary = 10;
+    bytes timetz_binary = 11;
+    bytes timestamp_binary = 12;
+    bytes timestamptz_binary = 13;
+    bytes interval_binary = 14;
+
   }
 }
 message PreviewRequest { TaskRequest request = 1; }
@@ -506,6 +516,16 @@ enum NativeDataType {
   NATIVE_DATA_TYPE_BIG_INT = 4;
   NATIVE_DATA_TYPE_TEXT = 5;
   NATIVE_DATA_TYPE_BYTES = 6;
+  NATIVE_DATA_TYPE_NUMERIC = 7;
+  NATIVE_DATA_TYPE_REAL = 8;
+  NATIVE_DATA_TYPE_DOUBLE_PRECISION = 9;
+  NATIVE_DATA_TYPE_DATE = 10;
+  NATIVE_DATA_TYPE_TIME = 11;
+  NATIVE_DATA_TYPE_TIMETZ = 12;
+  NATIVE_DATA_TYPE_TIMESTAMP = 13;
+  NATIVE_DATA_TYPE_TIMESTAMPTZ = 14;
+  NATIVE_DATA_TYPE_INTERVAL = 15;
+
 }
 
 message NativeError {

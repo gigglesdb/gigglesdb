@@ -264,6 +264,39 @@ pub(super) fn decode_value(value: Json) -> Result<proto::Value, ApiError> {
             Json::Bool(v) => P::BoolValue(v),
             _ => return Err(ApiError::InvalidArgument),
         },
+        "dateBinary" => P::DateBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "timeBinary" => P::TimeBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "timetzBinary" => P::TimetzBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "timestampBinary" => P::TimestampBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "timestamptzBinary" => P::TimestamptzBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "intervalBinary" => P::IntervalBinary(
+            STANDARD
+                .decode(text(value)?)
+                .map_err(|_| ApiError::InvalidArgument)?,
+        ),
+        "numericValue" => P::NumericValue(text(value)?),
+        "float4Bits" => P::Float4Bits(uint32(value)?),
+        "float8Bits" => P::Float8Bits(uint(value)?),
         "intValue" => P::IntValue(int(value)?),
         "textValue" => P::TextValue(text(value)?),
         "bytesValue" => {
@@ -415,6 +448,21 @@ impl Serialize for JsonValue<'_> {
             Some(P::IntValue(v)) => map.serialize_entry("intValue", &Decimal(v))?,
             Some(P::TextValue(v)) => map.serialize_entry("textValue", v)?,
             Some(P::BytesValue(v)) => map.serialize_entry("bytesValue", &Base64(v))?,
+            Some(P::DateBinary(v)) => map.serialize_entry("dateBinary", &STANDARD.encode(v))?,
+            Some(P::TimeBinary(v)) => map.serialize_entry("timeBinary", &STANDARD.encode(v))?,
+            Some(P::TimetzBinary(v)) => map.serialize_entry("timetzBinary", &STANDARD.encode(v))?,
+            Some(P::TimestampBinary(v)) => {
+                map.serialize_entry("timestampBinary", &STANDARD.encode(v))?
+            }
+            Some(P::TimestamptzBinary(v)) => {
+                map.serialize_entry("timestamptzBinary", &STANDARD.encode(v))?
+            }
+            Some(P::IntervalBinary(v)) => {
+                map.serialize_entry("intervalBinary", &STANDARD.encode(v))?
+            }
+            Some(P::NumericValue(v)) => map.serialize_entry("numericValue", v)?,
+            Some(P::Float4Bits(v)) => map.serialize_entry("float4Bits", v)?,
+            Some(P::Float8Bits(v)) => map.serialize_entry("float8Bits", &Decimal(v))?,
             _ => return Err(S::Error::custom("invalid output value")),
         }
         map.end()

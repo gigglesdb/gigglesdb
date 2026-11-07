@@ -213,7 +213,16 @@ impl OutboxTransaction {
                 n.checked_add(match v {
                     Value::Text(s) => s.len(),
                     Value::Bytes(b) => b.len(),
-                    _ => 9,
+                    Value::Numeric(n) => n.to_string().len(),
+                    Value::Date(_) => 4,
+                    Value::Time(_) => 8,
+                    Value::TimeTz(_) => 12,
+                    Value::Timestamp(_) => 8,
+                    Value::TimestampTz(_) => 8,
+                    Value::Interval(_) => 16,
+                    Value::Float4(_) => 4,
+                    Value::Float8(_) => 8,
+                    Value::Null | Value::Bool(_) | Value::Int(_) => 9,
                 })
                 .ok_or(Error::Limit)
             })?;

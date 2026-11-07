@@ -20,6 +20,31 @@ enum Record {
         rows: usize,
     },
 }
+pub(crate) fn profile(tables: &[Table]) -> (u32, &'static str) {
+    if tables.iter().flat_map(|t| &t.columns).any(|c| {
+        matches!(
+            c.data_type,
+            DataType::Date
+                | DataType::Time
+                | DataType::TimeTz
+                | DataType::Timestamp
+                | DataType::TimestampTz
+                | DataType::Interval
+        )
+    }) {
+        return (3, "giggles-logical-v3-temporal");
+    }
+    if tables.iter().flat_map(|t| &t.columns).any(|c| {
+        matches!(
+            c.data_type,
+            DataType::Numeric | DataType::Real | DataType::DoublePrecision
+        )
+    }) {
+        (2, "giggles-logical-v2-numeric")
+    } else {
+        (1, "giggles-logical-v1")
+    }
+}
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -169,7 +194,16 @@ pub(crate) fn validate(a: &Archive, bounds: Bounds) -> Result<()> {
                     (Value::Int(_), DataType::BigInt)
                     | (Value::Bool(_), DataType::Boolean)
                     | (Value::Text(_), DataType::Text)
-                    | (Value::Bytes(_), DataType::Bytes) => true,
+                    | (Value::Bytes(_), DataType::Bytes)
+                    | (Value::Numeric(_), DataType::Numeric)
+                    | (Value::Float4(_), DataType::Real)
+                    | (Value::Float8(_), DataType::DoublePrecision)
+                    | (Value::Date(_), DataType::Date)
+                    | (Value::Time(_), DataType::Time)
+                    | (Value::TimeTz(_), DataType::TimeTz)
+                    | (Value::Timestamp(_), DataType::Timestamp)
+                    | (Value::TimestampTz(_), DataType::TimestampTz)
+                    | (Value::Interval(_), DataType::Interval) => true,
                     _ => false,
                 };
                 if !valid {
@@ -179,7 +213,16 @@ pub(crate) fn validate(a: &Archive, bounds: Bounds) -> Result<()> {
                     .checked_add(match &v {
                         Value::Text(s) => s.len(),
                         Value::Bytes(b) => b.len(),
-                        _ => 9,
+                        Value::Numeric(n) => n.to_string().len(),
+                        Value::Date(_) => 4,
+                        Value::Time(_) => 8,
+                        Value::TimeTz(_) => 12,
+                        Value::Timestamp(_) => 8,
+                        Value::TimestampTz(_) => 8,
+                        Value::Interval(_) => 16,
+                        Value::Float4(_) => 4,
+                        Value::Float8(_) => 8,
+                        Value::Null | Value::Bool(_) | Value::Int(_) => 9,
                     })
                     .ok_or(Error::Limit)?;
                 if payload > relational::MAX_ROW_BYTES {
@@ -209,8 +252,8 @@ fn line(record: &Record) -> Result<Vec<u8>> {
 }
 pub(crate) fn header_charge(tables: &[Table], b: Bounds) -> Result<usize> {
     let size = line(&Record::Header {
-        format: 1,
-        profile: "giggles-logical-v1".into(),
+        format: profile(tables).0,
+        profile: profile(tables).1.into(),
         tables: tables.to_vec(),
     })?
     .len();
@@ -247,8 +290,8 @@ pub fn encode(a: &Archive, b: Bounds) -> Result<Vec<u8>> {
     append(
         &mut out,
         &Record::Header {
-            format: 1,
-            profile: "giggles-logical-v1".into(),
+            format: profile(&a.tables).0,
+            profile: profile(&a.tables).1.into(),
             tables: a.tables.clone(),
         },
         b,
@@ -282,6 +325,8 @@ pub fn decode(bytes: &[u8], b: Bounds) -> Result<Archive> {
         return Err(invalid("missing final newline"));
     }
     let mut archive = None;
+    let mut typed_profile = false;
+    let mut temporal_profile = false;
     let mut offset = 0usize;
     let mut footer = false;
     let mut previous_table = 0usize;
@@ -292,6 +337,87 @@ pub fn decode(bytes: &[u8], b: Bounds) -> Result<Archive> {
         }
         if footer {
             return Err(invalid("trailing record"));
+        }
+        // Gate the header before deserializing schemas with extended enum tags.
+        if offset == 0 {
+            let header: serde_json::Value =
+                serde_json::from_slice(raw).map_err(|_| invalid("JSON header"))?;
+            let pair = (header["format"].as_u64(), header["profile"].as_str());
+            if !matches!(
+                pair,
+                (Some(1), Some("giggles-logical-v1"))
+                    | (Some(2), Some("giggles-logical-v2-numeric"))
+                    | (Some(3), Some("giggles-logical-v3-temporal"))
+            ) {
+                return Err(invalid("header/version/profile"));
+            }
+            typed_profile = matches!(pair.0, Some(2 | 3));
+            temporal_profile = pair.0 == Some(3);
+            if !temporal_profile
+                && header["tables"].as_array().is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        t["columns"].as_array().is_some_and(|cs| {
+                            cs.iter().any(|c| {
+                                matches!(
+                                    c["data_type"].as_str(),
+                                    Some(
+                                        "Date"
+                                            | "Time"
+                                            | "TimeTz"
+                                            | "Timestamp"
+                                            | "TimestampTz"
+                                            | "Interval"
+                                    )
+                                )
+                            })
+                        })
+                    })
+                })
+            {
+                return Err(invalid("temporal schema requires v3"));
+            }
+            if pair.0 == Some(1)
+                && header["tables"].as_array().is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        t["columns"].as_array().is_some_and(|cs| {
+                            cs.iter().any(|c| {
+                                matches!(
+                                    c["data_type"].as_str(),
+                                    Some("Numeric" | "Real" | "DoublePrecision")
+                                )
+                            })
+                        })
+                    })
+                })
+            {
+                return Err(invalid("typed schema requires v2"));
+            }
+        }
+        if offset != 0 && !temporal_profile {
+            let record: serde_json::Value =
+                serde_json::from_slice(raw).map_err(|_| invalid("JSON record"))?;
+            if record["values"].as_array().is_some_and(|vs| {
+                vs.iter().any(|v| {
+                    matches!(
+                        v["type"].as_str(),
+                        Some(
+                            "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "interval"
+                        )
+                    )
+                })
+            }) {
+                return Err(invalid("temporal cells require v3"));
+            }
+        }
+        if offset != 0 && !typed_profile {
+            let record: serde_json::Value =
+                serde_json::from_slice(raw).map_err(|_| invalid("JSON record"))?;
+            if record["values"].as_array().is_some_and(|vs| {
+                vs.iter()
+                    .any(|v| matches!(v["type"].as_str(), Some("numeric" | "float4" | "float8")))
+            }) {
+                return Err(invalid("typed cells require v2"));
+            }
         }
         let r: Record = serde_json::from_slice(raw).map_err(|_| invalid("JSON record"))?;
         if line(&r)? != raw {
@@ -305,8 +431,7 @@ pub fn decode(bytes: &[u8], b: Bounds) -> Result<Archive> {
             } => {
                 if archive.is_some()
                     || offset != 0
-                    || format != 1
-                    || profile != "giggles-logical-v1"
+                    || (format, profile.as_str()) != self::profile(&tables)
                 {
                     return Err(invalid("header/version/profile"));
                 }
@@ -359,12 +484,21 @@ pub(crate) fn create_sql(t: &Table) -> String {
                 "{} {}{}",
                 c.name,
                 match c.data_type {
+                    DataType::Date => "DATE",
+                    DataType::Time => "TIME",
+                    DataType::TimeTz => "TIMETZ",
+                    DataType::Timestamp => "TIMESTAMP",
+                    DataType::TimestampTz => "TIMESTAMPTZ",
+                    DataType::Interval => "INTERVAL",
                     DataType::Boolean => "BOOLEAN",
                     DataType::SmallInt => "SMALLINT",
                     DataType::Integer => "INTEGER",
                     DataType::BigInt => "BIGINT",
                     DataType::Text => "TEXT",
                     DataType::Bytes => "BYTEA",
+                    DataType::Numeric => "NUMERIC",
+                    DataType::Real => "REAL",
+                    DataType::DoublePrecision => "DOUBLE PRECISION",
                 },
                 if c.not_null { " NOT NULL" } else { "" }
             )
