@@ -26,3 +26,5 @@ pub(crate) mod ssi_validate;
 
 #[cfg(test)]
 mod history_tests;
+
+pub(crate) mod kernel;

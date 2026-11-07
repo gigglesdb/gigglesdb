@@ -274,7 +274,7 @@ impl Transaction {
         value: Option<Vec<u8>>,
     ) -> Result<(), TxnError> {
         self.snapshot_ts();
-        if if ks == Keyspace::Catalog {
+        if if matches!(ks, Keyspace::Catalog | Keyspace::Kernel) {
             key.is_empty()
         } else {
             key.len() < 8

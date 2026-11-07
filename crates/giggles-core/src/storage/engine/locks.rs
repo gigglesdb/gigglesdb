@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 /// serializes concurrent DDL on the same relation name.
 pub(crate) const CATALOG_NAME_INDEX: u64 = u64::MAX;
 
+/// Reserved table lock serializing kernel image read/modify/write transactions.
+pub(crate) const KERNEL_LOCK_TABLE: u64 = u64::MAX - 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TxnId(pub u64);
 
