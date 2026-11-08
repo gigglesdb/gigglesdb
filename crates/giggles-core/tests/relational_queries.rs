@@ -90,14 +90,6 @@ fn invalid_scope_duplicate_and_ambiguous_names() {
             "SELECT p.id AS x,p.manager AS x FROM people p LIMIT 1",
             E::Duplicate,
         ),
-        (
-            "SELECT p.id FROM people p JOIN jobs j ON j.person=p.id",
-            E::Unbounded,
-        ),
-        (
-            "SELECT p.id FROM people p JOIN jobs j ON j.id>p.id",
-            E::Unsupported,
-        ),
         ("SELECT p.id FROM people p JOIN jobs j", E::Syntax),
         (
             "SELECT p.id FROM people p CROSS JOIN jobs j",
@@ -105,6 +97,12 @@ fn invalid_scope_duplicate_and_ambiguous_names() {
         ),
     ] {
         err(&mut s, q, e);
+    }
+    for q in [
+        "SELECT p.id FROM people p JOIN jobs j ON j.person=p.id",
+        "SELECT p.id FROM people p JOIN jobs j ON j.id>p.id",
+    ] {
+        assert!(run(&mut s, q).rows.is_empty(), "{q}");
     }
     let p = s
         .prepare("SELECT p.id FROM people p JOIN jobs j ON j.id=p.id")
@@ -214,10 +212,10 @@ fn indexed_join_multiplicity_left_null_self_and_composite() {
         .rows
         .is_empty()
     );
-    err(
-        &mut s,
-        "SELECT j.id FROM jobs j JOIN pairs x ON x.a=j.id",
-        E::Unbounded,
+    assert!(
+        run(&mut s, "SELECT j.id FROM jobs j JOIN pairs x ON x.a=j.id")
+            .rows
+            .is_empty()
     );
     run(&mut s, "INSERT INTO jobs VALUES(14,2,1)");
     assert_eq!(
@@ -488,7 +486,11 @@ fn bytes_boundary_no_partial_result() {
         32
     );
     // LIMIT 0 emits no projected bytes, even when the full projection would overflow.
-    assert!(run(&mut s, "SELECT p.body,p.body FROM payloads p LIMIT 0").rows.is_empty());
+    assert!(
+        run(&mut s, "SELECT p.body,p.body FROM payloads p LIMIT 0")
+            .rows
+            .is_empty()
+    );
     s.rollback();
     run(&mut s, "BEGIN");
     for id in 0..32 {
@@ -501,7 +503,11 @@ fn bytes_boundary_no_partial_result() {
     }
     s.execute("INSERT INTO payloads VALUES(32,$1)", &[body], None)
         .unwrap();
-    assert!(run(&mut s, "SELECT p.body FROM payloads p LIMIT 0").rows.is_empty());
+    assert!(
+        run(&mut s, "SELECT p.body FROM payloads p LIMIT 0")
+            .rows
+            .is_empty()
+    );
     s.rollback();
 }
 
@@ -669,7 +675,9 @@ fn indexed_point_explain_metadata_and_version_preservation() {
     schema(&mut s);
     run(&mut s, "INSERT INTO people VALUES(1,NULL,'x')");
     let plain = s.prepare("SELECT id FROM people WHERE id=$1").unwrap();
-    let aliased = s.prepare("SELECT p.id FROM people p WHERE p.id=$1").unwrap();
+    let aliased = s
+        .prepare("SELECT p.id FROM people p WHERE p.id=$1")
+        .unwrap();
     assert_eq!(plain.command(), "SELECT");
     assert_eq!(plain.table(), Some("people"));
     let plain_description = s.describe(&plain).unwrap();

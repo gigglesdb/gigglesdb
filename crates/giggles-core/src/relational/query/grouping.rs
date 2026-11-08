@@ -334,7 +334,6 @@ fn resolve_output(
 pub(super) fn bind<'a>(
     q: &'a Query,
     tables: &[&'a TableDef],
-    joins: Vec<BoundJoin>,
     mut parameters: Vec<Option<DataType>>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
 ) -> R<BoundQuery<'a>> {
@@ -676,6 +675,7 @@ pub(super) fn bind<'a>(
         .where_filter()
         .map(|f| f.bind(&parameters, resolve, tables))
         .transpose()?;
+    let joins = q.bind_joins(tables, &mut parameters, resolve)?;
     let parameters = parameters
         .into_iter()
         .map(|p| p.ok_or(SqlError::Parameters))
@@ -736,62 +736,6 @@ fn page_expr(expr: Option<&Expr>, params: &[Value]) -> R<Option<u64>> {
         Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
         _ => Err(SqlError::Limit),
     }
-}
-// Stream each join branch without retaining a Cartesian product. Only the
-// grouped path uses scan joins; ordinary queries still require right-side PKs.
-fn visit_joins(
-    query: &BoundQuery<'_>,
-    source: &dyn scan::RowSource,
-    index: usize,
-    row: &mut Tuple,
-    meter: &mut scan::Meter<'_>,
-    work: &mut usize,
-    accept: &mut impl FnMut(&Tuple) -> R<()>,
-) -> R<()> {
-    let Some(join) = query.joins.get(index) else {
-        return accept(row);
-    };
-    let table = query.tables[index + 1];
-    let mut matched = false;
-    if join.scan {
-        let range = scan::KeyRange {
-            lo: std::ops::Bound::Unbounded,
-            hi: std::ops::Bound::Unbounded,
-        };
-        for candidate in source.scan(table, &range, scan::Direction::Forward)? {
-            meter.tick()?;
-            *work = work.checked_add(1).ok_or(SqlError::Limit)?;
-            if *work > scan::MAX_QUERY_ROWS {
-                return Err(SqlError::Limit);
-            }
-            let candidate = candidate?;
-            if join.matches(row, &candidate.row.values)? {
-                matched = true;
-                row.values.push(candidate.row.values.clone());
-                visit_joins(query, source, index + 1, row, meter, work, accept)?;
-                row.values.pop();
-            }
-        }
-    } else {
-        let found = match join.key(row)? {
-            Some(key) => source.get(table, &encode_key(&key)?)?,
-            None => None,
-        };
-        if let Some(candidate) = found
-            && join.matches(row, &candidate.row.values)?
-        {
-            matched = true;
-            row.values.push(candidate.row.values.clone());
-            visit_joins(query, source, index + 1, row, meter, work, accept)?;
-            row.values.pop();
-        }
-    }
-    if !matched && join.left {
-        row.values.push(vec![Value::Null; table.columns.len()]);
-        visit_joins(query, source, index + 1, row, meter, work, accept)?;
-        row.values.pop();
-    }
-    Ok(())
 }
 impl Grouping {
     fn initial(&self) -> Vec<Value> {
@@ -912,22 +856,9 @@ impl Grouping {
                     lo: std::ops::Bound::Unbounded,
                     hi: std::ops::Bound::Unbounded,
                 };
-                for input in source.scan(query.tables[0], &range, scan::Direction::Forward)? {
-                    meter.tick()?;
-                    let input = input?;
-                    let mut row = Tuple {
-                        values: vec![input.row.values.clone()],
-                        version: 0,
-                    };
-                    visit_joins(
-                        query,
-                        source,
-                        0,
-                        &mut row,
-                        &mut meter,
-                        &mut join_work,
-                        &mut accept,
-                    )?;
+                let input = source.scan(query.tables[0], &range, scan::Direction::Forward)?;
+                for row in join_rows(query, source, input, params, &mut meter, &mut join_work) {
+                    accept(&row?)?;
                 }
             }
         }
@@ -1053,6 +984,7 @@ impl Grouping {
     ) {
         for join in joins {
             join.clock = clock.cloned();
+            join.on.attach_clock(clock);
         }
         for s in self
             .keys
@@ -1169,6 +1101,23 @@ mod tests {
                 .unwrap();
         }
         let before = bincode::serialize(&state).unwrap();
+        let ordinary = query(
+            "SELECT group_cap.id,group_scan.id FROM group_cap LEFT JOIN group_scan ON group_cap.id=group_scan.g",
+        );
+        let ordinary = ordinary.bind(&state, 0, &[]).unwrap();
+        // Ordinary execution shares the same per-inner-candidate cancel fences.
+        for fence in [3, 4, 5] {
+            let mut polls = 0;
+            assert_eq!(
+                ordinary.execute(&state, &scan::LegacyRows(&state), &[], &mut || {
+                    polls += 1;
+                    polls == fence
+                }),
+                Err(SqlError::Aborted)
+            );
+            assert_eq!(polls, fence);
+            assert_eq!(bincode::serialize(&state).unwrap(), before);
+        }
         let query = query(
             "SELECT group_cap.id,count(group_scan.id) FROM group_cap LEFT JOIN group_scan ON group_cap.id=group_scan.g GROUP BY group_cap.id ORDER BY group_cap.id",
         );

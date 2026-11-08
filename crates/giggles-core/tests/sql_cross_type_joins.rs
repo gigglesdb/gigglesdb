@@ -162,15 +162,15 @@ fn keyed_numeric_cross_type_joins() {
             (5, Some(30)),
         ],
     );
-    for (l, t) in [("f", "ki"), ("f", "kn"), ("r", "kn")] {
-        for on in [format!("p.{l}=x.k"), format!("x.k=p.{l}")] {
-            let sql = format!("SELECT p.id,x.v FROM p JOIN {t} x ON {on}");
-            assert_eq!(
-                s.execute_at(&sql, &[], None, &c),
-                Err(CoreError::Sql(SqlError::Unsupported)),
-                "{sql}"
-            );
-        }
+    // Float keys against integer/numeric keys cannot use the typed point probe
+    // (one float can equal several distinct keys), so they run as scan joins
+    // with the full ON condition. PG18.6 results (wo-join-left/pg-probes.txt).
+    for (l, t, e) in [
+        ("f", "ki", vec![(1, 10), (5, 30)]),
+        ("f", "kn", vec![(1, 10), (2, 40), (4, 15), (5, 30)]),
+        ("r", "kn", vec![(1, 10), (4, 15), (5, 30)]),
+    ] {
+        inner(&mut s, &c, t, l, "k", false, &e);
     }
 }
 #[test]
@@ -217,13 +217,14 @@ fn grouped_numeric_and_time_interval_joins() {
             ),
             vec![vec![Value::Int(1)]]
         );
-        // A non-key join without grouping keeps the existing bounded-join
-        // limit, exactly as a same-type non-key join does.
-        let sql = format!("SELECT count(*) FROM p JOIN q ON {on}");
+        // A non-key join without grouping runs as a bounded scan join (PG18.6: 1).
         assert_eq!(
-            s.execute_at(&sql, &[], None, &c),
-            Err(CoreError::Sql(SqlError::Unbounded)),
-            "{sql}"
+            run(
+                &mut s,
+                &c,
+                &format!("SELECT count(*) FROM p JOIN q ON {on}")
+            ),
+            vec![vec![Value::Int(1)]]
         );
     }
     for (l, r) in [("i", "d"), ("ttz", "iv")] {

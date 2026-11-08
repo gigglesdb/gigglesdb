@@ -351,7 +351,7 @@ fn replace_argument_aggregates(
                 *parameter = Some(DataType::Text);
             }
         }
-        let bound = grouping::bind(&query, tables, vec![], isolated, resolve)?;
+        let bound = grouping::bind(&query, tables, isolated, resolve)?;
         let ty = bound
             .columns
             .first()

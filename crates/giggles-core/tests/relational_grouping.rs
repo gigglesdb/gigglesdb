@@ -482,14 +482,18 @@ fn declared_primary_key_dependency_runs_django_left_join_shape() {
             vec![V::Int(3), text("Cy"), V::Int(20), V::Int(0)],
         ]
     );
-    // The grouping extension leaves ordinary non-key joins bounded as before.
+    // PostgreSQL 18.6: ordinary non-key LEFT joins preserve unmatched rows.
     assert_eq!(
-        s.execute(
-            "SELECT t.id,u.name FROM t LEFT JOIN u ON t.id=u.t_id",
-            &[],
-            None
+        rows(
+            &mut s,
+            "SELECT t.id,u.name FROM t LEFT JOIN u ON t.id=u.t_id ORDER BY t.id,u.name"
         ),
-        Err(CoreError::Sql(E::Unbounded))
+        vec![
+            vec![V::Int(1), text("one")],
+            vec![V::Int(1), text("two")],
+            vec![V::Int(2), text("three")],
+            vec![V::Int(3), V::Null]
+        ]
     );
 }
 #[test]
@@ -674,7 +678,7 @@ fn expressions_heaps_and_unique_indexes_do_not_establish_group_dependency() {
     }
 }
 #[test]
-fn grouped_scan_join_work_is_bounded_before_output_limit() {
+fn grouped_scan_join_above_legacy_cap_preserves_group_counts() {
     let (_a, mut s) = db();
     run(&mut s, "CREATE TABLE join_cap_t(id int PRIMARY KEY)");
     run(
@@ -693,8 +697,7 @@ fn grouped_scan_join_work_is_bounded_before_output_limit() {
             .join(",");
         run(&mut s, &format!("INSERT INTO join_cap_u VALUES {values}"));
     }
-    // 256 x 256 candidates reach the cap successfully; one more left row
-    // exceeds it, regardless of the final output limit.
+    // Verify both sides of the former 65,536 candidate boundary.
     assert_eq!(
         rows(
             &mut s,
@@ -703,7 +706,15 @@ fn grouped_scan_join_work_is_bounded_before_output_limit() {
         vec![vec![V::Int(256)]]
     );
     run(&mut s, "INSERT INTO join_cap_t VALUES(257)");
-    assert_eq!(s.execute("SELECT count(u.id) FROM join_cap_t t LEFT JOIN join_cap_u u ON t.id=u.t_id GROUP BY t.id LIMIT 1",&[],None),Err(CoreError::Sql(E::Limit)));
+    assert_eq!(
+        rows(
+            &mut s,
+            "SELECT t.id,count(u.id) FROM join_cap_t t LEFT JOIN join_cap_u u ON t.id=u.t_id GROUP BY t.id ORDER BY t.id"
+        ),
+        (1..=257)
+            .map(|id| vec![V::Int(id), V::Int(if id == 1 { 256 } else { 0 })])
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

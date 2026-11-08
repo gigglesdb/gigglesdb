@@ -132,36 +132,26 @@ enum Item {
 #[derive(Debug, Clone)]
 struct Join {
     left: bool,
-    equalities: Vec<(ColumnRef, ColumnRef)>,
+    on: Filter,
 }
 impl Join {
-    fn parse_equalities(
-        p: &mut Parser,
-        equalities: &mut Vec<(ColumnRef, ColumnRef)>,
-        depth: usize,
-    ) -> R<()> {
-        if depth > 32 {
-            return Err(SqlError::Limit);
-        }
-        loop {
-            if p.sym('(') {
-                Self::parse_equalities(p, equalities, depth + 1)?;
-                p.punct(')')?;
-            } else {
-                let a = p.column_ref()?;
-                if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
-                    return Err(SqlError::Unsupported);
+    // Only equalities required by an AND chain may narrow the candidate set.
+    fn equalities(&self) -> Vec<(&ColumnRef, &ColumnRef)> {
+        fn collect<'a>(f: &'a Filter, out: &mut Vec<(&'a ColumnRef, &'a ColumnRef)>) {
+            match f {
+                Filter::Compare(Scalar::Column(a), op, Scalar::Column(b)) if op == "=" => {
+                    out.push((a, b))
                 }
-                p.at += 1;
-                equalities.push((a, p.column_ref()?));
-                if equalities.len() > MAX_COLUMNS {
-                    return Err(SqlError::Limit);
+                Filter::Logic(a, true, b) => {
+                    collect(a, out);
+                    collect(b, out);
                 }
-            }
-            if !p.word("and") {
-                return Ok(());
+                _ => {}
             }
         }
+        let mut out = vec![];
+        collect(&self.on, &mut out);
+        out
     }
 }
 #[derive(Debug, Clone)]
@@ -431,8 +421,7 @@ impl Filter {
             if not {
                 p.at += 1;
             }
-            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike")
-            {
+            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike") {
                 let insensitive = p.word("ilike");
                 if !insensitive {
                     p.need("like")?;
@@ -486,7 +475,10 @@ impl Filter {
                     return Err(SqlError::Unsupported);
                 }
                 p.at += 1;
-                if matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',' | ';'))) {
+                if matches!(
+                    p.tokens.get(p.at),
+                    None | Some(Token::Symbol(')' | ',' | ';'))
+                ) {
                     return Err(SqlError::Syntax);
                 }
                 Self::Compare(a, op, parse_scalar(p, depth + 1)?)
@@ -1280,9 +1272,8 @@ impl Query {
                 return Err(SqlError::Limit);
             }
             p.need("on")?;
-            let mut equalities = vec![];
-            Join::parse_equalities(p, &mut equalities, 0)?;
-            joins.push(Join { left, equalities });
+            let on = Filter::parse(p, 0, 0)?;
+            joins.push(Join { left, on });
         }
         let mut filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
@@ -1416,6 +1407,64 @@ impl Query {
             order,
             limit,
         })
+    }
+    fn bind_joins(
+        &self,
+        tables: &[&TableDef],
+        parameters: &mut [Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    ) -> R<Vec<BoundJoin>> {
+        let mut joins = vec![];
+        for (j, join) in self.joins.iter().enumerate() {
+            let right = j + 1;
+            let mut keys = BTreeMap::new();
+            let mut equalities = vec![];
+            let scoped = |c: &ColumnRef, _: usize| resolve(c, right + 1);
+            if filter_contains_aggregate(&join.on) {
+                return Err(SqlError::GroupingError);
+            }
+            join.on.infer(parameters, &scoped, tables)?;
+            let on = join.on.bind(parameters, &scoped, tables)?;
+            for (a, b) in join.equalities() {
+                let a = resolve(a, right + 1)?;
+                let b = resolve(b, right + 1)?;
+                let (outer, inner) = if a.source == right && b.source < right {
+                    (b, a)
+                } else if b.source == right && a.source < right {
+                    (a, b)
+                } else {
+                    continue;
+                };
+                let outer_ty = &tables[outer.source].columns[outer.column].data_type;
+                let inner_ty = &tables[inner.source].columns[inner.column].data_type;
+                if !functions::comparable(outer_ty, inner_ty) {
+                    return Err(functions::comparison_mismatch(outer_ty, inner_ty));
+                }
+                if tables[right].primary_key.contains(&inner.column)
+                    && functions::join_key_supported(outer_ty, inner_ty)
+                {
+                    keys.entry(inner.column)
+                        .or_insert((outer, outer_ty.clone(), inner_ty.clone()));
+                }
+                equalities.push((outer, inner, outer_ty.clone(), inner_ty.clone()));
+            }
+            let key = tables[right]
+                .primary_key
+                .iter()
+                .map(|i| keys.get(i).cloned())
+                .collect::<Option<Vec<_>>>();
+            let scan = key.is_none();
+            let key = key.unwrap_or_default();
+            joins.push(BoundJoin {
+                left: join.left,
+                scan,
+                key,
+                equalities,
+                on,
+                clock: None,
+            });
+        }
+        Ok(joins)
     }
     /// Positive proof for the current bounded AST. Unknown calls keep a target.
     /// No stored functions, subqueries or CTEs are admitted by this proof.
@@ -1603,6 +1652,7 @@ impl Query {
         } = self;
         !explain
             && sources.is_empty()
+            && joins.iter().all(|j| filter(&j.on))
             && joins.is_empty()
             && predicates.is_empty()
             && items.iter().all(|(item, _)| match item {
@@ -1648,7 +1698,12 @@ impl Query {
                 }
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
-                Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
+                Filter::Like {
+                    value,
+                    pattern,
+                    escape,
+                    ..
+                } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
                 Filter::Not(f) | Filter::Is(f, _, _) => filter_ok(f),
                 Filter::Logic(a, _, b) => filter_ok(a) && filter_ok(b),
             }
@@ -1666,6 +1721,7 @@ impl Query {
         } = self;
         !explain
             && sources.is_empty()
+            && joins.iter().all(|j| filter_ok(&j.on))
             && joins.is_empty()
             && predicates.is_empty()
             && self.sequence_dependencies().is_empty()
@@ -1723,6 +1779,9 @@ impl Query {
             }
         }
         let mut out = Vec::new();
+        for join in &self.joins {
+            filter(&join.on, &mut out);
+        }
         for (item, _) in &self.items {
             match item {
                 Item::Scalar(s) | Item::Aggregate(_, Some(s)) => s.sequence_dependencies(&mut out),
@@ -1766,7 +1825,8 @@ impl Query {
         self.items.iter().any(|(item, _)| match item {
             Item::Scalar(s) | Item::Aggregate(_, Some(s)) => scalar_has_undefined_routine(s),
             _ => false,
-        }) || self.where_filter().is_some_and(filter)
+        }) || self.joins.iter().any(|j| filter(&j.on))
+            || self.where_filter().is_some_and(filter)
             || self.group().iter().any(scalar_has_undefined_routine)
             || self.having().is_some_and(filter)
             || self
@@ -1832,6 +1892,7 @@ impl Query {
             && !self.is_table_free()
             && !explain
             && sources.is_empty()
+            && joins.iter().all(|j| filter(&j.on))
             && joins.is_empty()
             && predicates.is_empty()
             && items.iter().all(|(item, _)| match item {
@@ -1978,66 +2039,20 @@ impl Query {
                         .iter()
                         .any(|(i, _)| !matches!(i, Item::Aggregate(..)))))
             || (self.sources.is_empty()
-                && self.items.iter().any(|(i, _)| matches!(i, Item::Aggregate(..))));
-        let mut joins = vec![];
+                && self
+                    .items
+                    .iter()
+                    .any(|(i, _)| matches!(i, Item::Aggregate(..))));
         for (j, join) in self.joins.iter().enumerate() {
-            let right = j + 1;
-            let mut keys = BTreeMap::new();
-            let mut equalities = vec![];
-            let mut unsupported_key = false;
-            for (a, b) in &join.equalities {
-                let a = resolve(a, right + 1)?;
-                let b = resolve(b, right + 1)?;
-                let (outer, inner) = if a.source == right && b.source < right {
-                    (b, a)
-                } else if b.source == right && a.source < right {
-                    (a, b)
-                } else {
-                    return Err(SqlError::Unsupported);
-                };
-                let outer_ty = &tables[outer.source].columns[outer.column].data_type;
-                let inner_ty = &tables[inner.source].columns[inner.column].data_type;
-                if !functions::comparable(outer_ty, inner_ty) {
-                    return Err(functions::comparison_mismatch(outer_ty, inner_ty));
-                }
-                if tables[right].primary_key.contains(&inner.column) {
-                    if functions::join_key_supported(outer_ty, inner_ty) {
-                        if keys
-                            .insert(inner.column, (outer, outer_ty.clone(), inner_ty.clone()))
-                            .is_some()
-                        {
-                            return Err(SqlError::Duplicate);
-                        }
-                    } else {
-                        unsupported_key = true;
-                    }
-                }
-                equalities.push((outer, inner, outer_ty.clone(), inner_ty.clone()));
+            let scoped = |c: &ColumnRef, _: usize| resolve(c, j + 2);
+            if filter_contains_aggregate(&join.on) {
+                return Err(SqlError::GroupingError);
             }
-            let key = tables[right]
-                .primary_key
-                .iter()
-                .map(|i| keys.get(i).cloned())
-                .collect::<Option<Vec<_>>>();
-            let scan = key.is_none();
-            if scan && !grouped {
-                return Err(if unsupported_key {
-                    SqlError::Unsupported
-                } else {
-                    SqlError::Unbounded
-                });
-            }
-            let key = key.unwrap_or_default();
-            joins.push(BoundJoin {
-                left: join.left,
-                scan,
-                key,
-                equalities,
-                clock: None,
-            });
+            aggregate_filter::validate_filter(&join.on, &parameters, &scoped, &tables)?;
+            join.on.infer(&mut parameters, &scoped, &tables)?;
         }
         if grouped {
-            return grouping::bind(self, &tables, joins, parameters, &resolve);
+            return grouping::bind(self, &tables, parameters, &resolve);
         }
         let mut items = vec![];
         let mut unresolved_count_parameters = Vec::new();
@@ -2132,11 +2147,10 @@ impl Query {
             if let Expr::Literal(value) = e
                 && !matches!(value, Value::Null | Value::Text(_))
             {
-                let literal = Scalar::Literal(value.clone()).bind(&resolve, &tables, &parameters)?;
+                let literal =
+                    Scalar::Literal(value.clone()).bind(&resolve, &tables, &parameters)?;
                 let column_type = &tables[c.source].columns[c.column].data_type;
-                if literal.ty != *column_type
-                    && !functions::comparable(&literal.ty, column_type)
-                {
+                if literal.ty != *column_type && !functions::comparable(&literal.ty, column_type) {
                     return Err(functions::comparison_mismatch(&literal.ty, column_type));
                 }
             }
@@ -2184,6 +2198,7 @@ impl Query {
                 }
             }
         }
+        let joins = self.bind_joins(&tables, &mut parameters, &resolve)?;
         let mut columns = vec![];
         let mut aliases = BTreeSet::new();
         for (item, alias) in &self.items {
@@ -2364,10 +2379,10 @@ enum BoundItem {
 }
 struct BoundJoin {
     left: bool,
-    // Only bounded grouped execution accepts a non-primary-key scan join.
     scan: bool,
     key: Vec<(BoundColumn, DataType, DataType)>,
     equalities: Vec<(BoundColumn, BoundColumn, DataType, DataType)>,
+    on: BoundFilter,
     clock: Option<super::clock::ExecutionClock>,
 }
 pub(super) struct BoundQuery<'a> {
@@ -2391,6 +2406,129 @@ impl Tuple {
     fn get(&self, c: BoundColumn) -> &Value {
         &self.values[c.source][c.column]
     }
+}
+/// Inner-row candidate visits allowed per statement across all joins. Each visit
+/// polls cancellation, so this bounds work, not latency; output and retention
+/// caps apply separately.
+pub(super) const MAX_JOIN_VISITS: usize = 1 << 24;
+// Depth-first streaming expansion retains one candidate per joined source. The
+// statement budget caps candidate visits over consumed input, including point hits.
+fn join_rows<'a>(
+    query: &'a BoundQuery<'_>,
+    source: &'a dyn scan::RowSource,
+    input: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
+    params: &'a [Value],
+    meter: &'a mut scan::Meter<'_>,
+    visits: &'a mut usize,
+) -> impl Iterator<Item = R<Tuple>> + 'a {
+    struct Frame<'a> {
+        rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
+        matched: bool,
+        extended: bool,
+    }
+    let mut frames = vec![Frame {
+        rows: input,
+        matched: false,
+        extended: false,
+    }];
+    let mut row = Tuple {
+        values: vec![],
+        version: 0,
+    };
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let next = (|| -> R<Option<Tuple>> {
+            loop {
+                let Some(depth) = frames.len().checked_sub(1) else {
+                    return Ok(None);
+                };
+                row.values.truncate(depth);
+                let candidate = frames[depth].rows.next();
+                if let Some(candidate) = candidate {
+                    meter.tick()?;
+                    if depth > 0 {
+                        *visits = visits.checked_add(1).ok_or(SqlError::Limit)?;
+                        if *visits > MAX_JOIN_VISITS {
+                            return Err(SqlError::Limit);
+                        }
+                    }
+                    let candidate = candidate?;
+                    if depth == 0 {
+                        row.version = candidate.row.version;
+                    }
+                    let equality_match = depth == 0
+                        || query.joins[depth - 1].matches(&row, &candidate.row.values)?;
+                    row.values.push(candidate.row.values.clone());
+                    if depth > 0 {
+                        let mut work = 0;
+                        if !equality_match
+                            || query.joins[depth - 1].on.eval(&row, params, &mut work)?
+                                != Some(true)
+                        {
+                            continue;
+                        }
+                        row.version = 0;
+                    }
+                    frames[depth].matched = true;
+                } else if depth > 0
+                    && !frames[depth].matched
+                    && !frames[depth].extended
+                    && query.joins[depth - 1].left
+                {
+                    frames[depth].extended = true;
+                    row.values
+                        .push(vec![Value::Null; query.tables[depth].columns.len()]);
+                    row.version = 0;
+                } else {
+                    frames.pop();
+                    continue;
+                }
+                if depth == query.joins.len() {
+                    return Ok(Some(Tuple {
+                        values: row.values.clone(),
+                        version: row.version,
+                    }));
+                }
+                let join = &query.joins[depth];
+                let table = query.tables[depth + 1];
+                let rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a> = if join.scan {
+                    source.scan(
+                        table,
+                        &scan::KeyRange {
+                            lo: std::ops::Bound::Unbounded,
+                            hi: std::ops::Bound::Unbounded,
+                        },
+                        scan::Direction::Forward,
+                    )?
+                } else {
+                    let candidate = match join.key(&row)? {
+                        Some(key) => source.get(table, &encode_key(&key)?)?,
+                        None => None,
+                    };
+                    Box::new(candidate.into_iter().map(Ok))
+                };
+                frames.push(Frame {
+                    rows,
+                    matched: false,
+                    extended: false,
+                });
+            }
+        })();
+        match next {
+            Ok(Some(row)) => Some(Ok(row)),
+            Ok(None) => {
+                done = true;
+                None
+            }
+            Err(e) => {
+                done = true;
+                Some(Err(e))
+            }
+        }
+    })
 }
 fn cmp(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
@@ -2481,6 +2619,11 @@ impl BoundQuery<'_> {
         let mut budget = 0;
         if let Some(grouping) = &self.grouping {
             grouping.validate_constants(self.parameters.is_empty(), &mut budget)?;
+        }
+        if self.parameters.is_empty() {
+            for join in &self.joins {
+                join.on.plan_constant(&mut budget)?;
+            }
         }
         for item in &self.items {
             match item {
@@ -2739,10 +2882,11 @@ impl BoundQuery<'_> {
                 scan::MAX_QUERY_ROWS,
             );
             for j in &self.joins {
-                plan.push_str(if j.left {
-                    "; LeftPrimaryKeyNestedLoop"
-                } else {
-                    "; InnerPrimaryKeyNestedLoop"
+                plan.push_str(match (j.left, j.scan) {
+                    (true, true) => "; LeftScanNestedLoop",
+                    (false, true) => "; InnerScanNestedLoop",
+                    (true, false) => "; LeftPrimaryKeyNestedLoop",
+                    (false, false) => "; InnerPrimaryKeyNestedLoop",
                 });
             }
             if self.aggregate {
@@ -2787,40 +2931,29 @@ impl BoundQuery<'_> {
             scan::KeyRange::from_bounds(bounds)
         };
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
-        let mut meter = if self.aggregate {
+        let mut meter = if self.aggregate || !self.joins.is_empty() {
             scan::Meter::per_row(cancel)
         } else {
             scan::Meter::new(cancel)
         };
-        let filtered = scan::filtered(input, &mut meter, |r| {
-            let mut filter_work = 0;
-            let mut row = Tuple {
-                values: vec![r.row.values.clone()],
-                version: r.row.version,
+        let mut candidate_work = 0;
+        let joined = join_rows(self, source, input, params, &mut meter, &mut candidate_work);
+        let filtered = joined.filter_map(|row| {
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => return Some(Err(e)),
             };
-            for (i, j) in self.joins.iter().enumerate() {
-                let table = self.tables[i + 1];
-                let found = match j.key(&row)? {
-                    Some(key) => source.get(table, &encode_key(&key)?)?,
-                    None => None,
-                };
-                let matched = match found {
-                    Some(r) if j.matches(&row, &r.row.values)? => Some(r),
-                    _ => None,
-                };
-                match matched {
-                    Some(r) => row.values.push(r.row.values.clone()),
-                    None if j.left => row.values.push(vec![Value::Null; table.columns.len()]),
-                    None => return Ok(None),
-                }
-                row.version = 0;
-            }
-            if let Some(f) = &self.filter
-                && f.eval(&row, params, &mut filter_work)? != Some(true)
+            let mut filter_work = 0;
+            match self
+                .filter
+                .as_ref()
+                .map(|f| f.eval(&row, params, &mut filter_work))
+                .transpose()
             {
-                return Ok(None);
+                Ok(None | Some(Some(true))) => Some(Ok(row)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
             }
-            Ok(Some(row))
         });
         let offset = match self.query.offset() {
             Some(e) => match e.value(params)? {
@@ -3016,6 +3149,7 @@ impl BoundQuery<'_> {
         } else {
             for join in &mut self.joins {
                 join.clock = clock.cloned();
+                join.on.attach_clock(clock);
             }
         }
         for item in &mut self.items {
@@ -3280,6 +3414,75 @@ fn update_filtered_aggregates(
 }
 
 #[cfg(test)]
+mod join_visit_budget_tests {
+    use super::*;
+    use scan::RowSource;
+
+    #[test]
+    fn candidate_budget_is_inclusive_and_shared_across_rows_and_joins() {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE budget_l(id int PRIMARY KEY)",
+            "CREATE TABLE budget_r(id int PRIMARY KEY)",
+            "CREATE TABLE budget_u(id int PRIMARY KEY)",
+            "INSERT INTO budget_l VALUES(1),(2)",
+            "INSERT INTO budget_r VALUES(1),(2)",
+            "INSERT INTO budget_u VALUES(1)",
+        ] {
+            let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state
+                .execute_with_cancel(&prepared, &[], None, || false)
+                .unwrap();
+        }
+        for (sql, candidates, outputs) in [
+            (
+                "SELECT l.id FROM budget_l l JOIN budget_r r ON true JOIN budget_u u ON true",
+                8,
+                4,
+            ),
+            (
+                "SELECT l.id FROM budget_l l JOIN budget_r r ON l.id=r.id",
+                2,
+                2,
+            ),
+        ] {
+            let query = Query::parse(&mut Parser {
+                tokens: lex(sql).unwrap(),
+                at: 0,
+                params: BTreeSet::new(),
+            })
+            .unwrap();
+            let bound = query.bind(&state, 0, &[]).unwrap();
+            let source = scan::LegacyRows(&state);
+            for remaining in [candidates, candidates - 1] {
+                let mut visits = MAX_JOIN_VISITS - remaining;
+                let mut cancel = || false;
+                let mut meter = scan::Meter::per_row(&mut cancel);
+                let input = source
+                    .scan(
+                        bound.tables[0],
+                        &scan::KeyRange {
+                            lo: std::ops::Bound::Unbounded,
+                            hi: std::ops::Bound::Unbounded,
+                        },
+                        scan::Direction::Forward,
+                    )
+                    .unwrap();
+                let result = join_rows(&bound, &source, input, &[], &mut meter, &mut visits)
+                    .collect::<R<Vec<_>>>();
+                if remaining == candidates {
+                    assert_eq!(result.unwrap().len(), outputs);
+                    assert_eq!(visits, MAX_JOIN_VISITS);
+                } else {
+                    assert!(matches!(result, Err(SqlError::Limit)));
+                    assert_eq!(visits, MAX_JOIN_VISITS + 1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod average_distinct_retention_tests {
     use super::*;
 
@@ -3508,7 +3711,9 @@ mod deferred_routine_only_tests {
         let sql = "SELECT nosuchfn() ORDER BY 1";
         match Prepared::parse(sql, 1, 0) {
             Ok(p) => assert!(p.deferred_routine_only(), "{sql}"),
-            Err(e) => eprintln!("F9 skipped {sql}: prepare error code={e:?}; ORDER BY literal not admitted"),
+            Err(e) => eprintln!(
+                "F9 skipped {sql}: prepare error code={e:?}; ORDER BY literal not admitted"
+            ),
         }
         for sql in [
             "SELECT 1",
@@ -3530,7 +3735,9 @@ mod deferred_routine_only_tests {
         ] {
             match Prepared::parse(sql, 1, 0) {
                 Ok(p) => assert!(!p.deferred_routine_only(), "{sql}"),
-                Err(e) => eprintln!("F9 skipped {sql}: prepare error code={e:?}; no Prepared classification exists"),
+                Err(e) => eprintln!(
+                    "F9 skipped {sql}: prepare error code={e:?}; no Prepared classification exists"
+                ),
             }
         }
     }

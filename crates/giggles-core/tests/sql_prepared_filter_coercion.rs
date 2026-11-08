@@ -162,10 +162,17 @@ fn aliases_order_ranges_and_indexed_join_still_filter() {
             .len(),
         3
     );
-    // A mixed numeric predicate cannot make an unkeyed join admissible.
-    assert!(
-        s.prepare("SELECT abs($1) FROM f a JOIN f b ON b.i=$1 WHERE a.i=$1 LIMIT 20")
-            .is_err()
+    // An unkeyed join with a parameter in ON is admissible (bounded scan join);
+    // PG18.6 infers $1 as bigint from b.i/a.i and EXECUTE p(1) returns one row.
+    let p = s
+        .prepare("SELECT abs($1) FROM f a JOIN f b ON b.i=$1 WHERE a.i=$1 LIMIT 20")
+        .unwrap();
+    assert_eq!(
+        s.execute_prepared(&p, &[V::Int(1)], None)
+            .unwrap()
+            .rows
+            .len(),
+        1
     );
     let p = s
         .prepare("SELECT $1::numeric FROM f WHERE i::real=$1 LIMIT 20")
