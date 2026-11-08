@@ -714,8 +714,10 @@ fn transaction_commit_then_keeps_locks_through_callback_and_callback_errors_are_
     for callback_fails in [false, true] {
         let (mem, seq, locks, _) = catalog_setup();
         let mut txn = transaction(&seq, &locks, 1, Isolation::ReadCommitted);
-        let key = vec![5; 8];
-        txn.put(Keyspace::Catalog, key.clone(), vec![7]).unwrap();
+        // A kind-3 name record needs no feature bits under the commit guard.
+        let key = vec![3, b'k', 0];
+        let value = 1u64.to_be_bytes().to_vec();
+        txn.put(Keyspace::Catalog, key.clone(), value.clone()).unwrap();
         externally_lock_table_and_row(&locks, 1);
         let before = seq.visible_ts();
         let mut called = false;
@@ -728,7 +730,7 @@ fn transaction_commit_then_keeps_locks_through_callback_and_callback_errors_are_
             assert_eq!(locks.held(TxnId(1)).len(), 2);
             assert_eq!(
                 super::super::mvcc::read_at(seq.kv(), Keyspace::Catalog, &key, ts).unwrap(),
-                Some(vec![7])
+                Some(value.clone())
             );
             if callback_fails {
                 Err(TxnError::Cancelled)
@@ -751,7 +753,7 @@ fn transaction_commit_then_keeps_locks_through_callback_and_callback_errors_are_
         let durable = Kv::new(Arc::new(mem.crash()));
         assert_eq!(
             super::super::mvcc::read_at(&durable, Keyspace::Catalog, &key, ts).unwrap(),
-            Some(vec![7])
+            Some(value)
         );
     }
 }
@@ -760,7 +762,8 @@ fn transaction_commit_then_keeps_locks_through_callback_and_callback_errors_are_
 fn transaction_commit_then_skips_callback_on_commit_failure_and_releases_locks() {
     let (mem, seq, locks, _) = catalog_setup();
     let mut txn = transaction(&seq, &locks, 1, Isolation::ReadCommitted);
-    txn.put(Keyspace::Catalog, vec![5; 8], vec![7]).unwrap();
+    txn.put(Keyspace::Catalog, vec![3, b'k', 0], 1u64.to_be_bytes().to_vec())
+        .unwrap();
     externally_lock_table_and_row(&locks, 1);
     mem.fail_next_write(KvError::Io("commit rejected".into()));
     let mut called = false;

@@ -370,6 +370,11 @@ impl Transaction {
         value: Option<Vec<u8>>,
     ) -> Result<(), TxnError> {
         self.snapshot_ts();
+        // Meta, Seq and Gc are unversioned: only the Sequencer worker writes them
+        // (counters via write_counter, which ORs bit 8 in the same batch; DD-0068).
+        if matches!(ks, Keyspace::Meta | Keyspace::Seq | Keyspace::Gc) {
+            return Err(TxnError::Misuse);
+        }
         if if matches!(ks, Keyspace::Catalog | Keyspace::Kernel) {
             key.is_empty()
         } else {

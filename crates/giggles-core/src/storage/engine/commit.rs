@@ -483,6 +483,21 @@ fn process_group(
         let request = &pending.request;
         let next_features = pending_features | request.features_or;
         if super::meta::check_features(next_features).is_err()
+            || request.writes.iter().any(|((space, key), value)| {
+                // Defense in depth: versioned writes never target unversioned
+                // keyspaces, so counters cannot bypass write_counter's bit 8.
+                if matches!(space, Keyspace::Meta | Keyspace::Seq | Keyspace::Gc) {
+                    return true;
+                }
+                if *space != Keyspace::Catalog {
+                    return false;
+                }
+                let Some(value) = value else {
+                    return false;
+                };
+                super::content_check::required_bits_for_catalog_value(key, value)
+                    .map_or(true, |required| required & !next_features != 0)
+            })
             || request.raw.iter().any(|op| match op {
                 RawOp::DeleteCounter { key } => !valid_counter_key(key),
             })
@@ -613,3 +628,7 @@ impl Sequencer {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "commit_guard_tests.rs"]
+mod guard_tests;

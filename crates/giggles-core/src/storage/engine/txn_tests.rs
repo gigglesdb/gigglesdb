@@ -420,7 +420,7 @@ fn snapshots_log_horizon_and_validation_order() {
             features_or: 0,
             raw: Vec::new(),
             snapshot: before,
-            writes: BTreeMap::from([((Keyspace::Catalog, key(8)), Some(vec![8]))]),
+            writes: BTreeMap::from([((Keyspace::Rows, key(8)), Some(vec![8]))]),
             validation: Some(Box::new(move |_, _, _, assigned| {
                 s.send(assigned).unwrap();
                 Ok(())
@@ -487,7 +487,7 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
         SequencerConfig::default(),
     )
     .unwrap();
-    let writes = || BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]);
+    let writes = || BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]);
     assert_eq!(
         seq.submit(CommitRequest {
             features_or: 0,
@@ -622,7 +622,7 @@ fn concurrent_validation_observes_accepted_predecessors_only() {
                     features_or: 0,
                     raw: Vec::new(),
                     snapshot: Ts(0),
-                    writes: BTreeMap::from([((Keyspace::Catalog, key(n)), Some(vec![n as u8]))]),
+                    writes: BTreeMap::from([((Keyspace::Rows, key(n)), Some(vec![n as u8]))]),
                     validation: Some(Box::new(move |log, _, snapshot, assigned| {
                         let mut expected = events.lock().unwrap();
                         let mut actual = vec![];
@@ -670,7 +670,7 @@ fn concurrent_validation_observes_accepted_predecessors_only() {
     assert_eq!(seq.visible_ts(), *accepted.last().unwrap());
     for n in 0..16 {
         assert_eq!(
-            mvcc::read_at(seq.kv(), Keyspace::Catalog, &key(n), seq.visible_ts()).unwrap(),
+            mvcc::read_at(seq.kv(), Keyspace::Rows, &key(n), seq.visible_ts()).unwrap(),
             if n % 3 == 0 {
                 None
             } else {
@@ -747,7 +747,7 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
                     writes: if n == 4 {
                         BTreeMap::new()
                     } else {
-                        BTreeMap::from([((Keyspace::Catalog, key(n)), Some(vec![n as u8]))])
+                        BTreeMap::from([((Keyspace::Rows, key(n)), Some(vec![n as u8]))])
                     },
                     validation: Some(Box::new(move |log, _, snapshot, assigned| {
                         let mut actual = vec![];
@@ -820,7 +820,7 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
                 assert_eq!(
                     mvcc::read_at(
                         recovered.kv(),
-                        Keyspace::Catalog,
+                        Keyspace::Rows,
                         &key(n),
                         recovered.visible_ts()
                     )
@@ -834,7 +834,7 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
             }
             assert_eq!(seq.visible_ts(), args[2]);
             assert_eq!(
-                mvcc::read_at(seq.kv(), Keyspace::Catalog, &key(2), seq.visible_ts()).unwrap(),
+                mvcc::read_at(seq.kv(), Keyspace::Rows, &key(2), seq.visible_ts()).unwrap(),
                 None
             );
         }
@@ -1048,7 +1048,7 @@ fn group_ack_waits_for_sync_and_empty_scan_has_no_predicate() {
             features_or: 0,
             raw: Vec::new(),
             snapshot: Ts(0),
-            writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
+            writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
             validation: None,
         });
         done_s.send(result).unwrap();
@@ -1134,7 +1134,7 @@ fn two_thousand_commits_retain_exact_active_history() {
                 raw: Vec::new(),
                 snapshot: old.ts(),
                 writes: BTreeMap::from([(
-                    (Keyspace::Catalog, key(1)),
+                    (Keyspace::Rows, key(1)),
                     Some(n.to_be_bytes().to_vec()),
                 )]),
                 validation: None,
@@ -1153,7 +1153,7 @@ fn two_thousand_commits_retain_exact_active_history() {
                 let mut expected = 1;
                 log.writes_after(snapshot, |ts, ks, k| {
                     assert_eq!(ts, Ts(expected));
-                    assert_eq!(ks, Keyspace::Catalog);
+                    assert_eq!(ks, Keyspace::Rows);
                     assert_eq!(k, key(1));
                     expected += 1;
                 })
@@ -1197,12 +1197,12 @@ fn concurrent_snapshot_registration_retains_every_needed_timestamp() {
                             features_or: 0,
                             raw: Vec::new(),
                             snapshot,
-                            writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
+                            writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
                             validation: Some(Box::new(move |log, _, snapshot, assigned| {
                                 let mut expected = snapshot.0 + 1;
                                 log.writes_after(snapshot, |ts, ks, k| {
                                     assert_eq!(ts, Ts(expected));
-                                    assert_eq!(ks, Keyspace::Catalog);
+                                    assert_eq!(ks, Keyspace::Rows);
                                     assert_eq!(k, key(1));
                                     expected += 1;
                                 })
@@ -1453,7 +1453,7 @@ fn store_failed(seq: &Arc<Sequencer>) -> Result<Ts, TxnError> {
         features_or: 0,
         raw: Vec::new(),
         snapshot: Ts(0),
-        writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
+        writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![1]))]),
         validation: None,
     })
 }

@@ -12,6 +12,28 @@ fn corrupt(error: impl std::fmt::Display) -> FormatError {
     FormatError::Corrupt(error.to_string())
 }
 
+/// Required format bits for one live, unversioned catalog value.
+pub(crate) fn required_bits_for_catalog_value(
+    key: &[u8],
+    value: &[u8],
+) -> Result<u64, FormatError> {
+    match catalog_codec::classify_catalog_key(key).map_err(corrupt)? {
+        CatalogKind::Table => {
+            let (_, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
+            let mut required = if ext.is_empty() { 0 } else { 64 };
+            if ext.values().any(|column| column.typmod.is_some()) {
+                required |= 128;
+            }
+            Ok(required)
+        }
+        CatalogKind::Constraint | CatalogKind::Sequence | CatalogKind::Type => Ok(64),
+        // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
+        // so the commit guard must refuse it too (DD-0068 X1).
+        CatalogKind::RoleBootstrap => Ok(512),
+        CatalogKind::Name => Ok(0),
+    }
+}
+
 pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
     let mut previous = None;
     let mut tables = BTreeMap::new();
@@ -40,15 +62,10 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
         let Some(value) = mvcc::decode(&value).map_err(corrupt)? else {
             continue;
         };
+        required |= required_bits_for_catalog_value(user, value)?;
         match kind {
             CatalogKind::Table => {
-                let (entry, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
-                if !ext.is_empty() {
-                    required |= 64;
-                }
-                if ext.values().any(|column| column.typmod.is_some()) {
-                    required |= 128;
-                }
+                let (entry, _) = catalog_codec::decode_table(value).map_err(corrupt)?;
                 tables.insert(
                     u64::from_be_bytes(user[1..9].try_into().unwrap()),
                     entry.def,
@@ -60,21 +77,18 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
                     .map_err(|_| corrupt("invalid catalog name id"))?;
             }
             CatalogKind::Constraint => {
-                required |= 64;
                 constraints.push((
                     u64::from_be_bytes(user[1..9].try_into().unwrap()),
                     value.to_vec(),
                 ));
             }
             CatalogKind::Sequence => {
-                required |= 64;
                 sequences.insert(
                     u64::from_be_bytes(user[1..9].try_into().unwrap()),
                     catalog_codec::decode_sequence(value).map_err(corrupt)?,
                 );
             }
             CatalogKind::Type => {
-                required |= 64;
                 catalog_codec::decode_type(value)
                     .map(|_| ())
                     .map_err(corrupt)?;
