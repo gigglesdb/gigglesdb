@@ -393,11 +393,12 @@ fn zone_error(e: giggles_pg_types::Error) -> SqlError {
         E::Unimplemented | E::Binary => SqlError::Unsupported,
     }
 }
-fn function_error(e: giggles_pg_types::temporal::TemporalFunctionError) -> SqlError {
+pub(super) fn function_error(e: giggles_pg_types::temporal::TemporalFunctionError) -> SqlError {
     use giggles_pg_types::temporal::TemporalFunctionError as E;
     match e {
         E::UnsupportedField => SqlError::Unsupported,
         E::NumericOverflow => SqlError::Overflow,
+        E::DivisionByZero => SqlError::DivisionByZero,
         E::Range | E::InvalidStride | E::InfiniteStride | E::InfiniteOrigin => {
             SqlError::DatetimeFieldOverflow
         }

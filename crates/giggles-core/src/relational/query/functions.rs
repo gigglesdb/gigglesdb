@@ -91,6 +91,11 @@ enum Node {
         Vec<(super::BoundFilter, BoundScalar)>,
         Option<Box<BoundScalar>>,
     ),
+    ZonedOperator(
+        String,
+        Vec<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     CrossCompare(
         String,
         Box<BoundScalar>,
@@ -1566,7 +1571,7 @@ impl BoundScalar {
                 b.attach_clock(clock);
             }
             Node::Clock(_, _, target) => *target = clock.cloned(),
-            Node::Sequence(_, args, target) => {
+            Node::Sequence(_, args, target) | Node::ZonedOperator(_, args, target) => {
                 *target = clock.cloned();
                 args.iter_mut().for_each(|a| a.attach_clock(clock));
             }
@@ -1584,7 +1589,7 @@ impl BoundScalar {
     }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
-            Node::Predicate(_) => None,
+            Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
             Node::Column(_, name)
@@ -1599,7 +1604,7 @@ impl BoundScalar {
         match &self.node {
             Node::Predicate(_) => "?column?",
             Node::Case(..) => "case",
-            Node::CrossCompare(..) => "?column?",
+            Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Cast(a) | Node::SessionCast(a, _) => {
                 if let Some(name) = a.strong_name() {
@@ -1644,6 +1649,13 @@ impl BoundScalar {
                 otherwise
                     .as_ref()
                     .map_or(Ok(Value::Null), |result| result.eval(row, params, budget))
+            }
+            Node::ZonedOperator(name, args, clock) => {
+                let values = args
+                    .iter()
+                    .map(|a| a.eval(row, params, budget))
+                    .collect::<R<Vec<_>>>()?;
+                arithmetic::eval_zoned(name, &values, clock.as_ref(), budget)
             }
             Node::CrossCompare(op, a, b, clock) => {
                 let a = a.eval(row, params, budget)?;
@@ -2077,6 +2089,11 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
     }
     let out = match (v, ty) {
         (Value::Date(v), DataType::Date) => Value::Date(v),
+        (Value::Date(v), DataType::Timestamp) => Value::Timestamp(
+            v.add_interval(Interval::new(0, 0, 0))
+                .map_err(temporal::function_error)?,
+        ),
+        (Value::Time(v), DataType::Interval) => Value::Interval(v.to_interval()),
         (Value::Date(v), DataType::Text) => Value::Text(v.to_string()),
         (Value::Time(v), DataType::Time) => Value::Time(v),
         (Value::Time(v), DataType::Text) => Value::Text(v.to_string()),

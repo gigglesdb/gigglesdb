@@ -395,6 +395,7 @@ impl BoundScalar {
             | Node::Column(..)
             | Node::Clock(..)
             | Node::Sequence(..)
+            | Node::ZonedOperator(..)
             | Node::CrossCompare(..)
             | Node::SessionCast(..) => Ok(None),
             Node::Literal(v) => {
@@ -467,7 +468,11 @@ impl BoundScalar {
                     .is_none_or(|result| result.constraint_immutable())
             }
             Node::Literal(_) | Node::Column(..) => true,
-            Node::Param(_) | Node::Clock(..) | Node::Sequence(..) | Node::SessionCast(..) => false,
+            Node::Param(_)
+            | Node::Clock(..)
+            | Node::Sequence(..)
+            | Node::SessionCast(..)
+            | Node::ZonedOperator(..) => false,
             // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
             // date/timestamp and time/interval pairs are immutable.
             Node::CrossCompare(_, a, b, _) => {
@@ -502,7 +507,9 @@ impl BoundScalar {
             Node::Clock(..) => true,
             Node::SessionCast(value, _) => value.insert_input_only(),
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
-            Node::Sequence(_, args, _) => args.iter().all(Self::insert_input_only),
+            Node::Sequence(_, args, _) | Node::ZonedOperator(_, args, _) => {
+                args.iter().all(Self::insert_input_only)
+            }
             Node::Cast(value) => {
                 value.insert_input_only()
                     && (immutable_cast(&value.ty, &self.ty)

@@ -30,6 +30,7 @@ pub enum TemporalField {
 pub enum TemporalFunctionError {
     UnsupportedField,
     NumericOverflow,
+    DivisionByZero,
     Range,
     InvalidStride,
     InfiniteStride,

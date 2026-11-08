@@ -108,14 +108,14 @@ impl Interval {
         }
         Ok(Self::new(m, d, self.microseconds))
     }
-    fn negate(self) -> Result<Self> {
+    pub fn checked_neg(self) -> Result<Self> {
         if self.same_components(Self::INFINITY) {
             return Ok(Self::NEG_INFINITY);
         }
         if self.same_components(Self::NEG_INFINITY) {
             return Ok(Self::INFINITY);
         }
-        Ok(Self::new(
+        finite_result(Self::new(
             self.months
                 .checked_neg()
                 .ok_or(TemporalFunctionError::Range)?,
@@ -128,6 +128,132 @@ impl Interval {
         ))
     }
 }
+fn finite_result(i: Interval) -> Result<Interval> {
+    if finite(i) { Ok(i) } else { bad() }
+}
+impl Interval {
+    fn negate(self) -> Result<Self> {
+        self.checked_neg()
+    }
+    pub fn checked_add(self, o: Self) -> Result<Self> {
+        if !finite(self) || !finite(o) {
+            if !finite(self) && !finite(o) && !self.same_components(o) {
+                return bad();
+            }
+            return Ok(if !finite(self) { self } else { o });
+        }
+        finite_result(Self::new(
+            self.months
+                .checked_add(o.months)
+                .ok_or(TemporalFunctionError::Range)?,
+            self.days
+                .checked_add(o.days)
+                .ok_or(TemporalFunctionError::Range)?,
+            self.microseconds
+                .checked_add(o.microseconds)
+                .ok_or(TemporalFunctionError::Range)?,
+        ))
+    }
+    pub fn checked_sub(self, o: Self) -> Result<Self> {
+        if !finite(self) || !finite(o) {
+            if !finite(self) && !finite(o) && self.same_components(o) {
+                return bad();
+            }
+            return if !finite(self) {
+                Ok(self)
+            } else {
+                o.checked_neg()
+            };
+        }
+        finite_result(Self::new(
+            self.months
+                .checked_sub(o.months)
+                .ok_or(TemporalFunctionError::Range)?,
+            self.days
+                .checked_sub(o.days)
+                .ok_or(TemporalFunctionError::Range)?,
+            self.microseconds
+                .checked_sub(o.microseconds)
+                .ok_or(TemporalFunctionError::Range)?,
+        ))
+    }
+    pub fn mul_f64(self, factor: f64) -> Result<Self> {
+        self.scale_f64(factor, false)
+    }
+    pub fn div_f64(self, factor: f64) -> Result<Self> {
+        self.scale_f64(factor, true)
+    }
+    fn scale_f64(self, factor: f64, divide: bool) -> Result<Self> {
+        if divide && factor == 0.0 {
+            return Err(TemporalFunctionError::DivisionByZero);
+        }
+        if factor.is_nan() {
+            return bad();
+        }
+        if !finite(self) {
+            if (divide && factor.is_infinite()) || (!divide && factor == 0.0) {
+                return bad();
+            }
+            return if factor < 0.0 {
+                self.checked_neg()
+            } else {
+                Ok(self)
+            };
+        }
+        if factor.is_infinite() {
+            if divide {
+                return Ok(Self::new(0, 0, 0));
+            }
+            // PG orders intervals by their 30-day-month total, and that total's sign is the sign here.
+            let total = (i128::from(self.months) * 30 + i128::from(self.days))
+                * i128::from(USECS_PER_DAY)
+                + i128::from(self.microseconds);
+            let sign = total.signum();
+            if sign == 0 {
+                return bad();
+            }
+            return Ok(if (sign < 0) == factor.is_sign_negative() {
+                Self::INFINITY
+            } else {
+                Self::NEG_INFINITY
+            });
+        }
+        // PostgreSQL computes each quotient directly, preserving float8 rounding.
+        let op = |v: f64| if divide { v / factor } else { v * factor };
+        let month_value = op(f64::from(self.months));
+        let day_value = op(f64::from(self.days));
+        if !(-2147483648.0..2147483648.0).contains(&month_value)
+            || !(-2147483648.0..2147483648.0).contains(&day_value)
+        {
+            return bad();
+        }
+        let month = month_value as i32;
+        let mut day = day_value as i32;
+        let tsround = |v: f64| (v * 1_000_000.0).round_ties_even() / 1_000_000.0;
+        let month_remainder = tsround((month_value - f64::from(month)) * 30.0);
+        let mut seconds_remainder = tsround(
+            (day_value - f64::from(day) + month_remainder - f64::from(month_remainder as i32))
+                * 86400.0,
+        );
+        if seconds_remainder.abs() >= 86400.0 {
+            let extra_days = (seconds_remainder / 86400.0) as i32;
+            day = day
+                .checked_add(extra_days)
+                .ok_or(TemporalFunctionError::Range)?;
+            seconds_remainder -= f64::from(extra_days) * 86400.0;
+        }
+        day = day
+            .checked_add(month_remainder as i32)
+            .ok_or(TemporalFunctionError::Range)?;
+        let time =
+            (op(self.microseconds as f64) + seconds_remainder * 1_000_000.0).round_ties_even();
+        if !(-9223372036854775808.0..9223372036854775808.0).contains(&time) {
+            return bad();
+        }
+        finite_result(Self::new(month, day, time as i64))
+    }
+}
+
 fn infinite_add(t: Timestamp, i: Interval) -> Result<Option<Timestamp>> {
     if !finite(i) {
         let v = if i.same_components(Interval::INFINITY) {
@@ -319,5 +445,126 @@ impl std::str::FromStr for TemporalField {
             "timezone_m" => TimezoneMinute,
             _ => return Err(TemporalFunctionError::UnsupportedField),
         })
+    }
+}
+
+impl Timestamp {
+    pub fn diff(self, o: Self) -> Result<Interval> {
+        if self == Self::INFINITY
+            || self == Self::NEG_INFINITY
+            || o == Self::INFINITY
+            || o == Self::NEG_INFINITY
+        {
+            if self == o {
+                return bad();
+            }
+            return Ok(if self == Self::INFINITY || o == Self::NEG_INFINITY {
+                Interval::INFINITY
+            } else {
+                Interval::NEG_INFINITY
+            });
+        }
+        Interval::new(
+            0,
+            0,
+            self.0
+                .checked_sub(o.0)
+                .ok_or(TemporalFunctionError::Range)?,
+        )
+        .justify_hours()
+    }
+}
+impl TimestampTz {
+    pub fn diff(self, o: Self) -> Result<Interval> {
+        Timestamp(self.0).diff(Timestamp(o.0))
+    }
+}
+impl Date {
+    pub fn add_days(self, days: i64) -> Result<Self> {
+        if self == Self::INFINITY || self == Self::NEG_INFINITY {
+            return Ok(self);
+        }
+        let days = i32::try_from(days).map_err(|_| TemporalFunctionError::Range)?;
+        let v = self
+            .0
+            .checked_add(days)
+            .ok_or(TemporalFunctionError::Range)?;
+        if v == i32::MIN || v == i32::MAX {
+            return bad();
+        }
+        range(Self::from_days(v))
+    }
+    pub fn sub_days(self, days: i64) -> Result<Self> {
+        self.add_days(days.checked_neg().ok_or(TemporalFunctionError::Range)?)
+    }
+    pub fn diff(self, o: Self) -> Result<i32> {
+        if self == Self::INFINITY
+            || self == Self::NEG_INFINITY
+            || o == Self::INFINITY
+            || o == Self::NEG_INFINITY
+        {
+            return bad();
+        }
+        self.0.checked_sub(o.0).ok_or(TemporalFunctionError::Range)
+    }
+    pub fn add_time(self, t: Time) -> Result<Timestamp> {
+        let base = self.timestamp()?;
+        if base == Timestamp::INFINITY || base == Timestamp::NEG_INFINITY {
+            return Ok(base);
+        }
+        let v = base
+            .0
+            .checked_add(t.0)
+            .ok_or(TemporalFunctionError::Range)?;
+        finite_timestamp(v).map(Timestamp)
+    }
+    pub fn add_timetz(self, t: TimeTz) -> Result<TimestampTz> {
+        if self == Self::INFINITY {
+            return Ok(TimestampTz::INFINITY);
+        }
+        if self == Self::NEG_INFINITY {
+            return Ok(TimestampTz::NEG_INFINITY);
+        }
+        let v = i128::from(self.0) * i128::from(USECS_PER_DAY)
+            + i128::from(t.time().microseconds())
+            - i128::from(t.offset_east()) * 1_000_000;
+        let v = i64::try_from(v).map_err(|_| TemporalFunctionError::Range)?;
+        finite_timestamp(v).map(TimestampTz)
+    }
+}
+fn finite_timestamp(v: i64) -> Result<i64> {
+    if !(MIN_TIMESTAMP..END_TIMESTAMP).contains(&v) {
+        return bad();
+    }
+    Ok(v)
+}
+impl Time {
+    pub fn add_interval(self, i: Interval) -> Result<Self> {
+        self.shift_interval(i, false)
+    }
+    pub fn sub_interval(self, i: Interval) -> Result<Self> {
+        self.shift_interval(i, true)
+    }
+    fn shift_interval(self, i: Interval, subtract: bool) -> Result<Self> {
+        if !finite(i) {
+            return bad();
+        }
+        let delta = i128::from(i.microseconds) * if subtract { -1 } else { 1 };
+        let v = (i128::from(self.0) + delta).rem_euclid(i128::from(USECS_PER_DAY));
+        Ok(Self(v as i64))
+    }
+    pub fn diff(self, o: Self) -> Interval {
+        Interval::new(0, 0, self.0 - o.0)
+    }
+    pub fn to_interval(self) -> Interval {
+        Interval::new(0, 0, self.0)
+    }
+}
+impl TimeTz {
+    pub fn add_interval(self, i: Interval) -> Result<Self> {
+        range(Self::new(self.time().add_interval(i)?, self.offset_east()))
+    }
+    pub fn sub_interval(self, i: Interval) -> Result<Self> {
+        range(Self::new(self.time().sub_interval(i)?, self.offset_east()))
     }
 }

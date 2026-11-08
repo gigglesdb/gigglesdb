@@ -71,6 +71,115 @@ fn known(
         Ok(Some(a.bind(resolve, tables, parameters)?.ty))
     }
 }
+// PostgreSQL's temporal overloads. Implicit conversions are deliberately closed.
+fn temporal_signature(
+    op: BinaryOp,
+    a: Option<&DataType>,
+    b: Option<&DataType>,
+) -> R<Option<(DataType, DataType, DataType)>> {
+    use BinaryOp::*;
+    use DataType::*;
+    let temporal =
+        |t: &DataType| matches!(t, Date | Time | TimeTz | Timestamp | TimestampTz | Interval);
+    if !a.is_some_and(temporal) && !b.is_some_and(temporal) {
+        return Ok(None);
+    }
+    let rows = [
+        (Add, Date, Integer, Date),
+        (Add, Integer, Date, Date),
+        (Add, Date, Time, Timestamp),
+        (Add, Time, Date, Timestamp),
+        (Add, Date, TimeTz, TimestampTz),
+        (Add, TimeTz, Date, TimestampTz),
+        (Add, Date, Interval, Timestamp),
+        (Add, Interval, Date, Timestamp),
+        (Add, Time, Interval, Time),
+        (Add, Interval, Time, Time),
+        (Add, TimeTz, Interval, TimeTz),
+        (Add, Interval, TimeTz, TimeTz),
+        (Add, Timestamp, Interval, Timestamp),
+        (Add, Interval, Timestamp, Timestamp),
+        (Add, TimestampTz, Interval, TimestampTz),
+        (Add, Interval, TimestampTz, TimestampTz),
+        (Add, Interval, Interval, Interval),
+        (Sub, Date, Integer, Date),
+        (Sub, Date, Date, Integer),
+        (Sub, Date, Interval, Timestamp),
+        (Sub, Time, Time, Interval),
+        (Sub, Time, Interval, Time),
+        (Sub, TimeTz, Interval, TimeTz),
+        (Sub, Timestamp, Timestamp, Interval),
+        (Sub, TimestampTz, TimestampTz, Interval),
+        (Sub, Timestamp, Interval, Timestamp),
+        (Sub, TimestampTz, Interval, TimestampTz),
+        (Sub, Interval, Interval, Interval),
+        (Mul, Interval, DoublePrecision, Interval),
+        (Mul, DoublePrecision, Interval, Interval),
+        (Div, Interval, DoublePrecision, Interval),
+    ];
+    let cost = |from: &DataType, to: &DataType| -> Option<usize> {
+        if from == to {
+            Some(0)
+        } else if matches!(
+            (from, to),
+            (SmallInt, Integer)
+                | (Time, Interval)
+                | (Date, Timestamp)
+                | (Timestamp, TimestampTz)
+                | (Date, TimestampTz)
+        ) || number(from) && *to == DoublePrecision
+        {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    if let (Some(known), None) | (None, Some(known)) = (a, b) {
+        let left_known = a.is_some();
+        let unknown = match (op, known, left_known) {
+            (Add, Date | TimeTz, _) => return Err(SqlError::AmbiguousFunction),
+            (Add, Time | Timestamp | TimestampTz | Interval, _) => Interval,
+            (Sub, TimeTz, true) => Interval,
+            (Sub, Date | Time | Timestamp | TimestampTz | Interval, _) => known.clone(),
+            (Mul, Time | Interval, _) | (Div, Time | Interval, true) => DoublePrecision,
+            _ => return Err(SqlError::UndefinedFunction),
+        };
+        return temporal_signature(op, Some(a.unwrap_or(&unknown)), Some(b.unwrap_or(&unknown)));
+    }
+    let mut candidates = Vec::new();
+    for (o, at, bt, out) in rows {
+        if o != op {
+            continue;
+        }
+        let ac = a.map_or(Some(0), |a| cost(a, &at));
+        let bc = b.map_or(Some(0), |b| cost(b, &bt));
+        if let (Some(ac), Some(bc)) = (ac, bc) {
+            candidates.push((ac + bc, at, bt, out));
+        }
+    }
+    let Some(best) = candidates.iter().map(|r| r.0).min() else {
+        return Err(SqlError::UndefinedFunction);
+    };
+    candidates.retain(|r| r.0 == best);
+    // Preferred datetime type resolves subtraction's mixed timestamp candidates.
+    if candidates.len() > 1 && op == Sub && a.is_some() && b.is_some() {
+        candidates.retain(|(_, at, bt, _)| *at == TimestampTz && *bt == TimestampTz);
+    }
+    if candidates.len() != 1 {
+        return Err(SqlError::AmbiguousFunction);
+    }
+    let (_, at, bt, out) = candidates.pop().unwrap();
+    Ok(Some((at, bt, out)))
+}
+fn unary_type(op: UnaryOp, ty: &DataType) -> R<DataType> {
+    if number(ty) {
+        Ok(ty.clone())
+    } else if op == UnaryOp::Neg && matches!(ty, DataType::Time | DataType::Interval) {
+        Ok(DataType::Interval)
+    } else {
+        Err(SqlError::UndefinedFunction)
+    }
+}
 fn signature(
     op: BinaryOp,
     a: Option<DataType>,
@@ -92,6 +201,9 @@ fn signature(
             return Ok((a, b, Text));
         }
         return Err(SqlError::UndefinedFunction);
+    }
+    if let Some(signature) = temporal_signature(op, a.as_ref(), b.as_ref())? {
+        return Ok(signature);
     }
     let (a, b) = match (a, b) {
         (None, None) => return Err(SqlError::AmbiguousFunction),
@@ -129,12 +241,10 @@ pub(super) fn infer(
     tables: &[&TableDef],
 ) -> R<()> {
     match value {
-        Scalar::Unary(_, a) => {
+        Scalar::Unary(op, a) => {
             a.infer(None, parameters, resolve, tables)?;
             let ty = known(a, resolve, tables, parameters)?.ok_or(SqlError::AmbiguousFunction)?;
-            if !number(&ty) {
-                return Err(SqlError::UndefinedFunction);
-            }
+            unary_type(*op, &ty)?;
             a.infer(Some(&ty), parameters, resolve, tables)
         }
         Scalar::Binary(op, a, b) => {
@@ -167,7 +277,19 @@ fn operand(
     if let Scalar::Literal(v @ (Value::Text(_) | Value::Null)) = a {
         return Ok(BoundScalar {
             ty: target.clone(),
-            node: literal_cast_node(v.clone(), target)?,
+            node: literal_cast_node(v.clone(), target).map_err(|error| {
+                // Date's bounded parser rejects short year fields before it checks
+                // missing month/day fields. Bare digits are invalid PG dates.
+                if error == SqlError::Unsupported
+                    && *target == DataType::Date
+                    && matches!(v, Value::Text(s) if !s.trim().is_empty()
+                        && s.trim().bytes().all(|b| b.is_ascii_digit()))
+                {
+                    SqlError::InvalidDatetimeFormat
+                } else {
+                    error
+                }
+            })?,
         });
     }
     let bound = a.bind(resolve, tables, parameters)?;
@@ -188,12 +310,12 @@ pub(super) fn bind(
 ) -> R<BoundScalar> {
     match value {
         Scalar::Unary(op, a) => {
-            let a = a.bind(resolve, tables, parameters)?;
-            if !number(&a.ty) {
-                return Err(SqlError::UndefinedFunction);
-            }
+            let source =
+                known(a, resolve, tables, parameters)?.ok_or(SqlError::AmbiguousFunction)?;
+            let ty = unary_type(*op, &source)?;
+            let a = operand(a, &ty, resolve, tables, parameters)?;
             Ok(BoundScalar {
-                ty: a.ty.clone(),
+                ty,
                 node: Node::Call(
                     if *op == UnaryOp::Neg {
                         "\u{1}operator:neg"
@@ -231,7 +353,18 @@ pub(super) fn bind(
             }
             Ok(BoundScalar {
                 ty,
-                node: Node::Call(name(*op).into(), args),
+                node: if matches!(
+                    (*op, args[0].ty.clone(), args[1].ty.clone()),
+                    (
+                        BinaryOp::Add | BinaryOp::Sub,
+                        DataType::TimestampTz,
+                        DataType::Interval
+                    ) | (BinaryOp::Add, DataType::Interval, DataType::TimestampTz)
+                ) {
+                    Node::ZonedOperator(name(*op).into(), args, None)
+                } else {
+                    Node::Call(name(*op).into(), args)
+                },
             })
         }
         _ => unreachable!(),
@@ -267,6 +400,10 @@ pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usi
             charge(budget, &values[0])?;
         }
         return match &values[0] {
+            Value::Interval(a) => a
+                .checked_neg()
+                .map(Value::Interval)
+                .map_err(temporal::function_error),
             Value::Int(a) => checked_integer(a.checked_neg().ok_or(SqlError::Overflow)?, ty),
             Value::Numeric(a) => Numeric::parse("0")
                 .map_err(pg_error)?
@@ -306,6 +443,10 @@ pub(super) fn eval(name: &str, ty: &DataType, values: &[Value], budget: &mut usi
             return Ok(Value::Bytes(out));
         }
         return Err(SqlError::UndefinedFunction);
+    }
+    if let Some(value) = eval_temporal(op, values)? {
+        charge(budget, &value)?;
+        return Ok(value);
     }
     match (&values[0], &values[1]) {
         (Value::Int(a), Value::Int(b)) => {
@@ -380,4 +521,91 @@ fn float_check(op: &str, a: f64, b: f64, result: f64) -> R<()> {
         return Err(SqlError::Overflow);
     }
     Ok(())
+}
+
+fn eval_temporal(op: &str, values: &[Value]) -> R<Option<Value>> {
+    use Value::*;
+    let out = match (op, &values[0], &values[1]) {
+        ("+", Date(a), Int(b)) | ("+", Int(b), Date(a)) => {
+            Date(a.add_days(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Date(a), Int(b)) => Date(a.sub_days(*b).map_err(temporal::function_error)?),
+        ("-", Date(a), Date(b)) => Int(i64::from(a.diff(*b).map_err(temporal::function_error)?)),
+        ("+", Date(a), Time(b)) | ("+", Time(b), Date(a)) => {
+            Timestamp(a.add_time(*b).map_err(temporal::function_error)?)
+        }
+        ("+", Date(a), TimeTz(b)) | ("+", TimeTz(b), Date(a)) => {
+            TimestampTz(a.add_timetz(*b).map_err(temporal::function_error)?)
+        }
+        ("+", Date(a), Interval(b)) | ("+", Interval(b), Date(a)) => {
+            Timestamp(a.add_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Date(a), Interval(b)) => {
+            Timestamp(a.sub_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("+", Timestamp(a), Interval(b)) | ("+", Interval(b), Timestamp(a)) => {
+            Timestamp(a.add_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Timestamp(a), Interval(b)) => {
+            Timestamp(a.sub_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Timestamp(a), Timestamp(b)) => {
+            Interval(a.diff(*b).map_err(temporal::function_error)?)
+        }
+        ("-", TimestampTz(a), TimestampTz(b)) => {
+            Interval(a.diff(*b).map_err(temporal::function_error)?)
+        }
+        ("+", Time(a), Interval(b)) | ("+", Interval(b), Time(a)) => {
+            Time(a.add_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Time(a), Interval(b)) => Time(a.sub_interval(*b).map_err(temporal::function_error)?),
+        ("-", Time(a), Time(b)) => Interval(a.diff(*b)),
+        ("+", TimeTz(a), Interval(b)) | ("+", Interval(b), TimeTz(a)) => {
+            TimeTz(a.add_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("-", TimeTz(a), Interval(b)) => {
+            TimeTz(a.sub_interval(*b).map_err(temporal::function_error)?)
+        }
+        ("+", Interval(a), Interval(b)) => {
+            Interval(a.checked_add(*b).map_err(temporal::function_error)?)
+        }
+        ("-", Interval(a), Interval(b)) => {
+            Interval(a.checked_sub(*b).map_err(temporal::function_error)?)
+        }
+        ("*", Interval(a), Float8(b)) | ("*", Float8(b), Interval(a)) => {
+            Interval(a.mul_f64(b.value()).map_err(temporal::function_error)?)
+        }
+        ("/", Interval(a), Float8(b)) => {
+            Interval(a.div_f64(b.value()).map_err(temporal::function_error)?)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
+}
+pub(super) fn eval_zoned(
+    name: &str,
+    values: &[Value],
+    clock: Option<&crate::relational::clock::ExecutionClock>,
+    budget: &mut usize,
+) -> R<Value> {
+    if values.contains(&Value::Null) {
+        return Ok(Value::Null);
+    }
+    use giggles_pg_types::temporal::SessionZone;
+    let zone = clock
+        .and_then(|c| c.zone())
+        .unwrap_or(SessionZone::Fixed(0));
+    let op = name
+        .strip_prefix(PREFIX)
+        .ok_or(SqlError::UndefinedFunction)?;
+    let value = match (op, &values[0], &values[1]) {
+        ("+", Value::TimestampTz(a), Value::Interval(b))
+        | ("+", Value::Interval(b), Value::TimestampTz(a)) => a.add_interval(*b, zone),
+        ("-", Value::TimestampTz(a), Value::Interval(b)) => a.sub_interval(*b, zone),
+        _ => return Err(SqlError::UndefinedFunction),
+    }
+    .map(Value::TimestampTz)
+    .map_err(temporal::function_error)?;
+    charge(budget, &value)?;
+    Ok(value)
 }

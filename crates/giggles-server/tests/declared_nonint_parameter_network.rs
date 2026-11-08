@@ -434,18 +434,18 @@ const CASES: &[&str] = &[
     r#"{"name":"F not bool","sql":"SELECT NOT $1","oids":[16],"inputs":["74"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["f"]]}}"#,
     // PG18.6: {"rows":[["f"]],"param_oids":[16],"col_oids":[16]}; F15 closed the boolean projection gap
     r#"{"name":"F bool AND","sql":"SELECT $1 AND true","oids":[16],"inputs":["66"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["f"]]}}"#,
-    // PG18.6: {"rows":[["2024-02-01"]],"param_oids":[1082],"col_oids":[1082]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F date + int","sql":"SELECT $1 + 1","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
-    // PG18.6: {"rows":[["2024-02-01 00:00:00"]],"param_oids":[1082],"col_oids":[1114]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F date + interval","sql":"SELECT $1 + interval '1 day'","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
-    // PG18.6: {"rows":[["30"]],"param_oids":[1082],"col_oids":[23]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F date - date","sql":"SELECT $1 - date '2024-01-01'","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
+    // PG18.6: {"rows":[["2024-02-01"]],"param_oids":[1082],"col_oids":[1082]}; F16 closed the temporal operator gap
+    r#"{"name":"F date + int","sql":"SELECT $1 + 1","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"execute","param_oids":[1082],"col_oids":[1082],"rows":[["2024-02-01"]]}}"#,
+    // PG18.6: {"rows":[["2024-02-01 00:00:00"]],"param_oids":[1082],"col_oids":[1114]}; F16 closed the temporal operator gap
+    r#"{"name":"F date + interval","sql":"SELECT $1 + interval '1 day'","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"execute","param_oids":[1082],"col_oids":[1114],"rows":[["2024-02-01 00:00:00"]]}}"#,
+    // PG18.6: {"rows":[["30"]],"param_oids":[1082],"col_oids":[23]}; F16 closed the temporal operator gap
+    r#"{"name":"F date - date","sql":"SELECT $1 - date '2024-01-01'","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"execute","param_oids":[1082],"col_oids":[23],"rows":[["30"]]}}"#,
     r#"{"name":"F extract year ts","sql":"SELECT extract(year from $1)","oids":[1114],"inputs":["323032342d30352d30362030373a30383a3039"],"binary":false,"expected":{"phase":"execute","param_oids":[1114],"col_oids":[1700],"rows":[["2024"]]}}"#,
     r#"{"name":"F date_part tstz","sql":"SELECT date_part('hour', $1)","oids":[1184],"inputs":["323032342d30352d30362030373a30383a30392b3030"],"binary":false,"expected":{"phase":"execute","param_oids":[1184],"col_oids":[701],"rows":[["7"]]}}"#,
-    // PG18.6: {"rows":[["2024-01-02 00:00:00"]],"param_oids":[1114,1186],"col_oids":[1114]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F ts + interval param","sql":"SELECT $1 + $2","oids":[1114,1186],"inputs":["323032342d30312d30312030303a30303a3030","3120646179"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
-    // PG18.6: {"rows":[["02:00:00"]],"param_oids":[1186],"col_oids":[1186]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F interval * 2","sql":"SELECT $1 * 2","oids":[1186],"inputs":["3120686f7572"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
+    // PG18.6: {"rows":[["2024-01-02 00:00:00"]],"param_oids":[1114,1186],"col_oids":[1114]}; F16 closed the temporal operator gap
+    r#"{"name":"F ts + interval param","sql":"SELECT $1 + $2","oids":[1114,1186],"inputs":["323032342d30312d30312030303a30303a3030","3120646179"],"binary":false,"expected":{"phase":"execute","param_oids":[1114,1186],"col_oids":[1114],"rows":[["2024-01-02 00:00:00"]]}}"#,
+    // PG18.6: {"rows":[["02:00:00"]],"param_oids":[1186],"col_oids":[1186]}; F16 closed the temporal operator gap
+    r#"{"name":"F interval * 2","sql":"SELECT $1 * 2","oids":[1186],"inputs":["3120686f7572"],"binary":false,"expected":{"phase":"execute","param_oids":[1186],"col_oids":[1186],"rows":[["02:00:00"]]}}"#,
     r#"{"name":"F numeric + int col","sql":"SELECT n + $1 FROM t WHERE id = 1","oids":[1700],"inputs":["31"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["2.5"]]}}"#,
     r#"{"name":"F int col + numeric","sql":"SELECT i + $1 FROM t WHERE id = 1","oids":[1700],"inputs":["302e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["2.5"]]}}"#,
     r#"{"name":"F int col * float8","sql":"SELECT i * $1 FROM t WHERE id = 1","oids":[701],"inputs":["302e35"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["1"]]}}"#,
@@ -460,8 +460,8 @@ const CASES: &[&str] = &[
     r#"{"name":"F $1::numeric text","sql":"SELECT $1::numeric","oids":[25],"inputs":["312e3235"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[1700],"rows":[["1.25"]]}}"#,
     r#"{"name":"F $1::int bool","sql":"SELECT $1::int","oids":[16],"inputs":["74"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"]]}}"#,
     r#"{"name":"F substr varchar","sql":"SELECT substr($1, 2)","oids":[1043],"inputs":["61626364"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["bcd"]]}}"#,
-    // PG18.6: {"rows":[["00:30:00"]],"param_oids":[1083],"col_oids":[1083]}; gap: temporal operator overload absent
-    r#"{"name":"known gap: F time + interval","sql":"SELECT $1 + interval '1 hour'","oids":[1083],"inputs":["32333a33303a3030"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
+    // PG18.6: {"rows":[["00:30:00"]],"param_oids":[1083],"col_oids":[1083]}; F16 closed the temporal operator gap
+    r#"{"name":"F time + interval","sql":"SELECT $1 + interval '1 hour'","oids":[1083],"inputs":["32333a33303a3030"],"binary":false,"expected":{"phase":"execute","param_oids":[1083],"col_oids":[1083],"rows":[["00:30:00"]]}}"#,
     // PG18.6: {"rows":[["2"]],"param_oids":[1700],"col_oids":[1700]}; gap: greatest absent from function registry
     r#"{"name":"known gap: F greatest numeric","sql":"SELECT greatest($1, 2)","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
     // PG18.6: {"rows":[["1"]],"param_oids":[16],"col_oids":[23]}; F15 closed the boolean projection gap
