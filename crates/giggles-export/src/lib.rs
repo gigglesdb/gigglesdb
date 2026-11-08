@@ -275,11 +275,11 @@ pub fn capture(admin: &Admin, bounds: Bounds) -> Result<Archive> {
 /// The catalog bracket certifies that the full-state BEGIN snapshot has this schema.
 pub fn capture_with_hook(admin: &Admin, bounds: Bounds, hook: Hook<'_>) -> Result<Archive> {
     bounds.check()?;
-    let before = admin.catalog()?;
+    let before = admin.logical_export_catalog()?;
     hook(Point::CatalogBefore)?;
     let mut tx = Transaction(admin.sql_session());
     tx.0.execute("BEGIN", &[], None)?;
-    let after = admin.catalog()?;
+    let after = admin.logical_export_catalog()?;
     if before != after {
         return Err(invalid("catalog changed across BEGIN"));
     }

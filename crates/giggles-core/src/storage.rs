@@ -1711,11 +1711,14 @@ impl Admin {
             deferral: Default::default(),
         }
     }
-    /// Catalog preflight for logical archives which cannot preserve secondary indexes.
+    /// Catalog preflight for the lossless logical archive profile. Refuse catalog
+    /// extensions (typmods, DEFAULTs, identity/serial, CHECK/FK/UNIQUE constraints,
+    /// sequences, and varchar/char identity) and secondary indexes because the
+    /// archive cannot preserve them.
     pub fn logical_export_catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
         self.inner.db(LOGICAL_EXPORT)?;
         self.inner.inspect(|s| {
-            if s.sql.has_secondary_indexes_engine() {
+            if !s.sql.catalog_ext().is_empty() || s.sql.has_secondary_indexes_engine() {
                 return Err(CoreError::Unsupported);
             }
             Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()))

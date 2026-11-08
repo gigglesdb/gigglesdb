@@ -30,18 +30,14 @@ fn varchar_and_char_columns_refuse_capture_and_export() {
         assert!(
             matches!(
                 capture(&a, Bounds::default()),
-                Err(Error::Core(giggles_core::CoreError::Sql(
-                    giggles_core::relational::SqlError::Unsupported
-                )))
+                Err(Error::Core(giggles_core::CoreError::Unsupported))
             ),
             "{ddl}"
         );
         assert!(
             matches!(
                 export(&a, p.join("copy"), Bounds::default()),
-                Err(Error::Core(giggles_core::CoreError::Sql(
-                    giggles_core::relational::SqlError::Unsupported
-                )))
+                Err(Error::Core(giggles_core::CoreError::Unsupported))
             ),
             "{ddl}"
         );
