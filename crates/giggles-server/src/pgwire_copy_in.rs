@@ -36,7 +36,13 @@ impl CopyIn {
                     .map(|(value, column)| {
                         value.map_or(Ok(Value::Null), |bytes| {
                             if format == 1 {
-                                decode_in_zone(&bytes, &column.data_type, 1, zone)
+                                decode_in_zone(
+                                    &bytes,
+                                    &column.data_type,
+                                    1,
+                                    zone,
+                                    self.clock.transaction_us,
+                                )
                             } else {
                                 String::from_utf8(bytes)
                                     .map(Value::Text)

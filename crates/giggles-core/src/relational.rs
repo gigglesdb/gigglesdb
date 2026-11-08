@@ -199,6 +199,8 @@ pub enum SqlError {
     BadCopyFileFormat,
     /// 22001 string_data_right_truncation
     StringDataRightTruncation,
+    /// 22009 invalid_time_zone_displacement_value
+    InvalidTimeZoneDisplacementValue,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

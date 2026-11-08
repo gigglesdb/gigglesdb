@@ -25,6 +25,9 @@ pub enum Error {
     DivisionByZero,
     Unimplemented,
     Range,
+    /// SQLSTATE 22009: PostgreSQL 18.6 rejects an explicit numeric UTC offset in
+    /// text datetime input when its hour is >=16 or minute/second is >=60.
+    TimeZoneDisplacement,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

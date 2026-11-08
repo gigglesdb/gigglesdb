@@ -42,8 +42,8 @@ fn string_data_right_truncation_has_append_only_protocol_identity() {
         error
     );
     assert_eq!(local::failure(CoreError::Sql(error)).code, 251);
-    assert!(le.deserialize::<SqlError>(&[52, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 52]).is_err());
+    assert!(le.deserialize::<SqlError>(&[53, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<SqlError>(&[0, 0, 0, 53]).is_err());
 }
 
 #[test]

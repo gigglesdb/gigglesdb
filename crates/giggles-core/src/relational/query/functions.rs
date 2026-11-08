@@ -2181,19 +2181,22 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
         (Value::Interval(v), DataType::Interval) => Value::Interval(v),
         (Value::Interval(v), DataType::Text) => Value::Text(v.to_string()),
         (Value::Text(s), DataType::Date) => Value::Date(
-            Date::parse(&s, &giggles_pg_types::temporal::ParserSettings::default())
-                .map_err(|e| temporal::parse_error(e, false))?,
+            Date::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
+                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
+            )?,
         ),
-        (Value::Text(s), DataType::Time) => {
-            Value::Time(Time::parse(&s).map_err(|e| temporal::parse_error(e, false))?)
-        }
+        (Value::Text(s), DataType::Time) => Value::Time(Time::parse(&s).map_err(|e| {
+            datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false))
+        })?),
         (Value::Text(s), DataType::TimeTz) => Value::TimeTz(
-            TimeTz::parse(&s, &giggles_pg_types::temporal::ParserSettings::default())
-                .map_err(|e| temporal::parse_error(e, false))?,
+            TimeTz::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
+                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
+            )?,
         ),
         (Value::Text(s), DataType::Timestamp) => Value::Timestamp(
-            Timestamp::parse(&s, &giggles_pg_types::temporal::ParserSettings::default())
-                .map_err(|e| temporal::parse_error(e, false))?,
+            Timestamp::parse(&s, &giggles_pg_types::temporal::ParserSettings::default()).map_err(
+                |e| datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false)),
+            )?,
         ),
         (Value::Text(s), DataType::TimestampTz) => Value::TimestampTz(
             TimestampTz::parse_in_session(
@@ -2203,7 +2206,9 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
                     zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
                 },
             )
-            .map_err(|e| temporal::parse_error(e, false))?,
+            .map_err(|e| {
+                datetime_input::zone_word_error(&s, ty, temporal::parse_error(e, false))
+            })?,
         ),
         (Value::Text(s), DataType::Interval) => {
             Value::Interval(Interval::parse(&s).map_err(|e| temporal::parse_error(e, true))?)
@@ -2683,7 +2688,7 @@ fn numeric_input_error(text: &str, error: giggles_pg_types::Error) -> SqlError {
     use giggles_pg_types::Error;
     match error {
         Error::Syntax | Error::Unimplemented | Error::Binary => SqlError::InvalidTextRepresentation,
-        Error::Range => SqlError::Overflow,
+        Error::Range | Error::TimeZoneDisplacement => SqlError::Overflow,
         Error::Limit if text.len() > giggles_pg_types::MAX_TEXT => SqlError::Limit,
         Error::Limit => {
             let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -2735,6 +2740,7 @@ fn pg_error(e: giggles_pg_types::Error) -> SqlError {
         giggles_pg_types::Error::Limit => SqlError::Limit,
         giggles_pg_types::Error::Range => SqlError::Overflow,
         giggles_pg_types::Error::DivisionByZero => SqlError::DivisionByZero,
+        giggles_pg_types::Error::TimeZoneDisplacement => SqlError::InvalidTimeZoneDisplacementValue,
         _ => SqlError::Type,
     }
 }

@@ -182,6 +182,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::NullValueNotAllowed) => "22004",
         CoreError::Sql(S::CannotCoerce) => "42846",
         CoreError::Sql(S::BadCopyFileFormat) => "22P04",
+        CoreError::Sql(S::InvalidTimeZoneDisplacementValue) => "22009",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
@@ -1600,6 +1601,15 @@ mod lifecycle_tests {
         assert_eq!(
             sqlstate(&CoreError::Sql(relational::SqlError::BadCopyFileFormat)),
             "22P04"
+        );
+    }
+    #[test]
+    fn sqlstate_time_zone_displacement() {
+        assert_eq!(
+            sqlstate(&CoreError::Sql(
+                relational::SqlError::InvalidTimeZoneDisplacementValue
+            )),
+            "22009"
         );
     }
     #[test]

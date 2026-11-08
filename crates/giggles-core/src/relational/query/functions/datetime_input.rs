@@ -31,7 +31,45 @@ pub(super) fn timetz(text: &str, offset_east: i32) -> R<TimeTz> {
     .map_err(|e| temporal::parse_error(e, false))
 }
 
+/// Classify malformed zone words without changing parser acceptance or other errors.
+pub(super) fn zone_word_error(text: &str, target: &DataType, error: SqlError) -> SqlError {
+    if error != SqlError::InvalidDatetimeFormat || !self::target(target) {
+        return error;
+    }
+    let tokens: Vec<_> = text.trim_ascii().split_ascii_whitespace().collect();
+    let clock_only = matches!(target, DataType::Time | DataType::TimeTz);
+    let zone_word = tokens.iter().enumerate().any(|(index, token)| {
+        if index == 0 && (!clock_only || tokens.len() >= 2) {
+            return false;
+        }
+        let bytes = token.as_bytes();
+        let letters = bytes.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+        if letters == 0 || !matches!(bytes.get(letters), Some(b'-' | b'/' | b'.')) {
+            return false;
+        }
+        if giggles_pg_types::temporal::SessionZone::named(token).is_ok() {
+            return false;
+        }
+        let offset = letters + usize::from(matches!(bytes.get(letters), Some(b'+' | b'-')));
+        let posix = letters >= 3 && bytes.get(offset).is_some_and(u8::is_ascii_digit);
+        !posix
+    });
+    if zone_word {
+        SqlError::InvalidParameterValue
+    } else {
+        error
+    }
+}
+
 pub(super) fn parse(
+    text: String,
+    target: &DataType,
+    clock: &crate::relational::clock::ExecutionClock,
+) -> R<Value> {
+    parse_inner(text.clone(), target, clock).map_err(|error| zone_word_error(&text, target, error))
+}
+
+fn parse_inner(
     text: String,
     target: &DataType,
     clock: &crate::relational::clock::ExecutionClock,
@@ -165,6 +203,39 @@ pub(super) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_word_classifier_preserves_errors_and_token_boundaries() {
+        for (text, ty, remap) in [
+            ("  12:00\tfoo-bar  ", DataType::Time, true),
+            ("foo-bar 12:00", DataType::Time, false),
+            ("noon-ish", DataType::Time, true),
+            ("noon-ish", DataType::Date, false),
+            ("12:00 UTC-5", DataType::Time, false),
+            ("12:00 ab-5", DataType::Time, true),
+            ("12:00 eUrOpE/pArIs", DataType::Time, false),
+            ("12:00 foo_bar", DataType::Time, false),
+            ("12:00 foo-bar", DataType::Interval, false),
+        ] {
+            assert_eq!(
+                zone_word_error(text, &ty, SqlError::InvalidDatetimeFormat),
+                if remap {
+                    SqlError::InvalidParameterValue
+                } else {
+                    SqlError::InvalidDatetimeFormat
+                },
+                "{text}"
+            );
+            for error in [
+                SqlError::Unsupported,
+                SqlError::DatetimeFieldOverflow,
+                SqlError::InvalidTimeZoneDisplacementValue,
+                SqlError::Type,
+            ] {
+                assert_eq!(zone_word_error(text, &ty, error.clone()), error, "{text}");
+            }
+        }
+    }
 
     #[test]
     fn malformed_short_date_words_are_not_unsupported_years() {

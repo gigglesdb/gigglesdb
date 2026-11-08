@@ -266,9 +266,15 @@ fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> &'stat
 }
 
 pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
-    decode_in_zone(b, ty, format, SessionZone::Fixed(0))
+    decode_in_zone(b, ty, format, SessionZone::Fixed(0), 0)
 }
-pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -> R<Value> {
+pub fn decode_in_zone(
+    b: &[u8],
+    ty: &DataType,
+    format: u16,
+    zone: SessionZone,
+    transaction_us: i64,
+) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
@@ -323,15 +329,38 @@ pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -
             DataType::Time => giggles_core::relational::PgTime::parse(s)
                 .map(Value::Time)
                 .map_err(temporal_error),
-            DataType::TimeTz => giggles_core::relational::TimeTz::parse(
-                s,
-                &giggles_pg_types::temporal::ParserSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::Ymd,
+            DataType::TimeTz => {
+                use giggles_pg_types::temporal::{
+                    Date, DateOrder, ParserSettings, TimeTz, TimestampTz,
+                };
+                let settings = ParserSettings {
+                    date_order: DateOrder::Ymd,
                     offset_east: 0,
-                },
-            )
-            .map(Value::TimeTz)
-            .map_err(temporal_error),
+                };
+                let parsed = TimeTz::parse(s, &settings).map_err(temporal_error)?;
+                let other = TimeTz::parse(
+                    s,
+                    &ParserSettings {
+                        offset_east: 3600,
+                        ..settings
+                    },
+                )
+                .map_err(temporal_error)?;
+                if parsed == other {
+                    Ok(Value::TimeTz(parsed))
+                } else {
+                    // StatementClock uses PostgreSQL-epoch microseconds, like TimestampTz.
+                    let instant =
+                        TimestampTz::from_microseconds(transaction_us).map_err(temporal_error)?;
+                    let local = zone.to_local(instant).map_err(temporal_error)?;
+                    let days = i32::try_from(local.microseconds().div_euclid(86_400_000_000))
+                        .map_err(|_| "22008")?;
+                    let date = Date::from_days(days).map_err(temporal_error)?;
+                    TimeTz::in_zone_on_date(parsed.time(), date, zone)
+                        .map(Value::TimeTz)
+                        .map_err(temporal_error)
+                }
+            }
             DataType::Timestamp => giggles_core::relational::Timestamp::parse(
                 s,
                 &giggles_pg_types::temporal::ParserSettings {
@@ -441,16 +470,23 @@ pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -
 fn temporal_error(e: giggles_pg_types::Error) -> &'static str {
     match e {
         giggles_pg_types::Error::Range => "22008",
+        giggles_pg_types::Error::TimeZoneDisplacement => "22009",
         giggles_pg_types::Error::Binary => "22P03",
         giggles_pg_types::Error::Limit => "54000",
-        _ => "22007",
+        giggles_pg_types::Error::Syntax
+        | giggles_pg_types::Error::DivisionByZero
+        | giggles_pg_types::Error::Unimplemented => "22007",
     }
 }
 fn numeric_error(e: giggles_pg_types::Error) -> &'static str {
     match e {
-        giggles_pg_types::Error::Range | giggles_pg_types::Error::Limit => "22003",
+        giggles_pg_types::Error::Range
+        | giggles_pg_types::Error::Limit
+        | giggles_pg_types::Error::TimeZoneDisplacement => "22003",
         giggles_pg_types::Error::Binary => "22P03",
-        _ => "22P02",
+        giggles_pg_types::Error::Syntax
+        | giggles_pg_types::Error::DivisionByZero
+        | giggles_pg_types::Error::Unimplemented => "22P02",
     }
 }
 fn encode(
@@ -1144,6 +1180,7 @@ impl State {
                 let mut params = vec![];
                 let mut catalog_params = vec![];
                 let mut parameter_bytes = 0usize;
+                let mut transaction_us = None;
                 for (i, ty) in s.d.parameters.iter().enumerate() {
                     let n = r.u32()?;
                     if matches!(s.p, Plan::Catalog(..)) {
@@ -1171,6 +1208,12 @@ impl State {
                             ty,
                             format_at(&fmts, i),
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            if matches!(ty, DataType::TimeTz) && format_at(&fmts, i) == 0 {
+                                *transaction_us
+                                    .get_or_insert_with(|| session.copy_clock().transaction_us)
+                            } else {
+                                0
+                            },
                         )?
                     });
                 }
@@ -1825,3 +1868,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 #[path = "pgwire_input_contract_tests.rs"]
 mod wire_input_contract_tests;
+
+#[cfg(test)]
+#[path = "pgwire_timetz_tests.rs"]
+mod timetz_tests;

@@ -338,12 +338,11 @@ fn split_offset(s: &str, default: i32) -> Result<(&str, i32), Error> {
         let h = number(p.next().ok_or(Error::Syntax)?)?;
         let m = number(p.next().unwrap_or("0"))?;
         let sec = number(p.next().unwrap_or("0"))?;
-        if p.next().is_some()
-            || !(0..16).contains(&h)
-            || !(0..60).contains(&m)
-            || !(0..60).contains(&sec)
-        {
+        if p.next().is_some() || h < 0 || m < 0 || sec < 0 {
             return Err(Error::Range);
+        }
+        if h >= 16 || m >= 60 || sec >= 60 {
+            return Err(Error::TimeZoneDisplacement);
         }
         Ok((t, offset_valid((sign * (h * 3600 + m * 60 + sec)) as i32)?))
     } else {
