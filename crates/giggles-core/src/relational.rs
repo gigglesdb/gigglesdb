@@ -197,6 +197,8 @@ pub enum SqlError {
     CannotCoerce,
     /// 22P04 bad_copy_file_format
     BadCopyFileFormat,
+    /// 22001 string_data_right_truncation
+    StringDataRightTruncation,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +218,7 @@ pub enum Value {
     TimestampTz(#[serde(with = "crate::pg_serde::timestamptz")] TimestampTz),
     Interval(#[serde(with = "crate::pg_serde::interval")] Interval),
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Boolean,
     SmallInt,
@@ -233,7 +235,72 @@ pub enum DataType {
     Timestamp,
     TimestampTz,
     Interval,
+    Varchar,
+    Bpchar,
 }
+impl Serialize for DataType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Boolean => (0, "Boolean"),
+            Self::SmallInt => (1, "SmallInt"),
+            Self::Integer => (2, "Integer"),
+            Self::BigInt => (3, "BigInt"),
+            Self::Text | Self::Varchar | Self::Bpchar => (4, "Text"),
+            Self::Bytes => (5, "Bytes"),
+            Self::Numeric => (6, "Numeric"),
+            Self::Real => (7, "Real"),
+            Self::DoublePrecision => (8, "DoublePrecision"),
+            Self::Date => (9, "Date"),
+            Self::Time => (10, "Time"),
+            Self::TimeTz => (11, "TimeTz"),
+            Self::Timestamp => (12, "Timestamp"),
+            Self::TimestampTz => (13, "TimestampTz"),
+            Self::Interval => (14, "Interval"),
+        };
+        serializer.serialize_unit_variant("DataType", index, name)
+    }
+}
+impl<'de> Deserialize<'de> for DataType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "DataType")]
+        enum LegacyDataType {
+            Boolean,
+            SmallInt,
+            Integer,
+            BigInt,
+            Text,
+            Bytes,
+            Numeric,
+            Real,
+            DoublePrecision,
+            Date,
+            Time,
+            TimeTz,
+            Timestamp,
+            TimestampTz,
+            Interval,
+        }
+        Ok(match LegacyDataType::deserialize(deserializer)? {
+            LegacyDataType::Boolean => Self::Boolean,
+            LegacyDataType::SmallInt => Self::SmallInt,
+            LegacyDataType::Integer => Self::Integer,
+            LegacyDataType::BigInt => Self::BigInt,
+            LegacyDataType::Text => Self::Text,
+            LegacyDataType::Bytes => Self::Bytes,
+            LegacyDataType::Numeric => Self::Numeric,
+            LegacyDataType::Real => Self::Real,
+            LegacyDataType::DoublePrecision => Self::DoublePrecision,
+            LegacyDataType::Date => Self::Date,
+            LegacyDataType::Time => Self::Time,
+            LegacyDataType::TimeTz => Self::TimeTz,
+            LegacyDataType::Timestamp => Self::Timestamp,
+            LegacyDataType::TimestampTz => Self::TimestampTz,
+            LegacyDataType::Interval => Self::Interval,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub id: u64,
@@ -356,7 +423,7 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
         | (DataType::DoublePrecision, Value::Float8(_))
         | (DataType::Boolean, Value::Bool(_))
         | (DataType::BigInt, Value::Int(_))
-        | (DataType::Text, Value::Text(_))
+        | (DataType::Text | DataType::Varchar | DataType::Bpchar, Value::Text(_))
         | (DataType::Bytes, Value::Bytes(_)) => true,
         (DataType::SmallInt, Value::Int(n)) => i16::try_from(*n).is_ok(),
         (DataType::Integer, Value::Int(n)) => i32::try_from(*n).is_ok(),
@@ -402,6 +469,25 @@ fn infer_mutation_parameter(
         *slot = Some(target.clone());
     }
     Ok(())
+}
+pub(crate) fn coerce_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
+    use giggles_pg_types::character::{CharKind, CharTypmod, coerce_assignment};
+    let kind = match column.data_type {
+        DataType::Varchar => CharKind::Varchar,
+        DataType::Bpchar => CharKind::Bpchar,
+        _ => return Ok(value),
+    };
+    let Some(typmod) = CharTypmod::from_typmod(kind, rel.column_typmod(column.id)) else {
+        return Ok(value);
+    };
+    match value {
+        Value::Text(text) => Ok(Value::Text(
+            coerce_assignment(&text, typmod)
+                .map_err(|_| SqlError::StringDataRightTruncation)?
+                .into_owned(),
+        )),
+        value => Ok(value),
+    }
 }
 pub(crate) fn row_check(t: &TableDef, values: &[Value]) -> R<()> {
     if values.len() != t.columns.len() {
@@ -954,6 +1040,7 @@ impl Parser {
             self.punct('(')?;
             let mut columns = vec![];
             let mut defaults = vec![];
+            let mut typmods = vec![];
             let mut sequences = vec![];
             let mut keys = vec![];
             let mut constraints = vec![];
@@ -994,11 +1081,20 @@ impl Parser {
                     } else {
                         None
                     };
-                    let data_type = if let Some(ty) = &serial {
-                        ty.clone()
+                    let parsed = if let Some(ty) = &serial {
+                        ddl_type::Parsed {
+                            data_type: ty.clone(),
+                            typmod: None,
+                            semantic_error: None,
+                        }
                     } else {
-                        ddl_type::parse(self, ddl_type::Site::Create)?.data_type
+                        ddl_type::parse(self, ddl_type::Site::Create)?
                     };
+                    if let Some(error) = parsed.semantic_error {
+                        return Err(error);
+                    }
+                    let data_type = parsed.data_type;
+                    typmods.push(parsed.typmod);
                     let mut not_null = serial.is_some();
                     let mut default = None;
                     let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
@@ -1064,7 +1160,7 @@ impl Parser {
             Statement::Create {
                 name,
                 optional,
-                typmods: vec![None; columns.len()],
+                typmods,
                 defaults,
                 sequences,
                 columns,
@@ -1229,10 +1325,10 @@ pub(crate) fn validate_create_definition(
     }
     for key in keys {
         ident(key)?;
-        if columns
-            .iter()
-            .any(|column| column.name == *key && column.data_type.is_temporal())
-        {
+        if columns.iter().any(|column| {
+            column.name == *key
+                && (column.data_type.is_temporal() || column.data_type == DataType::Bpchar)
+        }) {
             return Err(SqlError::Unsupported);
         }
         if !columns.iter().any(|column| column.name == *key) {
@@ -1368,6 +1464,11 @@ impl Prepared {
         }
         Relational::secondary_admit_values(values.iter())?;
         Self::engine_table(table, state)?;
+        let values = values
+            .into_iter()
+            .zip(&table.columns)
+            .map(|(value, column)| coerce_to_column(state, column, value))
+            .collect::<R<Vec<_>>>()?;
         row_check(table, &values)?;
         Ok(Self::engine(
             Statement::Insert {
@@ -1411,6 +1512,7 @@ impl Prepared {
                 if table.primary_key.contains(&index) {
                     return Err(SqlError::Unsupported);
                 }
+                let value = coerce_to_column(state, column, value)?;
                 check(&value, column)?;
                 Ok((column.name.clone(), Expr::Literal(value)))
             })
@@ -2990,6 +3092,7 @@ impl Relational {
                     } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
                     {
                         assign::plain_value(
+                            self,
                             v,
                             &t.columns[*i],
                             &prepared.parameter_types,
@@ -3009,6 +3112,9 @@ impl Relational {
                 } else {
                     None
                 };
+                for (value, column) in row.iter_mut().zip(&t.columns) {
+                    *value = coerce_to_column(self, column, value.clone())?;
+                }
                 row_check(t, &row)?;
                 let key = pk(t, &row)?;
                 let table_id = t.id;
@@ -3336,3 +3442,6 @@ mod describe_create_tests;
 
 #[cfg(test)]
 mod catalog_typmods_tests;
+
+#[cfg(test)]
+mod text_kind_tests;

@@ -1064,6 +1064,15 @@ impl Filter {
             Self::Compare(a, op, b) => {
                 let mut av = bind(a)?;
                 let mut bv = bind(b)?;
+                if av.ty == DataType::Bpchar || bv.ty == DataType::Bpchar {
+                    return Err(SqlError::Unsupported);
+                }
+                if av.ty == DataType::Varchar {
+                    av.ty = DataType::Text;
+                }
+                if bv.ty == DataType::Varchar {
+                    bv.ty = DataType::Text;
+                }
                 let unknown =
                     |a: &Scalar| matches!(a, Scalar::Literal(Value::Null | Value::Text(_)));
                 if av.ty != bv.ty {
@@ -1104,7 +1113,12 @@ impl Filter {
             } => {
                 let text = |a: &Scalar| {
                     let bound = bind(a)?;
-                    if bound.ty != DataType::Text && !matches!(a, Scalar::Literal(Value::Null)) {
+                    if bound.ty == DataType::Bpchar {
+                        return Err(SqlError::Unsupported);
+                    }
+                    if !matches!(bound.ty, DataType::Text | DataType::Varchar)
+                        && !matches!(a, Scalar::Literal(Value::Null))
+                    {
                         return Err(SqlError::UndefinedFunction);
                     }
                     Ok(bound)
@@ -2926,6 +2940,9 @@ impl Query {
         let mut predicates = vec![];
         for (c, op, e) in &self.predicates {
             let c = resolve(c, tables.len())?;
+            if tables[c.source].columns[c.column].data_type == DataType::Bpchar {
+                return Err(SqlError::Unsupported);
+            }
             if let Expr::Literal(value) = e
                 && !matches!(value, Value::Null | Value::Text(_))
             {
@@ -3034,6 +3051,9 @@ impl Query {
                         .map(|e| e.bind(&resolve, &tables, &parameters))
                         .transpose()?;
                     let ty = c.as_ref().map(|e| e.ty.clone());
+                    if ty == Some(DataType::Bpchar) {
+                        return Err(SqlError::Unsupported);
+                    }
                     if matches!(a.base(), Aggregate::Sum | Aggregate::Avg)
                         && !matches!(
                             ty,
@@ -3127,7 +3147,13 @@ impl Query {
         let order = self
             .order
             .iter()
-            .map(|(e, d, n)| Ok((e.bind(&resolve, &tables, &parameters)?, *d, *n)))
+            .map(|(e, d, n)| {
+                let bound = e.bind(&resolve, &tables, &parameters)?;
+                if bound.ty == DataType::Bpchar {
+                    return Err(SqlError::Unsupported);
+                }
+                Ok((bound, *d, *n))
+            })
             .collect::<R<Vec<_>>>()?;
         let parameters = parameters
             .into_iter()
@@ -4300,6 +4326,8 @@ fn update_filtered_aggregates(
                     | DataType::SmallInt
                     | DataType::Integer
                     | DataType::Text
+                    | DataType::Varchar
+                    | DataType::Bpchar
                     | DataType::Bytes
                     | DataType::Date
                     | DataType::Time

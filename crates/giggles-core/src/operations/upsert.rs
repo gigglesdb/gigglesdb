@@ -60,7 +60,10 @@ pub(super) fn run(
         crate::cancellation::check().map_err(core)?;
         let mut row = vec![Cow::Owned(Value::Null); table.columns.len()];
         for (index, expression) in plan.columns.iter().zip(expressions) {
-            row[*index] = expression.eval(&[])?;
+            row[*index] = Cow::Owned(
+                session
+                    .coerce_column(&table.columns[*index], expression.eval(&[])?.into_owned())?,
+            );
         }
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
         for (value, column) in row.iter().zip(&table.columns) {
@@ -137,14 +140,21 @@ pub(super) fn run(
             (Some(_), BoundConflict::Nothing) => Change::Skip,
             (Some(target), BoundConflict::Update { values, .. }) => {
                 let row = &existing[*target];
-                let evaluated = values
+                let evaluated: Vec<(usize, Cow<'_, Value>)> = values
                     .iter()
                     .map(|(index, expression)| {
                         Ok((
                             *index,
-                            expression.eval_conflict(&|index| &row.values[index], &|index| {
-                                proposal[index].as_ref()
-                            })?,
+                            Cow::Owned(
+                                session.coerce_column(
+                                    &table.columns[*index],
+                                    expression
+                                        .eval_conflict(&|index| &row.values[index], &|index| {
+                                            proposal[index].as_ref()
+                                        })?
+                                        .into_owned(),
+                                )?,
+                            ),
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;

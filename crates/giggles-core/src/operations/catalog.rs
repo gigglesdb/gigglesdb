@@ -202,6 +202,7 @@ fn bind_catalog(
                     | DataType::Integer
                     | DataType::BigInt
                     | DataType::Text
+                    | DataType::Varchar
                     | DataType::Bytes
             ) {
                 return Err(Error::Unsupported);

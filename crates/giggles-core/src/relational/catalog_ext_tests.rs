@@ -52,7 +52,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
             .contains("noncanonical")
     );
     let mut unknown = bytes(V1);
-    unknown[..4].copy_from_slice(&3u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&4u32.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&unknown)

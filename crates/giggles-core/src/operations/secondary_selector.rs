@@ -48,6 +48,7 @@ pub(super) fn choose<'a>(table: &TableDef, filter: &'a Bound) -> Option<Choice<'
                 | DataType::Integer
                 | DataType::BigInt
                 | DataType::Text
+                | DataType::Varchar
                 | DataType::Bytes
         ) {
             return None;

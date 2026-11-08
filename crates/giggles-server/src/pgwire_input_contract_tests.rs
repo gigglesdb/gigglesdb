@@ -102,3 +102,31 @@ fn text_and_bytea_domain_and_format_controls() {
         Ok(Value::Bytes(vec![0, 255]))
     );
 }
+
+#[test]
+fn character_variants_keep_pg_oids_and_text_payloads() {
+    for (ty, oid) in [(DataType::Varchar, 1043), (DataType::Bpchar, 1042)] {
+        assert_eq!(super::oid(&ty), oid);
+        assert_eq!(super::size(&ty), -1);
+        assert_eq!(super::core_declared_type(oid), Some(ty.clone()));
+        assert_eq!(super::sql_declared_type(&ty, oid), Some(ty.clone()));
+        for format in [0, 1] {
+            let value = Value::Text("a  ".into());
+            assert_eq!(decode(b"a  ", &ty, format), Ok(value.clone()));
+            assert_eq!(
+                super::encode(&value, &ty, format, 1, super::SessionZone::Fixed(0)),
+                Ok(Some(b"a  ".to_vec()))
+            );
+            assert_eq!(decode(&[0xff], &ty, format), Err("22021"));
+        }
+        assert_eq!(decode(b"a\0", &ty, 0), Err("22021"));
+    }
+    assert_eq!(
+        super::sql_declared_type(&DataType::Text, 1043),
+        Some(DataType::Varchar)
+    );
+    assert_eq!(
+        super::sql_declared_type(&DataType::Varchar, 25),
+        Some(DataType::Text)
+    );
+}

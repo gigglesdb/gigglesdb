@@ -93,6 +93,8 @@ fn type_name(t: &DataType) -> &'static str {
         DataType::Numeric => "numeric",
         DataType::Real => "real",
         DataType::DoublePrecision => "double precision",
+        DataType::Varchar => "character varying",
+        DataType::Bpchar => "character",
     }
 }
 

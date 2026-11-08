@@ -137,6 +137,8 @@ fn scalar(s: &Scalar) -> R<String> {
                 DataType::Integer => "integer",
                 DataType::BigInt => "bigint",
                 DataType::Text => "text",
+                DataType::Varchar => "varchar",
+                DataType::Bpchar => "bpchar",
                 DataType::Boolean => "boolean",
                 DataType::Numeric => "numeric",
                 DataType::Real => "real",
@@ -301,7 +303,11 @@ fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
                     // Canonical PG spelling emitted for a boolean-context NULL.
                     Scalar::Literal(Value::Null) if *target == DataType::Boolean => (),
                     // Canonical PG spelling emitted for text literals.
-                    Scalar::Literal(Value::Text(_)) if *target == DataType::Text => (),
+                    Scalar::Literal(Value::Text(_))
+                        if matches!(
+                            target,
+                            DataType::Text | DataType::Varchar | DataType::Bpchar
+                        ) => {}
                     // Canonical PG spelling emitted for a folded negative integer.
                     Scalar::Literal(Value::Text(value))
                         if *target == DataType::Integer

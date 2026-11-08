@@ -56,6 +56,7 @@ fn supported(c: &ColumnDef) -> R<()> {
         | DataType::Integer
         | DataType::BigInt
         | DataType::Text
+        | DataType::Varchar
         | DataType::Bytes => Ok(()),
         _ => Err(SqlError::Unsupported),
     }
@@ -111,7 +112,7 @@ fn minimum(c: &ColumnDef, nullable: bool) -> R<Value> {
         DataType::SmallInt => Value::Int(i16::MIN.into()),
         DataType::Integer => Value::Int(i32::MIN.into()),
         DataType::BigInt => Value::Int(i64::MIN),
-        DataType::Text => Value::Text(String::new()),
+        DataType::Text | DataType::Varchar => Value::Text(String::new()),
         DataType::Bytes => Value::Bytes(Vec::new()),
         _ => return Err(SqlError::Unsupported),
     })

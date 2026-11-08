@@ -193,7 +193,7 @@ pub(crate) fn validate(a: &Archive, bounds: Bounds) -> Result<()> {
                     (Value::Int(n), DataType::Integer) => i32::try_from(*n).is_ok(),
                     (Value::Int(_), DataType::BigInt)
                     | (Value::Bool(_), DataType::Boolean)
-                    | (Value::Text(_), DataType::Text)
+                    | (Value::Text(_), DataType::Text | DataType::Varchar | DataType::Bpchar)
                     | (Value::Bytes(_), DataType::Bytes)
                     | (Value::Numeric(_), DataType::Numeric)
                     | (Value::Float4(_), DataType::Real)
@@ -494,7 +494,7 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::SmallInt => "SMALLINT",
                     DataType::Integer => "INTEGER",
                     DataType::BigInt => "BIGINT",
-                    DataType::Text => "TEXT",
+                    DataType::Text | DataType::Varchar | DataType::Bpchar => "TEXT",
                     DataType::Bytes => "BYTEA",
                     DataType::Numeric => "NUMERIC",
                     DataType::Real => "REAL",

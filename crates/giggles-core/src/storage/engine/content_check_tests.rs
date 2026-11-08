@@ -50,6 +50,7 @@ fn table(ext: bool, typmod: bool) -> Vec<u8> {
                 typmod: typmod.then_some(65540),
                 default: Some("1".into()),
                 identity: None,
+                text_kind: None,
             },
         );
     }

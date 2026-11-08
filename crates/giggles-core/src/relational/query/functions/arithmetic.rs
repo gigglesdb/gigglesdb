@@ -172,6 +172,9 @@ fn temporal_signature(
     Ok(Some((at, bt, out)))
 }
 fn unary_type(op: UnaryOp, ty: &DataType) -> R<DataType> {
+    if *ty == DataType::Bpchar {
+        return Err(SqlError::Unsupported);
+    }
     if number(ty) {
         Ok(ty.clone())
     } else if op == UnaryOp::Neg && matches!(ty, DataType::Time | DataType::Interval) {
@@ -186,6 +189,11 @@ fn signature(
     b: Option<DataType>,
 ) -> R<(DataType, DataType, DataType)> {
     use DataType::*;
+    if a == Some(Bpchar) || b == Some(Bpchar) {
+        return Err(SqlError::Unsupported);
+    }
+    let a = a.map(|ty| if ty == Varchar { Text } else { ty });
+    let b = b.map(|ty| if ty == Varchar { Text } else { ty });
     if op == BinaryOp::Concat {
         let (a, b) = match (a, b) {
             (None, None) => (Text, Text),

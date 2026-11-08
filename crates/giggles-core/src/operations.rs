@@ -14,9 +14,9 @@ mod catalog;
 pub(crate) mod state_adapter;
 use state_adapter::Context;
 
+mod explain;
 #[cfg(test)]
 mod heap_native_tests;
-mod explain;
 mod secondary_selector;
 pub use explain::*;
 mod inspection;
@@ -767,6 +767,7 @@ enum Ty {
     Bool,
     Int,
     Text,
+    Bpchar,
     Bytes,
     Numeric,
     Real,
@@ -779,6 +780,9 @@ enum Ty {
     Interval,
 }
 fn unify_type(left: Option<Ty>, right: Option<Ty>) -> Result<Option<Ty>> {
+    if left == Some(Ty::Bpchar) || right == Some(Ty::Bpchar) {
+        return Err(Error::Unsupported);
+    }
     if left.is_some() && right.is_some() && left != right {
         return Err(Error::Type);
     }
@@ -806,7 +810,8 @@ fn colty(c: &ColumnDef) -> Ty {
     match c.data_type {
         DataType::Boolean => Ty::Bool,
         DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
-        DataType::Text => Ty::Text,
+        DataType::Text | DataType::Varchar => Ty::Text,
+        DataType::Bpchar => Ty::Bpchar,
         DataType::Bytes => Ty::Bytes,
         DataType::Numeric => Ty::Numeric,
         DataType::Real => Ty::Real,
@@ -823,7 +828,13 @@ fn check(v: &Value, c: &ColumnDef) -> Result<()> {
     if *v == Value::Null {
         return if c.not_null { Err(Error::Type) } else { Ok(()) };
     }
-    if ty(v) != Some(colty(c)) {
+    if ty(v)
+        != Some(if c.data_type == DataType::Bpchar {
+            Ty::Text
+        } else {
+            colty(c)
+        })
+    {
         return Err(Error::Type);
     }
     if let Value::Int(n) = v {
@@ -1006,6 +1017,9 @@ impl Binder<'_> {
                 // COALESCE will not evaluate a later argument at runtime.
                 for argument in arguments {
                     let (argument, argument_type) = self.expr(argument, d + 1)?;
+                    if argument_type == Some(Ty::Bpchar) {
+                        return Err(Error::Unsupported);
+                    }
                     match function {
                         ScalarFunction::Coalesce => {
                             if let Some(argument_type) = argument_type {
@@ -1059,6 +1073,9 @@ impl Binder<'_> {
             }
             Expr::Negate(e) => {
                 let (e, t) = self.expr(e, d + 1)?;
+                if t == Some(Ty::Bpchar) {
+                    return Err(Error::Unsupported);
+                }
                 if t.is_some() && t != Some(Ty::Int) {
                     return Err(Error::Type);
                 }
@@ -1067,6 +1084,9 @@ impl Binder<'_> {
             Expr::Arithmetic(a, op, b) => {
                 let (a, ta) = self.expr(a, d + 1)?;
                 let (b, tb) = self.expr(b, d + 1)?;
+                if ta == Some(Ty::Bpchar) || tb == Some(Ty::Bpchar) {
+                    return Err(Error::Unsupported);
+                }
                 if [ta, tb]
                     .into_iter()
                     .any(|t| t.is_some() && t != Some(Ty::Int))
@@ -1081,6 +1101,9 @@ impl Binder<'_> {
             Expr::Compare(a, op, b) => {
                 let (a, ta) = self.expr(a, d + 1)?;
                 let (b, tb) = self.expr(b, d + 1)?;
+                if ta == Some(Ty::Bpchar) || tb == Some(Ty::Bpchar) {
+                    return Err(Error::Unsupported);
+                }
                 if ta.is_some() && tb.is_some() && ta != tb {
                     return Err(Error::Type);
                 }
@@ -1095,12 +1118,18 @@ impl Binder<'_> {
             }
             Expr::Not(e) => {
                 let (e, t) = self.expr(e, d + 1)?;
+                if t == Some(Ty::Bpchar) {
+                    return Err(Error::Unsupported);
+                }
                 boolean(t)?;
                 (Bound::Not(Box::new(e)), Some(Ty::Bool))
             }
             Expr::And(a, b) | Expr::Or(a, b) => {
                 let (a, ta) = self.expr(a, d + 1)?;
                 let (b, tb) = self.expr(b, d + 1)?;
+                if ta == Some(Ty::Bpchar) || tb == Some(Ty::Bpchar) {
+                    return Err(Error::Unsupported);
+                }
                 boolean(ta)?;
                 boolean(tb)?;
                 (
@@ -1131,6 +1160,9 @@ impl Binder<'_> {
         let mut seen = BTreeSet::new();
         let mut out = vec![];
         for o in order {
+            if self.table()?.columns[self.field(&o.field)?].data_type == DataType::Bpchar {
+                return Err(Error::Unsupported);
+            }
             let i = self.field(&o.field)?;
             if !seen.insert(i) {
                 return Err(Error::Bind("duplicate order".into()));
@@ -1183,7 +1215,16 @@ impl Binder<'_> {
                 return Err(Error::Unsupported);
             }
             let (expression, ty) = self.expr(expression, 0)?;
-            if ty.is_some() && ty != Some(colty(&self.table()?.columns[index])) {
+            if ty.is_some()
+                && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
+                    != Some(
+                        if self.table()?.columns[index].data_type == DataType::Bpchar {
+                            Ty::Text
+                        } else {
+                            colty(&self.table()?.columns[index])
+                        },
+                    )
+            {
                 return Err(Error::Type);
             }
             // Column width and nullability depend on the selected postimages.
@@ -1212,6 +1253,7 @@ impl Binder<'_> {
                         Ty::Bool => DataType::Boolean,
                         Ty::Int => DataType::BigInt,
                         Ty::Text => DataType::Text,
+                        Ty::Bpchar => DataType::Bpchar,
                         Ty::Bytes => DataType::Bytes,
                         Ty::Numeric => DataType::Numeric,
                         Ty::Real => DataType::Real,
@@ -1330,7 +1372,16 @@ impl Binder<'_> {
                         let bound = self.expr(expression, 0);
                         self.allow_fields = true;
                         let (expression, ty) = bound?;
-                        if ty.is_some() && ty != Some(colty(&self.table()?.columns[*index])) {
+                        if ty.is_some()
+                            && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
+                                != Some(
+                                    if self.table()?.columns[*index].data_type == DataType::Bpchar {
+                                        Ty::Text
+                                    } else {
+                                        colty(&self.table()?.columns[*index])
+                                    },
+                                )
+                        {
                             return Err(Error::Type);
                         }
                         bound_row.push(expression);
@@ -1366,7 +1417,16 @@ impl Binder<'_> {
                     let bound = self.expr(expression, 0);
                     self.allow_fields = true;
                     let (expression, ty) = bound?;
-                    if ty.is_some() && ty != Some(colty(&self.table()?.columns[index])) {
+                    if ty.is_some()
+                        && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
+                            != Some(
+                                if self.table()?.columns[index].data_type == DataType::Bpchar {
+                                    Ty::Text
+                                } else {
+                                    colty(&self.table()?.columns[index])
+                                },
+                            )
+                    {
                         return Err(Error::Type);
                     }
                     expressions[index] = expression;
@@ -1914,7 +1974,11 @@ fn run<C: Context>(
             s.checkpoint().map_err(core)?;
             let evaluated = values
                 .iter()
-                .map(|value| value.eval(&[]))
+                .zip(&t.columns)
+                .map(|(value, column)| {
+                    s.coerce_column(column, value.eval(&[])?.into_owned())
+                        .map(Cow::Owned)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let mut remaining = crate::relational::MAX_ROW_BYTES;
             for (value, column) in evaluated.iter().zip(&t.columns) {
@@ -2016,6 +2080,11 @@ fn run<C: Context>(
             }
         }
         Operation::Insert { values, returning } => {
+            let values = values
+                .into_iter()
+                .zip(&t.columns)
+                .map(|(value, column)| s.coerce_column(column, value))
+                .collect::<Result<Vec<_>>>()?;
             let key = if let Some(projection) = &returning {
                 s.checkpoint().map_err(core)?;
                 let mut remaining_row = crate::relational::MAX_ROW_BYTES;
@@ -2117,6 +2186,17 @@ fn run<C: Context>(
                     ),
                     None => None,
                 };
+                let evaluated: Option<Vec<(usize, Cow<'_, Value>)>> = evaluated
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .map(|(index, value)| {
+                                s.coerce_column(&t.columns[index], value.into_owned())
+                                    .map(|value| (index, Cow::Owned(value)))
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?;
                 let post = |index| {
                     evaluated
                         .as_ref()
@@ -2335,7 +2415,10 @@ fn insert_many(
         crate::cancellation::check().map_err(core)?;
         let mut row = vec![Cow::Owned(Value::Null); table.columns.len()];
         for (index, expression) in columns.iter().zip(expressions) {
-            row[*index] = expression.eval(&[])?;
+            row[*index] = Cow::Owned(
+                session
+                    .coerce_column(&table.columns[*index], expression.eval(&[])?.into_owned())?,
+            );
         }
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
         for (value, column) in row.iter().zip(&table.columns) {

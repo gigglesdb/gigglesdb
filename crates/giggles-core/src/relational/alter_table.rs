@@ -307,6 +307,21 @@ pub(super) fn execute(
                     }
                 }
                 candidate.tables.insert(name.clone(), table.clone());
+                let kind = match column.data_type {
+                    DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
+                    DataType::Bpchar => Some(catalog_ext::TextKind::Bpchar),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    candidate
+                        .ext
+                        .columns
+                        .entry(column.id)
+                        .or_default()
+                        .text_kind = Some(kind);
+                    // ext_version follows content (v3 iff any text_kind); validate_ext checks it.
+                    Relational::normalize_ext(&mut candidate.ext);
+                }
                 if let Some(typmod) = typmod {
                     candidate.set_column_typmod(column.id, Some(*typmod))?;
                 }

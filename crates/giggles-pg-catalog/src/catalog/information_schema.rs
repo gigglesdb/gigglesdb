@@ -189,6 +189,7 @@ pub(super) fn populate(
                 &attribute[1],
                 *position,
                 *oid as u32,
+                &attribute[5],
                 attribute[4] == B(true),
                 !view,
                 all,
@@ -247,6 +248,7 @@ fn column_row(
     column: &Value,
     position: i64,
     oid: u32,
+    typmod: &Value,
     not_null: bool,
     updatable: bool,
     all: &BTreeMap<String, Relation>,
@@ -277,6 +279,8 @@ fn column_row(
         21 => "smallint",
         23 => "integer",
         25 => "text",
+        1043 => "character varying",
+        1042 => "character",
         26 => "oid",
         700 => "real",
         701 => "double precision",
@@ -295,6 +299,13 @@ fn column_row(
         _ => "USER-DEFINED",
     };
     row[7] = s(data_type);
+    if matches!(oid, 1042 | 1043)
+        && let I(n) = typmod
+        && *n >= 4
+    {
+        row[8] = I(n - 4);
+        row[9] = I((n - 4) * 4);
+    }
     if oid == 25 {
         row[9] = I(1073741824);
     }

@@ -21,7 +21,7 @@
 //! have a 4096-node / 16-level / 4 MiB limit. Exceeding a limit returns no result.
 //!
 //! This is a finite virtual catalog, not a PostgreSQL server: application types
-//! are the fifteen `ScalarType` variants. Catalog arrays, vectors, and rowtype
+//! are the seventeen `ScalarType` variants. Catalog arrays, vectors, and rowtype
 //! identities do not grant additional application SQL types. No PostgreSQL MVCC
 //! tuple exists (`xmin` is NULL); transaction IDs, general timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
@@ -36,6 +36,8 @@ pub enum ScalarType {
     Integer,
     BigInt,
     Text,
+    Varchar,
+    Bpchar,
     Bytes,
     Numeric,
     Real,
@@ -102,6 +104,8 @@ pub struct CatalogSnapshot {
     pub table_owners: std::collections::BTreeMap<u64, u32>,
     /// Owner of the current pg_database row (`datdba`); defaults to OID 10.
     pub database_owner: u32,
+    /// Stable column ID to PostgreSQL typmod; omitted entries mean -1.
+    pub column_typmods: std::collections::BTreeMap<u64, i32>,
 }
 impl Default for CatalogSnapshot {
     fn default() -> Self {
@@ -124,6 +128,7 @@ impl Default for CatalogSnapshot {
             }],
             table_owners: std::collections::BTreeMap::new(),
             database_owner: 10,
+            column_typmods: std::collections::BTreeMap::new(),
         }
     }
 }

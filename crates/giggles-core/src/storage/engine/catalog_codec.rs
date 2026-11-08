@@ -17,6 +17,15 @@ use std::collections::{BTreeMap, BTreeSet};
 fn corrupt(message: &str) -> CoreError {
     CoreError::Corrupt(message.into())
 }
+/// Fixed refusal feature (DD-0068 E1130): v2 does not persist varchar/char
+/// columns yet; carrying them is a later v2 DTO revision under pre-release.
+pub(crate) const V2_VARCHAR_CHAR: &str = "varchar/char types";
+fn varchar_char_unsupported() -> CoreError {
+    CoreError::EngineUnsupported {
+        engine: "v2",
+        feature: V2_VARCHAR_CHAR,
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableEntryV2Dto {
     def: TableDefDto,
@@ -55,9 +64,10 @@ enum DataTypeDto {
     TimestampTz,
     Interval,
 }
-impl From<DataType> for DataTypeDto {
-    fn from(v: DataType) -> Self {
-        match v {
+impl TryFrom<DataType> for DataTypeDto {
+    type Error = CoreError;
+    fn try_from(v: DataType) -> Result<Self, CoreError> {
+        Ok(match v {
             DataType::Boolean => Self::Boolean,
             DataType::SmallInt => Self::SmallInt,
             DataType::Integer => Self::Integer,
@@ -73,7 +83,10 @@ impl From<DataType> for DataTypeDto {
             DataType::Timestamp => Self::Timestamp,
             DataType::TimestampTz => Self::TimestampTz,
             DataType::Interval => Self::Interval,
-        }
+            // Explicit arms, no wildcard: a new live type must be decided here.
+            DataType::Varchar => return Err(varchar_char_unsupported()),
+            DataType::Bpchar => return Err(varchar_char_unsupported()),
+        })
     }
 }
 impl From<DataTypeDto> for DataType {
@@ -97,20 +110,21 @@ impl From<DataTypeDto> for DataType {
         }
     }
 }
-impl From<ColumnDef> for ColumnDefDto {
-    fn from(v: ColumnDef) -> Self {
+impl TryFrom<ColumnDef> for ColumnDefDto {
+    type Error = CoreError;
+    fn try_from(v: ColumnDef) -> Result<Self, CoreError> {
         let ColumnDef {
             id,
             name,
             data_type,
             not_null,
         } = v;
-        Self {
+        Ok(Self {
             id,
             name,
-            data_type: data_type.into(),
+            data_type: data_type.try_into()?,
             not_null,
-        }
+        })
     }
 }
 impl From<ColumnDefDto> for ColumnDef {
@@ -141,7 +155,10 @@ impl TryFrom<TableDef> for TableDefDto {
         Ok(Self {
             id,
             name,
-            columns: columns.into_iter().map(Into::into).collect(),
+            columns: columns
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             primary_key: primary_key
                 .into_iter()
                 .map(|i| u64::try_from(i).map_err(|_| corrupt("column offset overflow")))
@@ -204,18 +221,24 @@ impl From<IdentityDto> for Identity {
         }
     }
 }
-impl From<ColumnExt> for ColumnExtDto {
-    fn from(v: ColumnExt) -> Self {
+impl TryFrom<ColumnExt> for ColumnExtDto {
+    type Error = CoreError;
+    fn try_from(v: ColumnExt) -> Result<Self, CoreError> {
         let ColumnExt {
             typmod,
             default,
             identity,
+            text_kind,
         } = v;
-        Self {
+        // Explicit: any Some(text_kind) (varchar/char) is not representable on v2.
+        if text_kind.is_some() {
+            return Err(varchar_char_unsupported());
+        }
+        Ok(Self {
             typmod,
             default,
             identity: identity.map(Into::into),
-        }
+        })
     }
 }
 impl From<ColumnExtDto> for ColumnExt {
@@ -229,6 +252,8 @@ impl From<ColumnExtDto> for ColumnExt {
             typmod,
             default,
             identity: identity.map(Into::into),
+            // Decode stays closed: v2 bytes never carry a text kind.
+            text_kind: None,
         }
     }
 }
@@ -398,8 +423,9 @@ pub(crate) struct SequenceDefDto {
     identity: bool,
     incarnation: u128,
 }
-impl From<SequenceDef> for SequenceDefDto {
-    fn from(v: SequenceDef) -> Self {
+impl TryFrom<SequenceDef> for SequenceDefDto {
+    type Error = CoreError;
+    fn try_from(v: SequenceDef) -> Result<Self, CoreError> {
         let SequenceDef {
             name,
             data_type,
@@ -413,7 +439,7 @@ impl From<SequenceDef> for SequenceDefDto {
             identity,
             incarnation,
         } = v;
-        Self {
+        Ok(Self {
             name,
             start,
             increment,
@@ -424,8 +450,8 @@ impl From<SequenceDef> for SequenceDefDto {
             owned_by,
             identity,
             incarnation,
-            data_type: data_type.into(),
-        }
+            data_type: data_type.try_into()?,
+        })
     }
 }
 impl From<SequenceDefDto> for SequenceDef {
@@ -488,7 +514,10 @@ impl TryFrom<(TableEntry, BTreeMap<u64, ColumnExt>)> for TableEntryV2Dto {
         Ok(Self {
             def: def.try_into()?,
             heap,
-            columns_ext: ext.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            columns_ext: ext
+                .into_iter()
+                .map(|(k, v)| Ok((k, v.try_into()?)))
+                .collect::<Result<_, CoreError>>()?,
         })
     }
 }
@@ -614,7 +643,7 @@ pub(crate) fn decode_constraint(v: &[u8], table: &TableDef) -> Result<Constraint
     Constraint::try_from(dto)
 }
 pub(crate) fn encode_sequence(v: &SequenceDef) -> Result<Vec<u8>, CoreError> {
-    encode_version(1, &SequenceDefDto::from(v.clone()))
+    encode_version(1, &SequenceDefDto::try_from(v.clone())?)
 }
 pub(crate) fn decode_sequence(v: &[u8]) -> Result<SequenceDef, CoreError> {
     let dto: SequenceDefDto = decode_version(1, v)?;

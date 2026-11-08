@@ -3,9 +3,18 @@ use super::*;
 use crate::relational::clock::ExecutionClock;
 
 pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) -> bool {
-    source == target
+    matches!(
+        source,
+        DataType::Text | DataType::Varchar | DataType::Bpchar
+    ) && matches!(
+        target,
+        DataType::Text | DataType::Varchar | DataType::Bpchar
+    ) || source == target
         || number(source) && number(target)
-        || *target == DataType::Text
+        || matches!(
+            target,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        )
         || matches!(
             (source, target),
             (DataType::Date, DataType::Timestamp | DataType::TimestampTz)
@@ -58,7 +67,22 @@ pub(in crate::relational) fn convert(
     if !compatible(source, target) {
         return Err(SqlError::Type);
     }
-    if source == target || value == Value::Null {
+    // Character targets convert exactly as text; coerce_to_column applies the typmod.
+    let target = if matches!(target, DataType::Varchar | DataType::Bpchar) {
+        &DataType::Text
+    } else {
+        target
+    };
+    if source == target
+        || value == Value::Null
+        || matches!(
+            source,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        ) && matches!(
+            target,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        )
+    {
         return Ok(value);
     }
     if let Value::Numeric(n) = &value

@@ -194,7 +194,7 @@ impl Kind {
             DataType::SmallInt => Self::SmallInt,
             DataType::Integer => Self::Integer,
             DataType::BigInt => Self::BigInt,
-            DataType::Text => Self::Text,
+            DataType::Text | DataType::Varchar | DataType::Bpchar => Self::Text,
             DataType::Bytes => Self::Bytes,
             DataType::Numeric => Self::Numeric,
             DataType::Real => Self::Real,

@@ -111,6 +111,7 @@ fn legacy(column: &ColumnDef) -> bool {
             | DataType::Integer
             | DataType::BigInt
             | DataType::Text
+            | DataType::Varchar
             | DataType::Bytes
     )
 }
@@ -439,12 +440,15 @@ pub(super) fn plan_unique_conflict<'s>(
                     if semantics == Semantics::Native && table.primary_key.contains(index) {
                         return Err(Error::Unsupported.into());
                     }
-                    evaluated.push((
-                        *index,
-                        expression.eval_conflict(&|index| &old.values[index], &|index| {
-                            &proposal[index]
-                        })?,
-                    ));
+                    let value = expression
+                        .eval_conflict(&|index| &old.values[index], &|index| &proposal[index])?;
+                    let value = crate::relational::coerce_to_column(
+                        src,
+                        &table.columns[*index],
+                        value.into_owned(),
+                    )
+                    .map_err(sql)?;
+                    evaluated.push((*index, Cow::Owned(value)));
                 }
                 Postimage::Update {
                     values: evaluated,

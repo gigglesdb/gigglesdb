@@ -184,6 +184,8 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::Integer => 23,
         DataType::BigInt => 20,
         DataType::Text => 25,
+        DataType::Varchar => 1043,
+        DataType::Bpchar => 1042,
         DataType::Bytes => 17,
         DataType::Numeric => 1700,
         DataType::Real => 700,
@@ -209,7 +211,11 @@ fn size(t: &DataType) -> i16 {
         DataType::SmallInt => 2,
         DataType::Integer | DataType::Real => 4,
         DataType::BigInt | DataType::DoublePrecision => 8,
-        _ => -1,
+        DataType::Text
+        | DataType::Varchar
+        | DataType::Bpchar
+        | DataType::Bytes
+        | DataType::Numeric => -1,
     }
 }
 pub fn format_at(formats: &[u16], i: usize) -> u16 {
@@ -246,7 +252,7 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
         b.extend(0i16.to_be_bytes());
         b.extend(oid(&c.data_type).to_be_bytes());
         b.extend(size(&c.data_type).to_be_bytes());
-        b.extend((-1i32).to_be_bytes());
+        b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
     }
     frame(b'T', &b, out)
@@ -347,8 +353,10 @@ pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -
             DataType::Interval => giggles_core::relational::Interval::parse(s)
                 .map(Value::Interval)
                 .map_err(temporal_error),
-            DataType::Text if s.as_bytes().contains(&0) => Err("22021"),
-            DataType::Text => Ok(Value::Text(s.into())),
+            DataType::Text | DataType::Varchar | DataType::Bpchar if s.as_bytes().contains(&0) => {
+                Err("22021")
+            }
+            DataType::Text | DataType::Varchar | DataType::Bpchar => Ok(Value::Text(s.into())),
             DataType::Bytes => {
                 use giggles_pg_types::bytea::{ByteaInputError as E, prepare_bytea_text};
                 let map_error = |error| match error {
@@ -396,7 +404,7 @@ pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -
         (DataType::SmallInt, 2) => Ok(Value::Int(i16::from_be_bytes(b.try_into().unwrap()).into())),
         (DataType::Integer, 4) => Ok(Value::Int(i32::from_be_bytes(b.try_into().unwrap()).into())),
         (DataType::BigInt, 8) => Ok(Value::Int(i64::from_be_bytes(b.try_into().unwrap()))),
-        (DataType::Text, _) => String::from_utf8(b.to_vec())
+        (DataType::Text | DataType::Varchar | DataType::Bpchar, _) => String::from_utf8(b.to_vec())
             .map(Value::Text)
             .map_err(|_| "22021"),
         (DataType::Numeric, _) => giggles_pg_types::Numeric::from_binary(b)
@@ -499,7 +507,9 @@ fn encode(
             .to_be_bytes()
             .to_vec(),
         (Value::Int(v), DataType::BigInt) => v.to_be_bytes().to_vec(),
-        (Value::Text(s), DataType::Text) => s.as_bytes().to_vec(),
+        (Value::Text(s), DataType::Text | DataType::Varchar | DataType::Bpchar) => {
+            s.as_bytes().to_vec()
+        }
         (Value::Numeric(v), DataType::Numeric) => v.to_binary(),
         (Value::Float4(v), DataType::Real) => v.to_binary().to_vec(),
         (Value::Float8(v), DataType::DoublePrecision) => v.to_binary().to_vec(),
@@ -584,7 +594,8 @@ fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
         return Some(ty.clone());
     }
     match (ty, declared) {
-        (DataType::Text, 1043) => Some(DataType::Text),
+        (DataType::Text | DataType::Varchar, 25) => Some(DataType::Text),
+        (DataType::Text | DataType::Varchar, 1043) => Some(DataType::Varchar),
         (DataType::SmallInt | DataType::Integer | DataType::BigInt, 21) => Some(DataType::SmallInt),
         (DataType::SmallInt | DataType::Integer | DataType::BigInt, 23) => Some(DataType::Integer),
         (DataType::SmallInt | DataType::Integer | DataType::BigInt, 20) => Some(DataType::BigInt),
@@ -599,7 +610,9 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
         20 => Some(DataType::BigInt),
         21 => Some(DataType::SmallInt),
         23 => Some(DataType::Integer),
-        25 | 1043 => Some(DataType::Text),
+        25 => Some(DataType::Text),
+        1043 => Some(DataType::Varchar),
+        1042 => Some(DataType::Bpchar),
         1700 => Some(DataType::Numeric),
         700 => Some(DataType::Real),
         701 => Some(DataType::DoublePrecision),
@@ -1281,7 +1294,8 @@ impl State {
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
                     self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    let (current, tables, indexes) = core(session.catalog_snapshot())?;
+                    let (current, tables, indexes, typmods) =
+                        core(session.catalog_snapshot_with_typmods())?;
                     if current != *epoch {
                         return Err("0A000");
                     }
@@ -1289,7 +1303,7 @@ impl State {
                         self.settings.queried = true;
                         let result = catalog_wire::execute(
                             plan,
-                            &catalog_wire::snapshot(session, tables, indexes),
+                            &catalog_wire::snapshot(session, tables, indexes, typmods),
                             &p.catalog_params,
                         )
                         .map_err(catalog_wire::error)?;

@@ -4,6 +4,14 @@ use crate::relational::clock::ExecutionClock;
 use giggles_pg_types::temporal::{Date, Interval, TimeTz, Timestamp, TimestampTz};
 
 pub(in crate::relational::query) fn comparable(a: &DataType, b: &DataType) -> bool {
+    if *a == DataType::Bpchar || *b == DataType::Bpchar {
+        return false;
+    }
+    if matches!(a, DataType::Text | DataType::Varchar)
+        && matches!(b, DataType::Text | DataType::Varchar)
+    {
+        return true;
+    }
     a == b || comparison_type(a, b).is_some() || temporal_pair(a, b)
 }
 fn temporal_pair(a: &DataType, b: &DataType) -> bool {

@@ -40,7 +40,8 @@ fn kind(t: &DataType) -> Option<Kind> {
         DataType::SmallInt => Kind::SmallInt,
         DataType::Integer => Kind::Integer,
         DataType::BigInt => Kind::BigInt,
-        DataType::Text => Kind::Text,
+        DataType::Text | DataType::Varchar => Kind::Text,
+        DataType::Bpchar => return None,
         DataType::Bytes => Kind::Bytes,
         _ => return None,
     })
@@ -1240,6 +1241,21 @@ impl<'de> Deserialize<'de> for Relational {
                     value.ext = field!("ext");
                     if value.ext.is_empty() {
                         return Err(A::Error::custom("empty format-2 catalog extension"));
+                    }
+                    for table in value.tables.values_mut() {
+                        for column in &mut table.columns {
+                            if let Some(kind) =
+                                value.ext.columns.get(&column.id).and_then(|c| c.text_kind)
+                            {
+                                if column.data_type != DataType::Text {
+                                    return Err(A::Error::custom("text kind on non-text column"));
+                                }
+                                column.data_type = match kind {
+                                    TextKind::Varchar => DataType::Varchar,
+                                    TextKind::Bpchar => DataType::Bpchar,
+                                };
+                            }
+                        }
                     }
                     value.validate_ext().map_err(|error| {
                         A::Error::custom(format!("relational catalog invariant: {error:?}"))

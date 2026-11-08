@@ -245,6 +245,15 @@ fn table(t: TableDef) -> Result<Table> {
     if t.hidden_rowid().is_some() {
         return Err(Error::Core(CoreError::Sql(relational::SqlError::Unsupported)));
     }
+    // The logical archive has no varchar/char identity or typmod (E2a′). Refuse rather
+    // than silently exporting those columns as TEXT.
+    if t
+        .columns
+        .iter()
+        .any(|c| matches!(c.data_type, DataType::Varchar | DataType::Bpchar))
+    {
+        return Err(Error::Core(CoreError::Sql(relational::SqlError::Unsupported)));
+    }
     Ok(Table {
         name: t.name,
         columns: t

@@ -633,6 +633,21 @@ pub(super) fn install_create(
         .zip(defaults)
         .zip(sequences.iter().zip(typmods))
     {
+        let kind = match column.data_type {
+            DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
+            DataType::Bpchar => Some(catalog_ext::TextKind::Bpchar),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            candidate
+                .ext
+                .columns
+                .entry(column.id)
+                .or_default()
+                .text_kind = Some(kind);
+            // ext_version follows content (v3 iff any text_kind); validate_ext checks it.
+            Relational::normalize_ext(&mut candidate.ext);
+        }
         if let Some(typmod) = typmod {
             candidate.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
         }
@@ -735,6 +750,8 @@ fn type_name(ty: &DataType) -> &'static str {
         DataType::Real => "real",
         DataType::DoublePrecision => "double precision",
         DataType::Text => "text",
+        DataType::Varchar => "varchar",
+        DataType::Bpchar => "bpchar",
         DataType::Bytes => "bytea",
         DataType::Date => "date",
         DataType::Time => "time without time zone",
@@ -1066,7 +1083,14 @@ pub(super) fn evaluate_sql(
     {
         return Err(SqlError::Unsupported);
     }
-    query::InsertExpressions::default_value(&value.sql(), target, clock, true)?
+    // Character defaults are stored as text constants. Evaluate that physical
+    // value before the caller applies the destination column's character rules;
+    // relabeling a text cast as varchar/bpchar would change its scalar cast type.
+    let evaluation_target = match target {
+        DataType::Varchar | DataType::Bpchar => &DataType::Text,
+        other => other,
+    };
+    query::InsertExpressions::default_value(&value.sql(), evaluation_target, clock, true)?
         .ok_or(SqlError::Type)
 }
 pub(super) fn evaluate(
@@ -1078,6 +1102,7 @@ pub(super) fn evaluate(
         Some(sql) => evaluate_sql(&sql, &column.data_type, clock)?,
         None => Value::Null,
     };
+    let value = coerce_to_column(state, column, value)?;
     apply_typmod(value, state.column_typmod(column.id))
 }
 fn apply_typmod(value: Value, modifier: i32) -> R<Value> {

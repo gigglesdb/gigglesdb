@@ -186,6 +186,7 @@ fn diff_sets_exact_features_for_plain_extended_and_typmod_content() {
                     default: Some("1".into()),
                     typmod: (mode == 2).then_some(65540),
                     identity: None,
+                    text_kind: None,
                 },
             );
         }

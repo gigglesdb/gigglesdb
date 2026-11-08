@@ -71,7 +71,7 @@ pub(super) fn check_duplicate_literals(prepared: &Prepared, state: &Relational) 
         let mut column = table.columns[col(table, name)?].clone();
         column.not_null = false;
         if let Some(value @ Expr::Literal(_)) = value {
-            plain_value(value, &column, &prepared.parameter_types, &[], None)?;
+            plain_value(state, value, &column, &prepared.parameter_types, &[], None)?;
         }
     }
     Ok(())
@@ -97,6 +97,7 @@ pub(super) fn indexes(
 }
 
 pub(super) fn plain_value(
+    state: &Relational,
     value: &Expr,
     column: &ColumnDef,
     declared_types: &[Option<DataType>],
@@ -127,6 +128,7 @@ pub(super) fn plain_value(
         )?;
         bound = query::assignment::convert(bound, declared, &column.data_type, clock)?;
     }
+    bound = coerce_to_column(state, column, bound)?;
     check(&bound, column)?;
     Ok(bound)
 }
@@ -214,6 +216,7 @@ enum BoundValue<'a> {
     Scalar(Box<query::BoundQuery<'a>>),
 }
 pub(super) struct Plan<'a> {
+    state: &'a Relational,
     values: Vec<(usize, BoundValue<'a>)>,
     scalar: bool,
 }
@@ -236,12 +239,13 @@ impl<'a> Plan<'a> {
                     defaults::check_explicit(state, &table.columns[index])?;
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
-                    let value = plain_value(value, &column, &prepared.parameter_types, params, clock)?;
+                    let value = plain_value(state, value, &column, &prepared.parameter_types, params, clock)?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
             unique(values.iter().map(|(index, _)| index))?;
             return Ok(Self {
+                state,
                 values,
                 scalar: false,
             });
@@ -277,7 +281,7 @@ impl<'a> Plan<'a> {
                     Value::Plain(value) => {
                         let mut column = table.columns[index].clone();
                         column.not_null = false;
-                        let value = plain_value(value, &column, &prepared.parameter_types, params, clock)?;
+                        let value = plain_value(state, value, &column, &prepared.parameter_types, params, clock)?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(
@@ -294,6 +298,7 @@ impl<'a> Plan<'a> {
             })
             .collect::<R<Vec<_>>>()?;
         Ok(Self {
+            state,
             values,
             scalar: true,
         })
@@ -341,6 +346,7 @@ impl<'a> Plan<'a> {
                     .pop()
                     .ok_or(SqlError::Type)?,
             };
+            let value = coerce_to_column(self.state, &table.columns[index], value)?;
             check(&value, &table.columns[index])?;
             values.push((index, value));
         }

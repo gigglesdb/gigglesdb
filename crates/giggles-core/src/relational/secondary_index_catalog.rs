@@ -8,7 +8,7 @@ fn kind(t: &DataType) -> Option<Kind> {
         DataType::SmallInt => Kind::SmallInt,
         DataType::Integer => Kind::Integer,
         DataType::BigInt => Kind::BigInt,
-        DataType::Text => Kind::Text,
+        DataType::Text | DataType::Varchar => Kind::Text,
         DataType::Bytes => Kind::Bytes,
         _ => return None,
     })

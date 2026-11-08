@@ -3635,7 +3635,11 @@ impl Runtime<'_> {
             "obj_description" | "col_description" => N,
             "format_type" => {
                 let oid = integer(v[0].clone())?;
-                S(format_type(oid, &self.catalogs["pg_type"].rows)?)
+                S(format_type(
+                    oid,
+                    v[1].clone(),
+                    &self.catalogs["pg_type"].rows,
+                )?)
             }
             "has_table_privilege" | "has_schema_privilege" | "has_type_privilege" => {
                 let requested = text(v[1].clone())?;
@@ -3728,15 +3732,30 @@ fn compare_keys(l: &[Value], r: &[Value], order: &[Order]) -> std::cmp::Ordering
     }
     std::cmp::Ordering::Equal
 }
-fn format_type(oid: i64, rows: &[Vec<Value>]) -> R<String> {
+fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
     let r = rows
         .iter()
         .find(|r| r[0] == Value::Int(oid))
         .ok_or(Error::Unsupported)?;
     if r[12] == Value::Int(750) {
-        return Ok(format!("{}[]", format_type(integer(r[10].clone())?, rows)?));
+        return Ok(format!(
+            "{}[]",
+            format_type(integer(r[10].clone())?, typmod, rows)?
+        ));
     }
     Ok(match oid {
+        1043 | 1042 => {
+            let bounded = match typmod {
+                Value::Int(n) if n >= 4 => Some(n - 4),
+                _ => None,
+            };
+            match (oid, bounded) {
+                (1043, Some(n)) => format!("character varying({n})"),
+                (1043, None) => "character varying".into(),
+                (_, Some(n)) => format!("character({n})"),
+                (_, None) => "bpchar".into(),
+            }
+        }
         16 => "boolean".into(),
         20 => "bigint".into(),
         21 => "smallint".into(),

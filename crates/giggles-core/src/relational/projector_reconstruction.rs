@@ -199,6 +199,7 @@ fn preflight(
                 | DataType::Integer
                 | DataType::BigInt
                 | DataType::Text
+                | DataType::Varchar
                 | DataType::Bytes
                 | DataType::Numeric
                 | DataType::Real

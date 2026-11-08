@@ -34,6 +34,15 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
             p.need("precision")?;
             DataType::DoublePrecision
         }
+        "varchar" => DataType::Varchar,
+        "char" | "character" => {
+            if p.word("varying") {
+                DataType::Varchar
+            } else {
+                DataType::Bpchar
+            }
+        }
+        "bpchar" => DataType::Bpchar,
         "text" => DataType::Text,
         "bytea" => DataType::Bytes,
         "bytes" if matches!(site, Site::Create) => DataType::Bytes,
@@ -46,14 +55,29 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
         _ => return Err(SqlError::Unsupported),
     };
     let temporal_suffix = matches!(word.as_str(), "time" | "timestamp");
-    // CREATE currently rejects modifiers: retain its alias precision policy.
-    if matches!(site, Site::Create) && p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
+    let character = matches!(data_type, DataType::Varchar | DataType::Bpchar);
+    // CREATE accepts only character modifiers.
+    if matches!(site, Site::Create) && !character && p.tokens.get(p.at) == Some(&Token::Symbol('('))
+    {
         return Err(SqlError::Syntax);
     }
     let mut semantic_error = None;
-    let mut typmod = if matches!(site, Site::Alter) && p.sym('(') {
+    let mut typmod = if (matches!(site, Site::Alter) || character) && p.sym('(') {
         let first = integer(p)?;
-        let value = if data_type == DataType::Numeric {
+        let value = if character {
+            let kind = if data_type == DataType::Varchar {
+                giggles_pg_types::character::CharKind::Varchar
+            } else {
+                giggles_pg_types::character::CharKind::Bpchar
+            };
+            match giggles_pg_types::character::CharTypmod::new(kind, first) {
+                Ok(value) => value.to_typmod(),
+                Err(_) => {
+                    semantic_error = Some(SqlError::InvalidParameterValue);
+                    0
+                }
+            }
+        } else if data_type == DataType::Numeric {
             let scale = if p.sym(',') { integer(p)? } else { 0 };
             match giggles_pg_types::typmod::NumericTypmod::new(first, scale) {
                 Ok(value) => value.to_typmod(),
@@ -74,6 +98,9 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
     } else {
         None
     };
+    if typmod.is_none() && data_type == DataType::Bpchar && word != "bpchar" {
+        typmod = Some(5);
+    }
     if temporal_suffix {
         data_type = time_zone_suffix(p, data_type)?;
     }

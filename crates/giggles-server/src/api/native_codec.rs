@@ -518,7 +518,7 @@ fn column(v: ColumnDef) -> p::NativeColumn {
             DataType::SmallInt => 2,
             DataType::Integer => 3,
             DataType::BigInt => 4,
-            DataType::Text => 5,
+            DataType::Text | DataType::Varchar | DataType::Bpchar => 5,
             DataType::Bytes => 6,
             DataType::Numeric => 7,
             DataType::Real => 8,

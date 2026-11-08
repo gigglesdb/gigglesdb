@@ -8,6 +8,14 @@ fn family(types: &[Option<&DataType>]) -> R<DataType> {
     }
     let mut selected = None;
     for ty in types.iter().flatten() {
+        if **ty == DataType::Bpchar {
+            return Err(SqlError::Unsupported);
+        }
+        let ty = if **ty == DataType::Varchar {
+            &&DataType::Text
+        } else {
+            ty
+        };
         if !matches!(ty, DataType::Text | DataType::Bytes)
             || selected.as_ref().is_some_and(|old| old != *ty)
         {

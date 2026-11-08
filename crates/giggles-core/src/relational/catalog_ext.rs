@@ -40,6 +40,30 @@ pub(crate) struct ColumnExt {
     #[serde(deserialize_with = "optional_expr")]
     pub(crate) default: Option<String>,
     pub(crate) identity: Option<Identity>,
+    pub(crate) text_kind: Option<TextKind>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TextKind {
+    Varchar,
+    Bpchar,
+}
+// Frozen version-one/two column layout.
+#[derive(Serialize, Deserialize)]
+struct LegacyColumnExt {
+    typmod: Option<i32>,
+    #[serde(deserialize_with = "optional_expr")]
+    default: Option<String>,
+    identity: Option<Identity>,
+}
+impl From<LegacyColumnExt> for ColumnExt {
+    fn from(c: LegacyColumnExt) -> Self {
+        Self {
+            typmod: c.typmod,
+            default: c.default,
+            identity: c.identity,
+            text_kind: None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Identity {
@@ -173,6 +197,18 @@ impl From<&Constraint> for ConstraintV1 {
     }
 }
 impl CatalogExt {
+    fn has_text_kind(&self) -> bool {
+        self.columns.values().any(|c| c.text_kind.is_some())
+    }
+    fn wire_version(&self) -> u32 {
+        if self.has_text_kind() {
+            3
+        } else if self.has_deferrable() {
+            2
+        } else {
+            1
+        }
+    }
     fn has_deferrable(&self) -> bool {
         self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { deferral, .. } if deferral != Deferral::NotDeferrable))
     }
@@ -181,9 +217,27 @@ impl Serialize for CatalogExt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
         let mut out = serializer.serialize_tuple(5)?;
-        let version = if self.has_deferrable() { 2u32 } else { 1u32 };
+        let version = self.wire_version();
         out.serialize_element(&version)?;
-        out.serialize_element(&self.columns)?;
+        if version == 3 {
+            out.serialize_element(&self.columns)?;
+        } else {
+            let legacy: BTreeMap<_, _> = self
+                .columns
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        LegacyColumnExt {
+                            typmod: c.typmod,
+                            default: c.default.clone(),
+                            identity: c.identity.clone(),
+                        },
+                    )
+                })
+                .collect();
+            out.serialize_element(&legacy)?;
+        }
         if version == 1 {
             let legacy: BTreeMap<_, Vec<_>> = self
                 .constraints
@@ -203,6 +257,15 @@ impl<'de> Deserialize<'de> for CatalogExt {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Columns(#[serde(deserialize_with = "column_map")] BTreeMap<u64, ColumnExt>);
+        #[derive(Deserialize)]
+        struct LegacyColumns(
+            #[serde(deserialize_with = "legacy_column_map")] BTreeMap<u64, LegacyColumnExt>,
+        );
+        fn legacy_column_map<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<u64, LegacyColumnExt>, D::Error> {
+            bounded_map::<D, LegacyColumnExt, MAX_EXT_COLUMNS>(d)
+        }
         #[derive(Deserialize)]
         struct Sequences(#[serde(deserialize_with = "sequence_map")] BTreeMap<u64, SequenceDef>);
         #[derive(Deserialize)]
@@ -243,10 +306,18 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1 | 2) {
+                if !matches!(ext_version, 1..=3) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
-                let columns = next!(Columns).0;
+                let columns = if ext_version == 3 {
+                    next!(Columns).0
+                } else {
+                    next!(LegacyColumns)
+                        .0
+                        .into_iter()
+                        .map(|(id, c)| (id, c.into()))
+                        .collect()
+                };
                 let constraints = if ext_version == 1 {
                     next!(LegacyMap)
                         .0
@@ -263,7 +334,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     sequences: next!(Sequences).0,
                     types: next!(Types).0,
                 };
-                if ext_version == 2 && !out.has_deferrable() {
+                if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
                 }
                 Ok(out)
@@ -426,6 +497,7 @@ fn type_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, Type
 }
 pub(crate) fn validate_typmod(ty: &DataType, t: i32) -> R<()> {
     let valid = match ty {
+        DataType::Varchar | DataType::Bpchar => (5..=10_485_764).contains(&t),
         DataType::Numeric => {
             giggles_pg_types::typmod::NumericTypmod::from_typmod(t).is_some_and(|m| {
                 giggles_pg_types::typmod::NumericTypmod::new(m.precision(), m.scale()).is_ok()
@@ -578,7 +650,7 @@ impl Relational {
     pub(super) fn normalize_ext(ext: &mut CatalogExt) {
         ext.columns.retain(|_, v| v != &ColumnExt::default());
         ext.constraints.retain(|_, v| !v.is_empty());
-        ext.ext_version = if ext.has_deferrable() { 2 } else { 1 };
+        ext.ext_version = ext.wire_version();
     }
     pub(crate) fn validate_ext(&self) -> R<()> {
         self.validate_ext_candidate(&self.ext, self.next_id, None)
@@ -589,10 +661,10 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1 | 2) || !ext.types.is_empty() {
+        if !matches!(ext.ext_version, 1..=3) || !ext.types.is_empty() {
             return Err(SqlError::Unsupported);
         }
-        if (ext.ext_version == 2) != ext.has_deferrable() {
+        if ext.ext_version != ext.wire_version() {
             return Err(SqlError::Type);
         }
         if self.format != 1 {
@@ -623,6 +695,30 @@ impl Relational {
             .flat_map(|t| t.columns.iter().map(move |c| (c.id, (t.id, c))))
             .collect();
         let mut used: BTreeSet<_> = tables.keys().chain(columns.keys()).copied().collect();
+        for (id, (_, column)) in &columns {
+            let expected = match column.data_type {
+                DataType::Varchar => Some(TextKind::Varchar),
+                DataType::Bpchar => Some(TextKind::Bpchar),
+                DataType::Boolean
+                | DataType::SmallInt
+                | DataType::Integer
+                | DataType::BigInt
+                | DataType::Text
+                | DataType::Bytes
+                | DataType::Numeric
+                | DataType::Real
+                | DataType::DoublePrecision
+                | DataType::Date
+                | DataType::Time
+                | DataType::TimeTz
+                | DataType::Timestamp
+                | DataType::TimestampTz
+                | DataType::Interval => None,
+            };
+            if ext.columns.get(id).and_then(|c| c.text_kind) != expected {
+                return Err(SqlError::Type);
+            }
+        }
         for (id, e) in &ext.columns {
             let (_, c) = columns.get(id).ok_or(SqlError::Type)?;
             if let Some(t) = e.typmod {
@@ -764,6 +860,31 @@ impl Relational {
             ext.columns.entry(id).or_default().typmod = t;
             Ok(())
         })
+    }
+    pub(crate) fn set_column_text_kind(&mut self, id: u64, kind: Option<TextKind>) -> R<()> {
+        let mut candidate = self.clone();
+        let column = candidate
+            .tables
+            .values_mut()
+            .flat_map(|t| &mut t.columns)
+            .find(|c| c.id == id)
+            .ok_or(SqlError::Type)?;
+        if !matches!(
+            column.data_type,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        ) {
+            return Err(SqlError::Type);
+        }
+        column.data_type = match kind {
+            Some(TextKind::Varchar) => DataType::Varchar,
+            Some(TextKind::Bpchar) => DataType::Bpchar,
+            None => DataType::Text,
+        };
+        candidate.ext.columns.entry(id).or_default().text_kind = kind;
+        Self::normalize_ext(&mut candidate.ext);
+        candidate.validate_ext()?;
+        *self = candidate;
+        Ok(())
     }
     pub(crate) fn set_column_default(&mut self, id: u64, v: Option<String>) -> R<()> {
         self.require_column(id)?;

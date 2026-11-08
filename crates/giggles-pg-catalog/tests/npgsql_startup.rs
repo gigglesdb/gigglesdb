@@ -15,6 +15,8 @@ const EXPECTED_TYPES: &str = r#"nspname|oid|typname|typtype|typnotnull|elemtypoi
 23|pg_catalog|22|int2vector|b|f|
 24|pg_catalog|701|float8|b|f|
 32|pg_catalog|1033|aclitem|b|f|
+33|pg_catalog|1042|bpchar|b|f|
+34|pg_catalog|1043|varchar|b|f|
 35|pg_catalog|1082|date|b|f|
 36|pg_catalog|1083|time|b|f|
 37|pg_catalog|1114|timestamp|b|f|
@@ -44,6 +46,8 @@ const EXPECTED_TYPES: &str = r#"nspname|oid|typname|typtype|typnotnull|elemtypoi
 117|pg_catalog|1021|_float4|a|f|700
 118|pg_catalog|1022|_float8|a|f|701
 125|pg_catalog|1034|_aclitem|a|f|1033
+126|pg_catalog|1014|_bpchar|a|f|1042
+127|pg_catalog|1015|_varchar|a|f|1043
 128|pg_catalog|1182|_date|a|f|1082
 129|pg_catalog|1183|_time|a|f|1083
 130|pg_catalog|1115|_timestamp|a|f|1114
@@ -123,22 +127,22 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
             ("elemtypoid", 26)
         ]
     );
-    // G1-a2 tracks the known PG18 divergence: its 23 arrays report class a
+    // G1-a2 tracks the known PG18 divergence: its 25 arrays report class a
     // and an element OID. With pg_proc empty, G1-a reports b and NULL instead.
-    // The 24 base-type rows retain the exact PostgreSQL 18 reference values.
+    // The 26 base-type rows retain the exact PostgreSQL 18 reference values.
     assert_eq!(
         EXPECTED_TYPES
             .lines()
             .filter(|line| line.contains("|b|"))
             .count(),
-        24
+        26
     );
     assert_eq!(
         EXPECTED_TYPES
             .lines()
             .filter(|line| line.contains("|a|"))
             .count(),
-        23
+        25
     );
     let expected: BTreeSet<Vec<Value>> = EXPECTED_TYPES
         .lines()
@@ -161,8 +165,9 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
             ]
         })
         .collect();
-    assert_eq!(expected.len(), 47);
-    assert_eq!(types.rows.len(), 47);
+    // E2a′: + bpchar, varchar, _bpchar, _varchar (ranks from the PG18.6 batch output).
+    assert_eq!(expected.len(), 51);
+    assert_eq!(types.rows.len(), 51);
     assert_eq!(
         types.rows.iter().cloned().collect::<BTreeSet<_>>(),
         expected

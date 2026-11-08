@@ -506,6 +506,9 @@ pub(super) fn bind<'a>(
     let mut slots = vec![];
     for s in groups {
         let b = s.bind(resolve, tables, &parameters)?;
+        if b.ty == DataType::Bpchar {
+            return Err(SqlError::Unsupported);
+        }
         slots.push(col(
             format!("__group_slot_{}", slots.len()),
             b.ty.clone(),
@@ -548,6 +551,9 @@ pub(super) fn bind<'a>(
         arg.infer(expected, &mut parameters, resolve, tables)?;
         let legacy_column = matches!(arg, Scalar::Column(_));
         let b = arg.bind(resolve, tables, &parameters)?;
+        if b.ty == DataType::Bpchar {
+            return Err(SqlError::Unsupported);
+        }
         let ty = match a.base() {
             Aggregate::Count => DataType::BigInt,
             Aggregate::Avg => match b.ty {

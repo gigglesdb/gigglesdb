@@ -246,10 +246,10 @@ impl State {
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();
-            let (_, tables, indexes) = core(session.catalog_snapshot())?;
+            let (_, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
             let result = catalog_wire::execute(
                 &plan,
-                &catalog_wire::snapshot(session, tables, indexes),
+                &catalog_wire::snapshot(session, tables, indexes, typmods),
                 &[],
             )
             .map_err(catalog_wire::error)?;

@@ -124,7 +124,14 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
             Error::ApprovalRequired | Error::InvalidApproval | Error::StalePreview,
         ) => "GD001",
         CoreError::Policy(Error::IdConflict) => "GD002",
-        CoreError::Policy(_) => "22023",
+        CoreError::Policy(
+            Error::InvalidGrant
+            | Error::TaskExists
+            | Error::MissingRow
+            | Error::DuplicateKey
+            | Error::InvalidPredicate
+            | Error::Overflow,
+        ) => "22023",
         CoreError::Sql(S::Unsupported | S::Reserved)
         | CoreError::Unsupported
         | CoreError::EngineUnsupported { .. } => "0A000",
@@ -140,6 +147,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::Transaction) => "25000",
         CoreError::Sql(S::Aborted) => "25P02",
         CoreError::Sql(S::Overflow) => "22003",
+        CoreError::Sql(S::StringDataRightTruncation) => "22001",
         CoreError::Sql(S::UndefinedFunction) => "42883",
         CoreError::Sql(S::InvalidParameterValue) => "22023",
         CoreError::Sql(S::InvalidDatetimeFormat) => "22007",
@@ -607,6 +615,32 @@ impl Session {
                 .collect();
             let (epoch, visible) = session.validate_catalog_snapshot(epoch, visible)?;
             Ok((epoch, visible, indexes))
+        })
+    }
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn catalog_snapshot_with_typmods(
+        &mut self,
+    ) -> Result<
+        (
+            u64,
+            Vec<relational::TableDef>,
+            Vec<giggles_core::IndexInfo>,
+            BTreeMap<u64, i32>,
+        ),
+        CoreError,
+    > {
+        self.authority_scope(|session| {
+            let (epoch, tables, indexes) = session.catalog_snapshot()?;
+            let (typmod_epoch, mut typmods) = session.service.admin.catalog_typmods()?;
+            if typmod_epoch != epoch {
+                return Err(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            typmods.retain(|id, _| {
+                tables
+                    .iter()
+                    .any(|table| table.columns.iter().any(|column| column.id == *id))
+            });
+            Ok((epoch, tables, indexes, typmods))
         })
     }
     fn validate_catalog_snapshot(

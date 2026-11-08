@@ -1,7 +1,7 @@
 use bincode::Options;
 use giggles_core::{CoreError, local, relational::SqlError as E};
 
-const FIRST_UNKNOWN_TAG: u8 = 51; // next free SqlError tag; bump when appending
+const FIRST_UNKNOWN_TAG: u8 = 52; // next free SqlError tag; bump when appending
 
 #[test]
 fn f17_error_contract_goldens() {

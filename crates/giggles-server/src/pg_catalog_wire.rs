@@ -47,6 +47,7 @@ pub(crate) fn snapshot(
     session: &crate::Session,
     tables: Vec<giggles_core::relational::TableDef>,
     indexes: Vec<giggles_core::IndexInfo>,
+    column_typmods: std::collections::BTreeMap<u64, i32>,
 ) -> giggles_pg_catalog::CatalogSnapshot {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
@@ -57,6 +58,7 @@ pub(crate) fn snapshot(
             _ => "giggles".into(),
         },
         database: session.database.as_deref().unwrap_or("giggles").into(),
+        column_typmods,
         indexes: indexes
             .into_iter()
             .filter(|index| visible.contains(&index.table))
@@ -87,6 +89,8 @@ pub(crate) fn snapshot(
                             C::Integer => P::Integer,
                             C::BigInt => P::BigInt,
                             C::Text => P::Text,
+                            C::Varchar => P::Varchar,
+                            C::Bpchar => P::Bpchar,
                             C::Bytes => P::Bytes,
                             C::Numeric => P::Numeric,
                             C::Real => P::Real,

@@ -340,6 +340,73 @@ async fn binary_pgx_shape_without_trailer_and_disconnect() {
     f.stop().await;
 }
 #[tokio::test]
+async fn copy_character_typmods_text_and_binary() {
+    let f = Fixture::new().await;
+    let mut s = f.connect().await;
+    let r = query(
+        &mut s,
+        "CREATE TABLE chars (i INT PRIMARY KEY, v VARCHAR(5), c CHAR(3))",
+    )
+    .await;
+    assert_eq!(tags(&r), b"CZ");
+    for binary in [false, true] {
+        for (id, v, c, overflow) in [
+            (1i32, "abcde   ", "x", false),
+            (2, "ok", "abc   ", false),
+            (3, "abcdef", "x", true),
+            (4, "ok", "abcd", true),
+        ] {
+            let id = id + if binary { 10 } else { 0 };
+            start(
+                &mut s,
+                if binary {
+                    "COPY chars FROM STDIN (FORMAT binary)"
+                } else {
+                    "COPY chars FROM STDIN"
+                },
+            )
+            .await;
+            let bytes = if binary {
+                let mut bytes = b"PGCOPY\n\xff\r\n\0".to_vec();
+                bytes.extend([0; 8]);
+                bytes.extend(3i16.to_be_bytes());
+                bytes.extend(4i32.to_be_bytes());
+                bytes.extend(id.to_be_bytes());
+                for value in [v, c] {
+                    bytes.extend((value.len() as i32).to_be_bytes());
+                    bytes.extend(value.as_bytes());
+                }
+                bytes.extend((-1i16).to_be_bytes());
+                bytes
+            } else {
+                format!("{id}\t{v}\t{c}\n").into_bytes()
+            };
+            send(&mut s, b'd', &bytes).await;
+            send(&mut s, b'c', b"").await;
+            let r = read(&mut s).await;
+            if overflow {
+                assert_eq!(tags(&r), b"EZ");
+                error(&r, "22001");
+            } else {
+                assert_eq!(tags(&r), b"CZ");
+                assert_eq!(r[0].1, b"COPY 1\0");
+            }
+        }
+    }
+    let r = query(&mut s, "SELECT v,c FROM chars ORDER BY i").await;
+    assert_eq!(tags(&r), b"TDDDDCZ");
+    for (row, expected) in r[1..5].iter().zip([
+        b"\0\x02\0\0\0\x05abcde\0\0\0\x03x  ".as_slice(),
+        b"\0\x02\0\0\0\x02ok\0\0\0\x03abc".as_slice(),
+        b"\0\x02\0\0\0\x05abcde\0\0\0\x03x  ".as_slice(),
+        b"\0\x02\0\0\0\x02ok\0\0\0\x03abc".as_slice(),
+    ]) {
+        assert_eq!(row.1, expected);
+    }
+    drop(s);
+    f.stop().await;
+}
+#[tokio::test]
 async fn denied_copy_authorization_precedes_classification_and_data() {
     let f = Fixture::new().await;
     let mut s = f.connect_as("denied").await;

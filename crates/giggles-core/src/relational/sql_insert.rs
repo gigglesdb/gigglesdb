@@ -635,11 +635,21 @@ fn normalize_row(
         if !replaced(*index, *default) {
             row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
             {
-                assign::plain_value(expression, &table.columns[*index], declared, params, clock)?
+                assign::plain_value(
+                    state,
+                    expression,
+                    &table.columns[*index],
+                    declared,
+                    params,
+                    clock,
+                )?
             } else {
                 resolved_value(expression, params, &table.columns[*index].data_type, clock)?
             };
         }
+    }
+    for (value, column) in row.iter_mut().zip(&table.columns) {
+        *value = coerce_to_column(state, column, value.clone())?;
     }
     Relational::secondary_admit_values(row.iter())?;
     if let Some(hidden) = hidden_rowid {
@@ -1134,7 +1144,7 @@ pub(super) fn execute_declared(
                                 column.not_null = false;
                                 operations::Expr::Value(operations::ValueExpr::Literal(
                                     assign::plain_value(
-                                        expression, &column, declared, params, clock,
+                                        state, expression, &column, declared, params, clock,
                                     )?,
                                 ))
                             } else {

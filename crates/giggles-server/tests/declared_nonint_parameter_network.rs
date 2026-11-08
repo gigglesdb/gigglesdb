@@ -474,8 +474,8 @@ const CASES: &[&str] = &[
     r#"{"name":"F limit numeric","sql":"SELECT id FROM t ORDER BY id LIMIT $1","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[23],"rows":[["1"],["2"]]}}"#,
     r#"{"name":"R bare bool","sql":"SELECT $1","oids":[16],"inputs":["796573"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["t"]]}}"#,
     r#"{"name":"R bare text","sql":"SELECT $1","oids":[25],"inputs":["61"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[25],"rows":[["a"]]}}"#,
-    // PG18.6: {"rows":[["a"]],"param_oids":[1043],"col_oids":[1043]}; gap: varchar result described as text OID 25 instead of 1043
-    r#"{"name":"known gap: R bare varchar","sql":"SELECT $1","oids":[1043],"inputs":["61"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["a"]]}}"#,
+    // PG18.6: {"rows":[["a"]],"param_oids":[1043],"col_oids":[1043]}; E2a′ closed the varchar describe gap (DataType::Varchar)
+    r#"{"name":"R bare varchar","sql":"SELECT $1","oids":[1043],"inputs":["61"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[1043],"rows":[["a"]]}}"#,
     r#"{"name":"R bare numeric","sql":"SELECT $1","oids":[1700],"inputs":["312e3530"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["1.50"]]}}"#,
     r#"{"name":"R bare float4","sql":"SELECT $1","oids":[700],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[700],"rows":[["0.1"]]}}"#,
     r#"{"name":"R bare float8","sql":"SELECT $1","oids":[701],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["0.1"]]}}"#,
@@ -502,8 +502,8 @@ const CASES: &[&str] = &[
     r#"{"name":"T bad text nul","sql":"SELECT $1","oids":[25],"inputs":["610062"],"binary":false,"expected":{"phase":"bind","param_oids":[25],"col_oids":[25],"sqlstate":"22021"}}"#,
     r#"{"name":"B bool t","sql":"SELECT $1","oids":[16],"inputs":["01"],"binary":true,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["t"]]}}"#,
     r#"{"name":"B text","sql":"SELECT $1","oids":[25],"inputs":["616263"],"binary":true,"expected":{"phase":"execute","param_oids":[25],"col_oids":[25],"rows":[["abc"]]}}"#,
-    // PG18.6: {"rows":[["abc"]],"param_oids":[1043],"col_oids":[1043]}; gap: varchar result described as text OID 25 instead of 1043
-    r#"{"name":"known gap: B varchar","sql":"SELECT $1","oids":[1043],"inputs":["616263"],"binary":true,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["abc"]]}}"#,
+    // PG18.6: {"rows":[["abc"]],"param_oids":[1043],"col_oids":[1043]}; E2a′ closed the varchar describe gap (DataType::Varchar)
+    r#"{"name":"B varchar","sql":"SELECT $1","oids":[1043],"inputs":["616263"],"binary":true,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[1043],"rows":[["abc"]]}}"#,
     r#"{"name":"B numeric 1.5","sql":"SELECT $1","oids":[1700],"inputs":["000200000000000100011388"],"binary":true,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["1.5"]]}}"#,
     r#"{"name":"B float4 1.5","sql":"SELECT $1","oids":[700],"inputs":["3fc00000"],"binary":true,"expected":{"phase":"execute","param_oids":[700],"col_oids":[700],"rows":[["1.5"]]}}"#,
     r#"{"name":"B float8 1.5","sql":"SELECT $1","oids":[701],"inputs":["3ff8000000000000"],"binary":true,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["1.5"]]}}"#,
@@ -537,6 +537,6 @@ const CASES: &[&str] = &[
     r#"{"name":"B interval short","sql":"SELECT $1","oids":[1186],"inputs":["000000000000000000000000"],"binary":true,"expected":{"phase":"bind","param_oids":[1186],"col_oids":[1186],"sqlstate":"08P01"}}"#,
     r#"{"name":"B text bad utf8","sql":"SELECT $1","oids":[25],"inputs":["fffe"],"binary":true,"expected":{"phase":"bind","param_oids":[25],"col_oids":[25],"sqlstate":"22021"}}"#,
     // PG18.6: {"sqlstate":"22021","param_oids":[1043],"col_oids":[1043]}; gap: varchar result described as text OID 25 instead of 1043
-    r#"{"name":"known gap: B varchar bad utf8","sql":"SELECT $1","oids":[1043],"inputs":["c3"],"binary":true,"expected":{"phase":"bind","param_oids":[1043],"col_oids":[25],"sqlstate":"22021"}}"#,
+    r#"{"name":"B varchar bad utf8","sql":"SELECT $1","oids":[1043],"inputs":["c3"],"binary":true,"expected":{"phase":"bind","param_oids":[1043],"col_oids":[1043],"sqlstate":"22021"}}"#,
     r#"{"name":"B text nul","sql":"SELECT $1","oids":[25],"inputs":["610062"],"binary":true,"expected":{"phase":"bind","param_oids":[25],"col_oids":[25],"sqlstate":"22021"}}"#,
 ];

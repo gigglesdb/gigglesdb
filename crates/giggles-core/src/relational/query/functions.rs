@@ -136,6 +136,14 @@ fn cast_node(value: BoundScalar, target: &DataType) -> Node {
 fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> {
     let mut common = None;
     for ty in types {
+        if ty == DataType::Bpchar {
+            return Err(SqlError::Unsupported);
+        }
+        let ty = if ty == DataType::Varchar {
+            DataType::Text
+        } else {
+            ty
+        };
         common = Some(match common {
             None => ty,
             Some(ref old) if *old == ty => ty,
@@ -1034,12 +1042,18 @@ impl Scalar {
                     });
                 }
                 let a = a.bind(resolve, tables, parameters)?;
+                if (a.ty == DataType::Bpchar || *ty == DataType::Bpchar)
+                    && !(matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+                        && matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar))
+                {
+                    return Err(SqlError::Unsupported);
+                }
                 if !(number(&a.ty) && number(ty)
                     || a.ty == *ty
                     || integer(&a.ty) && (integer(ty) || *ty == DataType::Bytes)
                     || a.ty == DataType::Bytes && integer(ty)
-                    || a.ty == DataType::Text
-                    || *ty == DataType::Text
+                    || matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
+                    || matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
                     || a.ty == DataType::Boolean && *ty == DataType::Integer
                     || a.ty == DataType::Integer && *ty == DataType::Boolean
                     || session_sensitive(&a.ty, ty))
@@ -1163,8 +1177,15 @@ impl Scalar {
                             e
                         }
                     })?;
+                if args.iter().enumerate().any(|(index, arg)| {
+                    arg.ty == DataType::Bpchar && !(name == "format" && index > 0)
+                }) {
+                    return Err(SqlError::Unsupported);
+                }
                 if name == "format"
-                    && args.first().is_some_and(|a| a.ty != DataType::Text)
+                    && args
+                        .first()
+                        .is_some_and(|a| !matches!(a.ty, DataType::Text | DataType::Varchar))
                     && !matches!(original.first(), Some(Self::Literal(Value::Null)))
                 {
                     return Err(SqlError::UndefinedFunction);
@@ -1177,6 +1198,11 @@ impl Scalar {
                         }))
                 {
                     return Err(SqlError::UndefinedFunction);
+                }
+                for arg in &mut args {
+                    if arg.ty == DataType::Varchar {
+                        arg.ty = DataType::Text;
+                    }
                 }
                 let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
                 let ty = if integer_formats::known_name(name) {
@@ -1643,6 +1669,8 @@ impl BoundScalar {
                         DataType::Integer => "int4",
                         DataType::BigInt => "int8",
                         DataType::Text => "text",
+                        DataType::Varchar => "varchar",
+                        DataType::Bpchar => "bpchar",
                         DataType::Boolean => "bool",
                         DataType::Bytes => "bytea",
                         DataType::Numeric => "numeric",
@@ -1753,7 +1781,13 @@ impl BoundScalar {
                 Ok(value)
             }
             Node::Cast(a) => {
-                let v = a.eval(row, params, budget)?;
+                let mut v = a.eval(row, params, budget)?;
+                if a.ty == DataType::Bpchar
+                    && matches!(self.ty, DataType::Text | DataType::Varchar)
+                    && let Value::Text(text) = &mut v
+                {
+                    text.truncate(text.trim_end_matches(' ').len());
+                }
                 if let Value::Int(n) = v
                     && self.ty == DataType::Bytes
                 {
@@ -2122,6 +2156,12 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
     if v == Value::Null {
         return Ok(v);
     }
+    // Varchar/Bpchar values are text; length and padding apply at the column (coerce_to_column).
+    let ty = if matches!(ty, DataType::Varchar | DataType::Bpchar) {
+        &DataType::Text
+    } else {
+        ty
+    };
     let out = match (v, ty) {
         (Value::Date(v), DataType::Date) => Value::Date(v),
         (Value::Date(v), DataType::Timestamp) => Value::Timestamp(
@@ -2278,7 +2318,7 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
                 giggles_pg_types::integer::IntegerError::Limit => SqlError::Limit,
             })?)
         }
-        (Value::Text(s), DataType::Text) => Value::Text(s),
+        (Value::Text(s), DataType::Text | DataType::Bpchar) => Value::Text(s),
         (Value::Bool(b), DataType::Boolean) => Value::Bool(b),
         (Value::Bytes(b), DataType::Bytes) => Value::Bytes(b),
         (Value::Int(n), DataType::Text) => Value::Text(n.to_string()),
@@ -2860,11 +2900,31 @@ pub(super) fn aggregate_numeric_average(sum: Value, count: i64, budget: &mut usi
 
 impl BoundScalar {
     pub(in super::super) fn insert_assignment(self, target: &DataType) -> R<Self> {
+        // Numeric character assignments use the existing text conversion, including
+        // session float formatting. coerce_to_column applies the target typmod.
+        if number(&self.ty) && matches!(target, DataType::Varchar | DataType::Bpchar) {
+            return self.insert_assignment(&DataType::Text);
+        }
         if &self.ty == target {
             return Ok(self);
         }
+        if matches!(
+            self.ty,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        ) && matches!(
+            target,
+            DataType::Text | DataType::Varchar | DataType::Bpchar
+        ) {
+            return Ok(Self {
+                ty: target.clone(),
+                node: self.node,
+            });
+        }
         let node = if number(&self.ty) && number(target)
-            || *target == DataType::Text && (number(&self.ty) || self.ty == DataType::Boolean)
+            || matches!(
+                target,
+                DataType::Text | DataType::Varchar | DataType::Bpchar
+            ) && (number(&self.ty) || self.ty == DataType::Boolean)
         {
             cast_node(self, target)
         } else if assignment::compatible(&self.ty, target) {

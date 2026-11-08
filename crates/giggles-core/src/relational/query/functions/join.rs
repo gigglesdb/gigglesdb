@@ -40,6 +40,14 @@ fn temporal_type(ty: &DataType) -> bool {
 }
 
 pub(in crate::relational::query) fn join_key_supported(outer: &DataType, inner: &DataType) -> bool {
+    if *outer == DataType::Bpchar || *inner == DataType::Bpchar {
+        return false;
+    }
+    if matches!(outer, DataType::Text | DataType::Varchar)
+        && matches!(inner, DataType::Text | DataType::Varchar)
+    {
+        return true;
+    }
     if temporal_type(outer) || temporal_type(inner) {
         return false;
     }
@@ -62,6 +70,11 @@ pub(in crate::relational::query) fn join_key(
 ) -> R<Option<Value>> {
     if *outer == Value::Null || !join_key_supported(outer_ty, inner_ty) {
         return Ok(None);
+    }
+    if matches!(outer_ty, DataType::Text | DataType::Varchar)
+        && matches!(inner_ty, DataType::Text | DataType::Varchar)
+    {
+        return Ok(Some(outer.clone()));
     }
     if outer_ty == inner_ty {
         return Ok(Some(outer.clone()));
@@ -111,8 +124,16 @@ pub(in crate::relational::query) fn join_equal(
     inner_ty: &DataType,
     clock: Option<&ExecutionClock>,
 ) -> R<bool> {
+    if *outer_ty == DataType::Bpchar || *inner_ty == DataType::Bpchar {
+        return Err(SqlError::Unsupported);
+    }
     if *a == Value::Null || *b == Value::Null {
         return Ok(false);
+    }
+    if matches!(outer_ty, DataType::Text | DataType::Varchar)
+        && matches!(inner_ty, DataType::Text | DataType::Varchar)
+    {
+        return Ok(equal(a, b));
     }
     if outer_ty == inner_ty {
         return Ok(equal(a, b));

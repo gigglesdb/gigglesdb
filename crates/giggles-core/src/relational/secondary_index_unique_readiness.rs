@@ -112,6 +112,8 @@ fn legacy(ty: &DataType) -> R<Kind> {
         DataType::Integer => "Integer",
         DataType::BigInt => "BigInt",
         DataType::Text => "Text",
+        DataType::Varchar => "Text",
+        DataType::Bpchar => return Err(SqlError::Unsupported),
         DataType::Bytes => "Bytes",
         _ => return Err(SqlError::Unsupported),
     };

@@ -2024,6 +2024,10 @@ impl SqlSession {
         }
         result
     }
+    pub(crate) fn coerce_column_engine(&self, column: &relational::ColumnDef, value: relational::Value) -> Result<relational::Value, CoreError> {
+        let state = self.staged.as_ref().ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+        relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
+    }
     pub(crate) fn insert_engine(
         &mut self,
         table: &relational::TableDef,

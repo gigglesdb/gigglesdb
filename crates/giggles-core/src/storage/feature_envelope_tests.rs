@@ -355,7 +355,7 @@ fn catalog_ext_wire_errors_distinguish_corrupt_and_unsupported() {
         from_records(catalog_ext_raw_records(encode(&ext).unwrap())),
         Err(CoreError::Corrupt(_))
     ));
-    ext.ext_version = 3;
+    ext.ext_version = 4;
     // Exercise the relational decoder itself, before format-53 content policy:
     // unknown extensions retain Unsupported on the older namespace-5 path.
     let unknown_records = catalog_ext_raw_records(encode(&ext).unwrap());

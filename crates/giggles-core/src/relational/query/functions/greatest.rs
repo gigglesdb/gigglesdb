@@ -37,6 +37,9 @@ fn implicit(source: &DataType, target: &DataType) -> bool {
 }
 
 fn result_type(types: &[DataType]) -> R<DataType> {
+    if types.contains(&DataType::Bpchar) {
+        return Err(SqlError::Unsupported);
+    }
     let Some(first) = types.first() else {
         return Ok(DataType::Text);
     };
@@ -71,7 +74,15 @@ pub(super) fn hint(
     let types = args
         .iter()
         .filter(|arg| !arg.aggregate_unknown(parameters))
-        .map(|arg| arg.bind(resolve, tables, parameters).map(|bound| bound.ty))
+        .map(|arg| {
+            arg.bind(resolve, tables, parameters).map(|bound| {
+                if bound.ty == DataType::Varchar {
+                    DataType::Text
+                } else {
+                    bound.ty
+                }
+            })
+        })
         .collect::<R<Vec<_>>>()?;
     result_type(&types)
 }

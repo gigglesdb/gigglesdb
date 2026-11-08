@@ -5,6 +5,12 @@ use crate::storage::State;
 
 pub(super) trait Context {
     type Input;
+    fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
+        if matches!(column.data_type, DataType::Varchar | DataType::Bpchar) {
+            return Err(Error::Unsupported);
+        }
+        Ok(value)
+    }
     fn checkpoint(&self) -> std::result::Result<(), CoreError>;
     fn catalog_engine(&mut self) -> std::result::Result<(u64, Vec<TableDef>), CoreError>;
     fn consume_complete_engine(
@@ -42,6 +48,9 @@ pub(super) trait Context {
 }
 impl Context for SqlSession {
     type Input = CompleteRelation;
+    fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
+        self.coerce_column_engine(column, value).map_err(core)
+    }
     fn checkpoint(&self) -> std::result::Result<(), CoreError> {
         crate::cancellation::check()
     }
@@ -98,6 +107,10 @@ struct SnapshotContext {
 }
 impl Context for SnapshotContext {
     type Input = Vec<SqlRow>;
+    fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
+        crate::relational::coerce_to_column(&self.state.sql, column, value)
+            .map_err(|error| core(CoreError::Sql(error)))
+    }
     fn checkpoint(&self) -> std::result::Result<(), CoreError> {
         Ok(())
     }

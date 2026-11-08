@@ -9,11 +9,14 @@ enum Family {
 }
 
 fn family(types: [Option<&DataType>; 3]) -> R<Family> {
-    let source_text = types[0].is_none_or(|t| *t == DataType::Text);
+    if types.iter().flatten().any(|ty| **ty == DataType::Bpchar) {
+        return Err(SqlError::Unsupported);
+    }
+    let source_text = types[0].is_none_or(|t| matches!(t, DataType::Text | DataType::Varchar));
     let source_bytes = types[0].is_none_or(|t| *t == DataType::Bytes);
     let text = types[1..]
         .iter()
-        .all(|t| t.is_none_or(|t| *t == DataType::Text));
+        .all(|t| t.is_none_or(|t| matches!(t, DataType::Text | DataType::Varchar)));
     let numeric = types[1..]
         .iter()
         .all(|t| t.is_none_or(|t| matches!(t, DataType::SmallInt | DataType::Integer)));

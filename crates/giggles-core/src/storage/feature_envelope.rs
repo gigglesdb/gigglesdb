@@ -8,13 +8,13 @@ pub(super) const ROLE_BOOTSTRAP: u64 = 1 << 9;
 fn catalog_ext_present(s: &State) -> bool {
     !s.sql.catalog_ext().is_empty()
 }
-/// E1 detects typmod content; E2 adds extended type tags here later.
+/// Extended scalar metadata requires feature bit seven.
 fn extended_types_present(s: &State) -> bool {
     s.sql
         .catalog_ext()
         .columns
         .values()
-        .any(|column| column.typmod.is_some())
+        .any(|column| column.typmod.is_some() || column.text_kind.is_some())
 }
 /// E1: true for any namespace-11 sequence counter.
 fn sequence_counters_present(s: &State) -> bool {
@@ -98,3 +98,25 @@ pub(super) fn decode_relational(bytes: &[u8]) -> Result<Relational, CoreError> {
 #[cfg(test)]
 #[path = "feature_envelope_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn text_kind_requires_catalog_and_extended_feature_bits() {
+    use crate::relational::{Prepared, catalog_ext::TextKind};
+    let mut state = empty(17);
+    let p = Prepared::parse("CREATE TABLE t (id BIGINT PRIMARY KEY, value TEXT)", 17, 0).unwrap();
+    state.sql.execute(&p, &[], None).unwrap();
+    let id = state.sql.tables["t"].columns[1].id;
+    state
+        .sql
+        .set_column_text_kind(id, Some(TextKind::Varchar))
+        .unwrap();
+    let bits = feature_bits_present(&state).unwrap();
+    assert_eq!(bits & (3 << 6), 3 << 6);
+    let mut map = records(&state).unwrap();
+    map.insert(vec![10], (bits & !(1 << 7)).to_be_bytes().to_vec());
+    assert!(matches!(
+        from_records_mode(map, &mut || false, false),
+        Err(CoreError::Corrupt(_))
+    ));
+}

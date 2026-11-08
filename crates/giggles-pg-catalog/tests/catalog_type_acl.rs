@@ -56,16 +56,11 @@ fn s(v: &str) -> Value {
 
 #[test]
 fn exact_full_acl_has_real_ordered_authorized_oids_and_null_acl() {
-    // Exact wire bytes retained, including14 CRLFs and significant whitespace.
-    assert_eq!(FULL_ACL.len(), 511);
-    assert_eq!(
-        FULL_ACL
-            .as_bytes()
-            .windows(2)
-            .filter(|p| *p == b"\r\n")
-            .count(),
-        14
-    );
+    // Exact fixture content and significant whitespace. The committed blob is LF, so this
+    // must pass on both LF and CRLF (core.autocrlf=true) checkouts: compare CR-stripped text.
+    let lf = FULL_ACL.replace('\r', "");
+    assert_eq!(lf.len(), 497);
+    assert_eq!(lf.matches('\n').count(), 14);
     let p = plan_gateway(FULL_ACL).unwrap().unwrap();
     assert_eq!(p.parameter_types(), &[PgType::Oid; 3]);
     let fields = vec![

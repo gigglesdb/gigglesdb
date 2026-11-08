@@ -660,3 +660,26 @@ fn native_results_preserve_counts_versions_types_conflicts_and_empty_collections
         );
     }
 }
+
+#[test]
+fn character_column_types_use_existing_native_text_tag() {
+    for data_type in [DataType::Varchar, DataType::Bpchar] {
+        let encoded = column(ColumnDef {
+            id: 7,
+            name: "body".into(),
+            data_type,
+            not_null: false,
+        });
+        assert_eq!(encoded.data_type, 5);
+        let text = column(ColumnDef {
+            id: 7,
+            name: "body".into(),
+            data_type: DataType::Text,
+            not_null: false,
+        });
+        assert_eq!(
+            serde_json::to_value(encoded).unwrap()["dataType"],
+            serde_json::to_value(text).unwrap()["dataType"]
+        );
+    }
+}

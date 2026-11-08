@@ -149,7 +149,8 @@ impl BoundLocal {
         match self.data_type {
             DataType::Boolean => Ty::Bool,
             DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
-            DataType::Text => Ty::Text,
+            DataType::Text | DataType::Varchar => Ty::Text,
+            DataType::Bpchar => Ty::Bpchar,
             DataType::Bytes => Ty::Bytes,
             DataType::Numeric => Ty::Numeric,
             DataType::Real => Ty::Real,
@@ -323,6 +324,7 @@ fn scalar_description(bound: &Bound, ty: Option<Ty>) -> EmitDescription {
             Ty::Bool => DataType::Boolean,
             Ty::Int => DataType::BigInt,
             Ty::Text => DataType::Text,
+            Ty::Bpchar => DataType::Bpchar,
             Ty::Bytes => DataType::Bytes,
             Ty::Numeric => DataType::Numeric,
             Ty::Real => DataType::Real,

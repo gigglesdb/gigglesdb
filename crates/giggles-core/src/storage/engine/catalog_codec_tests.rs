@@ -67,6 +67,7 @@ fn frozen_table_goldens() {
                 always: true,
                 sequence_id: 3,
             }),
+            text_kind: None,
         },
     );
     assert_eq!(encode_table(&entry, &ext).unwrap(), hex(EXT));
@@ -421,7 +422,7 @@ fn decoded_primary_key_offsets_are_in_bounds() {
 fn decoded_column_extensions_belong_to_table() {
     let mut dto = table_dto();
     dto.columns_ext
-        .insert(99, ColumnExtDto::from(ColumnExt::default()));
+        .insert(99, ColumnExtDto::try_from(ColumnExt::default()).unwrap());
     assert_bad_table(&dto);
 }
 
@@ -436,7 +437,7 @@ fn decoded_typmods_are_checked_against_column_type() {
         (DataType::Interval, (32767 << 16) | 6, (32767 << 16) | 7),
     ] {
         let mut dto = table_dto();
-        dto.def.columns[0].data_type = data_type.into();
+        dto.def.columns[0].data_type = data_type.try_into().unwrap();
         // Temporal values are valid columns, but cannot be CREATE key fields.
         dto.def.primary_key.clear();
         dto.columns_ext.insert(
@@ -506,7 +507,7 @@ fn decoded_constraint_and_sequence_names_follow_legacy_bounds() {
             &encode_version(1, &dto).unwrap(),
             &table().def,
         ));
-        let mut dto = SequenceDefDto::from(sequence());
+        let mut dto = SequenceDefDto::try_from(sequence()).unwrap();
         dto.name = name;
         assert_corrupt(decode_sequence(&encode_version(1, &dto).unwrap()));
     }
@@ -554,4 +555,39 @@ fn decoded_foreign_key_columns_belong_to_owning_table() {
     ));
     // The fixture's remote table 8/column 9 need no cross-object lookup here.
     assert!(decode_constraint(&hex(FK), &table().def).is_ok());
+}
+
+#[test]
+fn varchar_char_refused_on_v2_without_changing_bytes() {
+    // DD-0068 E1130: live varchar/char never reaches v2 bytes.
+    let refused = |result: Result<Vec<u8>, CoreError>| {
+        assert!(matches!(
+            result,
+            Err(CoreError::EngineUnsupported {
+                engine: "v2",
+                feature: V2_VARCHAR_CHAR
+            })
+        ))
+    };
+    for data_type in [DataType::Varchar, DataType::Bpchar] {
+        let mut entry = table();
+        entry.def.columns[0].data_type = data_type;
+        refused(encode_table(&entry, &BTreeMap::new()));
+    }
+    let mut ext = BTreeMap::new();
+    ext.insert(
+        2,
+        ColumnExt {
+            typmod: None,
+            default: None,
+            identity: None,
+            text_kind: Some(crate::relational::catalog_ext::TextKind::Varchar),
+        },
+    );
+    refused(encode_table(&table(), &ext));
+    // Unchanged frozen bytes for everything representable.
+    assert_eq!(
+        encode_table(&table(), &BTreeMap::new()).unwrap(),
+        hex(TABLE)
+    );
 }
