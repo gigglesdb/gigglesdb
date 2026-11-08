@@ -134,9 +134,9 @@ fn character_adversarial_pg18_all_cases_values_oids_errors_and_visible_gaps() {
     let fixture: Json =
         serde_json::from_str(include_str!("fixtures/character-adversarial-pg18.json")).unwrap();
     assert_eq!(fixture["case_count"], 210);
-    assert_eq!(fixture["planned_parity"], 198);
+    assert_eq!(fixture["planned_parity"], 199);
     assert_eq!(fixture["typed_core_admission_controls"], 4);
-    assert_eq!(fixture["known_gaps"], 6);
+    assert_eq!(fixture["known_gaps"], 5);
     assert_eq!(fixture["pg_only_input_domain"], 2);
     assert_eq!(fixture["identity"]["rows"][0][1], "UTF8");
     assert_eq!(fixture["identity"]["rows"][0][2], "C");
@@ -250,7 +250,7 @@ fn character_adversarial_pg18_all_cases_values_oids_errors_and_visible_gaps() {
         }
         observations.push(json!({"id":id,"classification":class,"core":actual,"pg":expected}));
     }
-    assert_eq!((parity, typed_admission, gaps, excluded), (198, 4, 6, 2));
+    assert_eq!((parity, typed_admission, gaps, excluded), (199, 4, 5, 2));
     let report = json!({"fixture_count":210,"parity_candidates":parity,"typed_core_admission_controls":typed_admission,"known_gap_profiles":gaps,"PG_only_input_domain_exclusions":excluded,"mismatches":mismatches,"cases":observations,"limitations":["UTF8 libc C/Ctype only","Known gaps and invalid typed Core API admission controls are retained and not certified as parity","Core API phases and mapped_core_sqlstate interpretation do not certify observed pgwire Bind/Execute phase or SQLSTATE parity","Frozen source-v3 product only; not latest shared workspace"]});
     let path = unique_path("reports").with_extension("json");
     std::fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();

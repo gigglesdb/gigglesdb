@@ -5,6 +5,7 @@ use super::*;
 pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
     aggregates: Vec<BoundItem>,
+    aggregate_filters: Vec<Option<BoundFilter>>,
     dependents: Vec<BoundColumn>,
     aggregate_columns: Vec<ColumnDef>,
     outputs: Vec<BoundScalar>,
@@ -17,7 +18,11 @@ fn aggregate(name: &str) -> Option<Aggregate> {
 }
 pub(super) fn contains_aggregate(s: &Scalar) -> bool {
     match s {
-        Scalar::Call(n, a) => aggregate(n).is_some() || a.iter().any(contains_aggregate),
+        Scalar::Call(n, a) => {
+            n == aggregate_filter::CALL
+                || aggregate(n).is_some()
+                || a.iter().any(contains_aggregate)
+        }
         Scalar::Unary(_, a) | Scalar::Cast(a, _) => contains_aggregate(a),
         Scalar::Binary(_, a, b) => contains_aggregate(a) || contains_aggregate(b),
         Scalar::SubstringOrder(a) => a.iter().any(|a| contains_aggregate(a)),
@@ -176,7 +181,7 @@ struct Lower<'a, F> {
     scope: usize,
     resolve: &'a F,
     tables: &'a [&'a TableDef],
-    aggregates: Vec<(Aggregate, Option<Scalar>)>,
+    aggregates: Vec<(Aggregate, Option<Scalar>, Option<Filter>)>,
     dependent_sources: Vec<bool>,
     dependents: Vec<BoundColumn>,
 }
@@ -207,6 +212,12 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                     name: format!("__dependent_slot_{index}"),
                 })
             }
+            Scalar::Call(n, args) if n == aggregate_filter::CALL => {
+                let (a, arg, filter) = aggregate_filter::parts(args, self.resolve, self.tables)?;
+                let index = self.groups.len() + self.aggregates.len();
+                self.aggregates.push((a, arg, Some(filter)));
+                slot(index)
+            }
             Scalar::Call(n, args) if aggregate(n).is_some() => {
                 if args.len() != 1 {
                     return Err(SqlError::UndefinedFunction);
@@ -216,6 +227,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 self.aggregates.push((
                     aggregate(n).ok_or(SqlError::UndefinedFunction)?,
                     Some(args[0].clone()),
+                    None,
                 ));
                 slot(index)
             }
@@ -363,6 +375,7 @@ pub(super) fn bind<'a>(
         .map(|s| resolve_output(s, &projection, true, resolve, tables.len(), tables))
         .collect::<R<Vec<_>>>()?;
     for s in &groups {
+        aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
         reject_nested_aggregate(s)?;
         s.infer(None, &mut parameters, resolve, tables)?;
     }
@@ -376,6 +389,19 @@ pub(super) fn bind<'a>(
                 *p = Some(DataType::BigInt);
             }
         }
+    }
+    // FILTER consumes input rows, so validate its routine and Boolean predicate
+    // before an unrelated ungrouped output column can mask those errors.
+    for (item, _) in &projection {
+        if let Item::Scalar(s) | Item::Aggregate(_, Some(s)) = item {
+            aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
+        }
+    }
+    if let Some(filter) = q.having() {
+        aggregate_filter::validate_filter(filter, &parameters, resolve, tables)?;
+    }
+    for (s, _, _) in &q.order {
+        aggregate_filter::validate_scalar(s, &parameters, resolve, tables)?;
     }
     let group_identity = groups
         .iter()
@@ -407,7 +433,7 @@ pub(super) fn bind<'a>(
         .map(|(i, _)| {
             if let Item::Aggregate(Aggregate::Count, None) = i {
                 let index = lower.groups.len() + lower.aggregates.len();
-                lower.aggregates.push((Aggregate::Count, None));
+                lower.aggregates.push((Aggregate::Count, None, None));
                 Ok(slot(index))
             } else {
                 lower.scalar(&output_scalar(i)?)
@@ -434,7 +460,7 @@ pub(super) fn bind<'a>(
         })
         .collect::<R<Vec<_>>>()?;
     let mut unresolved_count = vec![];
-    for (a, arg) in &lower.aggregates {
+    for (a, arg, _) in &lower.aggregates {
         let Some(arg) = arg else {
             continue;
         };
@@ -457,6 +483,11 @@ pub(super) fn bind<'a>(
         };
         arg.infer(expected, &mut parameters, resolve, tables)?;
     }
+    for (_, _, filter) in &lower.aggregates {
+        if let Some(filter) = filter {
+            filter.infer(&mut parameters, resolve, tables)?;
+        }
+    }
     if unresolved_count
         .iter()
         .any(|n| parameters.get(n - 1).is_some_and(Option::is_some))
@@ -476,7 +507,14 @@ pub(super) fn bind<'a>(
     }
     let mut aggregates = vec![];
     let mut aggregate_columns = vec![];
-    for (a, arg) in lower.aggregates {
+    let mut aggregate_filters = vec![];
+    for (a, arg, filter) in lower.aggregates {
+        aggregate_filters.push(
+            filter
+                .as_ref()
+                .map(|f| f.bind(&parameters, resolve, tables))
+                .transpose()?,
+        );
         let Some(arg) = arg else {
             let column = col(
                 format!("__group_slot_{}", slots.len()),
@@ -612,10 +650,12 @@ pub(super) fn bind<'a>(
                 col(
                     match i {
                         Item::Aggregate(a, _) => a.name().into(),
+                        Item::Scalar(s) if aggregate_filter::kind(s).is_some() => aggregate_filter::kind(s).unwrap().name().into(),
                         _ => output_name.clone(),
                     },
                     b.ty.clone(),
-                    matches!(i, Item::Aggregate(kind, _) if matches!(kind.base(), Aggregate::Count)),
+                    matches!(i, Item::Aggregate(kind, _) if matches!(kind.base(), Aggregate::Count))
+                        || matches!(i, Item::Scalar(s) if aggregate_filter::kind(s).is_some_and(|a| matches!(a.base(), Aggregate::Count))),
                 )
             };
             if let Some(alias) = alias {
@@ -654,6 +694,7 @@ pub(super) fn bind<'a>(
         grouping: Some(Grouping {
             keys,
             aggregates,
+            aggregate_filters,
             aggregate_columns,
             dependents: lower.dependents,
             outputs,
@@ -841,8 +882,9 @@ impl Grouping {
                 }
                 let (values, auxiliary) = groups.get_mut(&key).ok_or(SqlError::Limit)?;
                 let before = retained(values);
-                update_aggregates(
+                update_filtered_aggregates(
                     &self.aggregates,
+                    &self.aggregate_filters,
                     &self.aggregate_columns,
                     values,
                     auxiliary,
@@ -988,6 +1030,10 @@ impl Grouping {
         {
             s.plan_constant(budget)?;
         }
+        // Validate constant predicate errors before scanning, just like WHERE.
+        for filter in self.aggregate_filters.iter().flatten() {
+            filter.plan_constant(budget)?;
+        }
         if no_parameters {
             for a in &self.aggregates {
                 if let BoundItem::Aggregate(_, Some(s)) = a {
@@ -1020,6 +1066,9 @@ impl Grouping {
             if let BoundItem::Aggregate(_, Some(s)) = a {
                 s.attach_clock(clock);
             }
+        }
+        for filter in self.aggregate_filters.iter_mut().flatten() {
+            filter.attach_clock(clock);
         }
         if let Some(h) = &mut self.having {
             h.attach_clock(clock);
@@ -1074,6 +1123,36 @@ mod tests {
             );
             assert_eq!(polls, fence);
             assert_eq!(bincode::serialize(&state).unwrap(), before);
+        }
+    }
+    #[test]
+    fn filtered_aggregate_polls_each_input_and_leaves_source_unchanged() {
+        let state = state(32);
+        let before = bincode::serialize(&state).unwrap();
+        for sql in [
+            "SELECT count(*) FILTER (WHERE true) FROM group_cap",
+            "SELECT count(*) FILTER (WHERE false) FROM group_cap",
+            "SELECT id,count(DISTINCT id) FILTER (WHERE false) FROM group_cap GROUP BY id",
+        ] {
+            let query = query(sql);
+            let bound = query.bind(&state, 0, &[]).unwrap();
+            for fence in [2, 5, 20] {
+                let mut polls = 0;
+                assert_eq!(
+                    bound.execute(&state, &scan::LegacyRows(&state), &[], &mut || {
+                        polls += 1;
+                        polls == fence
+                    }),
+                    Err(SqlError::Aborted)
+                );
+                assert_eq!(polls, fence);
+                assert_eq!(bincode::serialize(&state).unwrap(), before);
+            }
+            assert!(
+                bound
+                    .execute(&state, &scan::LegacyRows(&state), &[], &mut || false)
+                    .is_ok()
+            );
         }
     }
     #[test]

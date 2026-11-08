@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "case_count": 210,
-  "planned_parity": 198,
-  "known_gaps": 6,
+  "planned_parity": 199,
+  "known_gaps": 5,
   "pg_only_input_domain": 2,
   "seed": 681106,
   "identity": {
@@ -9978,8 +9978,7 @@
       "query": "SELECT sum(ascii(label)) FILTER (WHERE code>1) FROM adv_agg_filter",
       "params": [],
       "tags": [
-        "aggregate_filter",
-        "known_gap"
+        "aggregate_filter"
       ],
       "setup": [
         "CREATE TABLE adv_agg_filter (id bigint primary key,label text,code integer)",
@@ -9989,8 +9988,8 @@
         "INSERT INTO adv_agg_filter VALUES(4,'',1)",
         "INSERT INTO adv_agg_filter VALUES(5,NULL,NULL)"
       ],
-      "classification": "known_gap",
-      "expected_core_error": "Unsupported",
+      "classification": "parity",
+      "expected_core_error": null,
       "expected_core_stage": null,
       "observation": {
         "parameterTypes": [],

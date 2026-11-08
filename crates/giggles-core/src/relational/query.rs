@@ -1,6 +1,7 @@
 //! Private syntax, binding and bounded physical execution. No persisted types.
 use super::*;
 use std::cmp::Ordering;
+mod aggregate_filter;
 mod functions;
 pub(super) use functions::assignment;
 mod grouping;
@@ -1034,8 +1035,7 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
             args.iter().any(scalar_has_undefined_routine)
         }
         Scalar::Call(n, args) => {
-            (n.starts_with("public.\0") || n.starts_with("schema.\0"))
-                || args.iter().any(scalar_has_undefined_routine)
+            functions::is_deferred_routine_name(n) || args.iter().any(scalar_has_undefined_routine)
         }
         Scalar::Unary(_, a) | Scalar::Cast(a, _) => scalar_has_undefined_routine(a),
         Scalar::Binary(_, a, b) => {
@@ -1051,7 +1051,7 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
                     .as_ref()
                     .is_some_and(scalar_has_undefined_routine)
         }
-        _ => false,
+        Scalar::Literal(_) | Scalar::Param(_) | Scalar::Column(_) => false,
     }
 }
 impl Query {
@@ -1250,13 +1250,14 @@ impl Query {
         let explain = p.word("explain");
         p.need("select")?;
         preprocess_aggregates(p)?;
+        let aggregate_filters = aggregate_filter::normalize(p)?;
         // Subqueries remain outside this bounded relational grammar.
         if p.tokens[p.at..].windows(2).any(
             |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
         ) {
             return Err(SqlError::Unsupported);
         }
-        let items = Self::parse_items(p)?;
+        let mut items = Self::parse_items(p)?;
         let mut sources = vec![];
         if p.word("from") {
             sources.push(p.source()?);
@@ -1283,7 +1284,7 @@ impl Query {
             Join::parse_equalities(p, &mut equalities, 0)?;
             joins.push(Join { left, equalities });
         }
-        let filter = if p.word("where") {
+        let mut filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
         } else {
             None
@@ -1316,7 +1317,7 @@ impl Query {
                 p.tokens[n + 2] = Token::Number("1".into());
             }
         }
-        let having = if p.word("having") {
+        let mut having = if p.word("having") {
             Some(Filter::parse(p, 0, 0)?)
         } else {
             None
@@ -1359,6 +1360,25 @@ impl Query {
         } else {
             None
         };
+        if !aggregate_filters.is_empty() {
+            for (item, _) in &mut items {
+                match item {
+                    Item::Scalar(s) | Item::Aggregate(_, Some(s)) => {
+                        aggregate_filter::expand_scalar(s, &aggregate_filters)?
+                    }
+                    _ => {}
+                }
+            }
+            for f in filter.iter_mut().chain(having.iter_mut()) {
+                aggregate_filter::expand_filter(f, &aggregate_filters)?;
+            }
+            for s in &mut group {
+                aggregate_filter::expand_scalar(s, &aggregate_filters)?;
+            }
+            for (s, _, _) in &mut order {
+                aggregate_filter::expand_scalar(s, &aggregate_filters)?;
+            }
+        }
         // OFFSET is admitted by this work item only for grouped output.
         // Preserve the existing rejection boundary for ordinary row queries.
         if offset.is_some()
@@ -1411,6 +1431,14 @@ impl Query {
                 Scalar::Case(c) => {
                     c.arms.iter().all(|(f, s)| filter(f) && scalar(s))
                         && c.otherwise.as_ref().is_none_or(scalar)
+                }
+                Scalar::Call(name, args) if name == aggregate_filter::CALL => {
+                    let [call, condition] = args.as_slice() else {
+                        return false;
+                    };
+                    (matches!(call, Scalar::Call(name, args) if name == aggregate_filter::COUNT_STAR && args.is_empty())
+                        || scalar(call))
+                        && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
                 Scalar::Call(name, args) => {
                     matches!(
@@ -1921,6 +1949,9 @@ impl Query {
             }
             found.ok_or(SqlError::UnknownColumn)
         };
+        if let Some(filter) = self.where_filter() {
+            aggregate_filter::validate_filter(filter, &parameters, &resolve, &tables)?;
+        }
         if self.where_filter().is_some_and(filter_contains_aggregate) {
             return Err(SqlError::GroupingError);
         }
@@ -3083,10 +3114,41 @@ fn update_aggregates(
     params: &[Value],
     work: &mut usize,
 ) -> R<()> {
+    update_filtered_aggregates(
+        items,
+        &[],
+        columns,
+        values,
+        auxiliary,
+        retention,
+        row,
+        params,
+        work,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn update_filtered_aggregates(
+    items: &[BoundItem],
+    filters: &[Option<BoundFilter>],
+    columns: &[ColumnDef],
+    values: &mut [Value],
+    auxiliary: &mut [AggregateAuxiliary],
+    retention: &mut scan::Retention,
+    row: &Tuple,
+    params: &[Value],
+    work: &mut usize,
+) -> R<()> {
     for (index, item) in items.iter().enumerate() {
         let BoundItem::Aggregate(a, c) = item else {
             return Err(SqlError::Unsupported);
         };
+        // Like WHERE, each predicate has a fresh per-row scalar budget. Aggregate
+        // arguments retain the statement-wide input budget below.
+        if let Some(Some(filter)) = filters.get(index)
+            && filter.eval(row, params, &mut 0)? != Some(true)
+        {
+            continue;
+        }
         let evaluated = c.as_ref().map(|e| e.eval(row, params, work)).transpose()?;
         let v = evaluated.as_ref();
         if v == Some(&Value::Null) {
@@ -3349,6 +3411,70 @@ mod average_distinct_retention_tests {
 #[cfg(test)]
 mod deferred_routine_only_tests {
     use super::*;
+
+    fn query(sql: &str) -> Query {
+        let prepared = Prepared::parse(sql, 1, 0).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let Statement::Query(query) = prepared.statement else {
+            panic!("expected query: {sql}");
+        };
+        query
+    }
+
+    #[test]
+    fn aggregate_filter_classification_walks_conditions_and_private_markers() {
+        for sql in [
+            "SELECT count(*) FILTER (WHERE true)",
+            "SELECT pg_catalog.count(*) FILTER (WHERE false)",
+            "SELECT sum(1) FILTER (WHERE NULL)",
+            "SELECT count(*) FILTER (WHERE (true AND false) IS NOT UNKNOWN)",
+            "SELECT CASE WHEN true THEN count(*) FILTER (WHERE true) ELSE 0 END",
+            "SELECT (count(*) FILTER (WHERE true)>0)",
+            "SELECT count(*) FILTER (WHERE CASE WHEN true THEN true ELSE false END)",
+        ] {
+            let query = query(sql);
+            assert!(query.is_table_free(), "{sql}");
+            assert!(!query.has_undefined_routine(), "{sql}");
+            assert!(!query.deferred_routine_only(), "{sql}");
+            assert!(!query.rejects_unsupported_table_free_scalar(), "{sql}");
+            assert!(query.sequence_dependencies().is_empty(), "{sql}");
+        }
+        for sql in [
+            "SELECT public.count(*) FILTER (WHERE true)",
+            "SELECT count(*) FILTER (WHERE nosuchfn())",
+            "SELECT count(*) FILTER (WHERE CASE WHEN nosuchfn() THEN true ELSE false END)",
+            "SELECT count(*) FILTER (WHERE CASE WHEN true THEN nosuchfn() ELSE false END)",
+            "SELECT CASE WHEN count(*) FILTER (WHERE nosuchfn())>0 THEN 1 ELSE 0 END",
+        ] {
+            let query = query(sql);
+            assert!(!query.is_table_free(), "{sql}");
+            assert!(query.has_undefined_routine(), "{sql}");
+            assert!(query.deferred_routine_only(), "{sql}");
+        }
+        for sql in [
+            "SELECT count(*) FILTER (WHERE pg_toast.nosuchfn())",
+            "SELECT count(*) FILTER (WHERE CASE WHEN pg_toast.nosuchfn() THEN true ELSE false END)",
+            "SELECT count(*) FILTER (WHERE nosuchfn(x))",
+        ] {
+            let query = query(sql);
+            assert!(query.has_undefined_routine(), "{sql}");
+            assert!(!query.deferred_routine_only(), "{sql}");
+            assert!(!query.is_table_free(), "{sql}");
+        }
+        for sql in [
+            "SELECT count(*) FILTER (WHERE nextval('s')>0)",
+            "SELECT count(*) FILTER (WHERE CASE WHEN nextval('s')>0 THEN true ELSE false END)",
+            "SELECT CASE WHEN true THEN count(*) FILTER (WHERE nextval('s')>0) ELSE 0 END",
+        ] {
+            let query = query(sql);
+            assert_eq!(
+                query.sequence_dependencies(),
+                vec![Some("s".into())],
+                "{sql}"
+            );
+            assert!(!query.is_table_free(), "{sql}");
+            assert!(!query.deferred_routine_only(), "{sql}");
+        }
+    }
 
     #[test]
     fn deferred_routine_only_classification() {
