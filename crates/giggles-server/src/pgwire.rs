@@ -380,8 +380,10 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
         (DataType::Boolean, 0)
         | (DataType::SmallInt, 0..2)
         | (DataType::Integer, 0..4)
-        | (DataType::BigInt, 0..8) => Err("08P01"),
-        (DataType::Boolean, 1) if b[0] <= 1 => Ok(Value::Bool(b[0] != 0)),
+        | (DataType::BigInt, 0..8)
+        | (DataType::Real, 0..4)
+        | (DataType::DoublePrecision | DataType::Numeric, 0..8) => Err("08P01"),
+        (DataType::Boolean, 1) => Ok(Value::Bool(b[0] != 0)),
         (DataType::SmallInt, 2) => Ok(Value::Int(i16::from_be_bytes(b.try_into().unwrap()).into())),
         (DataType::Integer, 4) => Ok(Value::Int(i32::from_be_bytes(b.try_into().unwrap()).into())),
         (DataType::BigInt, 8) => Ok(Value::Int(i64::from_be_bytes(b.try_into().unwrap()))),
@@ -577,16 +579,27 @@ fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
 
 fn core_declared_type(oid: u32) -> Option<DataType> {
     match oid {
+        16 => Some(DataType::Boolean),
         17 => Some(DataType::Bytes),
         20 => Some(DataType::BigInt),
         21 => Some(DataType::SmallInt),
         23 => Some(DataType::Integer),
+        25 | 1043 => Some(DataType::Text),
+        1700 => Some(DataType::Numeric),
+        700 => Some(DataType::Real),
+        701 => Some(DataType::DoublePrecision),
+        1082 => Some(DataType::Date),
+        1083 => Some(DataType::Time),
+        1266 => Some(DataType::TimeTz),
+        1114 => Some(DataType::Timestamp),
+        1184 => Some(DataType::TimestampTz),
+        1186 => Some(DataType::Interval),
         _ => None,
     }
 }
 
 fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Plan, Description)> {
-    let mut declared = oids
+    let declared = oids
         .iter()
         .map(|&o| core_declared_type(o))
         .collect::<Vec<_>>();
@@ -594,38 +607,6 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
     let description = core(session.describe(&prepared))?;
     if oids.len() > description.parameters.len() {
         return Err("08P01");
-    }
-    let rejected_text = oids
-        .iter()
-        .zip(&description.parameters)
-        .enumerate()
-        .filter_map(|(i, (o, ty))| (*o == 25 && sql_declared_type(ty, *o).is_none()).then_some(i))
-        .collect::<Vec<_>>();
-    if session.role.is_sql() && !rejected_text.is_empty() {
-        for &i in &rejected_text {
-            declared[i] = Some(DataType::Text);
-        }
-        let was_aborted = session.is_aborted();
-        let retry =
-            core(session.prepare_with_parameter_types(sql, &declared)).and_then(|reprepared| {
-                core(session.describe(&reprepared)).map(|redescribed| (reprepared, redescribed))
-            });
-        match retry {
-            Ok((reprepared, redescribed))
-                if oids.len() <= redescribed.parameters.len()
-                    && rejected_text
-                        .iter()
-                        .all(|i| redescribed.parameters[*i] == DataType::Text)
-                    && oids
-                        .iter()
-                        .zip(&redescribed.parameters)
-                        .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
-            {
-                return Ok((Plan::Sql(Box::new(reprepared)), redescribed));
-            }
-            Err(error) if !was_aborted && session.is_aborted() => return Err(error),
-            _ => {}
-        }
     }
     Ok((Plan::Sql(Box::new(prepared)), description))
 }
@@ -1021,7 +1002,11 @@ impl State {
                         && mismatch
                         && oids
                             .iter()
-                            .all(|o| *o == 0 || catalog_wire::parameter_type(*o).is_ok())
+                            .all(|o| {
+                                *o == 0
+                                    || core_declared_type(*o).is_some()
+                                    || catalog_wire::parameter_type(*o).is_ok()
+                            })
                     {
                         let was_aborted = session.is_aborted();
                         match prepare_declared_sql(session, &sql, &oids) {

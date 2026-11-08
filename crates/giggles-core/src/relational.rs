@@ -373,12 +373,11 @@ fn infer_mutation_parameter(
     let Expr::Param(n) = value else { return Ok(()) };
     let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
     if let Some(Some(ty)) = declared.get(n - 1) {
-        let compatible = ty == target
-            || (integer_type(ty) && integer_type(target))
-            || (assignment && *target == DataType::Numeric && integer_type(ty))
-            || (assignment
-                && *target == DataType::Text
-                && (integer_type(ty) || *ty == DataType::Bytes));
+        let compatible = if assignment {
+            query::assignment::compatible(ty, target)
+        } else {
+            ty == target || (integer_type(ty) && integer_type(target))
+        };
         if !compatible {
             return Err(if assignment {
                 SqlError::Type
@@ -2687,7 +2686,13 @@ impl Relational {
                 return q
                     .bind(self, prepared.params, &prepared.parameter_types)?
                     .with_clock(clock)
-                    .execute(self, source, params, &mut cancel);
+                    .execute_declared(
+                        self,
+                        source,
+                        params,
+                        &mut cancel,
+                        &prepared.parameter_types,
+                    );
             }
             Statement::InsertExpressions(_) => return Err(SqlError::Unsupported),
             Statement::InsertMulti(insert) => {
@@ -2880,7 +2885,7 @@ impl Relational {
                         query::coerce(v.value(params)?, &t.columns[*i].data_type)?
                     } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
                     {
-                        assign::plain_value(v, &t.columns[*i], &prepared.parameter_types, params)?
+                        assign::plain_value(v, &t.columns[*i], &prepared.parameter_types, params, clock)?
                     } else {
                         v.value(params)?
                     };

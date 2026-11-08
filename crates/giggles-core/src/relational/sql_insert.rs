@@ -930,7 +930,7 @@ pub(super) fn execute_declared(
             if !replaced(*index, *default) {
                 row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
                 {
-                    assign::plain_value(expression, &table.columns[*index], declared, params)?
+                    assign::plain_value(expression, &table.columns[*index], declared, params, clock)?
                 } else {
                     resolved_value(expression, params, &table.columns[*index].data_type)?
                 };
@@ -987,7 +987,7 @@ pub(super) fn execute_declared(
                                 let mut column = table.columns[index].clone();
                                 column.not_null = false;
                                 operations::Expr::Value(operations::ValueExpr::Literal(
-                                    assign::plain_value(expression, &column, declared, params)?,
+                                    assign::plain_value(expression, &column, declared, params, clock)?,
                                 ))
                             } else {
                                 lower_operand(

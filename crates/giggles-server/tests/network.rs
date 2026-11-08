@@ -563,17 +563,25 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
             .get::<_, Option<String>>(0)
             .is_none()
     );
-    assert_eq!(
-        code(
-            c.prepare_typed(
+    {
+        // PG18.6: bigint = float8 via implicit cast (DD-0068 F13)
+        let statement = c
+            .prepare_typed(
                 "SELECT id FROM app WHERE id=$1",
-                &[tokio_postgres::types::Type::FLOAT8]
+                &[tokio_postgres::types::Type::FLOAT8],
             )
             .await
-            .unwrap_err()
-        ),
-        "0A000"
-    );
+            .unwrap();
+        assert_eq!(statement.params(), &[tokio_postgres::types::Type::FLOAT8]);
+        assert_eq!(
+            c.query_one(&statement, &[&2.0f64])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            2
+        );
+        assert!(c.query(&statement, &[&2.5f64]).await.unwrap().is_empty());
+    }
     for query in [
         "SET ROLE admin",
         "COPY app FROM STDIN",
@@ -1738,10 +1746,11 @@ async fn idle_postgres_connection_survives_frame_deadline_and_boolean_text_is_ca
             .is_err()
         );
     }
-    assert!(
-        giggles_server::pgwire::decode(&[2], &giggles_core::relational::DataType::Boolean, 1)
-            .is_err()
-    );
+    // PG18.6 boolrecv accepts any nonzero byte as true (DD-0068 F13).
+    assert!(matches!(
+        giggles_server::pgwire::decode(&[2], &giggles_core::relational::DataType::Boolean, 1),
+        Ok(Value::Bool(true))
+    ));
     drop(client);
     connection.await.unwrap();
     f.stop().await;

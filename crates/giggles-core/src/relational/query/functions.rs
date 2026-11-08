@@ -1,6 +1,7 @@
 //! Typed scalar projection binding. No SQL generation or catalog emulation.
 use super::*;
 mod arithmetic;
+pub(in crate::relational) mod assignment;
 mod binary;
 mod character;
 mod comparison;

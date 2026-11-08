@@ -2,6 +2,7 @@
 use super::*;
 use std::cmp::Ordering;
 mod functions;
+pub(super) use functions::assignment;
 mod grouping;
 mod insert_values;
 pub(super) use functions::comparison_requires_filter;
@@ -2335,12 +2336,23 @@ impl BoundQuery<'_> {
         }
         Ok(rows)
     }
+    #[cfg(test)]
     pub(super) fn execute(
         &self,
         state: &Relational,
         source: &dyn scan::RowSource,
         params: &[Value],
         cancel: &mut impl FnMut() -> bool,
+    ) -> R<SqlResult> {
+        self.execute_declared(state, source, params, cancel, &[])
+    }
+    pub(super) fn execute_declared(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        cancel: &mut impl FnMut() -> bool,
+        declared: &[Option<DataType>],
     ) -> R<SqlResult> {
         if self.aggregate && cancel() {
             return Err(SqlError::Aborted);
@@ -2360,11 +2372,21 @@ impl BoundQuery<'_> {
             return grouping.execute(self, state, source, params, cancel);
         }
         let limit = match &self.query.limit {
-            Some(e) => match e.value(params)? {
-                Value::Int(n) if n >= 0 => Some(n as u64),
-                Value::Null => None,
-                _ => return Err(SqlError::Limit),
-            },
+            Some(e) => {
+                let value = e.value(params)?;
+                let value = if matches!(e, Expr::Param(n)
+                    if declared.get(n - 1) == Some(&Some(DataType::Numeric)))
+                {
+                    assignment::convert(value, &DataType::Numeric, &DataType::BigInt, None)?
+                } else {
+                    value
+                };
+                match value {
+                    Value::Int(n) if n >= 0 => Some(n as u64),
+                    Value::Null => None,
+                    _ => return Err(SqlError::Limit),
+                }
+            }
             None => None,
         };
         if self.tables.is_empty() {

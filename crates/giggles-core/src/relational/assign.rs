@@ -71,7 +71,7 @@ pub(super) fn check_duplicate_literals(prepared: &Prepared, state: &Relational) 
         let mut column = table.columns[col(table, name)?].clone();
         column.not_null = false;
         if let Some(value @ Expr::Literal(_)) = value {
-            plain_value(value, &column, &prepared.parameter_types, &[])?;
+            plain_value(value, &column, &prepared.parameter_types, &[], None)?;
         }
     }
     Ok(())
@@ -110,6 +110,7 @@ pub(super) fn plain_value(
     column: &ColumnDef,
     declared_types: &[Option<DataType>],
     params: &[super::Value],
+    clock: Option<&clock::ExecutionClock>,
 ) -> R<super::Value> {
     let mut bound = value.value(params)?;
     if let Expr::Param(n) = value
@@ -124,29 +125,7 @@ pub(super) fn plain_value(
                 not_null: false,
             },
         )?;
-        if declared != &column.data_type {
-            match (&column.data_type, &bound) {
-                (DataType::SmallInt, super::Value::Int(n)) if i16::try_from(*n).is_err() => {
-                    return Err(SqlError::Overflow);
-                }
-                (DataType::Integer, super::Value::Int(n)) if i32::try_from(*n).is_err() => {
-                    return Err(SqlError::Overflow);
-                }
-                (DataType::Numeric, super::Value::Int(_)) => {
-                    bound = query::coerce(bound, &DataType::Numeric)?;
-                }
-                (DataType::Text, super::Value::Int(n)) => bound = super::Value::Text(n.to_string()),
-                (DataType::Text, super::Value::Bytes(bytes)) => {
-                    use std::fmt::Write;
-                    let mut text = String::from("\\x");
-                    for byte in bytes {
-                        write!(&mut text, "{byte:02x}").expect("writing into a String cannot fail");
-                    }
-                    bound = super::Value::Text(text);
-                }
-                _ => {}
-            }
-        }
+        bound = query::assignment::convert(bound, declared, &column.data_type, clock)?;
     }
     check(&bound, column)?;
     Ok(bound)
@@ -263,7 +242,7 @@ impl<'a> Plan<'a> {
                     }
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
-                    let value = plain_value(value, &column, &prepared.parameter_types, params)?;
+                    let value = plain_value(value, &column, &prepared.parameter_types, params, clock)?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
@@ -304,7 +283,7 @@ impl<'a> Plan<'a> {
                     Value::Plain(value) => {
                         let mut column = table.columns[index].clone();
                         column.not_null = false;
-                        let value = plain_value(value, &column, &prepared.parameter_types, params)?;
+                        let value = plain_value(value, &column, &prepared.parameter_types, params, clock)?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(

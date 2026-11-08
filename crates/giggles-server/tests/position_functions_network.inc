@@ -29,18 +29,6 @@ const POSITION_WIRE_DEVIATIONS: &[(u64, Option<&str>, &str, &str)] = &[
     ),
     // PG18.6: cases 71 and 72 return integer 2 on the implicit row (DD-0068 F11).
     (
-        76,
-        Some("0A000"),
-        "parse",
-        "A declared parameter type that conflicts with the inferred POSITION signature is rejected as unsupported before lookup. PG18: 42883.",
-    ),
-    (
-        77,
-        Some("0A000"),
-        "parse",
-        "A declared parameter type that conflicts with the inferred POSITION signature is rejected as unsupported before lookup. PG18: 42883.",
-    ),
-    (
         89,
         Some("42803"),
         "parse",
