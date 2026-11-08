@@ -53,6 +53,7 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         (first, error)
     };
     let mut actions = Vec::new();
+    let mut unsupported_type = false;
     loop {
         if p.at == p.tokens.len() || matches!(p.tokens.get(p.at), Some(Token::Symbol(';'))) {
             return Err(SqlError::Syntax);
@@ -92,91 +93,11 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 if !matches!(p.tokens.get(p.at), Some(Token::Word(_))) {
                     return Err(SqlError::Syntax);
                 }
-                let mut data_type = defaults::cast_type(p)?;
-                let mut semantic_error = None;
-                let mut typmod = if p.sym('(') {
-                    let first = integer(p)?;
-                    let value = if data_type == DataType::Numeric {
-                        let scale = if p.sym(',') { integer(p)? } else { 0 };
-                        match giggles_pg_types::typmod::NumericTypmod::new(first, scale) {
-                            Ok(value) => value.to_typmod(),
-                            Err(_) => {
-                                semantic_error = Some(SqlError::InvalidParameterValue);
-                                0
-                            }
-                        }
-                    } else {
-                        first
-                    };
-                    p.punct(')')?;
-                    Some(if data_type == DataType::Interval {
-                        (32767 << 16) | value
-                    } else {
-                        value
-                    })
-                } else {
-                    None
-                };
-                if matches!(data_type, DataType::Time | DataType::Timestamp) {
-                    let with = p.word("with");
-                    if with || p.word("without") {
-                        p.need("time")?;
-                        p.need("zone")?;
-                        if with {
-                            data_type = if data_type == DataType::Time {
-                                DataType::TimeTz
-                            } else {
-                                DataType::TimestampTz
-                            };
-                        }
-                    }
-                }
-                if data_type == DataType::Interval {
-                    let field = |p: &mut Parser| -> Option<i32> {
-                        for (word, mask) in [
-                            ("year", 4),
-                            ("month", 2),
-                            ("day", 8),
-                            ("hour", 1024),
-                            ("minute", 2048),
-                            ("second", 4096),
-                        ] {
-                            if p.word(word) {
-                                return Some(mask);
-                            }
-                        }
-                        None
-                    };
-                    if let Some(first) = field(p) {
-                        let mask = if p.word("to") {
-                            let last = field(p).ok_or(SqlError::Unsupported)?;
-                            match (first, last) {
-                                (4, 2) => 6,
-                                (8, 1024) => 1032,
-                                (8, 2048) => 3080,
-                                (8, 4096) => 7176,
-                                (1024, 2048) => 3072,
-                                (1024, 4096) => 7168,
-                                (2048, 4096) => 6144,
-                                _ => return Err(SqlError::InvalidParameterValue),
-                            }
-                        } else {
-                            first
-                        };
-                        if typmod.is_some() {
-                            return Err(SqlError::Unsupported);
-                        }
-                        let precision = if p.sym('(') {
-                            let value = integer(p)?;
-                            p.punct(')')?;
-                            value
-                        } else {
-                            65535
-                        };
-                        let value = (mask << 16) | precision;
-                        typmod = Some(value);
-                    }
-                }
+                let ddl_type::Parsed {
+                    data_type,
+                    typmod,
+                    semantic_error,
+                } = ddl_type::parse(p, ddl_type::Site::Alter)?;
                 let mut not_null = false;
                 let mut default = None;
                 loop {
@@ -231,12 +152,25 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         } else if p.word("alter") {
             p.word("column");
             let name = raw_name(p)?;
-            let set = if p.word("set") {
+            let set = p.word("set");
+            let type_change = if set && p.word("data") {
+                p.need("type")?;
+                true
+            } else {
+                !set && p.word("type")
+            };
+            if type_change {
+                ddl_type::parse(p, ddl_type::Site::Alter)?;
+                unsupported_type = true;
+                if p.sym(',') {
+                    continue;
+                }
+                break;
+            }
+            let set = if set {
                 true
             } else if p.word("drop") {
                 false
-            } else if p.word("type") {
-                return Err(SqlError::Unsupported);
             } else {
                 return Err(SqlError::Syntax);
             };
@@ -271,6 +205,9 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
     if p.at != p.tokens.len() {
         return Err(SqlError::Syntax);
     }
+    if unsupported_type {
+        return Err(SqlError::Unsupported);
+    }
     Ok(AlterTable {
         table,
         actions,
@@ -293,12 +230,6 @@ pub(super) fn raw_name(p: &mut Parser) -> R<String> {
             p.at += 1;
             Ok(value)
         }
-        _ => Err(SqlError::Syntax),
-    }
-}
-fn integer(p: &mut Parser) -> R<i32> {
-    match p.expr()? {
-        Expr::Literal(Value::Int(n)) => n.try_into().map_err(|_| SqlError::InvalidParameterValue),
         _ => Err(SqlError::Syntax),
     }
 }

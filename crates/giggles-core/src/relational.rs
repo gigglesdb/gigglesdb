@@ -10,6 +10,7 @@ mod assign;
 pub(crate) mod clock;
 mod constraint_lookup;
 mod constraint_primary_key;
+mod ddl_type;
 mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
@@ -987,41 +988,8 @@ impl Parser {
                     };
                     let data_type = if let Some(ty) = &serial {
                         ty.clone()
-                    } else if self.word("boolean") || self.word("bool") {
-                        DataType::Boolean
-                    } else if self.word("smallint") {
-                        DataType::SmallInt
-                    } else if self.word("integer") || self.word("int") {
-                        DataType::Integer
-                    } else if self.word("bigint") {
-                        DataType::BigInt
-                    } else if self.word("numeric") || self.word("decimal") {
-                        DataType::Numeric
-                    } else if self.word("real") || self.word("float4") {
-                        DataType::Real
-                    } else if self.word("double") {
-                        self.need("precision")?;
-                        DataType::DoublePrecision
-                    } else if self.word("float8") {
-                        DataType::DoublePrecision
-                    } else if self.word("date") {
-                        DataType::Date
-                    } else if self.word("time") {
-                        DataType::Time
-                    } else if self.word("timetz") {
-                        DataType::TimeTz
-                    } else if self.word("timestamp") {
-                        DataType::Timestamp
-                    } else if self.word("timestamptz") {
-                        DataType::TimestampTz
-                    } else if self.word("interval") {
-                        DataType::Interval
-                    } else if self.word("text") {
-                        DataType::Text
-                    } else if self.word("bytea") || self.word("bytes") {
-                        DataType::Bytes
                     } else {
-                        return Err(SqlError::Unsupported);
+                        ddl_type::parse(self, ddl_type::Site::Create)?.data_type
                     };
                     let mut not_null = serial.is_some();
                     let mut default = None;
