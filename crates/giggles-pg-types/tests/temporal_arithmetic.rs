@@ -130,8 +130,16 @@ fn interval_edge_components_and_infinite_factors() {
     for (value, factor, expected) in [
         (interval("1 month -40 days"), f64::INFINITY, "-infinity"),
         (interval("-1 month 40 days"), f64::NEG_INFINITY, "-infinity"),
-        (Interval::new(0, 1, -USECS_PER_DAY * 2), f64::INFINITY, "-infinity"),
-        (Interval::new(0, -1, USECS_PER_DAY * 2), f64::INFINITY, "infinity"),
+        (
+            Interval::new(0, 1, -USECS_PER_DAY * 2),
+            f64::INFINITY,
+            "-infinity",
+        ),
+        (
+            Interval::new(0, -1, USECS_PER_DAY * 2),
+            f64::INFINITY,
+            "infinity",
+        ),
     ] {
         check_interval(value.mul_f64(factor), expected);
     }
@@ -259,9 +267,11 @@ fn time_interval_arithmetic_pg18() {
     check_interval(Ok(time("24:00").diff(time("00:00"))), "24:00:00");
     for clock in ["00:00", "12:34:56.123456", "24:00"] {
         let value = time(clock);
-        assert!(value
-            .to_interval()
-            .same_components(Interval::new(0, 0, value.microseconds())));
+        assert!(
+            value
+                .to_interval()
+                .same_components(Interval::new(0, 0, value.microseconds()))
+        );
     }
 }
 
