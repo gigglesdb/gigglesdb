@@ -237,7 +237,7 @@
     {"id":"server_response_bytes","value":8388608,"unit":"aggregate server response bytes; also each portal parameter/result retention budget","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;"}},
     {"id":"server_io_timeout_seconds","value":10,"unit":"seconds per framed IO operation","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const IO_TIMEOUT: Duration = Duration::from_secs(10);"}},
     {"id":"server_deadline_ms","value":10000,"unit":"maximum native Deadline budget milliseconds","source":{"path":"crates/giggles-server/src/service.rs","needle":"budget_ms > 10_000"}},
-    {"id":"pg_startup_bytes","value":8192,"unit":"maximum pgwire startup bytes including length","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"!(8..=8192).contains(&n)"}},
+    {"id":"pg_startup_bytes","value":8192,"unit":"maximum pgwire startup bytes including length","source":{"path":"crates/giggles-server/src/pgwire_startup.rs","needle":"!(8..=8192).contains(&n)"}},
     {"id":"pg_objects","value":32,"unit":"prepared statements and separately portals per session","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_OBJECTS: usize = 32;"}},
     {"id":"pg_name_bytes","value":63,"unit":"prepared statement/portal name bytes","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"name.len() > 63"}},
     {"id":"prepared_task_bytes","value":4096,"unit":"finite prepared task statement bytes","source":{"path":"crates/giggles-server/src/task_statement.rs","needle":"4096"}},
