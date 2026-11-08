@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
 #[cfg(test)]
+#[path = "relational/catalog_image_tests.rs"]
+mod catalog_image_tests;
+#[cfg(test)]
 mod constraint_acceptance_tests;
 mod constraints;
 pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
@@ -398,6 +401,60 @@ impl Default for Relational {
             ext: CatalogExt::default(),
             secondary: secondary_index::Sidecar::default(),
         }
+    }
+}
+impl Relational {
+    /// Builds a rows-free v2 catalog image; row access must use RowSource/RowSink only.
+    #[allow(dead_code)] // Awaiting v2 catalog integration.
+    pub(crate) fn catalog_image(
+        tables: BTreeMap<String, TableDef>,
+        mut ext: CatalogExt,
+        next_id: u64,
+        next_version: u64,
+    ) -> R<Relational> {
+        Self::normalize_ext(&mut ext);
+        let image = Self {
+            rows: tables
+                .values()
+                .map(|table| (table.id, BTreeMap::new()))
+                .collect(),
+            tables,
+            ext,
+            next_id,
+            next_version,
+            ..Self::default()
+        };
+        image.validate()?;
+        // v2 does not enforce CHECK/FOREIGN KEY yet: fail closed on any catalog
+        // that carries them, so later DML can never run unenforced.
+        for constraint in image.ext.constraints.values().flatten() {
+            match constraint.kind {
+                ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. } => {
+                    return Err(SqlError::Unsupported);
+                }
+                ConstraintKind::PrimaryKey => {}
+            }
+        }
+        // v2 does not persist varchar/char columns yet (DD-0068 E1130): fail closed
+        // so later DML can never bypass E2's column coercion (padding, 22001).
+        if image
+            .tables
+            .values()
+            .flat_map(|table| &table.columns)
+            .any(|column| v2_varchar_char(&column.data_type))
+        {
+            return Err(SqlError::Unsupported);
+        }
+        Ok(image)
+    }
+    #[allow(dead_code)] // Awaiting v2 catalog integration.
+    pub(crate) fn catalog_parts(&self) -> (BTreeMap<String, TableDef>, CatalogExt, u64, u64) {
+        (
+            self.tables.clone(),
+            self.ext.clone(),
+            self.next_id,
+            self.next_version,
+        )
     }
 }
 fn allocate(n: &mut u64) -> R<u64> {
@@ -1288,6 +1345,37 @@ pub struct Prepared {
     params: usize,
     parameter_types: Vec<Option<DataType>>,
 }
+/// v2 refuses varchar/char columns (DD-0068 E1130). Exhaustive on purpose: a
+/// new DataType must be decided here.
+fn v2_varchar_char(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Varchar | DataType::Bpchar => true,
+        DataType::Boolean
+        | DataType::SmallInt
+        | DataType::Integer
+        | DataType::BigInt
+        | DataType::Text
+        | DataType::Bytes
+        | DataType::Numeric
+        | DataType::Real
+        | DataType::DoublePrecision
+        | DataType::Date
+        | DataType::Time
+        | DataType::TimeTz
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Interval => false,
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Awaiting v2 dispatch integration.
+pub(crate) enum V2Class {
+    Control(&'static str),
+    Ddl,
+    Dml,
+    Read,
+    Refused(&'static str),
+}
 #[derive(Debug, Clone)]
 pub struct Description {
     pub parameters: Vec<DataType>,
@@ -1340,6 +1428,94 @@ pub(crate) fn validate_create_definition(
     Ok(())
 }
 impl Prepared {
+    #[allow(dead_code)] // Awaiting v2 dispatch integration.
+    pub(crate) fn v2_class(&self) -> V2Class {
+        match &self.statement {
+            Statement::Begin => V2Class::Control("begin"),
+            Statement::Commit => V2Class::Control("commit"),
+            Statement::Rollback => V2Class::Control("rollback"),
+            Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
+            // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
+            Statement::InsertMulti(_)
+            | Statement::InsertExpressions(_)
+            | Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::UpdateExpressions { .. }
+            | Statement::Delete { .. } => V2Class::Dml,
+            Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
+            Statement::Create {
+                constraints,
+                columns,
+                ..
+            } => {
+                let (mut unique, mut unenforced) = (false, false);
+                for constraint in constraints {
+                    match constraint {
+                        constraints::Definition::Unique { .. } => unique = true,
+                        // v2 does not enforce CHECK/FK yet (same refusal as ALTER ADD).
+                        constraints::Definition::Check { .. }
+                        | constraints::Definition::ForeignKey { .. } => unenforced = true,
+                    }
+                }
+                if unique {
+                    V2Class::Refused("secondary indexes")
+                } else if unenforced {
+                    V2Class::Refused("SQL statement")
+                } else if columns
+                    .iter()
+                    .any(|column| v2_varchar_char(&column.data_type))
+                {
+                    // DD-0068 E1130: v2 does not persist varchar/char columns yet.
+                    V2Class::Refused("varchar/char types")
+                } else {
+                    V2Class::Ddl
+                }
+            }
+            Statement::CreateIndex(_) => V2Class::Refused("secondary indexes"),
+            Statement::AlterTable(alter) => {
+                let mut refusal = None;
+                for action in &alter.actions {
+                    match action {
+                        alter_table::Action::RenameColumn(..)
+                        | alter_table::Action::RenameTable(_)
+                        | alter_table::Action::Default(..)
+                        | alter_table::Action::NotNull(_, false) => (),
+                        alter_table::Action::Add(column, ..)
+                            if v2_varchar_char(&column.data_type) =>
+                        {
+                            return V2Class::Refused("varchar/char types");
+                        }
+                        alter_table::Action::Add(..)
+                        | alter_table::Action::Drop(..)
+                        | alter_table::Action::NotNull(_, true) => {
+                            refusal = Some("ALTER TABLE row rewrite")
+                        }
+                        alter_table::Action::Unique(..)
+                        | alter_table::Action::Constraint(constraints::Definition::Unique {
+                            ..
+                        }) => return V2Class::Refused("secondary indexes"),
+                        // These constraint operations need v2 enforcement/validation support.
+                        alter_table::Action::PrimaryKey(..)
+                        | alter_table::Action::Constraint(
+                            constraints::Definition::Check { .. }
+                            | constraints::Definition::ForeignKey { .. },
+                        )
+                        | alter_table::Action::Validate(_)
+                        | alter_table::Action::DropConstraint(..) => {
+                            refusal.get_or_insert("SQL statement");
+                        }
+                    }
+                }
+                refusal.map_or(V2Class::Ddl, V2Class::Refused)
+            }
+            // V2 has no deferred-constraint modes or savepoint stack yet.
+            Statement::SetConstraints(..)
+            | Statement::Savepoint(_)
+            | Statement::Release(_)
+            | Statement::RollbackTo(_) => V2Class::Refused("SQL statement"),
+        }
+    }
+
     /// DD-0068 F9 (GD-0001 Q8): table-free SELECT whose only non-table-free parts are deferred undefined / unknown-schema routine calls. Classification only; grants nothing by itself.
     pub fn deferred_routine_only(&self) -> bool {
         matches!(&self.statement, Statement::Query(query) if query.deferred_routine_only())
