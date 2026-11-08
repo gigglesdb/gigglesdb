@@ -1,4 +1,5 @@
 //! Searched mutations stage every postimage before publishing one batch.
+//! PostgreSQL uses physical heap order and GigglesDB key order for PK uniqueness; they agree for ascending key loads.
 use super::secondary_index_adapter::BatchRowChange;
 use super::*;
 

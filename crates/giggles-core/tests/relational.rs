@@ -107,7 +107,8 @@ fn crud_expected_rows_and_null_constraints() {
     );
     err(&mut s, "INSERT INTO things VALUES(9,1,NULL,NULL)", E::Type);
     err(&mut s, "UPDATE things SET active=NULL WHERE id=8", E::Null);
-    err(&mut s, "UPDATE things SET id=12 WHERE id=8", E::Unsupported);
+    assert_eq!(run(&mut s, "UPDATE things SET id=12 WHERE id=8").affected, 1);
+    assert_eq!(run(&mut s, "UPDATE things SET id=8 WHERE id=12").affected, 1);
     assert_eq!(
         run(
             &mut s,

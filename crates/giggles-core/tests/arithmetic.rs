@@ -528,7 +528,7 @@ fn sql_sum_and_scalar_predicates_preserve_primary_key_update_rejection() {
     let before = rows(&admin);
     assert_eq!(
         sql.execute("UPDATE numbers SET id=id+1 WHERE id=1", &[], None),
-        Err(CoreError::Sql(SqlError::Unsupported))
+        Err(CoreError::Sql(SqlError::Duplicate))
     );
     assert!(
         sql.execute("SELECT * FROM numbers WHERE n+1=2 LIMIT 1", &[], None)

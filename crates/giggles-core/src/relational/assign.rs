@@ -85,20 +85,11 @@ pub(super) fn indexes(
     if sets.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    let duplicate = duplicate_names(sets.iter().map(|(name, _)| name));
     sets.iter()
         .map(|(name, value)| {
             let index = col(table, name)?;
             if !matches!(value, Value::Default) {
                 defaults::check_explicit(state, &table.columns[index])?;
-            }
-            if !duplicate
-                && table.primary_key.contains(&index)
-                && !matches!(value, Value::Default)
-                && state.column_identity(table.columns[index].id).is_none()
-                && !state.constraint_key_update_allowed(table.id)
-            {
-                return Err(SqlError::Unsupported);
             }
             Ok(index)
         })
@@ -242,12 +233,6 @@ impl<'a> Plan<'a> {
                 .map(|(name, value)| {
                     let index = col(table, name)?;
                     defaults::check_explicit(state, &table.columns[index])?;
-                    if table.primary_key.contains(&index)
-                        && state.column_identity(table.columns[index].id).is_none()
-                        && !state.constraint_key_update_allowed(table.id)
-                    {
-                        return Err(SqlError::Unsupported);
-                    }
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
                     let value = plain_value(value, &column, &prepared.parameter_types, params, clock)?;

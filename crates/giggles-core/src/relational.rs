@@ -2366,11 +2366,6 @@ impl Value {
     }
 }
 impl Relational {
-    pub(super) fn constraint_key_update_allowed(&self, table_id: u64) -> bool {
-        self.ext.constraints.iter().any(|(child_id,constraints)| constraints.iter().any(|constraint| {
-            matches!(&constraint.kind,ConstraintKind::ForeignKey { ref_table, .. } if *child_id == table_id || *ref_table == table_id)
-        }))
-    }
     pub(crate) fn primary_key_constraint_name(&self, table: &TableDef) -> Option<String> {
         constraint_primary_key::primary_key_name(self, table)
     }

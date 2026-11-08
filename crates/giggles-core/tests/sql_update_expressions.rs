@@ -207,10 +207,11 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
             None,
         )
         .unwrap();
+        assert_eq!(run(s, "UPDATE items SET id=id+1 WHERE id=1").affected, 1);
+        assert_eq!(run(s, "UPDATE items SET id=1 WHERE id=2").affected, 1);
         let old = row(s);
         for (sql, expected) in [
             ("UPDATE items SET n='12' WHERE id=1", E::Type),
-            ("UPDATE items SET id=id+1 WHERE id=1", E::Unsupported),
             ("UPDATE items SET n=sum(n) WHERE id=1", E::GroupingError),
         ] {
             error(s, sql, expected);
@@ -227,14 +228,15 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
 #[test]
 fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
     database(|s| {
+        // SQL analysis precedes duplicate assignment validation.
+        assert_eq!(run(s, "UPDATE items SET id=2 WHERE id=1").affected, 1);
+        assert_eq!(run(s, "UPDATE items SET id=1 WHERE id=2").affected, 1);
         let old = row(s);
-        // Existing nonduplicate PK/type order remains; SQL analysis precedes duplicates.
         for (sql, expected) in [
-            ("UPDATE items SET id=2 WHERE id=1", E::Unsupported),
             // PG18.6 rejects repeated SET targets with 42601.
             ("UPDATE items SET n=1,n=2 WHERE id=1", E::Syntax),
             ("UPDATE items SET n='x' WHERE id=1", E::Type),
-            ("UPDATE items SET id='x',n='x' WHERE id=1", E::Unsupported),
+            ("UPDATE items SET id='x',n='x' WHERE id=1", E::Type),
             ("UPDATE items SET n='x',id=2 WHERE id=1", E::Type),
             ("UPDATE items SET n=1,n=2,m='x' WHERE id=1", E::Type),
             ("UPDATE items SET m='x',n=1,n=2 WHERE id=1", E::Type),
@@ -246,7 +248,7 @@ fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
         }
         for (sql, expected) in [
             ("UPDATE items SET n=$1 WHERE id=1", E::Type),
-            ("UPDATE items SET id=2,n=$1 WHERE id=1", E::Unsupported),
+            ("UPDATE items SET id=2,n=$1 WHERE id=1", E::Type),
             ("UPDATE items SET n=$1,id=2 WHERE id=1", E::Type),
             // PG18.6 rejects duplicate targets before binding parameter values.
             ("UPDATE items SET n=1,n=2,m=$1 WHERE id=1", E::Syntax),
@@ -281,8 +283,7 @@ fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
 
 #[test]
 fn searched_primary_key_moves_check_uniqueness_in_order_and_return_new_keys() {
-    // Primary-key moves are reachable for identity keys (and SET id = DEFAULT); plain
-    // primary-key assignment is still Unsupported (see the contract test above).
+    // Identity primary-key moves retain their existing assignment compatibility.
     database(|s| {
         run(
             s,

@@ -112,11 +112,35 @@ fn errors_and_noops_leave_rows_counters_and_sidecar_exact() {
         0
     );
     assert_eq!(s, before);
+    // PG18.6 (e1-sql/evidence/oracle-pg186-pk-update-expectations.txt): this fixture holds only
+    // id 1, so the move gives UPDATE 1, and so does moving it back.
     assert_eq!(
-        sql(&mut s, "UPDATE items SET id=2 WHERE id=1", &[]),
-        Err(SqlError::Unsupported)
+        sql(&mut s, "UPDATE items SET id=2 WHERE id=1", &[])
+            .unwrap()
+            .affected,
+        1
     );
-    assert_eq!(s, before);
+    // The by_tag entry now points at the new key.
+    assert_ne!(s.secondary, before.secondary);
+    assert_eq!(
+        sql(&mut s, "UPDATE items SET id=1 WHERE id=2", &[])
+            .unwrap()
+            .affected,
+        1
+    );
+    // Only row versions may differ after the restore. Every column of every row, and every
+    // secondary index descriptor and entry, must equal the pre-move state.
+    let contents = |r: &Relational| {
+        r.rows
+            .iter()
+            .map(|(table, rows)| {
+                let rows = rows.iter().map(|(key, row)| (key.clone(), row.values.clone()));
+                (*table, rows.collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(contents(&s), contents(&before));
+    assert_eq!(s.secondary, before.secondary);
 }
 #[test]
 fn helper_update_size_and_version_failure_roll_back_without_outer_transaction() {
