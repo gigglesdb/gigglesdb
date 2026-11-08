@@ -22,6 +22,7 @@ fn table() -> TableEntry {
             primary_key: vec![0],
         },
         heap: false,
+        columns_ext: BTreeMap::new(),
     }
 }
 fn sequence() -> SequenceDef {
@@ -69,8 +70,12 @@ fn frozen_table_goldens() {
         },
     );
     assert_eq!(encode_table(&entry, &ext).unwrap(), hex(EXT));
-    assert_eq!(decode_table(&hex(EXT)).unwrap(), (entry, ext));
-    assert_corrupt(super::super::catalog::decode_entry(&hex(EXT)));
+    entry.columns_ext = ext.clone();
+    assert_eq!(decode_table(&hex(EXT)).unwrap(), (entry.clone(), ext));
+    assert_eq!(
+        super::super::catalog::decode_entry(&hex(EXT)).unwrap(),
+        entry
+    );
     for version in [0, 1, 3, 255] {
         let mut bad = hex(TABLE);
         bad[0] = version;
@@ -175,7 +180,10 @@ fn frozen_constraints() {
                 deferral: live,
             },
         };
-        assert_eq!(decode_constraint(&hex(golden), &table().def).unwrap(), expected);
+        assert_eq!(
+            decode_constraint(&hex(golden), &table().def).unwrap(),
+            expected
+        );
         assert_eq!(encode_constraint(&expected, "t").unwrap(), hex(golden));
     }
     let missing = ConstraintDto {

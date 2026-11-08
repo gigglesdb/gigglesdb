@@ -292,6 +292,7 @@ fn table() -> TableEntry {
             primary_key: vec![0],
         },
         heap: false,
+        columns_ext: Default::default(),
     }
 }
 fn stage_pair(env: &Env, txn: &mut Transaction) {

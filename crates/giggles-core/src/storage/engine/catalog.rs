@@ -1,5 +1,6 @@
 //! Transactional table metadata and snapshot-versioned catalog views.
 use super::{
+    catalog_codec::{self, CatalogKind},
     commit::Sequencer,
     hlc::Ts,
     kv::{Direction, Keyspace, Kv, KvError},
@@ -10,12 +11,15 @@ use super::{
 };
 use crate::{
     CoreError,
-    relational::{self, ColumnDef, SqlError, TableDef},
+    relational::{
+        self, ColumnDef, SqlError, TableDef,
+        catalog_ext::{CatalogExt, ColumnExt, Constraint, SequenceDef, TypeDef},
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Bound,
+    ops::{Bound, Range},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -26,6 +30,7 @@ pub(crate) const MAX_TABLES: usize = 100_000;
 pub(crate) struct TableEntry {
     pub def: TableDef,
     pub heap: bool,
+    pub columns_ext: BTreeMap<u64, ColumnExt>,
 }
 
 #[derive(Debug)]
@@ -53,6 +58,42 @@ impl From<SqlError> for CatalogError {
 pub(crate) struct CatalogView {
     pub(crate) by_name: BTreeMap<String, Arc<TableEntry>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
+    pub(crate) names: BTreeMap<String, u64>,
+    pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
+    pub(crate) sequences: BTreeMap<u64, SequenceDef>,
+    pub(crate) types: BTreeMap<u64, TypeDef>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CatalogParts {
+    pub(crate) tables: BTreeMap<String, TableDef>,
+    pub(crate) heap: BTreeSet<u64>,
+    pub(crate) ext: CatalogExt,
+}
+impl CatalogView {
+    pub(crate) fn parts(&self) -> CatalogParts {
+        let mut parts = CatalogParts::default();
+        for entry in self.by_id.values() {
+            parts
+                .tables
+                .insert(entry.def.name.clone(), entry.def.clone());
+            if entry.heap {
+                parts.heap.insert(entry.def.id);
+            }
+            parts.ext.columns.extend(entry.columns_ext.clone());
+        }
+        parts.ext.constraints = self
+            .constraints
+            .iter()
+            .map(|(id, cs)| (*id, cs.values().cloned().collect()))
+            .collect();
+        parts.ext.sequences = self.sequences.clone();
+        parts.ext.types = self.types.clone();
+        if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
+            parts.ext.ext_version = 2;
+        }
+        parts
+    }
 }
 
 pub(crate) struct CatalogCache {
@@ -135,6 +176,158 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn reserve_ids(&self, n: u64) -> Result<Range<u64>, CoreError> {
+        self.seq.reserve_range(0, 0, n)
+    }
+
+    pub(crate) fn parts(&self, txn: &mut Transaction) -> Result<CatalogParts, CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        let view = match cache.view_at(txn.snapshot_ts()) {
+            Some(view) => view,
+            None => Arc::new(load_view(self.sequencer.kv(), txn.snapshot_ts())?),
+        };
+        Ok(overlay_view(&view, txn.catalog_writes())?.parts())
+    }
+
+    pub(crate) fn apply_diff(
+        &self,
+        txn: &mut Transaction,
+        old: &CatalogParts,
+        new: &CatalogParts,
+        ids: &Range<u64>,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let old_records = parts_records(old)?;
+        let new_records = parts_records(new)?;
+        let old_ids = object_ids(old)?;
+        let new_ids = object_ids(new)?;
+        for (id, kind) in &new_ids {
+            match old_ids.get(id) {
+                Some(old_kind) if old_kind != kind => {
+                    return Err(corrupt("catalog object id changed kind or owner"));
+                }
+                None if !ids.contains(id) => {
+                    return Err(corrupt("catalog object id outside reservation"));
+                }
+                _ => {}
+            }
+        }
+        for (name, table) in &new.tables {
+            if let Some(previous) = old.tables.get(name) {
+                if previous.id != table.id {
+                    return Err(corrupt("existing table id changed"));
+                }
+                for column in &table.columns {
+                    if previous
+                        .columns
+                        .iter()
+                        .any(|c| c.name == column.name && c.id != column.id)
+                    {
+                        return Err(corrupt("existing column id changed"));
+                    }
+                }
+            }
+        }
+        if old_records == new_records {
+            return Ok(());
+        }
+        self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
+        if !new.ext.is_empty() {
+            txn.require_features(1 << 6);
+        }
+        if new.ext.columns.values().any(|c| c.typmod.is_some()) {
+            txn.require_features(1 << 7);
+        }
+        for (id, def) in &old.ext.sequences {
+            if !new.ext.sequences.contains_key(id) {
+                txn.delete_counter(catalog_codec::counter_key(*id, def.incarnation))
+                    .map_err(CoreError::from)?;
+            }
+        }
+        // TODO: reclaim dropped table rows with a snapshot-safe GC sweep.
+        Ok(())
+    }
+
+    fn lock_and_write(
+        &self,
+        txn: &mut Transaction,
+        old_records: &BTreeMap<Vec<u8>, Vec<u8>>,
+        new_records: &BTreeMap<Vec<u8>, Vec<u8>>,
+        deadline: Option<Instant>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        let changes: BTreeMap<_, _> = old_records
+            .keys()
+            .chain(new_records.keys())
+            .filter_map(|key| {
+                if old_records.get(key) == new_records.get(key) {
+                    None
+                } else {
+                    Some((key.clone(), new_records.get(key).cloned()))
+                }
+            })
+            .collect();
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut tables = BTreeSet::new();
+        for key in changes.keys() {
+            match key[0] {
+                1 | 4 => {
+                    tables.insert(decode_id(&key[1..9]).map_err(commit_error)?);
+                }
+                3 => {
+                    let name = std::str::from_utf8(&key[1..key.len() - 1])
+                        .map_err(|_| commit_error(corrupt("invalid catalog name")))?;
+                    self.lock_name(txn, name, deadline, cancel)?;
+                }
+                _ => {}
+            }
+        }
+        for id in tables {
+            txn.acquire_lock(
+                LockKey::Table(id),
+                LockMode::AccessExclusive,
+                deadline,
+                cancel,
+            )?;
+        }
+        self.check()?;
+        // The caller's snapshot may predate a competing DDL commit. Validate
+        // after all locks, before buffering any part of this change.
+        for key in changes.keys() {
+            let current = match txn.catalog_own(key) {
+                Some(value) => value.clone(),
+                None => txn.catalog_latest_committed(key)?,
+            };
+            if current.as_ref() != old_records.get(key) {
+                return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+            }
+        }
+        for (key, value) in changes {
+            self.write_record(txn, key, value)?;
+        }
+        Ok(())
+    }
+
+    fn write_record(
+        &self,
+        txn: &mut Transaction,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), TxnError> {
+        match value {
+            Some(value) => txn.put(Keyspace::Catalog, key, value),
+            None => txn.delete(Keyspace::Catalog, key),
+        }
+    }
+
     pub(crate) fn create_table(
         &self,
         txn: &mut Transaction,
@@ -159,17 +352,19 @@ impl Catalog {
         for column in &mut def.columns {
             column.id = self.seq.next(0, 0)?;
         }
-        let entry = Arc::new(TableEntry { def, heap });
-        txn.put(
-            Keyspace::Catalog,
-            table_key(entry.def.id),
-            encode_entry(&entry)?,
-        )?;
-        txn.put(
-            Keyspace::Catalog,
-            name_key(&entry.def.name),
-            entry.def.id.to_be_bytes().to_vec(),
-        )?;
+        let entry = Arc::new(TableEntry {
+            def,
+            heap,
+            columns_ext: BTreeMap::new(),
+        });
+        let records = BTreeMap::from([
+            (table_key(entry.def.id), encode_entry(&entry)?),
+            (
+                name_key(&entry.def.name),
+                entry.def.id.to_be_bytes().to_vec(),
+            ),
+        ]);
+        self.lock_and_write(txn, &BTreeMap::new(), &records, deadline, cancel)?;
         Ok(entry)
     }
 
@@ -258,9 +453,20 @@ impl Catalog {
         validate_identifier(name)?;
         self.lock_name(txn, name, deadline, cancel)?;
         let entry = self.resolve(txn, name, LockMode::AccessExclusive, deadline, cancel)?;
-        txn.delete(Keyspace::Catalog, table_key(entry.def.id))?;
-        txn.delete(Keyspace::Catalog, name_key(name))?;
-        // Physical rows remain until snapshot-safe GC can reclaim them.
+        let old = self.parts(txn)?;
+        let mut new = old.clone();
+        new.tables.remove(name);
+        new.heap.remove(&entry.def.id);
+        for column in &entry.def.columns {
+            new.ext.columns.remove(&column.id);
+        }
+        new.ext.constraints.remove(&entry.def.id);
+        new.ext.sequences.retain(|_, sequence| {
+            sequence
+                .owned_by
+                .is_none_or(|(table, _)| table != entry.def.id)
+        });
+        self.apply_diff(txn, &old, &new, &(0..0), deadline, cancel)?;
         Ok(())
     }
 
@@ -374,23 +580,14 @@ pub(crate) fn name_key(name: &str) -> Vec<u8> {
     key
 }
 pub(crate) fn encode_entry(entry: &TableEntry) -> Result<Vec<u8>, CoreError> {
-    super::catalog_codec::encode_table(entry, &BTreeMap::new())
+    super::catalog_codec::encode_table(entry, &entry.columns_ext)
 }
 pub(crate) fn decode_entry(value: &[u8]) -> Result<TableEntry, CoreError> {
-    let (entry, columns_ext) = super::catalog_codec::decode_table(value)?;
-    if !columns_ext.is_empty() {
-        return Err(corrupt("catalog wrapper cannot represent column extensions"));
-    }
-    validate_definition(&entry.def).map_err(|_| corrupt("invalid catalog table definition"))?;
-    if entry.def.id == 0 || entry.def.columns.iter().any(|column| column.id == 0) {
-        return Err(corrupt("zero catalog object id"));
-    }
-    let ids: BTreeSet<_> = entry.def.columns.iter().map(|column| column.id).collect();
-    if ids.len() != entry.def.columns.len() {
-        return Err(corrupt("duplicate catalog column id"));
-    }
+    let (mut entry, columns_ext) = super::catalog_codec::decode_table(value)?;
+    entry.columns_ext = columns_ext;
     Ok(entry)
 }
+
 fn decode_id(value: &[u8]) -> Result<u64, CoreError> {
     let bytes = value
         .try_into()
@@ -424,11 +621,7 @@ fn overlay_view<'a>(
     records: impl Iterator<Item = (&'a Vec<u8>, &'a Option<Vec<u8>>)>,
 ) -> Result<CatalogView, CoreError> {
     let mut view = base.clone();
-    let mut names: BTreeMap<String, u64> = base
-        .by_name
-        .iter()
-        .map(|(name, entry)| (name.clone(), entry.def.id))
-        .collect();
+    let mut names = base.names.clone();
     // Remove first, so a full catalog can drop and create within one DDL txn
     // without exceeding the bound transiently due to key ordering.
     let records: Vec<_> = records.collect();
@@ -446,8 +639,8 @@ fn apply_record(
     key: &[u8],
     value: Option<&[u8]>,
 ) -> Result<(), CoreError> {
-    match key.first() {
-        Some(1) if key.len() == 9 => {
+    match catalog_codec::classify_catalog_key(key)? {
+        CatalogKind::Table => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
                 let entry = decode_entry(value)?;
@@ -462,20 +655,55 @@ fn apply_record(
                 view.by_id.remove(&id);
             }
         }
-        Some(3) if key.len() >= 3 && key.last() == Some(&0) => {
+        CatalogKind::Name => {
             let name = std::str::from_utf8(&key[1..key.len() - 1])
                 .map_err(|_| corrupt("invalid catalog name UTF-8"))?;
-            validate_identifier(name).map_err(|_| corrupt("invalid catalog name key"))?;
             if let Some(value) = value {
                 names.insert(name.to_owned(), decode_id(value)?);
             } else {
                 names.remove(name);
             }
-            if names.len() > MAX_TABLES {
-                return Err(CoreError::Limit);
+        }
+        CatalogKind::Constraint => {
+            let table = decode_id(&key[1..9])?;
+            let id = decode_id(&key[9..])?;
+            if let Some(value) = value {
+                let def = &view
+                    .by_id
+                    .get(&table)
+                    .ok_or_else(|| corrupt("constraint table absent"))?
+                    .def;
+                let constraint = catalog_codec::decode_constraint(value, def)?;
+                if constraint.id != id {
+                    return Err(corrupt("constraint key/id mismatch"));
+                }
+                view.constraints
+                    .entry(table)
+                    .or_default()
+                    .insert(id, constraint);
+            } else if let Some(cs) = view.constraints.get_mut(&table) {
+                cs.remove(&id);
+            }
+            view.constraints.retain(|_, cs| !cs.is_empty());
+        }
+        CatalogKind::Sequence => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.sequences
+                    .insert(id, catalog_codec::decode_sequence(value)?);
+            } else {
+                view.sequences.remove(&id);
             }
         }
-        _ => return Err(corrupt("invalid catalog user key")),
+        CatalogKind::Type => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.types.insert(id, catalog_codec::decode_type(value)?);
+            } else {
+                view.types.remove(&id);
+            }
+        }
+        CatalogKind::RoleBootstrap => {}
     }
     Ok(())
 }
@@ -484,20 +712,125 @@ fn finish_view(
     names: BTreeMap<String, u64>,
 ) -> Result<CatalogView, CoreError> {
     view.by_name.clear();
-    for (name, id) in names {
-        let entry = view
-            .by_id
-            .get(&id)
-            .ok_or_else(|| corrupt("catalog name references absent table"))?;
-        if entry.def.name != name || view.by_name.insert(name, entry.clone()).is_some() {
-            return Err(corrupt("catalog name/table mismatch"));
+    let mut expected = BTreeMap::new();
+    for entry in view.by_id.values() {
+        if expected
+            .insert(entry.def.name.clone(), entry.def.id)
+            .is_some()
+        {
+            return Err(corrupt("duplicate catalog relation name"));
+        }
+        view.by_name.insert(entry.def.name.clone(), entry.clone());
+    }
+    for (id, seq) in &view.sequences {
+        if expected.insert(seq.name.clone(), *id).is_some() {
+            return Err(corrupt("duplicate catalog relation name"));
         }
     }
-    if view.by_name.len() != view.by_id.len() {
-        return Err(corrupt("catalog table missing name"));
+    if expected != names {
+        return Err(corrupt("catalog relation/name mismatch"));
     }
+    if view
+        .constraints
+        .keys()
+        .any(|id| !view.by_id.contains_key(id))
+    {
+        return Err(corrupt("constraint table absent"));
+    }
+    view.names = names;
     Ok(view)
 }
+fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreError> {
+    let mut result = BTreeMap::new();
+    let mut insert = |id, kind| {
+        if id == 0 || result.insert(id, kind).is_some() {
+            Err(corrupt("duplicate or zero catalog object id"))
+        } else {
+            Ok(())
+        }
+    };
+    for table in parts.tables.values() {
+        insert(table.id, (1, 0))?;
+        for column in &table.columns {
+            insert(column.id, (2, table.id))?;
+        }
+    }
+    for (table, cs) in &parts.ext.constraints {
+        for c in cs {
+            insert(c.id, (4, *table))?;
+        }
+    }
+    for id in parts.ext.sequences.keys() {
+        insert(*id, (5, 0))?;
+    }
+    for id in parts.ext.types.keys() {
+        insert(*id, (6, 0))?;
+    }
+    Ok(result)
+}
+fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    object_ids(parts)?;
+    let mut records = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    let mut columns = BTreeSet::new();
+    let mut table_ids = BTreeSet::new();
+    for (name, def) in &parts.tables {
+        if name != &def.name || !names.insert(name.clone()) {
+            return Err(corrupt("catalog table name mismatch"));
+        }
+        table_ids.insert(def.id);
+        let ext = def
+            .columns
+            .iter()
+            .filter_map(|c| {
+                columns.insert(c.id);
+                parts.ext.columns.get(&c.id).map(|v| (c.id, v.clone()))
+            })
+            .collect();
+        let entry = TableEntry {
+            def: def.clone(),
+            heap: parts.heap.contains(&def.id),
+            columns_ext: ext,
+        };
+        let value = encode_entry(&entry)?;
+        decode_entry(&value)?;
+        records.insert(table_key(def.id), value);
+        records.insert(name_key(name), def.id.to_be_bytes().to_vec());
+    }
+    if parts.heap.iter().any(|id| !table_ids.contains(id))
+        || parts.ext.columns.keys().any(|id| !columns.contains(id))
+    {
+        return Err(corrupt("catalog extension owner absent"));
+    }
+    for (table, cs) in &parts.ext.constraints {
+        let def = parts
+            .tables
+            .values()
+            .find(|d| d.id == *table)
+            .ok_or_else(|| corrupt("constraint table absent"))?;
+        for c in cs {
+            let value = catalog_codec::encode_constraint(c, &def.name)?;
+            catalog_codec::decode_constraint(&value, def)?;
+            records.insert(catalog_codec::constraint_key(*table, c.id), value);
+        }
+    }
+    for (id, def) in &parts.ext.sequences {
+        if !names.insert(def.name.clone()) {
+            return Err(corrupt("duplicate catalog relation name"));
+        }
+        let value = catalog_codec::encode_sequence(def)?;
+        catalog_codec::decode_sequence(&value)?;
+        records.insert(catalog_codec::sequence_key(*id), value);
+        records.insert(name_key(&def.name), id.to_be_bytes().to_vec());
+    }
+    // TypeDef is uninhabited until E1/E2 add user types; this match stops
+    // compiling when they do, forcing the kind-6 writer to be added here.
+    if let Some(def) = parts.ext.types.values().next() {
+        match *def {}
+    }
+    Ok(records)
+}
+
 fn validate_definition(def: &TableDef) -> Result<(), SqlError> {
     validate_identifier(&def.name)?;
     if def.columns.is_empty() || def.columns.len() > relational::MAX_COLUMNS {
@@ -574,3 +907,7 @@ fn commit_error(error: CoreError) -> TxnError {
 #[cfg(test)]
 #[path = "catalog_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "catalog_diff_tests.rs"]
+mod diff_tests;

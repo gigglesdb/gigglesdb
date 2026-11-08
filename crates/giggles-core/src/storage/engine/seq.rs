@@ -62,6 +62,30 @@ impl SequenceAllocator {
         Ok(value)
     }
 
+    /// Reserves `n` contiguous values beyond all cached reservations. Unused
+    /// cached values are abandoned so later calls also advance past the range.
+    /// Zero length and exclusive-highwater overflow leave the sequence unchanged.
+    pub(crate) fn reserve_range(
+        &self,
+        kind: u8,
+        id: u64,
+        n: u64,
+    ) -> Result<std::ops::Range<u64>, crate::CoreError> {
+        if n == 0 {
+            return Err(TxnError::Misuse.into());
+        }
+        let key = sequence_key(kind, id);
+        let slot = self.slot(key)?;
+        let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
+        self.check_live()?;
+        let start = self.highwater(&key)?;
+        let end = start.checked_add(n).ok_or(TxnError::Misuse)?;
+        self.persist_highwater(key, end)?;
+        block.cur = 0;
+        block.end = 0;
+        Ok(start..end)
+    }
+
     /// Makes every subsequent allocation at least `floor`, without rewinding.
     /// Any cached block containing values below the floor is discarded. Raising
     /// the persisted highwater uses Sync before the cached state is changed.
@@ -127,4 +151,74 @@ fn sequence_key(kind: u8, id: u64) -> SequenceKey {
     key[0] = kind;
     key[1..].copy_from_slice(&id.to_be_bytes());
     key
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::storage::engine::kv_mem::MemKv;
+    use std::{collections::BTreeSet, sync::Barrier, thread};
+
+    #[test]
+    fn concurrent_next_and_ranges_never_overlap_and_survive_reopen() {
+        let mem = Arc::new(MemKv::new());
+        let kv = Arc::new(Kv::new(mem.clone()));
+        let seq = Arc::new(SequenceAllocator::new(kv.clone(), 7));
+        assert_eq!(seq.next(1, 42).unwrap(), 1);
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let seq = seq.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut values = Vec::new();
+                    for iteration in 0..100 {
+                        if (worker + iteration) % 2 == 0 {
+                            values.extend(seq.reserve_range(1, 42, 3).unwrap());
+                        } else {
+                            values.push(seq.next(1, 42).unwrap());
+                        }
+                    }
+                    values
+                })
+            })
+            .collect();
+        let mut seen = BTreeSet::from([1]);
+        for worker in workers {
+            for value in worker.join().unwrap() {
+                assert!(seen.insert(value), "duplicate sequence value {value}");
+            }
+        }
+        assert_eq!(seen.len(), 1601);
+        let reopened = SequenceAllocator::new(Arc::new(Kv::new(Arc::new(mem.crash()))), 7);
+        assert!(reopened.next(1, 42).unwrap() > *seen.last().unwrap());
+    }
+
+    #[test]
+    fn range_highwater_is_synced_before_return_and_survives_crash() {
+        let mem = Arc::new(MemKv::new());
+        let seq = SequenceAllocator::new(Arc::new(Kv::new(mem.clone())), 7);
+        assert_eq!(seq.next(0, 0).unwrap(), 1);
+        let reserved = seq.reserve_range(0, 0, 11).unwrap();
+        assert_eq!(reserved, 8..19);
+        // No later write or flush may make a NoSync reservation durable.
+        let crashed = Arc::new(Kv::new(Arc::new(mem.crash())));
+        assert_eq!(
+            crashed.get(Keyspace::Seq, &sequence_key(0, 0)).unwrap(),
+            Some(19_u64.to_be_bytes().to_vec())
+        );
+        let reopened = SequenceAllocator::new(crashed, 7);
+        assert_eq!(reopened.next(0, 0).unwrap(), reserved.end);
+        assert!(seq.next(0, 0).unwrap() >= reserved.end);
+    }
+
+    #[test]
+    fn invalid_range_preserves_cached_values() {
+        let seq = SequenceAllocator::new(Arc::new(Kv::new(Arc::new(MemKv::new()))), 7);
+        assert_eq!(seq.next(0, 0).unwrap(), 1);
+        assert!(seq.reserve_range(0, 0, 0).is_err());
+        assert!(seq.reserve_range(0, 0, u64::MAX).is_err());
+        assert_eq!(seq.next(0, 0).unwrap(), 2);
+    }
 }

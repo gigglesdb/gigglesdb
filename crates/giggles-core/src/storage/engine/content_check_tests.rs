@@ -40,6 +40,7 @@ fn table(ext: bool, typmod: bool) -> Vec<u8> {
             primary_key: vec![0],
         },
         heap: false,
+        columns_ext: Default::default(),
     };
     let mut extensions = BTreeMap::new();
     if ext {

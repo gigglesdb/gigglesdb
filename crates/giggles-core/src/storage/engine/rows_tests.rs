@@ -93,6 +93,7 @@ fn table(id: u64) -> TableEntry {
             primary_key: vec![0],
         },
         heap: false,
+        columns_ext: Default::default(),
     }
 }
 fn pk(n: i64) -> Vec<Value> {

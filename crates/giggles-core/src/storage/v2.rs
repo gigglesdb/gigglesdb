@@ -2,15 +2,18 @@
 #[cfg(feature = "engine-rocksdb")]
 use super::io;
 use super::{CoreError, engine};
-#[cfg(feature = "engine-rocksdb")]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::Path};
 
-// F8 reads kv/meta; until then only open/create and tests touch them.
 #[allow(dead_code)]
 pub(crate) struct V2Db {
-    pub(crate) kv: engine::kv::Kv,
+    pub(crate) kv: Arc<engine::kv::Kv>,
     pub(crate) meta: engine::meta::MetaInfo,
+    sequencer: Arc<engine::commit::Sequencer>,
+    locks: Arc<engine::locks::LockManager>,
+    catalog: engine::catalog::Catalog,
+    next_txn: AtomicU64,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
     match error {
@@ -49,10 +52,52 @@ impl V2Db {
             )?))
         })
         .map_err(format_error)?;
-        let kv = engine::kv::Kv::new(backend);
-        let meta = engine::meta::validate_meta(&kv).map_err(format_error)?;
-        Ok(Self { kv, meta })
+        Self::from_kv(Arc::new(engine::kv::Kv::new(backend)))
     }
+    #[cfg(feature = "engine-rocksdb")]
+    fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
+        let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
+        let sequencer = engine::commit::Sequencer::open(
+            kv.clone(),
+            Arc::new(engine::commit::SystemClock),
+            engine::commit::SequencerConfig::default(),
+        )?;
+        let locks = Arc::new(engine::locks::LockManager::new(
+            engine::locks::LockConfig::default(),
+        ));
+        let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
+        let catalog = engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences)?;
+        Ok(Self {
+            kv,
+            meta,
+            sequencer,
+            locks,
+            catalog,
+            next_txn: AtomicU64::new(1),
+        })
+    }
+
+    // F8a-3b routes v2 SQL sessions through this.
+    #[allow(dead_code)]
+    pub(crate) fn begin(&self, isolation: engine::txn::Isolation) -> engine::txn::Transaction {
+        let id = self
+            .next_txn
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("transaction ID space exhausted");
+        engine::txn::Transaction::begin(
+            &self.sequencer,
+            &self.locks,
+            engine::locks::TxnId(id),
+            isolation,
+        )
+    }
+
+    // F8a-3b routes v2 SQL sessions through this.
+    #[allow(dead_code)]
+    pub(crate) fn catalog(&self) -> &engine::catalog::Catalog {
+        &self.catalog
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self, CoreError> {
         if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
             return Err(CoreError::Corrupt("not a v2 directory".into()));
@@ -66,12 +111,10 @@ impl V2Db {
         }
         #[cfg(feature = "engine-rocksdb")]
         {
-            let kv = engine::kv::Kv::new(Arc::new(engine::kv_rocksdb::RocksKv::open(
-                path,
-                64 * 1024 * 1024,
-            )?));
-            let meta = engine::meta::validate_meta(&kv).map_err(format_error)?;
-            Ok(Self { kv, meta })
+            let kv = Arc::new(engine::kv::Kv::new(Arc::new(
+                engine::kv_rocksdb::RocksKv::open(path, 64 * 1024 * 1024)?,
+            )));
+            Self::from_kv(kv)
         }
     }
 }

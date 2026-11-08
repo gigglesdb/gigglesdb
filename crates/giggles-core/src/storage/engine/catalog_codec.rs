@@ -484,7 +484,7 @@ fn decode_version<T: DeserializeOwned>(version: u8, v: &[u8]) -> Result<T, CoreE
 impl TryFrom<(TableEntry, BTreeMap<u64, ColumnExt>)> for TableEntryV2Dto {
     type Error = CoreError;
     fn try_from((entry, ext): (TableEntry, BTreeMap<u64, ColumnExt>)) -> Result<Self, CoreError> {
-        let TableEntry { def, heap } = entry;
+        let TableEntry { def, heap, .. } = entry;
         Ok(Self {
             def: def.try_into()?,
             heap,
@@ -500,15 +500,17 @@ impl TryFrom<TableEntryV2Dto> for (TableEntry, BTreeMap<u64, ColumnExt>) {
             heap,
             columns_ext,
         } = v;
+        let columns_ext: BTreeMap<u64, ColumnExt> = columns_ext
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
         Ok((
             TableEntry {
                 def: def.try_into()?,
                 heap,
+                columns_ext: columns_ext.clone(),
             },
-            columns_ext
-                .into_iter()
-                .map(|(k, v)| (k, v.into()))
-                .collect(),
+            columns_ext,
         ))
     }
 }

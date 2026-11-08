@@ -53,6 +53,82 @@ fn marker_without_rocksdb_is_corrupt() {
     ));
     fs::remove_dir_all(path).unwrap();
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_open_rejects_catalog_content_missing_feature_or_unknown_kind() {
+    use crate::relational::{
+        ColumnDef, DataType, TableDef,
+        catalog_ext::{Constraint, ConstraintKind},
+    };
+    use engine::{
+        catalog::CatalogParts,
+        codec,
+        hlc::Ts,
+        kv::{Durability, Keyspace, WriteBatch},
+        mvcc,
+        txn::Isolation,
+    };
+
+    for unknown_kind in [false, true] {
+        let path = directory();
+        let db = V2Db::create(&path).unwrap();
+        let mut batch = WriteBatch::default();
+        if unknown_kind {
+            batch.put(
+                Keyspace::Catalog,
+                codec::user_key_seek_at(&[99], Ts(1)),
+                mvcc::encode_live(b"unknown"),
+            );
+        } else {
+            let ids = db.catalog().reserve_ids(3).unwrap();
+            let mut parts = CatalogParts::default();
+            parts.tables.insert(
+                "catalog_table".into(),
+                TableDef {
+                    id: ids.start,
+                    name: "catalog_table".into(),
+                    columns: vec![ColumnDef {
+                        id: ids.start + 1,
+                        name: "id".into(),
+                        data_type: DataType::BigInt,
+                        not_null: true,
+                    }],
+                    primary_key: vec![0],
+                },
+            );
+            parts.ext.constraints.insert(
+                ids.start,
+                vec![Constraint {
+                    id: ids.start + 2,
+                    name: "catalog_table_pkey".into(),
+                    kind: ConstraintKind::PrimaryKey,
+                }],
+            );
+            let mut txn = db.begin(Isolation::ReadCommitted);
+            db.catalog()
+                .apply_diff(
+                    &mut txn,
+                    &CatalogParts::default(),
+                    &parts,
+                    &ids,
+                    None,
+                    &|| false,
+                )
+                .unwrap();
+            db.catalog().commit_ddl(txn).unwrap();
+            batch.put(
+                Keyspace::Meta,
+                b"features".to_vec(),
+                0_u64.to_be_bytes().to_vec(),
+            );
+        }
+        db.kv.write(batch, Durability::Sync).unwrap();
+        drop(db);
+        assert!(matches!(V2Db::open(&path), Err(CoreError::Corrupt(_))));
+        fs::remove_dir_all(path).unwrap();
+    }
+}
 #[cfg(not(feature = "engine-rocksdb"))]
 #[test]
 fn creation_requires_rocksdb_feature() {
@@ -88,7 +164,9 @@ fn native_sql_sessions_are_refused() {
         limit: Some(ValueExpr::Literal(Value::Int(10))),
         projection: vec!["id".into()],
     };
-    let error = session.execute_native(&request, &Bindings::new()).unwrap_err();
+    let error = session
+        .execute_native(&request, &Bindings::new())
+        .unwrap_err();
     eprintln!("v2 execute_native refusal: {error:?}");
     drop(session);
     drop(admin);
@@ -103,7 +181,7 @@ fn lifecycle_and_public_refusals() {
     let domain = match &admin.inner.backend {
         Backend::V2(db) => {
             assert_eq!(
-                engine::meta::validate_meta(&db.kv).unwrap().engine,
+                engine::meta::validate_meta(db.kv.as_ref()).unwrap().engine,
                 "rocksdb"
             );
             db.meta.domain
