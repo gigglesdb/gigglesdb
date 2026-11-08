@@ -133,6 +133,14 @@ fn canonical_filter(
     let filter = |f| canonical_filter(f, resolve, scope, tables);
     Ok(match f {
         Filter::Clauses(_) => return Err(SqlError::Unsupported),
+        Filter::InSubquery {
+            value,
+            query,
+            negated,
+        } => canonical_fields(
+            "in-subquery",
+            &[negated.to_string(), scalar(value)?, format!("{query:?}")],
+        ),
         Filter::Scalar(s) => canonical_fields("scalar", &[scalar(s)?]),
         Filter::Null(s, not) => canonical_fields("null", &[not.to_string(), scalar(s)?]),
         Filter::Compare(a, op, b) => {
@@ -259,7 +267,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
     }
     fn filter(&mut self, f: &Filter) -> R<Filter> {
         Ok(match f {
-            Filter::Clauses(_) => return Err(SqlError::Unsupported),
+            Filter::Clauses(_) | Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
             Filter::Scalar(s) => Filter::Scalar(self.scalar(s)?),
             Filter::Compare(a, op, b) => {
                 Filter::Compare(self.scalar(a)?, op.clone(), self.scalar(b)?)
@@ -336,6 +344,7 @@ pub(super) fn bind<'a>(
     tables: &[&'a TableDef],
     mut parameters: Vec<Option<DataType>>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    subqueries: Vec<(usize, BoundQuery<'a>)>,
 ) -> R<BoundQuery<'a>> {
     let mut projection = vec![];
     for (item, alias) in &q.items {
@@ -379,7 +388,7 @@ pub(super) fn bind<'a>(
         s.infer(None, &mut parameters, resolve, tables)?;
     }
     if let Some(f) = q.where_filter() {
-        f.infer(&mut parameters, resolve, tables)?;
+        f.infer_with_subqueries(&mut parameters, resolve, tables, &subqueries)?;
     }
     for expr in q.limit.iter().chain(q.offset()) {
         if let Expr::Param(n) = expr {
@@ -673,7 +682,7 @@ pub(super) fn bind<'a>(
         .collect::<R<Vec<_>>>()?;
     let filter = q
         .where_filter()
-        .map(|f| f.bind(&parameters, resolve, tables))
+        .map(|f| f.bind_with_subqueries(&parameters, resolve, tables, &subqueries))
         .transpose()?;
     let joins = q.bind_joins(tables, &mut parameters, resolve)?;
     let parameters = parameters
@@ -691,6 +700,8 @@ pub(super) fn bind<'a>(
         filter,
         order: vec![],
         aggregate: true,
+        subqueries,
+        declared: vec![],
         grouping: Some(Grouping {
             keys,
             aggregates,
@@ -753,11 +764,13 @@ impl Grouping {
     pub(super) fn execute(
         &self,
         query: &BoundQuery<'_>,
-        _state: &Relational,
+        state: &Relational,
         source: &dyn scan::RowSource,
         params: &[Value],
-        cancel: &mut impl FnMut() -> bool,
+        execution: &Execution<'_>,
     ) -> R<SqlResult> {
+        let mut cancel_impl = || execution.cancelled();
+        let cancel = &mut cancel_impl;
         let page = scan::Page {
             offset: page_expr(query.query.offset(), params)?.unwrap_or(0),
             limit: page_expr(query.query.limit.as_ref(), params)?,
@@ -767,7 +780,12 @@ impl Grouping {
                 columns: vec!["plan".into()],
                 rows: vec![SqlRow {
                     values: vec![Value::Text(format!(
-                        "BoundedGroupAggregate; retained_bytes<={}; result_rows<={}; OutputLimit",
+                        "BoundedGroupAggregate{}; retained_bytes<={}; result_rows<={}; OutputLimit",
+                        if query.query.has_in_subquery() {
+                            "; InSubquery"
+                        } else {
+                            ""
+                        },
                         scan::MAX_RETAINED_BYTES,
                         scan::MAX_QUERY_ROWS
                     ))],
@@ -796,13 +814,15 @@ impl Grouping {
             groups.insert(Key(vec![]), (initial, auxiliary));
         }
         let mut aggregate_work = 0;
-        let mut join_work = 0;
+
         {
             let mut meter = scan::Meter::per_row(cancel);
             let mut accept = |row: &Tuple| -> R<()> {
                 let mut work = 0;
                 if let Some(f) = &query.filter
-                    && f.eval(row, params, &mut work)? != Some(true)
+                    && f.eval_with_subqueries(
+                        row, params, &mut work, query, state, source, execution,
+                    )? != Some(true)
                 {
                     return Ok(());
                 }
@@ -857,12 +877,13 @@ impl Grouping {
                     hi: std::ops::Bound::Unbounded,
                 };
                 let input = source.scan(query.tables[0], &range, scan::Direction::Forward)?;
-                for row in join_rows(query, source, input, params, &mut meter, &mut join_work) {
+                for row in join_rows(query, source, input, params, &mut meter, &execution.visits) {
                     accept(&row?)?;
                 }
             }
         }
         let mut rows = vec![];
+        let mut distinct = std::collections::BTreeSet::new();
         for (key, (mut values, auxiliary)) in groups {
             finish_aggregates(
                 &self.aggregates,
@@ -888,6 +909,14 @@ impl Grouping {
                 .iter()
                 .map(|s| s.eval(&row, params, &mut work))
                 .collect::<R<Vec<_>>>()?;
+            if query.query.distinct() {
+                let key = Key(values.clone());
+                if distinct.contains(&key) {
+                    continue;
+                }
+                retention.charge(retained(&values) + 4 * std::mem::size_of::<usize>())?;
+                distinct.insert(key);
+            }
             let mut work = 0;
             let keys = self
                 .order

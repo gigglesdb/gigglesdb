@@ -42,7 +42,9 @@ fn coerce_boolean_literals(filter: &mut Filter) {
             coerce_boolean_literals(a);
             coerce_boolean_literals(b);
         }
-        Filter::Clauses(_) => unreachable!("FILTER cannot contain query clauses"),
+        Filter::Clauses(_) | Filter::InSubquery { .. } => {
+            unreachable!("FILTER cannot contain query clauses or subqueries")
+        }
     }
 }
 fn coerce_scalar_conditions(s: &mut Scalar) {
@@ -106,7 +108,9 @@ fn encode(f: Filter) -> Scalar {
                 args,
             )
         }
-        Filter::Clauses(_) => unreachable!("FILTER cannot contain query clauses"),
+        Filter::Clauses(_) | Filter::InSubquery { .. } => {
+            unreachable!("FILTER cannot contain query clauses or subqueries")
+        }
     }
 }
 pub(super) fn decode(s: &Scalar) -> R<Filter> {
@@ -214,7 +218,9 @@ fn expand_filter_inner(
     }
     *work += 1;
     match f {
-        Filter::Scalar(s) | Filter::Null(s, _) => expand(s, replacements, depth + 1, work)?,
+        Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
+            expand(s, replacements, depth + 1, work)?
+        }
         Filter::Compare(a, _, b) => {
             expand(a, replacements, depth + 1, work)?;
             expand(b, replacements, depth + 1, work)?;
@@ -245,7 +251,17 @@ fn expand_filter_inner(
 fn innermost_postfix(tokens: &[Token], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut best = None;
+    let mut skip_until = start;
     for at in start..tokens.len() {
+        if at < skip_until {
+            continue;
+        }
+        if is_subquery_open(tokens, at) {
+            skip_until = subquery_end(tokens, at)
+                .unwrap_or(tokens.len())
+                .saturating_add(1);
+            continue;
+        }
         match tokens[at] {
             Token::Symbol('(') => depth += 1,
             Token::Symbol(')') => depth = depth.saturating_sub(1),
@@ -351,7 +367,7 @@ fn replace_argument_aggregates(
                 *parameter = Some(DataType::Text);
             }
         }
-        let bound = grouping::bind(&query, tables, isolated, resolve)?;
+        let bound = grouping::bind(&query, tables, isolated, resolve, Vec::new())?;
         let ty = bound
             .columns
             .first()
@@ -405,7 +421,7 @@ fn replace_filter_aggregates(
     tables: &[&TableDef],
 ) -> R<()> {
     match f {
-        Filter::Scalar(s) | Filter::Null(s, _) => {
+        Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
             replace_argument_aggregates(s, parameters, resolve, tables)?
         }
         Filter::Compare(a, _, b) => {
@@ -615,7 +631,9 @@ pub(super) fn validate_filter(
     tables: &[&TableDef],
 ) -> R<()> {
     match filter {
-        Filter::Scalar(s) | Filter::Null(s, _) => validate_scalar(s, parameters, resolve, tables)?,
+        Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
+            validate_scalar(s, parameters, resolve, tables)?
+        }
         Filter::Compare(a, _, b) => {
             validate_scalar(a, parameters, resolve, tables)?;
             validate_scalar(b, parameters, resolve, tables)?;
@@ -710,6 +728,7 @@ pub(super) fn normalize(p: &mut Parser) -> R<Vec<Scalar>> {
             }
         }
         let mut filter = Filter::parse(p, 0, 0)?;
+        filter.admit_subquery_positions(false)?;
         coerce_boolean_literals(&mut filter);
         p.punct(')')?;
         let end = p.at;

@@ -276,13 +276,13 @@ impl InsertExpressions {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            fn remap(value: &mut Scalar, map: &[usize]) {
-                fn filter(f: &mut Filter, map: &[usize]) {
+            fn remap(value: &mut Scalar, map: &[usize]) -> R<()> {
+                fn filter(f: &mut Filter, map: &[usize]) -> R<()> {
                     match f {
                         Filter::Scalar(s) | Filter::Null(s, _) => remap(s, map),
                         Filter::Compare(a, _, b) => {
-                            remap(a, map);
-                            remap(b, map);
+                            remap(a, map)?;
+                            remap(b, map)
                         }
                         Filter::Like {
                             value,
@@ -290,43 +290,49 @@ impl InsertExpressions {
                             escape,
                             ..
                         } => {
-                            remap(value, map);
-                            remap(pattern, map);
+                            remap(value, map)?;
+                            remap(pattern, map)?;
                             if let Some(s) = escape {
-                                remap(s, map);
+                                remap(s, map)?;
                             }
+                            Ok(())
                         }
                         Filter::Not(f) | Filter::Is(f, _, _) => filter(f, map),
                         Filter::Logic(a, _, b) => {
-                            filter(a, map);
-                            filter(b, map);
+                            filter(a, map)?;
+                            filter(b, map)
                         }
+                        Filter::InSubquery { .. } => Err(SqlError::Unsupported),
                         Filter::Clauses(_) => unreachable!("VALUES has no query clauses"),
                     }
                 }
                 match value {
-                    Scalar::Param(n) => *n = map.binary_search(n).unwrap() + 1,
+                    Scalar::Param(n) => {
+                        *n = map.binary_search(n).unwrap() + 1;
+                        Ok(())
+                    }
                     Scalar::Cast(value, _) | Scalar::Unary(_, value) => remap(value, map),
                     Scalar::Binary(_, a, b) => {
-                        remap(a, map);
-                        remap(b, map);
+                        remap(a, map)?;
+                        remap(b, map)
                     }
-                    Scalar::Call(_, args) => args.iter_mut().for_each(|arg| remap(arg, map)),
-                    Scalar::SubstringOrder(args) => args.iter_mut().for_each(|arg| remap(arg, map)),
+                    Scalar::Call(_, args) => args.iter_mut().try_for_each(|arg| remap(arg, map)),
+                    Scalar::SubstringOrder(args) => args.iter_mut().try_for_each(|arg| remap(arg, map)),
                     Scalar::Predicate(f) => filter(f, map),
                     Scalar::Case(c) => {
                         for (f, s) in &mut c.arms {
-                            filter(f, map);
-                            remap(s, map);
+                            filter(f, map)?;
+                            remap(s, map)?;
                         }
                         if let Some(s) = &mut c.otherwise {
-                            remap(s, map);
+                            remap(s, map)?;
                         }
+                        Ok(())
                     }
-                    _ => {}
+                    _ => Ok(()),
                 }
             }
-            values.iter_mut().for_each(|value| remap(value, &map));
+            values.iter_mut().try_for_each(|value| remap(value, &map))?;
             Some(map)
         } else {
             None

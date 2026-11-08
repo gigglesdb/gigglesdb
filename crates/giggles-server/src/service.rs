@@ -898,6 +898,24 @@ impl Session {
         }
         Ok(())
     }
+    fn table_privilege_allowed(
+        &self,
+        table: &str,
+        name: &str,
+        privilege: Option<roles::TablePrivilege>,
+    ) -> Result<bool, CoreError> {
+        let roles = self.service.admin.roles();
+        let name_at_commit = self.sql.table_authority_name(table)?;
+        let owner = roles
+            .table_owner(&name_at_commit)
+            .map_err(|_| CoreError::Policy(Error::Scope))?;
+        Ok(owner.as_deref() == Some(name)
+            || privilege.is_some_and(|privilege| {
+                roles
+                    .table_privileges(&name_at_commit, name)
+                    .is_ok_and(|privileges| privileges.contains(&privilege))
+            }))
+    }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         for table in p.constraint_reference_tables() {
             self.authorize_alter_table(&table)?;
@@ -919,8 +937,15 @@ impl Session {
         if p.sequence_only() {
             return Ok(());
         }
+        let read_tables = p.read_tables();
+        let joined_read = !read_tables.is_empty()
+            && matches!(p.command(), "SELECT" | "EXPLAIN")
+            && p.table() == Some("giggles_join");
         let allowed = matches!(&self.role, Role::Application { tables,.. }
             if !p.is_ddl() && p.table().is_none_or(|t| t != "giggles_join" && tables.contains(t)));
+        let allowed =
+            allowed || matches!(&self.role, Role::Application { .. } if !p.is_ddl() && joined_read);
+        let mut superuser = false;
         let allowed = if let Role::Database { name } = &self.role {
             let role = self
                 .service
@@ -931,6 +956,7 @@ impl Session {
                 .filter(|role| role.login && role.generation == self.epoch)
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
+                superuser = true;
                 true
             } else if p.is_alter_table() || p.is_drop_table() {
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
@@ -951,13 +977,8 @@ impl Session {
                     .contains(&roles::SchemaPrivilege::Create)
             } else if let Some(table) = p.table() {
                 if table == "giggles_join" {
-                    false
+                    joined_read
                 } else {
-                    let roles = self.service.admin.roles();
-                    let name_at_commit = self.sql.table_authority_name(table)?;
-                    let owner = roles
-                        .table_owner(&name_at_commit)
-                        .map_err(|_| CoreError::Policy(Error::Scope))?;
                     let privilege = match p.command() {
                         "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
                         "INSERT" => Some(roles::TablePrivilege::Insert),
@@ -965,12 +986,7 @@ impl Session {
                         "DELETE" => Some(roles::TablePrivilege::Delete),
                         _ => None,
                     };
-                    owner.as_deref() == Some(name.as_str())
-                        || privilege.is_some_and(|privilege| {
-                            roles
-                                .table_privileges(&name_at_commit, name)
-                                .is_ok_and(|privileges| privileges.contains(&privilege))
-                        })
+                    self.table_privilege_allowed(table, name, privilege)?
                 }
             } else {
                 true
@@ -983,6 +999,26 @@ impl Session {
             || (self.surface == Surface::Postgres
                 && self.role.is_sql()
                 && p.deferred_routine_only());
+        let mut allowed = allowed;
+        if allowed && !superuser {
+            for table in read_tables {
+                let readable = match &self.role {
+                    Role::Application { tables, .. } => {
+                        table != "giggles_join" && tables.contains(&table)
+                    }
+                    Role::Database { name } => self.table_privilege_allowed(
+                        &table,
+                        name,
+                        Some(roles::TablePrivilege::Select),
+                    )?,
+                    _ => false,
+                };
+                if !readable {
+                    allowed = false;
+                    break;
+                }
+            }
+        }
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));

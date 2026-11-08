@@ -150,6 +150,7 @@ fn scalar(s: &Scalar) -> R<String> {
 }
 fn deparse(f: &Filter) -> R<String> {
     Ok(match f {
+        Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
         Filter::Is(f, Some(target), negated) => {
             let inner = match f.as_ref() {
                 Filter::Scalar(s) => scalar(s)?,
@@ -258,6 +259,7 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
 }
 pub(super) fn immutable(filter: &BoundFilter) -> bool {
     match filter {
+        BoundFilter::InSubquery { .. } => false,
         BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => s.constraint_immutable(),
         BoundFilter::Compare(a, _, b) => a.constraint_immutable() && b.constraint_immutable(),
         BoundFilter::Like {
@@ -322,6 +324,7 @@ fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
         Ok(())
     }
     match filter {
+        Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
         Filter::Is(value, _, _) => cast_subset(value, table)?,
         Filter::Scalar(value) | Filter::Null(value, _) => scalar_casts(value, table)?,
         Filter::Compare(left, _, right) => {

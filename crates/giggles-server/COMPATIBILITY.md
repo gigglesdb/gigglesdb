@@ -56,10 +56,12 @@ cache path. Close unused statements; concurrent explicitly open statements still
 count. Ordinary prepared statements survive commits/rollbacks, with schema and
 binding checks on reuse.
 
-Application multi-source joins currently fail closed at the gateway, even when
-both tables are granted. The internal `giggles_join` marker cannot be granted as
-a table. Embedded owner SQL joins remain available; network joins require a
-complete source-table authorization contract first.
+Joins and uncorrelated `IN (SELECT ...)` subqueries follow PostgreSQL's
+per-relation rule: a non-superuser database role needs SELECT (owner or grant) on
+every table the statement reads, plus the target's own privilege for UPDATE or
+DELETE; otherwise the statement fails with 42501. An application role needs every
+read table in its allowlist. The internal `giggles_join` marker still cannot be
+granted as a table.
 
 Idle PostgreSQL connections do not expire after ten seconds. Once a frame starts,
 its remaining header/body must arrive within ten seconds. Idle sessions still

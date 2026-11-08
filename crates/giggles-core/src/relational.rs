@@ -1676,6 +1676,16 @@ impl Prepared {
             _ => None,
         }
     }
+    /// Tables whose rows are read by this statement, in first-seen order.
+    /// Mutation targets are included only when an IN subquery reads them.
+    pub fn read_tables(&self) -> Vec<String> {
+        match &self.statement {
+            Statement::Query(query) => query.read_tables(),
+            Statement::Select { name, .. } => vec![name.clone()],
+            _ => searched::target(self).map_or_else(Vec::new, query::Query::subquery_tables),
+        }
+    }
+
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
@@ -3115,7 +3125,13 @@ impl Relational {
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let b = match bounds(t, predicates, params) {
-                    Ok(b) if b.point => b,
+                    Ok(b)
+                        if b.point
+                            && !searched::target(prepared)
+                                .is_some_and(query::Query::has_in_subquery) =>
+                    {
+                        b
+                    }
                     other => {
                         return searched::route(
                             self,
@@ -3208,7 +3224,13 @@ impl Relational {
             } => {
                 let t = self.tables.get(name).ok_or(SqlError::UnknownTable)?;
                 let b = match bounds(t, predicates, params) {
-                    Ok(b) if b.point => b,
+                    Ok(b)
+                        if b.point
+                            && !searched::target(prepared)
+                                .is_some_and(query::Query::has_in_subquery) =>
+                    {
+                        b
+                    }
                     other => {
                         return searched::route(
                             self,

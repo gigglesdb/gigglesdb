@@ -22,6 +22,14 @@ pub(super) fn parse_target(
             };
             Ok((predicates, Some(Box::new(target))))
         }
+        Err(SqlError::Limit)
+            if p.tokens[start..].windows(3).any(|tokens| {
+                matches!(tokens, [Token::Word(in_word), Token::Symbol('('), Token::Word(select)]
+                    if in_word == "in" && select == "select")
+            }) =>
+        {
+            Err(SqlError::Limit)
+        }
         Err(_) => {
             p.at = legacy_end;
             p.params = legacy_parameters;

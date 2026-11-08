@@ -1,5 +1,6 @@
 //! Private syntax, binding and bounded physical execution. No persisted types.
 use super::*;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod aggregate_filter;
 mod functions;
@@ -168,6 +169,7 @@ pub(super) struct Query {
 
 #[derive(Debug, Clone)]
 struct QueryClauses {
+    distinct: bool,
     filter: Option<Filter>,
     group: Vec<Scalar>,
     having: Option<Filter>,
@@ -179,6 +181,11 @@ enum Filter {
     Clauses(Box<QueryClauses>),
     Scalar(Scalar),
     Compare(Scalar, String, Scalar),
+    InSubquery {
+        value: Scalar,
+        query: Box<Query>,
+        negated: bool,
+    },
     Null(Scalar, bool),
     Is(Box<Filter>, Option<bool>, bool),
     Like {
@@ -194,6 +201,13 @@ enum Filter {
 enum BoundFilter {
     Scalar(BoundScalar),
     Compare(BoundScalar, String, BoundScalar),
+    InSubquery {
+        value: BoundScalar,
+        query: usize,
+        column_type: DataType,
+        negated: bool,
+        clock: Option<super::clock::ExecutionClock>,
+    },
     Null(BoundScalar, bool),
     Is(Box<BoundFilter>, Option<bool>, bool),
     Like {
@@ -214,7 +228,7 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     fn filter_cost(f: &Filter, nodes: &mut usize, bytes: &mut usize) -> R<()> {
         *nodes = nodes.checked_add(1).ok_or(SqlError::Limit)?;
         match f {
-            Filter::Clauses(_) => return Err(SqlError::Unsupported),
+            Filter::Clauses(_) | Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
             Filter::Scalar(s) | Filter::Null(s, _) => cost(s, nodes, bytes)?,
             Filter::Compare(a, op, b) => {
                 *bytes = bytes.checked_add(op.len()).ok_or(SqlError::Limit)?;
@@ -292,7 +306,302 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     }
     Ok(())
 }
+
+fn is_subquery_open(tokens: &[Token], at: usize) -> bool {
+    tokens.get(at) == Some(&Token::Symbol('('))
+        && matches!(tokens.get(at + 1), Some(Token::Word(w)) if w == "select")
+}
+fn subquery_end(tokens: &[Token], open: usize) -> R<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().skip(open) {
+        match token {
+            Token::Symbol('(') => depth += 1,
+            Token::Symbol(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(SqlError::Syntax)
+}
+fn admit_subquery_forms(tokens: &[Token]) -> R<()> {
+    let mut at = 0;
+    while at < tokens.len() {
+        if is_subquery_open(tokens, at) {
+            if at == 0 || tokens.get(at - 1) != Some(&Token::Word("in".into())) {
+                return Err(SqlError::Unsupported);
+            }
+            if at >= 2 && tokens[at - 2] == Token::Symbol(')') {
+                let mut depth = 1;
+                let mut comma = false;
+                for open in (0..at - 2).rev() {
+                    match &tokens[open] {
+                        Token::Symbol(')') => depth += 1,
+                        Token::Symbol('(') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let call = open > 0
+                                    && match &tokens[open - 1] {
+                                        Token::QuotedIdent(_) => true,
+                                        Token::Word(w) => ![
+                                            "where", "and", "or", "not", "select", "on", "having",
+                                            "by", "when", "then", "else", "in",
+                                        ]
+                                        .contains(&w.as_str()),
+                                        _ => false,
+                                    };
+                                if comma && !call {
+                                    return Err(SqlError::Unsupported);
+                                }
+                                break;
+                            }
+                        }
+                        Token::Symbol(',') if depth == 1 => comma = true,
+                        _ => {}
+                    }
+                }
+            }
+            at = subquery_end(tokens, at)? + 1;
+        } else {
+            at += 1;
+        }
+    }
+    Ok(())
+}
+fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
+    let mut stack = Vec::new();
+    let mut nested = 0;
+    for (at, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Symbol('(') => {
+                let sub = is_subquery_open(tokens, at);
+                stack.push(sub);
+                if sub {
+                    nested += 1;
+                    if nested > 32 {
+                        return Err(SqlError::Limit);
+                    }
+                }
+            }
+            Token::Symbol(')') if stack.pop() == Some(true) => {
+                nested -= 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+fn walk_scalar(s: &Scalar, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
+    visit(s)?;
+    match s {
+        Scalar::Cast(a, _) | Scalar::Unary(_, a) => walk_scalar(a, visit)?,
+        Scalar::Binary(_, a, b) => {
+            walk_scalar(a, visit)?;
+            walk_scalar(b, visit)?;
+        }
+        Scalar::Call(_, args) => {
+            for a in args {
+                walk_scalar(a, visit)?;
+            }
+        }
+        Scalar::SubstringOrder(args) => {
+            for a in args {
+                walk_scalar(a, visit)?;
+            }
+        }
+        Scalar::Predicate(f) => f.walk_scalars(visit)?,
+        Scalar::Case(c) => {
+            for (f, a) in &c.arms {
+                f.walk_scalars(visit)?;
+                walk_scalar(a, visit)?;
+            }
+            if let Some(a) = &c.otherwise {
+                walk_scalar(a, visit)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn reject_scalar_subquery(s: &Scalar) -> R<()> {
+    match s {
+        Scalar::Predicate(f) => f.admit_subquery_positions(false)?,
+        Scalar::Case(c) => {
+            for (f, value) in &c.arms {
+                f.admit_subquery_positions(false)?;
+                reject_scalar_subquery(value)?;
+            }
+            if let Some(value) = &c.otherwise {
+                reject_scalar_subquery(value)?;
+            }
+        }
+        Scalar::Cast(value, _) | Scalar::Unary(_, value) => reject_scalar_subquery(value)?,
+        Scalar::Binary(_, a, b) => {
+            reject_scalar_subquery(a)?;
+            reject_scalar_subquery(b)?;
+        }
+        Scalar::Call(_, args) => {
+            for value in args {
+                reject_scalar_subquery(value)?;
+            }
+        }
+        Scalar::SubstringOrder(args) => {
+            for value in args {
+                reject_scalar_subquery(value)?;
+            }
+        }
+        Scalar::Literal(_) | Scalar::Param(_) | Scalar::Column(_) => {}
+    }
+    Ok(())
+}
 impl Filter {
+    fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
+        self.visit_scalars(&mut |s| walk_scalar(s, visit))?;
+        self.visit_subqueries(&mut |_, q| q.walk_scalars(visit))
+    }
+    fn visit_subqueries<'a>(
+        &'a self,
+        visit: &mut impl FnMut(&'a Scalar, &'a Query) -> R<()>,
+    ) -> R<()> {
+        match self {
+            Self::InSubquery { value, query, .. } => visit(value, query)?,
+            Self::Clauses(c) => {
+                if let Some(f) = &c.filter {
+                    f.visit_subqueries(visit)?;
+                }
+                if let Some(f) = &c.having {
+                    f.visit_subqueries(visit)?;
+                }
+            }
+            Self::Logic(a, _, b) => {
+                a.visit_subqueries(visit)?;
+                b.visit_subqueries(visit)?;
+            }
+            Self::Not(f) | Self::Is(f, _, _) => f.visit_subqueries(visit)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    fn admit_subquery_positions(&self, allowed: bool) -> R<()> {
+        self.visit_scalars(&mut reject_scalar_subquery)?;
+        self.visit_subqueries(&mut |_, _| {
+            if allowed {
+                Ok(())
+            } else {
+                Err(SqlError::Unsupported)
+            }
+        })
+    }
+    fn infer_outer(
+        &self,
+        params: &mut [Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<()> {
+        match self {
+            Self::InSubquery { .. } => Ok(()),
+            Self::Logic(a, _, b) => {
+                a.infer_outer(params, resolve, tables)?;
+                b.infer_outer(params, resolve, tables)
+            }
+            Self::Not(f) | Self::Is(f, _, _) => f.infer_outer(params, resolve, tables),
+            _ => self.infer(params, resolve, tables),
+        }
+    }
+    fn infer_with_subqueries(
+        &self,
+        params: &mut [Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        subqueries: &[(usize, BoundQuery<'_>)],
+    ) -> R<()> {
+        match self {
+            Self::InSubquery { value, query, .. } => {
+                let bound = subqueries
+                    .iter()
+                    .find(|(key, _)| *key == query.as_ref() as *const Query as usize)
+                    .ok_or(SqlError::Unsupported)?;
+                let expected = if matches!(value, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
+                {
+                    None
+                } else {
+                    Some(&bound.1.columns[0].data_type)
+                };
+                value.infer(expected, params, resolve, tables)
+            }
+            Self::Logic(a, _, b) => {
+                a.infer_with_subqueries(params, resolve, tables, subqueries)?;
+                b.infer_with_subqueries(params, resolve, tables, subqueries)
+            }
+            Self::Not(f) | Self::Is(f, _, _) => {
+                f.infer_with_subqueries(params, resolve, tables, subqueries)
+            }
+            _ => self.infer(params, resolve, tables),
+        }
+    }
+    fn bind_with_subqueries(
+        &self,
+        params: &[Option<DataType>],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+        subqueries: &[(usize, BoundQuery<'_>)],
+    ) -> R<BoundFilter> {
+        Ok(match self {
+            Self::InSubquery {
+                value,
+                query,
+                negated,
+            } => {
+                let key = query.as_ref() as *const Query as usize;
+                let column_type = &subqueries
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .ok_or(SqlError::Unsupported)?
+                    .1
+                    .columns[0]
+                    .data_type;
+                let value = if matches!(value, Scalar::Literal(Value::Null | Value::Text(_))) {
+                    Scalar::Cast(Box::new(value.clone()), column_type.clone())
+                } else {
+                    value.clone()
+                };
+                let bound = value.bind(resolve, tables, params)?;
+                // Compare's existing type policy, using a typed parameter as the RHS.
+                let mut comparison_params = params.to_vec();
+                comparison_params.push(Some(column_type.clone()));
+                Filter::Compare(
+                    value.clone(),
+                    "=".into(),
+                    Scalar::Param(comparison_params.len()),
+                )
+                .bind(&comparison_params, resolve, tables)?;
+                BoundFilter::InSubquery {
+                    value: bound,
+                    query: key,
+                    column_type: column_type.clone(),
+                    negated: *negated,
+                    clock: None,
+                }
+            }
+            Self::Logic(a, and, b) => BoundFilter::Logic(
+                Box::new(a.bind_with_subqueries(params, resolve, tables, subqueries)?),
+                *and,
+                Box::new(b.bind_with_subqueries(params, resolve, tables, subqueries)?),
+            ),
+            Self::Not(f) => BoundFilter::Not(Box::new(
+                f.bind_with_subqueries(params, resolve, tables, subqueries)?,
+            )),
+            Self::Is(f, target, negated) => BoundFilter::Is(
+                Box::new(f.bind_with_subqueries(params, resolve, tables, subqueries)?),
+                *target,
+                *negated,
+            ),
+            _ => self.bind(params, resolve, tables)?,
+        })
+    }
     fn visit_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
         match self {
             Self::Clauses(c) => {
@@ -306,7 +615,7 @@ impl Filter {
                     f.visit_scalars(visit)?;
                 }
             }
-            Self::Scalar(s) | Self::Null(s, _) => visit(s)?,
+            Self::Scalar(s) | Self::Null(s, _) | Self::InSubquery { value: s, .. } => visit(s)?,
             Self::Compare(a, _, b) => {
                 visit(a)?;
                 visit(b)?;
@@ -337,6 +646,10 @@ impl Filter {
             found |= s.has_volatile_call();
             Ok(())
         });
+        let _ = self.visit_subqueries(&mut |_, q| {
+            found |= q.has_volatile_call();
+            Ok(())
+        });
         found
     }
     fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
@@ -344,11 +657,19 @@ impl Filter {
             s.sequence_dependencies(out);
             Ok(())
         });
+        let _ = self.visit_subqueries(&mut |_, q| {
+            out.extend(q.sequence_dependencies());
+            Ok(())
+        });
     }
     fn has_undefined_routine(&self) -> bool {
         let mut found = false;
         let _ = self.visit_scalars(&mut |s| {
             found |= scalar_has_undefined_routine(s);
+            Ok(())
+        });
+        let _ = self.visit_subqueries(&mut |_, q| {
+            found |= q.has_undefined_routine();
             Ok(())
         });
         found
@@ -363,6 +684,7 @@ impl Filter {
         *nodes += 1;
         match self {
             Self::Clauses(_) => Err(SqlError::Unsupported),
+            Self::InSubquery { value, .. } => insert_values::shape(value, depth + 1, nodes),
             Self::Scalar(s) | Self::Null(s, _) => insert_values::shape(s, depth + 1, nodes),
             Self::Compare(a, _, b) => {
                 insert_values::shape(a, depth + 1, nodes)?;
@@ -444,14 +766,37 @@ impl Filter {
                 if p.sym(')') {
                     return Err(SqlError::Syntax);
                 }
-                let mut values = vec![parse_scalar(p, depth + 1)?];
-                while p.sym(',') {
-                    values.push(parse_scalar(p, depth + 1)?);
+                if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "select") {
+                    let end = subquery_end(&p.tokens, p.at - 1)?;
+                    let mut child = Parser {
+                        tokens: p.tokens[p.at..end].to_vec(),
+                        at: 0,
+                        params: BTreeSet::new(),
+                    };
+                    let distinct = child.tokens.get(1) == Some(&Token::Word("distinct".into()));
+                    if distinct {
+                        child.tokens.remove(1);
+                    }
+                    let mut query = Query::parse(&mut child)?;
+                    if distinct {
+                        query.set_distinct();
+                    }
+                    p.params.extend(child.params);
+                    p.at = end + 1;
+                    Self::InSubquery {
+                        value: a,
+                        query: Box::new(query),
+                        negated: not,
+                    }
+                } else {
+                    let mut values = vec![parse_scalar(p, depth + 1)?];
+                    while p.sym(',') {
+                        values.push(parse_scalar(p, depth + 1)?);
+                    }
+                    p.punct(')')?;
+                    admit_expansion(&a, values.len())?;
+                    Self::membership(&a, &values, not)
                 }
-                p.punct(')')?;
-                // Admit the expanded size from the borrowed AST before any clone.
-                admit_expansion(&a, values.len())?;
-                Self::membership(&a, &values, not)
             } else if p.word("between") {
                 if p.word("symmetric") {
                     return Err(SqlError::Unsupported);
@@ -619,7 +964,7 @@ impl Filter {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
-            Self::Clauses(_) => Err(SqlError::Unsupported),
+            Self::Clauses(_) | Self::InSubquery { .. } => Err(SqlError::Unsupported),
             Self::Scalar(a) => a.infer(Some(&DataType::Boolean), params, resolve, tables),
             Self::Null(a, _) => a.infer(None, params, resolve, tables),
             Self::Compare(a, _, b) => {
@@ -703,7 +1048,7 @@ impl Filter {
     ) -> R<BoundFilter> {
         let bind = |a: &Scalar| a.bind(resolve, tables, params);
         Ok(match self {
-            Self::Clauses(_) => return Err(SqlError::Unsupported),
+            Self::Clauses(_) | Self::InSubquery { .. } => return Err(SqlError::Unsupported),
             Self::Scalar(a) => {
                 let a = if matches!(a, Scalar::Literal(Value::Null)) {
                     bind(&Scalar::Cast(Box::new(a.clone()), DataType::Boolean))?
@@ -784,7 +1129,194 @@ impl Filter {
         })
     }
 }
+
+struct MaterializedSubquery {
+    values: Vec<Value>,
+    keys: Option<std::collections::HashSet<Vec<u8>>>,
+    has_null: bool,
+}
+struct Execution<'a> {
+    cancel: RefCell<&'a mut dyn FnMut() -> bool>,
+    visits: Cell<usize>,
+    subqueries: RefCell<BTreeMap<usize, MaterializedSubquery>>,
+    retention: RefCell<scan::Retention>,
+    declared: Vec<Option<DataType>>,
+}
+impl<'a> Execution<'a> {
+    fn new(cancel: &'a mut dyn FnMut() -> bool, declared: &[Option<DataType>]) -> Self {
+        Self {
+            cancel: RefCell::new(cancel),
+            declared: declared.to_vec(),
+            visits: Cell::new(0),
+            subqueries: RefCell::new(BTreeMap::new()),
+            retention: RefCell::new(scan::Retention::new(scan::MAX_RETAINED_BYTES)),
+        }
+    }
+    fn cancelled(&self) -> bool {
+        (self.cancel.borrow_mut())()
+    }
+    fn comparison(&self) -> R<()> {
+        charge_candidate(&self.visits)?;
+        if self
+            .visits
+            .get()
+            .is_multiple_of(scan::CANCEL_POLL_ROWS as usize)
+            && self.cancelled()
+        {
+            return Err(SqlError::Aborted);
+        }
+        Ok(())
+    }
+}
+fn charge_candidate(visits: &Cell<usize>) -> R<()> {
+    let next = visits.get().checked_add(1).ok_or(SqlError::Limit)?;
+    visits.set(next);
+    if next > MAX_JOIN_VISITS {
+        return Err(SqlError::Limit);
+    }
+    Ok(())
+}
 impl BoundFilter {
+    #[allow(clippy::too_many_arguments)]
+    fn eval_with_subqueries(
+        &self,
+        row: &Tuple,
+        params: &[Value],
+        bytes: &mut usize,
+        owner: &BoundQuery<'_>,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        execution: &Execution<'_>,
+    ) -> R<Option<bool>> {
+        match self {
+            Self::InSubquery {
+                value,
+                query,
+                column_type,
+                negated,
+                clock,
+            } => {
+                if !execution.subqueries.borrow().contains_key(query) {
+                    let child = &owner
+                        .subqueries
+                        .iter()
+                        .find(|(key, _)| key == query)
+                        .ok_or(SqlError::Unsupported)?
+                        .1;
+                    let result = child.execute_context(
+                        state,
+                        source,
+                        params,
+                        &execution.declared,
+                        execution,
+                        true,
+                    )?;
+                    let mut values = Vec::with_capacity(result.rows.len());
+                    let mut keys = functions::join_key_supported(&value.ty, column_type)
+                        .then(std::collections::HashSet::new);
+                    let mut has_null = false;
+                    for result_row in result.rows {
+                        if execution.cancelled() {
+                            return Err(SqlError::Aborted);
+                        }
+                        let element = result_row
+                            .values
+                            .into_iter()
+                            .next()
+                            .ok_or(SqlError::Syntax)?;
+                        execution
+                            .retention
+                            .borrow_mut()
+                            .charge(value_bytes(&element) + std::mem::size_of::<Value>())?;
+                        has_null |= element == Value::Null;
+                        if element != Value::Null
+                            && let Some(keys) = &mut keys
+                        {
+                            let key = encode_key(std::slice::from_ref(&element))?;
+                            execution
+                                .retention
+                                .borrow_mut()
+                                .charge(key.len() + 4 * std::mem::size_of::<usize>())?;
+                            keys.insert(key);
+                        }
+                        values.push(element);
+                    }
+                    execution.subqueries.borrow_mut().insert(
+                        *query,
+                        MaterializedSubquery {
+                            values,
+                            keys,
+                            has_null,
+                        },
+                    );
+                }
+                let lhs = value.eval(row, params, bytes)?;
+                let cache = execution.subqueries.borrow();
+                let materialized = cache.get(query).ok_or(SqlError::Unsupported)?;
+                let member = if materialized.values.is_empty() {
+                    Some(false)
+                } else if lhs == Value::Null {
+                    None
+                } else {
+                    let found = if let Some(keys) = &materialized.keys {
+                        match functions::join_key(&lhs, &value.ty, column_type)? {
+                            Some(key) => keys.contains(&encode_key(&[key])?),
+                            None => false,
+                        }
+                    } else {
+                        let mut found = false;
+                        for element in &materialized.values {
+                            execution.comparison()?;
+                            if functions::join_equal(
+                                &lhs,
+                                &value.ty,
+                                element,
+                                column_type,
+                                clock.as_ref(),
+                            )? {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    };
+                    if found {
+                        Some(true)
+                    } else if materialized.has_null {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                };
+                Ok(member.map(|v| v != *negated))
+            }
+            Self::Logic(a, and, b) => {
+                let a =
+                    a.eval_with_subqueries(row, params, bytes, owner, state, source, execution)?;
+                if a == Some(!*and) {
+                    return Ok(a);
+                }
+                let b =
+                    b.eval_with_subqueries(row, params, bytes, owner, state, source, execution)?;
+                Ok(if b == Some(!*and) {
+                    b
+                } else if a.is_none() || b.is_none() {
+                    None
+                } else {
+                    Some(*and)
+                })
+            }
+            Self::Not(f) => Ok(f
+                .eval_with_subqueries(row, params, bytes, owner, state, source, execution)?
+                .map(|v| !v)),
+            Self::Is(f, target, negated) => Ok(Some(
+                (f.eval_with_subqueries(row, params, bytes, owner, state, source, execution)?
+                    == *target)
+                    != *negated,
+            )),
+            _ => self.eval(row, params, bytes),
+        }
+    }
     /// Immutable planning only: outer None is dependent; inner None is SQL NULL.
     fn plan_constant(&self, budget: &mut usize) -> R<Option<Option<bool>>> {
         let boolean = |value| match value {
@@ -793,6 +1325,7 @@ impl BoundFilter {
             _ => Err(SqlError::Type),
         };
         match self {
+            Self::InSubquery { .. } => Ok(None),
             Self::Scalar(a) => a.plan_constant(budget)?.map(boolean).transpose(),
             Self::Null(a, not) => Ok(a
                 .plan_constant(budget)?
@@ -875,6 +1408,7 @@ impl BoundFilter {
     }
     fn eval(&self, row: &Tuple, params: &[Value], bytes: &mut usize) -> R<Option<bool>> {
         Ok(match self {
+            Self::InSubquery { .. } => return Err(SqlError::Unsupported),
             Self::Scalar(a) => match a.eval(row, params, bytes)? {
                 Value::Bool(b) => Some(b),
                 Value::Null => None,
@@ -962,6 +1496,10 @@ impl Parser {
 fn preprocess_aggregates(p: &mut Parser) -> R<()> {
     let mut n = p.at;
     while n + 2 < p.tokens.len() {
+        if is_subquery_open(&p.tokens, n) {
+            n = subquery_end(&p.tokens, n)? + 1;
+            continue;
+        }
         let a = match &p.tokens[n] {
             Token::Word(name) | Token::QuotedIdent(name) => Aggregate::from_name(name),
             _ => None,
@@ -1000,7 +1538,9 @@ fn filter_contains_aggregate(f: &Filter) -> bool {
                 || c.group.iter().any(grouping::contains_aggregate)
                 || c.having.as_ref().is_some_and(filter_contains_aggregate)
         }
-        Filter::Scalar(s) | Filter::Null(s, _) => grouping::contains_aggregate(s),
+        Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
+            grouping::contains_aggregate(s)
+        }
         Filter::Compare(a, _, b) => {
             grouping::contains_aggregate(a) || grouping::contains_aggregate(b)
         }
@@ -1047,6 +1587,158 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
     }
 }
 impl Query {
+    fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
+        for (item, _) in &self.items {
+            match item {
+                Item::Scalar(s) | Item::Aggregate(_, Some(s)) => walk_scalar(s, visit)?,
+                _ => {}
+            }
+        }
+        for j in &self.joins {
+            j.on.walk_scalars(visit)?;
+        }
+        if let Some(f) = &self.filter {
+            f.walk_scalars(visit)?;
+        }
+        for (s, _, _) in &self.order {
+            walk_scalar(s, visit)?;
+        }
+        Ok(())
+    }
+    fn has_volatile_call(&self) -> bool {
+        let mut found = false;
+        let _ = self.walk_scalars(&mut |s| {
+            found |= s.has_volatile_call();
+            Ok(())
+        });
+        found
+    }
+    pub(super) fn has_in_subquery(&self) -> bool {
+        let mut found = false;
+        if let Some(f) = &self.filter {
+            let _ = f.visit_subqueries(&mut |_, _| {
+                found = true;
+                Ok(())
+            });
+        }
+        found
+    }
+    pub(super) fn subquery_tables(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(f) = &self.filter {
+            let _ = f.visit_subqueries(&mut |_, q| {
+                for name in q.read_tables() {
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+                Ok(())
+            });
+        }
+        out
+    }
+    pub(super) fn read_tables(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in self
+            .sources
+            .iter()
+            .map(|s| s.name.clone())
+            .chain(self.subquery_tables())
+        {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+    fn used_parameters(&self) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        let _ = self.walk_scalars(&mut |s| {
+            if let Scalar::Param(n) = s {
+                out.insert(*n);
+            }
+            Ok(())
+        });
+        self.limit_parameters(&mut out);
+        out
+    }
+    fn limit_parameters(&self, out: &mut BTreeSet<usize>) {
+        for e in self.limit.iter().chain(self.offset()) {
+            if let Expr::Param(n) = e {
+                out.insert(*n);
+            }
+        }
+        if let Some(f) = self.where_filter() {
+            let _ = f.visit_subqueries(&mut |_, q| {
+                q.limit_parameters(out);
+                Ok(())
+            });
+        }
+    }
+    fn bind_subqueries<'a>(
+        &'a self,
+        state: &'a Relational,
+        parameters: &mut [Option<DataType>],
+        outer: &[Source],
+        resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        tables: &[&TableDef],
+    ) -> R<Vec<(usize, BoundQuery<'a>)>> {
+        let mut out = Vec::new();
+        if let Some(f) = self.where_filter() {
+            f.visit_subqueries(&mut |value, q| {
+                if let [(Item::Scalar(Scalar::Param(n)), _)] = q.items.as_slice()
+                    && parameters.get(n - 1).is_some_and(Option::is_none)
+                {
+                    let ty = value.bind(resolve, tables, parameters).ok().map(|v| v.ty).unwrap_or(DataType::Text);
+                    parameters[*n - 1] = Some(ty);
+                }
+                let used = q.used_parameters();
+                let seed = parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(n, p)| {
+                        if p.is_none() && !used.contains(&(n + 1)) {
+                            Some(DataType::Text)
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect();
+                let scopes: Vec<_> = self.sources.iter().chain(outer).cloned().collect();
+                let bound = q.bind_seeded_inner(state, seed, false, &scopes)?;
+                if bound.columns.len() != 1 {
+                    return Err(SqlError::Syntax);
+                }
+                if !matches!(value, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
+                    value.infer(Some(&bound.columns[0].data_type), parameters, resolve, tables)?;
+                }
+                for n in used {
+                    if let Some(slot) = parameters.get_mut(n - 1) {
+                        *slot = Some(bound.parameters[n - 1].clone());
+                    }
+                }
+                out.push((q as *const Query as usize, bound));
+                Ok(())
+            })?;
+        }
+        Ok(out)
+    }
+    fn distinct(&self) -> bool {
+        self.clauses().is_some_and(|c| c.distinct)
+    }
+    fn set_distinct(&mut self) {
+        if let Some(Filter::Clauses(c)) = &mut self.filter {
+            c.distinct = true;
+        } else {
+            self.filter = Some(Filter::Clauses(Box::new(QueryClauses {
+                distinct: true,
+                filter: self.filter.take(),
+                group: vec![],
+                having: None,
+                offset: None,
+            })));
+        }
+    }
     fn clauses(&self) -> Option<&QueryClauses> {
         match &self.filter {
             Some(Filter::Clauses(c)) => Some(c),
@@ -1105,7 +1797,15 @@ impl Query {
                 && (matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||", "=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
                     || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike"].contains(&w.as_str())))
             {
+                let mut skip_until = item_start;
                 for n in item_start..p.tokens.len().saturating_sub(3) {
+                    if n < skip_until {
+                        continue;
+                    }
+                    if is_subquery_open(&p.tokens, n) {
+                        skip_until = subquery_end(&p.tokens, n)? + 1;
+                        continue;
+                    }
                     if matches!(&p.tokens[n], Token::Word(w) if w == "count")
                         && p.tokens[n + 1] == Token::Symbol('(')
                         && p.tokens[n + 2] == Token::Symbol('*')
@@ -1129,17 +1829,16 @@ impl Query {
         Ok(items)
     }
     pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
-        // Keep subqueries outside the same bounded grammar as SELECT.
-        if p.tokens[p.at..].windows(2).any(
-            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
-        ) {
-            return Err(SqlError::Unsupported);
-        }
+        admit_subquery_depth(&p.tokens[p.at..])?;
+        admit_subquery_forms(&p.tokens[p.at..])?;
         let filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
         } else {
             None
         };
+        if let Some(f) = &filter {
+            f.admit_subquery_positions(true)?;
+        }
         let mut predicates = vec![];
         if let Some(filter) = &filter {
             filter.bounds(&mut predicates);
@@ -1191,7 +1890,16 @@ impl Query {
                 .ok_or(SqlError::UnknownColumn)?;
             Ok(BoundColumn { source: 0, column })
         };
+        if self.has_in_subquery()
+            && let Some(f) = self.where_filter()
+        {
+            f.infer_outer(parameters, &resolve, &[table])?;
+        }
+        let subqueries = self.bind_subqueries(state, parameters, &[], &resolve, &[table])?;
         if let Some(filter) = self.where_filter() {
+            if self.has_in_subquery() {
+                return filter.infer_with_subqueries(parameters, &resolve, &[table], &subqueries);
+            }
             // Infer independently of SET to retain undeclared column conflicts.
             // Plain comparisons preserve explicit declarations, including widths.
             let mut inferred = vec![None; parameters.len()];
@@ -1215,6 +1923,11 @@ impl Query {
         Ok(())
     }
     pub(super) fn returning(p: &mut Parser, table: &str) -> R<Self> {
+        if p.tokens[p.at..].windows(2).any(
+            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
+        ) {
+            return Err(SqlError::Unsupported);
+        }
         preprocess_aggregates(p)?;
         let items = Self::parse_items(p)?;
         for (item, _) in &items {
@@ -1239,16 +1952,12 @@ impl Query {
         })
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
+        admit_subquery_depth(&p.tokens[p.at..])?;
+        admit_subquery_forms(&p.tokens[p.at..])?;
         let explain = p.word("explain");
         p.need("select")?;
         preprocess_aggregates(p)?;
         let aggregate_filters = aggregate_filter::normalize(p)?;
-        // Subqueries remain outside this bounded relational grammar.
-        if p.tokens[p.at..].windows(2).any(
-            |w| matches!((&w[0], &w[1]), (Token::Symbol('('), Token::Word(s)) if s == "select"),
-        ) {
-            return Err(SqlError::Unsupported);
-        }
         let mut items = Self::parse_items(p)?;
         let mut sources = vec![];
         if p.word("from") {
@@ -1299,7 +2008,15 @@ impl Query {
         }
         // Scalar's ordinary parser deliberately rejects count(*). In post-group
         // clauses count(*) has the same transition input as count(1).
+        let mut skip_until = p.at;
         for n in p.at..p.tokens.len().saturating_sub(3) {
+            if n < skip_until {
+                continue;
+            }
+            if is_subquery_open(&p.tokens, n) {
+                skip_until = subquery_end(&p.tokens, n)? + 1;
+                continue;
+            }
             if matches!(&p.tokens[n], Token::Word(w) if w == "count")
                 && p.tokens[n + 1] == Token::Symbol('(')
                 && p.tokens[n + 2] == Token::Symbol('*')
@@ -1370,6 +2087,27 @@ impl Query {
                 aggregate_filter::expand_scalar(s, &aggregate_filters)?;
             }
         }
+        for (item, _) in &items {
+            match item {
+                Item::Scalar(s) | Item::Aggregate(_, Some(s)) => reject_scalar_subquery(s)?,
+                _ => {}
+            }
+        }
+        for join in &joins {
+            join.on.admit_subquery_positions(false)?;
+        }
+        if let Some(f) = &filter {
+            f.admit_subquery_positions(true)?;
+        }
+        if let Some(f) = &having {
+            f.admit_subquery_positions(false)?;
+        }
+        for s in &group {
+            reject_scalar_subquery(s)?;
+        }
+        for (s, _, _) in &order {
+            reject_scalar_subquery(s)?;
+        }
         // OFFSET is admitted by this work item only for grouped output.
         // Preserve the existing rejection boundary for ordinary row queries.
         if offset.is_some()
@@ -1398,6 +2136,7 @@ impl Query {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
+                    distinct: false,
                     filter,
                     group,
                     having,
@@ -1627,6 +2366,7 @@ impl Query {
                         && c.group.iter().all(scalar)
                         && c.having.as_ref().is_none_or(filter)
                 }
+                Filter::InSubquery { value, query, .. } => scalar(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
                 Filter::Like {
@@ -1696,6 +2436,7 @@ impl Query {
                         && c.group.iter().all(scalar)
                         && c.having.as_ref().is_none_or(filter_ok)
                 }
+                Filter::InSubquery { value, query, .. } => scalar(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
                 Filter::Like {
@@ -1719,7 +2460,8 @@ impl Query {
             order,
             limit,
         } = self;
-        !explain
+        self.subquery_tables().is_empty()
+            && !explain
             && sources.is_empty()
             && joins.iter().all(|j| filter_ok(&j.on))
             && joins.is_empty()
@@ -1738,7 +2480,9 @@ impl Query {
             })
     }
     pub(super) fn sequence_only(&self) -> bool {
-        self.sources.is_empty() && !self.sequence_dependencies().is_empty()
+        self.sources.is_empty()
+            && self.subquery_tables().is_empty()
+            && !self.sequence_dependencies().is_empty()
     }
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         fn filter(f: &Filter, out: &mut Vec<Option<String>>) {
@@ -1753,6 +2497,10 @@ impl Query {
                     if let Some(f) = &c.having {
                         filter(f, out);
                     }
+                }
+                Filter::InSubquery { value, query, .. } => {
+                    value.sequence_dependencies(out);
+                    out.extend(query.sequence_dependencies());
                 }
                 Filter::Scalar(s) | Filter::Null(s, _) => s.sequence_dependencies(out),
                 Filter::Compare(a, _, b) => {
@@ -1803,6 +2551,9 @@ impl Query {
                     c.filter.as_ref().is_some_and(filter)
                         || c.group.iter().any(scalar_has_undefined_routine)
                         || c.having.as_ref().is_some_and(filter)
+                }
+                Filter::InSubquery { value, query, .. } => {
+                    scalar_has_undefined_routine(value) || query.has_undefined_routine()
                 }
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar_has_undefined_routine(s),
                 Filter::Compare(a, _, b) => {
@@ -1863,6 +2614,7 @@ impl Query {
                         && c.group.iter().all(operand)
                         && c.having.as_ref().is_none_or(filter)
                 }
+                Filter::InSubquery { value, query, .. } => operand(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
                 Filter::Compare(a, _, b) => operand(a) && operand(b),
                 Filter::Like {
@@ -1944,27 +2696,30 @@ impl Query {
         }
         let mut parameters = vec![None; count];
         parameters[..declared.len()].clone_from_slice(declared);
-        self.bind_seeded_inner(state, parameters, classify_plain_columns)
+        let mut bound = self.bind_seeded_inner(state, parameters, classify_plain_columns, &[])?;
+        bound.declared = declared.to_vec();
+        Ok(bound)
     }
     pub(super) fn bind_seeded<'a>(
         &'a self,
         state: &'a Relational,
         parameters: Vec<Option<DataType>>,
     ) -> R<BoundQuery<'a>> {
-        self.bind_seeded_inner(state, parameters, false)
+        self.bind_seeded_inner(state, parameters, false, &[])
     }
     pub(super) fn bind_projection_seeded<'a>(
         &'a self,
         state: &'a Relational,
         parameters: Vec<Option<DataType>>,
     ) -> R<BoundQuery<'a>> {
-        self.bind_seeded_inner(state, parameters, true)
+        self.bind_seeded_inner(state, parameters, true, &[])
     }
     fn bind_seeded_inner<'a>(
         &'a self,
         state: &'a Relational,
         mut parameters: Vec<Option<DataType>>,
         classify_plain_columns: bool,
+        outer: &[Source],
     ) -> R<BoundQuery<'a>> {
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
@@ -1990,12 +2745,33 @@ impl Query {
             .iter()
             .map(|s| state.tables.get(&s.name).ok_or(SqlError::UnknownTable))
             .collect::<R<Vec<_>>>()?;
+        let missing = |c: &ColumnRef, error| {
+            let correlated = if let Some(q) = &c.qualifier {
+                !self.sources.iter().any(|s| q == &s.alias)
+                    && outer.iter().any(|s| q == &s.alias || q == &s.name)
+            } else {
+                let has_column = |source: &Source| {
+                    state.tables.get(&source.name).is_some_and(|t| {
+                        t.columns
+                            .iter()
+                            .enumerate()
+                            .any(|(n, column)| column.name == c.name && t.hidden_rowid() != Some(n))
+                    })
+                };
+                !self.sources.iter().any(has_column) && outer.iter().any(has_column)
+            };
+            if correlated {
+                SqlError::Unsupported
+            } else {
+                error
+            }
+        };
         let resolve = |c: &ColumnRef, scope: usize| -> R<BoundColumn> {
             if c.qualifier
                 .as_ref()
                 .is_some_and(|q| !self.sources.iter().take(scope).any(|s| q == &s.alias))
             {
-                return Err(SqlError::UnknownTable);
+                return Err(missing(c, SqlError::UnknownTable));
             }
             let mut found = None;
             for (source, (s, t)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
@@ -2011,8 +2787,14 @@ impl Query {
                     found = Some(BoundColumn { source, column });
                 }
             }
-            found.ok_or(SqlError::UnknownColumn)
+            found.ok_or_else(|| missing(c, SqlError::UnknownColumn))
         };
+        if self.has_in_subquery()
+            && let Some(f) = self.where_filter()
+        {
+            f.infer_outer(&mut parameters, &resolve, &tables)?;
+        }
+        let subqueries = self.bind_subqueries(state, &mut parameters, outer, &resolve, &tables)?;
         if let Some(filter) = self.where_filter() {
             aggregate_filter::validate_filter(filter, &parameters, &resolve, &tables)?;
         }
@@ -2052,7 +2834,7 @@ impl Query {
             join.on.infer(&mut parameters, &scoped, &tables)?;
         }
         if grouped {
-            return grouping::bind(self, &tables, parameters, &resolve);
+            return grouping::bind(self, &tables, parameters, &resolve, subqueries);
         }
         let mut items = vec![];
         let mut unresolved_count_parameters = Vec::new();
@@ -2085,7 +2867,7 @@ impl Query {
             }
         }
         if let Some(f) = self.where_filter() {
-            f.infer(&mut parameters, &resolve, &tables)?;
+            f.infer_with_subqueries(&mut parameters, &resolve, &tables, &subqueries)?;
         }
         for (e, _, _) in &self.order {
             e.infer(None, &mut parameters, &resolve, &tables)?;
@@ -2340,7 +3122,7 @@ impl Query {
         }
         let filter = self
             .where_filter()
-            .map(|f| f.bind(&parameters, &resolve, &tables))
+            .map(|f| f.bind_with_subqueries(&parameters, &resolve, &tables, &subqueries))
             .transpose()?;
         let order = self
             .order
@@ -2363,6 +3145,8 @@ impl Query {
             order,
             aggregate,
             grouping: None,
+            subqueries,
+            declared: vec![],
         })
     }
 }
@@ -2397,6 +3181,8 @@ pub(super) struct BoundQuery<'a> {
     order: Vec<(BoundScalar, bool, bool)>,
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
+    subqueries: Vec<(usize, BoundQuery<'a>)>,
+    declared: Vec<Option<DataType>>,
 }
 struct Tuple {
     values: Vec<Vec<Value>>,
@@ -2419,7 +3205,7 @@ fn join_rows<'a>(
     input: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
     params: &'a [Value],
     meter: &'a mut scan::Meter<'_>,
-    visits: &'a mut usize,
+    visits: &'a Cell<usize>,
 ) -> impl Iterator<Item = R<Tuple>> + 'a {
     struct Frame<'a> {
         rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
@@ -2450,10 +3236,7 @@ fn join_rows<'a>(
                 if let Some(candidate) = candidate {
                     meter.tick()?;
                     if depth > 0 {
-                        *visits = visits.checked_add(1).ok_or(SqlError::Limit)?;
-                        if *visits > MAX_JOIN_VISITS {
-                            return Err(SqlError::Limit);
-                        }
+                        charge_candidate(visits)?;
                     }
                     let candidate = candidate?;
                     if depth == 0 {
@@ -2711,12 +3494,15 @@ impl BoundQuery<'_> {
     /// Collect complete mutation rows in primary-key order, retaining their keys.
     pub(super) fn matching_rows(
         &self,
-        _state: &Relational,
+        state: &Relational,
         source: &dyn scan::RowSource,
         params: &[Value],
         retention: &mut scan::Retention,
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Vec<(Vec<u8>, SqlRow)>> {
+        let execution = Execution::new(cancel, &self.declared);
+        let mut cancel_impl = || execution.cancelled();
+        let cancel = &mut cancel_impl;
         if self.tables.len() != 1 || !self.joins.is_empty() || self.aggregate {
             return Err(SqlError::Unsupported);
         }
@@ -2749,7 +3535,9 @@ impl BoundQuery<'_> {
                 version: row.row.version,
             };
             if let Some(filter) = &self.filter
-                && filter.eval(&tuple, params, &mut work)? != Some(true)
+                && filter.eval_with_subqueries(
+                    &tuple, params, &mut work, self, state, source, &execution,
+                )? != Some(true)
             {
                 return Ok(None);
             }
@@ -2784,10 +3572,31 @@ impl BoundQuery<'_> {
         cancel: &mut impl FnMut() -> bool,
         declared: &[Option<DataType>],
     ) -> R<SqlResult> {
+        let execution = Execution::new(cancel, declared);
+        self.execute_context(state, source, params, declared, &execution, false)
+    }
+    fn execute_context(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        declared: &[Option<DataType>],
+        execution: &Execution<'_>,
+        subquery: bool,
+    ) -> R<SqlResult> {
+        let mut cancel_impl = || execution.cancelled();
+        let cancel = &mut cancel_impl;
         if self.aggregate && cancel() {
             return Err(SqlError::Aborted);
         }
-        for (v, ty) in params.iter().zip(&self.parameters) {
+        let used = subquery.then(|| self.query.used_parameters());
+        for (index, (v, ty)) in params.iter().zip(&self.parameters).enumerate() {
+            if used
+                .as_ref()
+                .is_some_and(|used| !used.contains(&(index + 1)))
+            {
+                continue;
+            }
             check(
                 v,
                 &ColumnDef {
@@ -2799,7 +3608,7 @@ impl BoundQuery<'_> {
             )?;
         }
         if let Some(grouping) = &self.grouping {
-            return grouping.execute(self, state, source, params, cancel);
+            return grouping.execute(self, state, source, params, execution);
         }
         let limit = match &self.query.limit {
             Some(e) => {
@@ -2819,6 +3628,16 @@ impl BoundQuery<'_> {
             }
             None => None,
         };
+        if self.query.explain && self.tables.is_empty() && self.query.has_in_subquery() {
+            return Ok(SqlResult {
+                columns: vec!["plan".into()],
+                rows: vec![SqlRow {
+                    values: vec![Value::Text("TableFree; InSubquery; OutputLimit".into())],
+                    version: 0,
+                }],
+                affected: 0,
+            });
+        }
         if self.tables.is_empty() {
             if self.aggregate || self.query.explain {
                 return Err(SqlError::Unsupported);
@@ -2843,7 +3662,9 @@ impl BoundQuery<'_> {
                 };
                 let mut work = 0;
                 if let Some(f) = &self.filter
-                    && f.eval(&row, params, &mut work)? != Some(true)
+                    && f.eval_with_subqueries(
+                        &row, params, &mut work, self, state, source, execution,
+                    )? != Some(true)
                 {
                     return Ok(result);
                 }
@@ -2899,6 +3720,9 @@ impl BoundQuery<'_> {
                     "; StableSort"
                 });
             }
+            if self.query.has_in_subquery() {
+                plan.push_str("; InSubquery");
+            }
             plan.push_str("; OutputLimit");
             return Ok(SqlResult {
                 columns: vec!["plan".into()],
@@ -2931,13 +3755,12 @@ impl BoundQuery<'_> {
             scan::KeyRange::from_bounds(bounds)
         };
         let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
-        let mut meter = if self.aggregate || !self.joins.is_empty() {
+        let mut meter = if subquery || self.aggregate || !self.joins.is_empty() {
             scan::Meter::per_row(cancel)
         } else {
             scan::Meter::new(cancel)
         };
-        let mut candidate_work = 0;
-        let joined = join_rows(self, source, input, params, &mut meter, &mut candidate_work);
+        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits);
         let filtered = joined.filter_map(|row| {
             let row = match row {
                 Ok(row) => row,
@@ -2947,7 +3770,17 @@ impl BoundQuery<'_> {
             match self
                 .filter
                 .as_ref()
-                .map(|f| f.eval(&row, params, &mut filter_work))
+                .map(|f| {
+                    f.eval_with_subqueries(
+                        &row,
+                        params,
+                        &mut filter_work,
+                        self,
+                        state,
+                        source,
+                        execution,
+                    )
+                })
                 .transpose()
             {
                 Ok(None | Some(Some(true))) => Some(Ok(row)),
@@ -2973,6 +3806,41 @@ impl BoundQuery<'_> {
         // Aggregate inputs keep the statement-wide scalar work budget (DD-0068
         // aggregate_scalar_work_budget_is_shared_over_full_input).
         let mut aggregate_work_bytes = 0usize;
+        if self.query.distinct() && !self.aggregate {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+            let mut unique_rows = Vec::new();
+            for row in filtered {
+                let row = row?;
+                let projected = self.project_tuple(&row, params, &mut 0, &mut 0)?;
+                let key = grouping::Key(projected.values.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+                if unique_rows.len() >= scan::MAX_QUERY_ROWS {
+                    return Err(SqlError::Limit);
+                }
+                let keys = self
+                    .order
+                    .iter()
+                    .map(|(s, _, _)| s.eval(&row, params, &mut 0))
+                    .collect::<R<Vec<_>>>()?;
+                retention.charge(
+                    projected.values.iter().map(value_bytes).sum::<usize>() * 2
+                        + keys.iter().map(value_bytes).sum::<usize>()
+                        + 8 * std::mem::size_of::<Value>(),
+                )?;
+                unique_rows.push((projected, keys));
+            }
+            unique_rows.sort_by(|(_, a), (_, b)| order_values(a, b, &self.order));
+            for (row, _) in page.apply(unique_rows.into_iter()) {
+                for value in &row.values {
+                    charge(&mut result_bytes, value)?;
+                }
+                result.rows.push(row);
+            }
+            return Ok(result);
+        }
         if self.aggregate {
             let mut values = self
                 .items
@@ -3100,6 +3968,36 @@ impl BoundQuery<'_> {
     }
 }
 
+fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -> Ordering {
+    for ((a, b), (_, desc, first)) in a.iter().zip(b).zip(order) {
+        let ord = match (a, b) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => {
+                if *first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (_, Value::Null) => {
+                if *first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            _ => {
+                let ord = cmp(a, b);
+                if *desc { ord.reverse() } else { ord }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 pub(super) fn coerce_clocked(
     v: Value,
     t: &DataType,
@@ -3114,6 +4012,14 @@ mod aggregate_tests;
 impl BoundFilter {
     fn attach_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
         match self {
+            Self::InSubquery {
+                value,
+                clock: saved,
+                ..
+            } => {
+                value.attach_clock(clock);
+                *saved = clock.cloned();
+            }
             Self::Scalar(a) | Self::Null(a, _) => a.attach_clock(clock),
             Self::Compare(a, _, b) => {
                 a.attach_clock(clock);
@@ -3144,6 +4050,13 @@ impl BoundQuery<'_> {
         mut self,
         clock: Option<&super::clock::ExecutionClock>,
     ) -> Self {
+        self.attach_execution_clock(clock);
+        self
+    }
+    fn attach_execution_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
+        for (_, subquery) in &mut self.subqueries {
+            subquery.attach_execution_clock(clock);
+        }
         if let Some(grouping) = &mut self.grouping {
             grouping.attach_clock(clock, &mut self.joins);
         } else {
@@ -3164,7 +4077,6 @@ impl BoundQuery<'_> {
         for (a, _, _) in &mut self.order {
             a.attach_clock(clock);
         }
-        self
     }
 }
 
@@ -3455,7 +4367,7 @@ mod join_visit_budget_tests {
             let bound = query.bind(&state, 0, &[]).unwrap();
             let source = scan::LegacyRows(&state);
             for remaining in [candidates, candidates - 1] {
-                let mut visits = MAX_JOIN_VISITS - remaining;
+                let visits = Cell::new(MAX_JOIN_VISITS - remaining);
                 let mut cancel = || false;
                 let mut meter = scan::Meter::per_row(&mut cancel);
                 let input = source
@@ -3468,14 +4380,14 @@ mod join_visit_budget_tests {
                         scan::Direction::Forward,
                     )
                     .unwrap();
-                let result = join_rows(&bound, &source, input, &[], &mut meter, &mut visits)
+                let result = join_rows(&bound, &source, input, &[], &mut meter, &visits)
                     .collect::<R<Vec<_>>>();
                 if remaining == candidates {
                     assert_eq!(result.unwrap().len(), outputs);
-                    assert_eq!(visits, MAX_JOIN_VISITS);
+                    assert_eq!(visits.get(), MAX_JOIN_VISITS);
                 } else {
                     assert!(matches!(result, Err(SqlError::Limit)));
-                    assert_eq!(visits, MAX_JOIN_VISITS + 1);
+                    assert_eq!(visits.get(), MAX_JOIN_VISITS + 1);
                 }
             }
         }
@@ -3748,3 +4660,117 @@ pub(super) use constraints::{
     constraint_check, constraint_deparse, constraint_key, constraint_key_supported,
     constraint_types_compatible, constraint_validate,
 };
+
+#[cfg(test)]
+mod in_subquery_execution_tests {
+    use super::*;
+    struct CountingSource<'a> {
+        rows: scan::LegacyRows<'a>,
+        child: u64,
+        visits: Cell<usize>,
+    }
+    impl scan::RowSource for CountingSource<'_> {
+        fn scan<'s>(
+            &'s self,
+            table: &TableDef,
+            range: &scan::KeyRange,
+            direction: scan::Direction,
+        ) -> R<Box<dyn Iterator<Item = R<scan::SourceRow<'s>>> + 's>> {
+            let child = table.id == self.child;
+            Ok(Box::new(self.rows.scan(table, range, direction)?.inspect(
+                move |_| {
+                    if child {
+                        self.visits.set(self.visits.get() + 1);
+                    }
+                },
+            )))
+        }
+        fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> R<Option<scan::SourceRow<'s>>> {
+            self.rows.get(table, key)
+        }
+    }
+    fn state() -> Relational {
+        let mut state = Relational::default();
+        for sql in [
+            "CREATE TABLE in_outer(id int PRIMARY KEY)",
+            "CREATE TABLE in_inner(id int PRIMARY KEY)",
+            "INSERT INTO in_outer VALUES(1),(2),(3)",
+            "INSERT INTO in_inner VALUES(1),(2),(3)",
+        ] {
+            let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        state
+    }
+    fn query(sql: &str) -> Query {
+        Query::parse(&mut Parser {
+            tokens: lex(sql).unwrap(),
+            at: 0,
+            params: BTreeSet::new(),
+        })
+        .unwrap()
+    }
+    #[test]
+    fn subquery_cache_is_once_per_execution_and_cancel_stops_child_scan() {
+        let state = state();
+        let query = query("SELECT id FROM in_outer WHERE id IN(SELECT id FROM in_inner)");
+        let bound = query.bind(&state, 0, &[]).unwrap();
+        let source = CountingSource {
+            rows: scan::LegacyRows(&state),
+            child: state.tables["in_inner"].id,
+            visits: Cell::new(0),
+        };
+        for visits in [3, 6] {
+            assert_eq!(
+                bound
+                    .execute(&state, &source, &[], &mut || false)
+                    .unwrap()
+                    .rows
+                    .len(),
+                3
+            );
+            assert_eq!(source.visits.get(), visits);
+        }
+        source.visits.set(0);
+        let mut polls = 0;
+        assert_eq!(
+            bound.execute(&state, &source, &[], &mut || {
+                polls += 1;
+                polls == 2
+            }),
+            Err(SqlError::Aborted)
+        );
+        assert_eq!(source.visits.get(), 2);
+        assert_eq!(polls, 2);
+    }
+    #[test]
+    fn linear_membership_budget_is_inclusive_and_shared_with_joins_and_nested_queries() {
+        let state = state();
+        let query = query(
+            "SELECT o.id FROM in_outer o JOIN in_inner j ON o.id=j.id WHERE o.id::double precision IN(SELECT id FROM in_inner WHERE id::double precision IN(SELECT id FROM in_inner LIMIT 1) LIMIT 1) LIMIT 1",
+        );
+        let bound = query.bind(&state, 0, &[]).unwrap();
+        let source = scan::LegacyRows(&state);
+        for remaining in [3, 2] {
+            let mut cancel = || false;
+            let execution = Execution::new(&mut cancel, &[]);
+            execution.visits.set(MAX_JOIN_VISITS - remaining);
+            let result = bound.execute_context(&state, &source, &[], &[], &execution, false);
+            if remaining == 3 {
+                assert_eq!(result.unwrap().rows.len(), 1);
+                assert_eq!(execution.visits.get(), MAX_JOIN_VISITS);
+            } else {
+                assert_eq!(result, Err(SqlError::Limit));
+                assert_eq!(execution.visits.get(), MAX_JOIN_VISITS + 1);
+            }
+        }
+    }
+    #[test]
+    fn sequence_only_does_not_hide_nested_table_reads() {
+        let query = query("SELECT nextval('seq') WHERE 1 IN(SELECT id FROM in_inner)");
+        assert!(!query.sequence_only());
+        assert!(!query.is_table_free());
+        assert!(!query.deferred_routine_only());
+        assert_eq!(query.read_tables(), vec!["in_inner"]);
+    }
+}

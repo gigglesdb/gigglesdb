@@ -435,6 +435,20 @@ fn thousand_literal_membership_list_keeps_bounded_filter_depth() {
 fn membership_and_between_reject_empty_lists_subqueries_and_symmetric_ranges() {
     let (_a, mut s) = db();
     fixture(&mut s, 3);
+    assert_eq!(
+        run(
+            &mut s,
+            "SELECT id FROM scan_rows WHERE id IN (SELECT id FROM scan_rows) ORDER BY id"
+        ),
+        ids(0..3)
+    );
+    assert!(
+        run(
+            &mut s,
+            "SELECT id FROM scan_rows WHERE id NOT IN (SELECT id FROM scan_rows)"
+        )
+        .is_empty()
+    );
     for predicate in ["id IN ()", "id NOT IN ()"] {
         assert_eq!(
             s.execute(&format!("SELECT id FROM scan_rows WHERE {predicate}"), &[], None),
@@ -443,8 +457,6 @@ fn membership_and_between_reject_empty_lists_subqueries_and_symmetric_ranges() {
         );
     }
     for predicate in [
-        "id IN (SELECT id FROM scan_rows)",
-        "id NOT IN (SELECT id FROM scan_rows)",
         "id BETWEEN SYMMETRIC 3 AND 7",
         "id NOT BETWEEN SYMMETRIC 3 AND 7",
         "id ! 1",
