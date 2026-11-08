@@ -35,7 +35,7 @@ use returning::Returning;
 pub(crate) mod secondary_index;
 pub(crate) mod secondary_index_access;
 mod secondary_index_adapter;
-pub(crate) use secondary_index_adapter::BatchRowChange;
+pub(crate) use secondary_index_adapter::{BatchRowChange, UpdateUnique};
 mod secondary_index_catalog;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
@@ -3150,6 +3150,8 @@ impl Relational {
                     row_check(t, &row.values)?;
                     self.check_insert_candidate(t, &row.values)?;
                     let new_key = pk(t, &row.values)?;
+                    // One-row UPDATE: per-row and statement-end UNIQUE checking coincide, so the
+                    // existing final-batch validation is exact here; no UpdateUnique occupancy needed.
                     let mut next_version = self.next_version;
                     row.version = allocate(&mut next_version)?;
                     returned_rows = returning::project(&returning, self, params, &[&row])?;

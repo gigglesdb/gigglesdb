@@ -550,6 +550,85 @@ pub(crate) struct BatchRowChange<'a> {
     pub old: Option<(&'a [u8], &'a SqlRow)>,
     pub new: Option<(&'a [u8], &'a SqlRow)>,
 }
+/// SQL immediate UNIQUE occupancy retains unvisited OLD and visited NEW tuples.
+/// Callers have admitted the complete mutation snapshot and secondary budgets.
+/// The publisher still validates the complete final batch atomically.
+/// Built once per multi-row statement (searched UPDATE, ON CONFLICT); the O(rows) build matches
+/// the legacy engine's existing unique lookups, which also scan (see stored_preflight).
+/// Single-row point UPDATEs do not build it: per-row and final-batch checks coincide there.
+pub(crate) struct UpdateUnique {
+    indexes: Vec<UpdateUniqueIndex>,
+}
+struct UpdateUniqueIndex {
+    columns: Vec<usize>,
+    occupied: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+impl UpdateUnique {
+    pub(crate) fn new(
+        state: &Relational,
+        table: &TableDef,
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<Self> {
+        let mut indexes = Vec::new();
+        for descriptor in state
+            .secondary
+            .descriptors()
+            .iter()
+            .filter(|d| d.table == table.id && d.unique)
+        {
+            let columns = descriptor
+                .columns
+                .iter()
+                .map(|id| column(table, *id))
+                .collect::<R<Vec<_>>>()?;
+            let mut occupied = BTreeMap::new();
+            for (key, row) in state.rows.get(&table.id).ok_or(SqlError::UnknownTable)? {
+                tick(cancel)?;
+                if let Some(tuple) = Self::tuple(&columns, &row.values)? {
+                    occupied.insert(tuple, key.clone());
+                }
+            }
+            indexes.push(UpdateUniqueIndex { columns, occupied });
+        }
+        Ok(Self { indexes })
+    }
+    fn tuple(columns: &[usize], values: &[Value]) -> R<Option<Vec<u8>>> {
+        if columns.iter().any(|column| values[*column] == Value::Null) {
+            return Ok(None);
+        }
+        tuple_len(columns.iter().map(|column| &values[*column]))?;
+        encode_tuple(columns.iter().map(|column| &values[*column])).map(Some)
+    }
+    pub(crate) fn visit(
+        &mut self,
+        old: Option<(&[u8], &SqlRow)>,
+        key: &[u8],
+        values: &[Value],
+        cancel: &mut impl FnMut() -> bool,
+    ) -> R<()> {
+        for UpdateUniqueIndex { columns, occupied } in &mut self.indexes {
+            tick(cancel)?;
+            let tuple = Self::tuple(columns, values)?;
+            if let Some(tuple) = &tuple
+                && occupied
+                    .get(tuple)
+                    .is_some_and(|owner| old.is_none_or(|(old_key, _)| owner.as_slice() != old_key))
+            {
+                return Err(SqlError::Duplicate);
+            }
+            if let Some((_, old)) = old
+                && let Some(tuple) = Self::tuple(columns, &old.values)?
+            {
+                occupied.remove(&tuple);
+            }
+            if let Some(tuple) = tuple {
+                occupied.insert(tuple, key.to_vec());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Relational {
     /// Next unassigned row version of this exact relational state.
     pub(crate) fn next_version_engine(&self) -> u64 {

@@ -1,5 +1,5 @@
 //! Searched mutations stage every postimage before publishing one batch.
-//! PostgreSQL uses physical heap order and GigglesDB key order for PK uniqueness; they agree for ascending key loads.
+//! PostgreSQL uses physical heap order and GigglesDB key order for immediate PK and secondary UNIQUE checks; they agree for ascending key loads.
 use super::secondary_index_adapter::BatchRowChange;
 use super::*;
 
@@ -92,6 +92,9 @@ pub(super) fn route(
     let mut postimages = Vec::with_capacity(matched.len());
     let mut postkeys = Vec::with_capacity(matched.len());
     let mut vacated = BTreeSet::new();
+    let mut unique = updating
+        .then(|| secondary_index_adapter::UpdateUnique::new(state, table, cancel))
+        .transpose()?;
     for (key, old) in &matched {
         if cancel() {
             return Err(SqlError::Aborted);
@@ -113,6 +116,12 @@ pub(super) fn route(
             {
                 return Err(SqlError::Duplicate);
             }
+            unique.as_mut().expect("UPDATE occupancy").visit(
+                Some((key, old)),
+                &new_key,
+                &row.values,
+                cancel,
+            )?;
             vacated.insert(key.as_slice());
             retention.charge(retained_row_bytes(&new_key, &row)?)?;
             row.version = allocate(&mut next_version)?;

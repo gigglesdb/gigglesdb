@@ -564,11 +564,24 @@ pub(super) fn plan_unique_conflict<'s>(
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let mut unique =
+            crate::relational::UpdateUnique::new(src, table, &mut || cancel()).map_err(sql)?;
         for (index, post) in postimages.iter().enumerate() {
             tick(cancel)?;
             if !post.changed() {
                 continue;
             }
+            let values = (0..table.columns.len())
+                .map(|column| value(post, &resolved[index], &incoming[index], column).clone())
+                .collect::<Vec<_>>();
+            unique
+                .visit(
+                    resolved[index].winner,
+                    &final_keys[index],
+                    &values,
+                    &mut || cancel(),
+                )
+                .map_err(sql)?;
             let old_key = resolved[index].winner.map(|(key, _)| key);
             if old_key != Some(final_keys[index].as_slice())
                 && occupied.contains(&final_keys[index])
