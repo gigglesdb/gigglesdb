@@ -279,7 +279,7 @@ fn sql_insert_null_fill_not_null_arity_and_type_match_existing_insert() {
     fail(
         &mut s,
         "INSERT INTO items (id,n) VALUES (1,10),(2,'wrong')",
-        SqlError::Type,
+        SqlError::InvalidTextRepresentation,
     );
     assert!(rows(&mut s).is_empty());
     assert_eq!(
@@ -373,7 +373,7 @@ fn sql_insert_primary_update_excluded_existing_and_parameter() {
     fail(
         &mut s,
         "INSERT INTO items (id,n) VALUES (1,1) ON CONFLICT (id) DO UPDATE SET n='wrong'",
-        SqlError::Type,
+        SqlError::InvalidTextRepresentation,
     );
 }
 

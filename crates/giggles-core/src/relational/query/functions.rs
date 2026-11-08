@@ -8,6 +8,7 @@ mod comparison;
 #[cfg(test)]
 mod cross_binding_tests;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
+mod datetime_input;
 mod degree_math;
 mod greatest;
 #[cfg(test)]
@@ -175,7 +176,7 @@ fn coalesce_hint(
         .and_then(|ty| common_result_type([ty]).ok())
 }
 pub(in crate::relational) fn zone_dependent_literal(value: &Value, target: &DataType) -> bool {
-    if *target != DataType::TimestampTz || !matches!(value, Value::Text(_)) {
+    if !datetime_input::target(target) || !matches!(value, Value::Text(_)) {
         return false;
     }
     matches!(
@@ -191,7 +192,7 @@ pub(in crate::relational) fn coerce_clocked(
     if value == Value::Null {
         return Ok(value);
     }
-    if matches!(value, Value::Text(_)) && *target == DataType::TimestampTz {
+    if matches!(value, Value::Text(_)) && datetime_input::target(target) {
         return session_cast(value, &DataType::Text, target, clock);
     }
     cast_value(value, target, &mut 0)
@@ -206,6 +207,26 @@ fn session_sensitive(source: &DataType, target: &DataType) -> bool {
     )
 }
 fn literal_cast_node(value: Value, target: &DataType) -> R<Node> {
+    if let Value::Text(text) = &value
+        && datetime_input::target(target)
+        && (datetime_input::clock_word(text)
+            || *target == DataType::TimeTz
+                && match (
+                    datetime_input::timetz(text, 0),
+                    datetime_input::timetz(text, 3600),
+                ) {
+                    (Ok(a), Ok(b)) => a != b,
+                    _ => false,
+                })
+    {
+        return Ok(Node::SessionCast(
+            Box::new(BoundScalar {
+                ty: DataType::Text,
+                node: Node::Literal(value),
+            }),
+            None,
+        ));
+    }
     if let Value::Text(text) = &value
         && *target == DataType::TimestampTz
     {
@@ -232,7 +253,7 @@ fn literal_cast_node(value: Value, target: &DataType) -> R<Node> {
             None,
         ));
     }
-    Ok(Node::Literal(cast_value(value, target, &mut 0)?))
+    Ok(Node::Literal(coerce_clocked(value, target, None)?))
 }
 fn session_cast(
     value: Value,
@@ -264,19 +285,8 @@ fn session_cast(
             n.to_text_with_extra_float_digits(clock.extra_float_digits())
                 .map_err(pg_error)?,
         )),
-        (Value::Text(text), DataType::TimestampTz) => {
-            let zone = clock
-                .zone()
-                .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
-            TimestampTz::parse_in_session(
-                &text,
-                &giggles_pg_types::temporal::SessionSettings {
-                    date_order: giggles_pg_types::temporal::DateOrder::default(),
-                    zone,
-                },
-            )
-            .map(Value::TimestampTz)
-            .map_err(|e| temporal::parse_error(e, false))
+        (Value::Text(text), target) if datetime_input::target(target) => {
+            datetime_input::parse(text, target, clock)
         }
         (Value::TimestampTz(t), DataType::Text) => Ok(Value::Text(
             t.format_in_zone(
@@ -995,7 +1005,7 @@ impl Scalar {
             ),
             Self::Cast(a, ty) => {
                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a.as_ref()
-                    && *ty == DataType::TimestampTz
+                    && datetime_input::target(ty)
                 {
                     return Ok(BoundScalar {
                         ty: ty.clone(),
@@ -2169,7 +2179,7 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
         (Value::Float4(n), DataType::Text) => Value::Text(n.to_text()),
         (Value::Float8(n), DataType::Text) => Value::Text(n.to_text()),
         (Value::Text(s), DataType::Numeric) => {
-            Value::Numeric(Numeric::parse(&s).map_err(pg_error)?)
+            Value::Numeric(Numeric::parse(&s).map_err(|e| numeric_input_error(&s, e))?)
         }
         (Value::Text(s), DataType::Real) => Value::Float4(Float4::parse(&s).map_err(pg_error)?),
         (Value::Text(s), DataType::DoublePrecision) => {
@@ -2314,7 +2324,7 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
                 .iter()
                 .any(|v| !s.is_empty() && v.starts_with(&s));
             if yes == no {
-                return Err(SqlError::Type);
+                return Err(SqlError::InvalidTextRepresentation);
             }
             Value::Bool(yes)
         }
@@ -2629,6 +2639,57 @@ impl Scalar {
     }
 }
 
+fn numeric_input_error(text: &str, error: giggles_pg_types::Error) -> SqlError {
+    use giggles_pg_types::Error;
+    match error {
+        Error::Syntax | Error::Unimplemented | Error::Binary => SqlError::InvalidTextRepresentation,
+        Error::Range => SqlError::Overflow,
+        Error::Limit if text.len() > giggles_pg_types::MAX_TEXT => SqlError::Limit,
+        Error::Limit => {
+            let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
+            let mut bytes = text.bytes().peekable();
+            if matches!(bytes.peek(), Some(b'+' | b'-')) {
+                bytes.next();
+            }
+            let mut digits = 0;
+            let mut dot = false;
+            while let Some(&b) = bytes.peek() {
+                if b.is_ascii_digit() {
+                    digits += 1;
+                } else if b == b'.' && !dot {
+                    dot = true;
+                } else {
+                    break;
+                }
+                bytes.next();
+            }
+            if digits == 0 {
+                return SqlError::InvalidTextRepresentation;
+            }
+            if matches!(bytes.peek(), Some(b'e' | b'E')) {
+                bytes.next();
+                if matches!(bytes.peek(), Some(b'+' | b'-')) {
+                    bytes.next();
+                }
+                let mut exponent_digits = 0;
+                while bytes.peek().is_some_and(u8::is_ascii_digit) {
+                    exponent_digits += 1;
+                    bytes.next();
+                }
+                if exponent_digits == 0 {
+                    return SqlError::InvalidTextRepresentation;
+                }
+            }
+            if bytes.next().is_some() {
+                SqlError::InvalidTextRepresentation
+            } else {
+                SqlError::Overflow
+            }
+        }
+        Error::DivisionByZero => SqlError::DivisionByZero,
+    }
+}
+
 fn pg_error(e: giggles_pg_types::Error) -> SqlError {
     match e {
         giggles_pg_types::Error::Limit => SqlError::Limit,
@@ -2802,14 +2863,18 @@ impl BoundScalar {
         if &self.ty == target {
             return Ok(self);
         }
-        if !(number(&self.ty) && number(target)
-            || *target == DataType::Text && (number(&self.ty) || self.ty == DataType::Boolean))
+        let node = if number(&self.ty) && number(target)
+            || *target == DataType::Text && (number(&self.ty) || self.ty == DataType::Boolean)
         {
+            cast_node(self, target)
+        } else if assignment::compatible(&self.ty, target) {
+            Node::SessionCast(Box::new(self), None)
+        } else {
             return Err(SqlError::Type);
-        }
+        };
         Ok(Self {
             ty: target.clone(),
-            node: cast_node(self, target),
+            node,
         })
     }
 }

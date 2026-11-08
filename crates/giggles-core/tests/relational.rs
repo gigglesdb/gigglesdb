@@ -158,10 +158,10 @@ fn signed_boundaries_and_no_coercion() {
         "INSERT INTO widths VALUES(2,32768,1)",
         "INSERT INTO widths VALUES(2,1,2147483648)",
         "INSERT INTO widths VALUES(9223372036854775808,1,1)",
-        "SELECT id FROM widths WHERE id='1'",
     ] {
-        err(&mut s, q, E::Type);
+        err(&mut s, q, E::Overflow);
     }
+    err(&mut s, "SELECT id FROM widths WHERE id='1'", E::Type);
     assert_eq!(
         s.execute(
             "INSERT INTO widths VALUES($1,$2,$3)",

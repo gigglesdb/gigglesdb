@@ -159,7 +159,11 @@ fn missing_rows_skip_scalar_evaluation_but_validate_types_and_inputs() {
                 E::UnknownTable,
             ),
             ("UPDATE items SET n=missing+1 WHERE id=99", E::UnknownColumn),
-            ("UPDATE items SET n='bad' WHERE id=99", E::Type),
+            // PG18.6: unknown literals take the column's input function (22P02).
+            (
+                "UPDATE items SET n='bad' WHERE id=99",
+                E::InvalidTextRepresentation,
+            ),
             // PG18.6 rejects repeated SET targets with 42601.
             ("UPDATE items SET n=n+1,n=n+2 WHERE id=99", E::Syntax),
         ] {
@@ -210,13 +214,18 @@ fn assignment_casts_and_plain_literals_keep_their_existing_contracts() {
         assert_eq!(run(s, "UPDATE items SET id=id+1 WHERE id=1").affected, 1);
         assert_eq!(run(s, "UPDATE items SET id=1 WHERE id=2").affected, 1);
         let old = row(s);
-        for (sql, expected) in [
-            ("UPDATE items SET n='12' WHERE id=1", E::Type),
-            ("UPDATE items SET n=sum(n) WHERE id=1", E::GroupingError),
-        ] {
-            error(s, sql, expected);
-            assert_eq!(row(s), old);
-        }
+        // PG18.6: unknown literals take the column's input function (22P02).
+        assert_eq!(run(s, "UPDATE items SET n='12' WHERE id=1").affected, 1);
+        assert_eq!(row(s).values[1], V::Int(12));
+        run(s, "UPDATE items SET n=9 WHERE id=1");
+        // Successful updates advance the row version even after restoring its values.
+        let old = SqlRow {
+            version: row(s).version,
+            ..old
+        };
+        assert_eq!(row(s), old);
+        error(s, "UPDATE items SET n=sum(n) WHERE id=1", E::GroupingError);
+        assert_eq!(row(s), old);
         assert_eq!(run(s, "UPDATE items SET n=n+1").affected, 1);
         assert_eq!(row(s).values[1], V::Int(10));
         // PG18: SET col = DEFAULT on a column without a default assigns NULL.
@@ -235,13 +244,35 @@ fn plain_assignment_errors_preserve_validation_order_and_the_whole_row() {
         for (sql, expected) in [
             // PG18.6 rejects repeated SET targets with 42601.
             ("UPDATE items SET n=1,n=2 WHERE id=1", E::Syntax),
-            ("UPDATE items SET n='x' WHERE id=1", E::Type),
-            ("UPDATE items SET id='x',n='x' WHERE id=1", E::Type),
-            ("UPDATE items SET n='x',id=2 WHERE id=1", E::Type),
-            ("UPDATE items SET n=1,n=2,m='x' WHERE id=1", E::Type),
-            ("UPDATE items SET m='x',n=1,n=2 WHERE id=1", E::Type),
-            ("UPDATE items SET n=1,n='x' WHERE id=1", E::Type),
-            ("UPDATE items SET n='x',n=2 WHERE id=1", E::Type),
+            // PG18.6: unknown literals take the column's input function (22P02).
+            (
+                "UPDATE items SET n='x' WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET id='x',n='x' WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET n='x',id=2 WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET n=1,n=2,m='x' WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET m='x',n=1,n=2 WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET n=1,n='x' WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
+            (
+                "UPDATE items SET n='x',n=2 WHERE id=1",
+                E::InvalidTextRepresentation,
+            ),
         ] {
             error(s, sql, expected);
             assert_eq!(row(s), old, "{sql}");
@@ -408,10 +439,11 @@ fn not_null_checks_only_matched_update_postimages() {
                     assert_eq!(run(s, select).rows.remove(0), old);
                 }
             }
+            // PG18.6: unknown literals take the column's input function (22P02).
             error(
                 s,
                 &format!("UPDATE required SET n='bad' WHERE {predicate}"),
-                E::Type,
+                E::InvalidTextRepresentation,
             );
         }
     });
@@ -426,7 +458,8 @@ fn conflict_set_duplicates_and_guarded_nulls_follow_sql_analysis() {
                 ("n=excluded.n,n=items.n", E::Syntax),
                 ("n=NULL,n=2", E::Syntax),
                 ("n=1,n=2,missing=1", E::UnknownColumn),
-                ("n=1,n=2,m='bad'", E::Type),
+                // PG18.6: unknown literals take the column's input function (22P02).
+                ("n=1,n=2,m='bad'", E::InvalidTextRepresentation),
             ] {
                 error(
                     s,

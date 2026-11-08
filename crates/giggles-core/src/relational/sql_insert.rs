@@ -726,13 +726,8 @@ fn resolved_value(
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
     let value = expression.value(params)?;
-    if matches!(expression, Expr::Literal(_))
-        && (matches!(
-            ty,
-            DataType::Numeric | DataType::Real | DataType::DoublePrecision
-        ) || ty.is_temporal())
-    {
-        query::coerce_clocked(value, ty, clock)
+    if matches!(expression, Expr::Literal(_)) {
+        query::assignment::literal(value, ty, clock)
     } else {
         Ok(value)
     }

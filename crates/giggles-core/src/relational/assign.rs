@@ -106,11 +106,12 @@ pub(super) fn plain_value(
     let mut bound = value.value(params)?;
     // Without a clock (the duplicate-literal pre-check) keep the text: a UTC
     // parse could reject a local value that is in range in the session zone.
-    if clock.is_some()
-        && matches!(value, Expr::Literal(super::Value::Text(_)))
-        && column.data_type == DataType::TimestampTz
+    if matches!(value, Expr::Literal(_))
+        && !(clock.is_none()
+            && matches!(value, Expr::Literal(super::Value::Text(_)))
+            && column.data_type == DataType::TimestampTz)
     {
-        bound = query::coerce_clocked(bound, &column.data_type, clock)?;
+        bound = query::assignment::literal(bound, &column.data_type, clock)?;
     }
     if let Expr::Param(n) = value
         && let Some(Some(declared)) = declared_types.get(n - 1)

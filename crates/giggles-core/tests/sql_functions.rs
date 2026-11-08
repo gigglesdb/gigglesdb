@@ -453,7 +453,16 @@ fn adversarial_cast_binding_and_unknown_literals() {
         "SELECT '\u{a0}1'::integer",
         E::InvalidTextRepresentation,
     );
-    error(&mut s, "SELECT '\u{a0}true'::boolean", E::Type);
+    error(
+        &mut s,
+        "SELECT '\u{a0}true'::boolean",
+        E::InvalidTextRepresentation,
+    );
+    error(
+        &mut s,
+        "SELECT 'maybe'::boolean",
+        E::InvalidTextRepresentation,
+    );
     let p = s
         .prepare("SELECT txt::text,abs(i)::text FROM f LIMIT 0")
         .unwrap();

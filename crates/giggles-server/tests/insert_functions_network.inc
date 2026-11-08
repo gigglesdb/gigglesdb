@@ -143,11 +143,13 @@ async fn insert_functions_prepared_metadata_effects_errors_and_rollback() {
     assert_eq!(response["sqlstate"], "22003");
     assert_eq!(response["stage"], "execute");
     assert_eq!(insert_functions_rows(&f), rows);
-    // Flat literals keep their old path; this is an explicit PG profile gap.
+    // F18: unknown literals use the column's input function; PG18.6 gives INSERT 0 1 with num=2.
     let response =
         insert_functions_extended(&mut raw, "INSERT INTO app(id,num) VALUES(50,'2')", &[]).await;
-    assert_eq!(response["sqlstate"], "42804");
-    assert_eq!(response["stage"], "execute");
+    assert_eq!(response["sqlstate"], serde_json::Value::Null);
+    assert_eq!(response["commands"], serde_json::json!(["INSERT 0 1"]));
+    let response = insert_functions_extended(&mut raw, "DELETE FROM app WHERE id=50", &[]).await;
+    assert_eq!(response["sqlstate"], serde_json::Value::Null);
     assert_eq!(insert_functions_rows(&f), rows);
     temporal_state_cycle(&mut raw, "BEGIN").await;
     let response = insert_functions_extended(

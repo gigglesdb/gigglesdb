@@ -170,9 +170,18 @@ fn nonlinear_error_precedence_and_display_scale() {
     for (q, expected) in [
         ("SELECT ln(-1::numeric)", "Sql(Overflow)"),
         ("SELECT log(1::numeric,2::numeric)", "Sql(DivisionByZero)"),
-        ("SELECT log(NULL::numeric,'bad'::numeric)", "Sql(Type)"),
-        ("SELECT log('bad',2) LIMIT 0", "Sql(Type)"),
-        ("SELECT ln('bad'::numeric) LIMIT 0", "Sql(Type)"),
+        (
+            "SELECT log(NULL::numeric,'bad'::numeric)",
+            "Sql(InvalidTextRepresentation)",
+        ),
+        (
+            "SELECT log('bad',2) LIMIT 0",
+            "Sql(InvalidTextRepresentation)",
+        ),
+        (
+            "SELECT ln('bad'::numeric) LIMIT 0",
+            "Sql(InvalidTextRepresentation)",
+        ),
     ] {
         assert_eq!(
             format!("{:?}", s.execute(q, &[], None).unwrap_err()),

@@ -161,8 +161,14 @@ fn numeric_sqrt_errors_keep_core_categories_and_eager_arguments() {
     for (query, expected) in [
         ("SELECT sqrt('-1'::numeric)", "Sql(Overflow)"),
         ("SELECT sqrt('-Infinity'::numeric)", "Sql(Overflow)"),
-        ("SELECT sqrt('bad'::numeric)", "Sql(Type)"),
-        ("SELECT sqrt('bad'::numeric) LIMIT 0", "Sql(Type)"),
+        (
+            "SELECT sqrt('bad'::numeric)",
+            "Sql(InvalidTextRepresentation)",
+        ),
+        (
+            "SELECT sqrt('bad'::numeric) LIMIT 0",
+            "Sql(InvalidTextRepresentation)",
+        ),
         (
             "SELECT coalesce(NULL::numeric,sqrt('-1'::numeric))",
             "Sql(Overflow)",

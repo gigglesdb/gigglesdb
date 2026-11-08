@@ -92,7 +92,7 @@ fn errors_and_noops_leave_rows_counters_and_sidecar_exact() {
     );
     assert_eq!(s, before);
     assert_eq!(
-        sql(&mut s, "UPDATE items SET tag=2 WHERE id=1", &[]),
+        sql(&mut s, "UPDATE items SET payload=2 WHERE id=1", &[]),
         Err(SqlError::Type)
     );
     assert_eq!(s, before);
@@ -141,6 +141,21 @@ fn errors_and_noops_leave_rows_counters_and_sidecar_exact() {
     };
     assert_eq!(contents(&s), contents(&before));
     assert_eq!(s.secondary, before.secondary);
+    // PG18.6: an int4 literal assigned to a text column uses the assignment cast (UPDATE 1).
+    assert_eq!(
+        sql(&mut s, "UPDATE items SET tag=2 WHERE id=1", &[])
+            .unwrap()
+            .affected,
+        1
+    );
+    assert_eq!(
+        sql(&mut s, "SELECT tag FROM items WHERE id=1", &[])
+            .unwrap()
+            .rows[0]
+            .values,
+        [Value::Text("2".into())]
+    );
+    assert_ne!(s.secondary, before.secondary);
 }
 #[test]
 fn helper_update_size_and_version_failure_roll_back_without_outer_transaction() {

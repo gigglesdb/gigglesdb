@@ -337,9 +337,10 @@ fn malformed_boolean_text_is_copy_local_invalid_input() {
         "INSERT INTO flags VALUES (1,'maybe')",
         "INSERT INTO flags VALUES (1,'maybe'),(2,'true')",
     ] {
+        // PG18.6: unknown literals take the column input function (22P02).
         assert!(matches!(
             s.execute(sql, &[], None),
-            Err(CoreError::Sql(E::Type))
+            Err(CoreError::Sql(E::InvalidTextRepresentation))
         ));
     }
     let (_, p) = s.prepare_copy("COPY flags FROM STDIN").unwrap();

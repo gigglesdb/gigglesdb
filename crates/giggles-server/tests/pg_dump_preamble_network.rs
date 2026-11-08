@@ -116,10 +116,9 @@ async fn bytea_untyped_literal_behavior_without_wo16() {
         observed.push(state);
     }
     println!("WO18 bytea baseline SQLSTATEs: {observed:?}");
-    // Since GD-0058 E3 (1ca74e2) streams SELECT through one path, the bytea
-    // predicate fails typing (42804) like the INSERT instead of reaching the
-    // bounded scan (54000). WO16 changes untyped-literal typing in core.
-    assert_eq!(observed, ["42804", "00000", "42804"]);
+    // F18: the INSERT's unknown bytea literal uses bytea input (PG18.6 INSERT 0 1).
+    // The bytea predicate is still 42804: predicate unknown-literal typing is a pending follow-up (PG returns 1 row).
+    assert_eq!(observed, ["00000", "00000", "42804"]);
     drop(c);
     f.stop().await;
 }

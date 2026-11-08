@@ -1,4 +1,4 @@
-//! Assignment casts for explicitly declared parameters only.
+//! Assignment casts for literals and explicitly declared parameters.
 use super::*;
 use crate::relational::clock::ExecutionClock;
 
@@ -20,6 +20,33 @@ pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) ->
                 | (DataType::Time, DataType::TimeTz | DataType::Interval)
                 | (DataType::TimeTz | DataType::Interval, DataType::Time)
         )
+}
+
+/// Preserve nulls and unknown text input errors; assign typed literals by source type.
+pub(in crate::relational) fn literal(
+    value: Value,
+    target: &DataType,
+    clock: Option<&ExecutionClock>,
+) -> R<Value> {
+    let source = match &value {
+        Value::Null => return Ok(value),
+        Value::Text(_) if *target == DataType::Text => return Ok(value),
+        Value::Text(_) => return crate::relational::query::coerce_clocked(value, target, clock),
+        Value::Int(n) if i32::try_from(*n).is_ok() => DataType::Integer,
+        Value::Int(_) => DataType::BigInt,
+        Value::Numeric(_) => DataType::Numeric,
+        Value::Bool(_) => DataType::Boolean,
+        Value::Bytes(_) => DataType::Bytes,
+        Value::Float4(_) => DataType::Real,
+        Value::Float8(_) => DataType::DoublePrecision,
+        Value::Date(_) => DataType::Date,
+        Value::Time(_) => DataType::Time,
+        Value::TimeTz(_) => DataType::TimeTz,
+        Value::Timestamp(_) => DataType::Timestamp,
+        Value::TimestampTz(_) => DataType::TimestampTz,
+        Value::Interval(_) => DataType::Interval,
+    };
+    convert(value, &source, target, clock)
 }
 
 pub(in crate::relational) fn convert(

@@ -316,17 +316,11 @@ impl Relational {
     }
 }
 
-/// Replace with query::assignment::literal when DD-0068 F18 lands; COPY text input equals unknown-literal assignment.
+/// COPY text input equals unknown-literal assignment (DD-0068 F18).
 pub(super) fn copy_text_field(
     text: String,
     ty: &DataType,
     clock: Option<&clock::ExecutionClock>,
 ) -> R<Value> {
-    query::coerce_clocked(Value::Text(text), ty, clock).map_err(|error| {
-        if *ty == DataType::Boolean && error == SqlError::Type {
-            SqlError::InvalidTextRepresentation
-        } else {
-            error
-        }
-    })
+    query::assignment::literal(Value::Text(text), ty, clock)
 }

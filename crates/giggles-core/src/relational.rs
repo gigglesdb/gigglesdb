@@ -2971,14 +2971,12 @@ impl Relational {
                 }
                 let mut row = defaults::row(self, t, &indexes, clock)?;
                 for (i, v) in indexes.iter().zip(values) {
-                    row[*i] = if matches!(v, Expr::Literal(_))
-                        && matches!(
-                            t.columns[*i].data_type,
-                            DataType::Numeric | DataType::Real | DataType::DoublePrecision
-                        )
-                        || matches!(v, Expr::Literal(_)) && t.columns[*i].data_type.is_temporal()
-                    {
-                        query::coerce_clocked(v.value(params)?, &t.columns[*i].data_type, clock)?
+                    row[*i] = if matches!(v, Expr::Literal(_)) {
+                        query::assignment::literal(
+                            v.value(params)?,
+                            &t.columns[*i].data_type,
+                            clock,
+                        )?
                     } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
                     {
                         assign::plain_value(
