@@ -409,10 +409,13 @@ fn clock_failure_and_both_decision_lease_checks_leave_handle_usable() {
         let calls = Cell::new(0);
         let cancellation = Cancellation::default();
         let result = cancellation.scope(|| {
-            admin.inner.persist_checked(&mut state, true, &mut || {
-                calls.set(calls.get() + 1);
-                calls.get() != reject_at
-            })
+            // Lease rejection persists an unchanged catalog snapshot.
+            admin
+                .inner
+                .persist_checked(&mut state, None, true, &mut || {
+                    calls.set(calls.get() + 1);
+                    calls.get() != reject_at
+                })
         });
         assert!(matches!(result, Err(GuardedPersistError::ClockExpired)));
         assert_eq!(calls.get(), reject_at);

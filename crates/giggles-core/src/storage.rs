@@ -145,6 +145,22 @@ pub(crate) struct State {
     pub next_approval: u64,
     pub origin: Option<u128>,
 }
+fn relation_names(state: &State) -> BTreeMap<(bool, u64), String> {
+    state
+        .sql
+        .tables
+        .values()
+        .map(|table| ((false, table.id), table.name.clone()))
+        .chain(
+            state
+                .sql
+                .catalog_ext()
+                .sequences
+                .iter()
+                .map(|(&id, sequence)| ((true, id), sequence.name.clone())),
+        )
+        .collect()
+}
 #[derive(Serialize, serde::Deserialize)]
 struct Metadata {
     format: u32,
@@ -615,17 +631,18 @@ impl Inner {
         &self,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
-        self.change_inner(false, f)
+        self.change_inner(false, false, f)
     }
     fn change_decision<T>(
         &self,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
-        self.change_inner(true, f)
+        self.change_inner(true, false, f)
     }
     fn change_inner<T>(
         &self,
         decision: bool,
+        authority_managed: bool,
         f: impl FnOnce(&mut State) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         let _ticket = self.enter()?;
@@ -638,32 +655,23 @@ impl Inner {
         let mut s = self.read().inspect_err(|_| {
             self.fenced.store(true, Ordering::Release);
         })?;
-        let previous_tables: BTreeMap<_, _> = s
-            .sql
-            .tables
-            .values()
-            .map(|table| (table.id, table.name.clone()))
-            .collect();
+        let previous_relations = relation_names(&s);
         // Logical errors can still advance the trusted monotonic decision clock.
         let result = f(&mut s);
-        let renames: Vec<_> = s
-            .sql
-            .tables
-            .values()
-            .filter_map(|table| {
-                previous_tables
-                    .get(&table.id)
-                    .filter(|old| **old != table.name)
-                    .map(|old| (old.clone(), table.name.clone()))
-            })
-            .collect();
-        self.persist_checked_mode(&mut s, decision, true, &mut || true, &renames)
-            .map_err(|error| match error {
-                GuardedPersistError::Core(error) => error,
-                GuardedPersistError::ClockExpired => {
-                    unreachable!("ordinary persistence has no clock lease")
-                }
-            })?;
+        self.persist_checked_mode(
+            &mut s,
+            Some(&previous_relations),
+            decision,
+            true,
+            &mut || true,
+            authority_managed,
+        )
+        .map_err(|error| match error {
+            GuardedPersistError::Core(error) => error,
+            GuardedPersistError::ClockExpired => {
+                unreachable!("ordinary persistence has no clock lease")
+            }
+        })?;
         result
     }
     /// Hold authority serialization across durable read admission and evaluation.
@@ -681,17 +689,24 @@ impl Inner {
         let mut s = self.read().inspect_err(|_| {
             self.fenced.store(true, Ordering::Release);
         })?;
+        let previous_relations = relation_names(&s);
         let admitted = admission(&mut s);
         // This write does not decide the business operation. A cancelled or lost
         // invocation can consume read work but cannot publish an unreserved read.
-        self.persist(&mut s, false)?;
+        self.persist(&mut s, Some(&previous_relations), false)?;
         admitted?;
+        let previous_relations = relation_names(&s);
         let result = work(&mut s);
-        self.persist(&mut s, decision)?;
+        self.persist(&mut s, Some(&previous_relations), decision)?;
         result
     }
-    fn persist(&self, s: &mut State, decision: bool) -> Result<(), CoreError> {
-        self.persist_checked(s, decision, &mut || true)
+    fn persist(
+        &self,
+        s: &mut State,
+        previous_relations: Option<&BTreeMap<(bool, u64), String>>,
+        decision: bool,
+    ) -> Result<(), CoreError> {
+        self.persist_checked(s, previous_relations, decision, &mut || true)
             .map_err(|error| match error {
                 GuardedPersistError::Core(error) => error,
                 GuardedPersistError::ClockExpired => {
@@ -702,15 +717,17 @@ impl Inner {
     fn persist_checked(
         &self,
         s: &mut State,
+        previous_relations: Option<&BTreeMap<(bool, u64), String>>,
         decision: bool,
         valid_lease: &mut dyn FnMut() -> bool,
     ) -> Result<(), GuardedPersistError> {
-        self.persist_checked_mode(s, decision, true, valid_lease, &[])
+        self.persist_checked_mode(s, previous_relations, decision, true, valid_lease, false)
     }
     // Caller holds gate; counter reservations share crash/cancellation handling
     // with SQL publication without advancing the SQL conflict generation.
     fn persist_counters(&self, s: &mut State) -> Result<(), CoreError> {
-        self.persist_checked_mode(s, false, false, &mut || true, &[])
+        // Counter reservations do not change relation identities or names.
+        self.persist_checked_mode(s, None, false, false, &mut || true, false)
             .map_err(|error| match error {
                 GuardedPersistError::Core(error) => error,
                 GuardedPersistError::ClockExpired => unreachable!("counter write has no lease"),
@@ -719,11 +736,48 @@ impl Inner {
     fn persist_checked_mode(
         &self,
         s: &mut State,
+        previous_relations: Option<&BTreeMap<(bool, u64), String>>,
         decision: bool,
         bump_generation: bool,
         valid_lease: &mut dyn FnMut() -> bool,
-        table_renames: &[(String, String)],
+        authority_managed: bool,
     ) -> Result<(), GuardedPersistError> {
+        // Callers capture stable relation ids under the gate before mutation.
+        let (renames, forgotten) = if let Some(old) = previous_relations {
+            let new = relation_names(s);
+            let renames: Vec<_> = new
+                .iter()
+                .filter_map(|(id, name)| {
+                    old.get(id)
+                        .filter(|old_name| *old_name != name)
+                        .map(|old_name| (old_name.clone(), name.clone()))
+                })
+                .collect();
+            let mut forgotten: std::collections::BTreeSet<_> = old
+                .iter()
+                .filter(|(id, _)| !new.contains_key(id))
+                .map(|(_, name)| name.clone())
+                .collect();
+            let created: std::collections::BTreeSet<_> = new
+                .iter()
+                .filter(|(id, _)| !old.contains_key(id))
+                .map(|(_, name)| name.clone())
+                .collect();
+            if authority_managed {
+                // The caller has installed authority for the replacement identity.
+                forgotten.retain(|name| !created.contains(name));
+            } else {
+                forgotten.extend(created);
+            }
+            // A rename into a dropped name owns that destination after publication.
+            // Conversely a newly created relation reusing a rename source is cleared.
+            for (_, destination) in &renames {
+                forgotten.remove(destination);
+            }
+            (renames, forgotten)
+        } else {
+            (Vec::new(), std::collections::BTreeSet::new())
+        };
         self.merge_live_sequences(s)?;
         if bump_generation {
             s.sql.generation = s
@@ -760,7 +814,8 @@ impl Inner {
                     t.insert(k.as_slice(), v.as_slice()).map_err(io)?;
                 }
             }
-            roles::rename_tables(&tx, table_renames)?;
+            roles::rename_tables(&tx, &renames)?;
+            roles::forget_relations(&tx, &forgotten)?;
             if point == CrashPoint::BeforeCommit {
                 crash_now();
             }
@@ -1625,6 +1680,7 @@ pub struct SqlSession {
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
     extra_float_digits: i32,
+    authority_managed: bool,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
     pending_sequences: sequences::Pending,
@@ -1646,6 +1702,7 @@ impl Admin {
             transaction_id: None,
             transaction_clock_us: None,
             extra_float_digits: 1,
+            authority_managed: false,
             staged_revision: 0,
             sequence_values: Default::default(),
             pending_sequences: Default::default(),
@@ -1683,6 +1740,13 @@ impl Admin {
     }
 }
 impl SqlSession {
+    /// Mark publications whose creator authority is maintained by the caller.
+    /// Dropped names lose their authority unless the same managed publication
+    /// creates a replacement whose authority the caller has installed.
+    pub fn set_authority_managed(&mut self, managed: bool) {
+        self.authority_managed = managed;
+    }
+
     /// Set the precision used by SQL floating-point text conversions.
     pub fn set_extra_float_digits(&mut self, value: i32) {
         self.extra_float_digits = value;
@@ -2523,6 +2587,24 @@ impl SqlSession {
         }
         Ok(result)
     }
+    /// Check the session's staged relation namespace, or the committed catalog.
+    pub fn relation_exists(&self, name: &str) -> Result<bool, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
+        let exists = |state: &State| {
+            state.sql.tables.contains_key(name)
+                || state
+                    .sql
+                    .catalog_ext()
+                    .sequences
+                    .values()
+                    .any(|sequence| sequence.name == name)
+        };
+        match &self.staged {
+            Some(state) => Ok(exists(state)),
+            None => self.admin.inner.inspect(|state| Ok(exists(state))),
+        }
+    }
+
     /// Resolve a staged table name to its durable owner key by stable table id.
     pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
         let Some(table) = self.staged.as_ref().and_then(|s| s.sql.tables.get(name)) else {
@@ -2539,16 +2621,19 @@ impl SqlSession {
     }
     fn publish(&self, staged: State) -> Result<(), CoreError> {
         self.admin.inner.db(SQL_SESSIONS)?;
-        self.admin.inner.change_decision(|s| {
-            if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation {
-                return Err(CoreError::Sql(relational::SqlError::Conflict));
-            }
-            let mut staged = staged;
-            sequences::merge(&mut staged, &s.seq);
-            self.admin.inner.merge_live_sequences(&mut staged)?;
-            *s = staged;
-            Ok(())
-        })
+        self.admin
+            .inner
+            .change_inner(true, self.authority_managed, |s| {
+                if s.view.domain != staged.view.domain || s.sql.generation != staged.sql.generation
+                {
+                    return Err(CoreError::Sql(relational::SqlError::Conflict));
+                }
+                let mut staged = staged;
+                sequences::merge(&mut staged, &s.seq);
+                self.admin.inner.merge_live_sequences(&mut staged)?;
+                *s = staged;
+                Ok(())
+            })
     }
     pub fn rollback(&mut self) {
         if self.staged.take().is_some() {

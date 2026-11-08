@@ -536,6 +536,32 @@ impl RoleCatalog {
     }
 }
 
+/// Remove authority for relation names in the schema publication transaction.
+pub(super) fn forget_relations(
+    tx: &redb::WriteTransaction,
+    names: &BTreeSet<String>,
+) -> Result<(), CoreError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut table = tx.open_table(ROLES).map_err(io)?;
+    let mut remove = Vec::new();
+    for name in names {
+        remove.push(key(b"owner/", name));
+        let prefix = grant_key(b"tgrant/", name, "");
+        for entry in table.iter().map_err(io)? {
+            let (key, _) = entry.map_err(io)?;
+            if key.value().starts_with(&prefix) {
+                remove.push(key.value().to_vec());
+            }
+        }
+    }
+    for key in remove {
+        table.remove(key.as_slice()).map_err(io)?;
+    }
+    Ok(())
+}
+
 /// Move name-keyed table authority in the same transaction as schema publication.
 /// Collect all values before removing keys so swaps cannot overwrite one another.
 pub(super) fn rename_tables(

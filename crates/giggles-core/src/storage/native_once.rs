@@ -450,8 +450,11 @@ impl Admin {
                 return Ok(0);
             }
             ledger.upper_watermark_unix_seconds = lease.upper_unix_seconds;
+            // Compaction changes only the outcome ledger, never the catalog.
             self.inner
-                .persist_checked(state, true, &mut || Instant::now() < lease.valid_until)
+                .persist_checked(state, None, true, &mut || {
+                    Instant::now() < lease.valid_until
+                })
                 .map_err(persistence)?;
             Ok(count)
         })
@@ -512,6 +515,7 @@ impl SqlSession {
                 retry_until_seconds,
                 result: Some(result),
             };
+            let previous_relations = relation_names(state);
             // Keep the old snapshot in self for normal slot cleanup. The terminal
             // branch keeps current state and discards all earlier staged effects.
             if mode == NativePublishMode::Success {
@@ -543,7 +547,9 @@ impl SqlSession {
                 .expect("accepted record")
                 .clone();
             inner
-                .persist_checked(state, true, &mut || Instant::now() < lease.valid_until)
+                .persist_checked(state, Some(&previous_relations), true, &mut || {
+                    Instant::now() < lease.valid_until
+                })
                 .map_err(persistence)?;
             Ok((response, false))
         })

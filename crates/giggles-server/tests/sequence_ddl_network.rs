@@ -808,3 +808,200 @@ async fn simple_sequence_owner_name_reuse() {
 async fn extended_sequence_owner_name_reuse() {
     sequence_owner_name_reuse(Protocol::Extended).await;
 }
+
+async fn owner_key_hygiene(protocol: Protocol) {
+    use giggles_core::roles::TablePrivilege;
+    let f = Fixture::new().await;
+    f.admin
+        .roles()
+        .create(NewRole {
+            name: "carol".into(),
+            login: true,
+            password: Some(Verifier::generate("pw")),
+            ..NewRole::default()
+        })
+        .unwrap();
+    f.admin
+        .roles()
+        .grant_schema("public", "carol", &[SchemaPrivilege::Create])
+        .unwrap();
+    let alice = f.connect("alice", "pw").await;
+    let bob = f.connect("bob", "pw").await;
+    let carol = f.connect("carol", "pw").await;
+    let roles = f.admin.roles();
+
+    // Native creation cannot inherit absent-object owner or grant keys.
+    roles.set_table_owner("ghost2", "alice").unwrap();
+    roles
+        .grant_table("ghost2", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    let mut native = f.admin.sql_session();
+    native
+        .execute("CREATE TABLE ghost2 (a int)", &[], None)
+        .unwrap();
+    native
+        .execute("INSERT INTO ghost2 VALUES (731)", &[], None)
+        .unwrap();
+    for client in [&alice, &bob] {
+        protocol
+            .error(client, "SELECT a FROM ghost2", "42501")
+            .await;
+    }
+    assert_eq!(roles.table_owner("ghost2").unwrap(), None);
+    assert!(roles.table_privileges("ghost2", "bob").unwrap().is_empty());
+
+    // R: a rename replaces absent-destination keys with the source authority.
+    roles.set_table_owner("renamed", "alice").unwrap();
+    roles
+        .grant_table("renamed", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    protocol.ok(&carol, "CREATE TABLE src (a int)").await;
+    protocol.ok(&carol, "INSERT INTO src VALUES (3)").await;
+    protocol
+        .ok(&carol, "ALTER TABLE src RENAME TO renamed")
+        .await;
+    protocol.ok(&carol, "SELECT * FROM renamed").await;
+    assert_eq!(
+        roles.table_owner("renamed").unwrap().as_deref(),
+        Some("carol")
+    );
+    for client in [&alice, &bob] {
+        protocol
+            .error(client, "SELECT * FROM renamed", "42501")
+            .await;
+    }
+
+    // B: a rolled-back SQL creator cannot read a later native relation.
+    roles
+        .create(NewRole {
+            name: "dave".into(),
+            login: true,
+            password: Some(Verifier::generate("pw")),
+            ..NewRole::default()
+        })
+        .unwrap();
+    roles
+        .grant_schema("public", "dave", &[SchemaPrivilege::Create])
+        .unwrap();
+    let dave = f.connect("dave", "pw").await;
+    protocol.ok(&dave, "BEGIN").await;
+    protocol.ok(&dave, "CREATE TABLE rb (a int)").await;
+    protocol.ok(&dave, "ROLLBACK").await;
+    native
+        .execute("CREATE TABLE rb (a int)", &[], None)
+        .unwrap();
+    native
+        .execute("INSERT INTO rb VALUES (5)", &[], None)
+        .unwrap();
+    assert_eq!(roles.table_owner("rb").unwrap(), None);
+    let mut raw_dave = raw_connect(f.pg.address, "dave").await;
+    let messages = raw_execute(protocol, &mut raw_dave, "SELECT a FROM rb").await;
+    let (_, error) = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'E')
+        .unwrap_or_else(|| panic!("{protocol:?}: SELECT a FROM rb: {messages:?}"));
+    assert!(
+        error.split(|byte| *byte == 0).any(|field| field == b"C42501"),
+        "{protocol:?}: SELECT a FROM rb: {messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|(kind, _)| *kind == b'D'),
+        "{protocol:?}: dave received rows from rb: {messages:?}"
+    );
+    drop(raw_dave);
+    drop(dave);
+
+    // Managed core commit must retain the owner installed by the SQL service.
+    protocol.ok(&carol, "BEGIN").await;
+    protocol.ok(&carol, "CREATE TABLE x (a int)").await;
+    protocol.ok(&carol, "COMMIT").await;
+    assert_eq!(roles.table_owner("x").unwrap().as_deref(), Some("carol"));
+    protocol.ok(&carol, "SELECT * FROM x").await;
+
+    roles.set_table_owner("y", "alice").unwrap();
+    roles
+        .grant_table("y", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    roles.set_table_owner("y_id_seq", "alice").unwrap();
+    roles
+        .grant_table("y_id_seq", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    let mut managed = f.service.role_session("carol").unwrap();
+    managed
+        .execute_sql("CREATE TABLE y (id serial)", &[])
+        .unwrap();
+    protocol.error(&bob, "SELECT * FROM y", "42501").await;
+    assert_eq!(roles.table_owner("y").unwrap().as_deref(), Some("carol"));
+    assert_eq!(
+        roles.table_owner("y_id_seq").unwrap().as_deref(),
+        Some("carol")
+    );
+    assert!(
+        roles
+            .table_privileges("y_id_seq", "bob")
+            .unwrap()
+            .is_empty()
+    );
+
+    // Existing relation no-ops preserve deliberately installed authority keys.
+    roles
+        .grant_table("y", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    protocol
+        .ok(&carol, "CREATE TABLE IF NOT EXISTS y (a int)")
+        .await;
+    assert_eq!(roles.table_owner("y").unwrap().as_deref(), Some("carol"));
+    assert!(
+        roles
+            .table_privileges("y", "bob")
+            .unwrap()
+            .contains(&TablePrivilege::Select)
+    );
+    protocol.ok(&bob, "SELECT * FROM y").await;
+    protocol.ok(&carol, "CREATE SEQUENCE keep_seq").await;
+    roles
+        .grant_table("keep_seq", "bob", &[TablePrivilege::Select])
+        .unwrap();
+    protocol
+        .ok(&carol, "CREATE SEQUENCE IF NOT EXISTS keep_seq")
+        .await;
+    assert_eq!(
+        roles.table_owner("keep_seq").unwrap().as_deref(),
+        Some("carol")
+    );
+    assert!(
+        roles
+            .table_privileges("keep_seq", "bob")
+            .unwrap()
+            .contains(&TablePrivilege::Select)
+    );
+    // Both CREATE forms share a relation namespace across table/sequence kinds.
+    protocol
+        .ok(&carol, "CREATE TABLE IF NOT EXISTS keep_seq (a int)")
+        .await;
+    protocol.ok(&carol, "CREATE SEQUENCE IF NOT EXISTS y").await;
+    for name in ["keep_seq", "y"] {
+        assert_eq!(roles.table_owner(name).unwrap().as_deref(), Some("carol"));
+        assert!(
+            roles
+                .table_privileges(name, "bob")
+                .unwrap()
+                .contains(&TablePrivilege::Select)
+        );
+    }
+    drop(managed);
+    drop(native);
+    drop(alice);
+    drop(bob);
+    drop(carol);
+    f.pg.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn simple_owner_key_hygiene() {
+    owner_key_hygiene(Protocol::Simple).await;
+}
+#[tokio::test]
+async fn extended_owner_key_hygiene() {
+    owner_key_hygiene(Protocol::Extended).await;
+}

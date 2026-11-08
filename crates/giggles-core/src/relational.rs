@@ -686,6 +686,7 @@ enum Statement {
     Query(query::Query),
     Create {
         name: String,
+        optional: bool,
         columns: Vec<ColumnDef>,
         typmods: Vec<Option<i32>>,
         defaults: Vec<Option<String>>,
@@ -933,6 +934,13 @@ impl Parser {
             Statement::SetConstraints(names, deferred)
         } else if self.word("create") {
             self.need("table")?;
+            let optional = if self.word("if") {
+                self.need("not")?;
+                self.need("exists")?;
+                true
+            } else {
+                false
+            };
             let name = self.create_table_name()?;
             self.punct('(')?;
             let mut columns = vec![];
@@ -1079,6 +1087,7 @@ impl Parser {
             self.punct(')')?;
             Statement::Create {
                 name,
+                optional,
                 typmods: vec![None; columns.len()],
                 defaults,
                 sequences,
@@ -1327,6 +1336,7 @@ impl Prepared {
         Ok(Self::engine(
             Statement::Create {
                 name,
+                optional: false,
                 typmods: vec![None; columns.len()],
                 defaults: vec![None; columns.len()],
                 sequences: vec![None; columns.len()],
@@ -2875,6 +2885,7 @@ impl Relational {
             }
             Statement::Create {
                 name,
+                optional,
                 columns,
                 typmods,
                 defaults,
@@ -2887,6 +2898,9 @@ impl Relational {
                     return Err(SqlError::Unsupported);
                 }
                 if self.relation_name_taken(name) {
+                    if *optional {
+                        return Ok(result);
+                    }
                     return Err(SqlError::DuplicateTable);
                 }
                 if self.tables.len() >= MAX_TABLES

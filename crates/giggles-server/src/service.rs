@@ -334,7 +334,11 @@ impl Service {
             scoped: false,
             connection: None,
             database: None,
-            sql: self.admin.sql_session(),
+            sql: {
+                let mut sql = self.admin.sql_session();
+                sql.set_authority_managed(true);
+                sql
+            },
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
             sequence_owner_candidates: BTreeSet::new(),
@@ -358,7 +362,11 @@ impl Service {
             connection: None,
             database: None,
             fingerprint: fingerprint.to_owned(),
-            sql: self.admin.sql_session(),
+            sql: {
+                let mut sql = self.admin.sql_session();
+                sql.set_authority_managed(true);
+                sql
+            },
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
             sequence_owner_candidates: BTreeSet::new(),
@@ -1019,6 +1027,14 @@ impl Session {
             } else {
                 vec![]
             };
+            let table_preexisting = if p.command() == "CREATE TABLE" {
+                match p.table() {
+                    Some(table) => session.sql.relation_exists(table)?,
+                    None => false,
+                }
+            } else {
+                false
+            };
             let result = session.sql.execute_prepared_at(p, params, None, &clock);
             if !session.sql.in_transaction() {
                 session.transaction_us = None;
@@ -1032,38 +1048,40 @@ impl Session {
             session
                 .sequence_owner_candidates
                 .extend(p.sequence_ddl_names().into_iter().map(str::to_owned));
-            if p.command() == "CREATE SEQUENCE"
-                && result.affected != 0
-                && let Role::Database { name } = &session.role
-            {
+            let roles = session.service.admin.roles();
+            if p.command() == "CREATE SEQUENCE" && result.affected != 0 {
                 for sequence in p.sequence_ddl_names() {
-                    session
-                        .service
-                        .admin
-                        .roles()
-                        .set_table_owner(sequence, name)
+                    roles
+                        .forget_table(sequence)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                    if let Role::Database { name } = &session.role {
+                        roles
+                            .set_table_owner(sequence, name)
+                            .map_err(|_| CoreError::Policy(Error::Scope))?;
+                    }
+                }
+            }
+            if p.command() == "CREATE TABLE"
+                && !table_preexisting
+                && let Some(table) = p.table()
+            {
+                roles
+                    .forget_table(table)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?;
+                if let Role::Database { name } = &session.role {
+                    roles
+                        .set_table_owner(table, name)
                         .map_err(|_| CoreError::Policy(Error::Scope))?;
                 }
             }
-            if p.is_ddl()
-                && !p.is_sequence_ddl()
-                && !p.is_alter_table()
-                && !p.is_drop_table()
-                && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
-            {
-                session
-                    .service
-                    .admin
-                    .roles()
-                    .set_table_owner(table, name)
-                    .map_err(|_| CoreError::Policy(Error::Scope))?;
-            }
             if p.is_ddl() && !p.is_sequence_ddl() {
-                let roles = session.service.admin.roles();
                 for (sequence, table) in session.sql.sequence_owners()? {
                     if sequence_candidates.contains(&sequence) {
                         continue;
                     }
+                    roles
+                        .forget_table(&sequence)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
                     if let Some(table) = table {
                         let durable_table = session.sql.table_authority_name(&table)?;
                         if let Some(owner) = roles
@@ -1073,9 +1091,9 @@ impl Session {
                             roles
                                 .set_table_owner(&sequence, &owner)
                                 .map_err(|_| CoreError::Policy(Error::Scope))?;
-                            session.sequence_owner_candidates.insert(sequence);
                         }
                     }
+                    session.sequence_owner_candidates.insert(sequence);
                 }
             }
             session.reconcile_sequence_owners()?;
