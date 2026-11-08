@@ -189,6 +189,7 @@ enum Filter {
     Scalar(Scalar),
     Compare(Scalar, String, Scalar),
     Null(Scalar, bool),
+    Is(Box<Filter>, Option<bool>, bool),
     Like {
         value: Scalar,
         pattern: Scalar,
@@ -203,6 +204,7 @@ enum BoundFilter {
     Scalar(BoundScalar),
     Compare(BoundScalar, String, BoundScalar),
     Null(BoundScalar, bool),
+    Is(Box<BoundFilter>, Option<bool>, bool),
     Like {
         value: BoundScalar,
         pattern: BoundScalar,
@@ -218,6 +220,36 @@ enum BoundFilter {
 /// (literal values, column/qualifier and routine names) against MAX_SQL,
 /// measured on the borrowed AST, before anything is cloned.
 fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
+    fn filter_cost(f: &Filter, nodes: &mut usize, bytes: &mut usize) -> R<()> {
+        *nodes = nodes.checked_add(1).ok_or(SqlError::Limit)?;
+        match f {
+            Filter::Clauses(_) => return Err(SqlError::Unsupported),
+            Filter::Scalar(s) | Filter::Null(s, _) => cost(s, nodes, bytes)?,
+            Filter::Compare(a, op, b) => {
+                *bytes = bytes.checked_add(op.len()).ok_or(SqlError::Limit)?;
+                cost(a, nodes, bytes)?;
+                cost(b, nodes, bytes)?;
+            }
+            Filter::Like {
+                value,
+                pattern,
+                escape,
+                ..
+            } => {
+                cost(value, nodes, bytes)?;
+                cost(pattern, nodes, bytes)?;
+                if let Some(s) = escape {
+                    cost(s, nodes, bytes)?;
+                }
+            }
+            Filter::Not(f) | Filter::Is(f, _, _) => filter_cost(f, nodes, bytes)?,
+            Filter::Logic(a, _, b) => {
+                filter_cost(a, nodes, bytes)?;
+                filter_cost(b, nodes, bytes)?;
+            }
+        }
+        Ok(())
+    }
     fn cost(s: &Scalar, nodes: &mut usize, bytes: &mut usize) -> R<()> {
         *nodes = nodes.checked_add(1).ok_or(SqlError::Limit)?;
         let payload = match s {
@@ -242,6 +274,20 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
                 }
                 0
             }
+            Scalar::Predicate(f) => {
+                filter_cost(f, nodes, bytes)?;
+                0
+            }
+            Scalar::Case(c) => {
+                for (f, s) in &c.arms {
+                    filter_cost(f, nodes, bytes)?;
+                    cost(s, nodes, bytes)?;
+                }
+                if let Some(s) = &c.otherwise {
+                    cost(s, nodes, bytes)?;
+                }
+                0
+            }
         };
         *bytes = bytes.checked_add(payload).ok_or(SqlError::Limit)?;
         Ok(())
@@ -256,100 +302,259 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     Ok(())
 }
 impl Filter {
+    fn visit_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
+        match self {
+            Self::Clauses(c) => {
+                if let Some(f) = &c.filter {
+                    f.visit_scalars(visit)?;
+                }
+                for s in &c.group {
+                    visit(s)?;
+                }
+                if let Some(f) = &c.having {
+                    f.visit_scalars(visit)?;
+                }
+            }
+            Self::Scalar(s) | Self::Null(s, _) => visit(s)?,
+            Self::Compare(a, _, b) => {
+                visit(a)?;
+                visit(b)?;
+            }
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                ..
+            } => {
+                visit(value)?;
+                visit(pattern)?;
+                if let Some(s) = escape {
+                    visit(s)?;
+                }
+            }
+            Self::Not(f) | Self::Is(f, _, _) => f.visit_scalars(visit)?,
+            Self::Logic(a, _, b) => {
+                a.visit_scalars(visit)?;
+                b.visit_scalars(visit)?;
+            }
+        }
+        Ok(())
+    }
+    fn has_volatile_call(&self) -> bool {
+        let mut found = false;
+        let _ = self.visit_scalars(&mut |s| {
+            found |= s.has_volatile_call();
+            Ok(())
+        });
+        found
+    }
+    fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
+        let _ = self.visit_scalars(&mut |s| {
+            s.sequence_dependencies(out);
+            Ok(())
+        });
+    }
+    fn has_undefined_routine(&self) -> bool {
+        let mut found = false;
+        let _ = self.visit_scalars(&mut |s| {
+            found |= scalar_has_undefined_routine(s);
+            Ok(())
+        });
+        found
+    }
+    fn reject_nested_aggregate(&self) -> R<()> {
+        self.visit_scalars(&mut |s| s.reject_nested_aggregate())
+    }
+    fn admit_shape(&self, depth: usize, nodes: &mut usize) -> R<()> {
+        if depth > 32 || *nodes == MAX_WORK {
+            return Err(SqlError::Limit);
+        }
+        *nodes += 1;
+        match self {
+            Self::Clauses(_) => Err(SqlError::Unsupported),
+            Self::Scalar(s) | Self::Null(s, _) => insert_values::shape(s, depth + 1, nodes),
+            Self::Compare(a, _, b) => {
+                insert_values::shape(a, depth + 1, nodes)?;
+                insert_values::shape(b, depth + 1, nodes)
+            }
+            Self::Like {
+                value,
+                pattern,
+                escape,
+                ..
+            } => {
+                insert_values::shape(value, depth + 1, nodes)?;
+                insert_values::shape(pattern, depth + 1, nodes)?;
+                if let Some(s) = escape {
+                    insert_values::shape(s, depth + 1, nodes)?;
+                }
+                Ok(())
+            }
+            Self::Not(f) | Self::Is(f, _, _) => f.admit_shape(depth + 1, nodes),
+            Self::Logic(a, _, b) => {
+                a.admit_shape(depth + 1, nodes)?;
+                b.admit_shape(depth + 1, nodes)
+            }
+        }
+    }
     fn parse(p: &mut Parser, precedence: usize, depth: usize) -> R<Self> {
+        Self::parse_context(p, precedence, depth, false)
+    }
+    fn parse_context(
+        p: &mut Parser,
+        precedence: usize,
+        depth: usize,
+        aggregate_argument: bool,
+    ) -> R<Self> {
         if depth > 32 {
             return Err(SqlError::Limit);
         }
         let mut f = if p.word("not") {
-            Self::Not(Box::new(Self::parse(p, 3, depth + 1)?))
+            Self::Not(Box::new(Self::parse_context(
+                p,
+                3,
+                depth + 1,
+                aggregate_argument,
+            )?))
         } else {
-            // Parenthesized scalar operands and boolean groups share a prefix.
-            let start = p.at;
-            let params = p.params.clone();
-            let scalar = Scalar::parse(p, depth);
-            match scalar {
-                Ok(a) => {
-                    let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
-                        && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
-                    if not {
-                        p.at += 1;
-                    }
-                    if p.word("is") {
-                        let not = p.word("not");
-                        p.need("null")?;
-                        Self::Null(a, not)
-                    } else if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike")
-                    {
-                        let insensitive = p.word("ilike");
-                        if !insensitive {
-                            p.need("like")?;
-                        }
-                        let pattern = Scalar::parse(p, depth + 1)?;
-                        let escape = if p.word("escape") {
-                            Some(Scalar::parse(p, depth + 1)?)
-                        } else {
-                            None
-                        };
-                        Self::Like {
-                            value: a,
-                            pattern,
-                            escape,
-                            insensitive,
-                            negated: not,
-                        }
-                    } else if p.word("in") {
-                        p.punct('(')?;
-                        if p.sym(')') {
-                            return Err(SqlError::Syntax);
-                        }
-                        let mut values = vec![Scalar::parse(p, depth + 1)?];
-                        while p.sym(',') {
-                            values.push(Scalar::parse(p, depth + 1)?);
-                        }
-                        p.punct(')')?;
-                        // Admit the expanded size from the borrowed AST before any clone.
-                        admit_expansion(&a, values.len())?;
-                        Self::membership(&a, &values, not)
-                    } else if p.word("between") {
-                        if p.word("symmetric") {
-                            return Err(SqlError::Unsupported);
-                        }
-                        p.word("asymmetric");
-                        let lower = Scalar::parse(p, depth + 1)?;
-                        p.need("and")?;
-                        let upper = Scalar::parse(p, depth + 1)?;
-                        admit_expansion(&a, 2)?;
-                        Self::Logic(
-                            Box::new(Self::Compare(
-                                a.clone(),
-                                if not { "<" } else { ">=" }.into(),
-                                lower,
-                            )),
-                            !not,
-                            Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
-                        )
-                    } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
-                        if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
-                            return Err(SqlError::Unsupported);
-                        }
-                        p.at += 1;
-                        Self::Compare(a, op, Scalar::parse(p, depth + 1)?)
-                    } else {
-                        Self::Scalar(a)
-                    }
+            let parse_scalar = |p: &mut Parser, depth| {
+                if aggregate_argument {
+                    Scalar::parse_aggregate_argument(p, depth)
+                } else {
+                    Scalar::parse(p, depth)
                 }
-                Err(e) => {
-                    p.at = start;
-                    p.params = params;
-                    if !p.sym('(') {
-                        return Err(e);
-                    }
-                    let f = Self::parse(p, 0, depth + 1)?;
-                    p.punct(')')?;
-                    f
+            };
+            let a = parse_scalar(p, depth)?;
+            let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
+                && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
+            if not {
+                p.at += 1;
+            }
+            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "like" || w == "ilike")
+            {
+                let insensitive = p.word("ilike");
+                if !insensitive {
+                    p.need("like")?;
+                }
+                let pattern = parse_scalar(p, depth + 1)?;
+                let escape = if p.word("escape") {
+                    Some(parse_scalar(p, depth + 1)?)
+                } else {
+                    None
+                };
+                Self::Like {
+                    value: a,
+                    pattern,
+                    escape,
+                    insensitive,
+                    negated: not,
+                }
+            } else if p.word("in") {
+                p.punct('(')?;
+                if p.sym(')') {
+                    return Err(SqlError::Syntax);
+                }
+                let mut values = vec![parse_scalar(p, depth + 1)?];
+                while p.sym(',') {
+                    values.push(parse_scalar(p, depth + 1)?);
+                }
+                p.punct(')')?;
+                // Admit the expanded size from the borrowed AST before any clone.
+                admit_expansion(&a, values.len())?;
+                Self::membership(&a, &values, not)
+            } else if p.word("between") {
+                if p.word("symmetric") {
+                    return Err(SqlError::Unsupported);
+                }
+                p.word("asymmetric");
+                let lower = parse_scalar(p, depth + 1)?;
+                p.need("and")?;
+                let upper = parse_scalar(p, depth + 1)?;
+                admit_expansion(&a, 2)?;
+                Self::Logic(
+                    Box::new(Self::Compare(
+                        a.clone(),
+                        if not { "<" } else { ">=" }.into(),
+                        lower,
+                    )),
+                    !not,
+                    Box::new(Self::Compare(a, if not { ">" } else { "<=" }.into(), upper)),
+                )
+            } else if let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() {
+                if !["=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()) {
+                    return Err(SqlError::Unsupported);
+                }
+                p.at += 1;
+                if matches!(p.tokens.get(p.at), None | Some(Token::Symbol(')' | ',' | ';'))) {
+                    return Err(SqlError::Syntax);
+                }
+                Self::Compare(a, op, parse_scalar(p, depth + 1)?)
+            } else {
+                match a {
+                    Scalar::Predicate(f) => *f,
+                    a => Self::Scalar(a),
                 }
             }
         };
+        // IS binds more tightly than prefix NOT and the logical operators.
+        let mut suffixes = depth;
+        while p.word("is") {
+            suffixes += 1;
+            if suffixes > 32 {
+                return Err(SqlError::Limit);
+            }
+            let negated = p.word("not");
+            if p.word("distinct") {
+                p.need("from")?;
+                let a = match f {
+                    Self::Scalar(a) => a,
+                    f => Scalar::Predicate(Box::new(f)),
+                };
+                let b = if aggregate_argument {
+                    Scalar::parse_aggregate_argument(p, depth + 1)?
+                } else {
+                    Scalar::parse(p, depth + 1)?
+                };
+                if a.has_volatile_call() || b.has_volatile_call() {
+                    return Err(SqlError::Unsupported);
+                }
+                admit_expansion(&a, 2)?;
+                admit_expansion(&b, 2)?;
+                let equal = Self::Is(
+                    Box::new(Self::Compare(a.clone(), "=".into(), b.clone())),
+                    Some(true),
+                    false,
+                );
+                let both_null = Self::Logic(
+                    Box::new(Self::Null(a, false)),
+                    true,
+                    Box::new(Self::Null(b, false)),
+                );
+                let same = Self::Logic(Box::new(equal), false, Box::new(both_null));
+                f = if negated {
+                    same
+                } else {
+                    Self::Not(Box::new(same))
+                };
+            } else {
+                let target = if p.word("true") {
+                    Some(true)
+                } else if p.word("false") {
+                    Some(false)
+                } else if p.word("unknown") {
+                    None
+                } else if p.word("null") {
+                    if let Self::Scalar(a) = f {
+                        f = Self::Null(a, negated);
+                        continue;
+                    }
+                    None
+                } else {
+                    return Err(SqlError::Syntax);
+                };
+                f = Self::Is(Box::new(f), target, negated);
+            }
+        }
         loop {
             let and = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "and");
             let or = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "or");
@@ -367,7 +572,12 @@ impl Filter {
             f = Self::Logic(
                 Box::new(f),
                 and,
-                Box::new(Self::parse(p, level, depth + 1)?),
+                Box::new(Self::parse_context(
+                    p,
+                    level,
+                    depth + 1,
+                    aggregate_argument,
+                )?),
             );
         }
         Ok(f)
@@ -391,6 +601,7 @@ impl Filter {
     }
     fn bounds(&self, out: &mut Vec<(ColumnRef, String, Expr)>) {
         match self {
+            Self::Is(_, _, _) => (),
             Self::Logic(a, true, b) => {
                 a.bounds(out);
                 b.bounds(out);
@@ -453,7 +664,7 @@ impl Filter {
                 }
                 Ok(())
             }
-            Self::Not(a) => a.infer(params, resolve, tables),
+            Self::Not(a) | Self::Is(a, _, _) => a.infer(params, resolve, tables),
             Self::Logic(a, _, b) => {
                 a.infer(params, resolve, tables)?;
                 b.infer(params, resolve, tables)
@@ -487,7 +698,7 @@ impl Filter {
                 a.infer_mutation(params, declared, resolve, tables)?;
                 b.infer_mutation(params, declared, resolve, tables)
             }
-            Self::Not(a) => a.infer_mutation(params, declared, resolve, tables),
+            Self::Not(a) | Self::Is(a, _, _) => a.infer_mutation(params, declared, resolve, tables),
             _ => self.infer(params, resolve, tables),
         }
     }
@@ -569,6 +780,9 @@ impl Filter {
                 }
             }
             Self::Not(a) => BoundFilter::Not(Box::new(a.bind(params, resolve, tables)?)),
+            Self::Is(a, target, not) => {
+                BoundFilter::Is(Box::new(a.bind(params, resolve, tables)?), *target, *not)
+            }
             Self::Logic(a, and, b) => BoundFilter::Logic(
                 Box::new(a.bind(params, resolve, tables)?),
                 *and,
@@ -643,6 +857,9 @@ impl BoundFilter {
                 }
             }
             Self::Not(a) => Ok(a.plan_constant(budget)?.map(|a| a.map(|v| !v))),
+            Self::Is(a, target, not) => Ok(a
+                .plan_constant(budget)?
+                .map(|a| Some((a == *target) != *not))),
             Self::Logic(a, and, b) => {
                 let a = a.plan_constant(budget)?;
                 if a == Some(Some(!*and)) {
@@ -708,6 +925,7 @@ impl BoundFilter {
                 }
             }
             Self::Not(a) => a.eval(row, params, bytes)?.map(|b| !b),
+            Self::Is(a, target, not) => Some((a.eval(row, params, bytes)? == *target) != *not),
             Self::Logic(a, and, b) => {
                 let a = a.eval(row, params, bytes)?;
                 if a == Some(!*and) {
@@ -803,7 +1021,7 @@ fn filter_contains_aggregate(f: &Filter) -> bool {
                 || grouping::contains_aggregate(pattern)
                 || escape.as_ref().is_some_and(grouping::contains_aggregate)
         }
-        Filter::Not(f) => filter_contains_aggregate(f),
+        Filter::Not(f) | Filter::Is(f, _, _) => filter_contains_aggregate(f),
         Filter::Logic(a, _, b) => filter_contains_aggregate(a) || filter_contains_aggregate(b),
     }
 }
@@ -824,6 +1042,15 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
             scalar_has_undefined_routine(a) || scalar_has_undefined_routine(b)
         }
         Scalar::SubstringOrder(args) => args.iter().any(|a| scalar_has_undefined_routine(a)),
+        Scalar::Predicate(f) => f.has_undefined_routine(),
+        Scalar::Case(c) => {
+            c.arms
+                .iter()
+                .any(|(f, s)| f.has_undefined_routine() || scalar_has_undefined_routine(s))
+                || c.otherwise
+                    .as_ref()
+                    .is_some_and(scalar_has_undefined_routine)
+        }
         _ => false,
     }
 }
@@ -874,16 +1101,17 @@ impl Query {
                         }
                         None
                     } else {
-                        Some(Scalar::parse_aggregate_argument(p, 0)?)
+                        Some(Scalar::parse_expr(p, 0, true)?)
                     };
                     p.punct(')')?;
                     Item::Aggregate(a, c)
                 } else {
-                    Item::Scalar(Scalar::parse(p, 0)?)
+                    Item::Scalar(Scalar::parse_expr(p, 0, false)?)
                 }
             };
             if matches!(item, Item::Aggregate(..))
-                && matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||"].contains(&op.as_str()))
+                && (matches!(p.tokens.get(p.at), Some(Token::Op(op)) if ["+", "-", "*", "/", "%", "||", "=", "<>", "!=", "<", "<=", ">", ">="].contains(&op.as_str()))
+                    || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["and", "or", "is", "not", "between", "in", "like", "ilike"].contains(&w.as_str())))
             {
                 for n in item_start..p.tokens.len().saturating_sub(3) {
                     if matches!(&p.tokens[n], Token::Word(w) if w == "count")
@@ -895,7 +1123,7 @@ impl Query {
                     }
                 }
                 p.at = item_start;
-                item = Item::Scalar(Scalar::parse_aggregate_argument(p, 0)?);
+                item = Item::Scalar(Scalar::parse_expr(p, 0, true)?);
             }
             let alias = if p.word("as") { Some(p.name()?) } else { None };
             items.push((item, alias));
@@ -1097,7 +1325,7 @@ impl Query {
         if p.word("order") {
             p.need("by")?;
             loop {
-                let c = Scalar::parse(p, 0)?;
+                let c = Scalar::parse_expr(p, 0, false)?;
                 let desc = p.word("desc");
                 if !desc {
                     p.word("asc");
@@ -1179,6 +1407,11 @@ impl Query {
                 Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
+                Scalar::Predicate(f) => filter(f),
+                Scalar::Case(c) => {
+                    c.arms.iter().all(|(f, s)| filter(f) && scalar(s))
+                        && c.otherwise.as_ref().is_none_or(scalar)
+                }
                 Scalar::Call(name, args) => {
                     matches!(
                         name.as_str(),
@@ -1322,7 +1555,7 @@ impl Query {
                     escape,
                     ..
                 } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
-                Filter::Not(f) => filter(f),
+                Filter::Not(f) | Filter::Is(f, _, _) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
         }
@@ -1363,6 +1596,11 @@ impl Query {
                 Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
+                Scalar::Predicate(f) => filter_ok(f),
+                Scalar::Case(c) => {
+                    c.arms.iter().all(|(f, s)| filter_ok(f) && scalar(s))
+                        && c.otherwise.as_ref().is_none_or(scalar)
+                }
                 Scalar::Call(name, args) => {
                     (!functions::is_deferred_routine_name(name)
                         || functions::deferred_routine_binds_for_sql_role(name))
@@ -1380,7 +1618,7 @@ impl Query {
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
                 Filter::Like { value, pattern, escape, .. } => scalar(value) && scalar(pattern) && escape.as_ref().is_none_or(scalar),
-                Filter::Not(f) => filter_ok(f),
+                Filter::Not(f) | Filter::Is(f, _, _) => filter_ok(f),
                 Filter::Logic(a, _, b) => filter_ok(a) && filter_ok(b),
             }
         }
@@ -1446,7 +1684,7 @@ impl Query {
                         escape.sequence_dependencies(out);
                     }
                 }
-                Filter::Not(f) => filter(f, out),
+                Filter::Not(f) | Filter::Is(f, _, _) => filter(f, out),
                 Filter::Logic(a, _, b) => {
                     filter(a, out);
                     filter(b, out);
@@ -1490,7 +1728,7 @@ impl Query {
                         || scalar_has_undefined_routine(pattern)
                         || escape.as_ref().is_some_and(scalar_has_undefined_routine)
                 }
-                Filter::Not(f) => filter(f),
+                Filter::Not(f) | Filter::Is(f, _, _) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) || filter(b),
             }
         }
@@ -1514,6 +1752,11 @@ impl Query {
                 Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::Call(_, args) => args.iter().all(scalar),
+                Scalar::Predicate(f) => filter(f),
+                Scalar::Case(c) => {
+                    c.arms.iter().all(|(f, s)| filter(f) && scalar(s))
+                        && c.otherwise.as_ref().is_none_or(scalar)
+                }
                 Scalar::SubstringOrder([first, second, third]) => {
                     scalar(first) && scalar(second) && scalar(third)
                 }
@@ -1537,7 +1780,7 @@ impl Query {
                     escape,
                     ..
                 } => operand(value) && operand(pattern) && escape.as_ref().is_none_or(operand),
-                Filter::Not(f) => filter(f),
+                Filter::Not(f) | Filter::Is(f, _, _) => filter(f),
                 Filter::Logic(a, _, b) => filter(a) && filter(b),
             }
         }
@@ -2721,7 +2964,7 @@ impl BoundFilter {
                     a.attach_clock(clock);
                 }
             }
-            Self::Not(a) => a.attach_clock(clock),
+            Self::Not(a) | Self::Is(a, _, _) => a.attach_clock(clock),
             Self::Logic(a, _, b) => {
                 a.attach_clock(clock);
                 b.attach_clock(clock);

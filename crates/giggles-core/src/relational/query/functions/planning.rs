@@ -376,6 +376,21 @@ impl BoundScalar {
             version: 0,
         };
         match &self.node {
+            Node::Predicate(filter) => Ok(filter
+                .plan_constant(budget)?
+                .map(|value| value.map_or(Value::Null, Value::Bool))),
+            Node::Case(arms, otherwise) => {
+                for (condition, result) in arms {
+                    match condition.plan_constant(budget)? {
+                        Some(Some(true)) => return result.plan_constant(budget),
+                        Some(Some(false) | None) => {}
+                        None => return Ok(None),
+                    }
+                }
+                otherwise
+                    .as_ref()
+                    .map_or(Ok(Some(Value::Null)), |result| result.plan_constant(budget))
+            }
             Node::Param(_)
             | Node::Column(..)
             | Node::Clock(..)
@@ -443,6 +458,14 @@ impl BoundScalar {
     /// CHECK admits only routines and casts marked immutable by this binder's metadata.
     pub(in super::super) fn constraint_immutable(&self) -> bool {
         match &self.node {
+            Node::Predicate(filter) => super::super::constraints::immutable(filter),
+            Node::Case(arms, otherwise) => {
+                arms.iter().all(|(condition, result)| {
+                    super::super::constraints::immutable(condition) && result.constraint_immutable()
+                }) && otherwise
+                    .as_ref()
+                    .is_none_or(|result| result.constraint_immutable())
+            }
             Node::Literal(_) | Node::Column(..) => true,
             Node::Param(_) | Node::Clock(..) | Node::Sequence(..) | Node::SessionCast(..) => false,
             // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
@@ -473,6 +496,7 @@ impl BoundScalar {
     }
     pub(in super::super) fn insert_input_only(&self) -> bool {
         match &self.node {
+            Node::Predicate(_) | Node::Case(..) => false,
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
             Node::Clock(..) => true,

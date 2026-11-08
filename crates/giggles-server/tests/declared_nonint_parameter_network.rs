@@ -430,10 +430,10 @@ const CASES: &[&str] = &[
     r#"{"name":"F upper varchar","sql":"SELECT upper($1)","oids":[1043],"inputs":["616263"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["ABC"]]}}"#,
     r#"{"name":"F concat text","sql":"SELECT $1 || 'x'","oids":[25],"inputs":["6162"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[25],"rows":[["abx"]]}}"#,
     r#"{"name":"F lower numeric","sql":"SELECT lower($1)","oids":[1700],"inputs":["31"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
-    // PG18.6: {"rows":[["f"]],"param_oids":[16],"col_oids":[16]}; gap: boolean or comparison projection grammar unsupported
-    r#"{"name":"known gap: F not bool","sql":"SELECT NOT $1","oids":[16],"inputs":["74"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
-    // PG18.6: {"rows":[["f"]],"param_oids":[16],"col_oids":[16]}; gap: boolean or comparison projection grammar unsupported
-    r#"{"name":"known gap: F bool AND","sql":"SELECT $1 AND true","oids":[16],"inputs":["66"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
+    // PG18.6: {"rows":[["f"]],"param_oids":[16],"col_oids":[16]}; F15 closed the boolean projection gap
+    r#"{"name":"F not bool","sql":"SELECT NOT $1","oids":[16],"inputs":["74"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["f"]]}}"#,
+    // PG18.6: {"rows":[["f"]],"param_oids":[16],"col_oids":[16]}; F15 closed the boolean projection gap
+    r#"{"name":"F bool AND","sql":"SELECT $1 AND true","oids":[16],"inputs":["66"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["f"]]}}"#,
     // PG18.6: {"rows":[["2024-02-01"]],"param_oids":[1082],"col_oids":[1082]}; gap: temporal operator overload absent
     r#"{"name":"known gap: F date + int","sql":"SELECT $1 + 1","oids":[1082],"inputs":["323032342d30312d3331"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
     // PG18.6: {"rows":[["2024-02-01 00:00:00"]],"param_oids":[1082],"col_oids":[1114]}; gap: temporal operator overload absent
@@ -464,13 +464,13 @@ const CASES: &[&str] = &[
     r#"{"name":"known gap: F time + interval","sql":"SELECT $1 + interval '1 hour'","oids":[1083],"inputs":["32333a33303a3030"],"binary":false,"expected":{"phase":"parse","sqlstate":"42883"}}"#,
     // PG18.6: {"rows":[["2"]],"param_oids":[1700],"col_oids":[1700]}; gap: greatest absent from function registry
     r#"{"name":"known gap: F greatest numeric","sql":"SELECT greatest($1, 2)","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
-    // PG18.6: {"rows":[["1"]],"param_oids":[16],"col_oids":[23]}; gap: boolean or comparison projection grammar unsupported
-    r#"{"name":"known gap: F CASE bool","sql":"SELECT CASE WHEN $1 THEN 1 ELSE 0 END","oids":[16],"inputs":["74727565"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
+    // PG18.6: {"rows":[["1"]],"param_oids":[16],"col_oids":[23]}; F15 closed the boolean projection gap
+    r#"{"name":"F CASE bool","sql":"SELECT CASE WHEN $1 THEN 1 ELSE 0 END","oids":[16],"inputs":["74727565"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"]]}}"#,
     r#"{"name":"F WHERE bool param","sql":"SELECT id FROM t WHERE $1 ORDER BY id","oids":[16],"inputs":["74727565"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"],["2"],["3"]]}}"#,
-    // PG18.6: {"rows":[["t"]],"param_oids":[1700],"col_oids":[16]}; gap: boolean or comparison projection grammar unsupported
-    r#"{"name":"known gap: F numeric > int literal","sql":"SELECT $1 > 1","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
-    // PG18.6: {"rows":[["t"]],"param_oids":[701],"col_oids":[16]}; gap: boolean or comparison projection grammar unsupported
-    r#"{"name":"known gap: F float8 = numeric literal","sql":"SELECT $1 = 1.5","oids":[701],"inputs":["312e35"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
+    // PG18.6: {"rows":[["t"]],"param_oids":[1700],"col_oids":[16]}; F15 closed the boolean projection gap
+    r#"{"name":"F numeric > int literal","sql":"SELECT $1 > 1","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[16],"rows":[["t"]]}}"#,
+    // PG18.6: {"rows":[["t"]],"param_oids":[701],"col_oids":[16]}; F15 closed the boolean projection gap
+    r#"{"name":"F float8 = numeric literal","sql":"SELECT $1 = 1.5","oids":[701],"inputs":["312e35"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[16],"rows":[["t"]]}}"#,
     r#"{"name":"F limit numeric","sql":"SELECT id FROM t ORDER BY id LIMIT $1","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[23],"rows":[["1"],["2"]]}}"#,
     r#"{"name":"R bare bool","sql":"SELECT $1","oids":[16],"inputs":["796573"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[16],"rows":[["t"]]}}"#,
     r#"{"name":"R bare text","sql":"SELECT $1","oids":[25],"inputs":["61"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[25],"rows":[["a"]]}}"#,

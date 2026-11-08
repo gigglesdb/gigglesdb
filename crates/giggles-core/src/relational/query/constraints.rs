@@ -38,8 +38,49 @@ fn quote(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
+fn without_case(s: &Scalar) -> R<()> {
+    match s {
+        Scalar::Case(_) => return Err(SqlError::Unsupported),
+        Scalar::Predicate(f) => f.visit_scalars(&mut without_case)?,
+        Scalar::Cast(s, _) | Scalar::Unary(_, s) => without_case(s)?,
+        Scalar::Binary(_, a, b) => {
+            without_case(a)?;
+            without_case(b)?;
+        }
+        Scalar::Call(_, args) => {
+            for arg in args {
+                without_case(arg)?;
+            }
+        }
+        Scalar::SubstringOrder(args) => {
+            for arg in args {
+                without_case(arg)?;
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}
 fn scalar(s: &Scalar) -> R<String> {
     Ok(match s {
+        Scalar::Predicate(f) => deparse(f)?,
+        Scalar::Case(case) => {
+            // PG indents nested CASE differently; keep this formatter at one level.
+            let otherwise = case.otherwise.as_ref().ok_or(SqlError::Unsupported)?;
+            without_case(otherwise)?;
+            let mut result = "\nCASE\n".to_owned();
+            for (condition, value) in &case.arms {
+                condition.visit_scalars(&mut without_case)?;
+                without_case(value)?;
+                result.push_str(&format!(
+                    "    WHEN {} THEN {}\n",
+                    deparse(condition)?,
+                    scalar(value)?
+                ));
+            }
+            result.push_str(&format!("    ELSE {}\nEND", scalar(otherwise)?));
+            result
+        }
         Scalar::Column(c) if c.qualifier.is_none() => quote(&c.name),
         Scalar::Literal(Value::Int(n)) if i32::try_from(*n).is_ok() => {
             if *n < 0 {
@@ -109,6 +150,18 @@ fn scalar(s: &Scalar) -> R<String> {
 }
 fn deparse(f: &Filter) -> R<String> {
     Ok(match f {
+        Filter::Is(f, Some(target), negated) => {
+            let inner = match f.as_ref() {
+                Filter::Scalar(s) => scalar(s)?,
+                _ => deparse(f)?,
+            };
+            format!(
+                "({inner} IS {}{})",
+                if *negated { "NOT " } else { "" },
+                if *target { "TRUE" } else { "FALSE" }
+            )
+        }
+        Filter::Is(_, None, _) => return Err(SqlError::Unsupported),
         Filter::Scalar(Scalar::Literal(Value::Null)) => "NULL::boolean".into(),
         Filter::Scalar(s) => scalar(s)?,
         Filter::Compare(a, op, b) => format!(
@@ -140,7 +193,11 @@ fn deparse(f: &Filter) -> R<String> {
     })
 }
 fn expression(tokens: Vec<Token>) -> R<Filter> {
-    if tokens.iter().any(|token|matches!(token,Token::Word(word) if word == "select"))
+    if tokens.iter().any(|token|matches!(token,Token::Word(word) if word == "select" || word == "distinct"))
+        || tokens.iter().enumerate().any(|(at, token)| {
+            matches!(token, Token::Word(word) if word == "case")
+                && !matches!(tokens.get(at + 1), Some(Token::Word(word)) if word == "when")
+        })
         || tokens.windows(2).any(|tokens|matches!((&tokens[0],&tokens[1]),(Token::Word(name) | Token::QuotedIdent(name),Token::Symbol('(')) if Aggregate::from_name(name).is_some()))
     {
         return Err(SqlError::Unsupported);
@@ -165,8 +222,19 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
         .strip_prefix("CHECK (")
         .and_then(|e| e.strip_suffix(')'))
         .unwrap_or(expr);
+    let mut tokens = lex(expr)?;
+    for at in 0..tokens.len() {
+        if matches!(tokens.get(at), Some(Token::QuotedIdent(name)) if name == "coalesce")
+            && tokens.get(at + 1) == Some(&Token::Symbol('('))
+            && at.checked_sub(1).and_then(|at| tokens.get(at)) != Some(&Token::Symbol('.'))
+        {
+            // The CHECK deparser quotes this keyword construct as a call name.
+            // Restore only its stored spelling; original input uses expression().
+            tokens[at] = Token::Word("coalesce".into());
+        }
+    }
     let mut p = Parser {
-        tokens: lex(expr)?,
+        tokens,
         at: 0,
         params: BTreeSet::new(),
     };
@@ -188,7 +256,7 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
         limit: None,
     })
 }
-fn immutable(filter: &BoundFilter) -> bool {
+pub(super) fn immutable(filter: &BoundFilter) -> bool {
     match filter {
         BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => s.constraint_immutable(),
         BoundFilter::Compare(a, _, b) => a.constraint_immutable() && b.constraint_immutable(),
@@ -204,13 +272,23 @@ fn immutable(filter: &BoundFilter) -> bool {
                     .as_ref()
                     .is_none_or(BoundScalar::constraint_immutable)
         }
-        BoundFilter::Not(a) => immutable(a),
+        BoundFilter::Not(a) | BoundFilter::Is(a, _, _) => immutable(a),
         BoundFilter::Logic(a, _, b) => immutable(a) && immutable(b),
     }
 }
 fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
     fn scalar_casts(value: &Scalar, table: &TableDef) -> R<()> {
         match value {
+            Scalar::Predicate(filter) => cast_subset(filter, table)?,
+            Scalar::Case(case) => {
+                for (condition, result) in &case.arms {
+                    cast_subset(condition, table)?;
+                    scalar_casts(result, table)?;
+                }
+                if let Some(otherwise) = &case.otherwise {
+                    scalar_casts(otherwise, table)?;
+                }
+            }
             Scalar::Cast(value, target) => {
                 match value.as_ref() {
                     Scalar::Column(column) => {
@@ -244,6 +322,7 @@ fn cast_subset(filter: &Filter, table: &TableDef) -> R<()> {
         Ok(())
     }
     match filter {
+        Filter::Is(value, _, _) => cast_subset(value, table)?,
         Filter::Scalar(value) | Filter::Null(value, _) => scalar_casts(value, table)?,
         Filter::Compare(left, _, right) => {
             scalar_casts(left, table)?;
@@ -362,6 +441,86 @@ mod pg186_deparse_tests {
             "length(NULL)>0",
             "n>-(1+2)",
             "-(-n)>1",
+        ] {
+            assert_eq!(
+                constraint_deparse(&lex(sql).unwrap()),
+                Err(SqlError::Unsupported),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn pg186_boolean_expression_check_definitions() {
+        for (sql, expected) in [
+            (
+                "CASE WHEN i > 0 THEN true ELSE false END",
+                "CHECK (\nCASE\n    WHEN (i > 0) THEN true\n    ELSE false\nEND)",
+            ),
+            (
+                "CASE WHEN b THEN i ELSE 0 END >= 0",
+                "CHECK ((\nCASE\n    WHEN b THEN i\n    ELSE 0\nEND >= 0))",
+            ),
+            ("i > 0 IS TRUE", "CHECK (((i > 0) IS TRUE))"),
+            ("(i > 0) IS NOT FALSE", "CHECK (((i > 0) IS NOT FALSE))"),
+            (
+                "coalesce(i > 0,true)",
+                "CHECK (\"coalesce\"((i > 0), true))",
+            ),
+            (
+                "CASE WHEN i > 0 THEN true WHEN b THEN false ELSE true END",
+                "CHECK (\nCASE\n    WHEN (i > 0) THEN true\n    WHEN b THEN false\n    ELSE true\nEND)",
+            ),
+        ] {
+            assert_eq!(
+                format!(
+                    "CHECK ({})",
+                    constraint_deparse(&lex(sql).unwrap()).unwrap()
+                ),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_check_coalesce_reparses_without_accepting_original_quoted_calls() {
+        let table = TableDef {
+            id: 0,
+            name: "checks".into(),
+            columns: vec![],
+            primary_key: vec![],
+        };
+        let canonical = constraint_deparse(&lex("coalesce(i > 0, false)").unwrap()).unwrap();
+        let stored = query(&table, &canonical).unwrap();
+        assert_eq!(deparse(stored.filter.as_ref().unwrap()).unwrap(), canonical);
+
+        let original = expression(lex("\"coalesce\"(true, false)").unwrap()).unwrap();
+        assert!(matches!(
+            original.bind(&[], &|_, _| Err(SqlError::UnknownColumn), &[]),
+            Err(SqlError::UndefinedFunction)
+        ));
+        assert_eq!(
+            constraint_deparse(&lex("\"coalesce\"(true, false)").unwrap()),
+            Err(SqlError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn noncanonical_boolean_expression_shapes_are_explicitly_bounded() {
+        for sql in [
+            "CASE WHEN b THEN true END",
+            "CASE WHEN CASE WHEN b THEN true ELSE false END THEN true ELSE false END",
+            "CASE WHEN b THEN CASE WHEN b THEN true ELSE false END ELSE false END",
+            "CASE WHEN b THEN true ELSE CASE WHEN b THEN true ELSE false END END",
+            "CASE WHEN b THEN coalesce(CASE WHEN b THEN true ELSE false END, true) ELSE false END",
+            "CASE i WHEN 1 THEN true ELSE false END",
+            "i IS DISTINCT FROM 0",
+            "i IS NOT DISTINCT FROM 0",
+            "(i > 0) IS UNKNOWN",
+            "(i > 0) IS NOT UNKNOWN",
+            "(i > 0) IS NULL",
+            "(i > 0) IS NOT NULL",
         ] {
             assert_eq!(
                 constraint_deparse(&lex(sql).unwrap()),

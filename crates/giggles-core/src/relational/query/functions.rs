@@ -65,6 +65,8 @@ pub(super) enum BinaryOp {
 }
 #[derive(Debug, Clone)]
 pub(super) enum Scalar {
+    Predicate(Box<super::Filter>),
+    Case(Box<CaseExpr>),
     Unary(UnaryOp, Box<Scalar>),
     Binary(BinaryOp, Box<Scalar>, Box<Scalar>),
     Param(usize),
@@ -74,11 +76,21 @@ pub(super) enum Scalar {
     Call(String, Vec<Scalar>),
     SubstringOrder([Box<Scalar>; 3]),
 }
+#[derive(Debug, Clone)]
+pub(super) struct CaseExpr {
+    pub(super) arms: Vec<(super::Filter, Scalar)>,
+    pub(super) otherwise: Option<Scalar>,
+}
 pub(in crate::relational) struct BoundScalar {
     pub(super) ty: DataType,
     node: Node,
 }
 enum Node {
+    Predicate(Box<super::BoundFilter>),
+    Case(
+        Vec<(super::BoundFilter, BoundScalar)>,
+        Option<Box<BoundScalar>>,
+    ),
     CrossCompare(
         String,
         Box<BoundScalar>,
@@ -111,6 +123,49 @@ fn cast_node(value: BoundScalar, target: &DataType) -> Node {
     } else {
         Node::Cast(Box::new(value))
     }
+}
+/// Shared result selection for COALESCE and CASE, with unknown literals omitted.
+fn common_result_type(types: impl IntoIterator<Item = DataType>) -> R<DataType> {
+    let mut common = None;
+    for ty in types {
+        common = Some(match common {
+            None => ty,
+            Some(ref old) if *old == ty => ty,
+            Some(ref old) if integer(old) && integer(&ty) => {
+                if *old == DataType::BigInt || ty == DataType::BigInt {
+                    DataType::BigInt
+                } else {
+                    DataType::Integer
+                }
+            }
+            Some(ref old) if number(old) && number(&ty) => {
+                if matches!(old, DataType::DoublePrecision | DataType::Real)
+                    || matches!(ty, DataType::DoublePrecision | DataType::Real)
+                {
+                    DataType::DoublePrecision
+                } else {
+                    DataType::Numeric
+                }
+            }
+            _ => return Err(SqlError::Type),
+        });
+    }
+    Ok(common.unwrap_or(DataType::Text))
+}
+fn coalesce_hint(
+    args: &[Scalar],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+    parameters: &[Option<DataType>],
+) -> Option<DataType> {
+    // Retain COALESCE's established first-known-argument parameter inference.
+    args.iter()
+        .find_map(|a| match a {
+            Scalar::Cast(_, ty) => Some(ty.clone()),
+            Scalar::Literal(Value::Null | Value::Text(_)) => None,
+            _ => a.bind(resolve, tables, parameters).ok().map(|b| b.ty),
+        })
+        .and_then(|ty| common_result_type([ty]).ok())
 }
 pub(in crate::relational) fn zone_dependent_literal(value: &Value, target: &DataType) -> bool {
     if *target != DataType::TimestampTz || !matches!(value, Value::Text(_)) {
@@ -245,6 +300,16 @@ impl Scalar {
     /// Catalog dependencies are distinct from the positive table-free proof.
     pub(in crate::relational) fn sequence_dependencies(&self, out: &mut Vec<Option<String>>) {
         match self {
+            Self::Predicate(filter) => filter.sequence_dependencies(out),
+            Self::Case(case) => {
+                for (condition, result) in &case.arms {
+                    condition.sequence_dependencies(out);
+                    result.sequence_dependencies(out);
+                }
+                if let Some(result) = &case.otherwise {
+                    result.sequence_dependencies(out);
+                }
+            }
             Self::Call(name, args) => {
                 if sequence_name(name) {
                     fn literal(arg: &Scalar) -> Option<String> {
@@ -275,6 +340,15 @@ impl Scalar {
     }
     pub(super) fn has_undefined_routine(&self) -> bool {
         match self {
+            Self::Predicate(filter) => filter.has_undefined_routine(),
+            Self::Case(case) => {
+                case.arms.iter().any(|(condition, result)| {
+                    condition.has_undefined_routine() || result.has_undefined_routine()
+                }) || case
+                    .otherwise
+                    .as_ref()
+                    .is_some_and(Self::has_undefined_routine)
+            }
             Self::Call(name, args) => {
                 deferred_routine_error(name).is_some()
                     || args.iter().any(Self::has_undefined_routine)
@@ -289,6 +363,7 @@ impl Scalar {
     }
     pub(super) fn aggregate_unknown(&self, parameters: &[Option<DataType>]) -> bool {
         match self {
+            Self::Predicate(_) | Self::Case(_) => false,
             Self::Literal(Value::Null | Value::Text(_)) => true,
             Self::Param(n) => parameters.get(n - 1).is_none_or(Option::is_none),
             _ => false,
@@ -296,6 +371,16 @@ impl Scalar {
     }
     pub(super) fn reject_nested_aggregate(&self) -> R<()> {
         match self {
+            Self::Predicate(filter) => filter.reject_nested_aggregate(),
+            Self::Case(case) => {
+                for (condition, result) in &case.arms {
+                    condition.reject_nested_aggregate()?;
+                    result.reject_nested_aggregate()?;
+                }
+                case.otherwise
+                    .as_ref()
+                    .map_or(Ok(()), Self::reject_nested_aggregate)
+            }
             Self::Call(name, _) if deferred_routine_error(name).is_some() => Ok(()),
             Self::Call(name, _) if matches!(name.as_str(), "count" | "sum" | "min" | "max") => {
                 Err(SqlError::GroupingError)
@@ -316,6 +401,39 @@ impl Scalar {
     }
     pub(super) fn parse_aggregate_argument(p: &mut Parser, depth: usize) -> R<Self> {
         Self::parse_context(p, depth, true)
+    }
+    pub(super) fn parse_expr(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
+        match super::Filter::parse_context(p, 0, depth, aggregate_argument)? {
+            super::Filter::Scalar(value) => {
+                arithmetic::admit_shape(&value, depth, &mut 0)?;
+                Ok(value)
+            }
+            filter => {
+                // Count the scalar wrapper without adding syntactic nesting depth.
+                filter.admit_shape(depth, &mut 1)?;
+                Ok(Self::Predicate(Box::new(filter)))
+            }
+        }
+    }
+    pub(super) fn has_volatile_call(&self) -> bool {
+        match self {
+            Self::Predicate(filter) => filter.has_volatile_call(),
+            Self::Case(case) => {
+                case.arms.iter().any(|(condition, result)| {
+                    condition.has_volatile_call() || result.has_volatile_call()
+                }) || case.otherwise.as_ref().is_some_and(Self::has_volatile_call)
+            }
+            Self::Call(name, args) => {
+                matches!(
+                    name.as_str(),
+                    "nextval" | "setval" | "currval" | "random" | "clock_timestamp"
+                ) || args.iter().any(Self::has_volatile_call)
+            }
+            Self::Cast(value, _) | Self::Unary(_, value) => value.has_volatile_call(),
+            Self::Binary(_, left, right) => left.has_volatile_call() || right.has_volatile_call(),
+            Self::SubstringOrder(args) => args.iter().any(|a| a.has_volatile_call()),
+            Self::Param(_) | Self::Column(_) | Self::Literal(_) => false,
+        }
     }
     fn parse_context(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
         let value = Self::parse_binary(p, depth, aggregate_argument, 0)?;
@@ -409,6 +527,54 @@ impl Scalar {
         if depth > 32 {
             return Err(SqlError::Limit);
         }
+        if p.word("case") {
+            let operand = if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "when") {
+                None
+            } else {
+                let operand = Self::parse_expr(p, depth + 1, aggregate_argument)?;
+                if operand.has_volatile_call() {
+                    return Err(SqlError::Unsupported);
+                }
+                Some(operand)
+            };
+            let mut arms = Vec::new();
+            while p.word("when") {
+                if arms.len() == MAX_COLUMNS {
+                    return Err(SqlError::Limit);
+                }
+                let condition = if operand.is_some() {
+                    super::Filter::Scalar(Self::parse_expr(p, depth + 1, aggregate_argument)?)
+                } else {
+                    super::Filter::parse_context(p, 0, depth + 1, aggregate_argument)?
+                };
+                p.need("then")?;
+                let result = Self::parse_expr(p, depth + 1, aggregate_argument)?;
+                arms.push((condition, result));
+            }
+            if arms.is_empty() {
+                return Err(SqlError::Syntax);
+            }
+            let otherwise = if p.word("else") {
+                Some(Self::parse_expr(p, depth + 1, aggregate_argument)?)
+            } else {
+                None
+            };
+            p.need("end")?;
+            if let Some(operand) = operand {
+                super::admit_expansion(&operand, arms.len())?;
+                for (condition, _) in &mut arms {
+                    let super::Filter::Scalar(value) = condition else {
+                        unreachable!()
+                    };
+                    *condition = super::Filter::Compare(operand.clone(), "=".into(), value.clone());
+                }
+            }
+            return Ok(Self::Case(Box::new(CaseExpr { arms, otherwise })));
+        }
+        if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if matches!(word.as_str(), "when" | "then" | "else" | "end"))
+        {
+            return Err(SqlError::Syntax);
+        }
         if let Some(Token::Word(name)) = p.tokens.get(p.at)
             && matches!(
                 name.as_str(),
@@ -445,7 +611,7 @@ impl Scalar {
             return Ok(Self::Cast(Box::new(value), ty));
         }
         if p.sym('(') {
-            let value = Self::parse_context(p, depth + 1, aggregate_argument)?;
+            let value = Self::parse_expr(p, depth + 1, aggregate_argument)?;
             p.punct(')')?;
             return Ok(value);
         }
@@ -530,13 +696,15 @@ impl Scalar {
                     p.punct(')')?;
                     return Ok(Self::Call(name, vec![Self::Literal(Value::Null)]));
                 }
+                if name == "count" && p.sym('*') {
+                    p.punct(')')?;
+                    // Nested scalar aggregate expressions use the same nonnull
+                    // input as query grouping's COUNT(*) normalization.
+                    return Ok(Self::Call(name, vec![Self::Literal(Value::Int(1))]));
+                }
                 if aggregate_argument && p.sym('*') {
                     p.punct(')')?;
-                    if name != "count" {
-                        return Err(SqlError::UndefinedFunction);
-                    }
-                    // Binder's existing nested-aggregate classifier rejects this marker.
-                    return Ok(Self::Call(name, vec![Self::Literal(Value::Null)]));
+                    return Err(SqlError::UndefinedFunction);
                 }
                 if name == "trim" && !qualified_call && !quoted {
                     return Self::parse_trim_construct(p, depth, aggregate_argument);
@@ -585,7 +753,16 @@ impl Scalar {
                             p.at += 4;
                             args.push(Self::Literal(Value::Text(value)));
                         } else {
-                            args.push(Self::parse_context(p, depth + 1, aggregate_argument)?);
+                            args.push(
+                                if !qualified_call
+                                    && !quoted
+                                    && matches!(name.as_str(), "substring" | "overlay")
+                                {
+                                    Self::parse_context(p, depth + 1, aggregate_argument)?
+                                } else {
+                                    Self::parse_expr(p, depth + 1, aggregate_argument)?
+                                },
+                            );
                         }
                         if !qualified_call
                             && !quoted
@@ -728,7 +905,82 @@ impl Scalar {
         if matches!(self, Self::Unary(..) | Self::Binary(..)) {
             return arithmetic::bind(self, resolve, tables, parameters);
         }
+        let expression_parameter_error = |error| {
+            if matches!(error, SqlError::Parameters) && parameters.iter().any(Option::is_none) {
+                SqlError::IndeterminateDatatype
+            } else {
+                error
+            }
+        };
         let (ty, node) = match self {
+            Self::Predicate(filter) => (
+                DataType::Boolean,
+                Node::Predicate(Box::new(
+                    filter
+                        .bind(parameters, resolve, tables)
+                        .map_err(expression_parameter_error)?,
+                )),
+            ),
+            Self::Case(case) => {
+                let originals: Vec<_> = case
+                    .arms
+                    .iter()
+                    .map(|(_, result)| result)
+                    .chain(case.otherwise.iter())
+                    .collect();
+                let ty = common_result_type(
+                    originals
+                        .iter()
+                        .filter(|result| {
+                            !matches!(result, Self::Literal(Value::Null | Value::Text(_)))
+                        })
+                        .map(|result| {
+                            result
+                                .bind(resolve, tables, parameters)
+                                .map_err(expression_parameter_error)
+                                .map(|bound| bound.ty)
+                        })
+                        .collect::<R<Vec<_>>>()?,
+                )?;
+                let result = |value: &Scalar| -> R<BoundScalar> {
+                    if let Self::Literal(value @ (Value::Text(_) | Value::Null)) = value {
+                        return Ok(BoundScalar {
+                            ty: ty.clone(),
+                            node: literal_cast_node(value.clone(), &ty)?,
+                        });
+                    }
+                    let bound = value
+                        .bind(resolve, tables, parameters)
+                        .map_err(expression_parameter_error)?;
+                    if bound.ty == ty {
+                        Ok(bound)
+                    } else {
+                        Ok(BoundScalar {
+                            ty: ty.clone(),
+                            node: cast_node(bound, &ty),
+                        })
+                    }
+                };
+                let arms = case
+                    .arms
+                    .iter()
+                    .map(|(condition, value)| {
+                        Ok((
+                            condition
+                                .bind(parameters, resolve, tables)
+                                .map_err(expression_parameter_error)?,
+                            result(value)?,
+                        ))
+                    })
+                    .collect::<R<Vec<_>>>()?;
+                let otherwise = case
+                    .otherwise
+                    .as_ref()
+                    .map(result)
+                    .transpose()?
+                    .map(Box::new);
+                (ty, Node::Case(arms, otherwise))
+            }
             Self::Unary(..) | Self::Binary(..) => unreachable!(),
             Self::Param(n) => (
                 parameters[*n - 1].clone().ok_or(SqlError::Parameters)?,
@@ -1241,40 +1493,15 @@ impl Scalar {
                             DataType::Text
                         }
                         "coalesce" if !args.is_empty() => {
-                            let mut ty: Option<DataType> = None;
-                            for (a, original) in args.iter().zip(original) {
-                                if matches!(original, Self::Literal(Value::Text(_))) {
-                                    continue;
-                                }
-                                if null(a) {
-                                    continue;
-                                }
-                                ty = Some(match ty {
-                                    None => a.ty.clone(),
-                                    Some(ref t) if t == &a.ty => t.clone(),
-                                    Some(ref t) if integer(t) && integer(&a.ty) => {
-                                        if *t == DataType::BigInt || a.ty == DataType::BigInt {
-                                            DataType::BigInt
-                                        } else {
-                                            DataType::Integer
-                                        }
-                                    }
-                                    Some(ref t) if number(t) && number(&a.ty) => {
-                                        if matches!(t, DataType::DoublePrecision | DataType::Real)
-                                            || matches!(
-                                                a.ty,
-                                                DataType::DoublePrecision | DataType::Real
-                                            )
-                                        {
-                                            DataType::DoublePrecision
-                                        } else {
-                                            DataType::Numeric
-                                        }
-                                    }
-                                    _ => return Err(SqlError::Type),
-                                });
-                            }
-                            let ty = ty.unwrap_or(DataType::Text);
+                            let ty = common_result_type(
+                                args.iter()
+                                    .zip(original)
+                                    .filter(|(a, original)| {
+                                        !matches!(original, Self::Literal(Value::Text(_)))
+                                            && !null(a)
+                                    })
+                                    .map(|(a, _)| a.ty.clone()),
+                            )?;
                             for (a, original) in args.iter_mut().zip(original) {
                                 if let Self::Literal(Value::Text(s)) = original {
                                     a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
@@ -1319,6 +1546,16 @@ impl BoundScalar {
         clock: Option<&crate::relational::clock::ExecutionClock>,
     ) {
         match &mut self.node {
+            Node::Predicate(filter) => filter.attach_clock(clock),
+            Node::Case(arms, otherwise) => {
+                for (condition, result) in arms {
+                    condition.attach_clock(clock);
+                    result.attach_clock(clock);
+                }
+                if let Some(result) = otherwise {
+                    result.attach_clock(clock);
+                }
+            }
             Node::SessionCast(value, target) => {
                 *target = clock.cloned();
                 value.attach_clock(clock);
@@ -1340,12 +1577,15 @@ impl BoundScalar {
     }
     pub(in crate::relational) fn clock_typmod(&self) -> i32 {
         match &self.node {
+            Node::Predicate(_) | Node::Case(..) => -1,
             Node::Clock(_, precision, _) => *precision,
             _ => -1,
         }
     }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
+            Node::Predicate(_) => None,
+            Node::Case(..) => Some("case"),
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
             Node::Column(_, name)
             | Node::Call(name, _)
@@ -1357,6 +1597,8 @@ impl BoundScalar {
     }
     pub(super) fn name(&self) -> &str {
         match &self.node {
+            Node::Predicate(_) => "?column?",
+            Node::Case(..) => "case",
             Node::CrossCompare(..) => "?column?",
             Node::Param(_) => "?column?",
             Node::Cast(a) | Node::SessionCast(a, _) => {
@@ -1390,6 +1632,19 @@ impl BoundScalar {
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::Predicate(filter) => Ok(filter
+                .eval(row, params, budget)?
+                .map_or(Value::Null, Value::Bool)),
+            Node::Case(arms, otherwise) => {
+                for (condition, result) in arms {
+                    if condition.eval(row, params, budget)? == Some(true) {
+                        return result.eval(row, params, budget);
+                    }
+                }
+                otherwise
+                    .as_ref()
+                    .map_or(Ok(Value::Null), |result| result.eval(row, params, budget))
+            }
             Node::CrossCompare(op, a, b, clock) => {
                 let a = a.eval(row, params, budget)?;
                 let b = b.eval(row, params, budget)?;
@@ -1692,6 +1947,18 @@ impl Query {
     pub(in super::super) fn admit_assignment_literals(&self, bytes: &mut usize) -> R<()> {
         fn admit(value: &Scalar, bytes: &mut usize) -> R<()> {
             match value {
+                Scalar::Predicate(filter) => {
+                    filter.visit_scalars(&mut |value| admit(value, bytes))?
+                }
+                Scalar::Case(case) => {
+                    for (condition, result) in &case.arms {
+                        condition.visit_scalars(&mut |value| admit(value, bytes))?;
+                        admit(result, bytes)?;
+                    }
+                    if let Some(result) = &case.otherwise {
+                        admit(result, bytes)?;
+                    }
+                }
                 Scalar::Literal(value) => {
                     Relational::secondary_admit_values(std::iter::once(value))?;
                     let bound = if let Value::Numeric(value) = value {
@@ -2023,6 +2290,37 @@ impl Scalar {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
+            Self::Predicate(filter) => filter.infer(parameters, resolve, tables)?,
+            Self::Case(case) => {
+                for (condition, _) in &case.arms {
+                    condition.infer(parameters, resolve, tables)?;
+                }
+                let results: Vec<_> = case
+                    .arms
+                    .iter()
+                    .map(|(_, result)| result)
+                    .chain(case.otherwise.iter())
+                    .collect();
+                for result in &results {
+                    result.infer(None, parameters, resolve, tables)?;
+                }
+                let ty = common_result_type(
+                    results
+                        .iter()
+                        .filter(|result| !result.aggregate_unknown(parameters))
+                        .map(|result| {
+                            result
+                                .bind(resolve, tables, parameters)
+                                .map(|bound| bound.ty)
+                        })
+                        .collect::<R<Vec<_>>>()?,
+                )?;
+                for result in results {
+                    if result.aggregate_unknown(parameters) {
+                        result.infer(Some(&ty), parameters, resolve, tables)?;
+                    }
+                }
+            }
             Self::Unary(..) | Self::Binary(..) => {
                 arithmetic::infer(self, parameters, resolve, tables)?
             }
@@ -2063,6 +2361,24 @@ impl Scalar {
                 ) -> R<bool> {
                     let mut bindable = true;
                     match arg {
+                        Scalar::Predicate(filter) => {
+                            filter.visit_scalars(&mut |arg| {
+                                bindable &= validate(arg, parameters, resolve, tables)?;
+                                Ok(())
+                            })?;
+                        }
+                        Scalar::Case(case) => {
+                            for (condition, result) in &case.arms {
+                                condition.visit_scalars(&mut |arg| {
+                                    bindable &= validate(arg, parameters, resolve, tables)?;
+                                    Ok(())
+                                })?;
+                                bindable &= validate(result, parameters, resolve, tables)?;
+                            }
+                            if let Some(result) = &case.otherwise {
+                                bindable &= validate(result, parameters, resolve, tables)?;
+                            }
+                        }
                         Scalar::Param(n) => {
                             bindable = parameters.get(n - 1).is_some_and(Option::is_some);
                         }
@@ -2148,17 +2464,7 @@ impl Scalar {
                     }
                 }
                 let common = if n == "coalesce" {
-                    args.iter().find_map(|a| match a {
-                        Self::Cast(_, t) => Some(t.clone()),
-                        Self::Literal(Value::Int(v)) => Some(if i32::try_from(*v).is_ok() {
-                            DataType::Integer
-                        } else {
-                            DataType::BigInt
-                        }),
-                        Self::Literal(Value::Bool(_)) => Some(DataType::Boolean),
-                        Self::Literal(Value::Null | Value::Text(_)) => None,
-                        _ => a.bind(resolve, tables, parameters).ok().map(|b| b.ty),
-                    })
+                    coalesce_hint(args, resolve, tables, parameters)
                 } else {
                     None
                 };

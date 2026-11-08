@@ -15,43 +15,110 @@ struct BoundValues {
 }
 pub(in super::super) struct Literals<'a> {
     roots: std::slice::Iter<'a, Scalar>,
-    stack: [Option<(&'a Scalar, usize)>; 64],
+    stack: [Option<(LiteralNode<'a>, usize)>; 64],
     depth: usize,
+}
+#[derive(Clone, Copy)]
+enum LiteralNode<'a> {
+    Scalar(&'a Scalar),
+    Filter(&'a Filter),
 }
 impl<'a> Iterator for Literals<'a> {
     type Item = &'a Value;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.depth == 0 {
-                self.stack[0] = Some((self.roots.next()?, 0));
+                self.stack[0] = Some((LiteralNode::Scalar(self.roots.next()?), 0));
                 self.depth = 1;
             }
             let (node, cursor) = self.stack[self.depth - 1].unwrap();
             let child = match node {
-                Scalar::Literal(value) => {
-                    let out = value;
-                    self.depth -= 1;
-                    return Some(out);
-                }
-                Scalar::Cast(value, _) | Scalar::Unary(_, value) if cursor == 0 => {
-                    self.stack[self.depth - 1] = Some((node, 1));
-                    Some(value.as_ref())
-                }
-                Scalar::Binary(_, a, b) if cursor < 2 => {
+                LiteralNode::Filter(f) => {
+                    let child = match f {
+                        Filter::Scalar(s) | Filter::Null(s, _) if cursor == 0 => {
+                            Some(LiteralNode::Scalar(s))
+                        }
+                        Filter::Compare(a, _, b) if cursor < 2 => {
+                            Some(LiteralNode::Scalar(if cursor == 0 { a } else { b }))
+                        }
+                        Filter::Like {
+                            value,
+                            pattern,
+                            escape,
+                            ..
+                        } => match cursor {
+                            0 => Some(LiteralNode::Scalar(value)),
+                            1 => Some(LiteralNode::Scalar(pattern)),
+                            2 => escape.as_ref().map(LiteralNode::Scalar),
+                            _ => None,
+                        },
+                        Filter::Not(f) | Filter::Is(f, _, _) if cursor == 0 => {
+                            Some(LiteralNode::Filter(f))
+                        }
+                        Filter::Logic(a, _, b) if cursor < 2 => {
+                            Some(LiteralNode::Filter(if cursor == 0 { a } else { b }))
+                        }
+                        _ => None,
+                    };
                     self.stack[self.depth - 1] = Some((node, cursor + 1));
-                    Some(if cursor == 0 { a.as_ref() } else { b.as_ref() })
+                    child
                 }
-                Scalar::Call(_, args) if cursor < args.len() => {
-                    let out = &args[cursor];
-                    self.stack[self.depth - 1] = Some((node, cursor + 1));
-                    Some(out)
+                LiteralNode::Scalar(scalar) => {
+                    let child = match scalar {
+                        Scalar::Literal(value) => {
+                            let out = value;
+                            self.depth -= 1;
+                            return Some(out);
+                        }
+                        Scalar::Cast(value, _) | Scalar::Unary(_, value) if cursor == 0 => {
+                            self.stack[self.depth - 1] = Some((node, 1));
+                            Some(value.as_ref())
+                        }
+                        Scalar::Binary(_, a, b) if cursor < 2 => {
+                            self.stack[self.depth - 1] = Some((node, cursor + 1));
+                            Some(if cursor == 0 { a.as_ref() } else { b.as_ref() })
+                        }
+                        Scalar::Call(_, args) if cursor < args.len() => {
+                            let out = &args[cursor];
+                            self.stack[self.depth - 1] = Some((node, cursor + 1));
+                            Some(out)
+                        }
+                        Scalar::SubstringOrder(args) if cursor < args.len() => {
+                            let out = args[cursor].as_ref();
+                            self.stack[self.depth - 1] = Some((node, cursor + 1));
+                            Some(out)
+                        }
+                        Scalar::Predicate(f) if cursor == 0 => {
+                            self.stack[self.depth - 1] = Some((node, 1));
+                            self.stack[self.depth] = Some((LiteralNode::Filter(f), 0));
+                            self.depth += 1;
+                            continue;
+                        }
+                        Scalar::Case(c) => {
+                            let child = if cursor < c.arms.len() * 2 {
+                                let (f, s) = &c.arms[cursor / 2];
+                                Some(if cursor % 2 == 0 {
+                                    LiteralNode::Filter(f)
+                                } else {
+                                    LiteralNode::Scalar(s)
+                                })
+                            } else if cursor == c.arms.len() * 2 {
+                                c.otherwise.as_ref().map(LiteralNode::Scalar)
+                            } else {
+                                None
+                            };
+                            self.stack[self.depth - 1] = Some((node, cursor + 1));
+                            if let Some(child) = child {
+                                self.stack[self.depth] = Some((child, 0));
+                                self.depth += 1;
+                                continue;
+                            }
+                            None
+                        }
+                        _ => None,
+                    };
+                    child.map(LiteralNode::Scalar)
                 }
-                Scalar::SubstringOrder(args) if cursor < args.len() => {
-                    let out = args[cursor].as_ref();
-                    self.stack[self.depth - 1] = Some((node, cursor + 1));
-                    Some(out)
-                }
-                _ => None,
             };
             if let Some(child) = child {
                 // This wrapper admits AST depth and node count before constructing the iterator.
@@ -70,7 +137,7 @@ fn bytes(value: &Value) -> usize {
         value_bytes(value)
     }
 }
-fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
+pub(super) fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
     if depth > 32 || *nodes == MAX_WORK {
         return Err(SqlError::Limit);
     }
@@ -87,6 +154,17 @@ fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
         Scalar::SubstringOrder(children) => children
             .iter()
             .try_for_each(|child| shape(child, depth + 1, nodes)),
+        Scalar::Predicate(f) => f.admit_shape(depth + 1, nodes),
+        Scalar::Case(c) => {
+            for (f, s) in &c.arms {
+                f.admit_shape(depth + 1, nodes)?;
+                shape(s, depth + 1, nodes)?;
+            }
+            if let Some(s) = &c.otherwise {
+                shape(s, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -199,6 +277,33 @@ impl InsertExpressions {
                 .into_iter()
                 .collect::<Vec<_>>();
             fn remap(value: &mut Scalar, map: &[usize]) {
+                fn filter(f: &mut Filter, map: &[usize]) {
+                    match f {
+                        Filter::Scalar(s) | Filter::Null(s, _) => remap(s, map),
+                        Filter::Compare(a, _, b) => {
+                            remap(a, map);
+                            remap(b, map);
+                        }
+                        Filter::Like {
+                            value,
+                            pattern,
+                            escape,
+                            ..
+                        } => {
+                            remap(value, map);
+                            remap(pattern, map);
+                            if let Some(s) = escape {
+                                remap(s, map);
+                            }
+                        }
+                        Filter::Not(f) | Filter::Is(f, _, _) => filter(f, map),
+                        Filter::Logic(a, _, b) => {
+                            filter(a, map);
+                            filter(b, map);
+                        }
+                        Filter::Clauses(_) => unreachable!("VALUES has no query clauses"),
+                    }
+                }
                 match value {
                     Scalar::Param(n) => *n = map.binary_search(n).unwrap() + 1,
                     Scalar::Cast(value, _) | Scalar::Unary(_, value) => remap(value, map),
@@ -208,6 +313,16 @@ impl InsertExpressions {
                     }
                     Scalar::Call(_, args) => args.iter_mut().for_each(|arg| remap(arg, map)),
                     Scalar::SubstringOrder(args) => args.iter_mut().for_each(|arg| remap(arg, map)),
+                    Scalar::Predicate(f) => filter(f, map),
+                    Scalar::Case(c) => {
+                        for (f, s) in &mut c.arms {
+                            filter(f, map);
+                            remap(s, map);
+                        }
+                        if let Some(s) = &mut c.otherwise {
+                            remap(s, map);
+                        }
+                    }
                     _ => {}
                 }
             }

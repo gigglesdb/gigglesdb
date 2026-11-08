@@ -21,6 +21,13 @@ pub(super) fn contains_aggregate(s: &Scalar) -> bool {
         Scalar::Unary(_, a) | Scalar::Cast(a, _) => contains_aggregate(a),
         Scalar::Binary(_, a, b) => contains_aggregate(a) || contains_aggregate(b),
         Scalar::SubstringOrder(a) => a.iter().any(|a| contains_aggregate(a)),
+        Scalar::Predicate(f) => filter_contains_aggregate(f),
+        Scalar::Case(c) => {
+            c.arms
+                .iter()
+                .any(|(f, s)| filter_contains_aggregate(f) || contains_aggregate(s))
+                || c.otherwise.as_ref().is_some_and(contains_aggregate)
+        }
         _ => false,
     }
 }
@@ -78,7 +85,90 @@ fn canonical(
                 .map(|a| canonical(a, resolve, scope, tables))
                 .collect::<R<Vec<_>>>()?
         ),
+        Scalar::Predicate(f) => {
+            canonical_fields("predicate", &[canonical_filter(f, resolve, scope, tables)?])
+        }
+        Scalar::Case(c) => {
+            let mut fields = c
+                .arms
+                .iter()
+                .map(|(f, s)| {
+                    Ok(canonical_fields(
+                        "arm",
+                        &[
+                            canonical_filter(f, resolve, scope, tables)?,
+                            canonical(s, resolve, scope, tables)?,
+                        ],
+                    ))
+                })
+                .collect::<R<Vec<_>>>()?;
+            fields.push(match &c.otherwise {
+                Some(s) => canonical_fields("else", &[canonical(s, resolve, scope, tables)?]),
+                None => "no-else".into(),
+            });
+            canonical_fields("case", &fields)
+        }
         _ => format!("{s:?}"),
+    })
+}
+fn canonical_fields(tag: &str, fields: &[String]) -> String {
+    let mut out = tag.to_owned();
+    for field in fields {
+        out.push_str(&format!(":{}:{field}", field.len()));
+    }
+    out
+}
+fn canonical_filter(
+    f: &Filter,
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    scope: usize,
+    tables: &[&TableDef],
+) -> R<String> {
+    let scalar = |s| canonical(s, resolve, scope, tables);
+    let filter = |f| canonical_filter(f, resolve, scope, tables);
+    Ok(match f {
+        Filter::Clauses(_) => return Err(SqlError::Unsupported),
+        Filter::Scalar(s) => canonical_fields("scalar", &[scalar(s)?]),
+        Filter::Null(s, not) => canonical_fields("null", &[not.to_string(), scalar(s)?]),
+        Filter::Compare(a, op, b) => {
+            canonical_fields("compare", &[op.clone(), scalar(a)?, scalar(b)?])
+        }
+        Filter::Like {
+            value,
+            pattern,
+            escape,
+            insensitive,
+            negated,
+        } => canonical_fields(
+            "like",
+            &[
+                insensitive.to_string(),
+                negated.to_string(),
+                scalar(value)?,
+                scalar(pattern)?,
+                match escape {
+                    Some(s) => canonical_fields("escape", &[scalar(s)?]),
+                    None => "no-escape".into(),
+                },
+            ],
+        ),
+        Filter::Not(f) => canonical_fields("not", &[filter(f)?]),
+        Filter::Is(f, target, not) => canonical_fields(
+            "is",
+            &[
+                match target {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "unknown",
+                }
+                .into(),
+                not.to_string(),
+                filter(f)?,
+            ],
+        ),
+        Filter::Logic(a, and, b) => {
+            canonical_fields("logic", &[and.to_string(), filter(a)?, filter(b)?])
+        }
     })
 }
 struct Lower<'a, F> {
@@ -143,6 +233,15 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 Box::new(self.scalar(&args[1])?),
                 Box::new(self.scalar(&args[2])?),
             ]),
+            Scalar::Predicate(f) => Scalar::Predicate(Box::new(self.filter(f)?)),
+            Scalar::Case(c) => Scalar::Case(Box::new(functions::CaseExpr {
+                arms: c
+                    .arms
+                    .iter()
+                    .map(|(f, s)| Ok((self.filter(f)?, self.scalar(s)?)))
+                    .collect::<R<Vec<_>>>()?,
+                otherwise: c.otherwise.as_ref().map(|s| self.scalar(s)).transpose()?,
+            })),
             _ => s.clone(),
         })
     }
@@ -168,6 +267,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 negated: *negated,
             },
             Filter::Not(f) => Filter::Not(Box::new(self.filter(f)?)),
+            Filter::Is(f, target, not) => Filter::Is(Box::new(self.filter(f)?), *target, *not),
             Filter::Logic(a, and, b) => {
                 Filter::Logic(Box::new(self.filter(a)?), *and, Box::new(self.filter(b)?))
             }

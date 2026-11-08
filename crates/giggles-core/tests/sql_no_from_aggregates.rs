@@ -184,17 +184,17 @@ fn pg18_no_from_aggregate_oracle() {
             Err(E::UndefinedFunction),
             vec![],
         ),
-        // Pre-existing parser limit, same with FROM; PG18.6 gives 42803 / 42883 (DD-0068 F11 follow-up)
+        // PG18.6: 42803 aggregate in WHERE / 42883 nosuchfn(bigint); F15 closed the F11 count(*) parser limit
         (
             "SELECT count(*) WHERE count(*)>0",
-            Err(E::Unsupported),
+            Err(E::GroupingError),
             vec![],
         ),
-        ("SELECT nosuchfn(count(*))", Err(E::Unsupported), vec![]),
+        ("SELECT nosuchfn(count(*))", Err(E::UndefinedFunction), vec![]),
         ("CREATE TABLE so(id serial PRIMARY KEY)", Ok(vec![]), vec![]),
         (
             "SELECT count(*) FROM so WHERE count(*)>0",
-            Err(E::Unsupported),
+            Err(E::GroupingError),
             vec![],
         ),
         (

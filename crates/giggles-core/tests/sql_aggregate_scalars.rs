@@ -385,7 +385,6 @@ fn nested_count_star_context_and_quoted_resolution_boundaries() {
         "SELECT sum(\"COUNT\"(*)) FROM agg",
         "SELECT sum(public.count(*)) FROM agg",
         "SELECT sum(missing.count(*)) FROM agg",
-        "SELECT abs(count(*)) FROM agg",
     ] {
         let e = match s.prepare(q) {
             Err(e) => e,
@@ -397,6 +396,10 @@ fn nested_count_star_context_and_quoted_resolution_boundaries() {
             "{q}"
         );
     }
+    // PG18.6: abs(count(*)) is an ordinary scalar over an aggregate (F15).
+    let p = s.prepare("SELECT abs(count(*)) FROM agg").unwrap();
+    assert_eq!(s.describe(&p).unwrap().columns[0].data_type, DataType::BigInt);
+    s.execute("SELECT abs(count(*)) FROM agg", &[], None).unwrap();
     let q = format!(
         "SELECT sum({}id{}) FROM agg",
         "(".repeat(40),
