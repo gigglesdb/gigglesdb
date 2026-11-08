@@ -715,6 +715,7 @@ fn sql_insert_constraint_descriptor_precedes_synthetic_primary_name() {
 
 fn admission_insert() -> Insert {
     Insert {
+        copy_input: None,
         table: "items".into(),
         columns: vec!["id".into(), "email".into(), "code".into(), "n".into()],
         rows: vec![
@@ -836,6 +837,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
     assert!(2 * per_row_work > secondary_index::MAX_WORK);
     assert!(2 * (raw + 9) < operations::MAX_INSERT_BYTES);
     let insert = Insert {
+        copy_input: None,
         table: "heavy".into(),
         columns: vec!["id".into(), "n".into()],
         rows: vec![
@@ -858,6 +860,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
     // Fifty individually admitted numerics exceed the row's raw byte budget
     // while remaining below both the input byte and aggregate work budgets.
     let insert = Insert {
+        copy_input: None,
         table: "wide_numeric".into(),
         columns: std::iter::once("id".to_owned())
             .chain((0..50).map(|i| format!("n{i}")))

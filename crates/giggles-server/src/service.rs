@@ -173,10 +173,11 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::WrongObjectType) => "42809",
         CoreError::Sql(S::NullValueNotAllowed) => "22004",
         CoreError::Sql(S::CannotCoerce) => "42846",
+        CoreError::Sql(S::BadCopyFileFormat) => "22P04",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
-        _ => "XX000",
+        CoreError::Corrupt(_) | CoreError::Exists => "XX000",
     }
 }
 pub struct Service {
@@ -674,6 +675,13 @@ impl Session {
             }
         }
         self.authority_scope(|session| {
+            if relational::Copy::is_copy(sql) {
+                session.authorize_copy_sql(sql)?;
+                let result = relational::Copy::parse(sql).map_err(CoreError::Sql);
+                session.abort();
+                result?;
+                return Err(CoreError::Sql(relational::SqlError::Unsupported));
+            }
             session.reconcile_sequence_owners()?;
             // Parse the complete ALTER before checking authority, but do not bind
             // its table, columns, or defaults until ownership has been checked.
@@ -984,6 +992,159 @@ impl Session {
         let implicit = self.sql.implicit_sequence_dependencies(p)?;
         self.authorize_sequences(&implicit)?;
         Ok(())
+    }
+    fn authorize_copy_sql(&mut self, sql: &str) -> Result<(), CoreError> {
+        if !self.role.is_sql() {
+            self.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        let unrestricted = if let Role::Database { name } = &self.role {
+            self.service
+                .admin
+                .roles()
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .ok_or(CoreError::Policy(Error::Authentication))?
+                .superuser
+        } else {
+            false
+        };
+        let target = match relational::Copy::target(sql) {
+            Ok(Some(target)) => target,
+            result => {
+                self.abort();
+                if !unrestricted {
+                    return Err(CoreError::Policy(Error::Scope));
+                }
+                return Err(CoreError::Sql(
+                    result.err().unwrap_or(relational::SqlError::Syntax),
+                ));
+            }
+        };
+        let allowed = match &self.role {
+            Role::Application { tables, .. } => tables.contains(&target),
+            Role::Database { name } => {
+                let target = self.sql.table_authority_name(&target)?;
+                let roles = self.service.admin.roles();
+                unrestricted
+                    || roles
+                        .table_owner(&target)
+                        .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
+                    || roles
+                        .table_privileges(&target, name)
+                        .is_ok_and(|privileges| privileges.contains(&roles::TablePrivilege::Insert))
+            }
+            _ => false,
+        };
+        if !allowed {
+            self.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_copy(
+        &mut self,
+        sql: &str,
+    ) -> Result<(relational::Copy, Prepared), CoreError> {
+        self.authority_scope(|session| {
+            session.authorize_copy_sql(sql)?;
+            session.reconcile_sequence_owners()?;
+            let (copy, prepared) = session.sql.prepare_copy(sql)?;
+            session.authorize(&prepared)?;
+            Ok((copy, prepared))
+        })
+    }
+    pub(crate) fn copy_columns(
+        &mut self,
+        copy: &relational::Copy,
+        prepared: &Prepared,
+    ) -> Result<Vec<relational::ColumnDef>, CoreError> {
+        self.authority_scope(|session| {
+            session.authorize(prepared)?;
+            session.sql.copy_columns(copy)
+        })
+    }
+    pub(crate) fn copy_clock(&mut self) -> StatementClock {
+        if !self.sql.in_transaction() {
+            self.transaction_us = None;
+        }
+        let (statement_us, unavailable) = match self.service.clock.sql_micros() {
+            Ok(sample) => (sample, None),
+            Err(error) => (self.transaction_us.unwrap_or(0), Some(error)),
+        };
+        let transaction_us = self.transaction_us.unwrap_or(statement_us);
+        if self.sql.in_transaction() && unavailable.is_none() {
+            self.transaction_us = Some(transaction_us);
+        }
+        let service = self.service.clone();
+        StatementClock {
+            unavailable,
+            transaction_us,
+            statement_us,
+            zone: self.zone,
+            wall: Some(Arc::new(move || service.clock.sql_micros())),
+        }
+    }
+    pub(crate) fn normalize_copy_rows(
+        &mut self,
+        prepared: &Prepared,
+        rows: Vec<Vec<Value>>,
+        clock: &StatementClock,
+    ) -> Result<(Prepared, Vec<Vec<Value>>), CoreError> {
+        self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
+            session.authorize(prepared)?;
+            session.sql.normalize_copy_rows_at(prepared, rows, clock)
+        })
+    }
+    pub(crate) fn ingest_normalized_copy(
+        &mut self,
+        authority: &Prepared,
+        prepared: &Prepared,
+        rows: Vec<Vec<Value>>,
+        clock: &StatementClock,
+    ) -> Result<SqlResult, CoreError> {
+        self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
+            session.authorize(authority)?;
+            let result = session.sql.ingest_copy_at(prepared, rows, clock);
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            }
+            result
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn ingest_copy(
+        &mut self,
+        prepared: &Prepared,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<SqlResult, CoreError> {
+        self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
+            session.authorize(prepared)?;
+            let (statement_us, unavailable) = match session.service.clock.sql_micros() {
+                Ok(sample) => (sample, None),
+                Err(error) => (session.transaction_us.unwrap_or(0), Some(error)),
+            };
+            let transaction_us = session.transaction_us.unwrap_or(statement_us);
+            let service = session.service.clone();
+            let clock = StatementClock {
+                unavailable,
+                transaction_us,
+                statement_us,
+                zone: session.zone,
+                wall: Some(Arc::new(move || service.clock.sql_micros())),
+            };
+            let result = session.sql.ingest_copy_at(prepared, rows, &clock);
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            } else if clock.unavailable.is_none() {
+                session.transaction_us = Some(transaction_us);
+            }
+            result
+        })
     }
     pub fn execute_prepared(
         &mut self,
@@ -1329,6 +1490,192 @@ mod lifecycle_tests {
             Service::new(admin, bindings.clone(), Clock::new(0, 3600).unwrap()).unwrap(),
             bindings,
         )
+    }
+    #[test]
+    fn copy_authority_and_atomic_insert_use_existing_sql_policy() {
+        let (service, bindings) = fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let (_, prepared) = session.prepare_copy("COPY app(id) FROM STDIN").unwrap();
+        let result = session
+            .ingest_copy(&prepared, vec![vec![Value::Int(1)], vec![Value::Int(2)]])
+            .unwrap();
+        assert_eq!(result.affected, 2);
+        let error = session
+            .ingest_copy(&prepared, vec![vec![Value::Int(3)], vec![Value::Int(1)]])
+            .unwrap_err();
+        assert_eq!(sqlstate(&error), "23505");
+        assert!(
+            session
+                .execute_sql("SELECT id FROM app WHERE id = 3", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            sqlstate(
+                &session
+                    .prepare_copy("COPY secret_missing FROM STDIN")
+                    .unwrap_err()
+            ),
+            "42501"
+        );
+        assert_eq!(
+            sqlstate(
+                &session
+                    .prepare_copy("COPY secret_missing FROM STDIN WITH (FORMAT")
+                    .unwrap_err()
+            ),
+            "42501"
+        );
+        assert_eq!(
+            sqlstate(&CoreError::Sql(relational::SqlError::BadCopyFileFormat)),
+            "22P04"
+        );
+    }
+    #[test]
+    fn application_copy_denies_target_errors_before_classification() {
+        let (service, bindings) = fixture();
+        let mut app = service.session(&bindings[0].fingerprint).unwrap();
+        for sql in [
+            "COPY (",
+            "COPY \"unterminated",
+            "COPY secret_schema.t FROM STDIN",
+            "COPY \u{96ea} FROM STDIN",
+            "COPY secret FROM STDIN WITH (FORMAT",
+        ] {
+            assert_eq!(
+                sqlstate(&app.prepare_copy(sql).unwrap_err()),
+                "42501",
+                "{sql}"
+            );
+            assert_eq!(sqlstate(&app.prepare(sql).unwrap_err()), "42501", "{sql}");
+            assert_eq!(
+                sqlstate(&app.execute_sql(sql, &[]).unwrap_err()),
+                "42501",
+                "{sql}"
+            );
+            assert_eq!(
+                app.handle(Request::Sql {
+                    sql: sql.into(),
+                    params: vec![]
+                })
+                .code,
+                "42501",
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            sqlstate(&app.prepare("COPY app FROM STDIN").unwrap_err()),
+            "0A000"
+        );
+    }
+    #[test]
+    fn database_copy_denies_target_errors_without_insert_authority() {
+        let (service, _) = fixture();
+        service
+            .admin
+            .roles()
+            .create(roles::NewRole {
+                name: "copy_reader".into(),
+                login: true,
+                superuser: false,
+                ..roles::NewRole::default()
+            })
+            .unwrap();
+        let mut reader = service.role_session("copy_reader").unwrap();
+        for sql in [
+            "COPY (",
+            "COPY \"unterminated",
+            "COPY secret_schema.t FROM STDIN",
+            "COPY \u{96ea} FROM STDIN",
+            "COPY app FROM STDIN WITH (FORMAT",
+        ] {
+            assert_eq!(
+                sqlstate(&reader.prepare_copy(sql).unwrap_err()),
+                "42501",
+                "{sql}"
+            );
+            assert_eq!(
+                sqlstate(&reader.prepare(sql).unwrap_err()),
+                "42501",
+                "{sql}"
+            );
+        }
+    }
+    #[test]
+    fn native_task_copy_denies_before_malformed_statement_or_data() {
+        let (service, mut bindings) = fixture();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        service
+            .admin
+            .grant(Grant {
+                task: TaskId(91),
+                issuer: Principal(90),
+                executor: Principal(92),
+                approver: Principal(93),
+                policy: Policy {
+                    tenant: TenantId(42),
+                    columns: BTreeSet::from([Column::Status]),
+                    transitions: BTreeSet::from([(Status::Failed, Status::Queued)]),
+                    incident: (100, 107),
+                    distinct_limit: 20,
+                    transition_limit: 20,
+                    approval_above: 10,
+                    valid_from: 1,
+                    expires: now + 7200,
+                },
+            })
+            .unwrap();
+        service
+            .admin
+            .provision_task_resources(
+                TaskId(91),
+                TaskResources {
+                    read_rows: 1000,
+                    disclosed_rows: 1000,
+                    encoded_bytes: 1_000_000,
+                },
+            )
+            .unwrap();
+        service.admin.executor(TaskId(91), Principal(92)).unwrap();
+        bindings[0].role = Role::Task {
+            domain: service.admin.authority_metadata().unwrap().0.to_string(),
+            task: TaskId(91),
+            principal: Principal(92),
+        };
+        service.reload_bindings(bindings.clone()).unwrap();
+        let mut task = service.session(&bindings[0].fingerprint).unwrap();
+        for sql in [
+            "COPY app FROM STDIN",
+            "COPY missing FROM STDIN WITH (FORMAT",
+            "COPY (",
+            "COPY \"unterminated",
+            "COPY secret_schema.t FROM STDIN",
+            "COPY app FROM STDIN; not-an-int",
+        ] {
+            assert_eq!(sqlstate(&task.execute_sql(sql, &[]).unwrap_err()), "42501");
+            assert_eq!(
+                task.handle(Request::Sql {
+                    sql: sql.into(),
+                    params: vec![]
+                })
+                .code,
+                "42501"
+            );
+        }
+        assert!(
+            service
+                .admin
+                .task_resources(TaskId(91))
+                .unwrap()
+                .unwrap()
+                .used
+                .encoded_bytes
+                > 0
+        );
     }
     fn sql_instant(session: &mut Session, sql: &str) -> i64 {
         match session.execute_sql(sql, &[]).unwrap().rows[0].values[0] {

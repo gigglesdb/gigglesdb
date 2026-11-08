@@ -582,9 +582,25 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
         );
         assert!(c.query(&statement, &[&2.5f64]).await.unwrap().is_empty());
     }
+    let copy = c
+        .copy_in::<_, bytes::Bytes>("COPY app FROM STDIN")
+        .await
+        .unwrap();
+    tokio::pin!(copy);
+    assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
+    for query in [
+        "COPY app FROM STDIN WITH (FORMAT csv)",
+        "COPY app TO STDOUT",
+        "COPY app FROM 'file'",
+    ] {
+        assert_eq!(
+            code(c.simple_query(query).await.unwrap_err()),
+            "0A000",
+            "{query}"
+        );
+    }
     for query in [
         "SET ROLE admin",
-        "COPY app FROM STDIN",
         "SELECT * FROM other LIMIT 1",
         "SELECT * FROM pg_catalog LIMIT 1",
         "CREATE TABLE evil (id BIGINT PRIMARY KEY)",
@@ -1951,7 +1967,12 @@ async fn raw_wire_text_parameters_binary_results_close_and_error_drain() {
     pg_send(&mut s, b'C', b"Sinsert\0").await;
     assert_eq!(pg_sync(&mut s).await[0].0, b'3');
     // A failed Parse drains pipelined Bind/Execute until Sync, so this insert cannot run.
-    pg_send(&mut s, b'P', &parse("bad", "COPY app FROM STDIN")).await;
+    pg_send(
+        &mut s,
+        b'P',
+        &parse("bad", "COPY app FROM STDIN WITH (FORMAT csv)"),
+    )
+    .await;
     pg_send(
         &mut s,
         b'B',
@@ -2402,7 +2423,7 @@ async fn startup_spoof_and_malformed_wire_corpus_remains_isolated() {
         assert_eq!(tag, b'E');
         trace.push_str(&format!("startup_response={}\n", hex::encode(b)));
     }
-    for tag in [b'P', b'B', b'D', b'E', b'C', b'd', 255] {
+    for tag in [b'P', b'B', b'D', b'E', b'C', 255] {
         for length in 0..8 {
             let mut s = raw_pg(&f).await;
             let bytes = vec![255; length];
@@ -2417,6 +2438,18 @@ async fn startup_spoof_and_malformed_wire_corpus_remains_isolated() {
             ));
         }
     }
+    // COPY data/done/fail outside CopyIn are ignored, as on PostgreSQL 18.6.
+    let mut s = raw_pg(&f).await;
+    for (tag, bytes) in [
+        (b'd', b"unused".as_slice()),
+        (b'c', b""),
+        (b'f', b"unused\0"),
+    ] {
+        pg_send(&mut s, tag, bytes).await;
+    }
+    let frames = pg_sync(&mut s).await;
+    assert_eq!(frames.iter().map(|frame| frame.0).collect::<Vec<_>>(), b"Z");
+    drop(s);
     for length in [0, 3, u32::MAX, giggles_server::MAX_FRAME as u32 + 1] {
         let mut s = raw_pg(&f).await;
         s.write_u8(b'Q').await.unwrap();

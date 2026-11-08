@@ -39,6 +39,7 @@ pub(crate) use secondary_index_adapter::BatchRowChange;
 mod secondary_index_catalog;
 mod secondary_index_unique_readiness;
 pub(crate) mod secondary_unique_lookup;
+mod sql_copy;
 mod sql_index;
 mod sql_insert;
 pub(crate) use giggles_pg_types::temporal::Time;
@@ -46,6 +47,7 @@ pub use giggles_pg_types::temporal::{
     Date, Interval, Time as PgTime, TimeTz, Timestamp, TimestampTz,
 };
 pub use giggles_pg_types::{Float4, Float8, Numeric};
+pub use sql_copy::{Copy, CopyFormat};
 
 pub const MAX_SQL: usize = 64 * 1024;
 pub const MAX_ROWS: usize = 1024;
@@ -193,6 +195,8 @@ pub enum SqlError {
     NullValueNotAllowed,
     /// 42846 cannot_coerce
     CannotCoerce,
+    /// 22P04 bad_copy_file_format
+    BadCopyFileFormat,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

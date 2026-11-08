@@ -13,10 +13,15 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
+#[path = "pgwire_copy.rs"]
+mod copy;
+#[path = "pgwire_copy_in.rs"]
+mod copy_in;
 #[path = "pgwire_settings_functions.rs"]
 mod settings_functions;
 #[path = "pgwire_simple.rs"]
 mod simple;
+use copy_in::{CopyIn, is_copy_sql};
 use simple::{execute_settings, parse_settings, settings_status, show_settings};
 #[path = "pgwire_transaction.rs"]
 mod transaction;
@@ -467,10 +472,7 @@ fn encode(
             Value::Time(v) => v.to_string().into_bytes(),
             Value::TimeTz(v) => v.to_string().into_bytes(),
             Value::Timestamp(v) => v.to_string().into_bytes(),
-            Value::TimestampTz(v) => v
-                .format_in_zone(zone)
-                .map_err(temporal_error)?
-                .into_bytes(),
+            Value::TimestampTz(v) => v.format_in_zone(zone).map_err(temporal_error)?.into_bytes(),
             Value::Interval(v) => v.to_string().into_bytes(),
             Value::Numeric(v) => v.to_string().into_bytes(),
             Value::Float4(v) => v
@@ -638,6 +640,7 @@ enum Plan {
         u64,
     ),
     Sql(Box<Prepared>),
+    Copy(giggles_core::relational::Copy, Box<Prepared>),
     Task(crate::task_statement::TaskStatement),
 }
 #[derive(Clone)]
@@ -658,6 +661,10 @@ impl Statement {
                 Ok(self.d.clone())
             }
             Plan::Sql(p) => core(session.describe(p)),
+            Plan::Copy(copy, p) => {
+                core(session.copy_columns(copy, p))?;
+                Ok(self.d.clone())
+            }
             Plan::Task(_)
             | Plan::Admin(_)
             | Plan::Empty
@@ -712,6 +719,9 @@ struct State {
     statements: BTreeMap<String, Statement>,
     portals: BTreeMap<String, Portal>,
     drain: bool,
+    copy: Option<CopyIn>,
+    copy_completion: Vec<u8>,
+    copy_active: Option<crate::cancel::Active>,
 }
 fn begin_implicit(
     session: &mut Session,
@@ -825,6 +835,12 @@ impl State {
         out: &mut Vec<u8>,
         received: std::time::Instant,
     ) -> R<bool> {
+        if matches!(tag, b'H' | b'S') && self.copy.is_none() {
+            out.append(&mut self.copy_completion);
+        }
+        if self.copy.is_some() {
+            return self.copy_message(tag, b, session, out, received);
+        }
         let mut r = Reader { b, at: 0 };
         if self.drain && tag != b'S' && tag != b'X' {
             return Ok(true);
@@ -876,7 +892,9 @@ impl State {
                 if !session.in_transaction() {
                     self.portals.clear();
                 }
-                ready(session, out)?;
+                if self.copy.is_none() {
+                    ready(session, out)?;
+                }
             }
             b'P' => {
                 let name = r.text()?;
@@ -900,8 +918,20 @@ impl State {
                 if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
                     return Err("54000");
                 }
-                core(session.authorize_sequence_sql(&sql))?;
-                let (mut p, mut d) = if let Some(stmt) = crate::auth::statements::parse(&sql) {
+                if !is_copy_sql(&sql) {
+                    core(session.authorize_sequence_sql(&sql))?;
+                }
+                let (mut p, mut d) = if is_copy_sql(&sql) {
+                    let (copy, prepared) = core(session.prepare_copy(&sql))?;
+                    (
+                        Plan::Copy(copy, Box::new(prepared)),
+                        Description {
+                            typmods: vec![],
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if let Some(stmt) = crate::auth::statements::parse(&sql) {
                     (
                         Plan::Admin(stmt),
                         Description {
@@ -1015,13 +1045,11 @@ impl State {
                     });
                     if session.role.is_sql()
                         && mismatch
-                        && oids
-                            .iter()
-                            .all(|o| {
-                                *o == 0
-                                    || core_declared_type(*o).is_some()
-                                    || catalog_wire::parameter_type(*o).is_ok()
-                            })
+                        && oids.iter().all(|o| {
+                            *o == 0
+                                || core_declared_type(*o).is_some()
+                                || catalog_wire::parameter_type(*o).is_ok()
+                        })
                     {
                         let was_aborted = session.is_aborted();
                         match prepare_declared_sql(session, &sql, &oids) {
@@ -1222,6 +1250,18 @@ impl State {
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
                 p.s.describe(session)?;
+                if let Plan::Copy(copy, prepared) = &p.s.p {
+                    if p.result.is_some() {
+                        return Err("55000");
+                    }
+                    read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
+                    begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                    let copy = copy.clone();
+                    let prepared = prepared.clone();
+                    p.result = Some(SqlResult::default());
+                    self.start_copy(copy, prepared, false, session, out)?;
+                    return Ok(true);
+                }
                 if let Plan::Admin(stmt) = &p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
@@ -1480,6 +1520,7 @@ impl State {
                 };
                 frame(b'3', &[], out)?;
             }
+            b'd' | b'c' | b'f' => {}
             _ => return Err("0A000"),
         }
         Ok(true)
@@ -1577,6 +1618,9 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         statements: BTreeMap::new(),
         portals: BTreeMap::new(),
         drain: false,
+        copy: None,
+        copy_completion: vec![],
+        copy_active: None,
     };
     startup_settings.timezone = timezone;
     // Preserve the locked agent profile's existing presentation default.
@@ -1629,29 +1673,35 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         let received = std::time::Instant::now();
         // A successful implicit cycle publishes at Sync and must be cancellable
         // at that decision boundary. Recovery-only Sync remains uncancellable.
-        let active = backend.begin(
-            matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E')
-                || (tag == b'S' && state.implicit && !session.is_aborted()),
-        );
+        let active = state.copy_active.take().unwrap_or_else(|| {
+            backend.begin(
+                matches!(tag, b'Q' | b'P' | b'B' | b'D' | b'E' | b'd' | b'c' | b'f')
+                    || (tag == b'S' && state.implicit && !session.is_aborted()),
+            )
+        });
         let permit = match blocking.admit(&active.context).await {
             Ok(permit) => permit,
             Err(e) => {
                 session.abort();
                 let mut out = Vec::new();
-                error(crate::service::sqlstate(&e), &mut out);
-                if tag == b'S' && state.implicit {
-                    session.sql.rollback();
-                    state.settings.transaction(true, false, "ROLLBACK");
-                    session.set_time_zone(&state.settings.current.timezone);
-                    session.set_extra_float_digits(state.settings.current.extra_float_digits);
-                    state.implicit = false;
-                    state.portals.clear();
-                }
-                if matches!(tag, b'Q' | b'S') {
-                    state.drain = false;
-                    ready(&session, &mut out).map_err(io::Error::other)?;
+                if state.copy.is_some() {
+                    state.copy_error(crate::service::sqlstate(&e), &mut session, &mut out);
                 } else {
-                    state.drain = true;
+                    error(crate::service::sqlstate(&e), &mut out);
+                    if tag == b'S' && state.implicit {
+                        session.sql.rollback();
+                        state.settings.transaction(true, false, "ROLLBACK");
+                        session.set_time_zone(&state.settings.current.timezone);
+                        session.set_extra_float_digits(state.settings.current.extra_float_digits);
+                        state.implicit = false;
+                        state.portals.clear();
+                    }
+                    if matches!(tag, b'Q' | b'S') {
+                        state.drain = false;
+                        ready(&session, &mut out).map_err(io::Error::other)?;
+                    } else {
+                        state.drain = true;
+                    }
                 }
                 drop(active);
                 send(s, &out).await?;
@@ -1700,7 +1750,8 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             session.sql.rollback();
                             state.settings.transaction(true, false, "ROLLBACK");
                             session.set_time_zone(&state.settings.current.timezone);
-                            session.set_extra_float_digits(state.settings.current.extra_float_digits);
+                            session
+                                .set_extra_float_digits(state.settings.current.extra_float_digits);
                             state.implicit = false;
                             state.portals.clear();
                         }
@@ -1713,19 +1764,28 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                             _ => "request rejected; consult documented code",
                         });
-                        diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
-                        if matches!(tag, b'Q' | b'S') {
-                            state.drain = false;
-                            ready(&session, &mut out)
-                                .map(|()| true)
-                                .map_err(io::Error::other)
-                        } else {
-                            state.drain = true;
+                        if state.copy.is_some() {
+                            state.copy_error(code, &mut session, &mut out);
                             Ok(true)
+                        } else {
+                            diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
+                            if matches!(tag, b'Q' | b'S') {
+                                state.drain = false;
+                                ready(&session, &mut out)
+                                    .map(|()| true)
+                                    .map_err(io::Error::other)
+                            } else {
+                                state.drain = true;
+                                Ok(true)
+                            }
                         }
                     }
                 };
-                drop(active);
+                if state.copy_receiving() {
+                    state.copy_active = Some(active);
+                } else {
+                    drop(active);
+                }
                 (session, state, out, keep)
             })
             .await?;

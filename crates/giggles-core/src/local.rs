@@ -127,6 +127,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::WrongObjectType => 47,
                 relational::SqlError::NullValueNotAllowed => 48,
                 relational::SqlError::CannotCoerce => 49,
+                relational::SqlError::BadCopyFileFormat => 50,
             }
         }
     };

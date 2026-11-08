@@ -29,7 +29,8 @@ impl State {
         {
             return Err("25001");
         }
-        for sql in statements {
+        let mut statements = statements.into_iter();
+        while let Some(sql) = statements.next() {
             let completed = out.len();
             let result = (|| {
                 if parse_control(&sql, session, &mut self.diagnostic)?.is_none_or(|command| {
@@ -51,6 +52,10 @@ impl State {
             })();
             if let Err(code) = result {
                 self.simple_failure(code, implicit, completed, session, out);
+                return Ok(());
+            }
+            if let Some(copy) = self.copy.as_mut() {
+                copy.remaining = statements.collect();
                 return Ok(());
             }
             // A later BEGIN in this message must not preserve portals from a
@@ -101,7 +106,7 @@ impl State {
 
     // Shared by single and multi-statement Query messages, including every
     // authorization, admin, settings, catalog and core SQL execution path.
-    fn simple_statement(
+    pub(super) fn simple_statement(
         &mut self,
         sql: &str,
         session: &mut Session,
@@ -127,6 +132,16 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        if is_copy_sql(sql) {
+            let (copy, prepared) = core(session.prepare_copy(sql))?;
+            read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
+            self.settings.queried = session.in_transaction();
+            self.start_copy(copy, Box::new(prepared), true, session, out)?;
+            if let Some(copy) = self.copy.as_mut() {
+                copy.simple_implicit = *implicit;
+            }
+            return Ok(());
+        }
         core(session.authorize_sequence_sql(sql))?;
         if let Some(json) = sql.strip_prefix("GIGGLES ") {
             if !matches!(session.role, Role::Task { .. }) {

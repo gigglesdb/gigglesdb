@@ -5,6 +5,7 @@ use crate::operations::{self, ConflictAction, ConflictSource};
 #[derive(Debug, Clone)]
 pub(super) struct Insert {
     pub table: String,
+    copy_input: Option<Vec<DataType>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
     defaults: Vec<Vec<bool>>,
@@ -231,6 +232,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         return Err(unsupported_or_syntax(p));
     }
     Ok(Insert {
+        copy_input: None,
         table,
         columns,
         rows,
@@ -416,6 +418,58 @@ fn infer_condition(
     Ok(())
 }
 impl Insert {
+    pub(super) fn copy(
+        table: String,
+        columns: Vec<String>,
+        types: Vec<DataType>,
+        rows: Vec<Vec<Value>>,
+    ) -> Self {
+        let defaults = rows.iter().map(|row| vec![false; row.len()]).collect();
+        Self {
+            table,
+            columns,
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(Expr::Literal).collect())
+                .collect(),
+            defaults,
+            default_values: false,
+            overriding: Some(true),
+            conflict: None,
+            returning: None,
+            copy_input: Some(types),
+        }
+    }
+    pub(super) fn replace_copy_rows(
+        &mut self,
+        rows: Vec<Vec<Value>>,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<()> {
+        let types = self.copy_input.as_ref().ok_or(SqlError::Unsupported)?;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                if row.len() != types.len() {
+                    return Err(SqlError::Type);
+                }
+                row.into_iter()
+                    .zip(types)
+                    .map(|(value, ty)| match value {
+                        Value::Text(text) => sql_copy::copy_text_field(text, ty, clock),
+                        other => Ok(other),
+                    })
+                    .collect::<R<Vec<_>>>()
+            })
+            .collect::<R<Vec<_>>>()?;
+        *self = Self::copy(
+            self.table.clone(),
+            self.columns.clone(),
+            types.clone(),
+            rows,
+        );
+        Ok(())
+    }
+
     pub(super) fn implicit_sequences(&self, state: &Relational) -> R<Vec<Option<String>>> {
         let table = state
             .tables
@@ -550,6 +604,121 @@ fn same_family(left: &DataType, right: &DataType) -> bool {
     };
     left == right || integer(left) && integer(right)
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared INSERT row normalization inputs"
+)]
+fn normalize_row(
+    state: &Relational,
+    table: &TableDef,
+    insert: &Insert,
+    indexes: &[usize],
+    values: &[Expr],
+    row_defaults: &[bool],
+    params: &[Value],
+    declared: &[Option<DataType>],
+    clock: Option<&clock::ExecutionClock>,
+) -> R<Vec<Value>> {
+    let hidden_rowid = table.hidden_rowid();
+    let replaced = |index: usize, default: bool| {
+        default
+            || insert.overriding == Some(false)
+                && state.column_identity(table.columns[index].id).is_some()
+    };
+    let supplied = indexes
+        .iter()
+        .zip(row_defaults)
+        .filter_map(|(i, default)| (!replaced(*i, *default)).then_some(*i))
+        .collect::<Vec<_>>();
+    let mut row = defaults::row(state, table, &supplied, clock)?;
+    for ((expression, index), default) in values.iter().zip(indexes).zip(row_defaults) {
+        if !replaced(*index, *default) {
+            row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
+            {
+                assign::plain_value(expression, &table.columns[*index], declared, params, clock)?
+            } else {
+                resolved_value(expression, params, &table.columns[*index].data_type, clock)?
+            };
+        }
+    }
+    Relational::secondary_admit_values(row.iter())?;
+    if let Some(hidden) = hidden_rowid {
+        // The NULL placeholder has the same fixed byte budget as its future Int.
+        // Skip only its check until a version supplies the hidden rowid.
+        let mut size = 0usize;
+        for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
+            if index != hidden {
+                check(value, column)?;
+            }
+            size = size
+                .checked_add(value_bytes(value))
+                .ok_or(SqlError::Limit)?;
+        }
+        if size > MAX_ROW_BYTES {
+            return Err(SqlError::Limit);
+        }
+    } else {
+        row_check(table, &row)?;
+    }
+    if insert.copy_input.is_some() {
+        state.check_insert_candidate(table, &row)?;
+    }
+    Ok(row)
+}
+
+pub(super) fn normalize_copy(
+    state: &Relational,
+    prepared: &Prepared,
+    rows: Vec<Vec<Value>>,
+    clock: Option<&clock::ExecutionClock>,
+) -> R<(Prepared, Vec<Vec<Value>>)> {
+    let mut prepared = prepared.copy_rows(rows, clock)?;
+    if prepared.epoch != state.epoch {
+        return Err(SqlError::StaleSchema);
+    }
+    let Statement::InsertMulti(insert) = &prepared.statement else {
+        return Err(SqlError::Unsupported);
+    };
+    admit_statement(insert, &[])?;
+    let table = state
+        .tables
+        .get(&insert.table)
+        .ok_or(SqlError::UnknownTable)?;
+    let indexes = indexes(insert, table)?;
+    let mut output = Vec::with_capacity(insert.rows.len());
+    for (row, defaults) in insert.rows.iter().zip(&insert.defaults) {
+        if crate::cancellation::check().is_err() {
+            return Err(SqlError::Aborted);
+        }
+        let full = normalize_row(
+            state,
+            table,
+            insert,
+            &indexes,
+            row,
+            defaults,
+            &[],
+            &[],
+            clock,
+        )?;
+        output.push(
+            table
+                .logical_offsets()
+                .into_iter()
+                .map(|i| full[i].clone())
+                .collect(),
+        );
+    }
+    let columns = table.logical_columns().map(|c| c.name.clone()).collect();
+    let types = table
+        .logical_columns()
+        .map(|c| c.data_type.clone())
+        .collect();
+    prepared.statement =
+        Statement::InsertMulti(Insert::copy(table.name.clone(), columns, types, vec![]));
+    Ok((prepared, output))
+}
+
 fn resolved_value(
     expression: &Expr,
     params: &[Value],
@@ -926,52 +1095,17 @@ pub(super) fn execute_declared(
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        let replaced = |index: usize, default: bool| {
-            default
-                || insert.overriding == Some(false)
-                    && state.column_identity(table.columns[index].id).is_some()
-        };
-        let supplied = indexes
-            .iter()
-            .zip(row_defaults)
-            .filter_map(|(i, default)| (!replaced(*i, *default)).then_some(*i))
-            .collect::<Vec<_>>();
-        let mut row = defaults::row(state, &table, &supplied, clock)?;
-        for ((expression, index), default) in values.iter().zip(&indexes).zip(row_defaults) {
-            if !replaced(*index, *default) {
-                row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
-                {
-                    assign::plain_value(
-                        expression,
-                        &table.columns[*index],
-                        declared,
-                        params,
-                        clock,
-                    )?
-                } else {
-                    resolved_value(expression, params, &table.columns[*index].data_type, clock)?
-                };
-            }
-        }
-        Relational::secondary_admit_values(row.iter())?;
-        if let Some(hidden) = hidden_rowid {
-            // The NULL placeholder has the same fixed byte budget as its future Int.
-            // Skip only its check until a version supplies the hidden rowid.
-            let mut size = 0usize;
-            for (index, (value, column)) in row.iter().zip(&table.columns).enumerate() {
-                if index != hidden {
-                    check(value, column)?;
-                }
-                size = size
-                    .checked_add(value_bytes(value))
-                    .ok_or(SqlError::Limit)?;
-            }
-            if size > MAX_ROW_BYTES {
-                return Err(SqlError::Limit);
-            }
-        } else {
-            row_check(&table, &row)?;
-        }
+        let row = normalize_row(
+            state,
+            &table,
+            insert,
+            &indexes,
+            values,
+            row_defaults,
+            params,
+            declared,
+            clock,
+        )?;
         for value in &row {
             total = total
                 .checked_add(value_bytes(value))

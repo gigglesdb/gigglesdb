@@ -2093,6 +2093,144 @@ impl SqlSession {
         }
         result
     }
+    /// Parse COPY and bind an INSERT-equivalent authority/dependency descriptor.
+    pub fn prepare_copy(
+        &mut self,
+        sql: &str,
+    ) -> Result<(relational::Copy, relational::Prepared), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
+        relational::assert_sql_frontend_allowed();
+        let result = (|| {
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
+            let prepare = |s: &State| copy.prepared(&s.sql, s.view.domain).map_err(CoreError::Sql);
+            let mut prepared = match &self.staged {
+                Some(s) => prepare(s)?,
+                None => self.admin.inner.inspect(prepare)?,
+            };
+            prepared.transaction = self.transaction_id;
+            Ok((copy, prepared))
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    pub fn copy_columns(
+        &mut self,
+        copy: &relational::Copy,
+    ) -> Result<Vec<relational::ColumnDef>, CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
+        relational::assert_sql_frontend_allowed();
+        let columns = |s: &State| copy.columns_in(&s.sql).map_err(CoreError::Sql);
+        let result = match &self.staged {
+            Some(s) => columns(s),
+            None => self.admin.inner.inspect(columns),
+        };
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    /// Resolve each COPY row once, including defaults, and check row-local constraints.
+    /// The returned descriptor supplies every logical column so final ingestion
+    /// neither reevaluates defaults nor reserves a sequence a second time.
+    pub fn normalize_copy_rows_at(
+        &mut self,
+        prepared: &relational::Prepared,
+        rows: Vec<Vec<relational::Value>>,
+        clock: &relational::StatementClock,
+    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
+        self.admin.inner.db(SQL_SESSIONS)?;
+        relational::assert_sql_frontend_allowed();
+        let result = (|| {
+            self.guard_clock(clock)?;
+            crate::cancellation::check()?;
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if prepared.transaction.is_some() && prepared.transaction != self.transaction_id {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            let mut state = match &self.staged {
+                Some(s) => s.clone(),
+                None => self.admin.inner.inspect(|s| Ok(s.clone()))?,
+            };
+            if prepared.domain != state.view.domain {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            self.admin.inner.merge_live_sequences(&mut state)?;
+            sequences::merge(
+                &mut state,
+                &*self
+                    .pending_sequences
+                    .lock()
+                    .map_err(|_| CoreError::Fenced)?,
+            );
+            let baseline = if self.staged.is_some() {
+                self.sequence_baseline.clone()
+            } else {
+                state
+                    .sql
+                    .catalog_ext()
+                    .sequences
+                    .iter()
+                    .map(|(&id, d)| (id, d.incarnation))
+                    .collect()
+            };
+            let context = relational::clock::ExecutionClock::new(clock)
+                .with_extra_float_digits(self.extra_float_digits)
+                .with_sequences(self.admin.inner.sequence_callback(
+                    state.clone(),
+                    baseline,
+                    self.pending_sequences.clone(),
+                    self.sequence_values.clone(),
+                    self.sequence_tables.clone(),
+                ));
+            let output = state.sql.normalize_copy(prepared, rows, Some(&context));
+            crate::cancellation::check()?;
+            if let Some(error) = context.take_error() {
+                return Err(error);
+            }
+            output.map_err(CoreError::Sql)
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    pub fn ingest_copy(
+        &mut self,
+        prepared: &relational::Prepared,
+        rows: Vec<Vec<relational::Value>>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        let prepared = match prepared.copy_rows(rows, None) {
+            Ok(p) => p,
+            Err(e) => {
+                self.abort();
+                return Err(CoreError::Sql(e));
+            }
+        };
+        self.execute_prepared(&prepared, &[], None)
+    }
+    pub fn ingest_copy_at(
+        &mut self,
+        prepared: &relational::Prepared,
+        rows: Vec<Vec<relational::Value>>,
+        clock: &relational::StatementClock,
+    ) -> Result<relational::SqlResult, CoreError> {
+        let context = relational::clock::ExecutionClock::new(clock);
+        let prepared = match prepared.copy_rows(rows, Some(&context)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.abort();
+                return Err(CoreError::Sql(e));
+            }
+        };
+        self.execute_prepared_at(&prepared, &[], None, clock)
+    }
     pub fn execute(
         &mut self,
         sql: &str,
