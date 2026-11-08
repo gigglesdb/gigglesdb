@@ -399,6 +399,8 @@ fn snapshots_log_horizon_and_validation_order() {
     let before = seq.visible_ts();
     let (s, r) = mpsc::channel();
     let result = seq.submit(CommitRequest {
+        features_or: 0,
+        raw: Vec::new(),
         snapshot: Ts(0),
         writes: BTreeMap::new(),
         validation: Some(Box::new(move |log, _, snapshot, assigned| {
@@ -415,6 +417,8 @@ fn snapshots_log_horizon_and_validation_order() {
     let (s, r) = mpsc::channel();
     let assigned = seq
         .submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: before,
             writes: BTreeMap::from([((Keyspace::Catalog, key(8)), Some(vec![8]))]),
             validation: Some(Box::new(move |_, _, _, assigned| {
@@ -486,6 +490,8 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     let writes = || BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]);
     assert_eq!(
         seq.submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: Ts(0),
             writes: writes(),
             validation: None
@@ -500,6 +506,8 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     clock.set(1);
     let first = seq
         .submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: Ts(0),
             writes: writes(),
             validation: None,
@@ -508,6 +516,8 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     mem.fail_next_write(KvError::Io("armed".into()));
     assert_eq!(
         seq.submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: first,
             writes: BTreeMap::new(),
             validation: None
@@ -517,6 +527,8 @@ fn sequencer_read_only_clock_overflow_and_malformed_metadata() {
     );
     assert_eq!(
         seq.submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: first,
             writes: writes(),
             validation: None
@@ -607,6 +619,8 @@ fn concurrent_validation_observes_accepted_predecessors_only() {
                 gate.wait();
                 let reject = n % 3 == 0;
                 let result = seq.submit(CommitRequest {
+                    features_or: 0,
+                    raw: Vec::new(),
                     snapshot: Ts(0),
                     writes: BTreeMap::from([((Keyspace::Catalog, key(n)), Some(vec![n as u8]))]),
                     validation: Some(Box::new(move |log, _, snapshot, assigned| {
@@ -727,6 +741,8 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
             .map(|n| {
                 let args = args.clone();
                 CommitRequest {
+                    features_or: 0,
+                    raw: Vec::new(),
                     snapshot: Ts(0),
                     writes: if n == 4 {
                         BTreeMap::new()
@@ -781,6 +797,8 @@ fn deterministic_group_hook_order_single_sync_and_ambiguous_all() {
             assert_eq!(
                 seq.process_group_for_test(
                     vec![CommitRequest {
+                        features_or: 0,
+                        raw: Vec::new(),
                         snapshot: Ts(0),
                         writes: BTreeMap::new(),
                         validation: None
@@ -1027,6 +1045,8 @@ fn group_ack_waits_for_sync_and_empty_scan_has_no_predicate() {
     let (done_s, done_r) = mpsc::channel();
     let worker = thread::spawn(move || {
         let result = worker_seq.submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: Ts(0),
             writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
             validation: None,
@@ -1110,6 +1130,8 @@ fn two_thousand_commits_retain_exact_active_history() {
     for n in 1..=2000u64 {
         let ts = seq
             .submit(CommitRequest {
+                features_or: 0,
+                raw: Vec::new(),
                 snapshot: old.ts(),
                 writes: BTreeMap::from([(
                     (Keyspace::Catalog, key(1)),
@@ -1122,6 +1144,8 @@ fn two_thousand_commits_retain_exact_active_history() {
     }
     let last = seq
         .submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: old.ts(),
             writes: BTreeMap::new(),
             validation: Some(Box::new(|log, _, snapshot, assigned| {
@@ -1170,6 +1194,8 @@ fn concurrent_snapshot_registration_retains_every_needed_timestamp() {
                     let snapshot = handle.ts();
                     let ts = seq
                         .submit(CommitRequest {
+                            features_or: 0,
+                            raw: Vec::new(),
                             snapshot,
                             writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
                             validation: Some(Box::new(move |log, _, snapshot, assigned| {
@@ -1424,6 +1450,8 @@ fn serializable_disjoint_writers_stress_and_read_only_paths() {
 }
 fn store_failed(seq: &Arc<Sequencer>) -> Result<Ts, TxnError> {
     seq.submit(CommitRequest {
+        features_or: 0,
+        raw: Vec::new(),
         snapshot: Ts(0),
         writes: BTreeMap::from([((Keyspace::Catalog, key(1)), Some(vec![1]))]),
         validation: None,
@@ -1444,6 +1472,8 @@ fn commit_with_observed_validator(
     ));
     let check = validator.clone();
     let result = t.seq.submit(CommitRequest {
+        features_or: 0,
+        raw: Vec::new(),
         snapshot,
         writes: std::mem::take(&mut t.writes),
         validation: Some(Box::new(move |log, kv, snapshot, _| {
@@ -1515,6 +1545,8 @@ fn grouped_serializable_fallback_sees_unpublished_accepted_write() {
             .into_iter()
             .enumerate()
             .map(|(n, validator)| CommitRequest {
+                features_or: 0,
+                raw: Vec::new(),
                 snapshot: Ts(0),
                 writes: if n == 0 {
                     BTreeMap::from([((Keyspace::Rows, key(1)), Some(b"staged".to_vec()))])
@@ -1545,6 +1577,8 @@ fn serializable_fallback_budget_counts_old_raw_versions() {
     });
     for n in 0..100 {
         seq.submit(CommitRequest {
+            features_or: 0,
+            raw: Vec::new(),
             snapshot: seq.visible_ts(),
             writes: BTreeMap::from([((Keyspace::Rows, key(1)), Some(vec![n]))]),
             validation: None,
@@ -1572,4 +1606,380 @@ fn serializable_fallback_budget_counts_old_raw_versions() {
             SerializationReason::ValidationBudget
         ))
     );
+}
+
+#[test]
+fn transaction_forwards_features_and_raw_and_discards_on_rollback_or_drop() {
+    let (mem, seq, locks) = setup(SequencerConfig::default());
+    let counter = super::super::catalog_codec::counter_key(3, 7);
+    for rollback in [false, true] {
+        let mut batch = WriteBatch::default();
+        batch.put(Keyspace::Seq, counter.clone(), vec![42]);
+        mem.write(batch, Durability::Sync).unwrap();
+        let mut t = txn(&seq, &locks, 1, Isolation::ReadCommitted);
+        t.require_features(64);
+        t.require_features(128);
+        t.delete_counter(counter.clone()).unwrap();
+        if rollback {
+            t.rollback();
+        } else {
+            drop(t);
+        }
+        assert_eq!(seq.kv().get(Keyspace::Meta, b"features").unwrap(), None);
+        assert_eq!(
+            seq.kv().get(Keyspace::Seq, &counter).unwrap(),
+            Some(vec![42])
+        );
+    }
+    let mut t = txn(&seq, &locks, 2, Isolation::ReadCommitted);
+    t.require_features(64);
+    t.require_features(128);
+    t.delete_counter(counter.clone()).unwrap();
+    assert_eq!(t.commit().unwrap(), Ts(0));
+    assert_eq!(
+        seq.kv().get(Keyspace::Meta, b"features").unwrap(),
+        Some(192u64.to_be_bytes().to_vec())
+    );
+    assert_eq!(seq.kv().get(Keyspace::Seq, &counter).unwrap(), None);
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Seq, counter.clone(), vec![42]);
+    mem.write(batch, Durability::Sync).unwrap();
+    let mut t = txn(&seq, &locks, 3, Isolation::ReadCommitted);
+    t.delete_counter(counter.clone()).unwrap();
+    t.commit_then(|_| {
+        assert_eq!(seq.kv().get(Keyspace::Seq, &counter)?, None);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        seq.kv().get(Keyspace::Meta, b"last_commit_ts").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn transaction_rejects_invalid_counter_and_restores_auxiliary_savepoint_state() {
+    let (_, seq, locks) = setup(SequencerConfig::default());
+    let mut t = txn(&seq, &locks, 1, Isolation::ReadCommitted);
+    assert_eq!(t.delete_counter(vec![2; 24]), Err(TxnError::Misuse));
+    let mark = t.savepoint();
+    t.require_features(64);
+    t.delete_counter(super::super::catalog_codec::counter_key(3, 7))
+        .unwrap();
+    t.rollback_to(&mark).unwrap();
+    t.commit().unwrap();
+    assert_eq!(seq.kv().get(Keyspace::Meta, b"features").unwrap(), None);
+}
+
+mod f8a_commit_tests {
+    use crate::relational::{DataType, catalog_ext::SequenceDef};
+    use crate::storage::engine::commit::*;
+    use crate::storage::engine::hlc::Ts;
+    use crate::storage::engine::kv::{Durability, Keyspace, Kv, KvRead, WriteBatch};
+    use crate::storage::engine::txn::TxnError;
+    use crate::storage::engine::{
+        catalog_codec,
+        kv::{KvBackend, KvError},
+        kv_mem::MemKv,
+        meta,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+
+    fn fixture() -> (Arc<MemKv>, Arc<Sequencer>) {
+        let mem = Arc::new(MemKv::new());
+        let mut batch = WriteBatch::default();
+        for (key, value) in [
+            (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
+            (b"subversion", 1u32.to_be_bytes().to_vec()),
+            (b"features", 0u64.to_be_bytes().to_vec()),
+            (b"domain", vec![0; 16]),
+            (b"engine", b"rocksdb".to_vec()),
+        ] {
+            batch.put(Keyspace::Meta, key.to_vec(), value);
+        }
+        mem.write(batch, Durability::Sync).unwrap();
+        let seq = reopen(mem.clone());
+        (mem, seq)
+    }
+    fn reopen(mem: Arc<MemKv>) -> Arc<Sequencer> {
+        Sequencer::open(
+            Arc::new(Kv::new(mem)),
+            Arc::new(ManualClock::new(10)),
+            SequencerConfig::default(),
+        )
+        .unwrap()
+    }
+    fn request(bits: u64) -> CommitRequest {
+        CommitRequest {
+            snapshot: Ts(0),
+            writes: BTreeMap::new(),
+            features_or: bits,
+            raw: Vec::new(),
+            validation: None,
+        }
+    }
+    fn sequence() -> SequenceDef {
+        SequenceDef {
+            name: "s".into(),
+            data_type: DataType::BigInt,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: 99,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+            identity: false,
+            incarnation: 7,
+        }
+    }
+    fn sequence_request() -> CommitRequest {
+        let mut request = request(64);
+        request.writes.insert(
+            (Keyspace::Catalog, catalog_codec::sequence_key(1)),
+            Some(catalog_codec::encode_sequence(&sequence()).unwrap()),
+        );
+        request
+    }
+    fn counter_value() -> Vec<u8> {
+        crate::storage::encode(&(8i64, true, 8i64, 1u64)).unwrap()
+    }
+
+    #[test]
+    fn features_and_catalog_commit_together_across_crash() {
+        for fail in [false, true] {
+            let (mem, seq) = fixture();
+            if fail {
+                mem.fail_next_write(KvError::Io("injected".into()));
+            }
+            let result = seq.submit(sequence_request());
+            assert_eq!(result.is_ok(), !fail);
+            let durable = Arc::new(mem.crash());
+            let info = meta::open_checks(durable.as_ref()).unwrap();
+            assert_eq!(info.features, if fail { 0 } else { 64 });
+            let recovered = reopen(durable);
+            assert_eq!(
+                crate::storage::engine::mvcc::latest_version(
+                    recovered.kv(),
+                    Keyspace::Catalog,
+                    &catalog_codec::sequence_key(1)
+                )
+                .unwrap()
+                .is_some(),
+                !fail
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_features_and_raw_requests_do_not_poison_group() {
+        let (_, seq) = fixture();
+        let mut invalid_raw = request(64);
+        invalid_raw
+            .raw
+            .push(RawOp::DeleteCounter { key: vec![2; 24] });
+        let results = seq.process_group_for_test(
+            vec![request(256), invalid_raw, request(320)],
+            &ManualClock::new(10),
+            &mut RecentLog::new(1024),
+        );
+        assert_eq!(
+            results,
+            vec![Err(TxnError::Misuse), Err(TxnError::Misuse), Ok(Ts(0))]
+        );
+        assert_eq!(load_features(seq.kv()).unwrap(), 320);
+        assert_eq!(
+            seq.kv().get(Keyspace::Meta, b"last_commit_ts").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn counter_deletion_and_catalog_tombstone_share_atomic_batch() {
+        for fail in [false, true] {
+            let (mem, seq) = fixture();
+            seq.submit(sequence_request()).unwrap();
+            let key = catalog_codec::counter_key(1, 7);
+            seq.write_counter(key.clone(), counter_value(), 0).unwrap();
+            let mut drop = request(0);
+            drop.writes
+                .insert((Keyspace::Catalog, catalog_codec::sequence_key(1)), None);
+            drop.raw.push(RawOp::DeleteCounter { key: key.clone() });
+            if fail {
+                mem.fail_next_write(KvError::Io("injected".into()));
+            }
+            assert_eq!(seq.submit(drop).is_ok(), !fail);
+            let durable = mem.crash();
+            assert_eq!(durable.get(Keyspace::Seq, &key).unwrap().is_some(), fail);
+            meta::open_checks(&durable).unwrap();
+            let entry = crate::storage::engine::mvcc::latest_version(
+                &durable,
+                Keyspace::Catalog,
+                &catalog_codec::sequence_key(1),
+            )
+            .unwrap()
+            .unwrap()
+            .1;
+            assert_eq!(entry.is_some(), fail);
+        }
+    }
+
+    #[test]
+    fn dropped_sequence_rejects_late_counter_write_across_crash() {
+        let (mem, seq) = fixture();
+        seq.submit(sequence_request()).unwrap();
+        assert_eq!(load_features(seq.kv()).unwrap(), 64);
+        let key = catalog_codec::counter_key(1, 7);
+        seq.write_counter(key.clone(), counter_value(), 0).unwrap();
+        let mut drop_request = request(0);
+        drop_request
+            .writes
+            .insert((Keyspace::Catalog, catalog_codec::sequence_key(1)), None);
+        drop_request
+            .raw
+            .push(RawOp::DeleteCounter { key: key.clone() });
+        seq.submit(drop_request).unwrap();
+        let error = seq.write_counter(key.clone(), counter_value(), 0).unwrap_err();
+        assert_eq!(error, TxnError::SequenceGone);
+        assert_eq!(error.sqlstate(), "42P01");
+        assert_eq!(seq.kv().get(Keyspace::Seq, &key).unwrap(), None);
+        drop(seq);
+        let durable = Arc::new(mem.crash());
+        assert_eq!(meta::open_checks(durable.as_ref()).unwrap().features, 320);
+        let recovered = reopen(durable);
+        assert_eq!(recovered.kv().get(Keyspace::Seq, &key).unwrap(), None);
+        assert_eq!(
+            crate::storage::engine::mvcc::latest_version(
+                recovered.kv(),
+                Keyspace::Catalog,
+                &catalog_codec::sequence_key(1),
+            )
+            .unwrap()
+            .unwrap()
+            .1,
+            None
+        );
+        meta::open_checks(recovered.kv()).unwrap();
+    }
+
+    #[test]
+    fn counter_write_rejects_missing_sequence_and_stale_incarnation() {
+        let (_, seq) = fixture();
+        let missing = catalog_codec::counter_key(1, 7);
+        assert_eq!(
+            seq.write_counter(missing.clone(), counter_value(), 64),
+            Err(TxnError::SequenceGone)
+        );
+        assert_eq!(seq.kv().get(Keyspace::Seq, &missing).unwrap(), None);
+        assert_eq!(load_features(seq.kv()).unwrap(), 0);
+        seq.submit(sequence_request()).unwrap();
+        let stale = catalog_codec::counter_key(1, 6);
+        assert_eq!(
+            seq.write_counter(stale.clone(), counter_value(), 0),
+            Err(TxnError::SequenceGone)
+        );
+        assert_eq!(seq.kv().get(Keyspace::Seq, &stale).unwrap(), None);
+        assert_eq!(load_features(seq.kv()).unwrap(), 64);
+        meta::open_checks(seq.kv()).unwrap();
+    }
+
+    #[test]
+    fn counter_write_rejects_inconsistent_reservation_without_writing() {
+        let (_, seq) = fixture();
+        seq.submit(sequence_request()).unwrap();
+        let key = catalog_codec::counter_key(1, 7);
+        let invalid = crate::storage::encode(&(8i64, true, 9i64, 1u64)).unwrap();
+        assert_eq!(
+            seq.write_counter(key.clone(), invalid, 0),
+            Err(TxnError::Misuse)
+        );
+        assert_eq!(seq.kv().get(Keyspace::Seq, &key).unwrap(), None);
+        assert_eq!(load_features(seq.kv()).unwrap(), 64);
+        meta::open_checks(seq.kv()).unwrap();
+    }
+
+    #[test]
+    fn counter_write_adds_bit_atomically_without_timestamp() {
+        for fail in [false, true] {
+            let (mem, seq) = fixture();
+            let committed = seq.submit(sequence_request()).unwrap();
+            let timestamp = seq.kv().get(Keyspace::Meta, b"last_commit_ts").unwrap();
+            let key = catalog_codec::counter_key(1, 7);
+            if fail {
+                mem.fail_next_write(KvError::Io("injected".into()));
+            }
+            assert_eq!(
+                seq.write_counter(key.clone(), counter_value(), 64).is_ok(),
+                !fail
+            );
+            assert_eq!(seq.visible_ts(), committed);
+            let durable = mem.crash();
+            assert_eq!(load_features(&durable).unwrap(), if fail { 64 } else { 320 });
+            assert_eq!(durable.get(Keyspace::Seq, &key).unwrap().is_some(), !fail);
+            assert_eq!(
+                durable.get(Keyspace::Meta, b"last_commit_ts").unwrap(),
+                timestamp
+            );
+        }
+    }
+
+    #[test]
+    fn counter_requires_valid_key_and_catalog_ext() {
+        let (_, seq) = fixture();
+        for key in [vec![], vec![2; 24], vec![1; 25], vec![2; 26]] {
+            assert_eq!(
+                seq.write_counter(key, counter_value(), 320),
+                Err(TxnError::Misuse)
+            );
+        }
+        assert_eq!(
+            seq.write_counter(catalog_codec::counter_key(1, 7), counter_value(), 0),
+            Err(TxnError::Misuse)
+        );
+        assert_eq!(load_features(seq.kv()).unwrap(), 0);
+    }
+
+    #[test]
+    fn reopened_worker_preserves_existing_feature_mask() {
+        let (mem, seq) = fixture();
+        seq.submit(sequence_request()).unwrap();
+        seq.submit(request(192)).unwrap();
+        drop(seq);
+        let seq = reopen(Arc::new(mem.crash()));
+        seq.write_counter(catalog_codec::counter_key(1, 7), counter_value(), 0)
+            .unwrap();
+        assert_eq!(load_features(seq.kv()).unwrap(), 448);
+    }
+
+    #[test]
+    fn sequencer_rejects_malformed_or_invalid_persisted_features() {
+        for value in [
+            vec![0; 7],
+            256u64.to_be_bytes().to_vec(),
+            1024u64.to_be_bytes().to_vec(),
+        ] {
+            let (mem, seq) = fixture();
+            drop(seq);
+            let mut batch = WriteBatch::default();
+            batch.put(Keyspace::Meta, b"features".to_vec(), value);
+            mem.write(batch, Durability::Sync).unwrap();
+            assert!(matches!(
+                Sequencer::open(
+                    Arc::new(Kv::new(mem)),
+                    Arc::new(ManualClock::new(10)),
+                    SequencerConfig::default()
+                ),
+                Err(TxnError::Kv(KvError::Corrupt(_)))
+            ));
+        }
+    }
+
+    fn load_features(kv: &dyn KvRead) -> Result<u64, TxnError> {
+        Ok(u64::from_be_bytes(
+            kv.get(Keyspace::Meta, b"features")?
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ))
+    }
 }

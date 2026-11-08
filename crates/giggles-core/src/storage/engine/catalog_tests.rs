@@ -624,8 +624,9 @@ fn catalog_short_name_has_exact_wire_keys_and_input_ids_are_ignored() {
     table_key.extend_from_slice(&committed.inverted_be());
     let mut name_key = vec![3, b'x', 0];
     name_key.extend_from_slice(&committed.inverted_be());
-    let mut table_value = vec![0, 1];
+    let mut table_value = vec![0, 2];
     table_value.extend(crate::storage::encode(&*entry).unwrap());
+    table_value.extend_from_slice(&[0; 8]); // frozen empty columns_ext map
     let mut name_value = vec![0];
     name_value.extend_from_slice(&entry.def.id.to_be_bytes());
     let actual = seq

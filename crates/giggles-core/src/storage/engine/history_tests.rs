@@ -661,6 +661,8 @@ fn probe(t: &Transaction, seq: &Sequencer) -> usize {
         validation: Some(Box::new(move |log, kv, snapshot, _| {
             hook.validate(log, kv, snapshot)
         })),
+        features_or: 0,
+        raw: Vec::new(),
     });
     if let Err(e) = result {
         assert!(legal_abort(&e), "unexpected diagnostic error {e:?}");

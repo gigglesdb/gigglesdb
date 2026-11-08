@@ -245,7 +245,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
         gc_watermark: optional(kv, b"gc_watermark")?,
     })
 }
-fn check_features(bits: u64) -> Result<(), FormatError> {
+pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
     if bits & !1023 != 0 {
         return Err(FormatError::Unsupported("feature bits".into()));
     }
@@ -253,6 +253,11 @@ fn check_features(bits: u64) -> Result<(), FormatError> {
         return Err(corrupt("sequence counters require catalog_ext"));
     }
     Ok(())
+}
+pub(crate) fn open_checks(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
+    let info = validate_meta(kv)?;
+    super::content_check::check(kv, info.features)?;
+    Ok(info)
 }
 pub(crate) fn put_features(batch: &mut WriteBatch, bits: u64) -> Result<(), FormatError> {
     check_features(bits)?;

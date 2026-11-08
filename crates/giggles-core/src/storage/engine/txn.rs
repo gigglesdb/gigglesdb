@@ -1,7 +1,7 @@
 //! Transaction isolation, write ownership, and lazy read-your-writes scans.
 use super::{
     codec::CodecError,
-    commit::{CommitRequest, Sequencer, SnapshotHandle},
+    commit::{CommitRequest, RawOp, Sequencer, SnapshotHandle, valid_counter_key},
     hlc::Ts,
     kv::{Direction, Keyspace, KvError},
     locks::{LockError, LockKey, LockManager, LockMode, TxnId},
@@ -34,6 +34,8 @@ pub(crate) enum TxnError {
     CommitAmbiguous,
     Fenced,
     Misuse,
+    /// A counter reservation targeted a sequence that was dropped or recreated.
+    SequenceGone,
     Kv(KvError),
     Codec(CodecError),
 }
@@ -46,6 +48,7 @@ impl TxnError {
             Self::Cancelled => "57014",
             Self::LockLimit | Self::WriteSetLimit => "53200",
             Self::CommitAmbiguous => "08007",
+            Self::SequenceGone => "42P01",
             Self::Fenced | Self::Misuse => "XX000",
             Self::Kv(_) | Self::Codec(_) => "XX000",
         }
@@ -87,6 +90,8 @@ impl From<TxnError> for crate::CoreError {
             // CoreError has no dedicated unknown-outcome variant; Storage follows its unknown-outcome route.
             TxnError::CommitAmbiguous => Self::Storage("engine commit outcome unknown".into()),
             TxnError::Misuse => Self::Corrupt("engine transaction misuse".into()),
+            // The sequence relation no longer exists (42P01, as on legacy).
+            TxnError::SequenceGone => Self::Sql(crate::relational::SqlError::UnknownTable),
         }
     }
 }
@@ -117,6 +122,8 @@ pub(crate) struct Savepoint {
     owner: Arc<()>,
     sequence: u64,
     undo_len: usize,
+    raw_len: usize,
+    features_or: u64,
 }
 struct UndoWrite {
     key: (Keyspace, Vec<u8>),
@@ -132,6 +139,8 @@ pub(crate) struct Transaction {
     isolation: Isolation,
     snapshot: Option<SnapshotHandle>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
+    features_or: u64,
+    raw: Vec<RawOp>,
     write_bytes: usize,
     savepoint_owner: Arc<()>,
     savepoint_sequence: u64,
@@ -156,6 +165,8 @@ impl Transaction {
             isolation,
             snapshot: None,
             writes: BTreeMap::new(),
+            features_or: 0,
+            raw: Vec::new(),
             write_bytes: 0,
             savepoint_owner: Arc::new(()),
             savepoint_sequence: 0,
@@ -183,6 +194,8 @@ impl Transaction {
             owner: self.savepoint_owner.clone(),
             sequence: self.savepoint_sequence,
             undo_len: self.undo.len(),
+            raw_len: self.raw.len(),
+            features_or: self.features_or,
         };
         self.savepoints.push((mark.sequence, mark.undo_len));
         mark
@@ -216,6 +229,8 @@ impl Transaction {
             self.undo_bytes -= undo.bytes;
         }
         self.savepoints.truncate(index + 1);
+        self.raw.truncate(mark.raw_len);
+        self.features_or = mark.features_or;
         Ok(())
     }
     /// Keeps writes while invalidating this mark and all later marks.
@@ -470,6 +485,16 @@ impl Transaction {
     pub(crate) fn writes_keyspace(&self, ks: Keyspace) -> bool {
         self.writes.keys().any(|(space, _)| *space == ks)
     }
+    pub(crate) fn require_features(&mut self, bits: u64) {
+        self.features_or |= bits;
+    }
+    pub(crate) fn delete_counter(&mut self, key: Vec<u8>) -> Result<(), TxnError> {
+        if !valid_counter_key(&key) {
+            return Err(TxnError::Misuse);
+        }
+        self.raw.push(RawOp::DeleteCounter { key });
+        Ok(())
+    }
     pub(crate) fn commit(self) -> Result<Ts, TxnError> {
         if self.writes_keyspace(Keyspace::Catalog) {
             return Err(TxnError::Misuse);
@@ -484,7 +509,11 @@ impl Transaction {
         mut self,
         publish: F,
     ) -> Result<Ts, TxnError> {
-        if self.writes.is_empty() && self.isolation != Isolation::Serializable {
+        if self.writes.is_empty()
+            && self.raw.is_empty()
+            && self.features_or == 0
+            && self.isolation != Isolation::Serializable
+        {
             let ts = self.seq.visible_ts();
             publish(ts)?;
             return Ok(ts);
@@ -501,6 +530,8 @@ impl Transaction {
         let ts = self.seq.submit(CommitRequest {
             snapshot,
             writes: std::mem::take(&mut self.writes),
+            features_or: self.features_or,
+            raw: std::mem::take(&mut self.raw),
             validation: validator.map(|validator| {
                 Box::new(
                     move |log: &super::commit::RecentLog,

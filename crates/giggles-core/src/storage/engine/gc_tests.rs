@@ -356,6 +356,8 @@ fn pin_admission_drop_active_snapshot_and_ten_second_retention() {
             snapshot: old,
             writes,
             validation: None,
+            features_or: 0,
+            raw: Vec::new(),
         })
         .unwrap();
     assert_eq!(committed, ts(100_000));

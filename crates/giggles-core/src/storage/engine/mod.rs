@@ -17,11 +17,13 @@ pub(crate) mod kv_conformance;
 mod tests;
 
 pub(crate) mod commit;
+pub(crate) mod content_check;
 pub(crate) mod gc;
 pub(crate) mod mvcc;
 pub(crate) mod txn;
 
 pub(crate) mod catalog;
+pub(crate) mod catalog_codec;
 pub(crate) mod seq;
 pub(crate) mod rows;
 pub(crate) mod ssi_validate;

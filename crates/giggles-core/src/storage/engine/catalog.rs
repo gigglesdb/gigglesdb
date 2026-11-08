@@ -374,15 +374,13 @@ pub(crate) fn name_key(name: &str) -> Vec<u8> {
     key
 }
 pub(crate) fn encode_entry(entry: &TableEntry) -> Result<Vec<u8>, CoreError> {
-    let mut value = vec![1];
-    value.extend(super::super::encode(entry)?);
-    Ok(value)
+    super::catalog_codec::encode_table(entry, &BTreeMap::new())
 }
 pub(crate) fn decode_entry(value: &[u8]) -> Result<TableEntry, CoreError> {
-    if value.first() != Some(&1) {
-        return Err(corrupt("unsupported catalog table version"));
+    let (entry, columns_ext) = super::catalog_codec::decode_table(value)?;
+    if !columns_ext.is_empty() {
+        return Err(corrupt("catalog wrapper cannot represent column extensions"));
     }
-    let entry: TableEntry = super::super::decode(&value[1..])?;
     validate_definition(&entry.def).map_err(|_| corrupt("invalid catalog table definition"))?;
     if entry.def.id == 0 || entry.def.columns.iter().any(|column| column.id == 0) {
         return Err(corrupt("zero catalog object id"));

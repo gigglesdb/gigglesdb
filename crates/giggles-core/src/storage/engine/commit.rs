@@ -136,8 +136,17 @@ type Validation = Box<dyn Fn(&RecentLog, &dyn KvRead, Ts, Ts) -> Result<(), TxnE
 pub(crate) struct CommitRequest {
     pub(crate) snapshot: Ts,
     pub(crate) writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
+    pub(crate) features_or: u64,
+    pub(crate) raw: Vec<RawOp>,
     // Hooks inspect the worker-owned log; no snapshot mutex is held during validation.
     pub(crate) validation: Option<Validation>,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum RawOp {
+    DeleteCounter { key: Vec<u8> },
+}
+pub(crate) fn valid_counter_key(key: &[u8]) -> bool {
+    key.len() == 25 && key.first() == Some(&2)
 }
 struct SnapState {
     visible: Ts,
@@ -172,6 +181,12 @@ struct Pending {
 }
 enum Message {
     Commit(Pending),
+    Counter {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        features_or: u64,
+        reply: mpsc::Sender<Result<(), TxnError>>,
+    },
     Shutdown,
 }
 pub(crate) struct Sequencer {
@@ -187,6 +202,7 @@ impl Sequencer {
         clock: Arc<dyn Clock>,
         config: SequencerConfig,
     ) -> Result<Arc<Self>, TxnError> {
+        let features = load_features(kv.as_ref())?;
         let seed = match kv
             .get(Keyspace::Meta, b"last_commit_ts")
             .map_err(TxnError::Kv)?
@@ -217,6 +233,7 @@ impl Sequencer {
                 worker_config,
                 worker_shared,
                 seed,
+                features,
             )
         });
         Ok(Arc::new(Self {
@@ -269,6 +286,45 @@ impl Sequencer {
             .map_err(|_| TxnError::Fenced)?;
         receive.recv().unwrap_or(Err(TxnError::Fenced))
     }
+    /// A counter reservation is durable independently of any SQL transaction.
+    pub(crate) fn write_counter(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        features_or: u64,
+    ) -> Result<(), TxnError> {
+        if !valid_counter_key(&key) {
+            return Err(TxnError::Misuse);
+        }
+        if self.kv.is_fenced() {
+            return Err(TxnError::Fenced);
+        }
+        let (reply, receive) = mpsc::channel();
+        self.sender
+            .send(Message::Counter {
+                key,
+                value,
+                features_or,
+                reply,
+            })
+            .map_err(|_| TxnError::Fenced)?;
+        receive.recv().unwrap_or(Err(TxnError::Fenced))
+    }
+}
+fn load_features(kv: &dyn KvRead) -> Result<u64, TxnError> {
+    // Bare engine fixtures predate format metadata. Format-aware callers must
+    // run open_checks first, which requires the features record to be present.
+    let bits = match kv.get(Keyspace::Meta, b"features")? {
+        None => 0,
+        Some(bytes) => u64::from_be_bytes(bytes.try_into().map_err(|_| {
+            TxnError::Kv(super::kv::KvError::Corrupt(
+                "invalid features length".into(),
+            ))
+        })?),
+    };
+    super::meta::check_features(bits)
+        .map_err(|e| TxnError::Kv(super::kv::KvError::Corrupt(e.to_string())))?;
+    Ok(bits)
 }
 impl Drop for Sequencer {
     fn drop(&mut self) {
@@ -286,13 +342,31 @@ fn run(
     config: SequencerConfig,
     shared: Arc<Shared>,
     seed: Ts,
+    mut features: u64,
 ) {
     let mut hlc = HlcClock::new(seed);
     let mut log = RecentLog::new(config.recent_log_bytes);
     let mut fenced = false;
-    while let Ok(message) = receiver.recv() {
-        let Message::Commit(first) = message else {
-            break;
+    let mut deferred = None;
+    while let Some(message) = deferred.take().or_else(|| receiver.recv().ok()) {
+        let first = match message {
+            Message::Commit(first) => first,
+            Message::Counter {
+                key,
+                value,
+                features_or,
+                reply,
+            } => {
+                let result = if fenced || kv.is_fenced() {
+                    Err(TxnError::Fenced)
+                } else {
+                    process_counter(&kv, key, value, features_or, &mut features)
+                };
+                fenced |= matches!(result, Err(TxnError::CommitAmbiguous | TxnError::Fenced));
+                let _ = reply.send(result);
+                continue;
+            }
+            Message::Shutdown => break,
         };
         let mut group = vec![first];
         let deadline = Instant::now()
@@ -302,6 +376,10 @@ fn run(
         while group.len() - 1 < config.group_max && Instant::now() < deadline {
             match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(Message::Commit(p)) => group.push(p),
+                Ok(counter @ Message::Counter { .. }) => {
+                    deferred = Some(counter);
+                    break;
+                }
                 Ok(Message::Shutdown) => {
                     shutdown = true;
                     break;
@@ -319,13 +397,67 @@ fn run(
             fenced = true;
             continue;
         }
-        fenced = process_group(group, &kv, clock.as_ref(), &shared, &mut hlc, &mut log);
+        fenced = process_group(
+            group,
+            &kv,
+            clock.as_ref(),
+            &shared,
+            &mut hlc,
+            &mut log,
+            &mut features,
+        );
     }
     for message in receiver.try_iter() {
-        if let Message::Commit(p) = message {
-            let _ = p.reply.send(Err(TxnError::Fenced));
+        match message {
+            Message::Commit(p) => {
+                let _ = p.reply.send(Err(TxnError::Fenced));
+            }
+            Message::Counter { reply, .. } => {
+                let _ = reply.send(Err(TxnError::Fenced));
+            }
+            Message::Shutdown => {}
         }
     }
+}
+fn process_counter(
+    kv: &Kv,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    features_or: u64,
+    features: &mut u64,
+) -> Result<(), TxnError> {
+    let next = *features | features_or | 256;
+    if !valid_counter_key(&key) || super::meta::check_features(next).is_err() {
+        return Err(TxnError::Misuse);
+    }
+    let seq_id = u64::from_be_bytes(key[1..9].try_into().expect("validated counter key"));
+    let incarnation = u128::from_be_bytes(key[9..25].try_into().expect("validated counter key"));
+    // This worker serializes commit groups and counter messages, so no DROP
+    // can interleave between this latest-physical-version check and the write.
+    // A latest tombstone hides every older live definition.
+    let definition = super::mvcc::latest_version(
+        kv,
+        Keyspace::Catalog,
+        &super::catalog_codec::sequence_key(seq_id),
+    )?
+    .and_then(|(_, value)| value)
+    .ok_or(TxnError::SequenceGone)?;
+    let definition = super::catalog_codec::decode_sequence(&definition)
+        .map_err(|error| TxnError::Kv(super::kv::KvError::Corrupt(error.to_string())))?;
+    if definition.incarnation != incarnation {
+        return Err(TxnError::SequenceGone);
+    }
+    super::catalog_codec::decode_counter(&key, &value, &definition)
+        .map_err(|_| TxnError::Misuse)?;
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Seq, key, value);
+    if next != *features {
+        super::meta::put_features(&mut batch, next).map_err(|_| TxnError::Misuse)?;
+    }
+    kv.write(batch, Durability::Sync)
+        .map_err(|_| TxnError::CommitAmbiguous)?;
+    *features = next;
+    Ok(())
 }
 
 // Returns whether an ambiguous backend result requires fencing subsequent groups.
@@ -336,6 +468,7 @@ fn process_group(
     shared: &Shared,
     hlc: &mut HlcClock,
     log: &mut RecentLog,
+    features: &mut u64,
 ) -> bool {
     let visible = shared
         .snap
@@ -345,8 +478,18 @@ fn process_group(
     let mut max = visible;
     let mut batch = WriteBatch::default();
     let mut accepted = Vec::new();
+    let mut pending_features = *features;
     for pending in group {
         let request = &pending.request;
+        let next_features = pending_features | request.features_or;
+        if super::meta::check_features(next_features).is_err()
+            || request.raw.iter().any(|op| match op {
+                RawOp::DeleteCounter { key } => !valid_counter_key(key),
+            })
+        {
+            let _ = pending.reply.send(Err(TxnError::Misuse));
+            continue;
+        }
         let ts = if request.writes.is_empty() {
             visible
         } else {
@@ -381,14 +524,26 @@ fn process_group(
             log.append(ts, keys);
             max = ts;
         }
+        for op in &request.raw {
+            match op {
+                RawOp::DeleteCounter { key } => batch.delete(Keyspace::Seq, key.clone()),
+            }
+        }
+        pending_features = next_features;
         accepted.push((pending.reply, ts));
     }
+    if pending_features != *features {
+        super::meta::put_features(&mut batch, pending_features)
+            .expect("validated pending features");
+    }
     if !batch.is_empty() {
-        batch.put(
-            Keyspace::Meta,
-            b"last_commit_ts".to_vec(),
-            max.0.to_be_bytes().to_vec(),
-        );
+        if max != visible {
+            batch.put(
+                Keyspace::Meta,
+                b"last_commit_ts".to_vec(),
+                max.0.to_be_bytes().to_vec(),
+            );
+        }
         if kv.write(batch, Durability::Sync).is_err() {
             for (reply, _) in accepted {
                 let _ = reply.send(Err(TxnError::CommitAmbiguous));
@@ -396,6 +551,7 @@ fn process_group(
             return true;
         }
     }
+    *features = pending_features;
     // Publish only after Sync succeeds; capture retention state in the same
     // short critical section, then trim and acknowledge without the mutex.
     let (visible, oldest) = {
@@ -441,7 +597,16 @@ impl Sequencer {
                 .map(|_| Err(TxnError::Fenced))
                 .collect();
         }
-        process_group(group, &self.kv, clock, &self.shared, &mut hlc, log);
+        let mut features = load_features(self.kv.as_ref()).unwrap();
+        process_group(
+            group,
+            &self.kv,
+            clock,
+            &self.shared,
+            &mut hlc,
+            log,
+            &mut features,
+        );
         receives
             .into_iter()
             .map(|receive| receive.recv().unwrap_or(Err(TxnError::Fenced)))
