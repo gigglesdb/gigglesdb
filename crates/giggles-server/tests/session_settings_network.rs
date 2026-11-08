@@ -481,7 +481,7 @@ async fn transaction_local_reset_and_multi_statement_settings() {
         ["batch", "GMT"]
     );
     c.query("RESET ALL", &[]).await.unwrap();
-    assert_eq!(values(&c.simple_query("SHOW application_name; SHOW TimeZone; SHOW DateStyle; SHOW search_path; SHOW extra_float_digits").await.unwrap()), ["", "UTC", "ISO", default_path, "0"]);
+    assert_eq!(values(&c.simple_query("SHOW application_name; SHOW TimeZone; SHOW DateStyle; SHOW search_path; SHOW extra_float_digits").await.unwrap()), ["", "UTC", "ISO", default_path, "1"]);
     drop(c);
     f.stop().await;
 }

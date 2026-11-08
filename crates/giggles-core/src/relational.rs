@@ -2882,7 +2882,7 @@ impl Relational {
                         )
                         || matches!(v, Expr::Literal(_)) && t.columns[*i].data_type.is_temporal()
                     {
-                        query::coerce(v.value(params)?, &t.columns[*i].data_type)?
+                        query::coerce_clocked(v.value(params)?, &t.columns[*i].data_type, clock)?
                     } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
                     {
                         assign::plain_value(v, &t.columns[*i], &prepared.parameter_types, params, clock)?

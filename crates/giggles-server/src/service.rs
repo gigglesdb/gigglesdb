@@ -384,6 +384,12 @@ pub struct Session {
     transaction_us: Option<i64>,
 }
 impl Session {
+    pub(crate) fn zone(&self) -> Option<SessionZone> {
+        self.zone
+    }
+    pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
+        self.sql.set_extra_float_digits(value);
+    }
     pub(crate) fn set_time_zone(&mut self, name: &str) {
         self.zone = if ["UTC", "Etc/UTC", "GMT", "Z"]
             .iter()

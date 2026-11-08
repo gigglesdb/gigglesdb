@@ -1811,6 +1811,9 @@ impl Query {
                 }
                 slot.get_or_insert_with(|| ty.clone());
             } else if let Expr::Literal(v) = e {
+                if functions::zone_dependent_literal(v, ty) {
+                    return Ok(false);
+                }
                 if !matches!(v, Value::Null | Value::Text(_)) {
                     let literal = Scalar::Literal(v.clone()).bind(&resolve, &tables, parameters)?;
                     if literal.ty != *ty && functions::comparable(&literal.ty, ty) {
@@ -1827,6 +1830,13 @@ impl Query {
                     // Keep out-of-range integer comparisons in the full filter.
                     return Ok(false);
                 }
+                let coerced;
+                let v = if matches!(v, Value::Text(_)) && *ty == DataType::TimestampTz {
+                    coerced = functions::coerce_clocked(v.clone(), ty, None)?;
+                    &coerced
+                } else {
+                    v
+                };
                 check(
                     v,
                     &ColumnDef {
@@ -2680,8 +2690,12 @@ impl BoundQuery<'_> {
     }
 }
 
-pub(super) fn coerce(v: Value, t: &DataType) -> R<Value> {
-    functions::cast_value(v, t, &mut 0)
+pub(super) fn coerce_clocked(
+    v: Value,
+    t: &DataType,
+    clock: Option<&super::clock::ExecutionClock>,
+) -> R<Value> {
+    functions::coerce_clocked(v, t, clock)
 }
 
 #[cfg(test)]

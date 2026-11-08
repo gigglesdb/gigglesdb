@@ -46,14 +46,24 @@ pub(crate) struct ExecutionClock {
     clock: StatementClock,
     error: Arc<Mutex<Option<CoreError>>>,
     sequence: Option<SequenceCallback>,
+    extra_float_digits: i32,
 }
 impl ExecutionClock {
     pub(crate) fn new(clock: &StatementClock) -> Self {
         Self {
             clock: clock.clone(),
             sequence: None,
+            extra_float_digits: 1,
             error: Arc::new(Mutex::new(None)),
         }
+    }
+    pub(crate) fn with_extra_float_digits(&self, value: i32) -> Self {
+        let mut context = self.clone();
+        context.extra_float_digits = value;
+        context
+    }
+    pub(crate) fn extra_float_digits(&self) -> i32 {
+        self.extra_float_digits
     }
     pub(crate) fn with_sequences(&self, callback: SequenceCallback) -> Self {
         let mut context = self.clone();
@@ -75,6 +85,9 @@ impl ExecutionClock {
                 Err(SqlError::Unsupported)
             }
         }
+    }
+    pub(crate) fn zone(&self) -> Option<SessionZone> {
+        self.clock.zone
     }
     pub(crate) fn comparison_context(&self) -> Result<(i64, SessionZone), SqlError> {
         if let Some(error) = &self.clock.unavailable {

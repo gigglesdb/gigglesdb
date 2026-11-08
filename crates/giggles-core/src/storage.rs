@@ -1624,6 +1624,7 @@ pub struct SqlSession {
     aborted: bool,
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
+    extra_float_digits: i32,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
     pending_sequences: sequences::Pending,
@@ -1644,6 +1645,7 @@ impl Admin {
             aborted: false,
             transaction_id: None,
             transaction_clock_us: None,
+            extra_float_digits: 1,
             staged_revision: 0,
             sequence_values: Default::default(),
             pending_sequences: Default::default(),
@@ -1681,6 +1683,11 @@ impl Admin {
     }
 }
 impl SqlSession {
+    /// Set the precision used by SQL floating-point text conversions.
+    pub fn set_extra_float_digits(&mut self, value: i32) {
+        self.extra_float_digits = value;
+    }
+
     /// Report default and identity sequence dependencies without resolving names.
     pub fn implicit_sequence_dependencies(
         &self,
@@ -2071,7 +2078,8 @@ impl SqlSession {
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
-        let context = relational::clock::ExecutionClock::new(clock);
+        let context = relational::clock::ExecutionClock::new(clock)
+            .with_extra_float_digits(self.extra_float_digits);
         let result = self.execute_bound_clocked(p, params, expected_version, Some(&context));
         // A BEGIN under an unavailable clock stays unpinned, so the first available clocked statement
         // becomes the pin. That is acceptable: the server clock stays latched until restart.

@@ -373,8 +373,7 @@ const CASES: &[&str] = &[
     r#"{"name":"A ins float8 NaN->numeric","sql":"INSERT INTO w(id, n) VALUES (116, $1) RETURNING n","oids":[701],"inputs":["4e614e"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[1700],"rows":[["NaN"]]}}"#,
     r#"{"name":"A ins float8->real oor","sql":"INSERT INTO w(id, r) VALUES (117, $1) RETURNING r","oids":[701],"inputs":["3165333030"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[700],"sqlstate":"22003"}}"#,
     r#"{"name":"A ins float8->real","sql":"INSERT INTO w(id, r) VALUES (118, $1) RETURNING r","oids":[701],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[700],"rows":[["0.1"]]}}"#,
-    // PG18.6: {"rows":[["0.10000000149011612"]],"param_oids":[700],"col_oids":[701]}; gap: legacy float output precision
-    r#"{"name":"known gap: A ins float4->float8","sql":"INSERT INTO w(id, f) VALUES (119, $1) RETURNING f","oids":[700],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[701],"rows":[["0.100000001490116"]]}}"#,
+    r#"{"name":"A ins float4->float8","sql":"INSERT INTO w(id, f) VALUES (119, $1) RETURNING f","oids":[700],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[701],"rows":[["0.10000000149011612"]]}}"#,
     r#"{"name":"A ins float4->numeric","sql":"INSERT INTO w(id, n) VALUES (120, $1) RETURNING n","oids":[700],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[1700],"rows":[["0.1"]]}}"#,
     r#"{"name":"A ins float4->smallint","sql":"INSERT INTO w(id, s) VALUES (121, $1) RETURNING s","oids":[700],"inputs":["372e35"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[21],"rows":[["8"]]}}"#,
     r#"{"name":"A ins float8->text","sql":"INSERT INTO w(id, tx) VALUES (122, $1) RETURNING tx","oids":[701],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[25],"rows":[["0.1"]]}}"#,
@@ -424,8 +423,7 @@ const CASES: &[&str] = &[
     r#"{"name":"F abs numeric","sql":"SELECT abs($1)","oids":[1700],"inputs":["2d312e3530"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["1.50"]]}}"#,
     r#"{"name":"F round numeric 1","sql":"SELECT round($1, 1)","oids":[1700],"inputs":["322e3435"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["2.5"]]}}"#,
     r#"{"name":"F round float8","sql":"SELECT round($1)","oids":[701],"inputs":["322e35"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["2"]]}}"#,
-    // PG18.6: {"rows":[["1.4142135623730951"]],"param_oids":[701],"col_oids":[701]}; gap: legacy float output precision
-    r#"{"name":"known gap: F sqrt float8","sql":"SELECT sqrt($1)","oids":[701],"inputs":["32"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["1.4142135623731"]]}}"#,
+    r#"{"name":"F sqrt float8","sql":"SELECT sqrt($1)","oids":[701],"inputs":["32"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[701],"rows":[["1.4142135623730951"]]}}"#,
     r#"{"name":"F sqrt numeric","sql":"SELECT sqrt($1)","oids":[1700],"inputs":["32"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["1.414213562373095"]]}}"#,
     r#"{"name":"F floor float4","sql":"SELECT floor($1)","oids":[700],"inputs":["322e35"],"binary":false,"expected":{"phase":"execute","param_oids":[700],"col_oids":[701],"rows":[["2"]]}}"#,
     r#"{"name":"F length text","sql":"SELECT length($1)","oids":[25],"inputs":["68656c6c6f"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[23],"rows":[["5"]]}}"#,
@@ -458,8 +456,7 @@ const CASES: &[&str] = &[
     r#"{"name":"F coalesce numeric","sql":"SELECT coalesce($1, 0)","oids":[1700],"inputs":["322e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["2.5"]]}}"#,
     r#"{"name":"F $1::int numeric","sql":"SELECT $1::int","oids":[1700],"inputs":["322e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[23],"rows":[["3"]]}}"#,
     r#"{"name":"F $1::text float8","sql":"SELECT $1::text","oids":[701],"inputs":["302e31"],"binary":false,"expected":{"phase":"execute","param_oids":[701],"col_oids":[25],"rows":[["0.1"]]}}"#,
-    // PG18.6: {"rows":[["2024-01-02"]],"param_oids":[1184],"col_oids":[1082]}; gap: explicit timestamptz-to-date cast restriction
-    r#"{"name":"known gap: F $1::date tstz","sql":"SELECT $1::date","oids":[1184],"inputs":["323032342d30312d30322032333a30303a30302b3030"],"binary":false,"expected":{"phase":"parse","sqlstate":"42804"}}"#,
+    r#"{"name":"F $1::date tstz","sql":"SELECT $1::date","oids":[1184],"inputs":["323032342d30312d30322032333a30303a30302b3030"],"binary":false,"expected":{"phase":"execute","param_oids":[1184],"col_oids":[1082],"rows":[["2024-01-02"]]}}"#,
     r#"{"name":"F $1::numeric text","sql":"SELECT $1::numeric","oids":[25],"inputs":["312e3235"],"binary":false,"expected":{"phase":"execute","param_oids":[25],"col_oids":[1700],"rows":[["1.25"]]}}"#,
     r#"{"name":"F $1::int bool","sql":"SELECT $1::int","oids":[16],"inputs":["74"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"]]}}"#,
     r#"{"name":"F substr varchar","sql":"SELECT substr($1, 2)","oids":[1043],"inputs":["61626364"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["bcd"]]}}"#,

@@ -97,10 +97,137 @@ enum Node {
     ),
     Param(usize),
     Cast(Box<BoundScalar>),
+    SessionCast(
+        Box<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     Column(BoundColumn, String),
     Literal(Value),
     Call(String, Vec<BoundScalar>),
 }
+fn cast_node(value: BoundScalar, target: &DataType) -> Node {
+    if session_sensitive(&value.ty, target) {
+        Node::SessionCast(Box::new(value), None)
+    } else {
+        Node::Cast(Box::new(value))
+    }
+}
+pub(in crate::relational) fn zone_dependent_literal(value: &Value, target: &DataType) -> bool {
+    if *target != DataType::TimestampTz || !matches!(value, Value::Text(_)) {
+        return false;
+    }
+    matches!(
+        literal_cast_node(value.clone(), target),
+        Ok(Node::SessionCast(..))
+    )
+}
+pub(in crate::relational) fn coerce_clocked(
+    value: Value,
+    target: &DataType,
+    clock: Option<&crate::relational::clock::ExecutionClock>,
+) -> R<Value> {
+    if value == Value::Null {
+        return Ok(value);
+    }
+    if matches!(value, Value::Text(_)) && *target == DataType::TimestampTz {
+        return session_cast(value, &DataType::Text, target, clock);
+    }
+    cast_value(value, target, &mut 0)
+}
+fn session_sensitive(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    matches!(
+        (source, target),
+        (TimestampTz | Real | DoublePrecision, Text)
+            | (Text | Date | Timestamp, TimestampTz)
+            | (TimestampTz, Date | Timestamp | Time | TimeTz)
+    )
+}
+fn literal_cast_node(value: Value, target: &DataType) -> R<Node> {
+    if let Value::Text(text) = &value
+        && *target == DataType::TimestampTz
+    {
+        use giggles_pg_types::temporal::{DateOrder, SessionSettings, SessionZone};
+        let parse = |offset| {
+            TimestampTz::parse_in_session(
+                text,
+                &SessionSettings {
+                    date_order: DateOrder::default(),
+                    zone: SessionZone::Fixed(offset),
+                },
+            )
+        };
+        if let (Ok(a), Ok(b)) = (parse(0), parse(3600))
+            && a == b
+        {
+            return Ok(Node::Literal(Value::TimestampTz(a)));
+        }
+        return Ok(Node::SessionCast(
+            Box::new(BoundScalar {
+                ty: DataType::Text,
+                node: Node::Literal(value),
+            }),
+            None,
+        ));
+    }
+    Ok(Node::Literal(cast_value(value, target, &mut 0)?))
+}
+fn session_cast(
+    value: Value,
+    source: &DataType,
+    target: &DataType,
+    clock: Option<&crate::relational::clock::ExecutionClock>,
+) -> R<Value> {
+    let fallback;
+    let clock = match clock {
+        Some(clock) => clock,
+        None => {
+            fallback =
+                crate::relational::clock::ExecutionClock::new(&crate::relational::StatementClock {
+                    unavailable: None,
+                    transaction_us: 0,
+                    statement_us: 0,
+                    zone: Some(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+                    wall: None,
+                });
+            &fallback
+        }
+    };
+    match (value, target) {
+        (Value::Float4(n), DataType::Text) => Ok(Value::Text(
+            n.to_text_with_extra_float_digits(clock.extra_float_digits())
+                .map_err(pg_error)?,
+        )),
+        (Value::Float8(n), DataType::Text) => Ok(Value::Text(
+            n.to_text_with_extra_float_digits(clock.extra_float_digits())
+                .map_err(pg_error)?,
+        )),
+        (Value::Text(text), DataType::TimestampTz) => {
+            let zone = clock
+                .zone()
+                .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0));
+            TimestampTz::parse_in_session(
+                &text,
+                &giggles_pg_types::temporal::SessionSettings {
+                    date_order: giggles_pg_types::temporal::DateOrder::default(),
+                    zone,
+                },
+            )
+            .map(Value::TimestampTz)
+            .map_err(|e| temporal::parse_error(e, false))
+        }
+        (Value::TimestampTz(t), DataType::Text) => Ok(Value::Text(
+            t.format_in_zone(
+                clock
+                    .zone()
+                    .unwrap_or(giggles_pg_types::temporal::SessionZone::Fixed(0)),
+            )
+            .map_err(pg_error)?,
+        )),
+        (value, target) => assignment::convert(value, source, target, Some(clock)),
+    }
+}
+
 fn number(t: &DataType) -> bool {
     integer(t)
         || matches!(
@@ -608,7 +735,23 @@ impl Scalar {
                 Node::Param(*n),
             ),
             Self::Cast(a, ty) => {
-                if let Self::Literal(Value::Text(_) | Value::Null) = a.as_ref() {
+                if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a.as_ref()
+                    && *ty == DataType::TimestampTz
+                {
+                    return Ok(BoundScalar {
+                        ty: ty.clone(),
+                        node: match literal_cast_node(v.clone(), ty)? {
+                            Node::Literal(value) => Node::Cast(Box::new(BoundScalar {
+                                ty: ty.clone(),
+                                node: Node::Literal(value),
+                            })),
+                            node => node,
+                        },
+                    });
+                }
+                if let Self::Literal(Value::Text(_) | Value::Null) = a.as_ref()
+                    && *ty != DataType::TimestampTz
+                {
                     let Self::Literal(v) = a.as_ref() else {
                         unreachable!()
                     };
@@ -629,11 +772,12 @@ impl Scalar {
                     || a.ty == DataType::Text
                     || *ty == DataType::Text
                     || a.ty == DataType::Boolean && *ty == DataType::Integer
-                    || a.ty == DataType::Integer && *ty == DataType::Boolean)
+                    || a.ty == DataType::Integer && *ty == DataType::Boolean
+                    || session_sensitive(&a.ty, ty))
                 {
                     return Err(SqlError::Type);
                 }
-                (ty.clone(), Node::Cast(Box::new(a)))
+                (ty.clone(), cast_node(a, ty))
             }
             Self::Column(c) => {
                 let c = resolve(c, tables.len())?;
@@ -693,7 +837,7 @@ impl Scalar {
                                 };
                                 value = BoundScalar {
                                     ty: target.clone(),
-                                    node: Node::Literal(cast_value(raw.clone(), &target, &mut 0)?),
+                                    node: literal_cast_node(raw.clone(), &target)?,
                                 };
                             } else if i == 1 && integer(&value.ty) {
                                 value = BoundScalar {
@@ -785,8 +929,7 @@ impl Scalar {
                             if let Self::Literal(Value::Text(s)) = original
                                 && ty != DataType::Text
                             {
-                                a.node =
-                                    Node::Literal(cast_value(Value::Text(s.clone()), &ty, &mut 0)?);
+                                a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                                 a.ty = ty.clone();
                             }
                             if null(a) {
@@ -835,11 +978,7 @@ impl Scalar {
                                 {
                                     *a = BoundScalar {
                                         ty: DataType::Numeric,
-                                        node: Node::Literal(cast_value(
-                                            v.clone(),
-                                            &DataType::Numeric,
-                                            &mut 0,
-                                        )?),
+                                        node: literal_cast_node(v.clone(), &DataType::Numeric)?,
                                     };
                                     continue;
                                 }
@@ -864,11 +1003,10 @@ impl Scalar {
                                 {
                                     *a = BoundScalar {
                                         ty: DataType::DoublePrecision,
-                                        node: Node::Literal(cast_value(
+                                        node: literal_cast_node(
                                             v.clone(),
                                             &DataType::DoublePrecision,
-                                            &mut 0,
-                                        )?),
+                                        )?,
                                     };
                                 } else {
                                     if !number(&a.ty) {
@@ -896,7 +1034,7 @@ impl Scalar {
                             {
                                 args[0] = BoundScalar {
                                     ty: target.clone(),
-                                    node: Node::Literal(cast_value(v.clone(), &target, &mut 0)?),
+                                    node: literal_cast_node(v.clone(), &target)?,
                                 };
                             } else {
                                 if !(integer(&args[0].ty) || args[0].ty == target) {
@@ -973,7 +1111,7 @@ impl Scalar {
                                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
                                     &original[i]
                                 {
-                                    a.node = Node::Literal(cast_value(v.clone(), &target, &mut 0)?);
+                                    a.node = literal_cast_node(v.clone(), &target)?;
                                     a.ty = target.clone();
                                     continue;
                                 }
@@ -1005,11 +1143,7 @@ impl Scalar {
                             {
                                 args[1] = BoundScalar {
                                     ty: DataType::Integer,
-                                    node: Node::Literal(cast_value(
-                                        v.clone(),
-                                        &DataType::Integer,
-                                        &mut 0,
-                                    )?),
+                                    node: literal_cast_node(v.clone(), &DataType::Integer)?,
                                 };
                             }
                             if args.len() == 2
@@ -1033,8 +1167,7 @@ impl Scalar {
                                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) =
                                     &original[0]
                                 {
-                                    args[0].node =
-                                        Node::Literal(cast_value(v.clone(), &target, &mut 0)?);
+                                    args[0].node = literal_cast_node(v.clone(), &target)?;
                                     args[0].ty = target.clone();
                                 }
                                 let old = std::mem::replace(
@@ -1060,11 +1193,7 @@ impl Scalar {
                                 } else {
                                     Value::Null
                                 };
-                                args[0].node = Node::Literal(cast_value(
-                                    v,
-                                    &DataType::DoublePrecision,
-                                    &mut 0,
-                                )?);
+                                args[0].node = literal_cast_node(v, &DataType::DoublePrecision)?;
                                 args[0].ty = DataType::DoublePrecision;
                             }
                             if !number(&args[0].ty) {
@@ -1099,11 +1228,7 @@ impl Scalar {
                                     DataType::Integer
                                 };
                                 if let Self::Literal(Value::Text(s)) = &original[i] {
-                                    a.node = Node::Literal(cast_value(
-                                        Value::Text(s.clone()),
-                                        &ty,
-                                        &mut 0,
-                                    )?);
+                                    a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                                     a.ty = ty.clone();
                                 }
                                 if null(a) {
@@ -1152,11 +1277,7 @@ impl Scalar {
                             let ty = ty.unwrap_or(DataType::Text);
                             for (a, original) in args.iter_mut().zip(original) {
                                 if let Self::Literal(Value::Text(s)) = original {
-                                    a.node = Node::Literal(cast_value(
-                                        Value::Text(s.clone()),
-                                        &ty,
-                                        &mut 0,
-                                    )?);
+                                    a.node = literal_cast_node(Value::Text(s.clone()), &ty)?;
                                     a.ty = ty.clone();
                                 }
                                 if null(a) {
@@ -1172,6 +1293,20 @@ impl Scalar {
                         _ => return Err(SqlError::Unsupported),
                     }
                 };
+                if matches!(name.as_str(), "concat" | "concat_ws") {
+                    for argument in &mut args {
+                        if session_sensitive(&argument.ty, &DataType::Text) {
+                            let old = std::mem::replace(
+                                argument,
+                                BoundScalar {
+                                    ty: DataType::Text,
+                                    node: Node::Literal(Value::Null),
+                                },
+                            );
+                            argument.node = Node::SessionCast(Box::new(old), None);
+                        }
+                    }
+                }
                 (ty, Node::Call(name.clone(), args))
             }
         };
@@ -1184,6 +1319,10 @@ impl BoundScalar {
         clock: Option<&crate::relational::clock::ExecutionClock>,
     ) {
         match &mut self.node {
+            Node::SessionCast(value, target) => {
+                *target = clock.cloned();
+                value.attach_clock(clock);
+            }
             Node::CrossCompare(_, a, b, target) => {
                 *target = clock.cloned();
                 a.attach_clock(clock);
@@ -1212,7 +1351,7 @@ impl BoundScalar {
             | Node::Call(name, _)
             | Node::Clock(name, ..)
             | Node::Sequence(name, ..) => Some(name),
-            Node::Cast(a) => a.strong_name(),
+            Node::Cast(a) | Node::SessionCast(a, _) => a.strong_name(),
             _ => None,
         }
     }
@@ -1220,7 +1359,7 @@ impl BoundScalar {
         match &self.node {
             Node::CrossCompare(..) => "?column?",
             Node::Param(_) => "?column?",
-            Node::Cast(a) => {
+            Node::Cast(a) | Node::SessionCast(a, _) => {
                 if let Some(name) = a.strong_name() {
                     name
                 } else {
@@ -1308,6 +1447,15 @@ impl BoundScalar {
                 let v = params.get(n - 1).ok_or(SqlError::Parameters)?;
                 charge(budget, v)?;
                 Ok(v.clone())
+            }
+            Node::SessionCast(a, clock) => {
+                let value = a.eval(row, params, budget)?;
+                if value == Value::Null {
+                    return Ok(value);
+                }
+                let value = session_cast(value, &a.ty, &self.ty, clock.as_ref())?;
+                charge(budget, &value)?;
+                Ok(value)
             }
             Node::Cast(a) => {
                 let v = a.eval(row, params, budget)?;
@@ -1532,7 +1680,7 @@ impl Query {
         {
             BoundScalar {
                 ty: target.clone(),
-                node: Node::Literal(cast_value(value.clone(), target, &mut 0)?),
+                node: literal_cast_node(value.clone(), target)?,
             }
         } else {
             value.insert_assignment(target)?
@@ -2296,7 +2444,7 @@ impl BoundScalar {
         }
         Ok(Self {
             ty: target.clone(),
-            node: Node::Cast(Box::new(self)),
+            node: cast_node(self, target),
         })
     }
 }

@@ -42,7 +42,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             application_name: String::new(),
-            extra_float_digits: 0,
+            extra_float_digits: 1,
             timezone: "UTC".into(),
             datestyle: "ISO".into(),
             search_path: r#""$user", public"#.into(),
@@ -644,6 +644,6 @@ mod tests {
         state.transaction(false, true, "BEGIN");
         state.current.apply(&Setting::ExtraFloatDigits(3));
         state.transaction(true, false, "ROLLBACK");
-        assert_eq!(state.current.extra_float_digits, 0);
+        assert_eq!(state.current.extra_float_digits, 1);
     }
 }

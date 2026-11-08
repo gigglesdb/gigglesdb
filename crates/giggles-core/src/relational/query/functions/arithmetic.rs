@@ -157,7 +157,7 @@ fn operand(
     if let Scalar::Literal(v @ (Value::Text(_) | Value::Null)) = a {
         return Ok(BoundScalar {
             ty: target.clone(),
-            node: Node::Literal(cast_value(v.clone(), target, &mut 0)?),
+            node: literal_cast_node(v.clone(), target)?,
         });
     }
     let bound = a.bind(resolve, tables, parameters)?;
@@ -166,7 +166,7 @@ fn operand(
     } else {
         Ok(BoundScalar {
             ty: target.clone(),
-            node: Node::Cast(Box::new(bound)),
+            node: cast_node(bound, target),
         })
     }
 }
@@ -201,15 +201,27 @@ pub(super) fn bind(
                 known(a, resolve, tables, parameters)?,
                 known(b, resolve, tables, parameters)?,
             )?;
+            let mut args = vec![
+                operand(a, &at, resolve, tables, parameters)?,
+                operand(b, &bt, resolve, tables, parameters)?,
+            ];
+            if *op == BinaryOp::Concat {
+                for argument in &mut args {
+                    if session_sensitive(&argument.ty, &DataType::Text) {
+                        let old = std::mem::replace(
+                            argument,
+                            BoundScalar {
+                                ty: DataType::Text,
+                                node: Node::Literal(Value::Null),
+                            },
+                        );
+                        argument.node = Node::SessionCast(Box::new(old), None);
+                    }
+                }
+            }
             Ok(BoundScalar {
                 ty,
-                node: Node::Call(
-                    name(*op).into(),
-                    vec![
-                        operand(a, &at, resolve, tables, parameters)?,
-                        operand(b, &bt, resolve, tables, parameters)?,
-                    ],
-                ),
+                node: Node::Call(name(*op).into(), args),
             })
         }
         _ => unreachable!(),

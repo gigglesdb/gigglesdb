@@ -501,7 +501,8 @@ impl Insert {
                     )?;
                 }
                 if let Operand::Value(expression @ Expr::Literal(_)) = operand {
-                    let value = resolved_value(expression, &[], &table.columns[index].data_type)?;
+                    let value =
+                        resolved_value(expression, &[], &table.columns[index].data_type, None)?;
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
                     check(&value, &column)?;
@@ -549,7 +550,12 @@ fn same_family(left: &DataType, right: &DataType) -> bool {
     };
     left == right || integer(left) && integer(right)
 }
-fn resolved_value(expression: &Expr, params: &[Value], ty: &DataType) -> R<Value> {
+fn resolved_value(
+    expression: &Expr,
+    params: &[Value],
+    ty: &DataType,
+    clock: Option<&clock::ExecutionClock>,
+) -> R<Value> {
     let value = expression.value(params)?;
     if matches!(expression, Expr::Literal(_))
         && (matches!(
@@ -557,7 +563,7 @@ fn resolved_value(expression: &Expr, params: &[Value], ty: &DataType) -> R<Value
             DataType::Numeric | DataType::Real | DataType::DoublePrecision
         ) || ty.is_temporal())
     {
-        query::coerce(value, ty)
+        query::coerce_clocked(value, ty, clock)
     } else {
         Ok(value)
     }
@@ -567,6 +573,7 @@ fn lower_operand(
     table: &TableDef,
     params: &[Value],
     expected: Option<&DataType>,
+    clock: Option<&clock::ExecutionClock>,
 ) -> R<operations::Expr> {
     Ok(match operand {
         Operand::Field(source, field) => {
@@ -578,7 +585,7 @@ fn lower_operand(
         }
         Operand::Value(expression) => {
             let value = match expected {
-                Some(ty) => resolved_value(expression, params, ty)?,
+                Some(ty) => resolved_value(expression, params, ty, clock)?,
                 None => expression.value(params)?,
             };
             operations::Expr::Value(operations::ValueExpr::Literal(value))
@@ -589,10 +596,11 @@ fn lower_condition(
     condition: &Condition,
     table: &TableDef,
     params: &[Value],
+    clock: Option<&clock::ExecutionClock>,
 ) -> R<operations::Expr> {
     Ok(match condition {
         Condition::Operand(operand) => {
-            lower_operand(operand, table, params, Some(&DataType::Boolean))?
+            lower_operand(operand, table, params, Some(&DataType::Boolean), clock)?
         }
         Condition::Compare(left, operator, right) => operations::Expr::Compare(
             Box::new(lower_operand(
@@ -600,6 +608,7 @@ fn lower_condition(
                 table,
                 params,
                 operand_type(right, table)?.as_ref(),
+                clock,
             )?),
             *operator,
             Box::new(lower_operand(
@@ -607,21 +616,23 @@ fn lower_condition(
                 table,
                 params,
                 operand_type(left, table)?.as_ref(),
+                clock,
             )?),
         ),
-        Condition::IsNull(operand, not) => {
-            operations::Expr::IsNull(Box::new(lower_operand(operand, table, params, None)?), *not)
-        }
+        Condition::IsNull(operand, not) => operations::Expr::IsNull(
+            Box::new(lower_operand(operand, table, params, None, clock)?),
+            *not,
+        ),
         Condition::Not(inner) => {
-            operations::Expr::Not(Box::new(lower_condition(inner, table, params)?))
+            operations::Expr::Not(Box::new(lower_condition(inner, table, params, clock)?))
         }
         Condition::And(left, right) => operations::Expr::And(
-            Box::new(lower_condition(left, table, params)?),
-            Box::new(lower_condition(right, table, params)?),
+            Box::new(lower_condition(left, table, params, clock)?),
+            Box::new(lower_condition(right, table, params, clock)?),
         ),
         Condition::Or(left, right) => operations::Expr::Or(
-            Box::new(lower_condition(left, table, params)?),
-            Box::new(lower_condition(right, table, params)?),
+            Box::new(lower_condition(left, table, params, clock)?),
+            Box::new(lower_condition(right, table, params, clock)?),
         ),
     })
 }
@@ -930,9 +941,15 @@ pub(super) fn execute_declared(
             if !replaced(*index, *default) {
                 row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
                 {
-                    assign::plain_value(expression, &table.columns[*index], declared, params, clock)?
+                    assign::plain_value(
+                        expression,
+                        &table.columns[*index],
+                        declared,
+                        params,
+                        clock,
+                    )?
                 } else {
-                    resolved_value(expression, params, &table.columns[*index].data_type)?
+                    resolved_value(expression, params, &table.columns[*index].data_type, clock)?
                 };
             }
         }
@@ -972,7 +989,7 @@ pub(super) fn execute_declared(
                 guard: update
                     .guard
                     .as_ref()
-                    .map(|guard| lower_condition(guard, &table, params))
+                    .map(|guard| lower_condition(guard, &table, params, clock))
                     .transpose()?,
                 values: update
                     .sets
@@ -987,7 +1004,9 @@ pub(super) fn execute_declared(
                                 let mut column = table.columns[index].clone();
                                 column.not_null = false;
                                 operations::Expr::Value(operations::ValueExpr::Literal(
-                                    assign::plain_value(expression, &column, declared, params, clock)?,
+                                    assign::plain_value(
+                                        expression, &column, declared, params, clock,
+                                    )?,
                                 ))
                             } else {
                                 lower_operand(
@@ -995,6 +1014,7 @@ pub(super) fn execute_declared(
                                     &table,
                                     params,
                                     Some(&table.columns[index].data_type),
+                                    clock,
                                 )?
                             },
                         ))

@@ -7,6 +7,7 @@ use giggles_core::{
     CoreError,
     relational::{DataType, Description, Prepared, SqlResult, Value},
 };
+use giggles_pg_types::temporal::SessionZone;
 use std::{collections::BTreeMap, io};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -254,6 +255,9 @@ fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> &'stat
 }
 
 pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
+    decode_in_zone(b, ty, format, SessionZone::Fixed(0))
+}
+pub fn decode_in_zone(b: &[u8], ty: &DataType, format: u16, zone: SessionZone) -> R<Value> {
     if format == 0 {
         let s = std::str::from_utf8(b).map_err(|_| "22021")?;
         return match ty {
@@ -330,7 +334,7 @@ pub fn decode(b: &[u8], ty: &DataType, format: u16) -> R<Value> {
                 s,
                 &giggles_pg_types::temporal::SessionSettings {
                     date_order: giggles_pg_types::temporal::DateOrder::Ymd,
-                    zone: giggles_pg_types::temporal::SessionZone::Fixed(0),
+                    zone,
                 },
             )
             .map(Value::TimestampTz)
@@ -436,7 +440,13 @@ fn numeric_error(e: giggles_pg_types::Error) -> &'static str {
         _ => "22P02",
     }
 }
-fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<Option<Vec<u8>>> {
+fn encode(
+    v: &Value,
+    ty: &DataType,
+    format: u16,
+    extra_float_digits: i32,
+    zone: SessionZone,
+) -> R<Option<Vec<u8>>> {
     if format > 1 {
         return Err("08P01");
     }
@@ -458,7 +468,7 @@ fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<O
             Value::TimeTz(v) => v.to_string().into_bytes(),
             Value::Timestamp(v) => v.to_string().into_bytes(),
             Value::TimestampTz(v) => v
-                .format_in_zone(giggles_pg_types::temporal::SessionZone::Fixed(0))
+                .format_in_zone(zone)
                 .map_err(temporal_error)?
                 .into_bytes(),
             Value::Interval(v) => v.to_string().into_bytes(),
@@ -501,8 +511,10 @@ fn encode(v: &Value, ty: &DataType, format: u16, extra_float_digits: i32) -> R<O
         _ => return Err("42804"),
     }))
 }
+#[allow(clippy::too_many_arguments)]
 fn rows(
     extra_float_digits: i32,
+    zone: SessionZone,
     result: &SqlResult,
     d: &Description,
     formats: &[u16],
@@ -519,6 +531,7 @@ fn rows(
                 &d.columns.get(i).ok_or("XX000")?.data_type,
                 format_at(formats, i),
                 extra_float_digits,
+                zone,
             )? {
                 None => b.extend((-1i32).to_be_bytes()),
                 Some(v) => {
@@ -798,8 +811,10 @@ impl State {
         // Settings also change through set_config and transaction recovery. Keep
         // the execution clock's zone aligned on every dispatch exit, including errors.
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_extra_float_digits(self.settings.current.extra_float_digits);
         let result = self.handle_inner(tag, b, session, out, received);
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
     }
     fn handle_inner(
@@ -1110,10 +1125,11 @@ impl State {
                     params.push(if n == u32::MAX {
                         Value::Null
                     } else {
-                        decode(
+                        decode_in_zone(
                             r.take(usize::try_from(n).map_err(|_| "54000")?)?,
                             ty,
                             format_at(&fmts, i),
+                            session.zone().unwrap_or(SessionZone::Fixed(0)),
                         )?
                     });
                 }
@@ -1350,6 +1366,7 @@ impl State {
                     let result = p.result.as_ref().unwrap();
                     rows(
                         self.settings.current.extra_float_digits,
+                        session.zone().unwrap_or(SessionZone::Fixed(0)),
                         result,
                         &p.s.d,
                         &p.formats,
@@ -1375,6 +1392,7 @@ impl State {
                     };
                     rows(
                         self.settings.current.extra_float_digits,
+                        session.zone().unwrap_or(SessionZone::Fixed(0)),
                         &result,
                         &p.s.d,
                         &p.formats,
@@ -1429,6 +1447,7 @@ impl State {
                 };
                 rows(
                     self.settings.current.extra_float_digits,
+                    session.zone().unwrap_or(SessionZone::Fixed(0)),
                     result,
                     &p.s.d,
                     &p.formats,
@@ -1567,6 +1586,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);
+    session.set_extra_float_digits(state.settings.current.extra_float_digits);
     let mut admin_sync = false;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
@@ -1623,6 +1643,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                     session.sql.rollback();
                     state.settings.transaction(true, false, "ROLLBACK");
                     session.set_time_zone(&state.settings.current.timezone);
+                    session.set_extra_float_digits(state.settings.current.extra_float_digits);
                     state.implicit = false;
                     state.portals.clear();
                 }
@@ -1679,6 +1700,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             session.sql.rollback();
                             state.settings.transaction(true, false, "ROLLBACK");
                             session.set_time_zone(&state.settings.current.timezone);
+                            session.set_extra_float_digits(state.settings.current.extra_float_digits);
                             state.implicit = false;
                             state.portals.clear();
                         }

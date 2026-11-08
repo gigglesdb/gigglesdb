@@ -112,8 +112,10 @@ impl State {
         // A multi-statement Query needs settings changes before its next SQL
         // statement, rather than only at the enclosing protocol-frame boundary.
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_extra_float_digits(self.settings.current.extra_float_digits);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
     }
 
@@ -157,6 +159,7 @@ impl State {
             row_description(&d, &[], out)?;
             rows(
                 self.settings.current.extra_float_digits,
+                session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result,
                 &d,
                 &[],
@@ -192,6 +195,7 @@ impl State {
             row_description(&description, &[], out)?;
             rows(
                 self.settings.current.extra_float_digits,
+                session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result,
                 &description,
                 &[],
@@ -271,6 +275,7 @@ impl State {
                     row_description(&d, &[], out)?;
                     rows(
                         self.settings.current.extra_float_digits,
+                        session.zone().unwrap_or(SessionZone::Fixed(0)),
                         &result,
                         &d,
                         &[],

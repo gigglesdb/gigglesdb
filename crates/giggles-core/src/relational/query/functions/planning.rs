@@ -380,7 +380,8 @@ impl BoundScalar {
             | Node::Column(..)
             | Node::Clock(..)
             | Node::Sequence(..)
-            | Node::CrossCompare(..) => Ok(None),
+            | Node::CrossCompare(..)
+            | Node::SessionCast(..) => Ok(None),
             Node::Literal(v) => {
                 charge(budget, v)?;
                 Ok(Some(v.clone()))
@@ -443,7 +444,7 @@ impl BoundScalar {
     pub(in super::super) fn constraint_immutable(&self) -> bool {
         match &self.node {
             Node::Literal(_) | Node::Column(..) => true,
-            Node::Param(_) | Node::Clock(..) | Node::Sequence(..) => false,
+            Node::Param(_) | Node::Clock(..) | Node::Sequence(..) | Node::SessionCast(..) => false,
             // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
             // date/timestamp and time/interval pairs are immutable.
             Node::CrossCompare(_, a, b, _) => {
@@ -475,6 +476,7 @@ impl BoundScalar {
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
             Node::Clock(..) => true,
+            Node::SessionCast(value, _) => value.insert_input_only(),
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
             Node::Sequence(_, args, _) => args.iter().all(Self::insert_input_only),
             Node::Cast(value) => {

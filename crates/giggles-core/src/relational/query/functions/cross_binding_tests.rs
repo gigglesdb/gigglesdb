@@ -1,5 +1,5 @@
 use crate::relational::clock::{ExecutionClock, StatementClock};
-use crate::relational::{DataType, Prepared, Relational, SqlError, SqlResult, Value};
+use crate::relational::{DataType, Prepared, Relational, SqlResult, Value};
 use giggles_pg_types::temporal::SessionZone;
 
 fn utc_clock() -> ExecutionClock {
@@ -144,15 +144,19 @@ fn membership_and_between_use_cross_type_comparison_binding() {
 }
 
 #[test]
-fn cross_type_comparisons_do_not_add_explicit_temporal_casts() {
+fn explicit_date_and_timestamp_casts_to_timestamptz_bind_as_pg18() {
     let state = Relational::default();
     for sql in [
         "SELECT (DATE '2024-01-01')::timestamptz",
         "SELECT (TIMESTAMP '2024-01-01 00:00:00')::timestamptz",
     ] {
         let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
-        assert!(
-            matches!(prepared.describe(&state), Err(SqlError::Type)),
+        // PostgreSQL 18.6 accepts both explicit casts and describes timestamptz.
+        let description = prepared.describe(&state).unwrap();
+        assert_eq!(description.columns.len(), 1, "{sql}");
+        assert_eq!(
+            description.columns[0].data_type,
+            DataType::TimestampTz,
             "{sql}"
         );
     }

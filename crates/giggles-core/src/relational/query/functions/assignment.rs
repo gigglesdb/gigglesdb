@@ -15,7 +15,7 @@ pub(in crate::relational) fn compatible(source: &DataType, target: &DataType) ->
                 )
                 | (
                     DataType::TimestampTz,
-                    DataType::Date | DataType::Timestamp | DataType::TimeTz
+                    DataType::Date | DataType::Timestamp | DataType::Time | DataType::TimeTz
                 )
                 | (DataType::Time, DataType::TimeTz | DataType::Interval)
                 | (DataType::TimeTz | DataType::Interval, DataType::Time)
@@ -90,6 +90,12 @@ pub(in crate::relational) fn convert(
         (Value::TimestampTz(t), DataType::Date) => Value::Date(date(
             context()?.1.to_local(t).map_err(pg_error)?.microseconds(),
         )?),
+        (Value::TimestampTz(t), DataType::Time) => Value::Time(time(
+            context()?.1.to_local(t).map_err(pg_error)?.microseconds(),
+        )?),
+        (value @ (Value::Float4(_) | Value::Float8(_)), DataType::Text) => {
+            session_cast(value, source, target, clock)?
+        }
         (Value::TimestampTz(t), DataType::TimeTz) => {
             let local = context()?.1.to_local(t).map_err(pg_error)?;
             let time = time(local.microseconds())?;

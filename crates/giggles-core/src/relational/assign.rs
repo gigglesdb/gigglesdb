@@ -113,6 +113,14 @@ pub(super) fn plain_value(
     clock: Option<&clock::ExecutionClock>,
 ) -> R<super::Value> {
     let mut bound = value.value(params)?;
+    // Without a clock (the duplicate-literal pre-check) keep the text: a UTC
+    // parse could reject a local value that is in range in the session zone.
+    if clock.is_some()
+        && matches!(value, Expr::Literal(super::Value::Text(_)))
+        && column.data_type == DataType::TimestampTz
+    {
+        bound = query::coerce_clocked(bound, &column.data_type, clock)?;
+    }
     if let Expr::Param(n) = value
         && let Some(Some(declared)) = declared_types.get(n - 1)
     {
