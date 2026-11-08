@@ -281,12 +281,12 @@ impl Copy {
             transaction: None,
             params: 0,
             parameter_types: vec![],
-            statement: Statement::InsertMulti(sql_insert::Insert::copy(
+            statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 self.table.clone(),
                 self.columns.clone(),
                 types,
                 vec![vec![Value::Null; width]],
-            )),
+            ))),
         })
     }
 }

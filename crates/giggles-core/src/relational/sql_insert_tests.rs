@@ -124,8 +124,8 @@ fn sql_insert_grammar_accept_matrix() {
         "INSERT INTO items VALUES (1,1.25,TRUE,FALSE),(2,-1.25,NULL,$1)",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO NOTHING",
         "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT ON CONSTRAINT items_pkey DO NOTHING",
-        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n,email=items.email,code=code WHERE NOT (items.n < $1 OR EXCLUDED.email IS NULL) AND code IS NOT NULL",
-        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=$1 WHERE n=10 OR n<>20 AND n<=30 AND n>=0 AND n>0",
+        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n,email=items.email,code=items.code WHERE NOT (items.n < $1 OR EXCLUDED.email IS NULL) AND items.code IS NOT NULL",
+        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=$1 WHERE items.n=10 OR items.n<>20 AND items.n<=30 AND items.n>=0 AND items.n>0",
     ] {
         parsed(text);
     }
@@ -154,16 +154,18 @@ fn sql_insert_grammar_unsupported_matrix() {
         "INSERT INTO items SELECT 1,'a','x',10 ON CONFLICT DO NOTHING",
         "INSERT INTO items VALUES (abs(1),'a','x',10),(2,'b','y',20)",
         "INSERT INTO items VALUES (1+1,'a','x',10),(2,'b','y',20)",
-        "INSERT INTO items AS t VALUES (1,'a','x',10),(2,'b','y',20)",
-        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=abs(n)",
-        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=n+1",
-        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=10 WHERE n != 0",
     ] {
-        assert_eq!(
-            Prepared::parse(text, 1, 0).unwrap_err(),
-            SqlError::Unsupported,
-            "{text}"
-        );
+        assert_eq!(Prepared::parse(text, 1, 0).unwrap_err(), SqlError::Unsupported, "{text}");
+    }
+    // PG18.6 accepts the INSERT alias and expressions over target/EXCLUDED columns in DO UPDATE
+    // SET/WHERE (e1-sql/evidence/oracle-pg186-upsert-expressions.txt), so these now parse.
+    for text in [
+        "INSERT INTO items AS t VALUES (1,'a','x',10),(2,'b','y',20)",
+        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=abs(items.n)",
+        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=items.n+1",
+        "INSERT INTO items VALUES (1,'a','x',10) ON CONFLICT (id) DO UPDATE SET n=10 WHERE items.n != 0",
+    ] {
+        assert!(Prepared::parse(text, 1, 0).is_ok(), "{text}");
     }
 }
 
@@ -382,9 +384,9 @@ fn sql_insert_where_true_false_and_null_boolean_semantics() {
     let (_, mut s, _) = fixture();
     run(&mut s, "INSERT INTO items VALUES (1,'a','x',10)");
     let before = rows(&mut s);
-    assert_eq!(run(&mut s,"INSERT INTO items VALUES (1,'b','y',20) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE n>EXCLUDED.n").affected,0);
+    assert_eq!(run(&mut s,"INSERT INTO items VALUES (1,'b','y',20) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE items.n>EXCLUDED.n").affected,0);
     assert_eq!(rows(&mut s), before);
-    assert_eq!(run(&mut s,"INSERT INTO items VALUES (1,'b','y',20) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE NOT (n>=EXCLUDED.n OR email IS NULL) AND code IS NOT NULL").affected,1);
+    assert_eq!(run(&mut s,"INSERT INTO items VALUES (1,'b','y',20) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE NOT (items.n>=EXCLUDED.n OR items.email IS NULL) AND items.code IS NOT NULL").affected,1);
     assert_eq!(rows(&mut s)[0].values[3], Value::Int(20));
     assert_eq!(run(&mut s,"INSERT INTO items (id,n) VALUES (1,30) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE EXCLUDED.email=items.email").affected,0);
 }
@@ -549,7 +551,7 @@ fn sql_insert_transaction_rollback_commit_reopen_and_sidecar() {
 #[test]
 fn sql_insert_describe_values_set_where_parameters() {
     let (_, mut s, _) = fixture();
-    let p=s.prepare("INSERT INTO items VALUES ($1,$2,'x',$3),($4,$5,'y',$6) ON CONFLICT (id) DO UPDATE SET n=$7 WHERE items.n<$8 AND email=$9").unwrap();
+    let p=s.prepare("INSERT INTO items VALUES ($1,$2,'x',$3),($4,$5,'y',$6) ON CONFLICT (id) DO UPDATE SET n=$7 WHERE items.n<$8 AND items.email=$9").unwrap();
     let d = s.describe(&p).unwrap();
     assert_eq!(
         d.parameters,
@@ -566,7 +568,7 @@ fn sql_insert_describe_values_set_where_parameters() {
         ]
     );
     assert!(d.columns.is_empty());
-    let p=s.prepare("INSERT INTO items (id,n) VALUES ($1,10) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE $2>n").unwrap();
+    let p=s.prepare("INSERT INTO items (id,n) VALUES ($1,10) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n WHERE $2>items.n").unwrap();
     assert_eq!(
         s.describe(&p).unwrap().parameters,
         [DataType::BigInt, DataType::Integer]
@@ -577,9 +579,10 @@ fn sql_insert_describe_values_set_where_parameters() {
 fn sql_insert_describe_unresolvable_and_conflicting_parameters() {
     let (_, mut s, _) = fixture();
     let p=s.prepare("INSERT INTO items (id,n) VALUES ($1,10) ON CONFLICT (id) DO UPDATE SET n=10 WHERE $2 IS NULL").unwrap();
+    // PG18.6 oracle: J:/gigglesdb-work/e1-sql/evidence/upsert-finish-20261108-f40c1191/pg186-parameter-description.txt
     assert_eq!(
         s.describe(&p).unwrap_err(),
-        CoreError::Sql(SqlError::Parameters)
+        CoreError::Sql(SqlError::IndeterminateDatatype)
     );
     let p = s
         .prepare("INSERT INTO items (id,email,n) VALUES ($1,$1,10),($1,'a',20)")
@@ -715,6 +718,8 @@ fn sql_insert_constraint_descriptor_precedes_synthetic_primary_name() {
 
 fn admission_insert() -> Insert {
     Insert {
+        alias: None,
+        casts: BTreeMap::new(),
         copy_input: None,
         table: "items".into(),
         columns: vec!["id".into(), "email".into(), "code".into(), "n".into()],
@@ -837,6 +842,8 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
     assert!(2 * per_row_work > secondary_index::MAX_WORK);
     assert!(2 * (raw + 9) < operations::MAX_INSERT_BYTES);
     let insert = Insert {
+        alias: None,
+        casts: BTreeMap::new(),
         copy_input: None,
         table: "heavy".into(),
         columns: vec!["id".into(), "n".into()],
@@ -860,6 +867,8 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
     // Fifty individually admitted numerics exceed the row's raw byte budget
     // while remaining below both the input byte and aggregate work budgets.
     let insert = Insert {
+        alias: None,
+        casts: BTreeMap::new(),
         copy_input: None,
         table: "wide_numeric".into(),
         columns: std::iter::once("id".to_owned())

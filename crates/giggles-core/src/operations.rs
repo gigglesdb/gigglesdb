@@ -1611,6 +1611,17 @@ enum Assignments {
     Values(Vec<(usize, Value)>),
     Expressions(Vec<(usize, Bound)>),
 }
+/// SQL-only prebound scalar evaluation; deliberately outside serialized types.
+pub(crate) trait SqlConflictEvaluation {
+    fn guard(&self, old: &SqlRow, incoming: &[Value]) -> std::result::Result<bool, SqlError>;
+    fn values(
+        &self,
+        table: &TableDef,
+        old: &SqlRow,
+        incoming: &[Value],
+    ) -> std::result::Result<Vec<(usize, Value)>, SqlError>;
+}
+
 #[derive(Clone)]
 enum BoundConflict {
     Nothing,

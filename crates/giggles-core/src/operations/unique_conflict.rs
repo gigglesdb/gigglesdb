@@ -156,6 +156,7 @@ fn value<'a>(
     }
 }
 
+#[cfg(test)]
 #[expect(clippy::too_many_arguments, reason = "frozen private planner contract")]
 pub(super) fn plan_unique_conflict<'s>(
     src: &'s Relational,
@@ -166,7 +167,29 @@ pub(super) fn plan_unique_conflict<'s>(
     incoming: &[Vec<Value>],
     action: &BoundConflict,
     returning: Option<&[BoundProjection]>,
+    retained: Option<&mut usize>,
+    cancel: &mut dyn FnMut() -> bool,
+) -> std::result::Result<UniquePlan<'s>, PlanError> {
+    plan_unique_conflict_evaluated(
+        src, table, epoch, arbiter, semantics, incoming, action, returning, retained, None, cancel,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SQL-only scalar callback alongside frozen native planner contract"
+)]
+fn plan_unique_conflict_evaluated<'s>(
+    src: &'s Relational,
+    table: &TableDef,
+    epoch: u64,
+    arbiter: Arbiter<'_>,
+    semantics: Semantics,
+    incoming: &[Vec<Value>],
+    action: &BoundConflict,
+    returning: Option<&[BoundProjection]>,
     mut retained: Option<&mut usize>,
+    evaluation: Option<&dyn SqlConflictEvaluation>,
     cancel: &mut dyn FnMut() -> bool,
 ) -> std::result::Result<UniquePlan<'s>, PlanError> {
     // Raw incoming admission precedes comparisons, key copies and callbacks.
@@ -391,8 +414,14 @@ pub(super) fn plan_unique_conflict<'s>(
         for (index, (proposal, resolved)) in incoming.iter().zip(&resolved).enumerate() {
             tick(cancel)?;
             if let Some((_, old)) = resolved.winner
-                && *guard.eval_conflict(&|index| &old.values[index], &|index| &proposal[index])?
-                    != Value::Bool(true)
+                && !match evaluation {
+                    Some(evaluation) => evaluation.guard(old, proposal).map_err(sql)?,
+                    None => {
+                        *guard
+                            .eval_conflict(&|index| &old.values[index], &|index| &proposal[index])?
+                            == Value::Bool(true)
+                    }
+                }
             {
                 if semantics == Semantics::Native {
                     return Err(Error::ConditionFailed.into());
@@ -436,19 +465,34 @@ pub(super) fn plan_unique_conflict<'s>(
             (Some(_), BoundConflict::Nothing) => Postimage::Skip,
             (Some((_, old)), BoundConflict::Update { values, .. }) => {
                 let mut evaluated = Vec::new();
-                for (index, expression) in values {
-                    if semantics == Semantics::Native && table.primary_key.contains(index) {
-                        return Err(Error::Unsupported.into());
+                if let Some(evaluation) = evaluation {
+                    evaluated = evaluation
+                        .values(table, old, proposal)
+                        .map_err(sql)?
+                        .into_iter()
+                        .map(|(index, value)| (index, Cow::Owned(value)))
+                        .collect();
+                } else {
+                    for (index, expression) in values {
+                        if semantics == Semantics::Native && table.primary_key.contains(index) {
+                            return Err(Error::Unsupported.into());
+                        }
+                        let value = expression.eval_conflict(
+                            &|index| &old.values[index],
+                            &|index| &proposal[index],
+                        )?;
+                        evaluated.push((*index, value));
                     }
-                    let value = expression
-                        .eval_conflict(&|index| &old.values[index], &|index| &proposal[index])?;
-                    let value = crate::relational::coerce_to_column(
-                        src,
-                        &table.columns[*index],
-                        value.into_owned(),
-                    )
-                    .map_err(sql)?;
-                    evaluated.push((*index, Cow::Owned(value)));
+                }
+                for (index, value) in &mut evaluated {
+                    *value = Cow::Owned(
+                        crate::relational::coerce_to_column(
+                            src,
+                            &table.columns[*index],
+                            value.clone().into_owned(),
+                        )
+                        .map_err(sql)?,
+                    );
                 }
                 Postimage::Update {
                     values: evaluated,
@@ -776,6 +820,7 @@ impl Relational {
             target,
             incoming,
             action,
+            None,
             project,
             cancel,
             &mut Vec::new(),
@@ -792,6 +837,7 @@ impl Relational {
         target: (Option<&[String]>, Option<&str>),
         incoming: &[Vec<Value>],
         action: &ConflictAction,
+        evaluation: Option<&dyn SqlConflictEvaluation>,
         project: Option<&mut SqlPostimageProjection<'_>>,
         cancel: &mut dyn FnMut() -> bool,
         events: &mut Vec<crate::relational::ConstraintEvent>,
@@ -900,7 +946,7 @@ impl Relational {
         .map_err(|error| into_sql(error.into()))?;
         #[cfg(test)]
         Self::sql_insert_test_event(3);
-        let plan = plan_unique_conflict(
+        let plan = plan_unique_conflict_evaluated(
             &src,
             table,
             self.epoch,
@@ -910,6 +956,7 @@ impl Relational {
             &bound,
             None,
             None,
+            evaluation,
             cancel,
         )
         .map_err(into_sql)?;

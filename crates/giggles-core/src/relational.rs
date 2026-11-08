@@ -204,6 +204,8 @@ pub enum SqlError {
     StringDataRightTruncation,
     /// 22009 invalid_time_zone_displacement_value
     InvalidTimeZoneDisplacementValue,
+    /// 42702 ambiguous_column
+    AmbiguousColumn,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -765,6 +767,17 @@ fn lex(s: &str) -> R<Vec<Token>> {
             }
             out.push(Token::Number(s[start..i].into()));
         } else if c == b'$' {
+            if b.get(i + 1) == Some(&b'$') {
+                i += 2;
+                let start = i;
+                let end = s[start..].find("$$").ok_or(SqlError::Syntax)? + start;
+                out.push(Token::String(s[start..end].into()));
+                i = end + 2;
+                if out.len() > 4096 {
+                    return Err(SqlError::Limit);
+                }
+                continue;
+            }
             i += 1;
             let start = i;
             while i < b.len() && b[i].is_ascii_digit() {
@@ -836,7 +849,7 @@ enum Statement {
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     CreateIndex(sql_index::CreateIndex),
-    InsertMulti(sql_insert::Insert),
+    InsertMulti(Box<sql_insert::Insert>),
     Query(query::Query),
     Create {
         name: String,
@@ -1028,7 +1041,7 @@ impl Parser {
         if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if word == "insert")
             && sql_insert::claims(&self.tokens)
         {
-            return sql_insert::parse(self).map(Statement::InsertMulti);
+            return sql_insert::parse(self).map(Box::new).map(Statement::InsertMulti);
         }
         if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "create")
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index" || w == "unique")
@@ -2129,6 +2142,7 @@ impl Prepared {
         let mut dependencies = match &self.statement {
             Statement::Query(query) => query.sequence_dependencies(),
             Statement::InsertExpressions(values) => values.sequence_dependencies(),
+            Statement::InsertMulti(insert) => insert.sequence_dependencies(),
             Statement::AlterTable(alter) => alter.sequence_dependencies(),
             Statement::Create { defaults, .. } => defaults
                 .iter()

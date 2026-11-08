@@ -481,7 +481,7 @@ fn conflict_set_duplicates_and_guarded_nulls_follow_sql_analysis() {
         assert_eq!(
             run(
                 s,
-                "INSERT INTO required VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=NULL WHERE n<0"
+                "INSERT INTO required VALUES(1,20) ON CONFLICT(id) DO UPDATE SET n=NULL WHERE required.n<0"
             )
             .affected,
             0

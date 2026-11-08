@@ -130,6 +130,7 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::BadCopyFileFormat => 50,
                 relational::SqlError::StringDataRightTruncation => 51,
                 relational::SqlError::InvalidTimeZoneDisplacementValue => 52,
+                relational::SqlError::AmbiguousColumn => 53,
             }
         }
     };

@@ -7,6 +7,7 @@ mod functions;
 pub(super) use functions::assignment;
 mod grouping;
 mod insert_values;
+pub(super) mod conflict;
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;

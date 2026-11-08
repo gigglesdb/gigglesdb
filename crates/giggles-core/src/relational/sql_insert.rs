@@ -1,13 +1,15 @@
 //! Bounded SQL multi-row INSERT and ON CONFLICT frontend.
 use super::*;
-use crate::operations::{self, ConflictAction, ConflictSource};
+use crate::operations::{self, ConflictAction};
 
 #[derive(Debug, Clone)]
 pub(super) struct Insert {
     pub table: String,
+    alias: Option<String>,
     copy_input: Option<Vec<DataType>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
+    casts: BTreeMap<(usize, usize), query::conflict::Expression>,
     defaults: Vec<Vec<bool>>,
     default_values: bool,
     overriding: Option<bool>,
@@ -27,17 +29,32 @@ struct Update {
 }
 #[derive(Debug, Clone)]
 enum Operand {
-    Value(Expr),
-    Field(ConflictSource, String),
+    Default,
+    Scalar(query::conflict::Expression),
 }
-#[derive(Debug, Clone)]
-enum Condition {
-    Operand(Operand),
-    Compare(Operand, operations::Compare, Operand),
-    IsNull(Operand, bool),
-    Not(Box<Condition>),
-    And(Box<Condition>, Box<Condition>),
-    Or(Box<Condition>, Box<Condition>),
+type Condition = query::conflict::Expression;
+
+#[cfg(test)]
+use operations::ConflictSource;
+#[cfg(test)]
+#[allow(non_snake_case)]
+impl Operand {
+    fn Value(value: Expr) -> Self {
+        Self::Scalar(Condition::admission_value(value))
+    }
+    fn Field(source: ConflictSource, name: String) -> Self {
+        Self::Scalar(Condition::admission_field(source, name))
+    }
+}
+#[cfg(test)]
+#[allow(non_snake_case)]
+impl Condition {
+    fn Compare(a: Operand, op: operations::Compare, b: Operand) -> Self {
+        match (a, b) {
+            (Operand::Scalar(a), Operand::Scalar(b)) => Self::admission_compare(a, op, b),
+            _ => unreachable!("admission comparisons use scalar operands"),
+        }
+    }
 }
 
 /// Claim only multiple VALUES tuples or a top-level ON CONFLICT clause.
@@ -124,6 +141,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     p.need("insert")?;
     p.need("into")?;
     let table = p.table_name()?;
+    let alias = if p.word("as") { Some(p.name()?) } else { None };
     let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
         names(p)?
     } else {
@@ -146,6 +164,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         return Err(unsupported_or_syntax(p));
     }
     let mut rows = Vec::new();
+    let mut casts = BTreeMap::new();
     let mut defaults = Vec::new();
     if default_values {
         rows.push(vec![]);
@@ -161,7 +180,20 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
                 row.push(if default {
                     Expr::Literal(Value::Null)
                 } else {
-                    value(p)?
+                    let start = p.at;
+                    let parameters = p.params.clone();
+                    let plain = value(p)?;
+                    if p.tokens.get(p.at) == Some(&Token::Symbol(':')) {
+                        p.at = start;
+                        p.params = parameters;
+                        casts.insert(
+                            (rows.len(), row.len()),
+                            query::conflict::Expression::input_cast(p)?,
+                        );
+                        Expr::Literal(Value::Null)
+                    } else {
+                        plain
+                    }
                 });
                 if !p.sym(',') {
                     break;
@@ -201,18 +233,30 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             p.need("set")?;
             let mut sets = Vec::new();
             loop {
-                let column = p.name()?;
+                let tuple = p.tokens.get(p.at) == Some(&Token::Symbol('('));
+                let targets = if tuple { names(p)? } else { vec![p.name()?] };
                 if p.tokens.get(p.at) != Some(&Token::Op("=".into())) {
                     return Err(SqlError::Syntax);
                 }
                 p.at += 1;
-                sets.push((column, operand(p, &table)?));
+                if tuple {
+                    p.punct('(')?;
+                }
+                for (slot, column) in targets.iter().enumerate() {
+                    if slot > 0 {
+                        p.punct(',')?;
+                    }
+                    sets.push((column.clone(), operand(p)?));
+                }
+                if tuple {
+                    p.punct(')')?;
+                }
                 if !p.sym(',') {
                     break;
                 }
             }
             let guard = if p.word("where") {
-                Some(condition(p, &table, 0)?)
+                Some(query::conflict::Expression::condition(p)?)
             } else {
                 None
             };
@@ -234,8 +278,10 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     Ok(Insert {
         copy_input: None,
         table,
+        alias,
         columns,
         rows,
+        casts,
         defaults,
         default_values,
         overriding,
@@ -243,80 +289,11 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         returning,
     })
 }
-fn operand(p: &mut Parser, table: &str) -> R<Operand> {
-    if matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "null" || word == "true" || word == "false")
-        || matches!(
-            p.tokens.get(p.at),
-            Some(Token::String(_) | Token::Number(_) | Token::Param(_))
-        )
-        || (matches!(p.tokens.get(p.at), Some(Token::Op(sign)) if sign == "+" || sign == "-")
-            && matches!(p.tokens.get(p.at + 1), Some(Token::Number(_))))
-    {
-        return value(p).map(Operand::Value);
-    }
+fn operand(p: &mut Parser) -> R<Operand> {
     if p.word("default") {
-        return Err(SqlError::Unsupported);
+        return Ok(Operand::Default);
     }
-    let (relation, field) = p.qualified_name()?;
-    let source = match relation.as_deref() {
-        Some("excluded") => ConflictSource::Incoming,
-        Some(name) if name == table => ConflictSource::Existing,
-        Some(_) => return Err(SqlError::Unsupported),
-        None => ConflictSource::Existing,
-    };
-    Ok(Operand::Field(source, field))
-}
-fn condition(p: &mut Parser, table: &str, depth: usize) -> R<Condition> {
-    let mut left = conjunction(p, table, depth)?;
-    while p.word("or") {
-        left = Condition::Or(Box::new(left), Box::new(conjunction(p, table, depth)?));
-    }
-    Ok(left)
-}
-fn conjunction(p: &mut Parser, table: &str, depth: usize) -> R<Condition> {
-    let mut left = predicate(p, table, depth)?;
-    while p.word("and") {
-        left = Condition::And(Box::new(left), Box::new(predicate(p, table, depth)?));
-    }
-    Ok(left)
-}
-fn predicate(p: &mut Parser, table: &str, depth: usize) -> R<Condition> {
-    if depth > operations::MAX_DEPTH {
-        return Err(SqlError::Limit);
-    }
-    if p.word("not") {
-        return Ok(Condition::Not(Box::new(predicate(p, table, depth + 1)?)));
-    }
-    if p.sym('(') {
-        let expression = condition(p, table, depth + 1)?;
-        p.punct(')')?;
-        return Ok(expression);
-    }
-    let left = operand(p, table)?;
-    if p.word("is") {
-        let not = p.word("not");
-        p.need("null")?;
-        return Ok(Condition::IsNull(left, not));
-    }
-    if let Some(Token::Op(operator)) = p.tokens.get(p.at) {
-        let mut operator = operator.clone();
-        p.at += 1;
-        if operator == "<" && p.tokens.get(p.at) == Some(&Token::Op(">".into())) {
-            operator = "<>".into();
-            p.at += 1;
-        }
-        let operator = match operator.as_str() {
-            "=" => operations::Compare::Eq,
-            "<>" => operations::Compare::Ne,
-            "<" => operations::Compare::Lt,
-            "<=" => operations::Compare::Le,
-            ">" => operations::Compare::Gt,
-            ">=" => operations::Compare::Ge,
-            _ => return Err(SqlError::Unsupported),
-        };
-        return Ok(Condition::Compare(left, operator, operand(p, table)?));
-    }
-    Ok(Condition::Operand(left))
+    query::conflict::Expression::parse(p).map(Operand::Scalar)
 }
 
 fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
@@ -340,84 +317,28 @@ fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
     }
     Ok(indexes)
 }
-fn infer_value(expression: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]) -> R<()> {
-    if let Expr::Param(number) = expression {
-        let slot = parameters.get_mut(number - 1).ok_or(SqlError::Parameters)?;
-        if slot.as_ref().is_some_and(|old| old != ty) {
-            return Err(SqlError::Type);
+impl Insert {
+    pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
+        let mut dependencies = vec![];
+        for expression in self.casts.values() {
+            dependencies.extend(expression.sequence_dependencies());
         }
-        *slot = Some(ty.clone());
-    }
-    Ok(())
-}
-fn operand_type(operand: &Operand, table: &TableDef) -> R<Option<DataType>> {
-    match operand {
-        Operand::Field(_, name) => Ok(Some(table.columns[col(table, name)?].data_type.clone())),
-        Operand::Value(_) => Ok(None),
-    }
-}
-fn infer_operand(
-    operand: &Operand,
-    expected: Option<&DataType>,
-    table: &TableDef,
-    parameters: &mut [Option<DataType>],
-    declared: &[Option<DataType>],
-) -> R<()> {
-    match operand {
-        Operand::Value(expression) => {
-            if let Some(expected) = expected {
-                if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
-                {
-                    infer_mutation_parameter(expression, expected, parameters, declared, false)?;
-                } else {
-                    infer_value(expression, expected, parameters)?;
+        if let Some(update) = self
+            .conflict
+            .as_ref()
+            .and_then(|conflict| conflict.update.as_ref())
+        {
+            for (_, operand) in &update.sets {
+                if let Operand::Scalar(expression) = operand {
+                    dependencies.extend(expression.sequence_dependencies());
                 }
             }
-        }
-        Operand::Field(_, name) => {
-            col(table, name)?;
-        }
-    }
-    Ok(())
-}
-fn infer_condition(
-    condition: &Condition,
-    table: &TableDef,
-    parameters: &mut [Option<DataType>],
-    declared: &[Option<DataType>],
-) -> R<()> {
-    match condition {
-        Condition::Compare(left, _, right) => {
-            let left_type = operand_type(left, table)?;
-            let right_type = operand_type(right, table)?;
-            infer_operand(left, right_type.as_ref(), table, parameters, declared)?;
-            infer_operand(right, left_type.as_ref(), table, parameters, declared)?;
-        }
-        Condition::Operand(operand) => {
-            if let Operand::Value(Expr::Param(n)) = operand
-                && let Some(Some(ty)) = declared.get(n - 1)
-                && *ty != DataType::Boolean
-            {
-                return Err(SqlError::Type);
+            if let Some(guard) = &update.guard {
+                dependencies.extend(guard.sequence_dependencies());
             }
-            infer_operand(
-                operand,
-                Some(&DataType::Boolean),
-                table,
-                parameters,
-                declared,
-            )?;
         }
-        Condition::IsNull(operand, _) => infer_operand(operand, None, table, parameters, declared)?,
-        Condition::Not(inner) => infer_condition(inner, table, parameters, declared)?,
-        Condition::And(left, right) | Condition::Or(left, right) => {
-            infer_condition(left, table, parameters, declared)?;
-            infer_condition(right, table, parameters, declared)?;
-        }
+        dependencies
     }
-    Ok(())
-}
-impl Insert {
     pub(super) fn copy(
         table: String,
         columns: Vec<String>,
@@ -427,12 +348,14 @@ impl Insert {
         let defaults = rows.iter().map(|row| vec![false; row.len()]).collect();
         Self {
             table,
+            alias: None,
             columns,
             rows: rows
                 .into_iter()
                 .map(|row| row.into_iter().map(Expr::Literal).collect())
                 .collect(),
             defaults,
+            casts: BTreeMap::new(),
             default_values: false,
             overriding: Some(true),
             conflict: None,
@@ -490,6 +413,20 @@ impl Insert {
                 }
             }
         }
+        if let Some(update) = self
+            .conflict
+            .as_ref()
+            .and_then(|conflict| conflict.update.as_ref())
+        {
+            for (name, value) in &update.sets {
+                if matches!(value, Operand::Default) {
+                    let column = &table.columns[col(table, name)?];
+                    if let Some(sql) = defaults::default_sql(state, column) {
+                        dependencies.extend(defaults::dependencies(&sql)?.into_iter().map(Some));
+                    }
+                }
+            }
+        }
         Ok(dependencies)
     }
     pub(super) fn has_duplicate_assignments(&self) -> bool {
@@ -514,8 +451,17 @@ impl Insert {
             return Err(SqlError::Parameters);
         }
         parameters[..declared.len()].clone_from_slice(declared);
-        for row in &self.rows {
-            for (expression, index) in row.iter().zip(&indexes) {
+        for (row_index, row) in self.rows.iter().enumerate() {
+            for (slot, (expression, index)) in row.iter().zip(&indexes).enumerate() {
+                if let Some(expression) = self.casts.get(&(row_index, slot)) {
+                    expression.infer(
+                        table,
+                        None,
+                        &table.columns[*index].data_type,
+                        &mut parameters,
+                    )?;
+                    continue;
+                }
                 infer_mutation_parameter(
                     expression,
                     &table.columns[*index].data_type,
@@ -534,41 +480,23 @@ impl Insert {
             duplicate = assign::duplicate_names(update.sets.iter().map(|(name, _)| name));
             for (name, operand) in &update.sets {
                 let index = col(table, name)?;
-                defaults::check_explicit(state, &table.columns[index])?;
-                if let Operand::Value(expression @ Expr::Param(n)) = operand
-                    && declared.get(n - 1).is_some_and(Option::is_some)
-                {
-                    infer_mutation_parameter(
-                        expression,
+                if let Operand::Scalar(expression) = operand {
+                    defaults::check_explicit(state, &table.columns[index])?;
+                    expression.infer(
+                        table,
+                        self.alias.as_deref(),
                         &table.columns[index].data_type,
                         &mut parameters,
-                        declared,
-                        true,
                     )?;
-                } else {
-                    infer_operand(
-                        operand,
-                        Some(&table.columns[index].data_type),
-                        table,
-                        &mut parameters,
-                        declared,
-                    )?;
-                }
-                if let Operand::Value(expression @ Expr::Literal(_)) = operand {
-                    let value =
-                        resolved_value(expression, &[], &table.columns[index].data_type, None)?;
-                    let mut column = table.columns[index].clone();
-                    column.not_null = false;
-                    check(&value, &column)?;
-                }
-                if let Some(ty) = operand_type(operand, table)?
-                    && !same_family(&ty, &table.columns[index].data_type)
-                {
-                    return Err(SqlError::Type);
                 }
             }
             if let Some(guard) = &update.guard {
-                infer_condition(guard, table, &mut parameters, declared)?;
+                guard.infer(
+                    table,
+                    self.alias.as_deref(),
+                    &DataType::Boolean,
+                    &mut parameters,
+                )?;
             }
         }
         if let Some(returning) = &self.returning {
@@ -595,15 +523,6 @@ impl Insert {
         })
     }
 }
-fn same_family(left: &DataType, right: &DataType) -> bool {
-    let integer = |ty: &DataType| {
-        matches!(
-            ty,
-            DataType::SmallInt | DataType::Integer | DataType::BigInt
-        )
-    };
-    left == right || integer(left) && integer(right)
-}
 #[expect(
     clippy::too_many_arguments,
     reason = "shared INSERT row normalization inputs"
@@ -614,6 +533,7 @@ fn normalize_row(
     insert: &Insert,
     indexes: &[usize],
     values: &[Expr],
+    row_index: usize,
     row_defaults: &[bool],
     params: &[Value],
     declared: &[Option<DataType>],
@@ -631,9 +551,35 @@ fn normalize_row(
         .filter_map(|(i, default)| (!replaced(*i, *default)).then_some(*i))
         .collect::<Vec<_>>();
     let mut row = defaults::row(state, table, &supplied, clock)?;
-    for ((expression, index), default) in values.iter().zip(indexes).zip(row_defaults) {
+    for (slot, ((expression, index), default)) in
+        values.iter().zip(indexes).zip(row_defaults).enumerate()
+    {
         if !replaced(*index, *default) {
-            row[*index] = if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
+            row[*index] = if let Some(expression) = insert.casts.get(&(row_index, slot)) {
+                let parameters = insert
+                    .describe(state, params.len(), declared)?
+                    .parameters
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                expression
+                    .bind(
+                        table,
+                        None,
+                        &table.columns[*index].data_type,
+                        &parameters,
+                        clock,
+                    )?
+                    .evaluate(
+                        &SqlRow {
+                            values: vec![],
+                            version: 0,
+                        },
+                        &[],
+                        params,
+                        &mut 0,
+                    )?
+            } else if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
             {
                 assign::plain_value(
                     state,
@@ -696,7 +642,7 @@ pub(super) fn normalize_copy(
         .ok_or(SqlError::UnknownTable)?;
     let indexes = indexes(insert, table)?;
     let mut output = Vec::with_capacity(insert.rows.len());
-    for (row, defaults) in insert.rows.iter().zip(&insert.defaults) {
+    for (row_index, (row, defaults)) in insert.rows.iter().zip(&insert.defaults).enumerate() {
         if crate::cancellation::check().is_err() {
             return Err(SqlError::Aborted);
         }
@@ -706,6 +652,7 @@ pub(super) fn normalize_copy(
             insert,
             &indexes,
             row,
+            row_index,
             defaults,
             &[],
             &[],
@@ -724,8 +671,12 @@ pub(super) fn normalize_copy(
         .logical_columns()
         .map(|c| c.data_type.clone())
         .collect();
-    prepared.statement =
-        Statement::InsertMulti(Insert::copy(table.name.clone(), columns, types, vec![]));
+    prepared.statement = Statement::InsertMulti(Box::new(Insert::copy(
+        table.name.clone(),
+        columns,
+        types,
+        vec![],
+    )));
     Ok((prepared, output))
 }
 
@@ -742,74 +693,109 @@ fn resolved_value(
         Ok(value)
     }
 }
-fn lower_operand(
-    operand: &Operand,
-    table: &TableDef,
-    params: &[Value],
-    expected: Option<&DataType>,
-    clock: Option<&clock::ExecutionClock>,
-) -> R<operations::Expr> {
-    Ok(match operand {
-        Operand::Field(source, field) => {
-            col(table, field)?;
-            operations::Expr::ConflictField {
-                source: *source,
-                field: field.clone(),
+enum BoundOperand {
+    Default(Option<String>),
+    Scalar(Box<query::conflict::BoundExpression>),
+}
+struct ConflictPlan<'a> {
+    values: Vec<(usize, BoundOperand)>,
+    guard: Option<query::conflict::BoundExpression>,
+    params: &'a [Value],
+    clock: Option<clock::ExecutionClock>,
+}
+impl<'a> ConflictPlan<'a> {
+    fn new(
+        update: &Update,
+        alias: Option<&str>,
+        table: &TableDef,
+        state: &Relational,
+        declared: &[Option<DataType>],
+        params: &'a [Value],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<Self> {
+        let mut parameters = declared.to_vec();
+        // Execution receives the fully inferred prepared parameter types.
+        if parameters.len() != params.len() {
+            return Err(SqlError::Parameters);
+        }
+        for (name, operand) in &update.sets {
+            if let Operand::Scalar(expression) = operand {
+                expression.infer(
+                    table,
+                    alias,
+                    &table.columns[col(table, name)?].data_type,
+                    &mut parameters,
+                )?;
             }
         }
-        Operand::Value(expression) => {
-            let value = match expected {
-                Some(ty) => resolved_value(expression, params, ty, clock)?,
-                None => expression.value(params)?,
-            };
-            operations::Expr::Value(operations::ValueExpr::Literal(value))
+        if let Some(guard) = &update.guard {
+            guard.infer(table, alias, &DataType::Boolean, &mut parameters)?;
         }
-    })
+        let values = update
+            .sets
+            .iter()
+            .map(|(name, operand)| {
+                let index = col(table, name)?;
+                let column = &table.columns[index];
+                let value = match operand {
+                    Operand::Default => BoundOperand::Default(defaults::default_sql(state, column)),
+                    Operand::Scalar(expression) => BoundOperand::Scalar(Box::new(expression.bind(
+                        table,
+                        alias,
+                        &column.data_type,
+                        &parameters,
+                        clock,
+                    )?)),
+                };
+                Ok((index, value))
+            })
+            .collect::<R<Vec<_>>>()?;
+        let guard = update
+            .guard
+            .as_ref()
+            .map(|guard| guard.bind(table, alias, &DataType::Boolean, &parameters, clock))
+            .transpose()?;
+        Ok(Self {
+            values,
+            guard,
+            params,
+            clock: clock.cloned(),
+        })
+    }
 }
-fn lower_condition(
-    condition: &Condition,
-    table: &TableDef,
-    params: &[Value],
-    clock: Option<&clock::ExecutionClock>,
-) -> R<operations::Expr> {
-    Ok(match condition {
-        Condition::Operand(operand) => {
-            lower_operand(operand, table, params, Some(&DataType::Boolean), clock)?
-        }
-        Condition::Compare(left, operator, right) => operations::Expr::Compare(
-            Box::new(lower_operand(
-                left,
-                table,
-                params,
-                operand_type(right, table)?.as_ref(),
-                clock,
-            )?),
-            *operator,
-            Box::new(lower_operand(
-                right,
-                table,
-                params,
-                operand_type(left, table)?.as_ref(),
-                clock,
-            )?),
-        ),
-        Condition::IsNull(operand, not) => operations::Expr::IsNull(
-            Box::new(lower_operand(operand, table, params, None, clock)?),
-            *not,
-        ),
-        Condition::Not(inner) => {
-            operations::Expr::Not(Box::new(lower_condition(inner, table, params, clock)?))
-        }
-        Condition::And(left, right) => operations::Expr::And(
-            Box::new(lower_condition(left, table, params, clock)?),
-            Box::new(lower_condition(right, table, params, clock)?),
-        ),
-        Condition::Or(left, right) => operations::Expr::Or(
-            Box::new(lower_condition(left, table, params, clock)?),
-            Box::new(lower_condition(right, table, params, clock)?),
-        ),
-    })
+impl operations::SqlConflictEvaluation for ConflictPlan<'_> {
+    fn guard(&self, old: &SqlRow, incoming: &[Value]) -> R<bool> {
+        self.guard.as_ref().map_or(Ok(true), |guard| {
+            Ok(guard.evaluate(old, incoming, self.params, &mut 0)? == Value::Bool(true))
+        })
+    }
+    fn values(&self, table: &TableDef, old: &SqlRow, incoming: &[Value]) -> R<Vec<(usize, Value)>> {
+        let mut bytes = 0;
+        let values = self
+            .values
+            .iter()
+            .map(|(index, value)| {
+                let value = match value {
+                    BoundOperand::Default(Some(sql)) => defaults::evaluate_sql(
+                        sql,
+                        &table.columns[*index].data_type,
+                        self.clock.as_ref(),
+                    )?,
+                    BoundOperand::Default(None) => Value::Null,
+                    BoundOperand::Scalar(value) => {
+                        value.evaluate(old, incoming, self.params, &mut bytes)?
+                    }
+                };
+                check(&value, &table.columns[*index])?;
+                Ok((*index, value))
+            })
+            .collect::<R<Vec<_>>>()?;
+        Relational::secondary_admit_values(values.iter().map(|(_, value)| value))?;
+        payload_bound(values.iter().map(|(_, value)| value))?;
+        Ok(values)
+    }
 }
+
 /// Allocation-free raw byte admission with secondary_admit_values work accounting.
 /// Rows have separate byte budgets; the whole input shares byte/work budgets.
 #[derive(Default)]
@@ -857,33 +843,8 @@ fn borrowed_value<'a>(expression: &'a Expr, params: &'a [Value]) -> R<&'a Value>
     }
 }
 fn admit_operand(operand: &Operand, params: &[Value], admission: &mut InputAdmission) -> R<()> {
-    if let Operand::Value(expression) = operand {
-        admission.value(borrowed_value(expression, params)?)?;
-    }
-    Ok(())
-}
-fn admit_condition(
-    condition: &Condition,
-    params: &[Value],
-    admission: &mut InputAdmission,
-    depth: usize,
-) -> R<()> {
-    if depth > operations::MAX_DEPTH {
-        return Err(SqlError::Limit);
-    }
-    match condition {
-        Condition::Operand(operand) | Condition::IsNull(operand, _) => {
-            admit_operand(operand, params, admission)?
-        }
-        Condition::Compare(left, _, right) => {
-            admit_operand(left, params, admission)?;
-            admit_operand(right, params, admission)?;
-        }
-        Condition::Not(inner) => admit_condition(inner, params, admission, depth + 1)?,
-        Condition::And(left, right) | Condition::Or(left, right) => {
-            admit_condition(left, params, admission, depth + 1)?;
-            admit_condition(right, params, admission, depth + 1)?;
-        }
+    if let Operand::Scalar(expression) = operand {
+        expression.visit_values(params, &mut |value| admission.value(value))?;
     }
     Ok(())
 }
@@ -895,15 +856,19 @@ fn admit_statement(insert: &Insert, params: &[Value]) -> R<()> {
         return Err(SqlError::Type);
     }
     let mut admission = InputAdmission::default();
-    for row in &insert.rows {
+    for (row_index, row) in insert.rows.iter().enumerate() {
         if row.len() > MAX_COLUMNS
             || !insert.columns.is_empty() && row.len() != insert.columns.len()
         {
             return Err(SqlError::Type);
         }
         admission.row();
-        for expression in row {
-            admission.value(borrowed_value(expression, params)?)?;
+        for (slot, expression) in row.iter().enumerate() {
+            if let Some(expression) = insert.casts.get(&(row_index, slot)) {
+                expression.visit_values(params, &mut |value| admission.value(value))?;
+            } else {
+                admission.value(borrowed_value(expression, params)?)?;
+            }
         }
     }
     if let Some(Conflict {
@@ -919,7 +884,7 @@ fn admit_statement(insert: &Insert, params: &[Value]) -> R<()> {
             admit_operand(operand, params, &mut admission)?;
         }
         if let Some(condition) = &update.guard {
-            admit_condition(condition, params, &mut admission, 0)?;
+            condition.visit_values(params, &mut |value| admission.value(value))?;
         }
     }
     Ok(())
@@ -1067,7 +1032,9 @@ pub(super) fn execute_declared(
     let logical_width = table.logical_columns().count();
     if !insert.default_values
         && insert.columns.is_empty()
-        && insert.rows.iter().any(|row| row.len() != logical_width)
+        && insert.rows.iter().any(|row| {
+            row.len() > logical_width || insert.conflict.is_none() && row.len() != logical_width
+        })
     {
         return Err(SqlError::Type);
     }
@@ -1085,8 +1052,10 @@ pub(super) fn execute_declared(
         ..
     }) = &insert.conflict
     {
-        for (name, _) in &update.sets {
-            defaults::check_explicit(state, &table.columns[col(&table, name)?])?;
+        for (name, operand) in &update.sets {
+            if !matches!(operand, Operand::Default) {
+                defaults::check_explicit(state, &table.columns[col(&table, name)?])?;
+            }
         }
     }
     for row_defaults in &insert.defaults {
@@ -1096,7 +1065,8 @@ pub(super) fn execute_declared(
             }
         }
     }
-    for (values, row_defaults) in insert.rows.iter().zip(&insert.defaults) {
+    for (row_index, (values, row_defaults)) in insert.rows.iter().zip(&insert.defaults).enumerate()
+    {
         if cancel() {
             return Err(SqlError::Aborted);
         }
@@ -1106,6 +1076,7 @@ pub(super) fn execute_declared(
             insert,
             &indexes,
             values,
+            row_index,
             row_defaults,
             params,
             declared,
@@ -1122,43 +1093,43 @@ pub(super) fn execute_declared(
         incoming.push(row);
     }
     if let Some(conflict) = &insert.conflict {
+        let parameters = insert
+            .describe(state, params.len(), declared)?
+            .parameters
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let evaluation = conflict
+            .update
+            .as_ref()
+            .map(|update| {
+                ConflictPlan::new(
+                    update,
+                    insert.alias.as_deref(),
+                    &table,
+                    state,
+                    &parameters,
+                    params,
+                    clock,
+                )
+            })
+            .transpose()?;
+        // The syntax-independent action carries only the assignment names. SQL
+        // scalar evaluation is prebound separately, outside the wire types.
         let action = match &conflict.update {
             None => ConflictAction::Nothing,
             Some(update) => ConflictAction::Update {
-                guard: update
-                    .guard
-                    .as_ref()
-                    .map(|guard| lower_condition(guard, &table, params, clock))
-                    .transpose()?,
+                guard: None,
                 values: update
                     .sets
                     .iter()
-                    .map(|(name, operand)| {
-                        let index = col(&table, name)?;
-                        Ok((
+                    .map(|(name, _)| {
+                        (
                             name.clone(),
-                            if let Operand::Value(expression @ Expr::Param(n)) = operand
-                                && declared.get(n - 1).is_some_and(Option::is_some)
-                            {
-                                let mut column = table.columns[index].clone();
-                                column.not_null = false;
-                                operations::Expr::Value(operations::ValueExpr::Literal(
-                                    assign::plain_value(
-                                        state, expression, &column, declared, params, clock,
-                                    )?,
-                                ))
-                            } else {
-                                lower_operand(
-                                    operand,
-                                    &table,
-                                    params,
-                                    Some(&table.columns[index].data_type),
-                                    clock,
-                                )?
-                            },
-                        ))
+                            operations::Expr::Value(operations::ValueExpr::Literal(Value::Null)),
+                        )
                     })
-                    .collect::<R<Vec<_>>>()?,
+                    .collect(),
             },
         };
         let mut result = if returning.is_some() {
@@ -1167,6 +1138,9 @@ pub(super) fn execute_declared(
                 (conflict.columns.as_deref(), conflict.constraint.as_deref()),
                 &incoming,
                 &action,
+                evaluation
+                    .as_ref()
+                    .map(|plan| plan as &dyn operations::SqlConflictEvaluation),
                 Some(&mut |source, rows| returning::project(returning, source, params, rows)),
                 cancel,
                 events,
@@ -1177,6 +1151,9 @@ pub(super) fn execute_declared(
                 (conflict.columns.as_deref(), conflict.constraint.as_deref()),
                 &incoming,
                 &action,
+                evaluation
+                    .as_ref()
+                    .map(|plan| plan as &dyn operations::SqlConflictEvaluation),
                 None,
                 cancel,
                 events,
