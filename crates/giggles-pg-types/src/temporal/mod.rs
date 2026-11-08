@@ -540,6 +540,11 @@ impl Interval {
         Self::parse(s)
     }
     pub fn parse(s: &str) -> Result<Self, Error> {
+        Self::parse_fields(s, false)
+    }
+    /// `ago` is true while parsing the fields before a trailing `ago`, which counts as a
+    /// following field: PostgreSQL then rejects a unitless number ('5 ago' is 22007).
+    fn parse_fields(s: &str, ago: bool) -> Result<Self, Error> {
         let s = bounded(s)?;
         if s.eq_ignore_ascii_case("infinity") {
             return Ok(Self::INFINITY);
@@ -548,7 +553,7 @@ impl Interval {
             return Ok(Self::NEG_INFINITY);
         }
         if let Some(s) = s.strip_suffix(" ago") {
-            let v = Self::parse(s.strip_prefix("@ ").unwrap_or(s))?;
+            let v = Self::parse_fields(s.strip_prefix("@ ").unwrap_or(s), true)?;
             return Ok(Self::new(
                 v.months.checked_neg().ok_or(Error::Range)?,
                 v.days.checked_neg().ok_or(Error::Range)?,
@@ -605,7 +610,17 @@ impl Interval {
                 days = days.checked_add(number(v)?).ok_or(Error::Range)?;
                 continue;
             }
-            let unit = p.next().ok_or(Error::Syntax)?;
+            // PostgreSQL DecodeInterval: an alphabetic next token is the unit (unknown units
+            // stay Unimplemented). A unitless number is seconds only as the final field
+            // ('0', '1 day 2'); elsewhere ('5 3 minutes', '1 2', '5 ago') it is 22007.
+            let unit = match p.peek().copied() {
+                Some(unit) if !unit.is_empty() && unit.chars().all(|c| c.is_ascii_alphabetic()) => {
+                    p.next();
+                    unit
+                }
+                None if !ago => "seconds",
+                _ => return Err(Error::Syntax),
+            };
             let mask = match unit {
                 "year" | "years" => 1,
                 "mon" | "mons" | "month" | "months" => 2,
