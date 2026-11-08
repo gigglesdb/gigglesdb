@@ -436,10 +436,10 @@ impl BoundScalar {
                     }
                 }
                 let types = normalized_signature_types(name, args);
-                let Some((true, _strict)) = arithmetic::internal_name(name)
-                    .then_some((true, true))
-                    .or_else(|| signature(name, &types, &self.ty))
-                else {
+                let Some((true, _strict)) = (arithmetic::internal_name(name)
+                    || greatest::known_name(name))
+                .then_some((true, true))
+                .or_else(|| signature(name, &types, &self.ty)) else {
                     return Ok(None);
                 };
                 if dependent {
@@ -485,7 +485,7 @@ impl BoundScalar {
             Node::Cast(value) => {
                 value.constraint_immutable() && immutable_cast(&value.ty, &self.ty)
             }
-            Node::Call(name, args) if name == "coalesce" => {
+            Node::Call(name, args) if name == "coalesce" || greatest::known_name(name) => {
                 args.iter().all(Self::constraint_immutable)
             }
             Node::Call(name, args) => {
@@ -517,7 +517,7 @@ impl BoundScalar {
                         || self.ty == DataType::Text
                             && (number(&value.ty) || value.ty == DataType::Boolean))
             }
-            Node::Call(name, args) if name == "coalesce" => {
+            Node::Call(name, args) if name == "coalesce" || greatest::known_name(name) => {
                 args.iter().all(Self::insert_input_only)
             }
             Node::Call(name, args) => {

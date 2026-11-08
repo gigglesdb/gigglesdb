@@ -9,6 +9,7 @@ mod comparison;
 mod cross_binding_tests;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod degree_math;
+mod greatest;
 #[cfg(test)]
 mod integer_cast_tests;
 mod integer_formats;
@@ -27,6 +28,7 @@ mod quoting;
 pub(super) fn keyword_requires_quotes(name: &str) -> bool {
     quoting::keyword_requires_quotes(name)
 }
+mod format;
 mod substring_order;
 mod temporal;
 mod text;
@@ -1072,6 +1074,9 @@ impl Scalar {
             Self::Call(name, args) if name == "overlay" => {
                 return Self::bind_overlay(args, resolve, tables, parameters);
             }
+            Self::Call(name, args) if greatest::known_name(name) => {
+                return greatest::bind(name, args, resolve, tables, parameters);
+            }
             Self::Call(name, args) => {
                 if planning::sequence_volatility(name).is_some() {
                     if !(matches!(name.as_str(), "nextval" | "currval") && args.len() == 1
@@ -1140,7 +1145,20 @@ impl Scalar {
                 let mut args = args
                     .iter()
                     .map(|a| a.bind(resolve, tables, parameters))
-                    .collect::<R<Vec<_>>>()?;
+                    .collect::<R<Vec<_>>>()
+                    .map_err(|e| {
+                        if name == "format" {
+                            expression_parameter_error(e)
+                        } else {
+                            e
+                        }
+                    })?;
+                if name == "format"
+                    && args.first().is_some_and(|a| a.ty != DataType::Text)
+                    && !matches!(original.first(), Some(Self::Literal(Value::Null)))
+                {
+                    return Err(SqlError::UndefinedFunction);
+                }
                 if let Some(arity) = degree_math::arity(name)
                     && (args.len() != arity
                         || args.iter().zip(original).any(|(a, source)| {
@@ -1525,7 +1543,7 @@ impl Scalar {
                         _ => return Err(SqlError::Unsupported),
                     }
                 };
-                if matches!(name.as_str(), "concat" | "concat_ws") {
+                if matches!(name.as_str(), "concat" | "concat_ws" | "format") {
                     for argument in &mut args {
                         if session_sensitive(&argument.ty, &DataType::Text) {
                             let old = std::mem::replace(
@@ -1770,7 +1788,11 @@ impl BoundScalar {
                     .iter()
                     .map(|a| a.eval(row, params, budget))
                     .collect::<R<Vec<_>>>()?;
+                if greatest::known_name(n) {
+                    return Ok(greatest::eval(n, values));
+                }
                 if n != "concat"
+                    && n != "format"
                     && n != "concat_ws"
                     && n != "quote_nullable"
                     && values.contains(&Value::Null)
@@ -1787,6 +1809,9 @@ impl BoundScalar {
                 }
                 if n == "overlay" {
                     return overlay::eval(&values, budget);
+                }
+                if n == "format" {
+                    return format::eval(&values, args, budget);
                 }
                 if let Some(result) = position::eval(n, &values, budget)
                     .or_else(|| binary::eval(n, &values, budget))
@@ -2438,6 +2463,23 @@ impl Scalar {
             }
             Self::Call(n, args) if n == "overlay" => {
                 Self::infer_overlay(args, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args) if greatest::known_name(n) => {
+                for arg in args {
+                    arg.infer(None, parameters, resolve, tables)?;
+                }
+                let ty = greatest::hint(args, resolve, tables, parameters)?;
+                for arg in args {
+                    let expected = match arg {
+                        Self::Param(slot)
+                            if parameters.get(slot - 1).is_some_and(Option::is_some) =>
+                        {
+                            None
+                        }
+                        _ => Some(&ty),
+                    };
+                    arg.infer(expected, parameters, resolve, tables)?;
+                }
             }
             Self::Call(n, args) if n == "position" => {
                 Self::infer_position(args, parameters, resolve, tables)?;

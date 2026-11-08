@@ -17,6 +17,7 @@ pub(super) fn signature(n: &str, count: usize) -> Option<R<Signature>> {
         "split_part" => (3, 3, vec![2], DataType::Text),
         "concat" => (1, MAX_COLUMNS, vec![], DataType::Text),
         "concat_ws" => (2, MAX_COLUMNS, vec![], DataType::Text),
+        "format" => (1, MAX_COLUMNS, vec![], DataType::Text),
         _ => return None,
     };
     Some(if count < min || count > max {
@@ -25,7 +26,7 @@ pub(super) fn signature(n: &str, count: usize) -> Option<R<Signature>> {
         Ok((
             (0..count)
                 .map(|i| {
-                    if n == "concat" || n == "concat_ws" && i > 0 {
+                    if n == "concat" || matches!(n, "concat_ws" | "format") && i > 0 {
                         None
                     } else {
                         Some(if ints.contains(&i) {

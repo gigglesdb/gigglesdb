@@ -110,6 +110,7 @@ fn catalog_and_syntax_names_keep_existing_dispatch() {
         "SELECT LOWER('a')",
         "SELECT \"lower\"('a')",
         "SELECT PG_CATALOG.lower('a')",
+        "SELECT format('%s','a')",
     ] {
         let p = s.prepare(sql).unwrap();
         assert!(s.describe(&p).is_ok(), "{sql}");
@@ -125,7 +126,6 @@ fn catalog_and_syntax_names_keep_existing_dispatch() {
         "SELECT to_char(1,'9')",
         "SELECT jsonb_path_query_first('{}','$')",
         "SELECT pg_typeof(1)",
-        "SELECT format('%s','a')",
         "SELECT nullif(1,2)",
         "SELECT row(1,2)",
         "SELECT information_schema._pg_expandarray(1)",

@@ -171,6 +171,8 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidTableDefinition) => "42P16",
         CoreError::Sql(S::RestrictViolation) => "23001",
         CoreError::Sql(S::WrongObjectType) => "42809",
+        CoreError::Sql(S::NullValueNotAllowed) => "22004",
+        CoreError::Sql(S::CannotCoerce) => "42846",
         CoreError::Cancelled => "57014",
         CoreError::Busy => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",

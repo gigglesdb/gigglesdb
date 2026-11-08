@@ -462,8 +462,8 @@ const CASES: &[&str] = &[
     r#"{"name":"F substr varchar","sql":"SELECT substr($1, 2)","oids":[1043],"inputs":["61626364"],"binary":false,"expected":{"phase":"execute","param_oids":[1043],"col_oids":[25],"rows":[["bcd"]]}}"#,
     // PG18.6: {"rows":[["00:30:00"]],"param_oids":[1083],"col_oids":[1083]}; F16 closed the temporal operator gap
     r#"{"name":"F time + interval","sql":"SELECT $1 + interval '1 hour'","oids":[1083],"inputs":["32333a33303a3030"],"binary":false,"expected":{"phase":"execute","param_oids":[1083],"col_oids":[1083],"rows":[["00:30:00"]]}}"#,
-    // PG18.6: {"rows":[["2"]],"param_oids":[1700],"col_oids":[1700]}; gap: greatest absent from function registry
-    r#"{"name":"known gap: F greatest numeric","sql":"SELECT greatest($1, 2)","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"parse","sqlstate":"0A000"}}"#,
+    // PG18.6: {"rows":[["2"]],"param_oids":[1700],"col_oids":[1700]} (DD-0068 F17)
+    r#"{"name":"F greatest numeric","sql":"SELECT greatest($1, 2)","oids":[1700],"inputs":["312e35"],"binary":false,"expected":{"phase":"execute","param_oids":[1700],"col_oids":[1700],"rows":[["2"]]}}"#,
     // PG18.6: {"rows":[["1"]],"param_oids":[16],"col_oids":[23]}; F15 closed the boolean projection gap
     r#"{"name":"F CASE bool","sql":"SELECT CASE WHEN $1 THEN 1 ELSE 0 END","oids":[16],"inputs":["74727565"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"]]}}"#,
     r#"{"name":"F WHERE bool param","sql":"SELECT id FROM t WHERE $1 ORDER BY id","oids":[16],"inputs":["74727565"],"binary":false,"expected":{"phase":"execute","param_oids":[16],"col_oids":[23],"rows":[["1"],["2"],["3"]]}}"#,

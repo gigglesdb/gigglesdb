@@ -175,7 +175,7 @@ fn integer_input_27_closed_errors_reject_unknown_tags_and_payloads() {
         assert!(serde_json::from_str::<E>(&format!("{json} null")).is_err());
         assert!(serde_json::from_str::<E>(&json[..json.len() - 1]).is_err());
     }
-    for tag in [48u32, u32::MAX] {
+    for tag in [50u32, u32::MAX] {
         assert!(
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()

@@ -135,8 +135,8 @@ fn e1_error_names_and_local_codes() {
         assert_eq!(be.deserialize::<E>(&be_bytes).unwrap(), error);
         assert_eq!(local::failure(CoreError::Sql(error)).code, code);
     }
-    assert!(le.deserialize::<E>(&[48, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 48]).is_err());
+    assert!(le.deserialize::<E>(&[50, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 50]).is_err());
 }
 
 #[test]

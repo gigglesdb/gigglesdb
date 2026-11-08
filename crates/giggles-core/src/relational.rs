@@ -189,6 +189,10 @@ pub enum SqlError {
     /// 42809 wrong_object_type: an operation names an object of a kind that does not support it
     /// (for example SET CONSTRAINTS on a non-deferrable constraint).
     WrongObjectType,
+    /// 22004 null_value_not_allowed
+    NullValueNotAllowed,
+    /// 42846 cannot_coerce
+    CannotCoerce,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -125,6 +125,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::InvalidTableDefinition => 45,
                 relational::SqlError::RestrictViolation => 46,
                 relational::SqlError::WrongObjectType => 47,
+                relational::SqlError::NullValueNotAllowed => 48,
+                relational::SqlError::CannotCoerce => 49,
             }
         }
     };

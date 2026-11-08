@@ -6,6 +6,11 @@ fn only_proven_table_free_scalar_queries_have_no_gateway_target() {
     let mut s = a.sql_session();
     for sql in [
         "SELECT 1",
+        "SELECT format('%s-%s',1,'a')",
+        "SELECT greatest(1,2)",
+        "SELECT least('a','b')",
+        "SELECT greatest(abs(-2),least(3,format('%s',4)::int))",
+        "SELECT format('%s',greatest(1,2))",
         "SELECT char_length(concat('a','b'))",
         "SELECT get_byte(sha256(decode('00','hex')),0)",
         "SELECT encode(set_byte(decode('00','hex'),0,1),'hex')",
@@ -39,6 +44,8 @@ fn only_proven_table_free_scalar_queries_have_no_gateway_target() {
     );
     // Unknown calls, user namespaces and nested table reads never get a table-free proof.
     for sql in [
+        "SELECT format('%s',(SELECT id FROM a))",
+        "SELECT greatest(1,(SELECT id FROM a))",
         "SELECT unknown_function()",
         "SELECT public.abs(-2)",
         "SELECT (SELECT id FROM a)",
@@ -48,5 +55,32 @@ fn only_proven_table_free_scalar_queries_have_no_gateway_target() {
             assert!(p.table().is_some(), "{sql}");
             assert!(s.describe(&p).is_err(), "{sql}");
         }
+    }
+}
+
+#[test]
+fn scalar_calls_without_from_reject_unbound_columns() {
+    let a = Admin::create(
+        common::fresh("table-free-unbound-column"),
+        Limits::default(),
+    )
+    .unwrap();
+    let mut s = a.sql_session();
+    for sql in [
+        "SELECT abs(id)",
+        "SELECT format('%s',id)",
+        "SELECT greatest(id,1)",
+    ] {
+        let prepared = s.prepare(sql).unwrap();
+        assert!(prepared.table().is_some(), "{sql}");
+        assert!(
+            matches!(
+                s.describe(&prepared),
+                Err(giggles_core::CoreError::Sql(
+                    giggles_core::relational::SqlError::UnknownColumn
+                ))
+            ),
+            "{sql}",
+        );
     }
 }
