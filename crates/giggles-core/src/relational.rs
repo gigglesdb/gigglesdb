@@ -672,6 +672,7 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    Sequence(defaults::SequenceDdl),
     DropTable {
         name: String,
         optional: bool,
@@ -855,6 +856,17 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if matches!(word.as_str(), "create" | "alter" | "drop"))
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word == "sequence")
+        {
+            return defaults::sequence_ddl(self).map(Statement::Sequence);
+        }
+        if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if word == "create")
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if matches!(word.as_str(), "temp" | "temporary" | "unlogged"))
+            && matches!(self.tokens.get(self.at + 2), Some(Token::Word(word)) if word == "sequence")
+        {
+            return Err(SqlError::Unsupported);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "alter") {
             return alter_table::parse(self).map(Statement::AlterTable);
         }
@@ -1501,6 +1513,9 @@ impl Prepared {
             return returning::describe_insert(values, state, self.params, &self.parameter_types);
         }
         if let Statement::Query(q) = &self.statement {
+            if !q.is_table_free() && state.sequence_by_name(q.target()).is_some() {
+                return Err(SqlError::Unsupported);
+            }
             return q
                 .bind_description(state, self.params, &self.parameter_types)
                 .map(|b| b.description(state));
@@ -1678,7 +1693,8 @@ impl Prepared {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Create { .. }
+            Statement::Sequence(_)
+                | Statement::Create { .. }
                 | Statement::CreateIndex(_)
                 | Statement::AlterTable(_)
                 | Statement::DropTable { .. }
@@ -1704,6 +1720,11 @@ impl Prepared {
     }
     pub fn command(&self) -> &'static str {
         match self.statement {
+            Statement::Sequence(ref ddl) => match ddl {
+                defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
+                defaults::SequenceDdl::Alter { .. } => "ALTER SEQUENCE",
+                defaults::SequenceDdl::Drop { .. } => "DROP SEQUENCE",
+            },
             Statement::Query(ref q) => {
                 if q.explain {
                     "EXPLAIN"
@@ -1904,7 +1925,85 @@ impl Prepared {
         Ok(dependencies)
     }
     pub fn sequence_only(&self) -> bool {
-        matches!(&self.statement, Statement::Query(query) if query.sequence_only())
+        self.is_sequence_ddl()
+            || matches!(&self.statement, Statement::Query(query) if query.sequence_only())
+    }
+    pub fn is_sequence_ddl(&self) -> bool {
+        matches!(self.statement, Statement::Sequence(_))
+    }
+    pub fn is_alter_sequence(&self) -> bool {
+        matches!(
+            self.statement,
+            Statement::Sequence(defaults::SequenceDdl::Alter { .. })
+        )
+    }
+    pub fn is_drop_sequence(&self) -> bool {
+        matches!(
+            self.statement,
+            Statement::Sequence(defaults::SequenceDdl::Drop { .. })
+        )
+    }
+    pub fn sequence_ddl_names(&self) -> Vec<&str> {
+        match &self.statement {
+            Statement::Sequence(ddl) => ddl.names(),
+            _ => vec![],
+        }
+    }
+    pub fn sequence_owned_by_table(&self) -> Option<&str> {
+        match &self.statement {
+            Statement::Sequence(ddl) => ddl.owned_by_table(),
+            _ => None,
+        }
+    }
+    pub fn sequence_ddl_targets(sql: &str) -> R<Vec<String>> {
+        let tokens = lex(sql)?;
+        if !matches!(tokens.first(), Some(Token::Word(word)) if matches!(word.as_str(), "create" | "alter" | "drop"))
+            || !matches!(tokens.get(1), Some(Token::Word(word)) if word == "sequence")
+        {
+            return Ok(vec![]);
+        }
+        let parsed = Self::parse(sql, 0, 0)?;
+        Ok(parsed
+            .sequence_ddl_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect())
+    }
+    pub fn sequence_owned_by(sql: &str) -> R<Option<String>> {
+        if Self::sequence_ddl_targets(sql)?.is_empty() {
+            return Ok(None);
+        }
+        Ok(Self::parse(sql, 0, 0)?
+            .sequence_owned_by_table()
+            .map(str::to_owned))
+    }
+    pub fn sequence_ddl_is_create(sql: &str) -> R<bool> {
+        if Self::sequence_ddl_targets(sql)?.is_empty() {
+            return Ok(false);
+        }
+        Ok(matches!(
+            Self::parse(sql, 0, 0)?.statement,
+            Statement::Sequence(defaults::SequenceDdl::Create { .. })
+        ))
+    }
+    pub(crate) fn sequence_restart_seed(&self, state: &Relational) -> Option<(u64, i64)> {
+        match &self.statement {
+            Statement::Sequence(ddl) => ddl.restart_seed(state),
+            _ => None,
+        }
+    }
+    pub(crate) fn sequence_copies_counter(&self) -> bool {
+        matches!(&self.statement, Statement::Sequence(ddl) if ddl.copies_counter())
+    }
+    pub(crate) fn validate_sequence_current(
+        &self,
+        state: &Relational,
+        current: impl Fn(u64) -> Option<i64>,
+    ) -> R<()> {
+        match &self.statement {
+            Statement::Sequence(ddl) => ddl.validate_current(state, current),
+            _ => Ok(()),
+        }
     }
     /// Return the ALTER target only after parsing the complete statement.
     pub fn alter_table_target(sql: &str) -> R<Option<String>> {
@@ -1929,6 +2028,9 @@ impl Prepared {
             }
         };
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
+            return Ok(None);
+        }
+        if matches!(tokens.get(1), Some(Token::Word(word)) if word == "sequence") {
             return Ok(None);
         }
         let mut parser = Parser {
@@ -2681,6 +2783,9 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
+                if !q.is_table_free() && self.sequence_by_name(q.target()).is_some() {
+                    return Err(SqlError::Unsupported);
+                }
                 let legacy = scan::LegacyRows(&*self);
                 let source = injected_source.unwrap_or(&legacy);
                 return q
@@ -2707,6 +2812,12 @@ impl Relational {
                     &prepared.parameter_types,
                     events,
                 );
+            }
+            Statement::Sequence(ddl) => {
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                result.affected = defaults::execute_sequence(self, ddl)?;
             }
             Statement::AlterTable(alter) => {
                 if expected.is_some() {
@@ -2885,7 +2996,13 @@ impl Relational {
                         query::coerce_clocked(v.value(params)?, &t.columns[*i].data_type, clock)?
                     } else if matches!(v, Expr::Param(n) if prepared.parameter_types.get(n - 1).is_some_and(Option::is_some))
                     {
-                        assign::plain_value(v, &t.columns[*i], &prepared.parameter_types, params, clock)?
+                        assign::plain_value(
+                            v,
+                            &t.columns[*i],
+                            &prepared.parameter_types,
+                            params,
+                            clock,
+                        )?
                     } else {
                         v.value(params)?
                     };

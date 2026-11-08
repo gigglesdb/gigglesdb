@@ -212,6 +212,8 @@ write: coordinating source/restore deployment ownership is external to this API.
 
 ## Finite SQL and CLI
 
+Sequence `CACHE n` is stored as given, but values are allocated one at a time; PostgreSQL per-session preallocation is unsupported, so observable gaps may differ.
+
 Only these whitespace-tokenized shapes are supported (case-insensitive keywords):
 
 ```sql

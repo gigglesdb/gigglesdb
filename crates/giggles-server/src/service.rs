@@ -337,6 +337,7 @@ impl Service {
             sql: self.admin.sql_session(),
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            sequence_owner_candidates: BTreeSet::new(),
         })
     }
     pub fn session(self: &Arc<Self>, fingerprint: &str) -> Result<Session, CoreError> {
@@ -360,6 +361,7 @@ impl Service {
             sql: self.admin.sql_session(),
             zone: Some(SessionZone::Fixed(0)),
             transaction_us: None,
+            sequence_owner_candidates: BTreeSet::new(),
         })
     }
 }
@@ -382,6 +384,7 @@ pub struct Session {
     pub(crate) sql: SqlSession,
     zone: Option<SessionZone>,
     transaction_us: Option<i64>,
+    sequence_owner_candidates: BTreeSet<String>,
 }
 impl Session {
     pub(crate) fn zone(&self) -> Option<SessionZone> {
@@ -389,6 +392,37 @@ impl Session {
     }
     pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
         self.sql.set_extra_float_digits(value);
+    }
+    fn reconcile_sequence_owners(&mut self) -> Result<(), CoreError> {
+        if self.sql.in_transaction() || self.sequence_owner_candidates.is_empty() {
+            return Ok(());
+        }
+        let mut live: BTreeSet<_> = self
+            .service
+            .admin
+            .sql_session()
+            .sequence_owners()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        live.extend(
+            self.service
+                .admin
+                .catalog()?
+                .1
+                .into_iter()
+                .map(|table| table.name),
+        );
+        let roles = self.service.admin.roles();
+        for name in &self.sequence_owner_candidates {
+            if !live.contains(name) {
+                roles
+                    .forget_table(name)
+                    .map_err(|_| CoreError::Policy(Error::Scope))?;
+            }
+        }
+        self.sequence_owner_candidates.clear();
+        Ok(())
     }
     pub(crate) fn set_time_zone(&mut self, name: &str) {
         self.zone = if ["UTC", "Etc/UTC", "GMT", "Z"]
@@ -630,6 +664,7 @@ impl Session {
             }
         }
         self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
             // Parse the complete ALTER before checking authority, but do not bind
             // its table, columns, or defaults until ownership has been checked.
             let alter_target = Prepared::alter_table_target(sql).map_err(|error| {
@@ -647,6 +682,25 @@ impl Session {
             })?;
             if let Some(table) = drop_target {
                 session.authorize_alter_table(&table)?;
+            }
+            let sequence_targets = Prepared::sequence_ddl_targets(sql).map_err(|error| {
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })?;
+            // CREATE uses schema authority; ALTER/DROP must check owner keys
+            // before core can resolve a sequence or its dependencies.
+            if !sequence_targets.is_empty() {
+                let create = Prepared::sequence_ddl_is_create(sql).map_err(CoreError::Sql)?;
+                if create {
+                    session.authorize_create_sequence()?;
+                } else {
+                    for sequence in sequence_targets {
+                        session.authorize_alter_table(&sequence)?;
+                    }
+                }
+                if let Some(table) = Prepared::sequence_owned_by(sql).map_err(CoreError::Sql)? {
+                    session.authorize_alter_table(&table)?;
+                }
             }
             // REFERENCES requires ownership before binding can reveal whether
             // the referenced relation, columns, or candidate key exist.
@@ -704,6 +758,27 @@ impl Session {
         }
         self.authority_scope(|session| session.authorize_sequences(&dependencies))
     }
+    fn authorize_create_sequence(&mut self) -> Result<(), CoreError> {
+        let allowed = if let Role::Database { name } = &self.role {
+            let roles = self.service.admin.roles();
+            let role = roles
+                .get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login && role.generation == self.epoch)
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            role.superuser
+                || roles
+                    .schema_privileges("public", name)
+                    .is_ok_and(|privileges| privileges.contains(&roles::SchemaPrivilege::Create))
+        } else {
+            false
+        };
+        if !allowed {
+            self.sql.abort();
+            return Err(CoreError::Policy(Error::Scope));
+        }
+        Ok(())
+    }
     fn authorize_sequences(&mut self, dependencies: &[Option<String>]) -> Result<(), CoreError> {
         let sequences = self.sql.sequence_owners()?;
         let roles = self.service.admin.roles();
@@ -722,6 +797,9 @@ impl Session {
                 _ => false,
             }
         };
+        let allowed_standalone = |sequence: &str| -> bool {
+            matches!(&self.role, Role::Database { .. }) && allowed_table(sequence)
+        };
         let superuser = if let Role::Database { name } = &self.role {
             roles
                 .get(name)
@@ -734,7 +812,11 @@ impl Session {
         };
         let allowed_tables: BTreeSet<String> = sequences
             .iter()
-            .filter_map(|(_, table)| table.as_ref().filter(|table| allowed_table(table)).cloned())
+            .filter_map(|(sequence, table)| match table {
+                Some(table) if allowed_table(table) => Some(table.clone()),
+                None if allowed_standalone(sequence) => Some(sequence.clone()),
+                _ => None,
+            })
             .collect();
         let live_context = superuser || !allowed_tables.is_empty();
         let allowed = live_context
@@ -753,7 +835,10 @@ impl Session {
                 sequences
                     .iter()
                     .find(|(sequence, _)| sequence == &name)
-                    .is_none_or(|(_, table)| table.as_deref().is_some_and(allowed_table))
+                    .is_none_or(|(sequence, table)| match table {
+                        Some(table) => allowed_table(table),
+                        None => allowed_standalone(sequence),
+                    })
             });
         self.sql
             .set_sequence_tables((!superuser).then_some(allowed_tables));
@@ -798,6 +883,19 @@ impl Session {
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         for table in p.constraint_reference_tables() {
             self.authorize_alter_table(&table)?;
+        }
+        if p.is_sequence_ddl() {
+            if p.command() == "CREATE SEQUENCE" {
+                self.authorize_create_sequence()?;
+            } else {
+                for sequence in p.sequence_ddl_names() {
+                    self.authorize_alter_table(sequence)?;
+                }
+            }
+            if let Some(table) = p.sequence_owned_by_table() {
+                self.authorize_alter_table(table)?;
+            }
+            return Ok(());
         }
         self.authorize_sequences(&p.sequences())?;
         if p.sequence_only() {
@@ -883,12 +981,14 @@ impl Session {
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
+            session.reconcile_sequence_owners()?;
             session.authorize(p)?;
             // Recovery must remain available even after the host clock latches.
             if session.sql.is_aborted() && p.command() == "ROLLBACK" {
                 let result = session.sql.execute_prepared(p, params, None);
                 if !session.sql.in_transaction() {
                     session.transaction_us = None;
+                    session.reconcile_sequence_owners()?;
                 }
                 return result;
             }
@@ -909,6 +1009,16 @@ impl Session {
                 zone: session.zone,
                 wall: Some(Arc::new(move || service.clock.sql_micros())),
             };
+            let sequence_candidates = if p.is_ddl() {
+                session
+                    .sql
+                    .sequence_owners()?
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
             let result = session.sql.execute_prepared_at(p, params, None, &clock);
             if !session.sql.in_transaction() {
                 session.transaction_us = None;
@@ -916,7 +1026,27 @@ impl Session {
                 session.transaction_us = Some(transaction_us);
             }
             let result = result?;
+            session
+                .sequence_owner_candidates
+                .extend(sequence_candidates.iter().cloned());
+            session
+                .sequence_owner_candidates
+                .extend(p.sequence_ddl_names().into_iter().map(str::to_owned));
+            if p.command() == "CREATE SEQUENCE"
+                && result.affected != 0
+                && let Role::Database { name } = &session.role
+            {
+                for sequence in p.sequence_ddl_names() {
+                    session
+                        .service
+                        .admin
+                        .roles()
+                        .set_table_owner(sequence, name)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                }
+            }
             if p.is_ddl()
+                && !p.is_sequence_ddl()
                 && !p.is_alter_table()
                 && !p.is_drop_table()
                 && let (Role::Database { name }, Some(table)) = (&session.role, p.table())
@@ -928,6 +1058,27 @@ impl Session {
                     .set_table_owner(table, name)
                     .map_err(|_| CoreError::Policy(Error::Scope))?;
             }
+            if p.is_ddl() && !p.is_sequence_ddl() {
+                let roles = session.service.admin.roles();
+                for (sequence, table) in session.sql.sequence_owners()? {
+                    if sequence_candidates.contains(&sequence) {
+                        continue;
+                    }
+                    if let Some(table) = table {
+                        let durable_table = session.sql.table_authority_name(&table)?;
+                        if let Some(owner) = roles
+                            .table_owner(&durable_table)
+                            .map_err(|_| CoreError::Policy(Error::Scope))?
+                        {
+                            roles
+                                .set_table_owner(&sequence, &owner)
+                                .map_err(|_| CoreError::Policy(Error::Scope))?;
+                            session.sequence_owner_candidates.insert(sequence);
+                        }
+                    }
+                }
+            }
+            session.reconcile_sequence_owners()?;
             Ok(result)
         })
     }
@@ -949,6 +1100,7 @@ impl Session {
             let result = self.sql.execute(sql, params, None);
             if !self.sql.in_transaction() {
                 self.transaction_us = None;
+                self.reconcile_sequence_owners()?;
             }
             return result;
         }

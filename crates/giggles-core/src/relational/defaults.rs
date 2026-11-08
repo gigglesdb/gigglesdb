@@ -1,14 +1,558 @@
 //! Bounded default syntax, assignment validation, and PostgreSQL-style stored text.
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(super) enum SequenceDdl {
+    Create {
+        name: String,
+        optional: bool,
+        spec: SequenceSpec,
+        resolution_error: Option<SqlError>,
+    },
+    Alter {
+        name: String,
+        optional: bool,
+        spec: SequenceSpec,
+        resolution_error: Option<SqlError>,
+    },
+    Drop {
+        names: Vec<String>,
+        optional: bool,
+        cascade: bool,
+        resolution_error: Option<SqlError>,
+    },
+}
+impl SequenceDdl {
+    pub(super) fn copies_counter(&self) -> bool {
+        matches!(self, Self::Alter { spec, .. } if spec.restart.is_none() && spec.rewrites_counter())
+    }
+    pub(super) fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Create { name, .. } | Self::Alter { name, .. } => vec![name],
+            Self::Drop { names, .. } => names.iter().map(String::as_str).collect(),
+        }
+    }
+    pub(super) fn owned_by_table(&self) -> Option<&str> {
+        match self {
+            Self::Create { spec, .. } | Self::Alter { spec, .. } => spec
+                .owned_by
+                .as_ref()
+                .and_then(|owner| owner.as_ref())
+                .map(|(table, _)| table.as_str()),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn sequence_ddl(p: &mut Parser) -> R<SequenceDdl> {
+    let create = p.word("create");
+    let alter = !create && p.word("alter");
+    if !create && !alter {
+        p.need("drop")?;
+    }
+    p.need("sequence")?;
+    let optional = if p.word("if") {
+        if create {
+            p.need("not")?;
+        }
+        p.need("exists")?;
+        true
+    } else {
+        false
+    };
+    // Preserve the raw target for authorization before reporting schema policy.
+    let (name, mut resolution_error) = sequence_name(p, create)?;
+    let result = if create || alter {
+        let mut spec = SequenceSpec::default();
+        options(p, &mut spec, false, alter)?;
+        if create {
+            SequenceDdl::Create {
+                name,
+                optional,
+                spec,
+                resolution_error,
+            }
+        } else {
+            SequenceDdl::Alter {
+                name,
+                optional,
+                spec,
+                resolution_error,
+            }
+        }
+    } else {
+        let mut names = vec![name];
+        while p.sym(',') {
+            let (name, error) = sequence_name(p, false)?;
+            names.push(name);
+            resolution_error = resolution_error.or(error);
+        }
+        let cascade = p.word("cascade");
+        if !cascade {
+            p.word("restrict");
+        }
+        SequenceDdl::Drop {
+            names,
+            optional,
+            cascade,
+            resolution_error,
+        }
+    };
+    p.sym(';');
+    if p.at != p.tokens.len() {
+        return Err(SqlError::Unsupported);
+    }
+    Ok(result)
+}
+fn sequence_name(p: &mut Parser, create: bool) -> R<(String, Option<SqlError>)> {
+    let first = alter_table::raw_name(p)?;
+    if p.sym('.') {
+        let name = alter_table::raw_name(p)?;
+        let error = if first != "public" {
+            Some(if create {
+                SqlError::InvalidSchema
+            } else {
+                SqlError::UnknownTable
+            })
+        } else {
+            ident::ident(&name).err()
+        };
+        Ok((name, error))
+    } else {
+        let error = ident::ident(&first).err();
+        Ok((first, error))
+    }
+}
+
+/// The same option parser is used by identity and standalone sequence DDL.
+fn options(p: &mut Parser, spec: &mut SequenceSpec, parenthesized: bool, alter: bool) -> R<()> {
+    let mut seen = BTreeSet::new();
+    loop {
+        if parenthesized && p.sym(')') {
+            break;
+        }
+        if !parenthesized
+            && (p.at == p.tokens.len() || matches!(p.tokens.get(p.at), Some(Token::Symbol(';'))))
+        {
+            break;
+        }
+        let key = if p.word("start") {
+            p.word("with");
+            spec.start = Some(integer(p)?);
+            "start"
+        } else if p.word("increment") {
+            p.word("by");
+            spec.increment = Some(integer(p)?);
+            "increment"
+        } else if p.word("minvalue") {
+            spec.min = Some(integer(p)?);
+            "min"
+        } else if p.word("maxvalue") {
+            spec.max = Some(integer(p)?);
+            "max"
+        } else if p.word("cache") {
+            spec.cache = Some(integer(p)?);
+            "cache"
+        } else if p.word("cycle") {
+            spec.cycle = Some(true);
+            "cycle"
+        } else if p.word("no") {
+            if p.word("cycle") {
+                spec.cycle = Some(false);
+                "cycle"
+            } else if p.word("minvalue") {
+                spec.no_min = true;
+                "min"
+            } else if p.word("maxvalue") {
+                spec.no_max = true;
+                "max"
+            } else {
+                return Err(SqlError::Unsupported);
+            }
+        } else if !parenthesized && p.word("as") {
+            spec.data_type = Some(if p.word("smallint") {
+                DataType::SmallInt
+            } else if p.word("integer") || p.word("int") {
+                DataType::Integer
+            } else if p.word("bigint") {
+                DataType::BigInt
+            } else {
+                return Err(SqlError::InvalidParameterValue);
+            });
+            "as"
+        } else if alter && p.word("restart") {
+            let with = p.word("with");
+            let value =
+                if with || matches!(p.tokens.get(p.at), Some(Token::Number(_) | Token::Op(_))) {
+                    Some(integer(p)?)
+                } else {
+                    None
+                };
+            spec.restart = Some(value);
+            "restart"
+        } else if !parenthesized && p.word("owned") {
+            p.need("by")?;
+            spec.owned_by = Some(if p.word("none") {
+                None
+            } else {
+                let first = alter_table::raw_name(p)?;
+                p.punct('.')?;
+                let second = alter_table::raw_name(p)?;
+                if p.sym('.') {
+                    if first != "public" {
+                        spec.owned_by_error = Some(SqlError::UnknownTable);
+                    }
+                    let column = alter_table::raw_name(p)?;
+                    spec.owned_by_error = spec
+                        .owned_by_error
+                        .take()
+                        .or_else(|| ident::ident(&second).err())
+                        .or_else(|| ident::ident(&column).err());
+                    Some((second, column))
+                } else {
+                    spec.owned_by_error = ident::ident(&first)
+                        .err()
+                        .or_else(|| ident::ident(&second).err());
+                    Some((first, second))
+                }
+            });
+            "owned"
+        } else {
+            return Err(SqlError::Unsupported);
+        };
+        if !seen.insert(key) {
+            return Err(SqlError::Syntax);
+        }
+    }
+    if alter && seen.is_empty() {
+        return Err(SqlError::Syntax);
+    }
+    Ok(())
+}
+
+fn type_bounds(ty: &DataType) -> R<(i64, i64)> {
+    match ty {
+        DataType::SmallInt => Ok((i64::from(i16::MIN), i64::from(i16::MAX))),
+        DataType::Integer => Ok((i64::from(i32::MIN), i64::from(i32::MAX))),
+        DataType::BigInt => Ok((i64::MIN, i64::MAX)),
+        _ => Err(SqlError::InvalidParameterValue),
+    }
+}
+fn validate_sequence(
+    ty: &DataType,
+    increment: i64,
+    min: i64,
+    max: i64,
+    start: i64,
+    cache: i64,
+) -> R<()> {
+    let (lo, hi) = type_bounds(ty)?;
+    if increment == 0 {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if min < lo || min > hi {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if max < lo || max > hi {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if min >= max {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if start < min {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if start > max {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if cache <= 0 {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    Ok(())
+}
+
+fn resolve_owner(state: &Relational, owner: &Option<(String, String)>) -> R<Option<(u64, u64)>> {
+    let Some((table_name, column_name)) = owner else {
+        return Ok(None);
+    };
+    let Some(table) = state.tables.get(table_name) else {
+        return Err(SqlError::UnknownTable);
+    };
+    let Some(column) = table
+        .columns
+        .iter()
+        .find(|column| column.name == *column_name)
+    else {
+        return Err(SqlError::UnknownColumn);
+    };
+    Ok(Some((table.id, column.id)))
+}
+fn restart_bounds(value: i64, min: i64, max: i64) -> R<()> {
+    if value < min {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    if value > max {
+        return Err(SqlError::InvalidParameterValue);
+    }
+    Ok(())
+}
+impl SequenceDdl {
+    pub(super) fn restart_seed(&self, state: &Relational) -> Option<(u64, i64)> {
+        let Self::Alter { name, spec, .. } = self else {
+            return None;
+        };
+        let restart = spec.restart?;
+        state
+            .ext
+            .sequences
+            .iter()
+            .find(|(_, seq)| seq.name == *name)
+            .map(|(&id, seq)| (id, restart.unwrap_or(seq.start)))
+    }
+    pub(super) fn validate_current(
+        &self,
+        state: &Relational,
+        current: impl Fn(u64) -> Option<i64>,
+    ) -> R<()> {
+        if let Self::Alter { name, spec, .. } = self
+            && spec.restart.is_none()
+            && let Some((&id, seq)) = state
+                .ext
+                .sequences
+                .iter()
+                .find(|(_, seq)| seq.name == *name)
+        {
+            restart_bounds(current(id).unwrap_or(seq.start), seq.min, seq.max)?;
+        }
+        Ok(())
+    }
+}
+pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u64> {
+    let resolution_error = match ddl {
+        SequenceDdl::Create {
+            resolution_error, ..
+        }
+        | SequenceDdl::Alter {
+            resolution_error, ..
+        }
+        | SequenceDdl::Drop {
+            resolution_error, ..
+        } => resolution_error,
+    };
+    if let Some(error) = resolution_error {
+        return Err(error.clone());
+    }
+    let mut candidate = state.clone();
+    let mut changed = false;
+    match ddl {
+        SequenceDdl::Create {
+            name,
+            optional,
+            spec,
+            ..
+        } => {
+            if candidate.relation_name_taken(name) {
+                if *optional {
+                    return Ok(0);
+                }
+                return Err(SqlError::DuplicateTable);
+            }
+            if let Some(error) = &spec.owned_by_error {
+                return Err(error.clone());
+            }
+            let owner = resolve_owner(&candidate, spec.owned_by.as_ref().unwrap_or(&None))?;
+            let definition = sequence_definition(
+                spec,
+                spec.data_type.as_ref().unwrap_or(&DataType::BigInt),
+                name.clone(),
+                owner,
+            )?;
+            candidate.add_sequence(definition)?;
+            changed = true;
+        }
+        SequenceDdl::Alter {
+            name,
+            optional,
+            spec,
+            ..
+        } => {
+            let Some((&id, original)) = candidate
+                .ext
+                .sequences
+                .iter()
+                .find(|(_, seq)| seq.name == *name)
+            else {
+                if candidate.relation_name_taken(name) {
+                    return Err(SqlError::WrongObjectType);
+                }
+
+                if *optional {
+                    return Ok(0);
+                }
+                return Err(SqlError::UnknownTable);
+            };
+            let original = original.clone();
+            let ty = spec.data_type.as_ref().unwrap_or(&original.data_type);
+            let (lo, hi) = type_bounds(ty)?;
+            let increment = spec.increment.unwrap_or(original.increment);
+            let old_bounds = type_bounds(&original.data_type)?;
+            let changed_type = ty != &original.data_type;
+            let min = if spec.no_min {
+                None
+            } else {
+                Some(
+                    spec.min
+                        .unwrap_or(if changed_type && original.min == old_bounds.0 {
+                            lo
+                        } else {
+                            original.min
+                        }),
+                )
+            };
+            let max = if spec.no_max {
+                None
+            } else {
+                Some(
+                    spec.max
+                        .unwrap_or(if changed_type && original.max == old_bounds.1 {
+                            hi
+                        } else {
+                            original.max
+                        }),
+                )
+            };
+            let effective = SequenceSpec {
+                identity: if original.identity { Some(false) } else { None },
+                start: Some(spec.start.unwrap_or(original.start)),
+                increment: Some(increment),
+                min,
+                max,
+                cache: Some(spec.cache.unwrap_or(original.cache)),
+                cycle: Some(spec.cycle.unwrap_or(original.cycle)),
+                ..Default::default()
+            };
+            if original.identity && spec.owned_by.is_some() {
+                return Err(SqlError::Unsupported);
+            }
+            if let Some(error) = &spec.owned_by_error {
+                return Err(error.clone());
+            }
+            let owner = if let Some(owner) = &spec.owned_by {
+                resolve_owner(&candidate, owner)?
+            } else {
+                original.owned_by
+            };
+            let mut definition = sequence_definition(&effective, ty, name.clone(), owner)?;
+            if let Some(restart) = spec.restart {
+                restart_bounds(
+                    restart.unwrap_or(definition.start),
+                    definition.min,
+                    definition.max,
+                )?;
+            } else if !spec.rewrites_counter() {
+                definition.incarnation = original.incarnation;
+            }
+            candidate.mutate_ext(|ext, _| {
+                ext.sequences.insert(id, definition);
+                Ok(())
+            })?;
+            changed = true;
+        }
+        SequenceDdl::Drop {
+            names,
+            optional,
+            cascade,
+            ..
+        } => {
+            // Resolve the whole list against a private candidate: failure is atomic.
+            for name in names {
+                let Some((&id, seq)) = candidate
+                    .ext
+                    .sequences
+                    .iter()
+                    .find(|(_, seq)| seq.name == *name)
+                else {
+                    if candidate.relation_name_taken(name) {
+                        return Err(SqlError::WrongObjectType);
+                    }
+
+                    if *optional {
+                        continue;
+                    }
+                    return Err(SqlError::UnknownTable);
+                };
+                if seq.identity {
+                    return Err(SqlError::DependentObjects);
+                }
+                let mut dependent = vec![];
+                for table in candidate.tables.values() {
+                    for column in &table.columns {
+                        if let Some(sql) = candidate.column_default(column.id)
+                            && dependencies(sql)?.iter().any(|dependency| {
+                                let Ok(tokens) = lex(dependency) else {
+                                    return false;
+                                };
+                                let mut parser = Parser {
+                                    tokens,
+                                    at: 0,
+                                    params: BTreeSet::new(),
+                                };
+                                parser.table_name().is_ok_and(|dependency| {
+                                    dependency == *name && parser.at == parser.tokens.len()
+                                })
+                            })
+                        {
+                            dependent.push(column.id);
+                        }
+                    }
+                }
+                if !*cascade && !dependent.is_empty() {
+                    return Err(SqlError::DependentObjects);
+                }
+                for column_id in dependent {
+                    candidate.set_column_default(column_id, None)?;
+                }
+                candidate.remove_sequence(id)?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        candidate.epoch = candidate.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+        *state = candidate;
+    }
+    Ok(u64::from(changed))
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct SequenceSpec {
     pub identity: Option<bool>,
+    data_type: Option<DataType>,
     start: Option<i64>,
     increment: Option<i64>,
     min: Option<i64>,
     max: Option<i64>,
-    cycle: bool,
+    cache: Option<i64>,
+    cycle: Option<bool>,
+    no_min: bool,
+    no_max: bool,
+    restart: Option<Option<i64>>,
+    owned_by: Option<Option<(String, String)>>,
+    owned_by_error: Option<SqlError>,
+}
+impl SequenceSpec {
+    fn rewrites_counter(&self) -> bool {
+        self.data_type.is_some()
+            || self.start.is_some()
+            || self.increment.is_some()
+            || self.min.is_some()
+            || self.max.is_some()
+            || self.no_min
+            || self.no_max
+            || self.cache.is_some()
+            || self.cycle.is_some()
+            || self.restart.is_some()
+    }
 }
 fn integer(p: &mut Parser) -> R<i64> {
     match p.expr()? {
@@ -31,46 +575,7 @@ pub(super) fn identity(p: &mut Parser) -> R<SequenceSpec> {
         ..Default::default()
     };
     if p.sym('(') {
-        let mut seen = BTreeSet::new();
-        while !p.sym(')') {
-            let (key, value) = if p.word("start") {
-                p.word("with");
-                ("start", Some(integer(p)?))
-            } else if p.word("increment") {
-                p.word("by");
-                ("increment", Some(integer(p)?))
-            } else if p.word("minvalue") {
-                ("min", Some(integer(p)?))
-            } else if p.word("maxvalue") {
-                ("max", Some(integer(p)?))
-            } else if p.word("cycle") {
-                spec.cycle = true;
-                ("cycle", None)
-            } else if p.word("no") {
-                if p.word("cycle") {
-                    spec.cycle = false;
-                    ("cycle", None)
-                } else if p.word("minvalue") {
-                    ("min", None)
-                } else if p.word("maxvalue") {
-                    ("max", None)
-                } else {
-                    return Err(SqlError::Unsupported);
-                }
-            } else {
-                return Err(SqlError::Unsupported);
-            };
-            if !seen.insert(key) {
-                return Err(SqlError::Syntax);
-            }
-            match key {
-                "start" => spec.start = value,
-                "increment" => spec.increment = value,
-                "min" => spec.min = value,
-                "max" => spec.max = value,
-                _ => {}
-            }
-        }
+        options(p, &mut spec, true, false)?;
     }
     Ok(spec)
 }
@@ -78,21 +583,19 @@ fn sequence_definition(
     spec: &SequenceSpec,
     ty: &DataType,
     name: String,
-    owner: (u64, u64),
+    owner: Option<(u64, u64)>,
 ) -> R<catalog_ext::SequenceDef> {
     let (lo, hi) = match ty {
         DataType::SmallInt => (i64::from(i16::MIN), i64::from(i16::MAX)),
         DataType::Integer => (i64::from(i32::MIN), i64::from(i32::MAX)),
         DataType::BigInt => (i64::MIN, i64::MAX),
-        _ => return Err(SqlError::Type),
+        _ => return Err(SqlError::InvalidParameterValue),
     };
     let increment = spec.increment.unwrap_or(1);
     let min = spec.min.unwrap_or(if increment < 0 { lo } else { 1 });
     let max = spec.max.unwrap_or(if increment < 0 { -1 } else { hi });
     let start = spec.start.unwrap_or(if increment < 0 { max } else { min });
-    if increment == 0 || min >= max || min < lo || max > hi || start < min || start > max {
-        return Err(SqlError::InvalidParameterValue);
-    }
+    validate_sequence(ty, increment, min, max, start, spec.cache.unwrap_or(1))?;
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| SqlError::Unsupported)?;
     Ok(catalog_ext::SequenceDef {
@@ -102,9 +605,9 @@ fn sequence_definition(
         increment,
         min,
         max,
-        cache: 1,
-        cycle: spec.cycle,
-        owned_by: Some(owner),
+        cache: spec.cache.unwrap_or(1),
+        cycle: spec.cycle.unwrap_or(false),
+        owned_by: owner,
         identity: spec.identity.is_some(),
         incarnation: u128::from_le_bytes(bytes),
     })
@@ -135,8 +638,12 @@ pub(super) fn install_create(
         }
         if let Some(spec) = spec {
             let name = candidate.choose_sequence_name(&table.name, &column.name);
-            let definition =
-                sequence_definition(spec, &column.data_type, name.clone(), (table.id, column.id))?;
+            let definition = sequence_definition(
+                spec,
+                &column.data_type,
+                name.clone(),
+                Some((table.id, column.id)),
+            )?;
             let id = candidate.add_sequence(definition)?;
             if let Some(always) = spec.identity {
                 candidate.set_column_identity(

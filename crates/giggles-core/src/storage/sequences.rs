@@ -58,6 +58,9 @@ fn step(value: i64, def: &SequenceDef) -> R<i64> {
     }
 }
 pub(crate) fn next(s: &mut State, id: u64) -> R<i64> {
+    // CACHE is stored for PostgreSQL catalog/dump compatibility. Allocation is
+    // deliberately one value at a time; the durable recovery reservation below
+    // is independent of per-session CACHE preallocation.
     let def = definition(s, id)?;
     let stamp = s
         .seq
@@ -265,7 +268,7 @@ impl Inner {
                 let owner = def
                     .owned_by
                     .and_then(|(id, _)| snapshot.sql.tables.values().find(|t| t.id == id));
-                if owner.is_none_or(|t| !allowed.contains(&t.name)) {
+                if !allowed.contains(&name) && owner.is_none_or(|t| !allowed.contains(&t.name)) {
                     return Err(CoreError::Policy(Error::Scope));
                 }
             }
@@ -341,10 +344,17 @@ impl Inner {
                 pending.insert(id, counter);
             }
             if operation == "nextval" || called {
-                values
-                    .lock()
-                    .map_err(|_| CoreError::Fenced)?
-                    .insert((id, def.incarnation), result);
+                let mut values = values.lock().map_err(|_| CoreError::Fenced)?;
+                // ALTER creates transactional physical storage, but currval is
+                // session state and follows the logical sequence across rollback.
+                // Keys remain incarnation-aware so rolled-back CREATE id reuse
+                // cannot expose a previous object's currval.
+                for ((sequence_id, _), value) in values.iter_mut() {
+                    if *sequence_id == id {
+                        *value = result;
+                    }
+                }
+                values.insert((id, def.incarnation), result);
             }
             Ok(relational::Value::Int(result))
         })

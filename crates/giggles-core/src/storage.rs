@@ -2349,6 +2349,9 @@ impl SqlSession {
         if p.domain != s.view.domain {
             return Err(CoreError::Sql(E::StaleSchema));
         }
+        if p.is_sequence_ddl() {
+            self.admin.inner.merge_live_sequences(&mut s)?;
+        }
         sequences::merge(
             &mut s,
             &*self
@@ -2376,6 +2379,27 @@ impl SqlSession {
             ))
         });
         let clock = context.as_ref();
+        let sequence_before = if p.is_sequence_ddl() {
+            Some(
+                s.sql
+                    .catalog_ext()
+                    .sequences
+                    .iter()
+                    .map(|(&id, definition)| {
+                        let counter = s.seq.get(&id).cloned().unwrap_or(sequences::SeqCounter {
+                            incarnation: definition.incarnation,
+                            last_value: definition.start,
+                            is_called: false,
+                            log_hw: definition.start,
+                            stamp: 0,
+                        });
+                        (id, counter)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        } else {
+            None
+        };
         let mut deferral = self.deferral.clone();
         let result = if let Some((names, deferred)) = p.set_constraints() {
             // Outside a block PostgreSQL still resolves named constraints;
@@ -2423,8 +2447,67 @@ impl SqlSession {
             return Err(error);
         }
         let result = result.map_err(CoreError::Sql)?;
+        p.validate_sequence_current(&s.sql, |id| {
+            sequence_before
+                .as_ref()
+                .and_then(|counters| counters.get(&id))
+                .map(|counter| counter.last_value)
+        })
+        .map_err(CoreError::Sql)?;
+        if p.sequence_copies_counter() {
+            for (&id, original_counter) in sequence_before.iter().flatten() {
+                let mut counter = original_counter.clone();
+                if let Some(definition) = s.sql.catalog_ext().sequences.get(&id)
+                    && definition.incarnation != counter.incarnation
+                {
+                    counter.incarnation = definition.incarnation;
+                    counter.log_hw = counter.last_value;
+                    counter.stamp = 0;
+                    s.seq.insert(id, counter);
+                }
+            }
+        }
+        if let Some((id, value)) = p.sequence_restart_seed(&s.sql) {
+            let definition = &s.sql.catalog_ext().sequences[&id];
+            s.seq.insert(
+                id,
+                sequences::SeqCounter {
+                    incarnation: definition.incarnation,
+                    last_value: value,
+                    is_called: false,
+                    log_hw: value,
+                    stamp: 0,
+                },
+            );
+        }
+        // ALTER may narrow bounds while retaining the current position. A prior
+        // recovery reservation is expendable; keep it inside the new bounds.
+        if p.is_sequence_ddl() {
+            s.seq.retain(|id, counter| {
+                s.sql
+                    .catalog_ext()
+                    .sequences
+                    .get(id)
+                    .is_some_and(|definition| definition.incarnation == counter.incarnation)
+            });
+            for (id, counter) in &mut s.seq {
+                let definition = &s.sql.catalog_ext().sequences[id];
+                counter.log_hw = counter.log_hw.clamp(definition.min, definition.max);
+            }
+        }
         // Reserve the complete durable/export envelope before accepting a stage.
         records(&s)?;
+        if let Some(before) = sequence_before {
+            let mut values = self.sequence_values.lock().map_err(|_| CoreError::Fenced)?;
+            for (id, counter) in before {
+                if let Some(definition) = s.sql.catalog_ext().sequences.get(&id)
+                    && definition.incarnation != counter.incarnation
+                    && let Some(value) = values.get(&(id, counter.incarnation)).copied()
+                {
+                    values.insert((id, definition.incarnation), value);
+                }
+            }
+        }
         if self.staged.is_some() {
             crate::cancellation::check()?;
             if !p.is_read() {

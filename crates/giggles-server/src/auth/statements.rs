@@ -447,6 +447,10 @@ pub(crate) fn execute(
                     return Err("42501");
                 }
             }
+            let sequence_names = admin
+                .sql_session()
+                .sequence_owners()
+                .map_err(|e| crate::service::sqlstate(&e))?;
             for name in names {
                 let dropped = admin.drop_table(name, *if_exists).map_err(|e| match e {
                     CoreError::Sql(SqlError::Conflict) => "55P03",
@@ -455,6 +459,15 @@ pub(crate) fn execute(
                 })?;
                 if dropped {
                     catalog.forget_table(name).map_err(|_| "XX000")?;
+                    let live_sequences = admin
+                        .sql_session()
+                        .sequence_owners()
+                        .map_err(|e| crate::service::sqlstate(&e))?;
+                    for (sequence, _) in &sequence_names {
+                        if !live_sequences.iter().any(|(name, _)| name == sequence) {
+                            catalog.forget_table(sequence).map_err(|_| "XX000")?;
+                        }
+                    }
                 }
             }
             Ok("DROP TABLE")
