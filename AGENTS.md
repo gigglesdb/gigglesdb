@@ -164,6 +164,22 @@ oracles) then show as modified or fail. Create and move worktrees with
 proof hashes from committed blobs (`git hash-object` / `git rev-parse <ref>:<path>`),
 never from CRLF working copies.
 
+## Integration test binaries
+
+giggles-core and giggles-language build their `tests/*.rs` files as a single
+test binary, `tests/all.rs` (`autotests = false`), because linking one binary
+per file dominated gate time. Build plus tests went from 620s to 249s for
+giggles-core and from 115s to 67s for giggles-language; target directories
+shrank from 21G to 1.7G and 4.6G to 1.3G (GD-0001 E135-E137).
+
+- Register every new test file. Add it to `tests/all.rs` as
+  `#[path = "x.rs"] mod x;`, or, if it re-runs its own test binary by exact
+  test name (`current_exe`), as its own `[[test]]` in `Cargo.toml`. The
+  `every_test_file_is_registered` test fails for an unregistered file.
+- Test names in the merged binary carry the file as a module prefix, so run
+  one file with `cargo test --test all <file>::` and use
+  `<file>::<test>` with `--exact`.
+
 ## Cleaning up J:/gigglesdb-work
 
 Agents must clean up after themselves in J:/gigglesdb-work. When a work item
