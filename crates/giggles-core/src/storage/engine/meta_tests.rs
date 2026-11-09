@@ -65,6 +65,8 @@ fn role(kv: &MemKv, id: u64, ts: u64, live: bool) {
 fn directory_matrix() {
     let d = TestDir::new();
     assert_eq!(classify_dir(&d.0).unwrap(), DirClass::Empty);
+    d.put("giggles.lock", b"stale writer identity");
+    assert_eq!(classify_dir(&d.0).unwrap(), DirClass::Empty);
     d.put(TMP, b"partial");
     assert_eq!(classify_dir(&d.0).unwrap(), DirClass::Empty);
     d.put("data.redb", b"");

@@ -5,18 +5,101 @@ use rocksdb::{
 };
 use std::{
     collections::BTreeMap,
-    ops::Bound,
+    fs::{File, OpenOptions, TryLockError},
+    io::{Read, Seek, SeekFrom, Write},
+    ops::{Bound, Deref},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) const WRITER_LOCK_FILE: &str = "giggles.lock";
+
+/// Never unlink this file: stale contents are harmless, but replacing its inode
+/// would let a new opener lock a different file while the old writer is alive.
+pub(crate) struct WriterLock {
+    _file: File,
+}
+
+impl WriterLock {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, KvError> {
+        let io_error = |error: std::io::Error| KvError::Io(error.to_string());
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // Permit other openers to reach try_lock, but prevent Windows deletion
+        // or replacement of the lock file for the entire writer lifetime.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(3); // FILE_SHARE_READ | FILE_SHARE_WRITE
+        }
+        let mut file = options
+            .open(path.join(WRITER_LOCK_FILE))
+            .map_err(io_error)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(KvError::Io(
+                    "database already open by another writer".into(),
+                ));
+            }
+            Err(TryLockError::Error(error)) => return Err(io_error(error)),
+        }
+        // Only the OS lock decides ownership. Never trust a stale pid (which can
+        // be reused), timestamp or nonce to decide whether a writer is alive.
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|error| KvError::Io(error.to_string()))?;
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| KvError::Io(error.to_string()))?
+            .as_nanos();
+        let identity = format!(
+            "pid={}\nstarted_unix_nanos={started}\nnonce={:032x}\n",
+            std::process::id(),
+            u128::from_be_bytes(nonce)
+        );
+        file.set_len(0).map_err(io_error)?;
+        file.write_all(identity.as_bytes()).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let mut saved = String::new();
+        file.read_to_string(&mut saved).map_err(io_error)?;
+        if saved != identity {
+            return Err(KvError::Io("writer lock identity changed".into()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+struct LockedDb {
+    // Field order matters: close RocksDB before releasing the explicit lock.
+    db: DB,
+    _writer_lock: WriterLock,
+}
+
+impl Deref for LockedDb {
+    type Target = DB;
+    fn deref(&self) -> &DB {
+        &self.db
+    }
+}
+
 pub(crate) struct RocksKv {
-    db: Arc<DB>,
+    db: Arc<LockedDb>,
 }
 
 impl RocksKv {
     pub(crate) fn open(path: &Path, cache_bytes: usize) -> Result<Self, KvError> {
+        std::fs::create_dir_all(path).map_err(|error| KvError::Io(error.to_string()))?;
+        Self::open_locked(path, cache_bytes, WriterLock::acquire(path)?)
+    }
+
+    pub(crate) fn open_locked(
+        path: &Path,
+        cache_bytes: usize,
+        writer_lock: WriterLock,
+    ) -> Result<Self, KvError> {
         let cache = Cache::new_lru_cache(cache_bytes);
         let mut table = BlockBasedOptions::default();
         table.set_block_cache(&cache);
@@ -31,7 +114,12 @@ impl RocksKv {
             Keyspace::ALL.map(|ks| (ks.name(), options.clone())),
         )
         .map_err(map_error)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(LockedDb {
+                db,
+                _writer_lock: writer_lock,
+            }),
+        })
     }
 }
 
@@ -219,7 +307,7 @@ fn disconnected() -> KvError {
 }
 
 impl OwnedSnapshot {
-    fn new(db: Arc<DB>) -> Result<Self, KvError> {
+    fn new(db: Arc<LockedDb>) -> Result<Self, KvError> {
         let (requests, receive) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(0);
         let worker = thread::Builder::new()
@@ -433,6 +521,10 @@ mod tests {
         db.write(single(), Durability::Sync).unwrap();
         let snapshot = db.snapshot().unwrap();
         drop(db);
+        assert!(matches!(
+            RocksKv::open(&dir.0, 8 * 1024 * 1024),
+            Err(KvError::Io(message)) if message == "database already open by another writer"
+        ));
         let mut forward = snapshot
             .range(
                 Keyspace::Rows,

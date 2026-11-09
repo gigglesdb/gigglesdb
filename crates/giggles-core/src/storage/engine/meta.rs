@@ -83,6 +83,7 @@ pub(crate) fn classify_dir(dir: &Path) -> Result<DirClass, FormatError> {
             MARKER => marker = true,
             "data.redb" => legacy = true,
             TMP => {}
+            "giggles.lock" => {}
             n if rocks_file(n) => {
                 rocks = true;
                 current |= n == "CURRENT";

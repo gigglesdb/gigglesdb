@@ -49,10 +49,13 @@ impl V2Db {
     pub(crate) fn create(path: &Path) -> Result<Self, CoreError> {
         let mut domain = [0u8; 16];
         getrandom::fill(&mut domain).map_err(io)?;
+        fs::create_dir_all(path).map_err(io)?;
+        let writer_lock = engine::kv_rocksdb::WriterLock::acquire(path)?;
         let backend = engine::meta::create(path, domain, |path| {
-            Ok(Arc::new(engine::kv_rocksdb::RocksKv::open(
+            Ok(Arc::new(engine::kv_rocksdb::RocksKv::open_locked(
                 path,
                 64 * 1024 * 1024,
+                writer_lock,
             )?))
         })
         .map_err(format_error)?;
