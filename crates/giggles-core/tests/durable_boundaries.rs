@@ -30,6 +30,10 @@ fn recovery_step(point: RecoveryPoint) -> &'static str {
         | RecoveryPoint::ExportSync
         | RecoveryPoint::ExportVerify
         | RecoveryPoint::ExportPublish => "export-error",
+        RecoveryPoint::CrashExportWrite
+        | RecoveryPoint::CrashExportSync
+        | RecoveryPoint::CrashExportVerify
+        | RecoveryPoint::CrashExportPublish => "export-crash",
         RecoveryPoint::InstallCreated
         | RecoveryPoint::InstallStaged
         | RecoveryPoint::InstallCommitted => "install-error",
@@ -59,6 +63,10 @@ fn registry() -> Vec<Boundary> {
         RecoveryPoint::ExportSync,
         RecoveryPoint::ExportVerify,
         RecoveryPoint::ExportPublish,
+        RecoveryPoint::CrashExportWrite,
+        RecoveryPoint::CrashExportSync,
+        RecoveryPoint::CrashExportVerify,
+        RecoveryPoint::CrashExportPublish,
         RecoveryPoint::InstallCreated,
         RecoveryPoint::InstallStaged,
         RecoveryPoint::InstallCommitted,
@@ -181,8 +189,10 @@ fn boundary_worker() {
         }
         Boundary::Recovery(point) => {
             let export = path.join("source.export");
-            if recovery_step(point) == "export-error" {
-                assert!(a.export_with_fault(&export, point).is_err());
+            if recovery_step(point).starts_with("export-") {
+                let result = a.export_with_fault(&export, point);
+                assert_eq!(recovery_step(point), "export-error", "crash seam returned");
+                assert!(result.is_err());
             } else {
                 a.export(&export).unwrap();
                 ack(
@@ -319,6 +329,24 @@ fn every_legacy_durable_boundary() {
                     point != RecoveryPoint::ExportWrite
                 );
                 install_checks = 3;
+            } else if recovery_step(point) == "export-crash" {
+                let stages: Vec<_> = fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|p| p.to_string_lossy().contains("source.export.staging-"))
+                    .collect();
+                assert_eq!(stages.len(), 1);
+                if point == RecoveryPoint::CrashExportWrite {
+                    assert!(Admin::verify_export(&stages[0]).is_err());
+                } else {
+                    assert_eq!(Admin::verify_export(&stages[0]).unwrap(), snapshot);
+                }
+                if point == RecoveryPoint::CrashExportPublish {
+                    assert_eq!(Admin::verify_export(&export).unwrap(), snapshot);
+                } else {
+                    assert!(!export.exists());
+                }
+                install_checks = 3;
             } else {
                 assert_eq!(Admin::verify_export(&export).unwrap(), snapshot);
                 assert_eq!(
@@ -359,7 +387,7 @@ fn every_legacy_durable_boundary() {
         report.push(json!({"boundary": format!("{boundary:?}"), "engine": "legacy",
             "outcome": "pass", "termination": match boundary {
                 Boundary::Commit(CrashPoint::BeforeCommit | CrashPoint::AfterCommit | CrashPoint::BeforeAck, _) |
-                Boundary::Recovery(RecoveryPoint::CrashInstallCreated | RecoveryPoint::CrashInstallStaged | RecoveryPoint::CrashInstallCommitted) => "existing-abrupt-crash-seam",
+                Boundary::Recovery(RecoveryPoint::CrashExportWrite | RecoveryPoint::CrashExportSync | RecoveryPoint::CrashExportVerify | RecoveryPoint::CrashExportPublish | RecoveryPoint::CrashInstallCreated | RecoveryPoint::CrashInstallStaged | RecoveryPoint::CrashInstallCommitted) => "existing-abrupt-crash-seam",
                 Boundary::Commit(CrashPoint::None, _) | Boundary::Recovery(RecoveryPoint::None) => "exit-after-ack-control",
                 _ => "exit-after-returned-error",
             }, "step": match boundary { Boundary::Commit(_, true) => "sql-commit", Boundary::Commit(_, false) => "task-receipt", Boundary::Recovery(p) => recovery_step(p) },
@@ -369,7 +397,7 @@ fn every_legacy_durable_boundary() {
     let report_path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
         .join("durable_boundaries_report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&json!({"boundaries": report,
-        "missing_fault_points": ["ExportWrite/Sync/Verify/Publish have returned-error seams only; abrupt export crashes need new seams"]})).unwrap()).unwrap();
+        "missing_fault_points": []})).unwrap()).unwrap();
     println!(
         "legacy durable boundaries: {} passed; report={}",
         report.len(),

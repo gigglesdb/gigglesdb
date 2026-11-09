@@ -115,6 +115,11 @@ pub enum RecoveryPoint {
     ExportSync,
     ExportVerify,
     ExportPublish,
+    CrashExportWrite,
+    CrashExportSync,
+    CrashExportVerify,
+    /// Crash after the verified export has been published.
+    CrashExportPublish,
     InstallCreated,
     InstallStaged,
     InstallCommitted,
@@ -1283,15 +1288,27 @@ impl Admin {
             .open(&stage)
             .map_err(io)?;
         f.write_all(MAGIC).map_err(io)?;
-        recovery(point, RecoveryPoint::ExportWrite, RecoveryPoint::None)?;
+        recovery(
+            point,
+            RecoveryPoint::ExportWrite,
+            RecoveryPoint::CrashExportWrite,
+        )?;
         f.write_all(&format.to_be_bytes()).map_err(io)?;
         f.write_all(&(payload.len() as u64).to_be_bytes())
             .map_err(io)?;
         f.write_all(&digest).map_err(io)?;
         f.write_all(&payload).map_err(io)?;
-        recovery(point, RecoveryPoint::ExportSync, RecoveryPoint::None)?;
+        recovery(
+            point,
+            RecoveryPoint::ExportSync,
+            RecoveryPoint::CrashExportSync,
+        )?;
         f.sync_all().map_err(io)?;
-        recovery(point, RecoveryPoint::ExportVerify, RecoveryPoint::None)?;
+        recovery(
+            point,
+            RecoveryPoint::ExportVerify,
+            RecoveryPoint::CrashExportVerify,
+        )?;
         Self::read_export(&stage)?;
         recovery(point, RecoveryPoint::ExportPublish, RecoveryPoint::None)?;
         fs::hard_link(&stage, path).map_err(|e| {
@@ -1301,6 +1318,9 @@ impl Admin {
                 io(e)
             }
         })?;
+        if point == RecoveryPoint::CrashExportPublish {
+            crash_now();
+        }
         Ok(digest)
     }
     fn read_export(path: impl AsRef<Path>) -> Result<State, CoreError> {
