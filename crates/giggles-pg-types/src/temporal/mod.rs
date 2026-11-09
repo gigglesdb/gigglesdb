@@ -523,8 +523,10 @@ impl Interval {
     }
     pub fn parse_with_style(s: &str, style: IntervalStyle) -> Result<Self, Error> {
         let s = bounded(s)?;
+        // '-.5' is a bad field in ParseDateTime before any style applies, so keep it 22007.
         if style == IntervalStyle::SqlStandard
             && s.starts_with('-')
+            && !s[1..].starts_with('.')
             && !s
                 .split_whitespace()
                 .skip(1)
@@ -613,6 +615,16 @@ impl Interval {
             // PostgreSQL DecodeInterval: an alphabetic next token is the unit (unknown units
             // stay Unimplemented). A unitless number is seconds only as the final field
             // ('0', '1 day 2'); elsewhere ('5 3 minutes', '1 2', '5 ago') it is 22007.
+            // PostgreSQL ParseDateTime reads a field that starts with '.' as a number with a
+            // zero whole part ('.5', '.' alone is 0); a sign before the '.' ('-.5') stays
+            // 22007 because decimal() then sees an empty whole part.
+            let padded;
+            let v = if v.starts_with('.') {
+                padded = format!("0{v}");
+                padded.as_str()
+            } else {
+                v
+            };
             let unit = match p.peek().copied() {
                 Some(unit) if !unit.is_empty() && unit.chars().all(|c| c.is_ascii_alphabetic()) => {
                     p.next();
@@ -629,7 +641,11 @@ impl Interval {
                 "hour" | "hours" => 16,
                 "minute" | "minutes" | "min" | "mins" => 32,
                 "second" | "seconds" | "sec" | "secs" => {
-                    if v.contains('.') {
+                    // DecodeInterval widens the mask to milli/microseconds only for a
+                    // nonzero fraction: '1. seconds 5 milliseconds' is accepted.
+                    if v.split_once('.')
+                        .is_some_and(|(_, f)| f.bytes().any(|b| b != b'0'))
+                    {
                         448
                     } else {
                         64
