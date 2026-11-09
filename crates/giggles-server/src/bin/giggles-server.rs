@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("connection limit".into());
     }
     c.api_limits.validate()?;
-    let postgresql = c
+    let mut postgresql = c
         .postgresql
         .as_ref()
         .map(PostgresqlConfig::build)
@@ -83,11 +83,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Clock::new(c.skew_seconds, c.max_pause_seconds)?,
         c.service_limits,
     )?;
-    let config = tls::server(
-        tls::certs(c.certificate)?,
-        tls::key(c.private_key)?,
+    let mut config = tls::server(
+        tls::certs(&c.certificate)?,
+        tls::key(&c.private_key)?,
         tls::certs(c.client_ca)?,
     )?;
+    let certificate_reload = tls::ReloadableCertificate::install(&mut config);
+    let postgresql_reload = postgresql.as_mut().and_then(|listener| {
+        std::sync::Arc::get_mut(listener).and_then(|listener| {
+            listener
+                .tls_config
+                .as_mut()
+                .map(tls::ReloadableCertificate::install)
+        })
+    });
     // Bind every requested socket before any accept loop can process traffic.
     // Dropping these listeners rolls back a partial bind failure automatically.
     let native_socket = TcpListener::bind(c.native).await?;
@@ -171,13 +180,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{} preview=single-host", addresses.join(" "));
     io::stdout().flush()?;
     // Trusted local stdin only; bounded command reader, one reload at a time.
-    // CA/server key material is immutable for this process and requires restart.
+    // Certificate reload uses the same trusted local trigger as binding reload.
     let mut reader = giggles_server::dev::ControlReader::default();
     while let Some(command) = reader.next().await? {
         if command.as_slice() == b"shutdown" {
             break;
         }
         if command.as_slice() == b"reload" {
+            match certificate_reload.reload(&c.certificate, &c.private_key) {
+                Ok(()) => {},
+                Err(error) => eprintln!("TLS reload rejected; prior certificate retained: {error}"),
+            }
+            if let (Some(resolver), Some(pg)) = (&postgresql_reload, &c.postgresql) {
+                match resolver.reload(
+                    pg.certificate.as_ref().unwrap(),
+                    pg.private_key.as_ref().unwrap(),
+                ) {
+                    Ok(()) => {},
+                    Err(error) => eprintln!(
+                        "PostgreSQL TLS reload rejected; prior certificate retained: {error}"
+                    ),
+                }
+            }
             if let Some(path) = c.bindings_file.clone() {
                 let service = service.clone();
                 let result = tokio::task::spawn_blocking(

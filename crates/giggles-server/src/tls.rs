@@ -69,6 +69,52 @@ pub fn server_optional_client(
         None => builder.with_no_client_auth(),
     };
     Ok(Arc::new(
-        builder.with_single_cert(chain, key).map_err(io::Error::other)?,
+        builder
+            .with_single_cert(chain, key)
+            .map_err(io::Error::other)?,
     ))
+}
+
+/// Shared certificate resolver. Existing TLS streams retain their negotiated keys.
+#[derive(Debug)]
+pub struct ReloadableCertificate {
+    resolver: std::sync::RwLock<Arc<dyn rustls::server::ResolvesServerCert>>,
+}
+impl ReloadableCertificate {
+    pub fn install(config: &mut Arc<ServerConfig>) -> Arc<Self> {
+        let resolver = Arc::new(Self {
+            resolver: std::sync::RwLock::new(config.cert_resolver.clone()),
+        });
+        let config = Arc::make_mut(config);
+        config.cert_resolver = resolver.clone();
+        // Resumption skips certificate authentication, so require a fresh handshake.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+        resolver
+    }
+
+    /// Validate all PEM and key correspondence before changing the live resolver.
+    pub fn reload(
+        &self,
+        certificate: impl AsRef<Path>,
+        private_key: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        let candidate = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs(certificate)?, key(private_key)?)
+            .map_err(io::Error::other)?;
+        *self
+            .resolver
+            .write()
+            .map_err(|_| io::Error::other("TLS resolver lock poisoned"))? = candidate.cert_resolver;
+        Ok(())
+    }
+}
+impl rustls::server::ResolvesServerCert for ReloadableCertificate {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.resolver.read().ok()?.resolve(hello)
+    }
 }

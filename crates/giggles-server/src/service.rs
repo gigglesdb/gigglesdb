@@ -197,6 +197,7 @@ pub struct Service {
     task_gate: std::sync::Mutex<()>,
     pub(crate) admin: Admin,
     pub(crate) clock: Clock,
+    password_generations: std::sync::Mutex<BTreeMap<String, (u32, u64, u64)>>,
     pub(crate) authority_gate: std::sync::RwLock<()>,
     bindings: std::sync::Mutex<Credentials>,
     pub(crate) admission: crate::admission::Admission,
@@ -234,6 +235,7 @@ impl Service {
             blocking: crate::blocking::Blocking::new(),
             cancellations: crate::cancel::Registry::default(),
             task_gate: std::sync::Mutex::new(()),
+            password_generations: std::sync::Mutex::new(BTreeMap::new()),
             authority_gate: std::sync::RwLock::new(()),
             bindings: std::sync::Mutex::new(Credentials { next, entries }),
             admission: crate::admission::Admission::new(limits)?,
@@ -330,6 +332,14 @@ impl Service {
             self.cancellations
                 .cancel(&session.fingerprint, session.epoch, pid, secret);
         }
+    }
+    fn role_generation_matches(&self, role: &giggles_core::roles::CatalogRole, epoch: u64) -> bool {
+        role.generation == epoch
+            || self.password_generations.lock().is_ok_and(|aliases| {
+                aliases.get(&role.name).is_some_and(|&(oid, first, last)| {
+                    role.oid == oid && role.generation == last && (first..=last).contains(&epoch)
+                })
+            })
     }
     pub fn role_session(self: &Arc<Self>, name: &str) -> Result<Session, CoreError> {
         let role = self
@@ -472,7 +482,7 @@ impl Session {
                 .roles()
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .map(|_| ())
                 .ok_or(CoreError::Policy(Error::Authentication));
         }
@@ -549,9 +559,46 @@ impl Session {
             .roles()
             .get(name)
             .map_err(|_| "28000")?
-            .filter(|role| role.login && role.generation == self.epoch)
+            .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
             .ok_or("28000")?;
-        crate::auth::statements::execute(stmt, &self.service.admin, &actor)
+        // Serialize SQL password rotations and publish aliases before returning to wire checks.
+        let mut aliases = self
+            .service
+            .password_generations
+            .lock()
+            .map_err(|_| "XX000")?;
+        let target = match stmt {
+            crate::auth::statements::AdminStatement::Alter(name, changes)
+                if changes.password.is_some()
+                    && changes.login.is_none()
+                    && changes.superuser.is_none()
+                    && changes.createrole.is_none() =>
+            {
+                self.service.admin.roles().get(name).map_err(|_| "XX000")?
+            }
+            _ => None,
+        };
+        let result = crate::auth::statements::execute(stmt, &self.service.admin, &actor)?;
+        if let Some(before) = target {
+            let after = self
+                .service
+                .admin
+                .roles()
+                .get(&before.name)
+                .map_err(|_| "XX000")?
+                .ok_or("XX000")?;
+            let mut expected = before.clone();
+            expected.password = after.password.clone();
+            expected.generation = after.generation;
+            if expected == after && before.generation.checked_add(1) == Some(after.generation) {
+                let first = aliases
+                    .get(&before.name)
+                    .filter(|&&(oid, _, last)| oid == before.oid && last == before.generation)
+                    .map_or(before.generation, |&(_, first, _)| first);
+                aliases.insert(before.name, (after.oid, first, after.generation));
+            }
+        }
+        Ok(result)
     }
     /// Wire description of a prepared statement. DDL returns no rows and takes
     /// no parameters; core does not describe it, so report an empty shape.
@@ -590,7 +637,10 @@ impl Session {
                         .roles()
                         .get(name)
                         .map_err(|_| CoreError::Policy(Error::Authentication))?
-                        .filter(|role| role.login && role.generation == session.epoch)
+                        .filter(|role| {
+                            role.login
+                                && session.service.role_generation_matches(role, session.epoch)
+                        })
                         .ok_or(CoreError::Policy(Error::Authentication))?;
                     if role.superuser {
                         None
@@ -837,7 +887,7 @@ impl Session {
             let role = roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             role.superuser
                 || roles
@@ -877,7 +927,7 @@ impl Session {
             roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {
@@ -930,7 +980,7 @@ impl Session {
             let role = roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 true
@@ -1032,7 +1082,7 @@ impl Session {
                 let role = roles
                     .get(name)
                     .map_err(|_| CoreError::Policy(Error::Authentication))?
-                    .filter(|r| r.login && r.generation == self.epoch)
+                    .filter(|r| r.login && self.service.role_generation_matches(r, self.epoch))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 if let Some(owner) = owner
                     && roles
@@ -1096,7 +1146,7 @@ impl Session {
                 .roles()
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 superuser = true;
@@ -1194,7 +1244,7 @@ impl Session {
                 .roles()
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && role.generation == self.epoch)
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {

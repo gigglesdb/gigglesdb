@@ -298,7 +298,8 @@ async fn passwords_and_authority(protocol: Protocol) {
     protocol
         .ok(&owner, "ALTER ROLE alice PASSWORD 'new-pw'")
         .await;
-    assert!(protocol.execute(&alice, "BEGIN").await.is_err());
+    protocol.ok(&alice, "BEGIN").await;
+    protocol.ok(&alice, "ROLLBACK").await;
     f.bad_password("alice", "alice-pw").await;
     let alice = f.connect("alice", "new-pw").await;
     protocol
@@ -308,7 +309,8 @@ async fn passwords_and_authority(protocol: Protocol) {
     protocol
         .ok(&alice, "ALTER ROLE alice PASSWORD 'self-pw'")
         .await;
-    assert!(protocol.execute(&alice, "BEGIN").await.is_err());
+    protocol.ok(&alice, "BEGIN").await;
+    protocol.ok(&alice, "ROLLBACK").await;
     drop(alice);
     f.bad_password("alice", "new-pw").await;
     let alice = f.connect("alice", "self-pw").await;

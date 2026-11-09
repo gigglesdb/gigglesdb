@@ -215,7 +215,7 @@ and the pinned tokio-postgres source for START TRANSACTION and RowDescription.
 
 See [CREDENTIALS_ADMISSION.md](CREDENTIALS_ADMISSION.md) for the bounded trusted
 stdin `reload`/`shutdown` workflow, binding epochs, identical-authority certificate
-overlap, restart-required CA/certificate changes, aggregate session/rate defaults,
+overlap, reloadable certificates and restart-required CA changes, aggregate session/rate defaults,
 cancellation saturation behavior and capacity worksheet.
 
 Optional HTTP/1.1, HTTP/2 and typed gRPC interfaces expose native reads, guarded
@@ -226,3 +226,18 @@ available. See [API.md](API.md) for configuration, schemas, limits and runnable
 clients. Both listeners are disabled unless configured and reuse the existing
 mTLS bindings and shared service admission.
 See [Design documentation](https://app.archdocs.io/design-docs/5850ae99-0d51-403f-9201-d9735687a000) for the actual parent P2 row.
+
+### Rotating credentials
+
+Replace the PEM certificate and matching private key at the configured paths,
+then send `reload` on the server's trusted local stdin (the binding reload
+command). This also reloads the optional `postgresql` listener's certificate
+from its own configured paths. New TLS handshakes use the replacement;
+established connections continue. Invalid PEM or a mismatched key logs an
+error and retains that listener's prior certificate. CA changes require restart.
+Certificate reload works even without `bindings_file`; bindings then remain unchanged.
+
+For SCRAM, connect as the role or an authorized administrator and run
+`ALTER ROLE role_name PASSWORD 'new-password'`. New connections must use the
+new password; already authenticated sessions continue. Role privilege or login
+changes still invalidate sessions.

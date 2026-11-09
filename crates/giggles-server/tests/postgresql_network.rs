@@ -27,7 +27,7 @@ use tokio::{
 use tokio_postgres::{Client, Config, NoTls, config::SslMode};
 use tokio_postgres_rustls::MakeRustlsConnect;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
-const PASSWORD: &str = "s3cret-pass";
+pub(crate) const PASSWORD: &str = "s3cret-pass";
 struct Cert {
     cert: Certificate,
     key: KeyPair,
@@ -51,16 +51,16 @@ fn cert(ca: Option<&Cert>, server: bool) -> Cert {
     };
     Cert { cert, key }
 }
-struct Fixture {
+pub(crate) struct Fixture {
     admin: Admin,
     service: Arc<Service>,
-    pg: Running,
+    pub(crate) pg: Running,
     ca: Cert,
     app: Cert,
     server: Cert,
 }
 impl Fixture {
-    async fn new(mode: TlsMode, trust: bool, mapped: bool) -> Self {
+    pub(crate) async fn new(mode: TlsMode, trust: bool, mapped: bool) -> Self {
         let path = std::env::temp_dir().join(format!(
             "postgresql-network-{}-{}-{}",
             std::process::id(),
@@ -145,7 +145,7 @@ impl Fixture {
             server,
         }
     }
-    fn config(&self, user: &str, password: Option<&str>, tls: bool) -> Config {
+    pub(crate) fn config(&self, user: &str, password: Option<&str>, tls: bool) -> Config {
         let mut c = Config::new();
         c.host("localhost")
             .hostaddr(self.pg.address.ip())
@@ -177,7 +177,7 @@ impl Fixture {
         };
         MakeRustlsConnect::new(c)
     }
-    async fn plain(&self, user: &str, password: Option<&str>) -> Client {
+    pub(crate) async fn plain(&self, user: &str, password: Option<&str>) -> Client {
         let (c, connection) = self
             .config(user, password, false)
             .connect(NoTls)
@@ -199,7 +199,7 @@ impl Fixture {
         });
         c
     }
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.pg.shutdown().await.unwrap();
     }
 }

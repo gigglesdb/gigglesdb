@@ -123,3 +123,6 @@ mod sql_cursors_network;
 mod mixed_catalog_app_query;
 #[path = "logical_columns.rs"]
 mod logical_columns;
+
+#[path = "key_rotation.rs"]
+mod key_rotation;
