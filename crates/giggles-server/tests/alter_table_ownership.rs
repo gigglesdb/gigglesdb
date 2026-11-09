@@ -13,13 +13,15 @@ fn alter_requires_owner_and_rename_publishes_authority_atomically() {
     let root = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = root.join(format!(
-        "alter-owner-{}-{}",
+        "alter-owner-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&path).unwrap();
     let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();

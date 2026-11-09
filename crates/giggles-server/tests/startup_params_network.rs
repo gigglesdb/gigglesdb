@@ -25,13 +25,15 @@ async fn frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
 
 #[tokio::test]
 async fn case_folded_timezone_and_duplicate_on_postgresql_listener() {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "startup-params-{}-{}",
+        "startup-params-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&path).unwrap();
     let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();

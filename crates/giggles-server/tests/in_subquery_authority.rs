@@ -27,14 +27,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path =
             PathBuf::from(std::env::var_os("TEMP").expect("task TEMP configured")).join(format!(
-                "in-authority-{}-{}",
+                "in-authority-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
         let directory = Directory(path);
         std::fs::create_dir_all(&directory.0).unwrap();

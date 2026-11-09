@@ -23,13 +23,15 @@ async fn primary_key_update_moves_rows_and_checks_wire_authorization() {
             .to_ascii_lowercase()
             .starts_with("j:/gigglesdb-work/")
     );
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = root.join(format!(
-        "primary-key-update-network-{}-{}",
+        "primary-key-update-network-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&path).unwrap();
     let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();

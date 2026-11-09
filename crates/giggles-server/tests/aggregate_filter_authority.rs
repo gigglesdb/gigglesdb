@@ -25,18 +25,20 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::var_os("TEMP")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("giggles-core-artifacts")
             })
             .join(format!(
-                "aggregate-authority-{}-{}",
+                "aggregate-authority-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
         std::fs::create_dir_all(&path).unwrap();
         let directory = Directory(path);

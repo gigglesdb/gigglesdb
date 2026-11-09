@@ -2,11 +2,11 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 // Parallel tests share a process id and may observe equal clock readings;
 // the counter keeps every fixture root distinct.
-static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 struct Cli {
     root: PathBuf,
     seq: usize,
@@ -16,11 +16,11 @@ impl Cli {
         let root = std::env::temp_dir().join(format!(
             "gd-query-process-{}-{}-{}",
             std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&root).unwrap();
         Self { root, seq: 0 }
