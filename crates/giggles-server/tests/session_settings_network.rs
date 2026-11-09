@@ -82,6 +82,7 @@ impl Fixture {
             .connect(NoTls)
             .await
             .unwrap();
+        assert_eq!(connection.parameter("server_version"), Some("18.0"));
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -105,6 +106,68 @@ fn values(messages: &[SimpleQueryMessage]) -> Vec<String> {
 }
 fn code(error: tokio_postgres::Error) -> String {
     error.code().unwrap().code().into()
+}
+
+#[tokio::test]
+async fn postgres_18_version_settings_agree_across_protocol_surfaces() {
+    let fixture = Fixture::new().await;
+    let client = fixture.client().await;
+    for (name, expected) in [("server_version", "18.0"), ("server_version_num", "180000")] {
+        for sql in [
+            format!("SHOW {name}"),
+            format!("SELECT current_setting('{name}')"),
+            format!("SELECT setting FROM pg_catalog.pg_settings WHERE name = '{name}'"),
+        ] {
+            assert_eq!(
+                values(&client.simple_query(&sql).await.unwrap()),
+                [expected]
+            );
+            let row = client.query_one(&sql, &[]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), expected);
+        }
+        for sql in [
+            format!("SET {name} = '1'"),
+            format!("SELECT set_config('{name}', '1', false)"),
+        ] {
+            assert_eq!(code(client.simple_query(&sql).await.unwrap_err()), "22023");
+        }
+    }
+    let version: String = client
+        .query_one("SELECT version()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version.starts_with("PostgreSQL 18.0 (GigglesDB "));
+    for (path, expected) in [("", "{}"), ("missing, public, public", r#"{"public"}"#)] {
+        client
+            .batch_execute(&format!("SET search_path = '{path}'"))
+            .await
+            .unwrap();
+        assert_eq!(
+            values(
+                &client
+                    .simple_query("SELECT current_schemas(false)")
+                    .await
+                    .unwrap()
+            ),
+            [expected]
+        );
+        let schemas: Vec<String> = client
+            .query_one("SELECT current_schemas(false)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            schemas,
+            if path.is_empty() {
+                vec![]
+            } else {
+                vec!["public"]
+            }
+        );
+    }
+    drop(client);
+    fixture.stop().await;
 }
 
 struct Cert {

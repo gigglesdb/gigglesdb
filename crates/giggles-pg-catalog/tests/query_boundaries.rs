@@ -70,7 +70,7 @@ fn detected_identity_and_startup_are_truthful_and_execution_scoped() {
         let Value::Text(v) = &r.rows[0][0] else {
             panic!()
         };
-        assert!(v.starts_with("GigglesDB "));
+        assert!(v.starts_with("PostgreSQL 18.0 (GigglesDB "));
     }
     let sql = "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time";
     let p = plan(sql).unwrap().unwrap();

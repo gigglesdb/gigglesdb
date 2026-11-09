@@ -123,6 +123,8 @@ pub struct CatalogSnapshot {
     pub indexes: Vec<IndexDef>,
     pub user: String,
     pub database: String,
+    /// Existing schemas in the session's explicit search path, in lookup order.
+    pub search_path: Vec<String>,
     /// All snapshot login and nonlogin roles, including exactly one OID 10.
     /// Defaults to `giggles` (OID 10), all flags true and connlimit -1.
     pub roles: Vec<RoleDef>,
@@ -153,6 +155,7 @@ impl Default for CatalogSnapshot {
             indexes: Vec::new(),
             user: "giggles".into(),
             database: "giggles".into(),
+            search_path: vec!["public".into()],
             roles: vec![RoleDef {
                 oid: 10,
                 name: "giggles".into(),

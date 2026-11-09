@@ -889,14 +889,18 @@ fn inventory_and_columns_cover_every_modeled_table_and_view() {
 }
 
 #[test]
-fn effective_primary_key_not_null_is_reported_without_pg_constraint_check_rows() {
+fn effective_primary_key_not_null_has_pg18_constraint_rows() {
     let mut snapshot = snapshot();
     snapshot.tables[0].columns[0].not_null = false;
     assert_eq!(run(&snapshot, "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'g3_items' AND column_name = 'id'").rows, vec![vec![Value::Text("NO".into())]]);
     assert_eq!(run(&snapshot, "SELECT constraint_type FROM information_schema.table_constraints WHERE constraint_schema = 'public' AND constraint_name = 'g3_items_id_not_null'").rows, vec![vec![Value::Text("CHECK".into())]]);
-    // Synthetic information_schema CHECK rows are presentation metadata only.
+    // PG18 exposes NOT NULL as contype='n', while information_schema uses CHECK.
     assert_eq!(run(&snapshot, "SELECT c.conname, c.contype FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = 'public' ORDER BY c.conname").rows, vec![
+        vec![Value::Text("g3_items_id_not_null".into()), Value::Text("n".into())],
+        vec![Value::Text("g3_items_name_not_null".into()), Value::Text("n".into())],
         vec![Value::Text("g3_items_pkey".into()), Value::Text("p".into())],
+        vec![Value::Text("g3_pair_a_not_null".into()), Value::Text("n".into())],
+        vec![Value::Text("g3_pair_b_not_null".into()), Value::Text("n".into())],
         vec![Value::Text("g3_pair_pkey".into()), Value::Text("p".into())],
     ]);
 }

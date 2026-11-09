@@ -138,7 +138,7 @@ To use pgwire, use `tokio-postgres = "=0.7.15"` with
 certificate/private key, use TLS hostname `localhost`, startup user/database
 `giggles`, and port7433. These startup names never select authority; the verified
 leaf fingerprint does. An executable integration example is in `tests/network.rs`
-(`Fixture::pg`). No password is needed or accepted. Server version14.0 is a wire
+(`Fixture::pg`). No password is needed or accepted. Server version 18.0 is a wire
 parameter for driver negotiation, not a PostgreSQL implementation claim.
 
 For DataGrip, select PostgreSQL, host `localhost`, port `7433`, user `giggles`,

@@ -3033,7 +3033,7 @@ async fn catalog_multiple_granted_tables_composite_key_order_and_empty_visible_s
             .collect::<Vec<_>>(),
         ["app", "composite"]
     );
-    let key = pg.query_one("SELECT conkey FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid WHERE t.relname='composite'", &[]).await.unwrap();
+    let key = pg.query_one("SELECT conkey FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid WHERE t.relname='composite' AND c.contype='p'", &[]).await.unwrap();
     assert_eq!(key.get::<_, Vec<i16>>(0), [2, 1]);
     let attrs = pg.query("SELECT attname, attnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid WHERE t.relname='composite' ORDER BY attnum", &[]).await.unwrap();
     assert_eq!(attrs.len(), 3);
@@ -3095,7 +3095,7 @@ async fn installed_datagrip_detection_and_startup_queries() {
     assert_eq!(pg.query(&typed, &[&28i64]).await.unwrap().len(), 1);
 
     let version: String = pg.query_one("select version()", &[]).await.unwrap().get(0);
-    assert!(version.starts_with("GigglesDB "));
+    assert!(version.starts_with("PostgreSQL 18.0 (GigglesDB "));
     let sql = "select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time";
     let p = pg.prepare(sql).await.unwrap();
     let first: i64 = pg.query_one(&p, &[]).await.unwrap().get(0);

@@ -128,7 +128,11 @@ fn captured_application_discovery() {
     ];
     for (i, sql) in cases.iter().enumerate() {
         let r = run(sql, &[Value::Int(2200)]);
-        assert_eq!(r.rows.len(), if i == 2 { 2 } else { 1 }, "case {i}");
+        assert_eq!(
+            r.rows.len(),
+            if matches!(i, 2 | 5) { 2 } else { 1 },
+            "case {i}"
+        );
         let get = |row: usize, name: &str| {
             r.rows[row][r.fields.iter().position(|f| f.name == name).expect(name)].clone()
         };
@@ -169,7 +173,13 @@ fn captured_application_discovery() {
                 assert_eq!(get(0, "con_expression"), Value::Null);
                 assert_eq!(get(0, "excl_operators_str"), Value::Array(vec![]));
             }
-            5 => assert_eq!(r.rows, vec![vec![Value::Int(65566)]]),
+            5 => assert_eq!(
+                r.rows,
+                vec![
+                    vec![Value::Int(65566)],
+                    vec![Value::Int(i64::from(u32::MAX))]
+                ]
+            ),
             6 => {
                 for name in ["col_idx", "column_position"] {
                     assert_eq!(get(0, name), Value::Int(1));

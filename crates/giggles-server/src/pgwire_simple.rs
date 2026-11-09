@@ -344,7 +344,10 @@ impl State {
                 &catalog_wire::with_application_rows(
                     session,
                     &plan,
-                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?,
+                    catalog_wire::with_search_path(
+                        catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?,
+                        &self.settings.current.search_path,
+                    ),
                 )?,
                 &[],
             )

@@ -1480,9 +1480,12 @@ impl State {
                             &catalog_wire::with_application_rows(
                                 session,
                                 plan,
-                                catalog_wire::snapshot(
-                                    session, current, tables, indexes, typmods, types,
-                                )?,
+                                catalog_wire::with_search_path(
+                                    catalog_wire::snapshot(
+                                        session, current, tables, indexes, typmods, types,
+                                    )?,
+                                    &self.settings.current.search_path,
+                                ),
                             )?,
                             &p.catalog_params,
                         )
@@ -1796,7 +1799,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     let key = [backend.pid.to_be_bytes(), backend.secret.to_be_bytes()].concat();
     frame(b'K', &key, &mut out).map_err(io::Error::other)?;
     for (key, value) in [
-        ("server_version", "14.0"),
+        ("server_version", "18.0"),
         ("client_encoding", "UTF8"),
         ("server_encoding", "UTF8"),
         ("standard_conforming_strings", "on"),

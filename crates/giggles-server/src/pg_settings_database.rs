@@ -171,6 +171,7 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "default_tablespace" => Ok(Show::DefaultTablespace),
         "default_table_access_method" => Ok(Show::DefaultTableAccessMethod),
         "server_version" => Ok(Show::ServerVersion),
+        "server_version_num" => Ok(Show::ServerVersionNum),
         _ => Err("42704"),
     }
 }
@@ -221,7 +222,10 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
     let name = p.name()?;
     if matches!(
         name,
-        Show::ServerVersion | Show::TransactionIsolation | Show::TransactionReadOnly
+        Show::ServerVersion
+            | Show::ServerVersionNum
+            | Show::TransactionIsolation
+            | Show::TransactionReadOnly
     ) {
         return Err("22023");
     }
@@ -428,7 +432,10 @@ pub(super) fn function_assignment(name: &str, value: &str, local: bool) -> Resul
     let name = lookup_name(name)?;
     if matches!(
         name,
-        Show::ServerVersion | Show::TransactionIsolation | Show::TransactionReadOnly
+        Show::ServerVersion
+            | Show::ServerVersionNum
+            | Show::TransactionIsolation
+            | Show::TransactionReadOnly
     ) {
         return Err("22023");
     }

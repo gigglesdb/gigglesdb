@@ -73,7 +73,7 @@ fn secondary_relations_keys_flags_and_primary_constraint() {
         ]
     );
     assert_eq!(
-        run("SELECT conname,contype,conkey,conindid FROM pg_constraint").rows,
+        run("SELECT conname,contype,conkey,conindid FROM pg_constraint WHERE contype='p'").rows,
         vec![vec![
             s("t_pkey"),
             s("p"),
@@ -259,7 +259,7 @@ fn supported_inner_joins_return_all_indexes_and_constraintdef() {
     sn.tables[0].columns[2].name = "select".into();
     assert_eq!(
         run_on(
-            "SELECT pg_get_constraintdef(oid),pg_get_constraintdef(oid,true) FROM pg_constraint",
+            "SELECT pg_get_constraintdef(oid),pg_get_constraintdef(oid,true) FROM pg_constraint WHERE contype='p'",
             &sn
         )
         .rows,
@@ -404,7 +404,7 @@ fn all_pg18_index_flags_and_secondary_only_table() {
         run_on("SELECT relhasindex FROM pg_class WHERE oid=65576", &sn).rows,
         vec![vec![B(true)]]
     );
-    assert!(run_on("SELECT oid FROM pg_constraint", &sn).rows.is_empty());
+    assert!(run_on("SELECT oid FROM pg_constraint WHERE contype='p'", &sn).rows.is_empty());
     sn.indexes.clear();
     assert_eq!(
         run_on("SELECT relhasindex FROM pg_class WHERE oid=65576", &sn).rows,

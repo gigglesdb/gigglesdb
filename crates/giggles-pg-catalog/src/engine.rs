@@ -261,7 +261,10 @@ impl Visitor for Scan {
     fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
         let p = object(n);
         let is_catalog = match p.as_slice() {
-            [n] => unqualified_catalog(n) || n == "pg_options_to_table",
+            [n] => {
+                unqualified_catalog(n)
+                    || matches!(n.as_str(), "pg_options_to_table" | "pg_get_sequence_data")
+            }
             [s, _] => s == "pg_catalog" || s == "information_schema",
             _ => false,
         };
@@ -850,7 +853,16 @@ impl Compiler {
             if series {
                 reject_local_series_reference(&from.relation, &schema)?;
             }
-            let (rhs, rs) = self.table(&from.relation, outer).map_err(|error| {
+            let mut function_outer = schema.clone();
+            function_outer.extend(outer.iter().cloned());
+            let table_outer = if matches!(&from.relation, a::TableFactor::Table { name, args: Some(_), .. }
+                if object(name).last().is_some_and(|n| n == "pg_get_sequence_data"))
+            {
+                &function_outer
+            } else {
+                outer
+            };
+            let (rhs, rs) = self.table(&from.relation, table_outer).map_err(|error| {
                 if series && operand_start != 0 && error == Error::UnknownColumn {
                     Error::Unsupported
                 } else {
@@ -1234,6 +1246,36 @@ impl Compiler {
                                 Field {
                                     name: "version".into(),
                                     data_type: PgType::Text,
+                                },
+                            ],
+                            alias,
+                            n,
+                        )
+                    } else if n == "pg_get_sequence_data"
+                        && args.args.len() == 1
+                        && args.settings.is_none()
+                    {
+                        let mut es = self.args(&args.args, outer)?;
+                        expect(&mut es[0], PgType::Oid)?;
+                        no_set_or_window(&es[0])?;
+                        if !matches!(&es[0].kind, K::Column(i)
+                            if outer[*i].qualifier == "pg_sequence"
+                                && outer[*i].field.name == "seqrelid")
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        // The catalog exposes no sequence rows. This PG18
+                        // dump inventory therefore has a typed empty result.
+                        (
+                            Source::Empty,
+                            vec![
+                                Field {
+                                    name: "last_value".into(),
+                                    data_type: PgType::Int8,
+                                },
+                                Field {
+                                    name: "is_called".into(),
+                                    data_type: PgType::Bool,
                                 },
                             ],
                             alias,
@@ -3794,9 +3836,9 @@ impl Runtime<'_> {
                 S(output)
             }
             "version" => S(concat!(
-                "GigglesDB ",
+                "PostgreSQL 18.0 (GigglesDB ",
                 env!("CARGO_PKG_VERSION"),
-                " (bounded PostgreSQL 14 wire compatibility)"
+                ")"
             )
             .into()),
             // A standalone GigglesDB server is always a primary, never a
@@ -3809,14 +3851,19 @@ impl Runtime<'_> {
             "current_user" | "session_user" | "current_role" | "user" => {
                 S(self.snapshot.user.clone())
             }
-            "current_schema" => S("public".into()),
+            "current_schema" => self
+                .snapshot
+                .search_path
+                .first()
+                .map(|s| S(s.clone()))
+                .unwrap_or(N),
             "current_schemas" => {
                 let b = boolean(v[0].clone())?.ok_or(Error::Type)?;
-                Value::Array(if b {
-                    vec![S("pg_catalog".into()), S("public".into())]
-                } else {
-                    vec![S("public".into())]
-                })
+                let mut path = self.snapshot.search_path.clone();
+                if b && !path.iter().any(|s| s == "pg_catalog") {
+                    path.insert(0, "pg_catalog".into());
+                }
+                Value::Array(path.into_iter().map(S).collect())
             }
             "replace" => {
                 let s = text(v[0].clone())?;
@@ -3988,7 +4035,9 @@ impl Runtime<'_> {
                 self.catalogs["pg_constraint"]
                     .rows
                     .iter()
-                    .find(|r| r[0] == I(oid) && r[3] == S("p".into()))
+                    .find(|r| {
+                        r[0] == I(oid) && matches!(&r[3], S(kind) if kind == "p" || kind == "n")
+                    })
                     .and_then(|constraint| match &constraint[6] {
                         Value::Array(keys) => keys
                             .iter()
@@ -4002,10 +4051,17 @@ impl Runtime<'_> {
                                         _ => None,
                                     })
                             })
-                            .collect::<Option<Vec<_>>>(),
+                            .collect::<Option<Vec<_>>>()
+                            .map(|keys| (constraint[3] == S("n".into()), keys)),
                         _ => None,
                     })
-                    .map(|keys| S(format!("PRIMARY KEY ({})", keys.join(", "))))
+                    .map(|(not_null, keys)| {
+                        if not_null {
+                            S(format!("NOT NULL {}", keys.join(", ")))
+                        } else {
+                            S(format!("PRIMARY KEY ({})", keys.join(", ")))
+                        }
+                    })
                     .unwrap_or(N)
             }
             "pg_get_indexdef" => {

@@ -244,6 +244,24 @@ pub(crate) fn application_schemas(
         .collect()
 }
 
+pub(crate) fn with_search_path(
+    mut snapshot: giggles_pg_catalog::CatalogSnapshot,
+    path: &str,
+) -> giggles_pg_catalog::CatalogSnapshot {
+    let mut seen = std::collections::BTreeSet::new();
+    snapshot.search_path = giggles_core::relational::schema_search_path(path, &snapshot.user)
+        .into_iter()
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                "pg_catalog" | "information_schema" | "public"
+            ) || snapshot.schemas.contains_key(name)
+        })
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+    snapshot
+}
+
 pub(crate) fn with_application_rows(
     session: &mut crate::Session,
     plan: &giggles_pg_catalog::Plan,

@@ -108,6 +108,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("relfrozenxid", T::Xid),
             ("relispopulated", T::Bool),
             ("relminmxid", T::Xid),
+            ("relallfrozen", T::Int4),
         ],
         "pg_attribute" => &[
             ("attrelid", T::Oid),
@@ -213,6 +214,9 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("conexclop", T::OidArray),
             ("conparentid", T::Oid),
             ("conperiod", T::Bool),
+            ("conenforced", T::Bool),
+            ("conislocal", T::Bool),
+            ("coninhcount", T::Int2),
         ],
         "pg_description" => &[
             ("objoid", T::Oid),
@@ -1709,6 +1713,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             I(if row[3] == s("r") { 2 } else { 0 }),
             B(true),
             I(if row[3] == s("r") { 1 } else { 0 }),
+            I(0),
         ]);
     }
     for ty in &snapshot.user_types {
@@ -1777,12 +1782,61 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             _ => 0,
         };
         let (storage, align) = type_layout(oid);
-        // PG18 represents an unset statistics target as NULL; pg_dump's PG14
-        // query variant requires its equivalent -1 sentinel to suppress ALTERs.
-        row.extend([I(-1), s(storage), s(align), N, s(""), B(false), N]);
+        // PG18 represents an unset statistics target as NULL.
+        row.extend([N, s(storage), s(align), N, s(""), B(false), N]);
+    }
+    // PG18 discovers NOT NULL via pg_constraint rather than attnotnull.
+    // These are snapshot-only identities; no persisted format is changed.
+    let mut used_oids = all
+        .values()
+        .flat_map(|relation| {
+            let oid = relation.fields.iter().position(|field| field.name == "oid");
+            relation.rows.iter().filter_map(move |row| {
+                oid.and_then(|i| match row[i] {
+                    I(oid) => Some(oid),
+                    _ => None,
+                })
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let mut next_oid = i64::from(u32::MAX);
+    let mut tables = snapshot.tables.iter().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.id);
+    for table in tables {
+        for (i, column) in table.columns.iter().enumerate() {
+            if !column.not_null && !table.primary_key.contains(&i) {
+                continue;
+            }
+            while !used_oids.insert(next_oid) {
+                next_oid -= 1;
+            }
+            all.get_mut("pg_constraint").unwrap().rows.push(vec![
+                I(next_oid),
+                s(&format!("{}_{}_not_null", table.name, column.name)),
+                I(i64::from(snapshot.table_schema(table.id).1)),
+                s("n"),
+                I(i64::from(table_oid(table.id)?)),
+                I(0),
+                Value::Array(vec![I(i as i64 + 1)]),
+                I(0),
+                N,
+                B(false),
+                B(false),
+                B(true),
+                N,
+                I(0),
+                s(" "),
+                s(" "),
+                s(" "),
+                B(false),
+                N,
+                N,
+            ]);
+            next_oid -= 1;
+        }
     }
     for row in &mut all.get_mut("pg_constraint").unwrap().rows {
-        row.extend([I(0), B(false)]);
+        row.extend([I(0), B(false), B(true), B(true), I(0)]);
     }
     for row in &mut all.get_mut("pg_database").unwrap().rows {
         row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N]);

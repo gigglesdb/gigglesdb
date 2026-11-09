@@ -9,6 +9,93 @@ fn run(sql: &str) -> Result<ResultSet, Error> {
 }
 
 #[test]
+fn pg18_dump_sequence_inventory_is_typed_and_empty() {
+    let result = run("SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle, last_value, is_called FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY seqrelid").unwrap();
+    assert!(result.rows.is_empty());
+    assert_eq!(result.fields[8].data_type, PgType::Int8);
+    assert_eq!(result.fields[9].data_type, PgType::Bool);
+    assert!(plan("SELECT * FROM pg_get_sequence_data(123::oid)").is_err());
+    assert!(!matches!(
+        plan("SELECT * FROM public.pg_get_sequence_data(123::oid)"),
+        Ok(Some(_))
+    ));
+}
+
+#[test]
+fn pg18_dump_not_null_constraint_join_and_deparse() {
+    let snapshot = CatalogSnapshot {
+        tables: vec![TableDef {
+            id: 10,
+            name: "version_probe".into(),
+            primary_key: vec![0],
+            columns: vec![
+                ColumnDef {
+                    id: 100,
+                    name: "id".into(),
+                    data_type: ScalarType::Integer,
+                    not_null: false,
+                },
+                ColumnDef {
+                    id: 101,
+                    name: "value".into(),
+                    data_type: ScalarType::Text,
+                    not_null: true,
+                },
+                ColumnDef {
+                    id: 102,
+                    name: "optional".into(),
+                    data_type: ScalarType::Text,
+                    not_null: false,
+                },
+            ],
+        }],
+        ..CatalogSnapshot::default()
+    };
+    // PG18.6 pg_dump reads these columns with this NOT NULL join condition.
+    let sql = "SELECT a.attname,a.attstattarget,co.conname,co.conenforced,co.conislocal,co.coninhcount,co.connoinherit,pg_get_constraintdef(co.oid),c.relallfrozen FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid LEFT JOIN pg_constraint co ON (a.attrelid=co.conrelid AND co.contype='n' AND co.conkey=array[a.attnum]) WHERE c.relname='version_probe' AND a.attnum>0 ORDER BY a.attnum";
+    let result = execute(&plan(sql).unwrap().unwrap(), &snapshot, &[]).unwrap();
+    assert_eq!(result.fields[8].data_type, PgType::Int4);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Text("id".into()),
+                Value::Null,
+                Value::Text("version_probe_id_not_null".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Text("NOT NULL id".into()),
+                Value::Int(0)
+            ],
+            vec![
+                Value::Text("value".into()),
+                Value::Null,
+                Value::Text("version_probe_value_not_null".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Text("NOT NULL value".into()),
+                Value::Int(0)
+            ],
+            vec![
+                Value::Text("optional".into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Int(0)
+            ],
+        ]
+    );
+}
+
+#[test]
 fn namespace_inventory_computes_defaults_without_fabricating_acl_metadata() {
     let result = run("SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n").unwrap();
     assert_eq!(result.fields[4].data_type, PgType::AclItemArray);
