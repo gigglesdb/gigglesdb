@@ -114,6 +114,102 @@ pub(crate) fn snapshot(
     }
 }
 
+/// Only the finite catalog scalar types can enter its evaluator.
+pub(crate) fn application_schemas(
+    snapshot: &giggles_pg_catalog::CatalogSnapshot,
+) -> std::collections::BTreeMap<String, Vec<Field>> {
+    use giggles_pg_catalog::ScalarType as S;
+    snapshot
+        .tables
+        .iter()
+        .filter_map(|table| {
+            let fields = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| {
+                    !(table.primary_key == [*i]
+                        && c.name == giggles_core::relational::HIDDEN_ROWID
+                        && c.data_type == S::BigInt
+                        && c.not_null)
+                })
+                .map(|(_, column)| {
+                    Some(Field {
+                        name: column.name.clone(),
+                        data_type: match column.data_type {
+                            S::Boolean => PgType::Bool,
+                            S::SmallInt => PgType::Int2,
+                            S::Integer => PgType::Int4,
+                            S::BigInt => PgType::Int8,
+                            S::Text | S::Varchar | S::Bpchar => PgType::Text,
+                            S::Bytes => PgType::Bytea,
+                            S::Numeric => PgType::Numeric,
+                            S::Real => PgType::Float4,
+                            S::DoublePrecision => PgType::Float8,
+                            _ => return None,
+                        },
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((table.name.clone(), fields))
+        })
+        .collect()
+}
+
+pub(crate) fn with_application_rows(
+    session: &mut crate::Session,
+    plan: &giggles_pg_catalog::Plan,
+    mut snapshot: giggles_pg_catalog::CatalogSnapshot,
+) -> Result<giggles_pg_catalog::CatalogSnapshot> {
+    use giggles_core::relational::Value as V;
+    let mut bytes = 0usize;
+    for (name, fields) in plan.user_relations() {
+        // Identifiers came from the binder; quote them again for the core parser.
+        let sql = format!(
+            "SELECT * FROM public.\"{}\" LIMIT {}",
+            name.replace('"', "\"\""),
+            giggles_pg_catalog::MAX_ROWS + 1
+        );
+        let result = session
+            .execute_sql(&sql, &[])
+            .map_err(|e| crate::service::sqlstate(&e))?;
+        if result.rows.len() > giggles_pg_catalog::MAX_ROWS {
+            return Err("54000");
+        }
+        let mut rows = Vec::new();
+        for row in result.rows {
+            let mut values = Vec::new();
+            for value in row.values {
+                let value = match value {
+                    V::Null => Value::Null,
+                    V::Bool(v) => Value::Bool(v),
+                    V::Int(v) => Value::Int(v),
+                    V::Text(v) => Value::Text(v),
+                    V::Bytes(v) => Value::Bytes(v),
+                    V::Numeric(v) => Value::Numeric(v),
+                    V::Float4(v) => Value::Float4(v),
+                    V::Float8(v) => Value::Float8(v),
+                    _ => return Err("0A000"),
+                };
+                bytes = bytes.checked_add(value_bytes(&value)?).ok_or("54000")?;
+                if bytes > giggles_pg_catalog::MAX_BYTES {
+                    return Err("54000");
+                }
+                values.push(value);
+            }
+            rows.push(values);
+        }
+        snapshot.user_relations.insert(
+            name.clone(),
+            ResultSet {
+                fields: fields.clone(),
+                rows,
+            },
+        );
+    }
+    Ok(snapshot)
+}
+
 /// Presentation-only role rows and owners of the already authorization-filtered
 /// tables, read from the role registry so `pg_get_userbyid(relowner)` names the
 /// creating role as PostgreSQL does. OID 10 stays the bootstrap row; a registry

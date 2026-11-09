@@ -855,3 +855,50 @@ fn temporal_catalog_identity_width_and_category() {
         ]
     );
 }
+
+#[test]
+fn mixed_snapshot_input_limit() {
+    let sn = snapshot();
+    let fields = vec![Field {
+        name: "id".into(),
+        data_type: PgType::Int4,
+    }];
+    let schemas = std::collections::BTreeMap::from([("app".into(), fields.clone())]);
+    let mixed = plan_gateway_with_relations(
+        "SELECT count(t.*) FROM pg_class c LEFT JOIN app t ON true WHERE c.relname = 'absent'",
+        &schemas,
+    )
+    .unwrap()
+    .unwrap();
+    let mut sn = sn;
+    sn.user_relations.insert(
+        "app".into(),
+        ResultSet {
+            fields,
+            rows: vec![vec![Value::Int(1)]; MAX_ROWS + 1],
+        },
+    );
+    assert_eq!(execute(&mixed, &sn, &[]), Err(Error::Limit));
+    let counts = plan_gateway_with_relations(
+        "SELECT count(t.*), count(*), count(t.id) FROM pg_class c LEFT JOIN app t ON true WHERE c.oid = 1259",
+        &schemas,
+    ).unwrap().unwrap();
+    sn.user_relations.get_mut("app").unwrap().rows.clear();
+    assert_eq!(
+        execute(&counts, &sn, &[]).unwrap().rows,
+        vec![vec![i(0), i(1), i(0)]]
+    );
+    sn.user_relations
+        .get_mut("app")
+        .unwrap()
+        .rows
+        .push(vec![Value::Null]);
+    assert_eq!(
+        execute(&counts, &sn, &[]).unwrap().rows,
+        vec![vec![i(1), i(1), i(0)]]
+    );
+    let empty = plan("SELECT count(*) FROM pg_class WHERE oid = 0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(execute(&empty, &sn, &[]).unwrap().rows, vec![vec![i(0)]]);
+}

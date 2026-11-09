@@ -15,11 +15,15 @@ use std::{collections::BTreeMap, ops::ControlFlow};
 #[derive(Debug, Clone)]
 pub struct Plan {
     query: Query,
+    user_relations: BTreeMap<String, Vec<Field>>,
     parameters: usize,
     parameter_types: Vec<PgType>,
     projection_parameters: bool,
 }
 impl Plan {
+    pub fn user_relations(&self) -> &BTreeMap<String, Vec<Field>> {
+        &self.user_relations
+    }
     /// Conservative wire widening is safe only when no SELECT projection
     /// (including a derived query) contains a parameter expression.
     pub fn allows_numeric_input_override(&self) -> bool {
@@ -115,6 +119,8 @@ struct Query {
     aggregate: bool,
 }
 struct Compiler {
+    user_relations: BTreeMap<String, Vec<Field>>,
+    used_relations: BTreeMap<String, Vec<Field>>,
     parameters: usize,
     qcount: usize,
     sources: usize,
@@ -213,15 +219,22 @@ fn binary(l: E, op: Op, r: E) -> E {
 
 /// Parse/classify structurally. No snapshot or authority is cached in a plan.
 pub fn plan(sql: &str) -> R<Option<Plan>> {
-    plan_inner(sql, false)
+    plan_inner(sql, false, None)
 }
 
 /// Classify a gateway query, reserving implicit catalog evaluation for literal
 /// keepalives. Other scalars must pass the core binder and gateway authority.
 pub fn plan_gateway(sql: &str) -> R<Option<Plan>> {
-    plan_inner(sql, true)
+    plan_inner(sql, true, None)
 }
 
+/// Bind mixed read-only queries against caller-authorized application schemas.
+pub fn plan_gateway_with_relations(
+    sql: &str,
+    relations: &BTreeMap<String, Vec<Field>>,
+) -> R<Option<Plan>> {
+    plan_inner(sql, true, Some(relations))
+}
 struct Scan {
     catalog: bool,
     explicit_catalog: bool,
@@ -390,7 +403,11 @@ fn constructor(token: &Token) -> bool {
     !leaf
 }
 
-fn plan_inner(sql: &str, gateway: bool) -> R<Option<Plan>> {
+fn plan_inner(
+    sql: &str,
+    gateway: bool,
+    relations: Option<&BTreeMap<String, Vec<Field>>>,
+) -> R<Option<Plan>> {
     if sql.len() > MAX_SQL {
         return Err(Error::Limit);
     }
@@ -437,7 +454,7 @@ fn plan_inner(sql: &str, gateway: bool) -> R<Option<Plan>> {
     if scan.mutation || statements.len() != 1 {
         return Err(Error::Mutation);
     }
-    if scan.user {
+    if scan.user && relations.is_none() {
         return Err(Error::MixedRelations);
     }
     // Without explicit catalog context the core binder owns scalar semantics.
@@ -450,13 +467,19 @@ fn plan_inner(sql: &str, gateway: bool) -> R<Option<Plan>> {
     let mut projection_parameters = ProjectionParameters(false);
     let _ = q.visit(&mut projection_parameters);
     let mut c = Compiler {
+        user_relations: relations.cloned().unwrap_or_default(),
+        used_relations: BTreeMap::new(),
         parameters: 0,
         qcount: 0,
         sources: 0,
         ctes: BTreeMap::new(),
     };
     let query = c.query(q, &vec![])?;
-    finish_plan(query, c.parameters, projection_parameters.0)
+    let mut plan = finish_plan(query, c.parameters, projection_parameters.0)?;
+    if let Some(plan) = &mut plan {
+        plan.user_relations = c.used_relations;
+    }
+    Ok(plan)
 }
 fn finish_plan(
     mut query: Query,
@@ -474,6 +497,7 @@ fn finish_plan(
         .collect::<Vec<_>>();
     join_selection::place(&mut query, &parameter_types);
     Ok(Some(Plan {
+        user_relations: BTreeMap::new(),
         projection_parameters,
         query,
         parameters,
@@ -505,7 +529,31 @@ pub fn execute_with_startup(
         .map(|(v, t)| cast(v.clone(), *t))
         .collect::<R<Vec<_>>>()?;
     validate_values(&parameters)?;
-    let catalogs = catalog::build(snapshot)?;
+    let mut catalogs = catalog::build(snapshot)?;
+    let mut input_bytes = 0;
+    for (name, fields) in &plan.user_relations {
+        let relation = snapshot
+            .user_relations
+            .get(name)
+            .ok_or(Error::InvalidSnapshot)?;
+        if relation.fields != *fields || catalogs.contains_key(name) {
+            return Err(Error::InvalidSnapshot);
+        }
+        for (i, row) in relation.rows.iter().enumerate() {
+            if row.len() != fields.len() {
+                return Err(Error::InvalidSnapshot);
+            }
+            validate_values(row)?;
+            admit(&relation.rows[..i], row, &mut input_bytes)?;
+        }
+        catalogs.insert(
+            name.clone(),
+            catalog::Relation {
+                fields: fields.clone(),
+                rows: relation.rows.clone(),
+            },
+        );
+    }
     let mut rt = Runtime {
         catalogs: &catalogs,
         snapshot,
@@ -1065,7 +1113,11 @@ impl Compiler {
                             != if args.is_some() {
                                 "pg_catalog"
                             } else {
-                                catalog::relation_namespace(&n)
+                                if self.user_relations.contains_key(&n) || p[0] == "public" {
+                                    "public"
+                                } else {
+                                    catalog::relation_namespace(&n)
+                                }
                             }
                 {
                     return Err(Error::Unsupported);
@@ -1147,9 +1199,14 @@ impl Compiler {
                         let q = self.ctes[&n].clone();
                         let fields = q.fields.clone();
                         (Source::Derived(q), fields, alias, n)
+                    } else if let Some(fields) = self.user_relations.get(&n) {
+                        self.used_relations.insert(n.clone(), fields.clone());
+                        (Source::Catalog(n.clone()), fields.clone(), alias, n)
                     } else {
-                        if p.len() == 1 && !unqualified_catalog(&n) {
-                            return Err(Error::Unsupported);
+                        if p.len() == 1 && !unqualified_catalog(&n)
+                            || p.len() == 2 && p[0] == "public"
+                        {
+                            return Err(Error::MixedRelations);
                         }
                         (
                             Source::Catalog(n.clone()),
@@ -1221,7 +1278,8 @@ impl Compiler {
             default
         };
         let tableoid = match &source {
-            Source::Catalog(name) => catalog::tableoid(name),
+            Source::Catalog(name) => catalog::tableoid(name)
+                .or_else(|| self.user_relations.contains_key(name).then_some(0)),
             _ => None,
         };
         let mut schema: Schema = fields
@@ -1672,6 +1730,24 @@ impl Compiler {
                     }
                     let arg = match &args.args[0] {
                         a::FunctionArg::Unnamed(a::FunctionArgExpr::Wildcard) => None,
+                        a::FunctionArg::Unnamed(a::FunctionArgExpr::QualifiedWildcard(name)) => {
+                            let parts = object(name);
+                            let [qualifier] = parts.as_slice() else {
+                                return Err(Error::Unsupported);
+                            };
+                            // A physical row marker survives even when every user field
+                            // is NULL, and becomes NULL only through outer-join extension.
+                            let (i, col) = schema
+                                .iter()
+                                .enumerate()
+                                .find(|(_, c)| {
+                                    c.qualifier == *qualifier
+                                        && c.system
+                                        && c.field.name == "tableoid"
+                                })
+                                .ok_or(Error::Unsupported)?;
+                            Some(Box::new(column(i, col.field.data_type)))
+                        }
                         _ => {
                             let arg = self.args(&args.args, schema)?.remove(0);
                             no_set_or_window(&arg)?;
@@ -2633,7 +2709,9 @@ impl Runtime<'_> {
                 let r = self.catalogs.get(n).ok_or(Error::Unsupported)?;
                 self.charge(r.rows.len())?;
                 let mut rows = r.rows.clone();
-                if let Some(oid) = catalog::tableoid(n) {
+                if let Some(oid) = catalog::tableoid(n)
+                    .or_else(|| self.snapshot.user_relations.contains_key(n).then_some(0))
+                {
                     for row in &mut rows {
                         row.push(Value::Int(i64::from(oid)));
                     }

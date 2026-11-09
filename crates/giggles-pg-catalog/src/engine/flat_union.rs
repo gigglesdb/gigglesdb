@@ -94,6 +94,8 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
     let mut projections = ProjectionParameters(false);
     // The flat wrapper consumes one query and one source, like an operator.
     let mut compiler = Compiler {
+        user_relations: BTreeMap::new(),
+        used_relations: BTreeMap::new(),
         parameters: 0,
         qcount: 1,
         sources: 1,

@@ -252,13 +252,17 @@ impl State {
             // exists; they get the same 42501 that application prepare gives them.
             self.diagnostic.phase = "application SQL";
             return Err("42501");
-        } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic)? {
+        } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();
             let (_, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
             let result = catalog_wire::execute(
                 &plan,
-                &catalog_wire::snapshot(session, tables, indexes, typmods),
+                &catalog_wire::with_application_rows(
+                    session,
+                    &plan,
+                    catalog_wire::snapshot(session, tables, indexes, typmods),
+                )?,
                 &[],
             )
             .map_err(catalog_wire::error)?;

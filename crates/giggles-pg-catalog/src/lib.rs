@@ -2,8 +2,8 @@
 //! No storage, sessions, SQL forwarding, or authority is held by this crate.
 //!
 //! `plan` returns `None` for parsed ordinary application statements. Recognized
-//! catalog statements must be a single read-only SELECT; mixed application
-//! relations, unknown catalog columns/functions, writes, locking, and unsupported
+//! catalog statements must be a single read-only SELECT; application relations
+//! require caller-supplied authorized schemas and rows. Unknown columns/functions, writes, locking, and unsupported
 //! expression forms fail explicitly. Nonrecursive CTEs, UNION, grouped/ordered
 //! array_agg and lateral unnest form part of the finite metadata profile.
 //! Parse errors are `Error::Syntax`, so the caller controls application fallback.
@@ -27,7 +27,9 @@
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
 mod engine;
-pub use engine::{Plan, describe, execute, execute_with_startup, plan, plan_gateway};
+pub use engine::{
+    Plan, describe, execute, execute_with_startup, plan, plan_gateway, plan_gateway_with_relations,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
@@ -93,6 +95,8 @@ pub struct RoleDef {
 /// none of this metadata establishes authentication, membership, or privileges.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    /// Freshly authorized application rows, supplied by the hosting session.
+    pub user_relations: std::collections::BTreeMap<String, ResultSet>,
     pub tables: Vec<TableDef>,
     pub indexes: Vec<IndexDef>,
     pub user: String,
@@ -110,6 +114,7 @@ pub struct CatalogSnapshot {
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
+            user_relations: Default::default(),
             tables: Vec::new(),
             indexes: Vec::new(),
             user: "giggles".into(),

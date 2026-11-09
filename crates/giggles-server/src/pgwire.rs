@@ -608,14 +608,27 @@ fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
 fn core<T>(r: Result<T, CoreError>) -> R<T> {
     r.map_err(|e| crate::service::sqlstate(&e))
 }
-fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_catalog::Plan>> {
+fn catalog_plan(
+    sql: &str,
+    diagnostic: &mut Diagnostic,
+    session: &mut Session,
+) -> R<Option<giggles_pg_catalog::Plan>> {
     diagnostic.phase = "catalog planning";
     // Dependency-bearing sequence calls use the SQL execution context, never
     // the immutable catalog evaluator or the positive table-free allowlist.
     if !Prepared::sequence_dependencies(sql).is_empty() {
         return Ok(None);
     }
-    match giggles_pg_catalog::plan_gateway(sql) {
+    let planned = match giggles_pg_catalog::plan_gateway(sql) {
+        Err(giggles_pg_catalog::Error::MixedRelations) => {
+            let (_, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
+            let snapshot = catalog_wire::snapshot(session, tables, indexes, typmods);
+            let relations = catalog_wire::application_schemas(&snapshot);
+            giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
+        }
+        other => other,
+    };
+    match planned {
         Ok(None) if Prepared::rejects_unsupported_table_free_scalar(sql) => {
             Err(catalog_wire::error(giggles_pg_catalog::Error::Unsupported))
         }
@@ -1079,7 +1092,7 @@ impl State {
                     // exists; they get the same 42501 that application prepare gives them.
                     self.diagnostic.phase = "application prepare";
                     return Err("42501");
-                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic)? {
+                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic, session)? {
                     let (epoch, _, _) = core(session.catalog_snapshot())?;
                     let fields =
                         giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
@@ -1394,7 +1407,11 @@ impl State {
                         self.settings.queried = true;
                         let result = catalog_wire::execute(
                             plan,
-                            &catalog_wire::snapshot(session, tables, indexes, typmods),
+                            &catalog_wire::with_application_rows(
+                                session,
+                                plan,
+                                catalog_wire::snapshot(session, tables, indexes, typmods),
+                            )?,
                             &p.catalog_params,
                         )
                         .map_err(catalog_wire::error)?;
