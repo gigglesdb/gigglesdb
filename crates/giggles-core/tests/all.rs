@@ -36,6 +36,8 @@ mod e2_string_truncation_error;
 mod e2_varchar_char_oracle;
 #[path = "export.rs"]
 mod export;
+#[path = "float_text_input.rs"]
+mod float_text_input;
 #[path = "heap_native_operations.rs"]
 mod heap_native_operations;
 #[path = "insert_many.rs"]

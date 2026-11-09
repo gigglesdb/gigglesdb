@@ -2206,9 +2206,11 @@ pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value
         (Value::Text(s), DataType::Numeric) => {
             Value::Numeric(Numeric::parse(&s).map_err(|e| numeric_input_error(&s, e))?)
         }
-        (Value::Text(s), DataType::Real) => Value::Float4(Float4::parse(&s).map_err(pg_error)?),
+        (Value::Text(s), DataType::Real) => {
+            Value::Float4(Float4::parse(&s).map_err(float_input_error)?)
+        }
         (Value::Text(s), DataType::DoublePrecision) => {
-            Value::Float8(Float8::parse(&s).map_err(pg_error)?)
+            Value::Float8(Float8::parse(&s).map_err(float_input_error)?)
         }
         (Value::Int(n), DataType::Numeric) => {
             Value::Numeric(Numeric::parse(&n.to_string()).map_err(pg_error)?)
@@ -2666,6 +2668,14 @@ impl Scalar {
             _ => {}
         }
         Ok(())
+    }
+}
+
+// PostgreSQL float4in/float8in: malformed text is 22P02, out-of-range is 22003.
+fn float_input_error(error: giggles_pg_types::Error) -> SqlError {
+    match error {
+        giggles_pg_types::Error::Syntax => SqlError::InvalidTextRepresentation,
+        e => pg_error(e),
     }
 }
 
