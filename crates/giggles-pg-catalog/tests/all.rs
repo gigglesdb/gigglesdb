@@ -49,6 +49,8 @@ mod psql_describe;
 mod psql_functions;
 #[path = "query_boundaries.rs"]
 mod query_boundaries;
+#[path = "recovery_state.rs"]
+mod recovery_state;
 #[path = "secondary_indexes.rs"]
 mod secondary_indexes;
 /// With `autotests = false`, a new `tests/*.rs` file is silently skipped unless it

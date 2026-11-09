@@ -285,6 +285,7 @@ impl Visitor for Scan {
                 n.as_str(),
                 "version"
                     | "pg_postmaster_start_time"
+                    | "pg_is_in_recovery"
                     | "current_database"
                     | "current_schema"
                     | "current_user"
@@ -2301,6 +2302,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
             0,
         ) => PgType::Name,
         ("version", 0) => PgType::Text,
+        ("pg_is_in_recovery", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
         ("replace" | "translate", 3)
         | ("pg_get_expr", 2 | 3)
@@ -3378,6 +3380,9 @@ impl Runtime<'_> {
                 " (bounded PostgreSQL 14 wire compatibility)"
             )
             .into()),
+            // A standalone GigglesDB server is always a primary, never a
+            // standby replaying WAL.
+            "pg_is_in_recovery" => B(false),
             "_service_start_epoch" => {
                 I(self.startup.filter(|v| *v >= 0).ok_or(Error::Unsupported)?)
             }
