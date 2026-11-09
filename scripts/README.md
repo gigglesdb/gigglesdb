@@ -3,9 +3,22 @@
 Open the repository root in IntelliJ IDEA. The shared `.run` configurations appear
 in **Run > Edit Configurations** and the run selector, grouped by purpose. Enable
 the bundled **Shell Script** plugin if the configurations appear as unknown.
-These configurations use Windows PowerShell 5 and Cargo from your PATH; they do
-not require a Rust IDE plugin. Install the Rust toolchain and Windows native build
-tools first. Restart the IDE after changing PATH.
+The original configurations use Windows PowerShell 5 and Cargo from your PATH;
+they do not require a Rust IDE plugin. Install the Rust toolchain and Windows native
+build tools first. Restart the IDE after changing PATH.
+
+## macOS setup
+
+On macOS, choose the matching **(macOS)** configurations in the **macOS - Daily**,
+**macOS - Tools**, **macOS - Distributed**, **macOS - Verification**, and
+**macOS - Crate tests** folders. They use `/bin/bash` and the sibling `.sh` scripts.
+Install Xcode Command Line Tools (`xcode-select --install`), Rust through rustup,
+and Python 3 (`python3`). A JDK is optional for PostgreSQL JDBC compatibility runs.
+Restart the IDE after installing tools or changing PATH.
+
+The macOS work root defaults to `~/gigglesdb-work`; set `GIGGLES_WORK_ROOT` to
+override it. The demo uses its `ide` subdirectory by default. Pass `--work` to
+choose another task subdirectory of that root.
 
 ## Start and query a server
 
@@ -26,7 +39,8 @@ the current pointer; stop the existing server before using it. Nothing deletes
 previous databases or artifacts. All generated credentials are local development
 fixtures, not deployment credentials.
 
-The current setup is recorded in `artifacts/ide/current.json`. Its `config` field
+The current setup is recorded in `<work>/current.json` (Windows defaults to
+`J:/gigglesdb-work/ide`; macOS defaults to `~/gigglesdb-work/ide`). Its `config` field
 points to the server configuration; its `fixture` field contains the client PEM
 files. The generated `query.json` can be edited to send a different native SQL
 request. Authorization is limited to the fixture's `app` table. Server startup
@@ -41,6 +55,8 @@ currently make the overall run fail. It discovers a JDK from `JAVA_HOME` or
 Eclipse Adoptium and the pinned JAR from JetBrains' driver cache. Override with
 `powershell -NoProfile -File scripts/check-pg-clients.ps1 -JavaHome PATH -JdbcJar PATH`.
 Missing drivers remain UNTESTED. Build targets are separate from the live IDE server.
+On macOS, use `bash scripts/check-pg-clients.sh --java-home PATH --jdbc-jar PATH`;
+the script also discovers a JDK using `JAVA_HOME` or `/usr/libexec/java_home`.
 
 | Group | Runs |
 | --- | --- |
@@ -60,7 +76,8 @@ can take many minutes. They exercise local fault scenarios; they are not product
 availability qualification. All-crate tests are similarly expensive and stop at
 the first failure. Tests run serially within each crate to reduce port/process
 contention. Build concurrency defaults to one job; Cargo output and failures appear
-directly in the run console. Build artifacts use `target-ide`.
+directly in the run console. Demo and verification build artifacts use
+`<work>/target`; generated demo data and temporary files also live under `<work>`.
 
 ## Command-line equivalents and customization
 
@@ -73,11 +90,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -Task ping
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -Task test -Crate giggles-core -Release
 ```
 
+On macOS:
+
+```bash
+bash scripts/dev.sh --task setup
+bash scripts/dev.sh --task server
+bash scripts/dev.sh --task ping
+bash scripts/dev.sh --task test --crate giggles-core --release
+```
+
+The other equivalents are `--work`, `--port`, `--java-home`, and `--jdbc-jar`.
+Regenerate the macOS configurations after changing a Windows configuration:
+
+```bash
+python3 scripts/gen-macos-run-configs.py
+python3 scripts/gen-macos-run-configs.py --check
+```
+
+The check reports missing, stale, or orphan macOS files without writing them.
+
 Duplicate a configuration in the IDE to customize its task or crate. `-Release`
 selects optimized binaries for daily tools and optimized builds/tests for the
 generic verification tasks. The named distributed suites and outbox example use
-their default debug profile. The shared configurations target Windows; on another
-host the PowerShell interpreter path and `.exe` launcher assumptions need adapting.
+their default debug profile. On macOS the equivalent switch is `--release`.
 Rust breakpoint debugging requires a Rust-capable IDE/plugin and its own Cargo
 debug configuration; these shell runs provide execution and console interaction.
 
