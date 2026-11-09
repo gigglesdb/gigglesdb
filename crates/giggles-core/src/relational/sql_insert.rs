@@ -607,6 +607,7 @@ impl Insert {
                 return Err(SqlError::Syntax);
             }
             return Ok(Description {
+                type_oids: vec![],
                 typmods,
                 columns,
                 parameters,
@@ -616,6 +617,7 @@ impl Insert {
             return Err(SqlError::Syntax);
         }
         Ok(Description {
+            type_oids: vec![],
             parameters: parameters
                 .into_iter()
                 .map(|ty| ty.ok_or(SqlError::Parameters))

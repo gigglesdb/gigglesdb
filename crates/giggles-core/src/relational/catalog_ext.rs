@@ -50,6 +50,7 @@ pub(crate) struct ColumnExt {
     pub(crate) default: Option<String>,
     pub(crate) identity: Option<Identity>,
     pub(crate) text_kind: Option<TextKind>,
+    pub(crate) type_id: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum TextKind {
@@ -63,6 +64,26 @@ pub(crate) enum LogicalKind {
     IntArray,
     BigIntArray,
     TextArray,
+}
+// Frozen version-three column tuple; version six appends type_id.
+#[derive(Serialize, Deserialize)]
+struct ColumnV3 {
+    typmod: Option<i32>,
+    #[serde(deserialize_with = "optional_expr")]
+    default: Option<String>,
+    identity: Option<Identity>,
+    text_kind: Option<TextKind>,
+}
+impl From<ColumnV3> for ColumnExt {
+    fn from(c: ColumnV3) -> Self {
+        Self {
+            typmod: c.typmod,
+            default: c.default,
+            identity: c.identity,
+            text_kind: c.text_kind,
+            type_id: None,
+        }
+    }
 }
 // Frozen version-one/two column layout.
 #[derive(Serialize, Deserialize)]
@@ -79,6 +100,7 @@ impl From<LegacyColumnExt> for ColumnExt {
             default: c.default,
             identity: c.identity,
             text_kind: None,
+            type_id: None,
         }
     }
 }
@@ -218,7 +240,9 @@ impl CatalogExt {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
     fn wire_version(&self) -> u32 {
-        if !self.schemas.is_empty() || !self.table_schemas.is_empty() {
+        if !self.types.is_empty() || self.columns.values().any(|c| c.type_id.is_some()) {
+            6
+        } else if !self.schemas.is_empty() || !self.table_schemas.is_empty() {
             5
         } else if !self.logical_kinds.is_empty() {
             4
@@ -239,13 +263,30 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
-            5 => 8,
+            5 | 6 => 8,
             4 => 6,
             _ => 5,
         })?;
         out.serialize_element(&version)?;
-        if version >= 3 {
+        if version == 6 {
             out.serialize_element(&self.columns)?;
+        } else if matches!(version, 3..=5) {
+            let columns: BTreeMap<_, _> = self
+                .columns
+                .iter()
+                .map(|(id, c)| {
+                    (
+                        *id,
+                        ColumnV3 {
+                            typmod: c.typmod,
+                            default: c.default.clone(),
+                            identity: c.identity.clone(),
+                            text_kind: c.text_kind,
+                        },
+                    )
+                })
+                .collect();
+            out.serialize_element(&columns)?;
         } else {
             let legacy: BTreeMap<_, _> = self
                 .columns
@@ -278,7 +319,7 @@ impl Serialize for CatalogExt {
         if version >= 4 {
             out.serialize_element(&self.logical_kinds)?;
         }
-        if version == 5 {
+        if version >= 5 {
             out.serialize_element(&self.schemas)?;
             out.serialize_element(&self.table_schemas)?;
         }
@@ -387,11 +428,24 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=5) {
+                if !matches!(ext_version, 1..=6) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
-                let columns = if ext_version >= 3 {
+                let columns = if ext_version == 6 {
                     next!(Columns).0
+                } else if matches!(ext_version, 3..=5) {
+                    #[derive(Deserialize)]
+                    struct V3(#[serde(deserialize_with = "v3_map")] BTreeMap<u64, ColumnV3>);
+                    fn v3_map<'de, D: serde::Deserializer<'de>>(
+                        d: D,
+                    ) -> Result<BTreeMap<u64, ColumnV3>, D::Error> {
+                        bounded_map::<D, ColumnV3, MAX_EXT_COLUMNS>(d)
+                    }
+                    next!(V3)
+                        .0
+                        .into_iter()
+                        .map(|(id, c)| (id, c.into()))
+                        .collect()
                 } else {
                     next!(LegacyColumns)
                         .0
@@ -413,18 +467,26 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     columns,
                     constraints,
                     sequences: next!(Sequences).0,
-                    types: next!(Types).0,
+                    types: if ext_version == 6 {
+                        next!(Types).0
+                    } else {
+                        #[derive(Deserialize)]
+                        struct EmptyTypes(
+                            #[serde(deserialize_with = "empty_types")] BTreeMap<u64, TypeDef>,
+                        );
+                        next!(EmptyTypes).0
+                    },
                     logical_kinds: if ext_version >= 4 {
                         next!(LogicalKinds).0
                     } else {
                         BTreeMap::new()
                     },
-                    schemas: if ext_version == 5 {
+                    schemas: if ext_version >= 5 {
                         next!(Schemas).0
                     } else {
                         BTreeMap::new()
                     },
-                    table_schemas: if ext_version == 5 {
+                    table_schemas: if ext_version >= 5 {
                         next!(Membership).0
                     } else {
                         BTreeMap::new()
@@ -463,8 +525,173 @@ pub(crate) struct SequenceDef {
     pub(crate) identity: bool,
     pub(crate) incarnation: u128,
 }
+pub type TypeField = (String, DataType, Option<i32>);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TypeDef {}
+pub enum TypeDef {
+    Enum {
+        #[serde(deserialize_with = "name")]
+        name: String,
+        #[serde(deserialize_with = "name")]
+        schema: String,
+        #[serde(deserialize_with = "type_labels")]
+        labels: Vec<String>,
+    },
+    Domain {
+        #[serde(deserialize_with = "name")]
+        name: String,
+        #[serde(deserialize_with = "name")]
+        schema: String,
+        #[serde(with = "type_def_scalar")]
+        base: DataType,
+        typmod: Option<i32>,
+        not_null: bool,
+        #[serde(deserialize_with = "optional_expr")]
+        check: Option<String>,
+        #[serde(deserialize_with = "name")]
+        constraint: String,
+    },
+    Composite {
+        #[serde(deserialize_with = "name")]
+        name: String,
+        #[serde(deserialize_with = "name")]
+        schema: String,
+        #[serde(
+            serialize_with = "serialize_type_fields",
+            deserialize_with = "type_fields"
+        )]
+        fields: Vec<TypeField>,
+    },
+}
+fn type_labels<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Label(#[serde(deserialize_with = "name")] String);
+    Ok(bounded_vec::<D, Label, MAX_COLUMNS>(d)?
+        .into_iter()
+        .map(|v| v.0)
+        .collect())
+}
+// Row DataType deliberately aliases logical text kinds to Text on the wire.
+// Type definitions have no column sidecar for their base/field types, so keep
+// their own scalar tags: existing 0..=14 stay byte-identical; 15..=21 retain kinds.
+mod type_def_scalar {
+    use super::*;
+    const TYPES: &[DataType] = &[
+        DataType::Boolean,
+        DataType::SmallInt,
+        DataType::Integer,
+        DataType::BigInt,
+        DataType::Text,
+        DataType::Bytes,
+        DataType::Numeric,
+        DataType::Real,
+        DataType::DoublePrecision,
+        DataType::Date,
+        DataType::Time,
+        DataType::TimeTz,
+        DataType::Timestamp,
+        DataType::TimestampTz,
+        DataType::Interval,
+        DataType::Varchar,
+        DataType::Bpchar,
+        DataType::Uuid,
+        DataType::Jsonb,
+        DataType::IntArray,
+        DataType::BigIntArray,
+        DataType::TextArray,
+    ];
+    pub(super) fn serialize<S: serde::Serializer>(ty: &DataType, s: S) -> Result<S::Ok, S::Error> {
+        let tag = TYPES.iter().position(|t| t == ty).ok_or_else(|| {
+            <S::Error as serde::ser::Error>::custom("unknown type-definition scalar")
+        })? as u32;
+        tag.serialize(s)
+    }
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<DataType, D::Error> {
+        let tag = u32::deserialize(d)?;
+        TYPES
+            .get(tag as usize)
+            .cloned()
+            .ok_or_else(|| de::Error::custom("unknown type-definition scalar"))
+    }
+}
+fn serialize_type_fields<S: serde::Serializer>(
+    fields: &[TypeField],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Field(
+        String,
+        #[serde(with = "type_def_scalar")] DataType,
+        Option<i32>,
+    );
+    fields
+        .iter()
+        .map(|(name, ty, typmod)| Field(name.clone(), ty.clone(), *typmod))
+        .collect::<Vec<_>>()
+        .serialize(s)
+}
+fn type_fields<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<TypeField>, D::Error> {
+    #[derive(Deserialize)]
+    struct Field(
+        #[serde(deserialize_with = "name")] String,
+        #[serde(with = "type_def_scalar")] DataType,
+        Option<i32>,
+    );
+    Ok(bounded_vec::<D, Field, MAX_COLUMNS>(d)?
+        .into_iter()
+        .map(|v| (v.0, v.1, v.2))
+        .collect())
+}
+fn empty_types<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, TypeDef>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = BTreeMap<u64, TypeDef>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("empty legacy type map")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            if a.size_hint().is_some_and(|n| n > 0) || a.next_key::<u64>()?.is_some() {
+                return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
+            }
+            Ok(BTreeMap::new())
+        }
+    }
+    d.deserialize_map(V)
+}
+
+impl TypeDef {
+    pub fn schema(&self) -> &str {
+        match self {
+            Self::Enum { schema, .. }
+            | Self::Domain { schema, .. }
+            | Self::Composite { schema, .. } => schema,
+        }
+    }
+    pub(super) fn set_schema(&mut self, value: String) {
+        match self {
+            Self::Enum { schema, .. }
+            | Self::Domain { schema, .. }
+            | Self::Composite { schema, .. } => *schema = value,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Enum { name, .. } | Self::Domain { name, .. } | Self::Composite { name, .. } => {
+                name
+            }
+        }
+    }
+    pub(crate) fn storage_type(&self) -> R<DataType> {
+        match self {
+            Self::Enum { .. } => Ok(DataType::Text),
+            Self::Domain { base, .. } => Ok(base.clone()),
+            Self::Composite { .. } => Err(SqlError::Unsupported),
+        }
+    }
+}
 fn bounded_vec<'de, D, T, const N: usize>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -576,20 +803,7 @@ fn sequence_map<'de, D: serde::Deserializer<'de>>(
     bounded_map::<D, SequenceDef, MAX_EXT_SEQUENCES>(d)
 }
 fn type_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<u64, TypeDef>, D::Error> {
-    struct V;
-    impl<'de> Visitor<'de> for V {
-        type Value = BTreeMap<u64, TypeDef>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("empty type map")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
-            if a.size_hint().is_some_and(|n| n > 0) || a.next_key::<u64>()?.is_some() {
-                return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
-            }
-            Ok(BTreeMap::new())
-        }
-    }
-    d.deserialize_map(V)
+    bounded_map::<D, TypeDef, MAX_EXT_COLUMNS>(d)
 }
 pub(crate) fn validate_typmod(ty: &DataType, t: i32) -> R<()> {
     let valid = match ty {
@@ -757,7 +971,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=5) || !ext.types.is_empty() {
+        if !matches!(ext.ext_version, 1..=6) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -771,6 +985,7 @@ impl Relational {
             || ext.columns.len() > MAX_EXT_COLUMNS
             || ext.constraints.len() > MAX_TABLES
             || ext.sequences.len() > MAX_EXT_SEQUENCES
+            || ext.types.len() > MAX_EXT_COLUMNS
         {
             return Err(SqlError::Type);
         }
@@ -798,6 +1013,26 @@ impl Relational {
             .copied()
             .chain(ext.schemas.values().map(|s| s.id))
             .collect();
+        let mut type_names = BTreeSet::new();
+        for (id, ty) in &ext.types {
+            if *id == 0 || *id >= next_id || !used.insert(*id) || !type_names.insert(ty.name()) {
+                return Err(SqlError::Type);
+            }
+            if let TypeDef::Enum { labels, .. } = ty {
+                for offset in 1..=labels.len() as u64 {
+                    let label_id = id.checked_add(offset).ok_or(SqlError::Limit)?;
+                    if label_id >= next_id || !used.insert(label_id) {
+                        return Err(SqlError::Type);
+                    }
+                    super::user_types::type_oid(label_id)?;
+                }
+            }
+            super::user_types::type_oid(*id)?;
+            super::user_types::validate_type(ty)?;
+            if ty.schema() != "public" && !ext.schemas.contains_key(ty.schema()) {
+                return Err(SqlError::InvalidSchema);
+            }
+        }
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
                 DataType::Varchar => Some(TextKind::Varchar),
@@ -844,6 +1079,12 @@ impl Relational {
         }
         for (id, e) in &ext.columns {
             let (_, c) = columns.get(id).ok_or(SqlError::Type)?;
+            if let Some(id) = e.type_id {
+                let ty = ext.types.get(&id).ok_or(SqlError::Type)?;
+                if ty.storage_type()? != c.data_type {
+                    return Err(SqlError::Type);
+                }
+            }
             if let Some(t) = e.typmod {
                 validate_typmod(&c.data_type, t)?;
             }

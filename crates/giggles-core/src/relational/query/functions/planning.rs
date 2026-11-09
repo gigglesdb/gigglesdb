@@ -397,7 +397,8 @@ impl BoundScalar {
                     .as_ref()
                     .map_or(Ok(Some(Value::Null)), |result| result.plan_constant(budget))
             }
-            Node::Param(_)
+            Node::EnumSort(..)
+            | Node::Param(_)
             | Node::Column(..)
             | Node::Clock(..)
             | Node::Sequence(..)
@@ -479,7 +480,7 @@ impl BoundScalar {
                     .as_ref()
                     .is_none_or(|result| result.constraint_immutable())
             }
-            Node::Literal(_) | Node::Column(..) => true,
+            Node::EnumSort(..) | Node::Literal(_) | Node::Column(..) => true,
             Node::Param(_)
             | Node::Clock(..)
             | Node::Sequence(..)
@@ -516,7 +517,7 @@ impl BoundScalar {
         match &self.node {
             Node::Predicate(_) | Node::Case(..) => false,
             Node::Literal(_) | Node::Param(_) => true,
-            Node::Column(..) => false,
+            Node::EnumSort(..) | Node::Column(..) => false,
             Node::Clock(..) => true,
             Node::SessionCast(value, _) | Node::TypmodCast(value, _) => value.insert_input_only(),
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),

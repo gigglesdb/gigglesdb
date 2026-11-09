@@ -128,7 +128,12 @@ pub(super) fn plain_value(
         )?;
         bound = query::assignment::convert(bound, declared, &column.data_type, clock)?;
     }
-    bound = coerce_to_column(state, column, bound)?;
+    // UPDATE builds constant assignments before visiting rows. Domain checks
+    // belong to evaluation of an actual destination row, not this preparation.
+    bound = coerce_base_to_column(state, column, bound)?;
+    if matches!(state.column_type(column.id), Some(TypeDef::Enum { .. })) {
+        user_types::coerce(state, column, &bound)?;
+    }
     check(&bound, column)?;
     Ok(bound)
 }
@@ -181,6 +186,7 @@ pub(super) fn describe(
         )
     };
     Ok(Description {
+        type_oids: vec![],
         typmods: columns
             .iter()
             .map(|c| result_typmod(state, TypmodSource::Column(c)))
@@ -239,7 +245,14 @@ impl<'a> Plan<'a> {
                     defaults::check_explicit(state, &table.columns[index])?;
                     let mut column = table.columns[index].clone();
                     column.not_null = false;
-                    let value = plain_value(state, value, &column, &prepared.parameter_types, params, clock)?;
+                    let value = plain_value(
+                        state,
+                        value,
+                        &column,
+                        &prepared.parameter_types,
+                        params,
+                        clock,
+                    )?;
                     Ok((index, BoundValue::Plain(value)))
                 })
                 .collect::<R<Vec<_>>>()?;
@@ -281,7 +294,14 @@ impl<'a> Plan<'a> {
                     Value::Plain(value) => {
                         let mut column = table.columns[index].clone();
                         column.not_null = false;
-                        let value = plain_value(state, value, &column, &prepared.parameter_types, params, clock)?;
+                        let value = plain_value(
+                            state,
+                            value,
+                            &column,
+                            &prepared.parameter_types,
+                            params,
+                            clock,
+                        )?;
                         BoundValue::Plain(value)
                     }
                     Value::Scalar(value) => BoundValue::Scalar(Box::new(
@@ -312,16 +332,19 @@ impl<'a> Plan<'a> {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Vec<(usize, super::Value)>> {
         if !self.scalar {
-            return Ok(self
+            return self
                 .values
                 .iter()
                 .map(|(index, value)| {
                     let BoundValue::Plain(value) = value else {
                         unreachable!()
                     };
-                    (*index, value.clone())
+                    Ok((
+                        *index,
+                        coerce_to_column(self.state, &table.columns[*index], value.clone())?,
+                    ))
                 })
-                .collect());
+                .collect();
         }
         let mut work = 0;
         let mut bytes = 0;

@@ -558,6 +558,7 @@ impl Session {
     pub fn describe(&mut self, p: &Prepared) -> Result<relational::Description, CoreError> {
         if p.is_ddl() {
             return Ok(relational::Description {
+                type_oids: vec![],
                 typmods: vec![],
                 parameters: vec![],
                 columns: vec![],
@@ -636,6 +637,7 @@ impl Session {
             Vec<relational::TableDef>,
             Vec<giggles_core::IndexInfo>,
             BTreeMap<u64, i32>,
+            relational::UserTypeCatalog,
         ),
         CoreError,
     > {
@@ -650,7 +652,13 @@ impl Session {
                     .iter()
                     .any(|table| table.columns.iter().any(|column| column.id == *id))
             });
-            Ok((epoch, tables, indexes, typmods))
+            // Match the committed-only tables, indexes and typmods above;
+            // private DDL must not splice the active session's newer epoch here.
+            let types = session.service.admin.sql_session().user_type_catalog()?;
+            if types.epoch != epoch {
+                return Err(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            Ok((epoch, tables, indexes, typmods, types))
         })
     }
     fn validate_catalog_snapshot(

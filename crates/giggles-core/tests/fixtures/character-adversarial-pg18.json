@@ -9942,9 +9942,9 @@
       "setup": [
         "CREATE DOMAIN adv_text_domain AS text"
       ],
-      "classification": "known_gap_setup",
-      "expected_core_error": "Syntax",
-      "expected_core_stage": null,
+      "classification": "known_gap",
+      "expected_core_error": "UndefinedObject",
+      "expected_core_stage": "prepare",
       "observation": {
         "parameterTypes": [
           16441
@@ -9971,7 +9971,7 @@
         "format": "PG text exact UTF8; numeric retained as text"
       },
       "raw_trace_reference": "oracle-raw.json#ADV_DOMAIN_TEXT",
-      "contract_note": "PostgreSQL domain executes successfully; custom CREATE DOMAIN remains broader core DDL Syntax gap, not character function parity."
+      "contract_note": "PostgreSQL domain executes successfully; CREATE DOMAIN now works, while scalar domain casts remain an UndefinedObject gap at prepare, not character function parity."
     },
     {
       "id": "ADV_GAP_AGG_FILTER",

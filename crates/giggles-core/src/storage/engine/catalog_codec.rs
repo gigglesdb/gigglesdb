@@ -234,8 +234,12 @@ impl TryFrom<ColumnExt> for ColumnExtDto {
             default,
             identity,
             text_kind,
+            type_id,
         } = v;
         // Explicit: any Some(text_kind) (varchar/char) is not representable on v2.
+        if type_id.is_some() {
+            return Err(CoreError::Unsupported);
+        }
         if text_kind.is_some() {
             return Err(varchar_char_unsupported());
         }
@@ -259,6 +263,7 @@ impl From<ColumnExtDto> for ColumnExt {
             identity: identity.map(Into::into),
             // Decode stays closed: v2 bytes never carry a text kind.
             text_kind: None,
+            type_id: None,
         }
     }
 }
@@ -491,11 +496,6 @@ impl From<SequenceDefDto> for SequenceDef {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum TypeDefDto {}
-impl From<TypeDef> for TypeDefDto {
-    fn from(v: TypeDef) -> Self {
-        match v {}
-    }
-}
 impl From<TypeDefDto> for TypeDef {
     fn from(v: TypeDefDto) -> Self {
         match v {}
@@ -657,8 +657,8 @@ pub(crate) fn decode_sequence(v: &[u8]) -> Result<SequenceDef, CoreError> {
     }
     Ok(dto.into())
 }
-pub(crate) fn encode_type(v: TypeDef) -> Result<Vec<u8>, CoreError> {
-    match v {}
+pub(crate) fn encode_type(_v: TypeDef) -> Result<Vec<u8>, CoreError> {
+    Err(CoreError::Unsupported)
 }
 pub(crate) fn decode_type(v: &[u8]) -> Result<TypeDef, CoreError> {
     Ok(decode_version::<TypeDefDto>(1, v)?.into())

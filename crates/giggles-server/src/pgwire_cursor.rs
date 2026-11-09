@@ -199,6 +199,7 @@ impl Cursors {
             return Err("25P02");
         }
         let mut d = Description {
+            type_oids: vec![],
             parameters: vec![],
             columns: vec![],
             typmods: vec![],

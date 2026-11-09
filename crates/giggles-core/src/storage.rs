@@ -1791,6 +1791,15 @@ impl SqlSession {
             None => self.admin.inner.inspect(read),
         }
     }
+    pub fn user_type_catalog(&self) -> Result<relational::UserTypeCatalog, CoreError> {
+        if self.aborted {
+            return Err(CoreError::Sql(relational::SqlError::Aborted));
+        }
+        if let Some(s) = &self.staged {
+            return Ok(s.sql.user_type_catalog());
+        }
+        self.admin.inner.inspect(|s| Ok(s.sql.user_type_catalog()))
+    }
 
     /// Mark publications whose creator authority is maintained by the caller.
     /// Dropped names lose their authority unless the same managed publication
@@ -2076,8 +2085,15 @@ impl SqlSession {
         }
         result
     }
-    pub(crate) fn coerce_column_engine(&self, column: &relational::ColumnDef, value: relational::Value) -> Result<relational::Value, CoreError> {
-        let state = self.staged.as_ref().ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+    pub(crate) fn coerce_column_engine(
+        &self,
+        column: &relational::ColumnDef,
+        value: relational::Value,
+    ) -> Result<relational::Value, CoreError> {
+        let state = self
+            .staged
+            .as_ref()
+            .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
         relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
     }
     pub(crate) fn insert_engine(

@@ -280,7 +280,10 @@ fn every_test_file_is_registered() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("utf-8 name");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name");
         if stem == "all" || stem == "common" {
             continue;
         }
@@ -301,11 +304,14 @@ mod sql_text_order;
 #[path = "numeric_column_typmod.rs"]
 mod numeric_column_typmod;
 
+#[path = "logical_columns.rs"]
+mod logical_columns;
 #[path = "relational_insert_select.rs"]
 mod relational_insert_select;
 #[path = "sql_insert_select_literals.rs"]
 mod sql_insert_select_literals;
-#[path = "logical_columns.rs"]
-mod logical_columns;
 #[path = "user_schemas.rs"]
 mod user_schemas;
+
+#[path = "user_defined_types.rs"]
+mod user_defined_types;

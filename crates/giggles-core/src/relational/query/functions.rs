@@ -92,6 +92,7 @@ pub(in crate::relational) struct BoundScalar {
     node: Node,
 }
 enum Node {
+    EnumSort(Box<BoundScalar>, Vec<String>),
     Predicate(Box<super::BoundFilter>),
     Case(
         Vec<(super::BoundFilter, BoundScalar)>,
@@ -1725,9 +1726,22 @@ impl BoundScalar {
             _ => -1,
         }
     }
+    pub(super) fn enum_sort(self, state: &Relational, tables: &[&TableDef]) -> Self {
+        if let Node::Column(c, _) = &self.node
+            && let Some(TypeDef::Enum { labels, .. }) =
+                state.column_type(tables[c.source].columns[c.column].id)
+        {
+            let labels = labels.clone();
+            return Self {
+                ty: DataType::BigInt,
+                node: Node::EnumSort(Box::new(self), labels),
+            };
+        }
+        self
+    }
     fn strong_name(&self) -> Option<&str> {
         match &self.node {
-            Node::Predicate(_) | Node::ZonedOperator(..) => None,
+            Node::EnumSort(..) | Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
             Node::Call(name, args) if name == "\0array_subscript" => args[0].strong_name(),
             Node::Call(name, _) if name.starts_with("\0json_") => None,
@@ -1742,7 +1756,7 @@ impl BoundScalar {
     }
     pub(super) fn name(&self) -> &str {
         match &self.node {
-            Node::Predicate(_) => "?column?",
+            Node::EnumSort(..) | Node::Predicate(_) => "?column?",
             Node::Case(..) => "case",
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
@@ -1788,6 +1802,15 @@ impl BoundScalar {
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
         match &self.node {
+            Node::EnumSort(inner, labels) => match inner.eval(row, params, budget)? {
+                Value::Null => Ok(Value::Null),
+                Value::Text(label) => labels
+                    .iter()
+                    .position(|s| *s == label)
+                    .map(|n| Value::Int(n as i64))
+                    .ok_or(SqlError::InvalidTextRepresentation),
+                _ => Err(SqlError::Type),
+            },
             Node::Predicate(filter) => Ok(filter
                 .eval(row, params, budget)?
                 .map_or(Value::Null, Value::Bool)),

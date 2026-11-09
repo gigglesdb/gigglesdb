@@ -126,6 +126,19 @@ struct Diagnostic {
     query_id: Option<String>,
 }
 impl Diagnostic {
+    fn core<T>(&mut self, result: Result<T, CoreError>) -> R<T> {
+        let message = giggles_core::relational::take_sql_error_message();
+        if matches!(
+            &result,
+            Err(CoreError::Sql(
+                giggles_core::relational::SqlError::CheckViolation
+            ))
+        ) {
+            self.wire_message = message;
+        }
+        core(result)
+    }
+
     // Only errors returned by the settings/mode parsers receive GUC diagnostics.
     fn settings<T>(&mut self, result: R<T>) -> R<T> {
         result.inspect_err(|code| {
@@ -260,7 +273,14 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
         z(&c.name, &mut b);
         b.extend(0u32.to_be_bytes());
         b.extend(0i16.to_be_bytes());
-        b.extend(oid(&c.data_type).to_be_bytes());
+        b.extend(
+            d.type_oids
+                .get(i)
+                .copied()
+                .filter(|id| *id != 0)
+                .unwrap_or_else(|| oid(&c.data_type))
+                .to_be_bytes(),
+        );
         b.extend(size(&c.data_type).to_be_bytes());
         b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
@@ -641,8 +661,9 @@ fn catalog_plan(
     }
     let planned = match giggles_pg_catalog::plan_gateway(sql) {
         Err(giggles_pg_catalog::Error::MixedRelations) => {
-            let (epoch, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
-            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods)?;
+            let (epoch, tables, indexes, typmods, types) =
+                core(session.catalog_snapshot_with_typmods())?;
+            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?;
             let relations = catalog_wire::application_schemas(session, &snapshot);
             giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
         }
@@ -861,6 +882,7 @@ fn inspect(
     let (name, value) = show.value(settings);
     Ok((
         Description {
+            type_oids: vec![],
             typmods: vec![-1],
             parameters: vec![],
             columns: vec![giggles_core::relational::ColumnDef {
@@ -1041,6 +1063,7 @@ impl State {
                     (
                         Plan::AccessShare(tables),
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1051,6 +1074,7 @@ impl State {
                     (
                         Plan::Copy(copy, Box::new(prepared)),
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1066,6 +1090,7 @@ impl State {
                     (
                         Plan::Admin(stmt),
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1075,6 +1100,7 @@ impl State {
                     (
                         Plan::Empty,
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1087,6 +1113,7 @@ impl State {
                     (
                         Plan::Control(command),
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1106,6 +1133,7 @@ impl State {
                     (
                         Plan::Settings(settings),
                         Description {
+                            type_oids: vec![],
                             typmods: vec![],
                             columns: vec![],
                             parameters: vec![],
@@ -1138,6 +1166,7 @@ impl State {
                     let fields =
                         giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
                     let d = Description {
+                        type_oids: vec![],
                         typmods: vec![-1; fields.len()],
                         parameters: vec![DataType::Text; plan.parameter_count()],
                         columns: fields
@@ -1439,7 +1468,7 @@ impl State {
                 if let Plan::Catalog(plan, fields, epoch) = &p.s.p {
                     self.diagnostic.phase = "catalog execution";
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
-                    let (current, tables, indexes, typmods) =
+                    let (current, tables, indexes, typmods, types) =
                         core(session.catalog_snapshot_with_typmods())?;
                     if current != *epoch {
                         return Err("0A000");
@@ -1451,7 +1480,9 @@ impl State {
                             &catalog_wire::with_application_rows(
                                 session,
                                 plan,
-                                catalog_wire::snapshot(session, current, tables, indexes, typmods)?,
+                                catalog_wire::snapshot(
+                                    session, current, tables, indexes, typmods, types,
+                                )?,
                             )?,
                             &p.catalog_params,
                         )
@@ -1636,7 +1667,8 @@ impl State {
                         self.implicit = false;
                         SqlResult::default()
                     } else {
-                        core(session.execute_prepared(prepared, &p.params))?
+                        self.diagnostic
+                            .core(session.execute_prepared(prepared, &p.params))?
                     };
                     if !session.in_transaction() {
                         self.implicit = false;
@@ -2144,3 +2176,7 @@ mod logical_wire_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pgwire_user_types_tests.rs"]
+mod user_types_tests;

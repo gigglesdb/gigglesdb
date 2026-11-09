@@ -110,6 +110,7 @@ pub(super) fn describe_insert(
         .ok_or(SqlError::Unsupported)?
         .describe(state, seed)?;
     Ok(Description {
+        type_oids: vec![],
         typmods,
         columns,
         parameters,

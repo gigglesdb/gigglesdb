@@ -992,6 +992,39 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     if !role_ids.contains(&10) || !role_ids.contains(&snapshot.database_owner) {
         return Err(Error::InvalidSnapshot);
     }
+    let mut type_oids = BTreeSet::new();
+    let mut type_names = BTreeSet::new();
+    if snapshot.user_types.len() > 16384 {
+        return Err(Error::Limit);
+    }
+    for ty in &snapshot.user_types {
+        if ty.oid < 65536
+            || (ty.oid - 65536) % 4 != 0
+            || !type_oids.insert(ty.oid)
+            || !type_names.insert(&ty.name)
+            || ty.name.is_empty()
+            || ty.name.len() > 63
+            || !matches!(ty.kind, 'e' | 'd' | 'c')
+            || ty.labels.len() > 64
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+        let mut labels = BTreeSet::new();
+        for label in &ty.labels {
+            if label.len() > 63 || !labels.insert(label) {
+                return Err(Error::InvalidSnapshot);
+            }
+            input_bytes += label.len();
+        }
+        let last_oid = u64::from(ty.oid) + ty.labels.len() as u64 * 4;
+        if last_oid > u32::MAX as u64 {
+            return Err(Error::InvalidSnapshot);
+        }
+        input_bytes += ty.name.len();
+        if input_bytes > 65536 {
+            return Err(Error::Limit);
+        }
+    }
     for t in &snapshot.tables {
         if !ids.insert(t.id)
             || !names.insert(&t.name)
@@ -1419,7 +1452,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 vec![
                     I(oid),
                     s(&c.name),
-                    I(ty as i64),
+                    I(snapshot.column_type_oids.get(&c.id).copied().unwrap_or(ty) as i64),
                     I(i as i64 + 1),
                     B(c.not_null || t.primary_key.contains(&i)),
                     I(i64::from(
@@ -1677,6 +1710,47 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             B(true),
             I(if row[3] == s("r") { 1 } else { 0 }),
         ]);
+    }
+    for ty in &snapshot.user_types {
+        let len = match (ty.kind, ty.base) {
+            ('e', _) | ('d', 23 | 700 | 1082) => 4,
+            ('d', 20 | 701 | 1083 | 1114 | 1184) => 8,
+            ('d', 21) => 2,
+            ('d', 16) => 1,
+            _ => -1,
+        };
+        let mut row = type_row(ty.oid, &ty.name, len, 0, 0, false);
+        row[2] = I(if ty.schema == "public" {
+            2200
+        } else {
+            snapshot
+                .schemas
+                .get(&ty.schema)
+                .ok_or(Error::InvalidSnapshot)?
+                .0 as i64
+        });
+        row[4] = s(&ty.kind.to_string());
+        row[5] = s(match ty.kind {
+            'e' => "E",
+            'c' => "C",
+            _ => "N",
+        });
+        row[6] = B(ty.not_null);
+        row[7] = I(ty.base as i64);
+        row[8] = I(ty.typmod as i64);
+        all.get_mut("pg_type").unwrap().rows.push(row);
+        for (i, label) in ty.labels.iter().enumerate() {
+            // Label OIDs are stable within this immutable enumeration.
+            let oid = i64::from(ty.oid) + 4 * (i as i64 + 1);
+            all.get_mut("pg_enum").unwrap().rows.push(vec![
+                I(oid),
+                I(ty.oid as i64),
+                Value::Float4(giggles_pg_types::Float4::from_bits(
+                    ((i + 1) as f32).to_bits(),
+                )),
+                s(label),
+            ]);
+        }
     }
     for row in &mut all.get_mut("pg_type").unwrap().rows {
         let oid = match row[0] {
@@ -2172,11 +2246,18 @@ mod schema_tests {
     fn exists_constant_projection_is_correlated_and_collects_parameters() {
         let snapshot = CatalogSnapshot::default();
         for (name, expected) in [("pg_class", true), ("absent", false)] {
-            let plan = plan("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname=$1)").unwrap().unwrap();
-            assert_eq!(execute(&plan, &snapshot, &[s(name)]).unwrap().rows, vec![vec![B(expected)]]);
+            let plan = plan("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname=$1)")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                execute(&plan, &snapshot, &[s(name)]).unwrap().rows,
+                vec![vec![B(expected)]]
+            );
         }
         let plan = plan("SELECT EXISTS(SELECT 1 FROM pg_class i WHERE i.oid=c.oid), NOT EXISTS(SELECT 1 FROM pg_class i WHERE i.oid=c.oid) FROM pg_class c WHERE c.relname='pg_class'").unwrap().unwrap();
-        assert_eq!(execute(&plan, &snapshot, &[]).unwrap().rows, vec![vec![B(true), B(false)]]);
+        assert_eq!(
+            execute(&plan, &snapshot, &[]).unwrap().rows,
+            vec![vec![B(true), B(false)]]
+        );
     }
-
 }

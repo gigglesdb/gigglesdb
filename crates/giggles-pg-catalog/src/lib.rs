@@ -94,6 +94,18 @@ pub struct RoleDef {
     pub bypassrls: bool,
     pub connlimit: i32,
 }
+/// Presentation of a user-defined type; enum labels are in declaration order.
+#[derive(Debug, Clone)]
+pub struct UserType {
+    pub schema: String,
+    pub oid: u32,
+    pub name: String,
+    pub kind: char,
+    pub base: u32,
+    pub typmod: i32,
+    pub not_null: bool,
+    pub labels: Vec<String>,
+}
 /// The caller must supply a coherent, freshly authorized set, including on repeated Execute.
 /// Roles include exactly one bootstrap role (OID 10); predefined PostgreSQL roles
 /// are supplied by the catalog. Ownership references snapshot roles, with omitted
@@ -103,6 +115,8 @@ pub struct RoleDef {
 pub struct CatalogSnapshot {
     /// Freshly authorized application rows, supplied by the hosting session.
     pub user_relations: std::collections::BTreeMap<String, ResultSet>,
+    pub user_types: Vec<UserType>,
+    pub column_type_oids: std::collections::BTreeMap<u64, u32>,
     pub tables: Vec<TableDef>,
     pub schemas: std::collections::BTreeMap<String, (u32, u32)>,
     pub table_schemas: std::collections::BTreeMap<u64, String>,
@@ -131,6 +145,8 @@ impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
             user_relations: Default::default(),
+            user_types: Vec::new(),
+            column_type_oids: std::collections::BTreeMap::new(),
             tables: Vec::new(),
             schemas: Default::default(),
             table_schemas: Default::default(),

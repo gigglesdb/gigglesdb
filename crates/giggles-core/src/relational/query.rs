@@ -3383,7 +3383,9 @@ impl Query {
                 } else {
                     e
                 };
-                let bound = e.bind(&resolve, &tables, &parameters)?;
+                let bound = e
+                    .bind(&resolve, &tables, &parameters)?
+                    .enum_sort(state, &tables);
                 if bound.ty == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
                 }
@@ -3692,6 +3694,7 @@ impl BoundQuery<'_> {
     }
     pub(super) fn description(&self, state: &Relational) -> Description {
         Description {
+            type_oids: vec![],
             parameters: self.parameters.clone(),
             typmods: if self.query.explain {
                 vec![result_typmod(state, TypmodSource::Other)]

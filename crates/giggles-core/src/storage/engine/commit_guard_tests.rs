@@ -67,6 +67,7 @@ fn table(typmod: bool) -> Vec<u8> {
             default: Some("1".into()),
             identity: None,
             text_kind: None,
+            type_id: None,
         },
     )]);
     catalog_codec::encode_table(&entry, &ext).unwrap()

@@ -263,6 +263,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
         let seed = parameters.iter().cloned().map(Some).collect::<Vec<_>>();
         target.bind_description(state, prepared.params, &seed)?;
         Ok(Description {
+            type_oids: vec![],
             columns,
             parameters,
             typmods,
@@ -270,6 +271,7 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
     } else {
         let bound = target.bind_description(state, prepared.params, &parameters)?;
         Ok(Description {
+            type_oids: vec![],
             columns: vec![],
             parameters: bound.description(state).parameters,
             typmods: vec![],

@@ -149,15 +149,41 @@ impl Relational {
                 .filter(|t| self.table_schema(t.id) == ddl.name)
                 .map(|t| t.name.clone())
                 .collect();
-            if !tables.is_empty() && !ddl.cascade {
+            let types: BTreeSet<_> = self
+                .ext
+                .types
+                .iter()
+                .filter(|(_, ty)| ty.schema() == ddl.name)
+                .map(|(id, _)| *id)
+                .collect();
+            if (!tables.is_empty() || !types.is_empty()) && !ddl.cascade {
                 return Err(SqlError::DependentObjects);
             }
             if ddl.name == "public" {
                 return Err(SqlError::Unsupported);
             }
+            // Cross-schema columns depending on a type need column-drop planning,
+            // which DROP TYPE CASCADE also deliberately does not implement yet.
+            if self
+                .tables
+                .values()
+                .filter(|t| self.table_schema(t.id) != ddl.name)
+                .any(|t| {
+                    t.columns.iter().any(|c| {
+                        self.ext
+                            .columns
+                            .get(&c.id)
+                            .and_then(|e| e.type_id)
+                            .is_some_and(|id| types.contains(&id))
+                    })
+                })
+            {
+                return Err(SqlError::Unsupported);
+            }
             for table in tables {
                 self.drop_table_with_actions(&table, true)?;
             }
+            self.ext.types.retain(|id, _| !types.contains(id));
             self.ext.schemas.remove(&ddl.name);
         }
         Self::normalize_ext(&mut self.ext);

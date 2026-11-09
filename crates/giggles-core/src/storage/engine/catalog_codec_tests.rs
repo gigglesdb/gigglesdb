@@ -68,6 +68,7 @@ fn frozen_table_goldens() {
                 sequence_id: 3,
             }),
             text_kind: None,
+            type_id: None,
         },
     );
     assert_eq!(encode_table(&entry, &ext).unwrap(), hex(EXT));
@@ -582,6 +583,7 @@ fn varchar_char_refused_on_v2_without_changing_bytes() {
             default: None,
             identity: None,
             text_kind: Some(crate::relational::catalog_ext::TextKind::Varchar),
+            type_id: None,
         },
     );
     refused(encode_table(&table(), &ext));

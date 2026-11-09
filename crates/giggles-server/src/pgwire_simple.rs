@@ -241,6 +241,7 @@ impl State {
             let response = session.handle_received(req, received);
             let value = serde_json::to_string(&response).map_err(|_| "XX000")?;
             let d = Description {
+                type_oids: vec![],
                 typmods: vec![-1],
                 parameters: vec![],
                 columns: vec![giggles_core::relational::ColumnDef {
@@ -336,13 +337,14 @@ impl State {
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();
-            let (epoch, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
+            let (epoch, tables, indexes, typmods, types) =
+                core(session.catalog_snapshot_with_typmods())?;
             let result = catalog_wire::execute(
                 &plan,
                 &catalog_wire::with_application_rows(
                     session,
                     &plan,
-                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods)?,
+                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods, types)?,
                 )?,
                 &[],
             )
@@ -377,7 +379,7 @@ impl State {
                 let d = core(session.describe(&p))?;
                 read_only_check(p.command(), &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
-                let result = core(session.execute_prepared(&p, &[]))?;
+                let result = self.diagnostic.core(session.execute_prepared(&p, &[]))?;
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
                 if !d.columns.is_empty() {

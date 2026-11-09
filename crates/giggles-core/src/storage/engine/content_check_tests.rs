@@ -51,6 +51,7 @@ fn table(ext: bool, typmod: bool) -> Vec<u8> {
                 default: Some("1".into()),
                 identity: None,
                 text_kind: None,
+                type_id: None,
             },
         );
     }

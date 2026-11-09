@@ -49,13 +49,58 @@ pub(crate) fn snapshot(
     tables: Vec<giggles_core::relational::TableDef>,
     indexes: Vec<giggles_core::IndexInfo>,
     column_typmods: std::collections::BTreeMap<u64, i32>,
+    types: giggles_core::relational::UserTypeCatalog,
 ) -> Result<giggles_pg_catalog::CatalogSnapshot> {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     let (roles, table_owners) = catalog_roles(session, &tables);
+    let user_types = types
+        .types
+        .iter()
+        .map(|(id, ty)| {
+            use giggles_core::relational::TypeDef;
+            let (kind, base, typmod, not_null, labels) = match ty {
+                TypeDef::Enum { labels, .. } => ('e', 0, -1, false, labels.clone()),
+                TypeDef::Domain {
+                    base,
+                    typmod,
+                    not_null,
+                    ..
+                } => (
+                    'd',
+                    crate::pgwire::oid(base),
+                    typmod.unwrap_or(-1),
+                    *not_null,
+                    vec![],
+                ),
+                TypeDef::Composite { .. } => ('c', 0, -1, false, vec![]),
+            };
+            giggles_pg_catalog::UserType {
+                oid: giggles_core::relational::type_oid(*id).expect("validated type ID"),
+                name: ty.name().into(),
+                schema: ty.schema().into(),
+                kind,
+                base,
+                typmod,
+                not_null,
+                labels,
+            }
+        })
+        .collect();
+    let column_type_oids = types
+        .column_types
+        .iter()
+        .map(|(id, ty)| {
+            (
+                *id,
+                giggles_core::relational::type_oid(*ty).expect("validated type ID"),
+            )
+        })
+        .collect();
     let metadata = session
-        .service.admin
+        .service
+        .admin
         .catalog_schema_metadata()
         .map_err(|e| crate::service::sqlstate(&e))?;
     if metadata.epoch != epoch {
@@ -81,6 +126,8 @@ pub(crate) fn snapshot(
             .into_iter()
             .filter(|(id, _)| visible.contains(id))
             .collect(),
+        user_types,
+        column_type_oids,
         roles,
         table_owners,
         user: match &session.role {

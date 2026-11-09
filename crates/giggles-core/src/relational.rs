@@ -14,6 +14,8 @@ pub(crate) mod clock;
 mod constraint_lookup;
 mod constraint_primary_key;
 mod ddl_type;
+mod user_types;
+pub use user_types::{TypeDef, UserTypeCatalog, take_sql_error_message, type_oid};
 mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
@@ -554,6 +556,11 @@ fn infer_mutation_parameter(
     Ok(())
 }
 pub(crate) fn coerce_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
+    let value = coerce_base_to_column(rel, column, value)?;
+    user_types::coerce(rel, column, &value)?;
+    Ok(value)
+}
+fn coerce_base_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
     if column.data_type.is_extended_text() {
         return logical_types::coerce(value, &column.data_type);
     }
@@ -886,6 +893,8 @@ struct Predicate {
 enum Statement {
     Schema(schemas::Ddl),
     Sequence(defaults::SequenceDdl),
+    TypeDdl(user_types::Ddl),
+    CompositeSelect(user_types::CompositeSelect),
     DropTable {
         name: String,
         optional: bool,
@@ -902,6 +911,7 @@ enum Statement {
         optional: bool,
         columns: Vec<ColumnDef>,
         typmods: Vec<Option<i32>>,
+        user_types: Vec<Option<String>>,
         defaults: Vec<Option<String>>,
         sequences: Vec<Option<defaults::SequenceSpec>>,
         keys: Vec<String>,
@@ -1077,6 +1087,9 @@ impl Parser {
         if schemas::claims(&self.tokens) {
             return schemas::parse(self).map(Statement::Schema);
         }
+        if user_types::claims(self) {
+            return user_types::parse(self).map(Statement::TypeDdl);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if matches!(word.as_str(), "create" | "alter" | "drop"))
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word == "sequence")
         {
@@ -1168,6 +1181,7 @@ impl Parser {
             let mut columns = vec![];
             let mut defaults = vec![];
             let mut typmods = vec![];
+            let mut user_types = vec![];
             let mut sequences = vec![];
             let mut keys = vec![];
             let mut constraints = vec![];
@@ -1208,6 +1222,7 @@ impl Parser {
                     } else {
                         None
                     };
+                    let mut user_type = None;
                     let parsed = if let Some(ty) = &serial {
                         ddl_type::Parsed {
                             data_type: ty.clone(),
@@ -1215,13 +1230,47 @@ impl Parser {
                             semantic_error: None,
                         }
                     } else {
-                        ddl_type::parse(self, ddl_type::Site::Create)?
+                        let start = self.at;
+                        match ddl_type::parse(self, ddl_type::Site::Create) {
+                            Ok(parsed) => parsed,
+                            Err(SqlError::Unsupported)
+                                if self.at == start + 1
+                                    && self.tokens.get(self.at).is_some_and(
+                                        |token| match token {
+                                            Token::Symbol(',' | ')' | '.') => true,
+                                            Token::Word(w) => matches!(
+                                                w.as_str(),
+                                                "not"
+                                                    | "null"
+                                                    | "default"
+                                                    | "constraint"
+                                                    | "check"
+                                                    | "unique"
+                                                    | "references"
+                                                    | "primary"
+                                                    | "generated"
+                                            ),
+                                            _ => false,
+                                        },
+                                    ) =>
+                            {
+                                self.at = start;
+                                user_type = Some(user_types::parse_name(self)?);
+                                ddl_type::Parsed {
+                                    data_type: DataType::Text,
+                                    typmod: None,
+                                    semantic_error: None,
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
                     };
                     if let Some(error) = parsed.semantic_error {
                         return Err(error);
                     }
                     let data_type = parsed.data_type;
                     typmods.push(parsed.typmod);
+                    user_types.push(user_type);
                     let mut not_null = serial.is_some();
                     let mut default = None;
                     let mut sequence = serial.map(|_| defaults::SequenceSpec::default());
@@ -1287,6 +1336,7 @@ impl Parser {
             Statement::Create {
                 name,
                 optional,
+                user_types,
                 typmods,
                 defaults,
                 sequences,
@@ -1455,6 +1505,8 @@ pub(crate) enum V2Class {
 }
 #[derive(Debug, Clone)]
 pub struct Description {
+    /// Optional result OID overrides; storage types remain unchanged.
+    pub type_oids: Vec<u32>,
     pub parameters: Vec<DataType>,
     pub columns: Vec<ColumnDef>,
     pub typmods: Vec<i32>,
@@ -1511,7 +1563,9 @@ impl Prepared {
             Statement::Begin => V2Class::Control("begin"),
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
-            Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
+            Statement::Select { .. } | Statement::Query(_) | Statement::CompositeSelect(_) => {
+                V2Class::Read
+            }
             // INSERT ... SELECT reads other relations through the injected RowSource; v2 serves
             // multi-table reads only from F8(c), so it stays refused until then.
             Statement::InsertMulti(insert) if insert.source.is_some() => {
@@ -1525,12 +1579,17 @@ impl Prepared {
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
             Statement::Schema(_) => V2Class::Refused("user schemas"),
+            Statement::TypeDdl(_) => V2Class::Refused("user types"),
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
             Statement::Create {
                 constraints,
                 columns,
+                user_types,
                 ..
             } => {
+                if user_types.iter().any(Option::is_some) {
+                    return V2Class::Refused("user types");
+                }
                 let (mut unique, mut unenforced) = (false, false);
                 for constraint in constraints {
                     match constraint {
@@ -1673,6 +1732,7 @@ impl Prepared {
             Statement::Create {
                 name,
                 optional: false,
+                user_types: vec![None; columns.len()],
                 typmods: vec![None; columns.len()],
                 defaults: vec![None; columns.len()],
                 sequences: vec![None; columns.len()],
@@ -1844,11 +1904,40 @@ impl Prepared {
             self.describe_inner(state)?;
             return Err(SqlError::Syntax);
         }
-        self.describe_inner(state)
+        if let Statement::Create { user_types, .. } = &self.statement {
+            for name in user_types.iter().flatten() {
+                state
+                    .resolve_type(name, &self.search_path)?
+                    .ok_or(SqlError::UndefinedObject)?
+                    .1
+                    .storage_type()?;
+            }
+        }
+        let mut description = self.describe_inner(state)?;
+        if description.type_oids.is_empty() {
+            description.type_oids = description
+                .columns
+                .iter()
+                .map(
+                    |c| match state.ext.columns.get(&c.id).and_then(|c| c.type_id) {
+                        Some(id)
+                            if matches!(state.ext.types.get(&id), Some(TypeDef::Enum { .. })) =>
+                        {
+                            type_oid(id)
+                        }
+                        _ => Ok(0),
+                    },
+                )
+                .collect::<R<_>>()?;
+        }
+        Ok(description)
     }
     fn describe_inner(&self, state: &Relational) -> R<Description> {
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
+        }
+        if let Statement::CompositeSelect(select) = &self.statement {
+            return select.describe(state, self.params, &self.search_path);
         }
         if let Statement::AlterTable(alter) = &self.statement {
             if let Some(error) = &alter.resolution_error {
@@ -2002,12 +2091,14 @@ impl Prepared {
         if let Some(returning) = self.returning() {
             let (columns, parameters, typmods) = returning.describe(state, params)?;
             return Ok(Description {
+                type_oids: vec![],
                 typmods,
                 columns,
                 parameters,
             });
         }
         Ok(Description {
+            type_oids: vec![],
             parameters: params
                 .into_iter()
                 .map(|t| t.ok_or(SqlError::Parameters))
@@ -2062,6 +2153,7 @@ impl Prepared {
             self.statement,
             Statement::Schema(_)
                 | Statement::Sequence(_)
+                | Statement::TypeDdl(_)
                 | Statement::Create { .. }
                 | Statement::CreateIndex(_)
                 | Statement::AlterTable(_)
@@ -2095,6 +2187,8 @@ impl Prepared {
                     "DROP SCHEMA"
                 }
             }
+            Statement::TypeDdl(ref ddl) => ddl.command(),
+            Statement::CompositeSelect(_) => "SELECT",
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
                 defaults::SequenceDdl::Alter { .. } => "ALTER SEQUENCE",
@@ -2531,7 +2625,11 @@ impl Prepared {
         };
         let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
-            Statement::Query(query::Query::parse(&mut p)?)
+            if user_types::CompositeSelect::claims(&p) {
+                Statement::CompositeSelect(user_types::CompositeSelect::parse(&mut p)?)
+            } else {
+                Statement::Query(query::Query::parse(&mut p)?)
+            }
         } else {
             match p.parse() {
                 Ok(statement) => statement,
@@ -2610,7 +2708,7 @@ impl Prepared {
     pub(crate) fn is_read(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Select { .. } | Statement::Query(_)
+            Statement::Select { .. } | Statement::Query(_) | Statement::CompositeSelect(_)
         )
     }
 }
@@ -3049,6 +3147,7 @@ impl Relational {
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
         prepared.validate_schemas(self)?;
+        user_types::clear_sql_error_message();
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -3172,6 +3271,12 @@ impl Relational {
         };
         let mut result = SqlResult::default();
         match &prepared.statement {
+            Statement::TypeDdl(ddl) => {
+                user_types::execute(self, ddl, prepared)?;
+            }
+            Statement::CompositeSelect(select) => {
+                return select.execute(self, params, &prepared.search_path);
+            }
             Statement::Query(q) => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
@@ -3280,9 +3385,30 @@ impl Relational {
                 keys,
                 constraints,
                 primary_name,
+                user_types,
             } => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
+                }
+                let mut columns = columns.clone();
+                let mut typmods = typmods.clone();
+                let mut type_ids = vec![None; columns.len()];
+                for (i, name) in user_types.iter().enumerate() {
+                    if let Some(name) = name {
+                        let (id, ty) = self
+                            .resolve_type(name, &prepared.search_path)?
+                            .ok_or(SqlError::UndefinedObject)?;
+                        columns[i].data_type = ty.storage_type()?;
+                        if let TypeDef::Domain { typmod, .. } = ty {
+                            typmods[i] = *typmod;
+                        }
+                        type_ids[i] = Some(id);
+                    }
+                }
+                let columns = &columns;
+                let typmods = &typmods;
+                if self.type_by_name(name).is_some() {
+                    return Err(SqlError::DuplicateObject);
                 }
                 if self.relation_name_taken(name) {
                     if *optional {
@@ -3352,6 +3478,14 @@ impl Relational {
                     self.ext.table_schemas.insert(table.id, schema);
                     Self::normalize_ext(&mut self.ext);
                 }
+                self.mutate_ext(|ext, _| {
+                    for (column, type_id) in table.columns.iter().zip(&type_ids) {
+                        if let Some(id) = type_id {
+                            ext.columns.entry(column.id).or_default().type_id = Some(*id);
+                        }
+                    }
+                    Ok(())
+                })?;
                 if let Some(name) = chosen_primary {
                     constraint_primary_key::record_name(self, &table, &name)?;
                 }

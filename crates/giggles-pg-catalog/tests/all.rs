@@ -68,7 +68,10 @@ fn every_test_file_is_registered() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("utf-8 name");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name");
         if stem == "all" {
             continue;
         }
@@ -94,3 +97,5 @@ mod compat_metadata;
 
 #[path = "logical_column_types.rs"]
 mod logical_column_types;
+#[path = "user_defined_types.rs"]
+mod user_defined_types;

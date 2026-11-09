@@ -823,10 +823,10 @@ fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Cor
         records.insert(catalog_codec::sequence_key(*id), value);
         records.insert(name_key(&def.name), id.to_be_bytes().to_vec());
     }
-    // TypeDef is uninhabited until E1/E2 add user types; this match stops
-    // compiling when they do, forcing the kind-6 writer to be added here.
-    if let Some(def) = parts.ext.types.values().next() {
-        match *def {}
+    // User types currently belong to the namespace-5 ext-version-six layout.
+    // Refuse them rather than dropping metadata in the independent v2 codec.
+    if !parts.ext.types.is_empty() {
+        return Err(CoreError::Unsupported);
     }
     Ok(records)
 }

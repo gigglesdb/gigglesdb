@@ -318,7 +318,9 @@ impl InsertExpressions {
                         remap(b, map)
                     }
                     Scalar::Call(_, args) => args.iter_mut().try_for_each(|arg| remap(arg, map)),
-                    Scalar::SubstringOrder(args) => args.iter_mut().try_for_each(|arg| remap(arg, map)),
+                    Scalar::SubstringOrder(args) => {
+                        args.iter_mut().try_for_each(|arg| remap(arg, map))
+                    }
                     Scalar::Predicate(f) => filter(f, map),
                     Scalar::Case(c) => {
                         for (f, s) in &mut c.arms {
@@ -445,6 +447,7 @@ impl InsertExpressions {
     ) -> R<Description> {
         let bound = self.bind(state, count, declared)?;
         Ok(Description {
+            type_oids: vec![],
             parameters: bound.parameters,
             typmods: vec![],
             columns: vec![],
