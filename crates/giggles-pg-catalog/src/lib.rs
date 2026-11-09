@@ -210,7 +210,7 @@ impl PgType {
         }
     }
     /// Non-null array wire encoders can use this instead of matching each variant.
-    /// AclItemArray is only used for NULL catalog cells and has no scalar variant.
+    /// AclItemArray stores ACL text elements and has no scalar PgType variant.
     /// Int2Vector/OidVector use a space-separated representation, not array braces.
     pub fn array_element(self) -> Option<Self> {
         Some(match self {

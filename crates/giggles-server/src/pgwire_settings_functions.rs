@@ -38,14 +38,19 @@ fn evaluate(
         return Err("25P02");
     }
     let before = settings.current.clone();
-    let value = diagnostic.settings(function.evaluate(settings))?;
+    let rows = if function.has_row(settings) {
+        let value = diagnostic.settings(function.evaluate(settings))?;
+        vec![giggles_core::relational::SqlRow {
+            values: vec![value.map(Value::Text).unwrap_or(Value::Null)],
+            version: 0,
+        }]
+    } else {
+        vec![]
+    };
     settings_status(&before, settings, session, out)?;
     Ok(SqlResult {
         columns: vec![function.column().into()],
-        rows: vec![giggles_core::relational::SqlRow {
-            values: vec![value.map(Value::Text).unwrap_or(Value::Null)],
-            version: 0,
-        }],
+        rows,
         affected: 0,
     })
 }

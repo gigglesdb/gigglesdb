@@ -85,3 +85,6 @@ fn every_test_file_is_registered() {
 }
 #[path = "npgsql_get_schema.rs"]
 mod npgsql_get_schema;
+
+#[path = "pg_dump_catalog.rs"]
+mod pg_dump_catalog;

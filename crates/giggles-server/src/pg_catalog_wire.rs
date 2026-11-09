@@ -361,6 +361,15 @@ fn encode_with_extra(
         return Ok(None);
     }
     let bytes = match (value, ty) {
+        (Value::Array(_), PgType::AclItemArray) => {
+            // ACL items are stored as their PostgreSQL text representation.
+            // PostgreSQL has no aclitem binary send function; do not substitute
+            // text bytes into a binary array claiming an aclitem element OID.
+            if format == 1 {
+                return Err("42883");
+            }
+            return encode_with_extra(value, PgType::TextArray, 0, extra);
+        }
         (Value::Numeric(v), PgType::Numeric) => {
             if format == 1 {
                 v.to_binary()
@@ -638,6 +647,38 @@ pub(crate) fn execute(
 mod tests {
     use super::*;
     use tokio_postgres::types::{FromSql, Type};
+
+    #[test]
+    fn acl_defaults_encode_as_text_arrays_with_acl_and_array_quoting() {
+        let plan = giggles_pg_catalog::plan(
+            "SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n",
+        ).unwrap().unwrap();
+        let mut snapshot = giggles_pg_catalog::CatalogSnapshot::default();
+        snapshot.roles[0].name = "a\"b\\c".into();
+        let result = giggles_pg_catalog::execute(&plan, &snapshot, &[]).unwrap();
+        assert_eq!(result.fields[5].data_type.oid(), 1034);
+        for row in result.rows {
+            assert_eq!(encode(&row[4], PgType::AclItemArray, 0).unwrap(), None);
+            let bytes = encode(&row[5], PgType::AclItemArray, 0).unwrap().unwrap();
+            // Array escaping surrounds the independently quoted ACL role names.
+            let expected: &[u8] = if row[3] == Value::Int(6171) {
+                br#"{"pg_database_owner=UC/pg_database_owner"}"#
+            } else {
+                br#"{"\"a\"\"b\\c\"=UC/\"a\"\"b\\c\""}"#
+            };
+            assert_eq!(bytes, expected);
+            assert_eq!(encode(&row[5], PgType::AclItemArray, 1), Err("42883"));
+        }
+        assert_eq!(
+            encode(
+                &Value::Array(vec![Value::Text("giggles=UC/giggles".into())]),
+                PgType::AclItemArray,
+                0
+            )
+            .unwrap(),
+            Some(b"{\"giggles=UC/giggles\"}".to_vec())
+        );
+    }
 
     #[test]
     fn empty_internal_char_has_distinct_text_binary_and_null_encodings() {

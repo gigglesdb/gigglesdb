@@ -343,7 +343,10 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("extname", T::Name),
             ("extowner", T::Oid),
             ("extnamespace", T::Oid),
+            ("extrelocatable", T::Bool),
             ("extversion", T::Text),
+            ("extconfig", T::OidArray),
+            ("extcondition", T::TextArray),
             ("xmin", T::Xid),
         ],
         "pg_depend" => &[
@@ -672,6 +675,25 @@ pub(crate) fn relation_namespace(name: &str) -> &'static str {
         "information_schema"
     } else {
         "pg_catalog"
+    }
+}
+/// Only physical catalog tables have system columns; catalog views do not.
+pub(crate) fn tableoid(name: &str) -> Option<u32> {
+    if relation_namespace(name) != "pg_catalog"
+        || matches!(
+            name,
+            "pg_indexes"
+                | "pg_user"
+                | "pg_roles"
+                | "pg_shadow"
+                | "pg_timezone_names"
+                | "pg_timezone_abbrevs"
+                | "pg_user_mappings"
+        )
+    {
+        None
+    } else {
+        relation_oid(name)
     }
 }
 pub(crate) fn relation_oid(name: &str) -> Option<u32> {

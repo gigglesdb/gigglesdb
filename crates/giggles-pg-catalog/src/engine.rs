@@ -39,6 +39,7 @@ struct Col {
     qualifier: String,
     field: Field,
     natural_hidden: bool,
+    system: bool,
     scope_depth: u8,
 }
 type Schema = Vec<Col>;
@@ -748,7 +749,7 @@ impl Compiler {
                 );
                 schema.extend(rs)
             }
-            logical_columns.extend(logical_columns.len()..schema.len());
+            logical_columns.extend((operand_start..schema.len()).filter(|&i| !schema[i].system));
             if has_natural && matches!(source, Source::Unnest(..) | Source::Scalar(_)) {
                 return Err(Error::Unsupported);
             }
@@ -809,7 +810,9 @@ impl Compiler {
                     a::JoinConstraint::None => truth(),
                     a::JoinConstraint::Natural if !left => {
                         // Logical output order is independent of the physical join row.
-                        let right: Vec<_> = (old_width..schema.len()).collect();
+                        let right: Vec<_> = (old_width..schema.len())
+                            .filter(|&i| !schema[i].system)
+                            .collect();
                         for input in [&logical_columns, &right] {
                             let mut names = std::collections::BTreeSet::new();
                             for &i in input {
@@ -876,7 +879,8 @@ impl Compiler {
                     _ => return Err(Error::Unsupported),
                 };
                 if !matches!(constraint, a::JoinConstraint::Natural) {
-                    logical_columns.extend(old_width..schema.len());
+                    logical_columns
+                        .extend((old_width..schema.len()).filter(|&i| !schema[i].system));
                 }
                 expect(&mut on, PgType::Bool)?;
                 no_set_or_window(&on)?;
@@ -1215,18 +1219,35 @@ impl Compiler {
         } else {
             default
         };
-        Ok((
-            source,
-            fields
-                .into_iter()
-                .map(|field| Col {
-                    qualifier: qualifier.clone(),
-                    field,
-                    natural_hidden: false,
-                    scope_depth: 0,
-                })
-                .collect(),
-        ))
+        let tableoid = match &source {
+            Source::Catalog(name) => catalog::tableoid(name),
+            _ => None,
+        };
+        let mut schema: Schema = fields
+            .into_iter()
+            .map(|field| Col {
+                qualifier: qualifier.clone(),
+                field,
+                natural_hidden: false,
+                system: false,
+                scope_depth: 0,
+            })
+            .collect();
+        // Physical system slots participate in binding and null extension, but
+        // never in wildcard expansion or the ordinary catalog column inventory.
+        if tableoid.is_some() {
+            schema.push(Col {
+                qualifier,
+                field: Field {
+                    name: "tableoid".into(),
+                    data_type: PgType::Oid,
+                },
+                natural_hidden: false,
+                system: true,
+                scope_depth: 0,
+            });
+        }
+        Ok((source, schema))
     }
     fn args(&mut self, args: &[a::FunctionArg], schema: &Schema) -> R<Vec<E>> {
         args.iter()
@@ -2038,6 +2059,15 @@ fn array_element(t: PgType) -> R<PgType> {
         t.array_element().ok_or(Error::Type)
     }
 }
+// PostgreSQL ACL role names quote punctuation and non-ASCII bytes, but allow
+// uppercase letters, digits (including first), and SQL keywords unquoted.
+fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
 fn textual(t: PgType) -> bool {
     matches!(t, PgType::Text | PgType::Name | PgType::Char)
 }
@@ -2190,6 +2220,10 @@ fn check_expr(e: &mut E) -> R<()> {
             e.ty = t;
         }
         K::Call(n, args) => match n.as_str() {
+            "acldefault" => {
+                expect(&mut args[0], PgType::Char)?;
+                coerce(&mut args[1], PgType::Oid)?;
+            }
             "pg_get_viewdef" | "pg_get_ruledef" | "pg_get_triggerdef" => {
                 expect(&mut args[0], PgType::Oid)?;
                 expect(&mut args[1], PgType::Bool)?;
@@ -2304,6 +2338,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("version", 0) => PgType::Text,
         ("pg_is_in_recovery", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
+        ("acldefault", 2) => PgType::AclItemArray,
         ("replace" | "translate", 3)
         | ("pg_get_expr", 2 | 3)
         | ("format_type", 2)
@@ -2565,7 +2600,13 @@ impl Runtime<'_> {
             Source::Catalog(n) => {
                 let r = self.catalogs.get(n).ok_or(Error::Unsupported)?;
                 self.charge(r.rows.len())?;
-                Ok(r.rows.clone())
+                let mut rows = r.rows.clone();
+                if let Some(oid) = catalog::tableoid(n) {
+                    for row in &mut rows {
+                        row.push(Value::Int(i64::from(oid)));
+                    }
+                }
+                Ok(rows)
             }
             Source::Derived(q) => self.query(q, &[]),
             Source::FlatUnion(arms) => flat_union::execute(self, arms, outer),
@@ -3331,6 +3372,20 @@ impl Runtime<'_> {
             return Ok(N);
         }
         Ok(match n {
+            "acldefault" => {
+                // Defaults describe the object owner's initial rights, independently
+                // of actual catalog ACLs (which this snapshot does not model).
+                if text(v[0].clone())? != "n" {
+                    return Err(Error::Unsupported);
+                }
+                let oid = integer(v[1].clone())?;
+                self.charge(self.snapshot.roles.len() + 16)?;
+                let owner = catalog::role_name(self.snapshot, oid)
+                    .map(acl_role_name)
+                    .unwrap_or_else(|| oid.to_string());
+                let grantee = if oid == 0 { "" } else { &owner };
+                Value::Array(vec![S(format!("{grantee}=UC/{owner}"))])
+            }
             "encode" => {
                 let (Value::Bytes(input), S(format)) = (&v[0], &v[1]) else {
                     return Err(Error::Type);

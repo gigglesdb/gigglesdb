@@ -165,6 +165,8 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "client_min_messages" => Ok(Show::ClientMinMessages),
         "row_security" => Ok(Show::RowSecurity),
         "check_function_bodies" => Ok(Show::CheckFunctionBodies),
+        "synchronize_seqscans" => Ok(Show::SynchronizeSeqscans),
+        "restrict_nonsystem_relation_kind" => Ok(Show::RestrictNonsystemRelationKind),
         "xmloption" => Ok(Show::XmlOption),
         "default_tablespace" => Ok(Show::DefaultTablespace),
         "default_table_access_method" => Ok(Show::DefaultTableAccessMethod),
@@ -326,13 +328,23 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         {
             Ok(lower)
         }
-        Show::CheckFunctionBodies => boolean(&lower).map(|v| if v { "on" } else { "off" }.into()),
+        Show::CheckFunctionBodies | Show::SynchronizeSeqscans => {
+            boolean(&lower).map(|v| if v { "on" } else { "off" }.into())
+        }
         Show::RowSecurity => {
             if boolean(&lower)? {
                 Err("0A000")
             } else {
                 Ok("off".into())
             }
+        }
+        Show::RestrictNonsystemRelationKind
+            if value.trim().is_empty()
+                || lower
+                    .split(',')
+                    .all(|part| matches!(part.trim(), "view" | "foreign-table")) =>
+        {
+            Ok(value)
         }
         Show::XmlOption if matches!(lower.as_str(), "content" | "document") => Ok(lower),
         Show::DefaultTablespace if value.is_empty() => Ok(value),

@@ -1,4 +1,4 @@
-//! Standalone, literal-only configuration SELECTs. Larger SQL stays on its old path.
+//! Literal configuration SELECTs and the bounded pg_dump pg_settings lookup.
 use super::{Result, SessionSettings, database};
 
 #[derive(Clone)]
@@ -7,6 +7,7 @@ pub(crate) enum Function {
         name: String,
         value: String,
         local: bool,
+        from_settings: bool,
         column: String,
     },
     Current {
@@ -19,6 +20,19 @@ impl Function {
     pub fn column(&self) -> &str {
         match self {
             Self::Set { column, .. } | Self::Current { column, .. } => column,
+        }
+    }
+    /// pg_settings.name comparisons are case-sensitive; absent rows never run set_config.
+    pub fn has_row(&self, settings: &SessionSettings) -> bool {
+        match self {
+            Self::Set {
+                name,
+                from_settings: true,
+                ..
+            } => database::lookup_name(name).is_ok_and(|setting| {
+                setting.value(&settings.current).0.to_ascii_lowercase() == *name
+            }),
+            _ => true,
         }
     }
     /// Called within a real SQL transaction, including a statement's implicit one.
@@ -52,6 +66,7 @@ enum Token {
     Right,
     Dot,
     Comma,
+    Equals,
 }
 fn lex(sql: &str) -> Option<Vec<Token>> {
     let mut chars = sql
@@ -71,6 +86,7 @@ fn lex(sql: &str) -> Option<Vec<Token>> {
             ')' => Token::Right,
             '.' => Token::Dot,
             ',' => Token::Comma,
+            '=' => Token::Equals,
             '\'' | '"' => {
                 let mut value = String::new();
                 loop {
@@ -156,7 +172,14 @@ fn parse(sql: &str) -> Option<Function> {
         return None;
     }
     p.token(Token::Left)?;
-    let name = p.text()?;
+    let from_settings =
+        function == "set_config" && p.tokens.get(p.at) == Some(&Token::Word("name".into()));
+    let name = if from_settings {
+        p.at += 1;
+        String::new()
+    } else {
+        p.text()?
+    };
     let mut call = if function == "set_config" {
         p.token(Token::Comma)?;
         let value = p.text()?;
@@ -166,6 +189,7 @@ fn parse(sql: &str) -> Option<Function> {
             name,
             value,
             local,
+            from_settings,
             column: function,
         }
     } else {
@@ -182,7 +206,7 @@ fn parse(sql: &str) -> Option<Function> {
         }
     };
     p.token(Token::Right)?;
-    if p.at < p.tokens.len() {
+    if p.tokens.get(p.at) == Some(&Token::Word("as".into())) {
         p.token(Token::Word("as".into()))?;
         let column = match p.tokens.get(p.at)? {
             Token::Word(s) | Token::Ident(s) => s.clone(),
@@ -191,6 +215,16 @@ fn parse(sql: &str) -> Option<Function> {
         p.at += 1;
         match &mut call {
             Function::Set { column: c, .. } | Function::Current { column: c, .. } => *c = column,
+        }
+    }
+    if from_settings {
+        for word in ["from", "pg_settings", "where", "name"] {
+            p.token(Token::Word(word.into()))?;
+        }
+        p.token(Token::Equals)?;
+        let filter = p.text()?;
+        if let Function::Set { name, .. } = &mut call {
+            *name = filter;
         }
     }
     (p.at == p.tokens.len()).then_some(call)

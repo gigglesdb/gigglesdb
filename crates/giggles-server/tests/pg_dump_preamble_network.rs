@@ -488,3 +488,207 @@ async fn public_qualified_names_are_core_gap_until_e1_a3() {
     drop(c);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn synchronize_seqscans_pg_dump_setting_and_session_lifetimes() {
+    let f = Fixture::new().await;
+    for extended in [false, true] {
+        let c = f.client().await;
+        for (sql, expected) in [
+            ("SHOW synchronize_seqscans", Some("on")),
+            ("SET synchronize_seqscans TO off", None),
+            ("SHOW synchronize_seqscans", Some("off")),
+            ("RESET synchronize_seqscans", None),
+            ("SHOW synchronize_seqscans", Some("on")),
+            ("BEGIN", None),
+            ("SET synchronize_seqscans TO off", None),
+            ("SHOW synchronize_seqscans", Some("off")),
+            ("ROLLBACK", None),
+            ("SHOW synchronize_seqscans", Some("on")),
+            ("BEGIN", None),
+            ("SET LOCAL synchronize_seqscans TO off", None),
+            ("SHOW synchronize_seqscans", Some("off")),
+            ("COMMIT", None),
+            ("SHOW synchronize_seqscans", Some("on")),
+            ("BEGIN", None),
+            ("SET synchronize_seqscans TO false", None),
+            ("COMMIT", None),
+            ("SHOW synchronize_seqscans", Some("off")),
+            ("RESET ALL", None),
+            ("SHOW synchronize_seqscans", Some("on")),
+        ] {
+            let actual = if extended {
+                c.query(sql, &[])
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|row| row.get::<_, String>(0))
+            } else {
+                values(&c.simple_query(sql).await.unwrap()).first().cloned()
+            };
+            assert_eq!(actual.as_deref(), expected, "{sql} (extended={extended})");
+        }
+        for (value, expected) in [
+            ("true", "on"),
+            ("false", "off"),
+            ("yes", "on"),
+            ("no", "off"),
+            ("1", "on"),
+            ("0", "off"),
+        ] {
+            let sql = format!("SET synchronize_seqscans TO {value}");
+            if extended {
+                c.query(&sql, &[]).await.unwrap();
+            } else {
+                c.simple_query(&sql).await.unwrap();
+            }
+            assert_eq!(
+                values(&c.simple_query("SHOW synchronize_seqscans").await.unwrap()),
+                [expected]
+            );
+        }
+        let sql = "SET synchronize_seqscans TO maybe";
+        let error = if extended {
+            c.query(sql, &[]).await.unwrap_err()
+        } else {
+            c.simple_query(sql).await.unwrap_err()
+        };
+        assert_eq!(code(error), "22023");
+        assert_eq!(
+            values(&c.simple_query("SHOW synchronize_seqscans").await.unwrap()),
+            ["off"]
+        );
+        drop(c);
+    }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn pg_dump_set_config_from_pg_settings_simple_and_extended() {
+    let f = Fixture::new().await;
+    for extended in [false, true] {
+        let c = f.client().await;
+        for (sql, expected) in [
+            ("SHOW restrict_nonsystem_relation_kind", Some("")),
+            (
+                "SELECT set_config(name, 'UTC', false) FROM pg_settings WHERE name = 'timezone'",
+                Some("UTC"),
+            ),
+            (
+                "SELECT set_config(name, 'ISO, MDY', false) FROM pg_settings WHERE name = 'datestyle'",
+                Some("ISO, MDY"),
+            ),
+            (
+                "SELECT set_config(name, 'view, foreign-table', false) FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'",
+                Some("view, foreign-table"),
+            ),
+            (
+                "SHOW restrict_nonsystem_relation_kind",
+                Some("view, foreign-table"),
+            ),
+            ("BEGIN", None),
+            (
+                "SELECT set_config(name, 'foreign-table,view', false) FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'",
+                Some("foreign-table,view"),
+            ),
+            (
+                "SHOW restrict_nonsystem_relation_kind",
+                Some("foreign-table,view"),
+            ),
+            ("ROLLBACK", None),
+            (
+                "SHOW restrict_nonsystem_relation_kind",
+                Some("view, foreign-table"),
+            ),
+            ("BEGIN", None),
+            ("SET LOCAL restrict_nonsystem_relation_kind='view'", None),
+            ("SHOW restrict_nonsystem_relation_kind", Some("view")),
+            ("COMMIT", None),
+            (
+                "SHOW restrict_nonsystem_relation_kind",
+                Some("view, foreign-table"),
+            ),
+            // A missing catalog row suppresses both assignment and value validation.
+            (
+                "SELECT set_config(name, 'invalid', false) FROM pg_settings WHERE name = 'nonexistent'",
+                None,
+            ),
+            (
+                "SELECT set_config(name, 'view', false) FROM pg_settings WHERE name = 'RESTRICT_NONSYSTEM_RELATION_KIND'",
+                None,
+            ),
+            (
+                "SHOW restrict_nonsystem_relation_kind",
+                Some("view, foreign-table"),
+            ),
+            ("RESET ALL", None),
+            ("SHOW restrict_nonsystem_relation_kind", Some("")),
+        ] {
+            let actual = if extended {
+                let rows = c.query(sql, &[]).await.unwrap();
+                assert_eq!(rows.len(), usize::from(expected.is_some()), "{sql}");
+                if sql.starts_with("SELECT") && !rows.is_empty() {
+                    assert_eq!(rows[0].columns()[0].name(), "set_config");
+                    assert_eq!(
+                        *rows[0].columns()[0].type_(),
+                        tokio_postgres::types::Type::TEXT
+                    );
+                }
+                rows.first().map(|row| row.get::<_, String>(0))
+            } else {
+                let messages = c.simple_query(sql).await.unwrap();
+                if sql.starts_with("SELECT") {
+                    assert!(messages.iter().any(|message| matches!(message,
+                        SimpleQueryMessage::CommandComplete(n) if *n == u64::from(expected.is_some()))));
+                    if let Some(SimpleQueryMessage::Row(row)) = messages
+                        .iter()
+                        .find(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    {
+                        assert_eq!(row.columns()[0].name(), "set_config");
+                    }
+                }
+                let rows = values(&messages);
+                assert_eq!(rows.len(), usize::from(expected.is_some()), "{sql}");
+                rows.first().cloned()
+            };
+            assert_eq!(actual.as_deref(), expected, "{sql} (extended={extended})");
+        }
+        for value in ["table", "view,", "view,,foreign-table"] {
+            let sql = format!(
+                "SELECT set_config(name, '{value}', false) FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'"
+            );
+            let error = if extended {
+                c.query(&sql, &[]).await.unwrap_err()
+            } else {
+                c.simple_query(&sql).await.unwrap_err()
+            };
+            assert_eq!(code(error), "22023");
+        }
+        for suffix in [
+            " AND true",
+            " trailing",
+            " = 'view'",
+            " ORDER BY name",
+            " OR name = 'application_name'",
+        ] {
+            let sql = format!(
+                "SELECT set_config(name, 'view', false) FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'{suffix}"
+            );
+            if extended {
+                assert!(c.query(&sql, &[]).await.is_err(), "{sql}");
+            } else {
+                assert!(c.simple_query(&sql).await.is_err(), "{sql}");
+            }
+            assert_eq!(
+                values(
+                    &c.simple_query("SHOW restrict_nonsystem_relation_kind")
+                        .await
+                        .unwrap()
+                ),
+                [""]
+            );
+        }
+        drop(c);
+    }
+    f.stop().await;
+}
