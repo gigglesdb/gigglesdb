@@ -533,6 +533,19 @@ fn infer_mutation_parameter(
 }
 pub(crate) fn coerce_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
     use giggles_pg_types::character::{CharKind, CharTypmod, coerce_assignment};
+    if column.data_type == DataType::Numeric {
+        let Some(typmod) =
+            giggles_pg_types::typmod::NumericTypmod::from_typmod(rel.column_typmod(column.id))
+        else {
+            return Ok(value);
+        };
+        return match value {
+            Value::Numeric(value) => Ok(Value::Numeric(
+                value.apply_typmod(typmod).map_err(|_| SqlError::Overflow)?,
+            )),
+            value => Ok(value),
+        };
+    }
     let kind = match column.data_type {
         DataType::Varchar => CharKind::Varchar,
         DataType::Bpchar => CharKind::Bpchar,

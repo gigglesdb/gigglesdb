@@ -41,6 +41,8 @@ mod information_schema;
 mod metadata;
 #[path = "npgsql_startup.rs"]
 mod npgsql_startup;
+#[path = "numeric_column_typmod.rs"]
+mod numeric_column_typmod;
 #[path = "pg18_type_rows.rs"]
 mod pg18_type_rows;
 #[path = "psql_describe.rs"]

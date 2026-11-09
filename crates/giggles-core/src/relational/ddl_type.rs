@@ -56,14 +56,23 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
     };
     let temporal_suffix = matches!(word.as_str(), "time" | "timestamp");
     let character = matches!(data_type, DataType::Varchar | DataType::Bpchar);
-    // CREATE accepts only character modifiers.
-    if matches!(site, Site::Create) && !character && p.tokens.get(p.at) == Some(&Token::Symbol('('))
+    // CREATE accepts character and numeric modifiers.
+    if matches!(site, Site::Create)
+        && !character
+        && data_type != DataType::Numeric
+        && p.tokens.get(p.at) == Some(&Token::Symbol('('))
     {
         return Err(SqlError::Syntax);
     }
     let mut semantic_error = None;
-    let mut typmod = if (matches!(site, Site::Alter) || character) && p.sym('(') {
-        let first = integer(p)?;
+    let mut typmod = if (matches!(site, Site::Alter) || character || data_type == DataType::Numeric)
+        && p.sym('(')
+    {
+        let first = if data_type == DataType::Numeric {
+            numeric_integer(p)?
+        } else {
+            integer(p)?
+        };
         let value = if character {
             let kind = if data_type == DataType::Varchar {
                 giggles_pg_types::character::CharKind::Varchar
@@ -78,7 +87,13 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
                 }
             }
         } else if data_type == DataType::Numeric {
-            let scale = if p.sym(',') { integer(p)? } else { 0 };
+            let scale = if p.sym(',') { numeric_integer(p)? } else { 0 };
+            // PostgreSQL reports valid integer modifiers with excess arity as
+            // an invalid parameter, while malformed argument lists stay syntax errors.
+            while p.sym(',') {
+                numeric_integer(p)?;
+                semantic_error = Some(SqlError::InvalidParameterValue);
+            }
             match giggles_pg_types::typmod::NumericTypmod::new(first, scale) {
                 Ok(value) => value.to_typmod(),
                 Err(_) => {
@@ -186,4 +201,13 @@ fn integer(p: &mut Parser) -> R<i32> {
         Expr::Literal(Value::Int(n)) => n.try_into().map_err(|_| SqlError::InvalidParameterValue),
         _ => Err(SqlError::Syntax),
     }
+}
+
+// The expression parser uses Unsupported for absent or unsupported primaries;
+// within a numeric modifier list these are malformed arguments.
+fn numeric_integer(p: &mut Parser) -> R<i32> {
+    integer(p).map_err(|error| match error {
+        SqlError::Unsupported => SqlError::Syntax,
+        error => error,
+    })
 }

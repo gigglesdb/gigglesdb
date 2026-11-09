@@ -297,3 +297,6 @@ fn every_test_file_is_registered() {
 }
 #[path = "sql_text_order.rs"]
 mod sql_text_order;
+
+#[path = "numeric_column_typmod.rs"]
+mod numeric_column_typmod;

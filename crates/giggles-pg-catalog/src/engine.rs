@@ -3767,6 +3767,13 @@ fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
         23 => "integer".into(),
         700 => "real".into(),
         701 => "double precision".into(),
+        1700 => match typmod {
+            Value::Int(raw) => i32::try_from(raw)
+                .ok()
+                .and_then(giggles_pg_types::typmod::NumericTypmod::from_typmod)
+                .map_or_else(|| "numeric".into(), |modifier| format!("numeric{modifier}")),
+            _ => "numeric".into(),
+        },
         1083 => "time without time zone".into(),
         1266 => "time with time zone".into(),
         1114 => "timestamp without time zone".into(),

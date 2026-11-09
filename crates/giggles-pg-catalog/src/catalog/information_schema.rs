@@ -323,7 +323,18 @@ fn column_row(
             row[10] = I(if oid == 700 { 24 } else { 53 });
             row[11] = I(2);
         }
-        1700 => row[11] = I(10),
+        1700 => {
+            row[11] = I(10);
+            if let I(raw) = typmod
+                && let Ok(raw) = i32::try_from(*raw)
+                && let Some(modifier) = giggles_pg_types::typmod::NumericTypmod::from_typmod(raw)
+            {
+                row[10] = I(i64::from(modifier.precision()));
+                // PG18 information_schema exposes the unsigned packed scale,
+                // unlike format_type's signed interpretation.
+                row[12] = I(i64::from(modifier.scale() & 0x7ff));
+            }
+        }
         1082 => row[13] = I(0),
         1083 | 1266 | 1114 | 1184 | 1186 => row[13] = I(6),
         _ => {}
