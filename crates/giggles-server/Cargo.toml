@@ -2,6 +2,7 @@
 name = "giggles-server"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 
 [dependencies]
 giggles-pg-types = { path = "../giggles-pg-types" }
@@ -39,3 +40,11 @@ prost-types = "0.14"
 rcgen = "0.13"
 tokio-postgres = "=0.7.15"
 tokio-postgres-rustls = "0.13"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[test]]
+name = "network"
+path = "tests/network.rs"

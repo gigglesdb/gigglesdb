@@ -2,8 +2,21 @@
 name = "giggles-pg-catalog"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 
 [dependencies]
 giggles-pg-types = { path = "../giggles-pg-types" }
 sqlparser = { version = "=0.53.0", features = ["visitor"] }
 regex = "=1.12.2"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[test]]
+name = "datagrip_flat_union"
+path = "tests/datagrip_flat_union.rs"
+
+[[test]]
+name = "parser_process"
+path = "tests/parser_process.rs"
