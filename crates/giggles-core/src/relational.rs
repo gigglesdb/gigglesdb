@@ -2557,7 +2557,14 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
         if !t.primary_key.contains(&i) {
             return Err(SqlError::Unbounded);
         }
-        let v = p.value.value(params)?;
+        let mut v = p.value.value(params)?;
+        if let Expr::Literal(literal) = &p.value
+            && let Some(typed) =
+                query::unknown_comparison_literal(literal, &t.columns[i].data_type)?
+        {
+            // A clock-dependent literal is compared in the full filter.
+            v = typed.ok_or(SqlError::Unbounded)?;
+        }
         if let Value::Int(n) = &v
             && match t.columns[i].data_type {
                 DataType::SmallInt => i16::try_from(*n).is_err(),

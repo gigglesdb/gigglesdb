@@ -54,6 +54,8 @@ mod once_schema;
 mod operations;
 #[path = "owner_key_hygiene.rs"]
 mod owner_key_hygiene;
+#[path = "predicate_unknown_literals.rs"]
+mod predicate_unknown_literals;
 #[path = "public_unique.rs"]
 mod public_unique;
 #[path = "quoted_routines.rs"]

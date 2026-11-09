@@ -2957,6 +2957,16 @@ impl Query {
                     return Err(functions::comparison_mismatch(&literal.ty, column_type));
                 }
             }
+            if let Expr::Literal(value @ Value::Text(_)) = e
+                && let Some(Some(_)) = unknown_comparison_literal(
+                    value,
+                    &tables[c.source].columns[c.column].data_type,
+                )?
+            {
+                // Key bounds resolve the literal the same way (relational::bounds).
+                predicates.push((c, op.as_str(), e));
+                continue;
+            }
             if bind_expr(
                 e,
                 &tables[c.source].columns[c.column].data_type,
@@ -4028,6 +4038,27 @@ fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -
     Ordering::Equal
 }
 
+/// PG18 resolves an unknown (quoted) literal compared with a column through
+/// the column type's input function. `None`: character and bytea columns keep
+/// their existing route; `Some(None)`: resolution needs the session clock;
+/// `Some(Some(v))`: the typed value.
+pub(super) fn unknown_comparison_literal(
+    value: &Value,
+    ty: &DataType,
+) -> R<Option<Option<Value>>> {
+    if !matches!(value, Value::Text(_))
+        || matches!(
+            ty,
+            DataType::Text | DataType::Varchar | DataType::Bpchar | DataType::Bytes
+        )
+    {
+        return Ok(None);
+    }
+    if *ty == DataType::TimestampTz || functions::zone_dependent_literal(value, ty) {
+        return Ok(Some(None));
+    }
+    functions::coerce_clocked(value.clone(), ty, None).map(|v| Some(Some(v)))
+}
 pub(super) fn coerce_clocked(
     v: Value,
     t: &DataType,

@@ -161,7 +161,11 @@ fn signed_boundaries_and_no_coercion() {
     ] {
         err(&mut s, q, E::Overflow);
     }
-    err(&mut s, "SELECT id FROM widths WHERE id='1'", E::Type);
+    // PG18: the unknown literal takes the key column's type.
+    assert_eq!(
+        values(run(&mut s, "SELECT id FROM widths WHERE id='1'")),
+        ints(&[1])
+    );
     assert_eq!(
         s.execute(
             "INSERT INTO widths VALUES($1,$2,$3)",
