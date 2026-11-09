@@ -3,7 +3,7 @@ use super::*;
 use engine::{catalog::CatalogParts, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
 use relational::{SqlError, SqlRow, TableDef, row_sink::RowSink};
-use std::ops::Bound;
+use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
 mod sql_sequences;
 
@@ -153,16 +153,23 @@ impl SqlSession {
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
                         let parts = db.catalog().parts(txn)?;
-                        if let Some(name) = p.table()
-                            && parts.tables.contains_key(name)
-                        {
+                        let mut names = p.read_tables().into_iter().collect::<BTreeSet<_>>();
+                        if let Some(name) = p.table() {
+                            names.insert(name.to_owned());
+                        }
+                        for name in &names {
+                            if !parts.tables.contains_key(name) {
+                                // Preserve the legacy binder's SQL error precedence.
+                                continue;
+                            }
+                            let target = p.table() == Some(name.as_str());
                             db.catalog()
                                 .resolve(
                                     txn,
                                     name,
-                                    if ddl {
+                                    if target && ddl {
                                         LockMode::AccessExclusive
-                                    } else if writing {
+                                    } else if target && writing {
                                         LockMode::RowExclusive
                                     } else {
                                         LockMode::AccessShare
@@ -174,16 +181,23 @@ impl SqlSession {
                                     engine::catalog::CatalogError::Core(e) => e,
                                     engine::catalog::CatalogError::Txn(e) => e.into(),
                                 })?;
-                            if writing && !ddl {
-                                // Empty PK cannot name a real row. This transaction-held
-                                // SQL writer mutex allows AccessShare MVCC readers.
-                                let id = parts.tables[name].id.to_be_bytes();
-                                txn.lock_for_write(Keyspace::Rows, &id, None, &|| {
-                                    crate::cancellation::check().is_err()
-                                })?;
-                            }
-                            txn.begin_statement();
                         }
+                        if writing
+                            && !ddl
+                            && let Some(table) = p.table().and_then(|name| parts.tables.get(name))
+                        {
+                            // Empty PK cannot name a real row. Serialize SQL writers
+                            // only on the destination; source readers remain MVCC.
+                            txn.lock_for_write(
+                                Keyspace::Rows,
+                                &table.id.to_be_bytes(),
+                                None,
+                                &|| crate::cancellation::check().is_err(),
+                            )?;
+                        }
+                        // Choose ONE snapshot after every potentially blocking lock.
+                        // No refresh occurs while staging any of the statement's rows.
+                        txn.begin_statement();
                         let old = db.catalog().parts(txn)?;
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
@@ -360,6 +374,12 @@ impl RowSink for SqlRows<'_> {
             })
             .map_err(CoreError::Sql)?;
         }
+        #[cfg(test)]
+        AFTER_TABLE_SCAN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&table.name);
+            }
+        });
         Ok(())
     }
     fn apply(
@@ -432,6 +452,10 @@ impl RowSink for SqlRows<'_> {
 }
 
 #[cfg(test)]
+type TableScanHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
 thread_local! {
+    static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
     static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

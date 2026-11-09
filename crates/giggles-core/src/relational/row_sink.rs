@@ -1,4 +1,4 @@
-//! Bounded single-table statement staging over an external row store.
+//! Bounded multi-table statement staging over an external row store.
 //!
 //! The legacy publisher checks complete pre/postimages (including immediate PK
 //! occupancy, witness ownership, work and byte limits). Reuse those checks in a
@@ -33,12 +33,31 @@ impl Relational {
         sink: &mut impl RowSink,
         version_end: u64,
     ) -> Result<SqlResult, CoreError> {
-        let table = prepared
-            .table()
-            .and_then(|name| self.tables.get(name))
-            .cloned();
+        // Keep the mutation target separate from the read set: a join's first
+        // source must never be published, and INSERT ... SELECT still needs its
+        // destination's complete occupancy image for immediate PK checks.
+        let table = (!matches!(prepared.v2_class(), V2Class::Read))
+            .then(|| {
+                prepared
+                    .table()
+                    .and_then(|name| self.tables.get(name))
+                    .cloned()
+            })
+            .flatten();
+        let mut names = prepared.read_tables();
+        if let Some(table) = &table
+            && !names.contains(&table.name)
+        {
+            names.push(table.name.clone());
+        }
+        // One budget across ALL scanned relations, including nested subqueries.
+        // The target preimage and legacy execution retain A1's separate bounds.
         let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
-        if let Some(table) = &table {
+        for name in names {
+            let Some(table) = self.tables.get(&name) else {
+                // Binding owns SQL error precedence (including unknown tables).
+                continue;
+            };
             let rows = self
                 .rows
                 .get_mut(&table.id)
@@ -47,9 +66,13 @@ impl Relational {
                 if crate::cancellation::check().is_err() {
                     return Err(SqlError::Aborted);
                 }
-                self.next_version = self
-                    .next_version
-                    .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
+                // Only destination rows constrain its version allocator. A
+                // concurrent source writer may hold a newer reserved range.
+                if prepared.table() == Some(table.name.as_str()) {
+                    self.next_version = self
+                        .next_version
+                        .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
+                }
                 let key = pk(table, &row.values)?;
                 retention.charge(searched::retained_row_bytes(&key, &row)?)?;
                 if rows.insert(key, row).is_some() {
@@ -79,5 +102,63 @@ impl Relational {
             sink.apply(table, before, after)?;
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct WideSources {
+        scans: Vec<(String, usize)>,
+    }
+    impl RowSink for WideSources {
+        fn scan(
+            &mut self,
+            table: &TableDef,
+            visit: &mut dyn FnMut(SqlRow) -> R<()>,
+        ) -> Result<(), CoreError> {
+            self.scans.push((table.name.clone(), 0));
+            // Each table is below both MAX_ROWS and 64 MiB. Together they exceed
+            // the bridge's shared budget; reject before running the cross join.
+            for id in 0..600 {
+                self.scans.last_mut().unwrap().1 += 1;
+                visit(SqlRow {
+                    values: vec![Value::Int(id), Value::Text("x".repeat(60 * 1024))],
+                    version: 1,
+                })
+                .map_err(CoreError::Sql)?;
+            }
+            Ok(())
+        }
+        fn apply(
+            &mut self,
+            _: &TableDef,
+            _: &BTreeMap<Vec<u8>, SqlRow>,
+            _: &BTreeMap<Vec<u8>, SqlRow>,
+        ) -> Result<(), CoreError> {
+            panic!("read-only statements must never publish");
+        }
+    }
+
+    #[test]
+    fn staging_budget_is_shared_across_tables() {
+        let mut image = Relational::default();
+        for sql in [
+            "CREATE TABLE a (id bigint PRIMARY KEY,v text)",
+            "CREATE TABLE b (id bigint PRIMARY KEY,v text)",
+        ] {
+            let p = Prepared::parse(sql, 1, image.epoch).unwrap();
+            image.execute(&p, &[], None).unwrap();
+        }
+        let p = Prepared::parse("SELECT a.id,b.id FROM a JOIN b ON true", 1, image.epoch).unwrap();
+        let mut sink = WideSources { scans: Vec::new() };
+        assert_eq!(
+            image.execute_with_sink(&p, &[], None, None, &mut sink, u64::MAX),
+            Err(CoreError::Sql(SqlError::Limit))
+        );
+        assert_eq!(sink.scans[0], ("a".into(), 600));
+        assert_eq!(sink.scans[1].0, "b");
+        assert!((1..600).contains(&sink.scans[1].1));
     }
 }

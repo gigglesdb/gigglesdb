@@ -1661,9 +1661,6 @@ impl Query {
         }
         out
     }
-    pub(super) fn v2_single_table(&self) -> bool {
-        self.sources.len() <= 1 && self.joins.is_empty() && !self.has_in_subquery()
-    }
     pub(super) fn read_tables(&self) -> Vec<String> {
         let mut out = Vec::new();
         for name in self

@@ -610,7 +610,7 @@ fn failed_statement_preserves_prior_transaction_writes() {
 }
 
 #[test]
-fn v2_admission_and_multitable_refusals() {
+fn v2_admission_limits() {
     let f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY)");
     let ticket = f.admin().inner.enter_sql().unwrap();
@@ -646,24 +646,6 @@ fn v2_admission_and_multitable_refusals() {
     next.execute("BEGIN", &[], None).unwrap();
     next.execute("ROLLBACK", &[], None).unwrap();
     drop(sessions);
-    for sql in [
-        "SELECT a.id FROM t a JOIN t b ON a.id=b.id",
-        "SELECT id FROM t WHERE id IN (SELECT id FROM t)",
-        "UPDATE t SET id=2 WHERE id IN (SELECT id FROM t)",
-        "DELETE FROM t WHERE id IN (SELECT id FROM t)",
-    ] {
-        assert!(
-            matches!(
-                f.admin().sql_session().execute(sql, &[], None),
-                Err(CoreError::EngineUnsupported {
-                    feature: "multi-table SQL reads",
-                    ..
-                })
-            ),
-            "{sql}"
-        );
-    }
-    assert!(values(&mut f.admin().sql_session(), "SELECT * FROM t ORDER BY id").is_empty());
 }
 
 #[test]
@@ -793,4 +775,245 @@ fn mutation_limits_and_parameter_errors_match_legacy_without_rows() {
     assert!(values(&mut b, "SELECT * FROM t ORDER BY id").is_empty());
     drop((a, b, legacy));
     fs::remove_dir_all(path).unwrap();
+}
+
+fn parity(
+    legacy: &mut SqlSession,
+    v2: &mut SqlSession,
+    sql: &str,
+    params: &[relational::Value],
+) -> Result<relational::SqlResult, CoreError> {
+    let left = legacy.execute(sql, params, None);
+    let right = v2.execute(sql, params, None);
+    match (&left, &right) {
+        (Ok(left), Ok(right)) => {
+            assert_eq!(left.columns, right.columns, "{sql}");
+            assert_eq!(left.affected, right.affected, "{sql}");
+            assert_eq!(
+                left.rows.iter().map(|r| &r.values).collect::<Vec<_>>(),
+                right.rows.iter().map(|r| &r.values).collect::<Vec<_>>(),
+                "{sql}"
+            );
+        }
+        (Err(left), Err(right)) => assert_eq!(left, right, "{sql}"),
+        _ => panic!("{sql}: legacy={left:?}, v2={right:?}"),
+    }
+    left
+}
+
+#[test]
+fn multitable_reads_and_mutations_match_legacy() {
+    let f = Fixture::new();
+    let path = f.path.with_extension("multitable-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    for sql in [
+        "CREATE TABLE a (id bigint PRIMARY KEY,k bigint,v text)",
+        "CREATE TABLE b (id bigint PRIMARY KEY,k bigint,v text)",
+        "CREATE TABLE c (id bigint PRIMARY KEY,bid bigint)",
+        "CREATE TABLE dst (id bigint PRIMARY KEY,k bigint,v text)",
+        "CREATE TABLE heap (k bigint,v text)",
+        "INSERT INTO a VALUES (1,10,'alpha'),(2,20,'beta'),(3,NULL,NULL)",
+        "INSERT INTO b VALUES (11,10,'apple'),(12,10,NULL),(13,30,'berry')",
+        "INSERT INTO c VALUES (21,11),(22,13)",
+        "SELECT a.id,b.id FROM a INNER JOIN b ON a.k=b.k ORDER BY 1,2",
+        "SELECT a.id,b.id FROM a LEFT OUTER JOIN b ON a.k=b.k ORDER BY 1,2",
+        "SELECT a.id,b.id,c.id FROM a LEFT JOIN b ON a.k=b.k LEFT JOIN c ON b.id=c.bid ORDER BY 1,2,3",
+        "SELECT x.id,y.id FROM a x JOIN a y ON x.k=y.k ORDER BY 1,2",
+        "SELECT a.id,b.id FROM a JOIN b ON true ORDER BY 1,2 LIMIT 3",
+        "SELECT a.id,count(*),count(b.id) FROM a LEFT JOIN b ON a.k=b.k GROUP BY a.id ORDER BY 1",
+        "SELECT a.k,sum(b.id),min(b.id),max(b.id) FROM a JOIN b ON a.k=b.k GROUP BY a.k HAVING count(*)>1 ORDER BY 1",
+        "SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id",
+        "SELECT id FROM a WHERE k NOT IN (SELECT k FROM b) ORDER BY id",
+        "SELECT id FROM a WHERE k NOT IN (SELECT k FROM b WHERE false) ORDER BY id",
+        "SELECT id FROM a WHERE k IN (SELECT b.k FROM b JOIN c ON b.id=c.bid) ORDER BY id",
+        "SELECT id FROM a WHERE k IN (SELECT k FROM b WHERE id IN (SELECT bid FROM c)) ORDER BY id",
+        "SELECT a.id,b.id FROM a JOIN b ON a.k=b.k WHERE b.id IN (SELECT bid FROM c) ORDER BY 1,2",
+        "INSERT INTO dst SELECT a.id,b.id,a.v FROM a JOIN b ON a.k=b.k WHERE b.id=11 RETURNING *",
+        "INSERT INTO dst SELECT id,k,v FROM a WHERE id=2 RETURNING *",
+        "INSERT INTO dst SELECT id,k,v FROM a WHERE id=1 ON CONFLICT (id) DO NOTHING RETURNING *",
+        "INSERT INTO dst SELECT id,k,v FROM a WHERE id=1 ON CONFLICT (id) DO UPDATE SET k=excluded.k RETURNING *",
+        "INSERT INTO heap SELECT k,v FROM a WHERE id IN (SELECT id FROM dst) RETURNING *",
+        "SELECT * FROM heap ORDER BY k,v",
+        "INSERT INTO dst SELECT id+10,k,v FROM dst RETURNING *",
+        "SELECT * FROM dst ORDER BY id",
+        "UPDATE dst SET k=k+1 WHERE id IN (SELECT id FROM a WHERE k IN (SELECT k FROM b)) RETURNING *",
+        "DELETE FROM dst WHERE id IN (SELECT id FROM a WHERE id=2) RETURNING *",
+        "SELECT * FROM dst ORDER BY id",
+        "BEGIN",
+        "INSERT INTO b VALUES (14,20,'new')",
+        "INSERT INTO dst SELECT id+100,k,v FROM a WHERE k IN (SELECT k FROM b) RETURNING *",
+        "SELECT dst.id,b.id FROM dst JOIN b ON dst.k=b.k ORDER BY 1,2",
+        "ROLLBACK",
+        "SELECT * FROM dst ORDER BY id",
+    ] {
+        parity(&mut a, &mut b, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    for (sql, params) in [
+        (
+            "SELECT a.id,b.id FROM a LEFT JOIN b ON a.k=b.k AND b.id=$1 ORDER BY 1,2",
+            vec![relational::Value::Int(12)],
+        ),
+        (
+            "SELECT id FROM a WHERE k IN (SELECT k FROM b WHERE id=$1) ORDER BY id",
+            vec![relational::Value::Int(11)],
+        ),
+        (
+            "INSERT INTO dst SELECT id+$1,k,v FROM a WHERE id=$2 RETURNING *",
+            vec![relational::Value::Int(200), relational::Value::Int(3)],
+        ),
+        (
+            "UPDATE dst SET k=$1 WHERE id IN (SELECT id FROM a WHERE id=$2) RETURNING *",
+            vec![relational::Value::Int(77), relational::Value::Int(1)],
+        ),
+    ] {
+        parity(&mut a, &mut b, sql, &params).unwrap();
+    }
+    // Exact legacy errors, including statements that fail after source staging.
+    for sql in [
+        "SELECT a.id,b.id FROM a JOIN b ON true ORDER BY 1,2 LIMIT 3 OFFSET 1",
+        "SELECT missing FROM a JOIN b ON a.id=b.id",
+        "SELECT a.id FROM a JOIN absent ON a.id=absent.id",
+        "SELECT id FROM a WHERE k IN (SELECT v FROM b)",
+        "INSERT INTO dst SELECT id,k,v FROM a",
+        "UPDATE dst SET id=11 WHERE id IN (SELECT id FROM a)",
+        "INSERT INTO dst SELECT id+500,1/(id-2),v FROM a",
+    ] {
+        parity(&mut a, &mut b, sql, &[]).unwrap_err();
+    }
+    parity(&mut a, &mut b, "SELECT * FROM dst ORDER BY id", &[]).unwrap();
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn legacy_unsupported_read_forms_keep_exact_errors() {
+    let f = Fixture::new();
+    let path = f.path.with_extension("unsupported-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    for sql in [
+        "CREATE TABLE a (id bigint PRIMARY KEY)",
+        "CREATE TABLE b (id bigint PRIMARY KEY)",
+        "INSERT INTO a VALUES (1)",
+        "INSERT INTO b VALUES (2)",
+    ] {
+        parity(&mut a, &mut b, sql, &[]).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM a UNION SELECT id FROM b",
+        "SELECT id FROM a UNION ALL SELECT id FROM b",
+        "SELECT id FROM a INTERSECT SELECT id FROM b",
+        "SELECT id FROM a EXCEPT SELECT id FROM b",
+        "WITH q AS (SELECT id FROM a) SELECT id FROM q",
+        "SELECT a.id,b.id FROM a RIGHT JOIN b ON a.id=b.id",
+        "SELECT a.id,b.id FROM a FULL OUTER JOIN b ON a.id=b.id",
+        "SELECT id FROM a WHERE EXISTS (SELECT id FROM b)",
+        "SELECT (SELECT id FROM b) FROM a",
+        "SELECT id FROM a WHERE id=(SELECT id FROM b)",
+        "SELECT id FROM (SELECT id FROM a) q",
+        "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b",
+    ] {
+        parity(&mut a, &mut b, sql, &[]).unwrap_err();
+    }
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
+}
+
+struct ScanHookGuard;
+impl Drop for ScanHookGuard {
+    fn drop(&mut self) {
+        AFTER_TABLE_SCAN.with(|hook| hook.replace(None));
+    }
+}
+
+#[test]
+fn all_statement_sources_share_one_snapshot_despite_concurrent_commit() {
+    use relational::Value::Int;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    // Exercise implicit and explicit SQL transactions. The second statement
+    // must see the writer, while every read of the first sees the old snapshot.
+    for explicit in [false, true] {
+        for sql in [
+            "SELECT a.n,b.n FROM a JOIN b ON a.id=b.id",
+            "SELECT n FROM a WHERE n IN (SELECT n FROM b)",
+            "SELECT sum(a.n::integer),sum(b.n::integer) FROM a JOIN b ON a.id=b.id",
+            "INSERT INTO dst SELECT a.n,b.n FROM a JOIN b ON a.id=b.id RETURNING *",
+            "UPDATE dst SET n=n+1 WHERE n IN (SELECT n FROM a WHERE n IN (SELECT n FROM b)) RETURNING *",
+            "DELETE FROM dst WHERE n IN (SELECT n FROM a WHERE n IN (SELECT n FROM b)) RETURNING *",
+        ] {
+            let f = Fixture::new();
+            for ddl in [
+                "CREATE TABLE a (id bigint PRIMARY KEY,n bigint)",
+                "CREATE TABLE b (id bigint PRIMARY KEY,n bigint)",
+                "CREATE TABLE dst (id bigint PRIMARY KEY,n bigint)",
+                "INSERT INTO a VALUES (1,10)",
+                "INSERT INTO b VALUES (1,10)",
+            ] {
+                f.execute(ddl);
+            }
+            if sql.starts_with("UPDATE") || sql.starts_with("DELETE") {
+                f.execute("INSERT INTO dst VALUES (10,10)");
+            }
+            let (start, started) = mpsc::sync_channel(0);
+            let (done, finished) = mpsc::sync_channel(0);
+            let admin = f.admin().clone();
+            let writer = std::thread::spawn(move || {
+                started.recv_timeout(Duration::from_secs(30)).unwrap();
+                let mut s = admin.sql_session();
+                for sql in ["BEGIN", "UPDATE a SET n=20", "UPDATE b SET n=20", "COMMIT"] {
+                    s.execute(sql, &[], None).unwrap();
+                }
+                done.send(()).unwrap();
+            });
+            let mut session = f.admin().sql_session();
+            if explicit {
+                session.execute("BEGIN", &[], None).unwrap();
+            }
+            let mut scans = Vec::new();
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = observed.clone();
+            let mut first = true;
+            AFTER_TABLE_SCAN.with(|hook| {
+                hook.replace(Some(Box::new(move |name| {
+                    record.lock().unwrap().push(name.to_owned());
+                    if first {
+                        first = false;
+                        start.send(()).unwrap();
+                        finished.recv_timeout(Duration::from_secs(30)).unwrap();
+                    }
+                })))
+            });
+            let guard = ScanHookGuard;
+            let result = values(&mut session, sql);
+            drop(guard);
+            writer.join().unwrap();
+            scans.extend(observed.lock().unwrap().iter().cloned());
+            assert_eq!(&scans[..2], &["a", "b"], "{sql}");
+            let expected = if sql.starts_with("UPDATE") {
+                vec![vec![Int(10), Int(11)]]
+            } else if sql.starts_with("SELECT n") {
+                vec![vec![Int(10)]]
+            } else {
+                vec![vec![Int(10), Int(10)]]
+            };
+            assert_eq!(result, expected, "explicit={explicit}: {sql}");
+            assert_eq!(
+                values(&mut session, "SELECT a.n,b.n FROM a JOIN b ON a.id=b.id"),
+                vec![vec![Int(20), Int(20)]]
+            );
+            if sql.starts_with("INSERT") {
+                assert_eq!(
+                    values(&mut session, "SELECT * FROM dst"),
+                    vec![vec![Int(10), Int(10)]]
+                );
+            }
+            if explicit {
+                session.execute("COMMIT", &[], None).unwrap();
+            }
+        }
+    }
 }
