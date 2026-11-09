@@ -566,7 +566,7 @@ impl Interval {
         if s.starts_with('P') {
             return Self::parse_iso(s);
         }
-        let mut p = s.split_whitespace().peekable();
+        let mut p = interval_tokens(s).into_iter().peekable();
         let mut months = 0i64;
         let mut days = 0i64;
         let mut us = 0i64;
@@ -633,14 +633,15 @@ impl Interval {
                 None if !ago => "seconds",
                 _ => return Err(Error::Syntax),
             };
+            let unit = interval_unit(unit).ok_or(Error::Unimplemented)?;
             let mask = match unit {
-                "year" | "years" => 1,
-                "mon" | "mons" | "month" | "months" => 2,
-                "day" | "days" => 4,
-                "week" | "weeks" => 8,
-                "hour" | "hours" => 16,
-                "minute" | "minutes" | "min" | "mins" => 32,
-                "second" | "seconds" | "sec" | "secs" => {
+                "years" => 1,
+                "months" => 2,
+                "days" => 4,
+                "weeks" => 8,
+                "hours" => 16,
+                "minutes" => 32,
+                "seconds" => {
                     // DecodeInterval widens the mask to milli/microseconds only for a
                     // nonzero fraction: '1. seconds 5 milliseconds' is accepted.
                     if v.split_once('.')
@@ -651,9 +652,11 @@ impl Interval {
                         64
                     }
                 }
-                "millisecond" | "milliseconds" => 128,
-                "microsecond" | "microseconds" => 256,
-                _ => return Err(Error::Unimplemented),
+                "milliseconds" => 128,
+                "microseconds" => 256,
+                "decades" => 512,
+                "centuries" => 1024,
+                _ => 2048,
             };
             if fields & mask != 0 {
                 return Err(Error::Syntax);
@@ -676,6 +679,66 @@ impl Interval {
         ))
     }
 }
+/// PG18.6 interval unit spellings (datetime.c deltatktbl), mapped to the names
+/// `Interval::unit` takes. Decades, centuries and millennia keep their own field bits.
+fn interval_unit(unit: &str) -> Option<&'static str> {
+    Some(match unit {
+        "y" | "yr" | "yrs" | "year" | "years" => "years",
+        "mon" | "mons" | "month" | "months" => "months",
+        "d" | "day" | "days" => "days",
+        "w" | "week" | "weeks" => "weeks",
+        "h" | "hr" | "hrs" | "hour" | "hours" => "hours",
+        "m" | "min" | "mins" | "minute" | "minutes" => "minutes",
+        "s" | "sec" | "secs" | "second" | "seconds" => "seconds",
+        "ms" | "msec" | "msecs" | "msecond" | "millisecond" | "milliseconds" => "milliseconds",
+        "us" | "usec" | "usecs" | "usecond" | "microsecond" | "microseconds" => "microseconds",
+        "dec" | "decade" | "decades" => "decades",
+        "c" | "cent" | "century" | "centuries" => "centuries",
+        "mil" | "mils" | "millennium" | "millennia" => "millennia",
+        _ => return None,
+    })
+}
+
+/// Splits whitespace fields the way PG18.6 ParseDateTime does for a number glued to a
+/// unit: '1day' is '1' 'day', '1h30m' is '1' 'h' '30' 'm', '1h+30m' is '1' 'h' '+30' 'm'.
+/// A field is split only when every letter run is a known unit; anything else (a clock,
+/// a year-month field, '1h-30m', '.5e1', '1dago') stays whole and is rejected as before.
+fn interval_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for t in s.split_whitespace() {
+        let b = t.as_bytes();
+        let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+        let simple = !body.contains(['-', '/', ':'])
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-'))
+            && !b
+                .windows(2)
+                .any(|w| w[0].is_ascii_alphabetic() && w[1] == b'.');
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for i in 1..b.len() {
+            let sign = matches!(b[i - 1], b'+' | b'-');
+            if b[i] == b'+' || (!sign && b[i].is_ascii_alphabetic() != b[i - 1].is_ascii_alphabetic())
+            {
+                runs.push(&t[start..i]);
+                start = i;
+            }
+        }
+        runs.push(&t[start..]);
+        if simple
+            && runs.len() > 1
+            && runs.iter().all(|r| {
+                !r.as_bytes()[0].is_ascii_alphabetic() || interval_unit(r).is_some()
+            })
+        {
+            out.extend(runs);
+        } else {
+            out.push(t);
+        }
+    }
+    out
+}
+
 impl PartialEq for Interval {
     fn eq(&self, o: &Self) -> bool {
         self.key() == o.key()

@@ -84,6 +84,10 @@ impl Interval {
         let multiply = |scale| n.checked_mul(scale).ok_or(Error::Range);
         match unit {
             "year" | "years" => months = even(multiply(12)?, d),
+            // AdjustFractYears: rint(fraction * scale * 12) months.
+            "decades" => months = even(multiply(120)?, d),
+            "centuries" => months = even(multiply(1_200)?, d),
+            "millennia" => months = even(multiply(12_000)?, d),
             "mon" | "mons" | "month" | "months" => {
                 months = n / d;
                 let daynum = (n % d) * 30;
