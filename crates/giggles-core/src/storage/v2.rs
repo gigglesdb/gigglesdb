@@ -10,9 +10,13 @@ use std::{fs, path::Path};
 pub(crate) struct V2Db {
     pub(crate) kv: Arc<engine::kv::Kv>,
     pub(crate) meta: engine::meta::MetaInfo,
-    sequencer: Arc<engine::commit::Sequencer>,
+    pub(crate) sequencer: Arc<engine::commit::Sequencer>,
     locks: Arc<engine::locks::LockManager>,
     catalog: engine::catalog::Catalog,
+    pub(crate) rows: engine::rows::RowStore,
+    pub(crate) sequences: Arc<engine::seq::SequenceAllocator>,
+    pub(crate) sql_counters:
+        std::sync::Mutex<std::collections::BTreeMap<u64, super::sequences::SeqCounter>>,
     next_txn: AtomicU64,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
@@ -66,13 +70,17 @@ impl V2Db {
             engine::locks::LockConfig::default(),
         ));
         let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
-        let catalog = engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences)?;
+        let catalog =
+            engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
         Ok(Self {
             kv,
             meta,
             sequencer,
             locks,
             catalog,
+            rows: engine::rows::RowStore::new(sequences.clone()),
+            sequences,
+            sql_counters: Default::default(),
             next_txn: AtomicU64::new(1),
         })
     }

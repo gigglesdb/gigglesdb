@@ -320,14 +320,26 @@ fn lifecycle_and_public_refusals() {
         )
         .unwrap();
     let read = session.prepare("SELECT * FROM routed").unwrap();
-    denied(session.execute_prepared(&read, &[], None), SQL_QUERIES);
-    denied(
-        session.execute_prepared_at(&read, &[], None, &clock),
-        SQL_QUERIES,
+    assert!(
+        session
+            .execute_prepared(&read, &[], None)
+            .unwrap()
+            .rows
+            .is_empty()
     );
-    denied(
-        session.execute("INSERT INTO routed VALUES (1)", &[], None),
-        SQL_DML,
+    assert!(
+        session
+            .execute_prepared_at(&read, &[], None, &clock)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        session
+            .execute("INSERT INTO routed VALUES (1)", &[], None)
+            .unwrap()
+            .affected,
+        1
     );
     denied(session.begin_engine(), SQL_SESSIONS);
     denied(session.commit_engine(), SQL_SESSIONS);

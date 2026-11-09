@@ -231,8 +231,6 @@ fn implicit_failure_and_refusals_leave_catalog_unchanged() {
             "ALTER TABLE t ADD COLUMN n bigint",
             "ALTER TABLE row rewrite",
         ),
-        ("INSERT INTO t VALUES (1)", SQL_DML),
-        ("SELECT * FROM t", SQL_QUERIES),
     ] {
         assert!(
             matches!(f.admin().sql_session().execute(sql, &[], None),
@@ -418,4 +416,381 @@ fn varchar_char_refusals_leave_catalog_bytes_unchanged() {
         );
         assert_eq!(f.catalog_bytes(), bytes, "{sql}");
     }
+}
+
+fn values(session: &mut SqlSession, sql: &str) -> Vec<Vec<relational::Value>> {
+    session
+        .execute(sql, &[], None)
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.values)
+        .collect()
+}
+
+#[test]
+fn dml_script_matches_legacy_results_and_errors() {
+    let f = Fixture::new();
+    let path = f.path.with_extension("legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    // Compare SQL values, column names, affected counts and exact error variants.
+    // Row versions are engine-owned opaque tokens; test their behavior separately.
+    let script = [
+        "CREATE TABLE t (id bigint PRIMARY KEY, n bigint NOT NULL, label text DEFAULT 'default')",
+        "INSERT INTO t (id,n) VALUES (1,10) RETURNING *",
+        "INSERT INTO t VALUES (2,20,'two'),(3,30,'three') RETURNING id,n,label",
+        "INSERT INTO t VALUES (1,99,'duplicate')",
+        "INSERT INTO t VALUES (4,40,'four'),(2,22,'duplicate') RETURNING *",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET id=8,n=n+1 WHERE id=1 RETURNING *",
+        "UPDATE t SET id=3 WHERE id=2 RETURNING *",
+        "UPDATE t SET n=n+5 WHERE n>=20 RETURNING id,n",
+        "UPDATE t SET n=NULL WHERE id=8",
+        "SELECT id,n,label FROM t ORDER BY id DESC",
+        "DELETE FROM t WHERE n>30 RETURNING *",
+        "DELETE FROM t WHERE id=999 RETURNING *",
+        "INSERT INTO t VALUES (2,99,'ignored') ON CONFLICT (id) DO NOTHING RETURNING *",
+        "INSERT INTO t VALUES (2,99,'updated') ON CONFLICT (id) DO UPDATE SET n=excluded.n RETURNING *",
+        "BEGIN",
+        "INSERT INTO t VALUES (10,100,'ten') RETURNING *",
+        "UPDATE t SET id=11 WHERE id=10 RETURNING *",
+        "SELECT * FROM t ORDER BY id",
+        "ROLLBACK",
+        "SELECT * FROM t ORDER BY id",
+        "BEGIN",
+        "INSERT INTO t VALUES (12,120,'twelve') RETURNING *",
+        "DELETE FROM t WHERE id=8 RETURNING *",
+        "COMMIT",
+        "BEGIN",
+        "INSERT INTO t VALUES (13,130,'thirteen')",
+        "INSERT INTO t VALUES (14,140,'fourteen'),(12,120,'duplicate')",
+        "SELECT * FROM t ORDER BY id",
+        "COMMIT",
+        "ROLLBACK",
+        "SELECT * FROM t ORDER BY id",
+        "DROP TABLE t",
+        "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)",
+        "SELECT * FROM t ORDER BY id",
+        "CREATE TABLE heap (n bigint, label text)",
+        "INSERT INTO heap VALUES (10,'a'),(20,'b') RETURNING *",
+        "UPDATE heap SET n=n+1 RETURNING *",
+        "DELETE FROM heap WHERE n>15 RETURNING *",
+        "SELECT * FROM heap ORDER BY n",
+    ];
+    for sql in script {
+        let left = a.execute(sql, &[], None);
+        let right = b.execute(sql, &[], None);
+        match (left, right) {
+            (Ok(left), Ok(right)) => {
+                assert_eq!(left.columns, right.columns, "{sql}");
+                assert_eq!(left.affected, right.affected, "{sql}");
+                assert_eq!(
+                    left.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+                    right.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+                    "{sql}"
+                );
+            }
+            (Err(left), Err(right)) => assert_eq!(left, right, "{sql}"),
+            (left, right) => panic!("{sql}: legacy={left:?}, v2={right:?}"),
+        }
+    }
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn dml_versions_rekey_reopen_and_mvcc_visibility() {
+    use relational::Value::Int;
+    let mut f = Fixture::new();
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY, n bigint)");
+    let mut s = f.admin().sql_session();
+    let initial = s
+        .execute("INSERT INTO t VALUES (1,10) RETURNING *", &[], None)
+        .unwrap()
+        .rows
+        .remove(0);
+    let updated = s
+        .execute(
+            "UPDATE t SET id=2,n=20 WHERE id=1 RETURNING *",
+            &[],
+            Some(initial.version),
+        )
+        .unwrap()
+        .rows
+        .remove(0);
+    assert!(updated.version > initial.version);
+    let allocator = f.db().kv.get(Keyspace::Seq, &[0; 9]).unwrap();
+    let commit = f.db().kv.get(Keyspace::Meta, b"last_commit_ts").unwrap();
+    values(&mut s, "SELECT * FROM t ORDER BY id");
+    assert_eq!(f.db().kv.get(Keyspace::Seq, &[0; 9]).unwrap(), allocator);
+    assert_eq!(
+        f.db().kv.get(Keyspace::Meta, b"last_commit_ts").unwrap(),
+        commit
+    );
+    assert!(values(&mut s, "SELECT * FROM t WHERE id=1").is_empty());
+    assert_eq!(
+        s.execute("UPDATE t SET n=30 WHERE id=2", &[], Some(initial.version)),
+        Err(CoreError::Sql(relational::SqlError::Version))
+    );
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("UPDATE t SET id=3 WHERE id=2", &[], None)
+        .unwrap();
+    assert_eq!(
+        values(&mut s, "SELECT * FROM t ORDER BY id"),
+        vec![vec![Int(3), Int(20)]]
+    );
+    // Readers do not wait on the SQL writer mutex, and see committed row versions.
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT * FROM t ORDER BY id"),
+        vec![vec![Int(2), Int(20)]]
+    );
+    s.execute("COMMIT", &[], None).unwrap();
+    drop(s);
+    f.reopen();
+    assert_eq!(
+        values(&mut f.admin().sql_session(), "SELECT * FROM t ORDER BY id"),
+        vec![vec![Int(3), Int(20)]]
+    );
+    f.execute("DROP TABLE t");
+    // DROP cascades row tombstones in the catalog transaction, not orphan rows.
+    let mut txn = f.db().begin(Isolation::ReadCommitted);
+    assert!(
+        txn.scan(
+            Keyspace::Rows,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Direction::Forward,
+            None
+        )
+        .unwrap()
+        .next()
+        .is_none()
+    );
+    drop(txn);
+    f.reopen();
+    assert!(f.parts().tables.is_empty());
+}
+
+#[test]
+fn failed_statement_preserves_prior_transaction_writes() {
+    use relational::Value::Int;
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY,n bigint)");
+    let mut s = f.admin().sql_session();
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO t VALUES (1,10)", &[], None).unwrap();
+    assert_eq!(
+        s.execute("INSERT INTO t VALUES (2,20),(1,99)", &[], None),
+        Err(CoreError::Sql(relational::SqlError::Duplicate))
+    );
+    assert!(s.is_aborted());
+    // Inspect the existing MVCC transaction directly: a failed statement keeps
+    // the first successful statement but publishes none of its own rows.
+    let parts = f.parts();
+    let entry = engine::catalog::TableEntry {
+        def: parts.tables["t"].clone(),
+        heap: false,
+        columns_ext: BTreeMap::new(),
+    };
+    let txn = s.v2_transaction.as_mut().unwrap();
+    assert_eq!(
+        f.db()
+            .rows
+            .get(txn, &entry, &[Int(1)])
+            .unwrap()
+            .unwrap()
+            .values,
+        vec![Int(1), Int(10)]
+    );
+    assert!(f.db().rows.get(txn, &entry, &[Int(2)]).unwrap().is_none());
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert!(values(&mut s, "SELECT * FROM t ORDER BY id").is_empty());
+}
+
+#[test]
+fn v2_admission_and_multitable_refusals() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY)");
+    let ticket = f.admin().inner.enter_sql().unwrap();
+    // Default admission allows 32 simultaneous statements.
+    let mut tickets = vec![ticket];
+    for _ in 1..Limits::default().admitted {
+        tickets.push(f.admin().inner.enter_sql().unwrap());
+    }
+    assert_eq!(
+        f.admin()
+            .sql_session()
+            .execute("INSERT INTO t VALUES (1)", &[], None),
+        Err(CoreError::Busy)
+    );
+    drop(tickets);
+    let mut sessions = (0..relational::MAX_TRANSACTIONS)
+        .map(|_| {
+            let mut s = f.admin().sql_session();
+            s.execute("BEGIN", &[], None).unwrap();
+            s
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        f.admin().sql_session().execute("BEGIN", &[], None),
+        Err(CoreError::Busy)
+    );
+    sessions
+        .pop()
+        .unwrap()
+        .execute("COMMIT", &[], None)
+        .unwrap();
+    let mut next = f.admin().sql_session();
+    next.execute("BEGIN", &[], None).unwrap();
+    next.execute("ROLLBACK", &[], None).unwrap();
+    drop(sessions);
+    for sql in [
+        "SELECT a.id FROM t a JOIN t b ON a.id=b.id",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t)",
+        "UPDATE t SET id=2 WHERE id IN (SELECT id FROM t)",
+        "DELETE FROM t WHERE id IN (SELECT id FROM t)",
+    ] {
+        assert!(
+            matches!(
+                f.admin().sql_session().execute(sql, &[], None),
+                Err(CoreError::EngineUnsupported {
+                    feature: "multi-table SQL reads",
+                    ..
+                })
+            ),
+            "{sql}"
+        );
+    }
+    assert!(values(&mut f.admin().sql_session(), "SELECT * FROM t ORDER BY id").is_empty());
+}
+
+#[test]
+fn clocked_serial_defaults_match_legacy_and_transactional_create_persists() {
+    let mut f = Fixture::new();
+    let path = f.path.with_extension("serial-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    let clock = relational::StatementClock {
+        unavailable: None,
+        transaction_us: 1,
+        statement_us: 1,
+        zone: None,
+        wall: None,
+    };
+    for sql in [
+        "BEGIN",
+        "CREATE TABLE t (id serial PRIMARY KEY,n bigint DEFAULT 7)",
+        "INSERT INTO t DEFAULT VALUES RETURNING *",
+        "INSERT INTO t DEFAULT VALUES RETURNING *",
+        "COMMIT",
+        "INSERT INTO t DEFAULT VALUES RETURNING *",
+        "BEGIN",
+        "INSERT INTO t DEFAULT VALUES RETURNING *",
+        "ROLLBACK",
+        "INSERT INTO t DEFAULT VALUES RETURNING *",
+        "SELECT * FROM t ORDER BY id",
+    ] {
+        let left = a
+            .execute_at(sql, &[], None, &clock)
+            .unwrap_or_else(|e| panic!("legacy {sql}: {e:?}"));
+        let right = b
+            .execute_at(sql, &[], None, &clock)
+            .unwrap_or_else(|e| panic!("v2 {sql}: {e:?}"));
+        assert_eq!(left.columns, right.columns, "{sql}");
+        assert_eq!(left.affected, right.affected, "{sql}");
+        assert_eq!(
+            left.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+            right.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
+    f.reopen();
+    // The persisted reservation may skip values across restart, as on legacy.
+    let next = f
+        .admin()
+        .sql_session()
+        .execute_at(
+            "INSERT INTO t DEFAULT VALUES RETURNING id",
+            &[],
+            None,
+            &clock,
+        )
+        .unwrap();
+    assert!(matches!(next.rows[0].values[0],relational::Value::Int(n) if n>5));
+}
+
+#[test]
+fn sink_failure_rolls_back_partial_rekey_and_drop() {
+    use relational::Value::Int;
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY,n bigint)");
+    f.execute("INSERT INTO t VALUES (1,10),(2,20)");
+    let mut s = f.admin().sql_session();
+    for sql in ["UPDATE t SET id=3 WHERE id=1", "DROP TABLE t"] {
+        s.execute("BEGIN", &[], None).unwrap();
+        s.execute("INSERT INTO t VALUES (4,40)", &[], None).unwrap();
+        FAIL_AFTER_ROW_WRITE.set(true);
+        assert_eq!(s.execute(sql, &[], None), Err(CoreError::Cancelled));
+        assert!(!FAIL_AFTER_ROW_WRITE.get());
+        let txn = s.v2_transaction.as_mut().unwrap();
+        let parts = f.db().catalog().parts(txn).unwrap();
+        let entry = engine::catalog::TableEntry {
+            def: parts.tables["t"].clone(),
+            heap: false,
+            columns_ext: BTreeMap::new(),
+        };
+        for (id, n) in [(1, 10), (2, 20), (4, 40)] {
+            assert_eq!(
+                f.db()
+                    .rows
+                    .get(txn, &entry, &[Int(id)])
+                    .unwrap()
+                    .unwrap()
+                    .values,
+                vec![Int(id), Int(n)]
+            );
+        }
+        assert!(f.db().rows.get(txn, &entry, &[Int(3)]).unwrap().is_none());
+        s.execute("ROLLBACK", &[], None).unwrap();
+    }
+}
+
+#[test]
+fn mutation_limits_and_parameter_errors_match_legacy_without_rows() {
+    use relational::Value::{Int, Text};
+    let f = Fixture::new();
+    let path = f.path.with_extension("limits-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    for s in [&mut a, &mut b] {
+        s.execute("CREATE TABLE t (id bigint PRIMARY KEY,v text)", &[], None)
+            .unwrap();
+    }
+    let wide = [Int(1), Text("x".repeat(relational::MAX_ROW_BYTES + 1))];
+    for params in [&wide[..], &[Int(1)][..]] {
+        let left = a
+            .execute("INSERT INTO t VALUES ($1,$2)", params, None)
+            .unwrap_err();
+        assert_eq!(
+            b.execute("INSERT INTO t VALUES ($1,$2)", params, None),
+            Err(left)
+        );
+    }
+    let tuples = (0..=relational::MAX_ROWS)
+        .map(|i| format!("({i},'x')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO t VALUES {tuples}");
+    let left = a.execute(&sql, &[], None).unwrap_err();
+    assert_eq!(b.execute(&sql, &[], None), Err(left));
+    assert!(values(&mut a, "SELECT * FROM t ORDER BY id").is_empty());
+    assert!(values(&mut b, "SELECT * FROM t ORDER BY id").is_empty());
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
 }

@@ -30,6 +30,7 @@ pub(crate) mod projector_reconstruction;
 mod query;
 use query::{TypmodSource, result_typmod};
 mod returning;
+pub(crate) mod row_sink;
 mod scan;
 mod searched;
 #[cfg(test)]
@@ -1563,8 +1564,17 @@ impl Prepared {
             Statement::Begin => V2Class::Control("begin"),
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
-            Statement::Select { .. } | Statement::Query(_) | Statement::CompositeSelect(_) => {
-                V2Class::Read
+            Statement::Query(query) if !query.v2_single_table() => {
+                V2Class::Refused("multi-table SQL reads")
+            }
+            Statement::CompositeSelect(_) => V2Class::Refused("user types"),
+            Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
+            Statement::Update { .. }
+            | Statement::UpdateExpressions { .. }
+            | Statement::Delete { .. }
+                if searched::target(self).is_some_and(query::Query::has_in_subquery) =>
+            {
+                V2Class::Refused("multi-table SQL reads")
             }
             // INSERT ... SELECT reads other relations through the injected RowSource; v2 serves
             // multi-table reads only from F8(c), so it stays refused until then.

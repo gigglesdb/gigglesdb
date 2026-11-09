@@ -514,8 +514,6 @@ const TASK_EXECUTORS: &str = "task executors";
 const PROTECTED_OPERATIONS: &str = "protected operations";
 const KERNEL_RECORDS: &str = "kernel records";
 const SQL_SESSIONS: &str = "SQL sessions";
-const SQL_DML: &str = "SQL DML";
-const SQL_QUERIES: &str = "SQL queries";
 const LOGICAL_EXPORT: &str = "logical export";
 const ROLES: &str = "roles";
 #[allow(dead_code)]
@@ -2870,8 +2868,8 @@ impl SqlSession {
             })
     }
     pub fn rollback(&mut self) {
-        self.v2_transaction = None;
-        if self.staged.take().is_some() {
+        let v2 = self.v2_transaction.take().is_some();
+        if self.staged.take().is_some() || v2 {
             self.admin
                 .inner
                 .sql_transactions

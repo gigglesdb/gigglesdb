@@ -144,6 +144,7 @@ pub(crate) struct CommitRequest {
 #[derive(Clone, Debug)]
 pub(crate) enum RawOp {
     DeleteCounter { key: Vec<u8> },
+    PutCounter { key: Vec<u8>, value: Vec<u8> },
 }
 pub(crate) fn valid_counter_key(key: &[u8]) -> bool {
     key.len() == 25 && key.first() == Some(&2)
@@ -500,6 +501,22 @@ fn process_group(
             })
             || request.raw.iter().any(|op| match op {
                 RawOp::DeleteCounter { key } => !valid_counter_key(key),
+                RawOp::PutCounter { key, value } => {
+                    if !valid_counter_key(key) || next_features & 256 == 0 {
+                        return true;
+                    }
+                    let id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                    let definition = request
+                        .writes
+                        .get(&(Keyspace::Catalog, super::catalog_codec::sequence_key(id)));
+                    // Transactional counters accompany a new/replaced definition.
+                    let Some(Some(definition)) = definition else {
+                        return true;
+                    };
+                    super::catalog_codec::decode_sequence(definition)
+                        .and_then(|def| super::catalog_codec::decode_counter(key, value, &def))
+                        .is_err()
+                }
             })
         {
             let _ = pending.reply.send(Err(TxnError::Misuse));
@@ -542,6 +559,9 @@ fn process_group(
         for op in &request.raw {
             match op {
                 RawOp::DeleteCounter { key } => batch.delete(Keyspace::Seq, key.clone()),
+                RawOp::PutCounter { key, value } => {
+                    batch.put(Keyspace::Seq, key.clone(), value.clone())
+                }
             }
         }
         pending_features = next_features;

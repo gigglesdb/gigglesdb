@@ -1,6 +1,11 @@
-//! SQL DDL bridge: relational plans mutate a rows-free image, then the v2 catalog.
+//! SQL bridge: relational statement checks publish through v2 catalog and row sinks.
 use super::*;
 use engine::{catalog::CatalogParts, txn::Isolation};
+use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
+use relational::{SqlError, SqlRow, TableDef, row_sink::RowSink};
+use std::ops::Bound;
+#[path = "v2_sql_sequences.rs"]
+mod sql_sequences;
 
 impl SqlSession {
     pub(super) fn prepare_v2(
@@ -26,7 +31,7 @@ impl SqlSession {
 
     pub(super) fn execute_v2(
         &mut self,
-        db: &v2::V2Db,
+        db: &Arc<v2::V2Db>,
         p: &relational::Prepared,
         params: &[relational::Value],
         expected_version: Option<u64>,
@@ -36,6 +41,14 @@ impl SqlSession {
         if self.aborted && !p.allows_aborted_transaction() {
             return Err(CoreError::Sql(E::Aborted));
         }
+        let inner = self.admin.inner.clone();
+        let _ticket = match inner.enter_sql() {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.abort();
+                return Err(error);
+            }
+        };
         let result = (|| {
             crate::cancellation::check()?;
             if p.domain != u128::from_be_bytes(db.meta.domain)
@@ -60,17 +73,58 @@ impl SqlSession {
                             }
                             let mut token = [0u8; 16];
                             getrandom::fill(&mut token).map_err(io)?;
-                            self.v2_transaction = Some(db.begin(Isolation::ReadCommitted));
+                            let mut txn = db.begin(Isolation::ReadCommitted);
+                            self.sequence_baseline = db
+                                .catalog()
+                                .parts(&mut txn)?
+                                .ext
+                                .sequences
+                                .iter()
+                                .map(|(&id, def)| (id, def.incarnation))
+                                .collect();
+                            inner
+                                .sql_transactions
+                                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                    if n < relational::MAX_TRANSACTIONS {
+                                        Some(n + 1)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .map_err(|_| CoreError::Busy)?;
+                            self.v2_transaction = Some(txn);
                             self.transaction_id = Some(u128::from_be_bytes(token));
                         }
                         "commit" => {
+                            // Publish live sequence positions before another session can
+                            // allocate from the newly committed durable reservation.
+                            let mut live = crate::cancellation::lock(&db.sql_counters)?;
                             let txn = self
                                 .v2_transaction
                                 .take()
                                 .ok_or(CoreError::Sql(E::Transaction))?;
-                            let committed = db.catalog().commit_ddl(txn).map_err(CoreError::from);
+                            inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
+                            let mut txn = txn;
+                            let committed =
+                                sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
+                                    .and_then(|()| {
+                                        db.catalog()
+                                            .commit_ddl(txn)
+                                            .map(|_| ())
+                                            .map_err(CoreError::from)
+                                    });
+                            if committed.is_ok() {
+                                live.extend(
+                                    self.pending_sequences
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone(),
+                                );
+                            }
+                            drop(live);
                             self.rollback();
                             committed?;
+                            return Ok(Default::default());
                         }
                         "rollback" => {
                             if self.v2_transaction.is_none() {
@@ -82,8 +136,10 @@ impl SqlSession {
                     }
                     Ok(Default::default())
                 }
-                V2Class::Ddl => {
-                    if expected_version.is_some() {
+                class @ (V2Class::Ddl | V2Class::Dml | V2Class::Read) => {
+                    let ddl = matches!(class, V2Class::Ddl);
+                    let writing = !matches!(class, V2Class::Read);
+                    if ddl && expected_version.is_some() {
                         return Err(CoreError::Sql(E::Parameters));
                     }
                     let mut implicit = None;
@@ -94,16 +150,75 @@ impl SqlSession {
                     txn.begin_statement();
                     let mark = txn.savepoint();
                     let result = (|| {
+                        // Lock before choosing the statement snapshot/image. SQL mutations
+                        // serialize per table; readers retain MVCC snapshot visibility.
+                        let parts = db.catalog().parts(txn)?;
+                        if let Some(name) = p.table()
+                            && parts.tables.contains_key(name)
+                        {
+                            db.catalog()
+                                .resolve(
+                                    txn,
+                                    name,
+                                    if ddl {
+                                        LockMode::AccessExclusive
+                                    } else if writing {
+                                        LockMode::RowExclusive
+                                    } else {
+                                        LockMode::AccessShare
+                                    },
+                                    None,
+                                    &|| crate::cancellation::check().is_err(),
+                                )
+                                .map_err(|e| match e {
+                                    engine::catalog::CatalogError::Core(e) => e,
+                                    engine::catalog::CatalogError::Txn(e) => e.into(),
+                                })?;
+                            if writing && !ddl {
+                                // Empty PK cannot name a real row. This transaction-held
+                                // SQL writer mutex allows AccessShare MVCC readers.
+                                let id = parts.tables[name].id.to_be_bytes();
+                                txn.lock_for_write(Keyspace::Rows, &id, None, &|| {
+                                    crate::cancellation::check().is_err()
+                                })?;
+                            }
+                            txn.begin_statement();
+                        }
                         let old = db.catalog().parts(txn)?;
                         // This bounds every ID E1 DDL allocates per statement.
-                        let ids = db
-                            .catalog()
-                            .reserve_ids(3 * relational::MAX_COLUMNS as u64 + 64)?;
+                        let ids = if ddl {
+                            db.catalog()
+                                .reserve_ids(3 * relational::MAX_COLUMNS as u64 + 64)?
+                        } else {
+                            // DML/reads allocate no catalog objects. Derive only the
+                            // validation ceiling, without a durable ID reservation.
+                            let floor = old
+                                .tables
+                                .values()
+                                .flat_map(|table| {
+                                    std::iter::once(table.id)
+                                        .chain(table.columns.iter().map(|column| column.id))
+                                })
+                                .chain(old.ext.constraints.values().flatten().map(|c| c.id))
+                                .chain(old.ext.sequences.keys().copied())
+                                .chain(old.ext.types.keys().copied())
+                                .max()
+                                .unwrap_or(0)
+                                .checked_add(1)
+                                .ok_or(CoreError::Sql(E::Overflow))?;
+                            floor..floor
+                        };
+                        let versions = if matches!(class, V2Class::Dml) {
+                            db.sequences
+                                .reserve_range(3, 0, relational::MAX_ROWS as u64 + 1)?
+                        } else {
+                            1..u64::MAX
+                        };
                         let mut image = relational::Relational::catalog_image(
                             old.tables.clone(),
                             old.ext.clone(),
                             ids.start,
-                            1,
+                            versions.start,
                         )
                         .map_err(|error| match error {
                             E::Unsupported => CoreError::Sql(E::Unsupported),
@@ -111,15 +226,35 @@ impl SqlSession {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
                         })?;
-                        let result = image
-                            .execute_clocked(
-                                p,
-                                params,
-                                None,
-                                || crate::cancellation::check().is_err(),
-                                clock,
-                            )
-                            .map_err(CoreError::Sql)?;
+                        let context = clock.map(|clock| {
+                            clock.with_sequences(sql_sequences::callback(
+                                db.clone(),
+                                image.clone(),
+                                self.sequence_baseline.clone(),
+                                self.pending_sequences.clone(),
+                                self.sequence_values.clone(),
+                            ))
+                        });
+                        let result = image.execute_with_sink(
+                            p,
+                            params,
+                            expected_version,
+                            context.as_ref(),
+                            &mut SqlRows {
+                                db,
+                                txn,
+                                parts: &old,
+                                writing,
+                            },
+                            versions.end,
+                        );
+                        if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
+                            return Err(error);
+                        }
+                        let result = result?;
+                        if !ddl {
+                            return Ok(result);
+                        }
                         let (tables, ext, next_id, _) = image.catalog_parts();
                         if next_id > ids.end {
                             return Err(CoreError::Corrupt(
@@ -155,8 +290,6 @@ impl SqlSession {
                     }
                     result
                 }
-                V2Class::Dml => Err(unsupported(SQL_DML)),
-                V2Class::Read => Err(unsupported(SQL_QUERIES)),
                 V2Class::Refused(feature) => Err(unsupported(feature)),
             }
         })();
@@ -192,3 +325,113 @@ fn check_post_image(
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_sql_tests.rs"]
 mod tests;
+
+/// Transient statement images use legacy keys. Only this sink translates them
+/// into the existing v2 key/row codec; it never persists relational image bytes.
+struct SqlRows<'a> {
+    db: &'a v2::V2Db,
+    txn: &'a mut Transaction,
+    parts: &'a CatalogParts,
+    writing: bool,
+}
+impl RowSink for SqlRows<'_> {
+    fn scan(
+        &mut self,
+        table: &TableDef,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        let entry = TableEntry {
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        for pair in self.db.rows.scan(
+            self.txn,
+            &entry,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            engine::kv::Direction::Forward,
+            None,
+        )? {
+            let (_, row) = pair?;
+            visit(SqlRow {
+                values: row.values,
+                version: row.version,
+            })
+            .map_err(CoreError::Sql)?;
+        }
+        Ok(())
+    }
+    fn apply(
+        &mut self,
+        table: &TableDef,
+        before: &BTreeMap<Vec<u8>, SqlRow>,
+        after: &BTreeMap<Vec<u8>, SqlRow>,
+    ) -> Result<(), CoreError> {
+        if !self.writing {
+            return Ok(());
+        }
+        let mut changes = BTreeMap::new();
+        for key in before.keys().chain(after.keys()) {
+            let old = before.get(key);
+            let new = after.get(key);
+            if old == new {
+                continue;
+            }
+            let row = old.or(new).expect("changed row");
+            let pk = table
+                .primary_key
+                .iter()
+                .map(|i| row.values[*i].clone())
+                .collect::<Vec<_>>();
+            let mut physical = table.id.to_be_bytes().to_vec();
+            physical.extend(codec::pk_bytes(&pk)?);
+            changes.insert(physical, (old, new));
+        }
+        // Acquire and validate every witness before buffering any write, with
+        // deterministic physical key order for re-key and searched mutations.
+        for (key, (old, _)) in &changes {
+            crate::cancellation::check()?;
+            let target = self.txn.lock_for_write(Keyspace::Rows, key, None, &|| {
+                crate::cancellation::check().is_err()
+            })?;
+            match (old, target.current) {
+                (None, Some(_)) => return Err(CoreError::Sql(SqlError::Duplicate)),
+                (Some(old), Some(bytes)) => {
+                    let record = codec::decode_row(key, &bytes)?;
+                    let mut values = record.values;
+                    if record.tombstone || values.len() > table.columns.len() {
+                        return Err(CoreError::Corrupt("invalid v2 SQL row witness".into()));
+                    }
+                    values.resize(table.columns.len(), relational::Value::Null);
+                    if values != old.values || record.row_version != old.version {
+                        return Err(CoreError::Sql(SqlError::Conflict));
+                    }
+                }
+                (Some(_), None) => return Err(CoreError::Sql(SqlError::Conflict)),
+                (None, None) => (),
+            }
+        }
+        for (key, (_, new)) in changes {
+            crate::cancellation::check()?;
+            match new {
+                Some(row) => self.txn.put(
+                    Keyspace::Rows,
+                    key.clone(),
+                    codec::encode_row(&key, row.version, &row.values)?,
+                )?,
+                None => self.txn.delete(Keyspace::Rows, key)?,
+            }
+            #[cfg(test)]
+            if FAIL_AFTER_ROW_WRITE.replace(false) {
+                return Err(CoreError::Cancelled);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}

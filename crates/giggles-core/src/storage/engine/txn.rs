@@ -493,6 +493,15 @@ impl Transaction {
     pub(crate) fn require_features(&mut self, bits: u64) {
         self.features_or |= bits;
     }
+    /// Existing counter bytes, committed atomically with their new definition.
+    pub(crate) fn put_counter(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), TxnError> {
+        if !valid_counter_key(&key) || value.len() != 25 {
+            return Err(TxnError::Misuse);
+        }
+        self.require_features(256);
+        self.raw.push(RawOp::PutCounter { key, value });
+        Ok(())
+    }
     pub(crate) fn delete_counter(&mut self, key: Vec<u8>) -> Result<(), TxnError> {
         if !valid_counter_key(&key) {
             return Err(TxnError::Misuse);
