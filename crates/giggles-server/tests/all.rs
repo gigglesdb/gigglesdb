@@ -110,3 +110,5 @@ fn every_test_file_is_registered() {
         "tests/*.rs files not registered in tests/all.rs or Cargo.toml [[test]]: {missing:?}"
     );
 }
+#[path = "npgsql_get_schema_network.rs"]
+mod npgsql_get_schema_network;

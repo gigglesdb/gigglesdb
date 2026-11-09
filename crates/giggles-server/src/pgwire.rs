@@ -625,6 +625,17 @@ fn catalog_plan(sql: &str, diagnostic: &mut Diagnostic) -> R<Option<giggles_pg_c
     }
 }
 
+/// A declared wire type may replace an inferred catalog input type only when no
+/// SELECT projection contains a parameter, and only within one family: the
+/// integer/oid family, or the string family (name, text, varchar). Drivers such
+/// as Npgsql bind text for `information_schema` identifier comparisons
+/// (`table_schema = $1`), which PostgreSQL resolves as a text comparison.
+fn catalog_input_override(plan: &giggles_pg_catalog::Plan, declared: u32, inferred: u32) -> bool {
+    plan.allows_numeric_input_override()
+        && ((matches!(declared, 20 | 21 | 23 | 26) && matches!(inferred, 20 | 21 | 23 | 26))
+            || (matches!(declared, 19 | 25 | 1043) && matches!(inferred, 19 | 25 | 1043)))
+}
+
 fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
     if declared == 0 || declared == oid(ty) {
         return Some(ty.clone());
@@ -1086,11 +1097,7 @@ impl State {
                 // 0A000. Keep catalog validation and successful numeric overrides intact.
                 if let Plan::Catalog(plan, _, _) = &p {
                     let mismatch = oids.iter().zip(&parameter_oids).any(|(o, inferred)| {
-                        *o != 0
-                            && o != inferred
-                            && !(plan.allows_numeric_input_override()
-                                && matches!(*o, 20 | 21 | 23 | 26)
-                                && matches!(*inferred, 20 | 21 | 23 | 26))
+                        *o != 0 && o != inferred && !catalog_input_override(plan, *o, *inferred)
                     });
                     if session.role.is_sql()
                         && mismatch
@@ -1130,11 +1137,9 @@ impl State {
                             // change only ParameterDescription while leaving a
                             // projected parameter's output type unchanged.
                             if o != parameter_oids[i] {
-                                let safe_numeric = matches!(&p, Plan::Catalog(plan, _, _)
-                                    if plan.allows_numeric_input_override())
-                                    && matches!(o, 20 | 21 | 23 | 26)
-                                    && matches!(parameter_oids[i], 20 | 21 | 23 | 26);
-                                if !safe_numeric {
+                                let safe = matches!(&p, Plan::Catalog(plan, _, _)
+                                    if catalog_input_override(plan, o, parameter_oids[i]));
+                                if !safe {
                                     return Err("0A000");
                                 }
                             }
