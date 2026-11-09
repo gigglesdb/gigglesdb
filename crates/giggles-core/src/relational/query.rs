@@ -3162,6 +3162,13 @@ impl Query {
             .order
             .iter()
             .map(|(e, d, n)| {
+                let ordinal;
+                let e = if let Scalar::Literal(Value::Int(k)) = e {
+                    ordinal = self.order_ordinal(*k, &tables)?;
+                    &ordinal
+                } else {
+                    e
+                };
                 let bound = e.bind(&resolve, &tables, &parameters)?;
                 if bound.ty == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
@@ -4005,6 +4012,47 @@ impl BoundQuery<'_> {
             return Err(SqlError::Aborted);
         }
         Ok(result)
+    }
+}
+
+impl Query {
+    /// PG18: an integer literal in ORDER BY names that select-list output
+    /// (1-based, `*` expanded), not a constant sort key.
+    fn order_ordinal(&self, k: i64, tables: &[&TableDef]) -> R<Scalar> {
+        let mut n = 0i64;
+        for (item, _) in &self.items {
+            match item {
+                Item::Star => {
+                    for (source, table) in self.sources.iter().zip(tables) {
+                        for (i, column) in table.columns.iter().enumerate() {
+                            if table.hidden_rowid() == Some(i) {
+                                continue;
+                            }
+                            n += 1;
+                            if n == k {
+                                return Ok(Scalar::Column(ColumnRef {
+                                    qualifier: Some(source.alias.clone()),
+                                    name: column.name.clone(),
+                                }));
+                            }
+                        }
+                    }
+                }
+                Item::Scalar(s) => {
+                    n += 1;
+                    if n == k {
+                        return Ok(s.clone());
+                    }
+                }
+                Item::Aggregate(..) => {
+                    n += 1;
+                    if n == k {
+                        return Err(SqlError::Unsupported);
+                    }
+                }
+            }
+        }
+        Err(SqlError::UnknownColumn)
     }
 }
 

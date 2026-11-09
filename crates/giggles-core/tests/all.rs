@@ -295,3 +295,5 @@ fn every_test_file_is_registered() {
         "tests/*.rs files not registered in tests/all.rs or Cargo.toml [[test]]: {missing:?}"
     );
 }
+#[path = "sql_text_order.rs"]
+mod sql_text_order;
