@@ -95,6 +95,11 @@ fn type_name(t: &DataType) -> &'static str {
         DataType::DoublePrecision => "double precision",
         DataType::Varchar => "character varying",
         DataType::Bpchar => "character",
+        DataType::Uuid => "uuid",
+        DataType::Jsonb => "jsonb",
+        DataType::IntArray => "integer[]",
+        DataType::BigIntArray => "bigint[]",
+        DataType::TextArray => "text[]",
     }
 }
 

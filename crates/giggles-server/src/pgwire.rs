@@ -188,6 +188,12 @@ pub fn oid(t: &DataType) -> u32 {
         DataType::Text => 25,
         DataType::Varchar => 1043,
         DataType::Bpchar => 1042,
+        DataType::Uuid => 2950,
+        DataType::Jsonb => 3802,
+        DataType::IntArray => 1007,
+        DataType::BigIntArray => 1016,
+        DataType::TextArray => 1009,
+
         DataType::Bytes => 17,
         DataType::Numeric => 1700,
         DataType::Real => 700,
@@ -202,6 +208,8 @@ pub fn oid(t: &DataType) -> u32 {
 }
 fn size(t: &DataType) -> i16 {
     match t {
+        DataType::Uuid => 16,
+        DataType::Jsonb | DataType::IntArray | DataType::BigIntArray | DataType::TextArray => -1,
         DataType::Boolean => 1,
         DataType::Date => 4,
         DataType::Time => 8,
@@ -388,6 +396,14 @@ pub fn decode_in_zone(
                 Err("22021")
             }
             DataType::Text | DataType::Varchar | DataType::Bpchar => Ok(Value::Text(s.into())),
+            DataType::Uuid
+            | DataType::Jsonb
+            | DataType::IntArray
+            | DataType::BigIntArray
+            | DataType::TextArray => {
+                giggles_core::relational::logical_types::coerce(Value::Text(s.into()), ty)
+                    .map_err(|_| "22P02")
+            }
             DataType::Bytes => {
                 use giggles_pg_types::bytea::{ByteaInputError as E, prepare_bytea_text};
                 let map_error = |error| match error {
@@ -403,6 +419,9 @@ pub fn decode_in_zone(
                     .map_err(map_error)
             }
         };
+    }
+    if ty.is_extended_text() {
+        return logical_binary_input(ty, b);
     }
     let temporal_size = match ty {
         DataType::Date => Some(4),
@@ -535,6 +554,7 @@ fn encode(
         }));
     }
     Ok(Some(match (v, ty) {
+        (Value::Text(s), ty) if ty.is_extended_text() => logical_binary_output(ty, s)?,
         (Value::Bool(v), DataType::Boolean) => vec![u8::from(*v)],
         (Value::Int(v), DataType::SmallInt) => i16::try_from(*v)
             .map_err(|_| "22003")?
@@ -675,6 +695,12 @@ fn core_declared_type(oid: u32) -> Option<DataType> {
         25 => Some(DataType::Text),
         1043 => Some(DataType::Varchar),
         1042 => Some(DataType::Bpchar),
+        2950 => Some(DataType::Uuid),
+        3802 => Some(DataType::Jsonb),
+        1007 => Some(DataType::IntArray),
+        1016 => Some(DataType::BigIntArray),
+        1009 => Some(DataType::TextArray),
+
         1700 => Some(DataType::Numeric),
         700 => Some(DataType::Real),
         701 => Some(DataType::DoublePrecision),
@@ -1965,3 +1991,151 @@ mod wire_input_contract_tests;
 #[cfg(test)]
 #[path = "pgwire_timetz_tests.rs"]
 mod timetz_tests;
+fn logical_binary_output(ty: &DataType, s: &str) -> R<Vec<u8>> {
+    use giggles_core::relational::logical_types::array_values;
+    if *ty == DataType::Uuid {
+        return hex::decode(s.replace('-', "")).map_err(|_| "22P02");
+    }
+    if *ty == DataType::Jsonb {
+        let mut b = vec![1];
+        b.extend_from_slice(s.as_bytes());
+        return Ok(b);
+    }
+    let vals = array_values(s).map_err(|_| "22P02")?;
+    let elem = match ty {
+        DataType::IntArray => 23u32,
+        DataType::BigIntArray => 20,
+        _ => 25,
+    };
+    let mut b = Vec::new();
+    b.extend_from_slice(&(if vals.is_empty() { 0i32 } else { 1 }).to_be_bytes());
+    b.extend_from_slice(&i32::from(vals.contains(&None)).to_be_bytes());
+    b.extend_from_slice(&elem.to_be_bytes());
+    if !vals.is_empty() {
+        b.extend_from_slice(&(vals.len() as i32).to_be_bytes());
+        b.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for val in vals {
+        if let Some(s) = val {
+            let v = match ty {
+                DataType::IntArray => s
+                    .parse::<i32>()
+                    .map_err(|_| "22P02")?
+                    .to_be_bytes()
+                    .to_vec(),
+                DataType::BigIntArray => s
+                    .parse::<i64>()
+                    .map_err(|_| "22P02")?
+                    .to_be_bytes()
+                    .to_vec(),
+                _ => s.into_bytes(),
+            };
+            b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            b.extend(v);
+        } else {
+            b.extend_from_slice(&(-1i32).to_be_bytes());
+        }
+    }
+    Ok(b)
+}
+fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
+    use giggles_core::relational::logical_types::{array_quote, coerce};
+    if *ty == DataType::Uuid {
+        if b.len() != 16 {
+            return Err("22P03");
+        }
+        return coerce(Value::Text(hex::encode(b)), ty).map_err(|_| "22P02");
+    }
+    if *ty == DataType::Jsonb {
+        if b.first() != Some(&1) {
+            return Err("22P03");
+        }
+        let s = std::str::from_utf8(&b[1..]).map_err(|_| "22021")?;
+        return coerce(Value::Text(s.into()), ty).map_err(|_| "22P02");
+    }
+    let mut at = 0;
+    fn int(b: &[u8], at: &mut usize) -> R<i32> {
+        let v = b.get(*at..*at + 4).ok_or("08P01")?;
+        *at += 4;
+        Ok(i32::from_be_bytes(v.try_into().unwrap()))
+    }
+    let ndim = int(b, &mut at)?;
+    let hasnull = int(b, &mut at)?;
+    let elem = int(b, &mut at)?;
+    let expected = match ty {
+        DataType::IntArray => 23,
+        DataType::BigIntArray => 20,
+        _ => 25,
+    };
+    if !(0..=1).contains(&ndim) || !(0..=1).contains(&hasnull) || elem != expected {
+        return Err("22P03");
+    }
+    let count = if ndim == 1 {
+        let n = int(b, &mut at)?;
+        let lb = int(b, &mut at)?;
+        if n < 0 || lb != 1 {
+            return Err("22P03");
+        }
+        n as usize
+    } else {
+        0
+    };
+    if count > b.len() / 4 {
+        return Err("08P01");
+    }
+    let mut vals = Vec::new();
+    for _ in 0..count {
+        let len = int(b, &mut at)?;
+        if len == -1 {
+            vals.push("NULL".into());
+            continue;
+        }
+        let len = usize::try_from(len).map_err(|_| "22P03")?;
+        let v = b.get(at..at + len).ok_or("08P01")?;
+        at += len;
+        vals.push(match ty {
+            DataType::IntArray if len == 4 => i32::from_be_bytes(v.try_into().unwrap()).to_string(),
+            DataType::BigIntArray if len == 8 => {
+                i64::from_be_bytes(v.try_into().unwrap()).to_string()
+            }
+            DataType::TextArray => array_quote(std::str::from_utf8(v).map_err(|_| "22021")?),
+            _ => return Err("22P03"),
+        });
+    }
+    if at != b.len() {
+        return Err("22P03");
+    }
+    coerce(Value::Text(format!("{{{}}}", vals.join(","))), ty).map_err(|_| "22P02")
+}
+
+#[cfg(test)]
+mod logical_wire_tests {
+    use super::*;
+    #[test]
+    fn binary_outputs_roundtrip() {
+        for (ty, text) in [
+            (DataType::Uuid, "12345678-1234-5678-1234-567812345678"),
+            (DataType::Jsonb, "{\"a\": 1}"),
+            (DataType::IntArray, "{1,NULL,-3}"),
+            (DataType::BigIntArray, "{9223372036854775807}"),
+            (DataType::TextArray, "{\"a,b\",NULL,\"NULL\"}"),
+        ] {
+            let binary = logical_binary_output(&ty, text).unwrap();
+            assert_eq!(
+                logical_binary_input(&ty, &binary),
+                Ok(Value::Text(text.into()))
+            );
+            if ty == DataType::Uuid {
+                assert_eq!(binary.len(), 16);
+            }
+            if ty == DataType::Jsonb {
+                assert_eq!(binary[0], 1);
+            }
+        }
+        let binary = logical_binary_output(&DataType::IntArray, "{1,NULL,-3}").unwrap();
+        assert_eq!(
+            &binary[..20],
+            &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 23, 0, 0, 0, 3, 0, 0, 0, 1]
+        );
+    }
+}

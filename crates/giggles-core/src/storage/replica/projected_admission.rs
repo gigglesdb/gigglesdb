@@ -1432,7 +1432,7 @@ fn layouts() -> Result<(), Failure> {
         size_of::<TableDef>(),
         size_of::<SqlRow>(),
         size_of::<relational::Relational>(),
-    ] != [40, 40, 80, 32, 240]
+    ] != [40, 40, 80, 32, 264]
         || [
             align_of::<Value>(),
             align_of::<ColumnDef>(),
@@ -1445,6 +1445,7 @@ fn layouts() -> Result<(), Failure> {
             size_of::<Vec<u8>>(),
             size_of::<BTreeMap<u64, u64>>(),
         ] != [24; 3]
+        || size_of::<State>() != 608
         || size_of::<bincode::ErrorKind>() > 32
     {
         return Err(Failure::Unsupported);
@@ -1610,9 +1611,9 @@ mod tests {
             ],
             [8; 4]
         );
-        assert_eq!(size_of::<relational::Relational>(), 240);
+        assert_eq!(size_of::<relational::Relational>(), 264);
         assert_eq!(size_of::<Metadata>(), 80);
-        assert_eq!(size_of::<State>(), 576);
+        assert_eq!(size_of::<State>(), 608);
         assert_eq!(size_of::<DataType>(), 1);
         layouts().unwrap();
         println!(

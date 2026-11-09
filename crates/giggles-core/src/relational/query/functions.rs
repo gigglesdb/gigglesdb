@@ -531,13 +531,43 @@ impl Scalar {
     }
     fn parse_casts(p: &mut Parser, depth: usize, mut value: Self) -> R<Self> {
         let mut casts = depth;
-        while p.sym(':') {
-            p.punct(':')?;
-            casts += 1;
-            if casts > 32 {
-                return Err(SqlError::Limit);
+        loop {
+            if p.sym('[') {
+                let index = Self::parse_expr(p, depth + 1, false)?;
+                p.punct(']')?;
+                value = Self::Call("\0array_subscript".into(), vec![value, index]);
+            } else if matches!(p.tokens.get(p.at), Some(Token::Op(op)) if op=="->" || op=="->>") {
+                let Some(Token::Op(op)) = p.tokens.get(p.at).cloned() else {
+                    unreachable!()
+                };
+                p.at += 1;
+                let negative = matches!(p.tokens.get(p.at),Some(Token::Op(op)) if op=="-");
+                if negative {
+                    p.at += 1;
+                }
+                let mut key = Self::primary_context(p, depth + 1, false)?;
+                if negative {
+                    key = Self::Unary(UnaryOp::Neg, Box::new(key));
+                }
+                value = Self::Call(
+                    if op == "->" {
+                        "\0json_get"
+                    } else {
+                        "\0json_text"
+                    }
+                    .into(),
+                    vec![value, key],
+                );
+            } else if p.sym(':') {
+                p.punct(':')?;
+                casts += 1;
+                if casts > 32 {
+                    return Err(SqlError::Limit);
+                }
+                value = cast::expression(value, cast_type(p)?);
+            } else {
+                break;
             }
-            value = cast::expression(value, cast_type(p)?);
         }
         Ok(value)
     }
@@ -1222,7 +1252,44 @@ impl Scalar {
                     }
                 }
                 let null = |a: &BoundScalar| matches!(a.node, Node::Literal(Value::Null));
-                let ty = if integer_formats::known_name(name) {
+                let ty = if matches!(
+                    name.as_str(),
+                    "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+                ) {
+                    if args.len() != 2 {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    match name.as_str() {
+                        "array_length" | "\0array_subscript" => {
+                            if !integer(&args[1].ty) {
+                                return Err(SqlError::UndefinedFunction);
+                            }
+                            let element = match args[0].ty {
+                                DataType::IntArray => DataType::Integer,
+                                DataType::BigIntArray => DataType::BigInt,
+                                DataType::TextArray => DataType::Text,
+                                _ => return Err(SqlError::UndefinedFunction),
+                            };
+                            if name == "array_length" {
+                                DataType::Integer
+                            } else {
+                                element
+                            }
+                        }
+                        _ => {
+                            if args[0].ty != DataType::Jsonb
+                                || !(integer(&args[1].ty) || args[1].ty == DataType::Text)
+                            {
+                                return Err(SqlError::UndefinedFunction);
+                            }
+                            if name == "\0json_get" {
+                                DataType::Jsonb
+                            } else {
+                                DataType::Text
+                            }
+                        }
+                    }
+                } else if integer_formats::known_name(name) {
                     if args.len() != 1 {
                         return Err(SqlError::UndefinedFunction);
                     }
@@ -1662,6 +1729,8 @@ impl BoundScalar {
         match &self.node {
             Node::Predicate(_) | Node::ZonedOperator(..) => None,
             Node::Case(..) => Some("case"),
+            Node::Call(name, args) if name == "\0array_subscript" => args[0].strong_name(),
+            Node::Call(name, _) if name.starts_with("\0json_") => None,
             Node::Call(name, _) if arithmetic::internal_name(name) => None,
             Node::Column(_, name)
             | Node::Call(name, _)
@@ -1689,6 +1758,12 @@ impl BoundScalar {
                         DataType::Text => "text",
                         DataType::Varchar => "varchar",
                         DataType::Bpchar => "bpchar",
+                        DataType::Uuid => "uuid",
+                        DataType::Jsonb => "jsonb",
+                        DataType::IntArray => "integer[]",
+                        DataType::BigIntArray => "bigint[]",
+                        DataType::TextArray => "text[]",
+
                         DataType::Boolean => "bool",
                         DataType::Bytes => "bytea",
                         DataType::Numeric => "numeric",
@@ -1705,6 +1780,8 @@ impl BoundScalar {
             }
             Node::Column(_, name) => name,
             Node::Literal(_) => "?column?",
+            Node::Call(n, args) if n == "\0array_subscript" => args[0].name(),
+            Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
             Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) => n,
         }
@@ -1844,6 +1921,18 @@ impl BoundScalar {
                         .map(|a| a.eval(row, params, budget))
                         .collect::<R<Vec<_>>>()?;
                     return arithmetic::eval(n, &self.ty, &values, budget);
+                }
+                if matches!(
+                    n.as_str(),
+                    "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+                ) {
+                    let values = args
+                        .iter()
+                        .map(|a| a.eval(row, params, budget))
+                        .collect::<R<Vec<_>>>()?;
+                    let result = crate::relational::logical_types::eval(n, &args[0].ty, &values)?;
+                    charge(budget, &result)?;
+                    return Ok(result);
                 }
                 if n == "coalesce" {
                     for a in args {
@@ -2114,7 +2203,17 @@ fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
 }
 
 fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {
-    cast::target(p)
+    let (mut ty, modifier) = cast::target(p)?;
+    if p.sym('[') {
+        p.punct(']')?;
+        ty = match ty {
+            DataType::Integer => DataType::IntArray,
+            DataType::BigInt => DataType::BigIntArray,
+            DataType::Text => DataType::TextArray,
+            _ => return Err(SqlError::Unsupported),
+        };
+    }
+    Ok((ty, modifier))
 }
 fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
     let exclusive_upper = match ty {
@@ -2135,6 +2234,11 @@ fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
 pub(super) fn cast_value(v: Value, ty: &DataType, budget: &mut usize) -> R<Value> {
     if v == Value::Null {
         return Ok(v);
+    }
+    if ty.is_extended_text() {
+        let out = crate::relational::logical_types::coerce(v, ty)?;
+        charge(budget, &out)?;
+        return Ok(out);
     }
     // Varchar/Bpchar values are text; length and padding apply at the column (coerce_to_column).
     let ty = if matches!(ty, DataType::Varchar | DataType::Bpchar) {
@@ -2428,6 +2532,33 @@ impl Scalar {
             }
             Self::SubstringOrder(args) => {
                 Self::infer_substring_order(args, parameters, resolve, tables)?;
+            }
+            Self::Call(n, args)
+                if matches!(
+                    n.as_str(),
+                    "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+                ) =>
+            {
+                if args.len() != 2 {
+                    return Err(SqlError::UndefinedFunction);
+                }
+                let first = if n.starts_with("\0json_") {
+                    Some(&DataType::Jsonb)
+                } else {
+                    None
+                };
+                args[0].infer(first, parameters, resolve, tables)?;
+                let key = if n.starts_with("\0json_") {
+                    DataType::Text
+                } else {
+                    DataType::Integer
+                };
+                let hint = if args[1].aggregate_unknown(parameters) {
+                    Some(&key)
+                } else {
+                    None
+                };
+                args[1].infer(hint, parameters, resolve, tables)?;
             }
             Self::Call(n, args) if n == CAST_TYPMOD => {
                 let [inner, Self::Literal(Value::Int(_))] = args.as_slice() else {

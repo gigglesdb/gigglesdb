@@ -307,9 +307,22 @@ pub(super) fn execute(
                     }
                 }
                 candidate.tables.insert(name.clone(), table.clone());
+                let logical = match column.data_type {
+                    DataType::Uuid => Some(catalog_ext::LogicalKind::Uuid),
+                    DataType::Jsonb => Some(catalog_ext::LogicalKind::Jsonb),
+                    DataType::IntArray => Some(catalog_ext::LogicalKind::IntArray),
+                    DataType::BigIntArray => Some(catalog_ext::LogicalKind::BigIntArray),
+                    DataType::TextArray => Some(catalog_ext::LogicalKind::TextArray),
+                    _ => None,
+                };
+                if let Some(kind) = logical {
+                    candidate.ext.logical_kinds.insert(column.id, kind);
+                    Relational::normalize_ext(&mut candidate.ext);
+                }
                 let kind = match column.data_type {
                     DataType::Varchar => Some(catalog_ext::TextKind::Varchar),
                     DataType::Bpchar => Some(catalog_ext::TextKind::Bpchar),
+
                     _ => None,
                 };
                 if let Some(kind) = kind {

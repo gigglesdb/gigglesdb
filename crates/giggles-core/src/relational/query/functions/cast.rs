@@ -179,6 +179,8 @@ fn generic(p: &mut Parser, name: &str) -> R<(DataType, Option<i32>)> {
         "timestamptz" => DataType::TimestampTz,
         "interval" => DataType::Interval,
         "varchar" => DataType::Varchar,
+        "uuid" => DataType::Uuid,
+        "jsonb" => DataType::Jsonb,
         "bpchar" => DataType::Bpchar,
         _ => {
             return Err(if pg18_types::PG_CATALOG.binary_search(&name).is_ok() {

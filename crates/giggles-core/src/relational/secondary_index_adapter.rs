@@ -1257,6 +1257,24 @@ impl<'de> Deserialize<'de> for Relational {
                             }
                         }
                     }
+                    for table in value.tables.values_mut() {
+                        for column in &mut table.columns {
+                            if let Some(kind) = value.ext.logical_kinds.get(&column.id) {
+                                if column.data_type != DataType::Text {
+                                    return Err(A::Error::custom(
+                                        "logical kind on non-text column",
+                                    ));
+                                }
+                                column.data_type = match kind {
+                                    catalog_ext::LogicalKind::Uuid => DataType::Uuid,
+                                    catalog_ext::LogicalKind::Jsonb => DataType::Jsonb,
+                                    catalog_ext::LogicalKind::IntArray => DataType::IntArray,
+                                    catalog_ext::LogicalKind::BigIntArray => DataType::BigIntArray,
+                                    catalog_ext::LogicalKind::TextArray => DataType::TextArray,
+                                };
+                            }
+                        }
+                    }
                     value.validate_ext().map_err(|error| {
                         A::Error::custom(format!("relational catalog invariant: {error:?}"))
                     })?;

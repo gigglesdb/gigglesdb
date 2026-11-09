@@ -264,7 +264,7 @@ fn cast_type_name_errors_are_exact() {
         ("'a'::\"VARCHAR\"", E::UndefinedObject),
         ("'a'::nosuchtype(", E::Syntax),
         ("'a'::public.nosuchtype", E::Unsupported),
-        ("'a'::uuid", E::Unsupported),
+        ("'a'::uuid", E::InvalidTextRepresentation),
         ("'a'::\"char\"", E::Unsupported),
         ("'a'::varchar(0)", E::InvalidParameterValue),
         ("'a'::varchar(10485761)", E::InvalidParameterValue),

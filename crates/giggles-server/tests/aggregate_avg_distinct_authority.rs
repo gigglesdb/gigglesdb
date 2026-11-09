@@ -28,7 +28,7 @@ impl Fixture {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path =
             PathBuf::from(std::env::var_os("TEMP").expect("task TEMP configured")).join(format!(
-                "aggregate-authority-{}-{}-{}",
+                "aggregate-avg-distinct-authority-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)

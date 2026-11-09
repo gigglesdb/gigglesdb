@@ -305,3 +305,5 @@ mod numeric_column_typmod;
 mod relational_insert_select;
 #[path = "sql_insert_select_literals.rs"]
 mod sql_insert_select_literals;
+#[path = "logical_columns.rs"]
+mod logical_columns;

@@ -31,6 +31,12 @@ pub(super) fn sequence_volatility(name: &str) -> Option<Volatility> {
 }
 fn signature(name: &str, args: &[DataType], result: &DataType) -> Option<(bool, bool)> {
     use DataType::*;
+    if matches!(
+        name,
+        "\0array_subscript" | "array_length" | "\0json_get" | "\0json_text"
+    ) {
+        return Some((true, true));
+    }
     if let Some((clock_type, _volatility)) = clock_signature(name) {
         let precision_keyword = matches!(
             name,

@@ -5,9 +5,9 @@ use std::cmp::Ordering;
 mod aggregate_filter;
 mod functions;
 pub(super) use functions::assignment;
+pub(super) mod conflict;
 mod grouping;
 mod insert_values;
-pub(super) mod conflict;
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
@@ -4318,10 +4318,7 @@ fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -
 /// the column type's input function. `None`: character and bytea columns keep
 /// their existing route; `Some(None)`: resolution needs the session clock;
 /// `Some(Some(v))`: the typed value.
-pub(super) fn unknown_comparison_literal(
-    value: &Value,
-    ty: &DataType,
-) -> R<Option<Option<Value>>> {
+pub(super) fn unknown_comparison_literal(value: &Value, ty: &DataType) -> R<Option<Option<Value>>> {
     if !matches!(value, Value::Text(_))
         || matches!(
             ty,
@@ -4637,6 +4634,11 @@ fn update_filtered_aggregates(
                     | DataType::SmallInt
                     | DataType::Integer
                     | DataType::Text
+                    | DataType::Uuid
+                    | DataType::Jsonb
+                    | DataType::IntArray
+                    | DataType::BigIntArray
+                    | DataType::TextArray
                     | DataType::Varchar
                     | DataType::Bpchar
                     | DataType::Bytes

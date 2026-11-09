@@ -14,6 +14,7 @@ pub(crate) struct CatalogExt {
     pub(crate) constraints: BTreeMap<u64, Vec<Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
+    pub(crate) logical_kinds: BTreeMap<u64, LogicalKind>,
 }
 impl Default for CatalogExt {
     fn default() -> Self {
@@ -23,6 +24,7 @@ impl Default for CatalogExt {
             constraints: BTreeMap::new(),
             sequences: BTreeMap::new(),
             types: BTreeMap::new(),
+            logical_kinds: BTreeMap::new(),
         }
     }
 }
@@ -32,6 +34,7 @@ impl CatalogExt {
             && self.constraints.is_empty()
             && self.sequences.is_empty()
             && self.types.is_empty()
+            && self.logical_kinds.is_empty()
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -46,6 +49,14 @@ pub(crate) struct ColumnExt {
 pub(crate) enum TextKind {
     Varchar,
     Bpchar,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum LogicalKind {
+    Uuid,
+    Jsonb,
+    IntArray,
+    BigIntArray,
+    TextArray,
 }
 // Frozen version-one/two column layout.
 #[derive(Serialize, Deserialize)]
@@ -201,7 +212,9 @@ impl CatalogExt {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
     fn wire_version(&self) -> u32 {
-        if self.has_text_kind() {
+        if !self.logical_kinds.is_empty() {
+            4
+        } else if self.has_text_kind() {
             3
         } else if self.has_deferrable() {
             2
@@ -216,10 +229,10 @@ impl CatalogExt {
 impl Serialize for CatalogExt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
-        let mut out = serializer.serialize_tuple(5)?;
         let version = self.wire_version();
+        let mut out = serializer.serialize_tuple(if version == 4 { 6 } else { 5 })?;
         out.serialize_element(&version)?;
-        if version == 3 {
+        if version >= 3 {
             out.serialize_element(&self.columns)?;
         } else {
             let legacy: BTreeMap<_, _> = self
@@ -250,6 +263,9 @@ impl Serialize for CatalogExt {
         }
         out.serialize_element(&self.sequences)?;
         out.serialize_element(&self.types)?;
+        if version == 4 {
+            out.serialize_element(&self.logical_kinds)?;
+        }
         out.end()
     }
 }
@@ -292,6 +308,15 @@ impl<'de> Deserialize<'de> for CatalogExt {
         struct CurrentMap(
             #[serde(deserialize_with = "constraint_map")] BTreeMap<u64, Vec<Constraint>>,
         );
+        #[derive(Deserialize)]
+        struct LogicalKinds(
+            #[serde(deserialize_with = "logical_kind_map")] BTreeMap<u64, LogicalKind>,
+        );
+        fn logical_kind_map<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<u64, LogicalKind>, D::Error> {
+            bounded_map::<D, LogicalKind, MAX_EXT_COLUMNS>(d)
+        }
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = CatalogExt;
@@ -306,10 +331,10 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=3) {
+                if !matches!(ext_version, 1..=4) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
-                let columns = if ext_version == 3 {
+                let columns = if ext_version >= 3 {
                     next!(Columns).0
                 } else {
                     next!(LegacyColumns)
@@ -333,6 +358,11 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     constraints,
                     sequences: next!(Sequences).0,
                     types: next!(Types).0,
+                    logical_kinds: if ext_version == 4 {
+                        next!(LogicalKinds).0
+                    } else {
+                        BTreeMap::new()
+                    },
                 };
                 if ext_version != out.wire_version() {
                     return Err(de::Error::custom("noncanonical catalog extension version"));
@@ -340,7 +370,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(5, V)
+        d.deserialize_tuple(6, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,7 +691,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=3) || !ext.types.is_empty() {
+        if !matches!(ext.ext_version, 1..=4) || !ext.types.is_empty() {
             return Err(SqlError::Unsupported);
         }
         if ext.ext_version != ext.wire_version() {
@@ -670,7 +700,8 @@ impl Relational {
         if self.format != 1 {
             return Err(SqlError::Type);
         }
-        if ext.columns.len() > MAX_EXT_COLUMNS
+        if ext.logical_kinds.len() > MAX_EXT_COLUMNS
+            || ext.columns.len() > MAX_EXT_COLUMNS
             || ext.constraints.len() > MAX_TABLES
             || ext.sequences.len() > MAX_EXT_SEQUENCES
         {
@@ -699,7 +730,13 @@ impl Relational {
             let expected = match column.data_type {
                 DataType::Varchar => Some(TextKind::Varchar),
                 DataType::Bpchar => Some(TextKind::Bpchar),
-                DataType::Boolean
+
+                DataType::Uuid
+                | DataType::Jsonb
+                | DataType::IntArray
+                | DataType::BigIntArray
+                | DataType::TextArray
+                | DataType::Boolean
                 | DataType::SmallInt
                 | DataType::Integer
                 | DataType::BigInt
@@ -715,9 +752,23 @@ impl Relational {
                 | DataType::TimestampTz
                 | DataType::Interval => None,
             };
+            let logical = match column.data_type {
+                DataType::Uuid => Some(LogicalKind::Uuid),
+                DataType::Jsonb => Some(LogicalKind::Jsonb),
+                DataType::IntArray => Some(LogicalKind::IntArray),
+                DataType::BigIntArray => Some(LogicalKind::BigIntArray),
+                DataType::TextArray => Some(LogicalKind::TextArray),
+                _ => None,
+            };
+            if ext.logical_kinds.get(id).copied() != logical {
+                return Err(SqlError::Type);
+            }
             if ext.columns.get(id).and_then(|c| c.text_kind) != expected {
                 return Err(SqlError::Type);
             }
+        }
+        if ext.logical_kinds.keys().any(|id| !columns.contains_key(id)) {
+            return Err(SqlError::Type);
         }
         for (id, e) in &ext.columns {
             let (_, c) = columns.get(id).ok_or(SqlError::Type)?;
@@ -878,6 +929,7 @@ impl Relational {
         column.data_type = match kind {
             Some(TextKind::Varchar) => DataType::Varchar,
             Some(TextKind::Bpchar) => DataType::Bpchar,
+
             None => DataType::Text,
         };
         candidate.ext.columns.entry(id).or_default().text_kind = kind;
@@ -958,6 +1010,7 @@ impl Relational {
     pub(crate) fn drop_column_ext(&mut self, id: u64) -> R<()> {
         self.mutate_ext(|ext, _| {
             ext.columns.remove(&id);
+            ext.logical_kinds.remove(&id);
             ext.sequences
                 .retain(|_, v| !matches!(v.owned_by,Some((_,c)) if c==id));
             Ok(())
@@ -989,5 +1042,41 @@ impl Relational {
             .iter()
             .find(|(_, s)| s.name == name)
             .map(|(id, s)| (*id, s))
+    }
+}
+
+#[cfg(test)]
+mod logical_catalog_ext_tests {
+    use super::*;
+    use bincode::Options;
+    fn codec() -> impl Options {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_big_endian()
+            .reject_trailing_bytes()
+    }
+    #[test]
+    fn catalog_ext_v4_frozen_layout() {
+        let mut ext = CatalogExt::default();
+        ext.logical_kinds.insert(7, LogicalKind::Uuid);
+        Relational::normalize_ext(&mut ext);
+        let bytes = codec().serialize(&ext).unwrap();
+        let mut expected = 4u32.to_be_bytes().to_vec();
+        for _ in 0..4 {
+            expected.extend_from_slice(&0u64.to_be_bytes());
+        }
+        expected.extend_from_slice(&1u64.to_be_bytes());
+        expected.extend_from_slice(&7u64.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(bytes, expected);
+        assert_eq!(codec().deserialize::<CatalogExt>(&bytes).unwrap(), ext);
+        assert_eq!(
+            codec().serialize(&DataType::Uuid).unwrap(),
+            codec().serialize(&DataType::Text).unwrap()
+        );
+        // A v3 payload cannot smuggle the new metadata through its frozen tail.
+        let mut wrong = bytes;
+        wrong[..4].copy_from_slice(&3u32.to_be_bytes());
+        assert!(codec().deserialize::<CatalogExt>(&wrong).is_err());
     }
 }

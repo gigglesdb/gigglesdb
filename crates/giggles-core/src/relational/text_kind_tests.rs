@@ -105,7 +105,8 @@ fn text_kind_invariants_and_wire_rejections() {
             .contains(catalog_ext::UNSUPPORTED_CATALOG_EXT)
     );
     let mut bytes = valid;
-    bytes[..4].copy_from_slice(&4u32.to_be_bytes());
+    // A version no build will ever write.
+    bytes[..4].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&bytes)

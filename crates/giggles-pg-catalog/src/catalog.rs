@@ -927,6 +927,11 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
         ScalarType::Text => (25, "text", -1, 1009),
         ScalarType::Varchar => (1043, "varchar", -1, 1015),
         ScalarType::Bpchar => (1042, "bpchar", -1, 1014),
+        ScalarType::Uuid => (2950, "uuid", 16, 2951),
+        ScalarType::Jsonb => (3802, "jsonb", -1, 3807),
+        ScalarType::IntArray => (1007, "_int4", -1, 0),
+        ScalarType::BigIntArray => (1016, "_int8", -1, 0),
+        ScalarType::TextArray => (1009, "_text", -1, 0),
         ScalarType::Bytes => (17, "bytea", -1, 1001),
         ScalarType::Numeric => (1700, "numeric", -1, 1231),
         ScalarType::Real => (700, "float4", 4, 1021),
@@ -1248,6 +1253,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ScalarType::Text,
         ScalarType::Varchar,
         ScalarType::Bpchar,
+        ScalarType::Uuid,
+        ScalarType::Jsonb,
         ScalarType::Bytes,
         ScalarType::Numeric,
         ScalarType::Real,
@@ -1259,6 +1266,15 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ScalarType::TimestampTz,
         ScalarType::Interval,
     ] {
+        if matches!(ty, ScalarType::Uuid | ScalarType::Jsonb)
+            && !snapshot
+                .tables
+                .iter()
+                .flat_map(|table| &table.columns)
+                .any(|column| column.data_type == ty)
+        {
+            continue;
+        }
         let (oid, name, len, array) = scalar(ty);
         add("pg_type", type_row(oid, name, len, 0, array, false));
         add(
@@ -1770,7 +1786,7 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             "D"
         } else if oid == 1186 {
             "T"
-        } else if matches!(oid, 17 | 28 | 1033) {
+        } else if matches!(oid, 17 | 28 | 1033 | 2950 | 3802) {
             "U"
         } else if oid == 18 {
             "Z"
@@ -1827,6 +1843,8 @@ fn type_receive(oid: u32, is_array: bool) -> i64 {
         1186 => 2478,
         1266 => 2472,
         1700 => 2460,
+        2950 => 2961,
+        3802 => 3805,
         _ => 0,
     }
 }

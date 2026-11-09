@@ -244,6 +244,11 @@ pub enum DataType {
     Interval,
     Varchar,
     Bpchar,
+    Uuid,
+    Jsonb,
+    IntArray,
+    BigIntArray,
+    TextArray,
 }
 impl Serialize for DataType {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -252,7 +257,14 @@ impl Serialize for DataType {
             Self::SmallInt => (1, "SmallInt"),
             Self::Integer => (2, "Integer"),
             Self::BigInt => (3, "BigInt"),
-            Self::Text | Self::Varchar | Self::Bpchar => (4, "Text"),
+            Self::Text
+            | Self::Varchar
+            | Self::Bpchar
+            | Self::Uuid
+            | Self::Jsonb
+            | Self::IntArray
+            | Self::BigIntArray
+            | Self::TextArray => (4, "Text"),
             Self::Bytes => (5, "Bytes"),
             Self::Numeric => (6, "Numeric"),
             Self::Real => (7, "Real"),
@@ -484,7 +496,17 @@ pub(crate) fn check(v: &Value, c: &ColumnDef) -> R<()> {
         | (DataType::DoublePrecision, Value::Float8(_))
         | (DataType::Boolean, Value::Bool(_))
         | (DataType::BigInt, Value::Int(_))
-        | (DataType::Text | DataType::Varchar | DataType::Bpchar, Value::Text(_))
+        | (
+            DataType::Text
+            | DataType::Varchar
+            | DataType::Bpchar
+            | DataType::Uuid
+            | DataType::Jsonb
+            | DataType::IntArray
+            | DataType::BigIntArray
+            | DataType::TextArray,
+            Value::Text(_),
+        )
         | (DataType::Bytes, Value::Bytes(_)) => true,
         (DataType::SmallInt, Value::Int(n)) => i16::try_from(*n).is_ok(),
         (DataType::Integer, Value::Int(n)) => i32::try_from(*n).is_ok(),
@@ -532,6 +554,9 @@ fn infer_mutation_parameter(
     Ok(())
 }
 pub(crate) fn coerce_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
+    if column.data_type.is_extended_text() {
+        return logical_types::coerce(value, &column.data_type);
+    }
     use giggles_pg_types::character::{CharKind, CharTypmod, coerce_assignment};
     if column.data_type == DataType::Numeric {
         let Some(typmod) =
@@ -803,9 +828,16 @@ fn lex(s: &str) -> R<Vec<Token>> {
                 return Err(SqlError::Parameters);
             }
             out.push(Token::Param(n));
-        } else if b"(),*;.:".contains(&c) {
+        } else if b"(),*;.:[]".contains(&c) {
             out.push(Token::Symbol(c as char));
             i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'>') {
+            let start = i;
+            i += 2;
+            if b.get(i) == Some(&b'>') {
+                i += 1;
+            }
+            out.push(Token::Op(s[start..i].into()));
         } else if b"+-/%".contains(&c) {
             out.push(Token::Op((c as char).to_string()));
             i += 1;
@@ -1054,7 +1086,9 @@ impl Parser {
         if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if word == "insert")
             && sql_insert::claims(&self.tokens)
         {
-            return sql_insert::parse(self).map(Box::new).map(Statement::InsertMulti);
+            return sql_insert::parse(self)
+                .map(Box::new)
+                .map(Statement::InsertMulti);
         }
         if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "create")
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index" || w == "unique")
@@ -1375,7 +1409,13 @@ pub struct Prepared {
 /// new DataType must be decided here.
 fn v2_varchar_char(data_type: &DataType) -> bool {
     match data_type {
-        DataType::Varchar | DataType::Bpchar => true,
+        DataType::Varchar
+        | DataType::Bpchar
+        | DataType::Uuid
+        | DataType::Jsonb
+        | DataType::IntArray
+        | DataType::BigIntArray
+        | DataType::TextArray => true,
         DataType::Boolean
         | DataType::SmallInt
         | DataType::Integer
@@ -2718,6 +2758,7 @@ impl Relational {
         let mut ext = self.ext.clone();
         for column in &table.columns {
             ext.columns.remove(&column.id);
+            ext.logical_kinds.remove(&column.id);
         }
         ext.constraints.remove(&table_id);
         for constraints in ext.constraints.values_mut() {
@@ -3667,3 +3708,5 @@ mod catalog_typmods_tests;
 
 #[cfg(test)]
 mod text_kind_tests;
+
+pub mod logical_types;

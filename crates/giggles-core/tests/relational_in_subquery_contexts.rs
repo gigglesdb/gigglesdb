@@ -16,7 +16,7 @@ struct Db {
 impl Db {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "gd-in-subquery-{}-{}",
+            "gd-in-subquery-contexts-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

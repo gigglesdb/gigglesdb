@@ -91,3 +91,6 @@ mod pg_dump_catalog;
 
 #[path = "compat_metadata.rs"]
 mod compat_metadata;
+
+#[path = "logical_column_types.rs"]
+mod logical_column_types;

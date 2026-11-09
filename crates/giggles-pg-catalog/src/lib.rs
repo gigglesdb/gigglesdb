@@ -33,6 +33,12 @@ pub use engine::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
+    Uuid,
+    Jsonb,
+    IntArray,
+    BigIntArray,
+    TextArray,
+
     Boolean,
     SmallInt,
     Integer,

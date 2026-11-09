@@ -121,3 +121,5 @@ mod transaction_isolation_reporting;
 mod sql_cursors_network;
 #[path = "mixed_catalog_app_query.rs"]
 mod mixed_catalog_app_query;
+#[path = "logical_columns.rs"]
+mod logical_columns;

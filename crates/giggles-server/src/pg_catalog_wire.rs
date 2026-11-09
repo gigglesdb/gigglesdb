@@ -94,6 +94,12 @@ pub(crate) fn snapshot(
                             C::Text => P::Text,
                             C::Varchar => P::Varchar,
                             C::Bpchar => P::Bpchar,
+                            C::Uuid => P::Uuid,
+                            C::Jsonb => P::Jsonb,
+                            C::IntArray => P::IntArray,
+                            C::BigIntArray => P::BigIntArray,
+                            C::TextArray => P::TextArray,
+
                             C::Bytes => P::Bytes,
                             C::Numeric => P::Numeric,
                             C::Real => P::Real,

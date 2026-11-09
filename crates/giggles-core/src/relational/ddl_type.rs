@@ -44,6 +44,8 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
         }
         "bpchar" => DataType::Bpchar,
         "text" => DataType::Text,
+        "uuid" => DataType::Uuid,
+        "jsonb" => DataType::Jsonb,
         "bytea" => DataType::Bytes,
         "bytes" if matches!(site, Site::Create) => DataType::Bytes,
         "date" => DataType::Date,
@@ -54,6 +56,23 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
         "interval" => DataType::Interval,
         _ => return Err(SqlError::Unsupported),
     };
+    // Keep unsupported array families rejected before CREATE precision policy.
+    // The lexer now admits brackets for the supported integer/text arrays.
+    if !matches!(
+        data_type,
+        DataType::Integer | DataType::BigInt | DataType::Text
+    ) {
+        let mut nesting = 0usize;
+        for token in &p.tokens[p.at..] {
+            match token {
+                Token::Symbol('[') => return Err(SqlError::Unsupported),
+                Token::Symbol('(') => nesting += 1,
+                Token::Symbol(')') if nesting > 0 => nesting -= 1,
+                Token::Symbol(',' | ')' | ';') if nesting == 0 => break,
+                _ => {}
+            }
+        }
+    }
     let temporal_suffix = matches!(word.as_str(), "time" | "timestamp");
     let character = matches!(data_type, DataType::Varchar | DataType::Bpchar);
     // CREATE accepts character and numeric modifiers.
@@ -173,6 +192,15 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
             || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "with" || w == "without"))
     {
         return Err(SqlError::Syntax);
+    }
+    if p.sym('[') {
+        p.punct(']')?;
+        data_type = match data_type {
+            DataType::Integer => DataType::IntArray,
+            DataType::BigInt => DataType::BigIntArray,
+            DataType::Text => DataType::TextArray,
+            _ => return Err(SqlError::Unsupported),
+        };
     }
     Ok(Parsed {
         data_type,

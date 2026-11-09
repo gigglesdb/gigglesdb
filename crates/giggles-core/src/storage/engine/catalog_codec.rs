@@ -85,7 +85,12 @@ impl TryFrom<DataType> for DataTypeDto {
             DataType::Interval => Self::Interval,
             // Explicit arms, no wildcard: a new live type must be decided here.
             DataType::Varchar => return Err(varchar_char_unsupported()),
-            DataType::Bpchar => return Err(varchar_char_unsupported()),
+            DataType::Bpchar
+            | DataType::Uuid
+            | DataType::Jsonb
+            | DataType::IntArray
+            | DataType::BigIntArray
+            | DataType::TextArray => return Err(varchar_char_unsupported()),
         })
     }
 }

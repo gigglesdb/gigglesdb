@@ -184,7 +184,14 @@ impl Writer {
             DataType::SmallInt => 1,
             DataType::Integer => 2,
             DataType::BigInt => 3,
-            DataType::Text | DataType::Varchar | DataType::Bpchar => 4,
+            DataType::Uuid
+            | DataType::Jsonb
+            | DataType::IntArray
+            | DataType::BigIntArray
+            | DataType::TextArray
+            | DataType::Text
+            | DataType::Varchar
+            | DataType::Bpchar => 4,
             DataType::Bytes => 5,
             DataType::Numeric => 6,
             DataType::Real => 7,

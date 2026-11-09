@@ -810,7 +810,13 @@ fn colty(c: &ColumnDef) -> Ty {
     match c.data_type {
         DataType::Boolean => Ty::Bool,
         DataType::SmallInt | DataType::Integer | DataType::BigInt => Ty::Int,
-        DataType::Text | DataType::Varchar => Ty::Text,
+        DataType::Uuid
+        | DataType::Jsonb
+        | DataType::IntArray
+        | DataType::BigIntArray
+        | DataType::TextArray
+        | DataType::Text
+        | DataType::Varchar => Ty::Text,
         DataType::Bpchar => Ty::Bpchar,
         DataType::Bytes => Ty::Bytes,
         DataType::Numeric => Ty::Numeric,

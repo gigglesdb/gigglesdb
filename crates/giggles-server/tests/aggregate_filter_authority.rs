@@ -32,7 +32,7 @@ impl Fixture {
                 PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("giggles-core-artifacts")
             })
             .join(format!(
-                "aggregate-authority-{}-{}-{}",
+                "aggregate-filter-authority-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
