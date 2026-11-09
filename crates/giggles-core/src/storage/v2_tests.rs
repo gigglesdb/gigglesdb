@@ -296,16 +296,38 @@ fn lifecycle_and_public_refusals() {
         }),
         SQL_SESSIONS,
     );
-    denied(session.prepare("invalid"), SQL_SESSIONS);
-    denied(session.execute("invalid", &[], None), SQL_SESSIONS);
+    let clock = relational::StatementClock {
+        statement_us: clock.transaction_us,
+        ..clock
+    };
+    let ddl = session
+        .prepare("CREATE TABLE routed (id bigint PRIMARY KEY)")
+        .unwrap();
+    session.execute_prepared(&ddl, &[], None).unwrap();
+    session
+        .execute(
+            "ALTER TABLE routed ALTER COLUMN id SET DEFAULT 1",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute_at(
+            "ALTER TABLE routed ALTER COLUMN id DROP DEFAULT",
+            &[],
+            None,
+            &clock,
+        )
+        .unwrap();
+    let read = session.prepare("SELECT * FROM routed").unwrap();
+    denied(session.execute_prepared(&read, &[], None), SQL_QUERIES);
     denied(
-        session.execute_at("invalid", &[], None, &clock),
-        SQL_SESSIONS,
+        session.execute_prepared_at(&read, &[], None, &clock),
+        SQL_QUERIES,
     );
-    denied(session.execute_prepared(&prepared, &[], None), SQL_SESSIONS);
     denied(
-        session.execute_prepared_at(&prepared, &[], None, &clock),
-        SQL_SESSIONS,
+        session.execute("INSERT INTO routed VALUES (1)", &[], None),
+        SQL_DML,
     );
     denied(session.begin_engine(), SQL_SESSIONS);
     denied(session.commit_engine(), SQL_SESSIONS);

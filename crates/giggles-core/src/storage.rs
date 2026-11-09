@@ -14,6 +14,7 @@ mod secondary_index_public;
 mod sequence_counters;
 pub(crate) mod sequences;
 mod v2;
+mod v2_sql;
 pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
 use bincode::Options;
@@ -511,6 +512,8 @@ const TASK_EXECUTORS: &str = "task executors";
 const PROTECTED_OPERATIONS: &str = "protected operations";
 const KERNEL_RECORDS: &str = "kernel records";
 const SQL_SESSIONS: &str = "SQL sessions";
+const SQL_DML: &str = "SQL DML";
+const SQL_QUERIES: &str = "SQL queries";
 const LOGICAL_EXPORT: &str = "logical export";
 const ROLES: &str = "roles";
 #[allow(dead_code)]
@@ -1674,6 +1677,7 @@ fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
 pub struct SqlSession {
     admin: Admin,
     staged: Option<State>,
+    v2_transaction: Option<engine::txn::Transaction>,
     savepoints: Vec<SqlSavepoint>,
     savepoint_budget: u64,
     aborted: bool,
@@ -1696,6 +1700,7 @@ impl Admin {
         SqlSession {
             admin: self.clone(),
             staged: None,
+            v2_transaction: None,
             savepoints: Vec::new(),
             savepoint_budget: SAVEPOINT_BYTES,
             aborted: false,
@@ -1863,7 +1868,7 @@ impl SqlSession {
     }
     /// A gateway parse/bind/authorization failure poisons an explicit transaction.
     pub fn abort(&mut self) {
-        if self.staged.is_some() {
+        if self.in_transaction() {
             self.aborted = true;
         }
     }
@@ -2068,12 +2073,15 @@ impl SqlSession {
         )
     }
     pub fn in_transaction(&self) -> bool {
-        self.staged.is_some()
+        self.staged.is_some() || self.v2_transaction.is_some()
     }
     pub fn is_aborted(&self) -> bool {
         self.aborted
     }
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let mut result = if let Some(s) = &self.staged {
@@ -2244,7 +2252,6 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         // ROLLBACK remains available after any parse/bind/statement/commit error.
         if self.aborted {
@@ -2271,7 +2278,6 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let p = self.prepare(sql)?;
@@ -2284,7 +2290,6 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: &relational::StatementClock,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.guard_clock(clock)?;
         let context = relational::clock::ExecutionClock::new(clock)
@@ -2298,7 +2303,6 @@ impl SqlSession {
         result
     }
     fn guard_clock(&mut self, clock: &relational::StatementClock) -> Result<(), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         // Unavailable instants cannot be validated or establish a transaction pin.
         if clock.unavailable.is_some() {
             return Ok(());
@@ -2306,7 +2310,7 @@ impl SqlSession {
         use relational::SqlError as E;
         let error = if clock.statement_us < clock.transaction_us {
             Some(E::InvalidParameterValue)
-        } else if self.staged.is_some()
+        } else if self.in_transaction()
             && self
                 .transaction_clock_us
                 .is_some_and(|us| us != clock.transaction_us)
@@ -2319,12 +2323,12 @@ impl SqlSession {
             None
         };
         if let Some(error) = error {
-            if self.staged.is_some() {
+            if self.in_transaction() {
                 self.aborted = true;
             }
             return Err(CoreError::Sql(error));
         }
-        if self.staged.is_some() && self.transaction_clock_us.is_none() {
+        if self.in_transaction() && self.transaction_clock_us.is_none() {
             self.transaction_clock_us = Some(clock.transaction_us);
         }
         Ok(())
@@ -2335,7 +2339,6 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         self.execute_bound_engine(p, params, expected_version)
     }
@@ -2348,7 +2351,6 @@ impl SqlSession {
         params: &[relational::Value],
         expected_version: Option<u64>,
     ) -> Result<relational::SqlResult, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_bound_clocked(p, params, expected_version, None)
     }
     fn execute_bound_clocked(
@@ -2358,6 +2360,10 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            return self.execute_v2(&db, p, params, expected_version, clock);
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         if self.aborted && !p.allows_aborted_transaction() {
             return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -2781,6 +2787,7 @@ impl SqlSession {
             })
     }
     pub fn rollback(&mut self) {
+        self.v2_transaction = None;
         if self.staged.take().is_some() {
             self.admin
                 .inner
