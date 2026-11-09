@@ -45,3 +45,7 @@ path = "tests/recovery.rs"
 [[test]]
 name = "relational_process"
 path = "tests/relational_process.rs"
+
+[[test]]
+name = "durable_boundaries"
+path = "tests/durable_boundaries.rs"
