@@ -3,10 +3,12 @@ use super::*;
 mod arithmetic;
 pub(in crate::relational) mod assignment;
 mod binary;
+mod cast;
 mod character;
 mod comparison;
 #[cfg(test)]
 mod cross_binding_tests;
+mod pg18_types;
 pub(super) use comparison::{comparable, compare_cross, cross_compare};
 mod datetime_input;
 mod degree_math;
@@ -34,6 +36,7 @@ mod substring_order;
 mod temporal;
 mod text;
 // Preserve failed routine lookup until argument and source analysis finishes.
+pub(super) const CAST_TYPMOD: &str = "\0cast:typmod";
 const UNDEFINED_ROUTINE_PREFIX: &str = "public.\0";
 const PG_TOAST_ROUTINE_PREFIX: &str = "pg_toast.\0";
 const INVALID_SCHEMA_ROUTINE_PREFIX: &str = "schema.\0";
@@ -117,6 +120,7 @@ enum Node {
     ),
     Param(usize),
     Cast(Box<BoundScalar>),
+    TypmodCast(Box<BoundScalar>, i32),
     SessionCast(
         Box<BoundScalar>,
         Option<crate::relational::clock::ExecutionClock>,
@@ -176,10 +180,11 @@ fn coalesce_hint(
 ) -> Option<DataType> {
     // Retain COALESCE's established first-known-argument parameter inference.
     args.iter()
-        .find_map(|a| match a {
-            Scalar::Cast(_, ty) => Some(ty.clone()),
-            Scalar::Literal(Value::Null | Value::Text(_)) => None,
-            _ => a.bind(resolve, tables, parameters).ok().map(|b| b.ty),
+        .find_map(|a| {
+            cast::explicit_target(a).cloned().or_else(|| match a {
+                Scalar::Literal(Value::Null | Value::Text(_)) => None,
+                _ => a.bind(resolve, tables, parameters).ok().map(|b| b.ty),
+            })
         })
         .and_then(|ty| common_result_type([ty]).ok())
 }
@@ -532,7 +537,7 @@ impl Scalar {
             if casts > 32 {
                 return Err(SqlError::Limit);
             }
-            value = Self::Cast(Box::new(value), cast_type(p)?);
+            value = cast::expression(value, cast_type(p)?);
         }
         Ok(value)
     }
@@ -633,18 +638,18 @@ impl Scalar {
             p.need("as")?;
             let ty = cast_type(p)?;
             p.punct(')')?;
-            return Ok(Self::Cast(Box::new(value), ty));
+            return Ok(cast::expression(value, ty));
         }
         if p.sym('(') {
             let value = Self::parse_expr(p, depth + 1, aggregate_argument)?;
             p.punct(')')?;
             return Ok(value);
         }
-        if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if ["date","time","timetz","timestamp","timestamptz","interval"].contains(&w.as_str()))
-            && (matches!(p.tokens.get(p.at + 1), Some(Token::String(_)))
-                || matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "with" || w == "without"))
-        {
-            let ty = cast_type(p)?;
+        if cast::typed_literal(p) {
+            let (ty, modifier) = cast_type(p)?;
+            if modifier.is_some() {
+                return Err(SqlError::Unsupported);
+            }
             let Expr::Literal(v) = p.expr()? else {
                 return Err(SqlError::Syntax);
             };
@@ -1042,9 +1047,8 @@ impl Scalar {
                     });
                 }
                 let a = a.bind(resolve, tables, parameters)?;
-                if (a.ty == DataType::Bpchar || *ty == DataType::Bpchar)
-                    && !(matches!(a.ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
-                        && matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar))
+                if a.ty == DataType::Bpchar
+                    && !matches!(ty, DataType::Text | DataType::Varchar | DataType::Bpchar)
                 {
                     return Err(SqlError::Unsupported);
                 }
@@ -1091,6 +1095,19 @@ impl Scalar {
             ),
             Self::SubstringOrder(args) => {
                 return Self::bind_substring_order(args, resolve, tables, parameters);
+            }
+            Self::Call(name, args) if name == CAST_TYPMOD => {
+                let [inner, Self::Literal(Value::Int(modifier))] = args.as_slice() else {
+                    return Err(SqlError::Syntax);
+                };
+                let inner = inner.bind(resolve, tables, parameters)?;
+                return Ok(BoundScalar {
+                    ty: inner.ty.clone(),
+                    node: Node::TypmodCast(
+                        Box::new(inner),
+                        i32::try_from(*modifier).map_err(|_| SqlError::Type)?,
+                    ),
+                });
             }
             Self::Call(name, _) if deferred_routine_error(name).is_some() => {
                 return Err(deferred_routine_error(name).unwrap());
@@ -1629,7 +1646,7 @@ impl BoundScalar {
                 *target = clock.cloned();
                 args.iter_mut().for_each(|a| a.attach_clock(clock));
             }
-            Node::Cast(value) => value.attach_clock(clock),
+            Node::Cast(value) | Node::TypmodCast(value, _) => value.attach_clock(clock),
             Node::Call(_, args) => args.iter_mut().for_each(|a| a.attach_clock(clock)),
             _ => {}
         }
@@ -1637,7 +1654,7 @@ impl BoundScalar {
     pub(in crate::relational) fn clock_typmod(&self) -> i32 {
         match &self.node {
             Node::Predicate(_) | Node::Case(..) => -1,
-            Node::Clock(_, precision, _) => *precision,
+            Node::Clock(_, precision, _) | Node::TypmodCast(_, precision) => *precision,
             _ => -1,
         }
     }
@@ -1650,7 +1667,7 @@ impl BoundScalar {
             | Node::Call(name, _)
             | Node::Clock(name, ..)
             | Node::Sequence(name, ..) => Some(name),
-            Node::Cast(a) | Node::SessionCast(a, _) => a.strong_name(),
+            Node::Cast(a) | Node::SessionCast(a, _) | Node::TypmodCast(a, _) => a.strong_name(),
             _ => None,
         }
     }
@@ -1660,6 +1677,7 @@ impl BoundScalar {
             Node::Case(..) => "case",
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
+            Node::TypmodCast(inner, _) => inner.name(),
             Node::Cast(a) | Node::SessionCast(a, _) => {
                 if let Some(name) = a.strong_name() {
                     name
@@ -1780,6 +1798,14 @@ impl BoundScalar {
                 charge(budget, &value)?;
                 Ok(value)
             }
+            // Consumers may relabel varchar as text for overload resolution;
+            // the inner cast retains the type whose modifier is applied.
+            Node::TypmodCast(inner, modifier) => cast::apply(
+                inner.eval(row, params, budget)?,
+                &inner.ty,
+                *modifier,
+                budget,
+            ),
             Node::Cast(a) => {
                 let mut v = a.eval(row, params, budget)?;
                 if a.ty == DataType::Bpchar
@@ -2087,54 +2113,8 @@ fn reserve(budget: &mut usize, bytes: usize) -> R<()> {
     Ok(())
 }
 
-fn cast_type(p: &mut Parser) -> R<DataType> {
-    Ok(match p.name()?.as_str() {
-        "smallint" | "int2" => DataType::SmallInt,
-        "integer" | "int" | "int4" => DataType::Integer,
-        "bigint" | "int8" => DataType::BigInt,
-        "text" => DataType::Text,
-        "boolean" | "bool" => DataType::Boolean,
-        "bytea" => DataType::Bytes,
-        "numeric" | "decimal" => DataType::Numeric,
-        "real" | "float4" => DataType::Real,
-        "float8" => DataType::DoublePrecision,
-        "date" => DataType::Date,
-        "time" => {
-            if p.word("with") {
-                p.need("time")?;
-                p.need("zone")?;
-                DataType::TimeTz
-            } else {
-                if p.word("without") {
-                    p.need("time")?;
-                    p.need("zone")?;
-                }
-                DataType::Time
-            }
-        }
-        "timetz" => DataType::TimeTz,
-        "timestamp" => {
-            if p.word("with") {
-                p.need("time")?;
-                p.need("zone")?;
-                DataType::TimestampTz
-            } else {
-                if p.word("without") {
-                    p.need("time")?;
-                    p.need("zone")?;
-                }
-                DataType::Timestamp
-            }
-        }
-        "timestamptz" => DataType::TimestampTz,
-        "interval" => DataType::Interval,
-
-        "double" => {
-            p.need("precision")?;
-            DataType::DoublePrecision
-        }
-        _ => return Err(SqlError::Unsupported),
-    })
+fn cast_type(p: &mut Parser) -> R<(DataType, Option<i32>)> {
+    cast::target(p)
 }
 fn integer_from_float(value: f64, ty: &DataType) -> R<i64> {
     let exclusive_upper = match ty {
@@ -2447,6 +2427,12 @@ impl Scalar {
             Self::SubstringOrder(args) => {
                 Self::infer_substring_order(args, parameters, resolve, tables)?;
             }
+            Self::Call(n, args) if n == CAST_TYPMOD => {
+                let [inner, Self::Literal(Value::Int(_))] = args.as_slice() else {
+                    return Err(SqlError::Syntax);
+                };
+                inner.infer(expected, parameters, resolve, tables)?;
+            }
             Self::Call(n, args) if deferred_routine_error(n).is_some() => {
                 // Validate ordinary arguments without inventing a signature for
                 // unresolved parameters or binding aggregates as scalar calls.
@@ -2609,12 +2595,11 @@ impl Scalar {
                             "date_trunc"
                                 if args.len() == 3
                                     && i != 1
-                                    && (matches!(
-                                        &args[1],
-                                        Self::Cast(_, DataType::TimestampTz)
-                                    ) || args[1]
-                                        .bind(resolve, tables, parameters)
-                                        .is_ok_and(|a| a.ty == DataType::TimestampTz)) =>
+                                    && (cast::explicit_target(&args[1])
+                                        == Some(&DataType::TimestampTz)
+                                        || args[1]
+                                            .bind(resolve, tables, parameters)
+                                            .is_ok_and(|a| a.ty == DataType::TimestampTz)) =>
                             {
                                 Some(DataType::Text)
                             }

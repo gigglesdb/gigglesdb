@@ -58,25 +58,74 @@ fn bpchar_scalar_consumers_fail_closed_pending_dd68_semantics() {
 }
 
 #[test]
-fn character_casts_are_rejected_not_silently_untyped() {
-    // PG18.6 truncates explicit character casts silently ('abcdef'::varchar(3) = 'abc').
-    // The cast grammar has no varchar/char spelling yet (DD-0068 F19 owns cast typmods),
-    // so every form is rejected (0A000) rather than dropping the typmod or describing
-    // the result as text (25). DD68 follow-up flips these.
+fn character_casts_follow_pg18() {
+    use giggles_core::{
+        SqlSession,
+        relational::{DataType as T, Value},
+    };
+
+    fn check_query(
+        session: &mut SqlSession,
+        failures: &mut Vec<String>,
+        sql: &str,
+        expected_text: &str,
+        expected_type: T,
+        expected_typmod: i32,
+    ) {
+        let prepared = match session.prepare(sql) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                failures.push(format!("{sql}: prepare: {error:?}"));
+                return;
+            }
+        };
+        match session.describe(&prepared) {
+            Ok(description) => {
+                let types: Vec<_> = description
+                    .columns
+                    .iter()
+                    .map(|column| column.data_type.clone())
+                    .collect();
+                if types != [expected_type.clone()] {
+                    failures.push(format!(
+                        "{sql}: types {types:?}, expected [{expected_type:?}]"
+                    ));
+                }
+                if description.typmods != [expected_typmod] {
+                    failures.push(format!(
+                        "{sql}: typmods {:?}, expected [{expected_typmod}]",
+                        description.typmods
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("{sql}: describe: {error:?}")),
+        }
+        match session.execute_prepared(&prepared, &[], None) {
+            Ok(result) => {
+                let rows: Vec<_> = result.rows.iter().map(|row| row.values.clone()).collect();
+                let expected = vec![vec![Value::Text(expected_text.into())]];
+                if rows != expected {
+                    failures.push(format!("{sql}: rows {rows:?}, expected {expected:?}"));
+                }
+            }
+            Err(error) => failures.push(format!("{sql}: execute: {error:?}")),
+        }
+    }
+
+    // PG18.6 explicit character casts (DD-0068 F19): silent truncation, char(n) padding, unbounded varchar/bpchar without a typmod.
     let a = Admin::create(fresh("e2-character-casts"), Limits::default()).unwrap();
     let mut s = a.sql_session();
-    for sql in [
-        "SELECT 'abcdef'::varchar(3)",
-        "SELECT 'abc'::character varying(2)",
-        "SELECT 'abc'::varchar",
-        "SELECT 'abc'::char(3)",
-        "SELECT 'abc'::bpchar",
-        "SELECT CAST('abcdef' AS varchar(3))",
+    let mut failures = Vec::new();
+    for (sql, text, ty, typmod) in [
+        ("SELECT 'abcdef'::varchar(3)", "abc", T::Varchar, 7),
+        ("SELECT 'abc'::character varying(2)", "ab", T::Varchar, 6),
+        ("SELECT 'abc'::varchar", "abc", T::Varchar, -1),
+        ("SELECT 'abc'::char(3)", "abc", T::Bpchar, 7),
+        ("SELECT 'ab'::char(3)", "ab ", T::Bpchar, 7),
+        ("SELECT 'abc'::bpchar", "abc", T::Bpchar, -1),
+        ("SELECT CAST('abcdef' AS varchar(3))", "abc", T::Varchar, 7),
     ] {
-        assert_eq!(
-            s.execute(sql, &[], None).map(|_| ()),
-            Err(CoreError::Sql(SqlError::Unsupported)),
-            "{sql}"
-        );
+        check_query(&mut s, &mut failures, sql, text, ty, typmod);
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

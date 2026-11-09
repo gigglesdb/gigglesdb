@@ -2243,6 +2243,9 @@ impl Query {
                         || scalar(call))
                         && aggregate_filter::decode(condition).is_ok_and(|f| filter(&f))
                 }
+                Scalar::Call(name, args) if name == functions::CAST_TYPMOD => {
+                    args.iter().all(scalar)
+                }
                 Scalar::Call(name, args) => {
                     matches!(
                         name.as_str(),

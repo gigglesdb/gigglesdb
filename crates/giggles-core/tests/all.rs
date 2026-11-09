@@ -112,6 +112,8 @@ mod sql_boolean_expressions;
 mod sql_bytea_input;
 #[path = "sql_bytea_input_error_codes.rs"]
 mod sql_bytea_input_error_codes;
+#[path = "sql_cast_type_names.rs"]
+mod sql_cast_type_names;
 #[path = "sql_character_adversarial.rs"]
 mod sql_character_adversarial;
 #[path = "sql_character_functions.rs"]

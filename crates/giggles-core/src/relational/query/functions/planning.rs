@@ -402,6 +402,12 @@ impl BoundScalar {
                 charge(budget, v)?;
                 Ok(Some(v.clone()))
             }
+            Node::TypmodCast(inner, modifier) => {
+                let Some(value) = inner.plan_constant(budget)? else {
+                    return Ok(None);
+                };
+                cast::apply(value, &inner.ty, *modifier, budget).map(Some)
+            }
             Node::Cast(a) => {
                 let value = a.plan_constant(budget)?;
                 if !immutable_cast(&a.ty, &self.ty) {
@@ -482,6 +488,7 @@ impl BoundScalar {
                         .iter()
                         .any(|ty| matches!(ty, DataType::TimestampTz | DataType::TimeTz))
             }
+            Node::TypmodCast(value, _) => value.constraint_immutable(),
             Node::Cast(value) => {
                 value.constraint_immutable() && immutable_cast(&value.ty, &self.ty)
             }
@@ -505,7 +512,7 @@ impl BoundScalar {
             Node::Literal(_) | Node::Param(_) => true,
             Node::Column(..) => false,
             Node::Clock(..) => true,
-            Node::SessionCast(value, _) => value.insert_input_only(),
+            Node::SessionCast(value, _) | Node::TypmodCast(value, _) => value.insert_input_only(),
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
             Node::Sequence(_, args, _) | Node::ZonedOperator(_, args, _) => {
                 args.iter().all(Self::insert_input_only)
