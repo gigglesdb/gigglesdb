@@ -694,6 +694,7 @@ fn sql_insert_parser_row_cap_1024_and_1025() {
             tokens,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         }
     };
     assert_eq!(

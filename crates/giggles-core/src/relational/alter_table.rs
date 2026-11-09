@@ -42,14 +42,14 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
     let first = raw_name(p)?;
     let (table, resolution_error) = if p.sym('.') {
         let table = raw_name(p)?;
-        let error = if first != "public" {
-            Some(SqlError::UnknownTable)
-        } else {
-            ident::ident(&table).err()
-        };
+        let error = ident::ident(&table).err();
+        p.relations
+            .push(schemas::Reference::read(table.clone(), Some(first)));
         (table, error)
     } else {
         let error = ident::ident(&first).err();
+        p.relations
+            .push(schemas::Reference::read(first.clone(), None));
         (first, error)
     };
     let mut actions = Vec::new();

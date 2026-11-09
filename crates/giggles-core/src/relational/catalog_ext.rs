@@ -15,6 +15,8 @@ pub(crate) struct CatalogExt {
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
     pub(crate) logical_kinds: BTreeMap<u64, LogicalKind>,
+    pub(crate) schemas: BTreeMap<String, schemas::Schema>,
+    pub(crate) table_schemas: BTreeMap<u64, String>,
 }
 impl Default for CatalogExt {
     fn default() -> Self {
@@ -25,6 +27,8 @@ impl Default for CatalogExt {
             sequences: BTreeMap::new(),
             types: BTreeMap::new(),
             logical_kinds: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            table_schemas: BTreeMap::new(),
         }
     }
 }
@@ -35,6 +39,8 @@ impl CatalogExt {
             && self.sequences.is_empty()
             && self.types.is_empty()
             && self.logical_kinds.is_empty()
+            && self.schemas.is_empty()
+            && self.table_schemas.is_empty()
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -212,7 +218,9 @@ impl CatalogExt {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
     fn wire_version(&self) -> u32 {
-        if !self.logical_kinds.is_empty() {
+        if !self.schemas.is_empty() || !self.table_schemas.is_empty() {
+            5
+        } else if !self.logical_kinds.is_empty() {
             4
         } else if self.has_text_kind() {
             3
@@ -230,7 +238,11 @@ impl Serialize for CatalogExt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
-        let mut out = serializer.serialize_tuple(if version == 4 { 6 } else { 5 })?;
+        let mut out = serializer.serialize_tuple(match version {
+            5 => 8,
+            4 => 6,
+            _ => 5,
+        })?;
         out.serialize_element(&version)?;
         if version >= 3 {
             out.serialize_element(&self.columns)?;
@@ -263,8 +275,12 @@ impl Serialize for CatalogExt {
         }
         out.serialize_element(&self.sequences)?;
         out.serialize_element(&self.types)?;
-        if version == 4 {
+        if version >= 4 {
             out.serialize_element(&self.logical_kinds)?;
+        }
+        if version == 5 {
+            out.serialize_element(&self.schemas)?;
+            out.serialize_element(&self.table_schemas)?;
         }
         out.end()
     }
@@ -317,6 +333,46 @@ impl<'de> Deserialize<'de> for CatalogExt {
         ) -> Result<BTreeMap<u64, LogicalKind>, D::Error> {
             bounded_map::<D, LogicalKind, MAX_EXT_COLUMNS>(d)
         }
+        #[derive(Deserialize)]
+        struct Schemas(#[serde(deserialize_with = "schema_map")] BTreeMap<String, schemas::Schema>);
+        fn schema_map<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<String, schemas::Schema>, D::Error> {
+            struct SV;
+            impl<'de> Visitor<'de> for SV {
+                type Value = BTreeMap<String, schemas::Schema>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("bounded schemas")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                    if a.size_hint().is_some_and(|n| n > MAX_TABLES) {
+                        return Err(de::Error::custom("too many schemas"));
+                    }
+                    let mut out = BTreeMap::new();
+                    #[derive(Deserialize)]
+                    struct Name(#[serde(deserialize_with = "name")] String);
+                    while let Some(key) = a.next_key::<Name>()? {
+                        if out.len() >= MAX_TABLES || out.insert(key.0, a.next_value()?).is_some() {
+                            return Err(de::Error::custom("invalid schemas"));
+                        }
+                    }
+                    Ok(out)
+                }
+            }
+            d.deserialize_map(SV)
+        }
+        #[derive(Deserialize)]
+        struct Membership(#[serde(deserialize_with = "membership_map")] BTreeMap<u64, String>);
+        fn membership_map<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<BTreeMap<u64, String>, D::Error> {
+            #[derive(Deserialize)]
+            struct Name(#[serde(deserialize_with = "name")] String);
+            Ok(bounded_map::<D, Name, MAX_TABLES>(d)?
+                .into_iter()
+                .map(|(id, name)| (id, name.0))
+                .collect())
+        }
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = CatalogExt;
@@ -331,7 +387,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=4) {
+                if !matches!(ext_version, 1..=5) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
                 let columns = if ext_version >= 3 {
@@ -358,8 +414,18 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     constraints,
                     sequences: next!(Sequences).0,
                     types: next!(Types).0,
-                    logical_kinds: if ext_version == 4 {
+                    logical_kinds: if ext_version >= 4 {
                         next!(LogicalKinds).0
+                    } else {
+                        BTreeMap::new()
+                    },
+                    schemas: if ext_version == 5 {
+                        next!(Schemas).0
+                    } else {
+                        BTreeMap::new()
+                    },
+                    table_schemas: if ext_version == 5 {
+                        next!(Membership).0
                     } else {
                         BTreeMap::new()
                     },
@@ -370,7 +436,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                 Ok(out)
             }
         }
-        d.deserialize_tuple(6, V)
+        d.deserialize_tuple(8, V)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,7 +524,7 @@ where
 fn string<'de, D: serde::Deserializer<'de>, const N: usize>(d: D) -> Result<String, D::Error> {
     String::from_utf8(bounded_vec::<D, u8, N>(d)?).map_err(de::Error::custom)
 }
-fn name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+pub(super) fn name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string::<D, 63>(d)
 }
 fn expression<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -691,9 +757,10 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=4) || !ext.types.is_empty() {
+        if !matches!(ext.ext_version, 1..=5) || !ext.types.is_empty() {
             return Err(SqlError::Unsupported);
         }
+        self.validate_schemas(ext, next_id, excluded_table)?;
         if ext.ext_version != ext.wire_version() {
             return Err(SqlError::Type);
         }
@@ -725,7 +792,12 @@ impl Relational {
             .filter(|t| Some(t.id) != excluded_table)
             .flat_map(|t| t.columns.iter().map(move |c| (c.id, (t.id, c))))
             .collect();
-        let mut used: BTreeSet<_> = tables.keys().chain(columns.keys()).copied().collect();
+        let mut used: BTreeSet<_> = tables
+            .keys()
+            .chain(columns.keys())
+            .copied()
+            .chain(ext.schemas.values().map(|s| s.id))
+            .collect();
         for (id, (_, column)) in &columns {
             let expected = match column.data_type {
                 DataType::Varchar => Some(TextKind::Varchar),

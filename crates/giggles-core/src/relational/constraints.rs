@@ -68,14 +68,14 @@ pub(super) fn parse_foreign(
     let first = alter_table::raw_name(p)?;
     let (parent, mut resolution_error) = if p.sym('.') {
         let parent = alter_table::raw_name(p)?;
-        let error = if first != "public" {
-            Some(SqlError::UnknownTable)
-        } else {
-            ident::ident(&parent).err()
-        };
+        let error = ident::ident(&parent).err();
+        p.relations
+            .push(schemas::Reference::read(parent.clone(), Some(first)));
         (parent, error)
     } else {
         let error = ident::ident(&first).err();
+        p.relations
+            .push(schemas::Reference::read(first.clone(), None));
         (first, error)
     };
     let references = if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
@@ -417,7 +417,7 @@ pub(super) fn install(
         .entry(table.id)
         .or_default()
         .push(Constraint { id, name, kind });
-    if state.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { deferral, .. } if deferral != Deferral::NotDeferrable)) { state.ext.ext_version = 2; }
+    Relational::normalize_ext(&mut state.ext);
     Ok(())
 }
 fn validate_kind(
@@ -497,7 +497,7 @@ pub(super) fn drop_named(
     if cs.is_empty() {
         state.ext.constraints.remove(&table.id);
     }
-    state.ext.ext_version = if state.ext.constraints.values().flatten().any(|c| matches!(c.kind,ConstraintKind::ForeignKey {deferral,..} if deferral != Deferral::NotDeferrable)) {2} else {1};
+    Relational::normalize_ext(&mut state.ext);
     Ok(())
 }
 

@@ -161,3 +161,44 @@ async fn mixed_catalog_checks_table_privileges_and_counts_outer_rows() {
 fn sqlstate(error: tokio_postgres::Error) -> String {
     error.code().unwrap().code().to_owned()
 }
+
+#[tokio::test]
+async fn mixed_catalog_respects_user_schema_and_search_path() {
+    let f = Fixture::new().await;
+    let c = f.client("owner").await;
+    for sql in [
+        "CREATE SCHEMA app_s",
+        "CREATE TABLE app_s.t(id integer PRIMARY KEY)",
+        "INSERT INTO app_s.t VALUES(7)",
+    ] {
+        c.batch_execute(sql).await.unwrap();
+    }
+    let qualified = "SELECT t.id FROM app_s.t t JOIN pg_catalog.pg_class c ON c.relname='t'";
+    assert_eq!(
+        c.query(qualified, &[]).await.unwrap()[0].get::<_, i32>(0),
+        7
+    );
+    c.simple_query(qualified).await.unwrap();
+    assert!(
+        c.query(
+            "SELECT t.id FROM public.t t JOIN pg_catalog.pg_class c ON c.relname='t'",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    let unqualified = "SELECT t.id FROM t JOIN pg_catalog.pg_class c ON c.relname='t'";
+    assert!(c.query(unqualified, &[]).await.is_err());
+    c.batch_execute("SET search_path TO app_s,public")
+        .await
+        .unwrap();
+    assert_eq!(
+        c.query(unqualified, &[]).await.unwrap()[0].get::<_, i32>(0),
+        7
+    );
+    c.simple_query(unqualified).await.unwrap();
+    c.batch_execute("SET search_path TO public").await.unwrap();
+    assert!(c.query(unqualified, &[]).await.is_err());
+    drop(c);
+    f.stop().await;
+}

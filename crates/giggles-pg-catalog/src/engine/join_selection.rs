@@ -212,7 +212,7 @@ pub(super) fn equality_key(on: &E, width: usize, rwidth: usize) -> Option<(usize
 
 fn nested_queries(expression: &mut E, parameters: &[PgType]) {
     walk(expression, &mut |e| match &mut e.kind {
-        K::Subquery(q) | K::ArrayQuery(q) | K::InQuery(_, q, _) => place(q, parameters),
+        K::Subquery(q) | K::Exists(q, _) | K::ArrayQuery(q) | K::InQuery(_, q, _) => place(q, parameters),
         _ => {}
     });
 }

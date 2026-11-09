@@ -543,6 +543,10 @@ pub(crate) fn execute(
     }
 }
 
+fn quote_relation(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 // Parse the bounded pg_dump lock surface without granting admin authority.
 pub(crate) fn access_share_tables(sql: &str) -> Result<Option<Vec<String>>, &'static str> {
     let tokens = match lex(sql) {
@@ -560,10 +564,9 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<Vec<String>>, &'st
         let mut name = p.ident()?;
         if p.tokens.get(p.pos) == Some(&Token::Dot) {
             p.pos += 1;
-            if name != "public" {
-                return Err("3F000");
-            }
-            name = p.ident()?;
+            name = format!("{}.{}", quote_relation(&name), quote_relation(&p.ident()?));
+        } else {
+            name = quote_relation(&name);
         }
         tables.push(name);
         if !p.comma() {
@@ -591,13 +594,12 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static s
         return Ok(None);
     }
     let mut table = p.ident()?;
-    if p.tokens.get(p.pos) == Some(&Token::Dot) {
+    table = if p.tokens.get(p.pos) == Some(&Token::Dot) {
         p.pos += 1;
-        if table != "public" {
-            return Err("3F000");
-        }
-        table = p.ident()?;
-    }
+        format!("{}.{}", quote_relation(&table), quote_relation(&p.ident()?))
+    } else {
+        quote_relation(&table)
+    };
     let mut columns = Vec::new();
     if p.tokens.get(p.pos) == Some(&Token::LParen) {
         p.pos += 1;
@@ -623,7 +625,7 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static s
             .collect::<Vec<_>>()
             .join(",")
     };
-    Ok(Some(format!("SELECT {projection} FROM {}", quoted(&table))))
+    Ok(Some(format!("SELECT {projection} FROM {table}")))
 }
 
 #[cfg(test)]

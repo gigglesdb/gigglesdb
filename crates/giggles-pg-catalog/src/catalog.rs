@@ -948,6 +948,26 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     if snapshot.tables.len() > 128 || snapshot.roles.len() > MAX_ROWS - PREDEFINED_ROLES.len() {
         return Err(Error::Limit);
     }
+    if snapshot.schemas.len() > 128 || snapshot.table_schemas.len() > 128 {
+        return Err(Error::Limit);
+    }
+    let mut schema_oids = BTreeSet::new();
+    for (name, (oid, owner)) in &snapshot.schemas {
+        if name.is_empty()
+            || name.len() > 63
+            || name == "public"
+            || *oid < 65536
+            || !schema_oids.insert(*oid)
+            || !snapshot.roles.iter().any(|r| r.oid == *owner)
+        {
+            return Err(Error::InvalidSnapshot);
+        }
+    }
+    if snapshot.table_schemas.iter().any(|(id, name)| {
+        !snapshot.tables.iter().any(|t| t.id == *id) || !snapshot.schemas.contains_key(name)
+    }) {
+        return Err(Error::InvalidSnapshot);
+    }
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut input_bytes = 0usize;
@@ -981,7 +1001,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         {
             return Err(Error::InvalidSnapshot);
         }
-        table_oid(t.id)?;
+        if schema_oids.contains(&table_oid(t.id)?) {
+            return Err(Error::InvalidSnapshot);
+        }
         let mut cn = BTreeSet::new();
         let mut ci = BTreeSet::new();
         let mut pk = BTreeSet::new();
@@ -1024,7 +1046,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         {
             return Err(Error::InvalidSnapshot);
         }
-        table_oid(i.id)?;
+        if schema_oids.contains(&table_oid(i.id)?) {
+            return Err(Error::InvalidSnapshot);
+        }
         input_bytes += i.name.len();
         if input_bytes > 65536 {
             return Err(Error::Limit);
@@ -1349,9 +1373,17 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         row[21] = I(receive);
         add("pg_type", row);
     }
+    for (name, (oid, owner)) in &snapshot.schemas {
+        add(
+            "pg_namespace",
+            vec![I(i64::from(*oid)), s(name), I(i64::from(*owner)), N, N],
+        );
+    }
     let mut ordered_tables = snapshot.tables.iter().collect::<Vec<_>>();
     ordered_tables.sort_by_key(|t| t.id);
     for t in ordered_tables {
+        let (schema, namespace) = snapshot.table_schema(t.id);
+        let namespace = i64::from(namespace);
         let oid = table_oid(t.id)? as i64;
         let has_pk = !t.primary_key.is_empty();
         let owner = i64::from(*snapshot.table_owners.get(&t.id).unwrap_or(&10));
@@ -1360,7 +1392,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             vec![
                 I(oid),
                 s(&t.name),
-                I(2200),
+                I(namespace),
                 s("r"),
                 I(owner),
                 I(t.columns.len() as i64),
@@ -1378,7 +1410,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         );
         add(
             "pg_type",
-            composite_row((oid + 3) as u32, &t.name, 2200, oid, owner),
+            composite_row((oid + 3) as u32, &t.name, namespace, oid, owner),
         );
         for (i, c) in t.columns.iter().enumerate() {
             let (ty, _, len, _) = scalar(c.data_type);
@@ -1412,11 +1444,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             add(
                 "pg_indexes",
                 vec![
-                    s("public"),
+                    s(schema),
                     s(&t.name),
                     s(n),
                     N,
-                    s(&index_definition(t, n, &t.primary_key, true)),
+                    s(&index_definition(schema, t, n, &t.primary_key, true)),
                 ],
             );
             add(
@@ -1424,7 +1456,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 vec![
                     I(oid + 1),
                     s(n),
-                    I(2200),
+                    I(namespace),
                     s("i"),
                     I(owner),
                     I(t.primary_key.len() as i64),
@@ -1496,7 +1528,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 vec![
                     I(oid + 2),
                     s(n),
-                    I(2200),
+                    I(namespace),
                     s("p"),
                     I(oid),
                     I(oid + 1),
@@ -1536,7 +1568,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 vec![
                     I(index_oid),
                     s(n),
-                    I(2200),
+                    I(namespace),
                     s("i"),
                     I(owner),
                     I(keys.len() as i64),
@@ -1606,11 +1638,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             add(
                 "pg_indexes",
                 vec![
-                    s("public"),
+                    s(schema),
                     s(&t.name),
                     s(n),
                     N,
-                    s(&index_definition(t, n, &keys, index.unique)),
+                    s(&index_definition(schema, t, n, &keys, index.unique)),
                 ],
             );
         }
@@ -1865,11 +1897,18 @@ pub(crate) fn quote_identifier(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
-fn index_definition(t: &TableDef, name: &str, keys: &[usize], unique: bool) -> String {
+fn index_definition(
+    schema: &str,
+    t: &TableDef,
+    name: &str,
+    keys: &[usize],
+    unique: bool,
+) -> String {
     format!(
-        "CREATE {}INDEX {} ON public.{} USING btree ({})",
+        "CREATE {}INDEX {} ON {}.{} USING btree ({})",
         if unique { "UNIQUE " } else { "" },
         quote_identifier(name),
+        quote_identifier(schema),
         quote_identifier(&t.name),
         keys.iter()
             .map(|k| quote_identifier(&t.columns[*k].name))
@@ -2073,3 +2112,71 @@ const REQUIRES_QUOTES: &[&str] = &[
     "xmlserialize",
     "xmltable",
 ];
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn user_schema_namespaces_include_primary_index_and_information_schema() {
+        let snapshot = CatalogSnapshot {
+            schemas: BTreeMap::from([("app".into(), (70000, 10))]),
+            table_schemas: BTreeMap::from([(1, "app".into())]),
+            tables: vec![TableDef {
+                id: 1,
+                name: "t".into(),
+                columns: vec![ColumnDef {
+                    id: 2,
+                    name: "id".into(),
+                    data_type: ScalarType::Integer,
+                    not_null: true,
+                }],
+                primary_key: vec![0],
+            }],
+            ..Default::default()
+        };
+        let catalogs = build(&snapshot).unwrap();
+        assert!(
+            catalogs["pg_namespace"]
+                .rows
+                .iter()
+                .any(|r| r[0] == I(70000) && r[1] == s("app"))
+        );
+        for name in ["t", "t_pkey"] {
+            assert!(
+                catalogs["pg_class"]
+                    .rows
+                    .iter()
+                    .any(|r| r[1] == s(name) && r[2] == I(70000))
+            );
+        }
+        assert!(
+            catalogs["pg_constraint"]
+                .rows
+                .iter()
+                .any(|r| r[1] == s("t_pkey") && r[2] == I(70000))
+        );
+        assert!(
+            catalogs["tables"]
+                .rows
+                .iter()
+                .any(|r| r[1] == s("app") && r[2] == s("t"))
+        );
+        assert!(
+            catalogs["columns"]
+                .rows
+                .iter()
+                .any(|r| r[1] == s("app") && r[2] == s("t"))
+        );
+    }
+    #[test]
+    fn exists_constant_projection_is_correlated_and_collects_parameters() {
+        let snapshot = CatalogSnapshot::default();
+        for (name, expected) in [("pg_class", true), ("absent", false)] {
+            let plan = plan("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname=$1)").unwrap().unwrap();
+            assert_eq!(execute(&plan, &snapshot, &[s(name)]).unwrap().rows, vec![vec![B(expected)]]);
+        }
+        let plan = plan("SELECT EXISTS(SELECT 1 FROM pg_class i WHERE i.oid=c.oid), NOT EXISTS(SELECT 1 FROM pg_class i WHERE i.oid=c.oid) FROM pg_class c WHERE c.relname='pg_class'").unwrap().unwrap();
+        assert_eq!(execute(&plan, &snapshot, &[]).unwrap().rows, vec![vec![B(true), B(false)]]);
+    }
+
+}

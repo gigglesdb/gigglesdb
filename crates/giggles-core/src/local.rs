@@ -75,6 +75,7 @@ pub fn failure(e: CoreError) -> Reply {
         CoreError::Fenced => 15,
         CoreError::Limit => 16,
         CoreError::Cancelled => 17,
+        CoreError::DuplicateSchema => 18,
         CoreError::Sql(e) => {
             200 + match e {
                 relational::SqlError::Unsupported => 0,

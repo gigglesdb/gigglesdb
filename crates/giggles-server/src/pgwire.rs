@@ -641,9 +641,9 @@ fn catalog_plan(
     }
     let planned = match giggles_pg_catalog::plan_gateway(sql) {
         Err(giggles_pg_catalog::Error::MixedRelations) => {
-            let (_, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
-            let snapshot = catalog_wire::snapshot(session, tables, indexes, typmods);
-            let relations = catalog_wire::application_schemas(&snapshot);
+            let (epoch, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
+            let snapshot = catalog_wire::snapshot(session, epoch, tables, indexes, typmods)?;
+            let relations = catalog_wire::application_schemas(session, &snapshot);
             giggles_pg_catalog::plan_gateway_with_relations(sql, &relations)
         }
         other => other,
@@ -927,6 +927,7 @@ impl State {
         // Settings also change through set_config and transaction recovery. Keep
         // the execution clock's zone aligned on every dispatch exit, including errors.
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         let result = self.handle_inner(tag, b, session, out, received);
         if !session.in_transaction() {
@@ -934,6 +935,7 @@ impl State {
                 .transaction_end(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
     }
@@ -1449,7 +1451,7 @@ impl State {
                             &catalog_wire::with_application_rows(
                                 session,
                                 plan,
-                                catalog_wire::snapshot(session, tables, indexes, typmods),
+                                catalog_wire::snapshot(session, current, tables, indexes, typmods)?,
                             )?,
                             &p.catalog_params,
                         )
@@ -1804,6 +1806,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     state.settings.defaults = startup_settings.clone();
     state.settings.current = startup_settings;
     session.set_time_zone(&state.settings.current.timezone);
+    session.set_search_path(&state.settings.current.search_path);
     session.set_extra_float_digits(state.settings.current.extra_float_digits);
     let mut admin_sync = false;
     loop {
@@ -1866,6 +1869,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                         session.sql.rollback();
                         state.settings.transaction(true, false, "ROLLBACK");
                         session.set_time_zone(&state.settings.current.timezone);
+                        session.set_search_path(&state.settings.current.search_path);
                         session.set_extra_float_digits(state.settings.current.extra_float_digits);
                         state.implicit = false;
                         state.cursors.transaction_end("ROLLBACK");
@@ -1925,6 +1929,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             session.sql.rollback();
                             state.settings.transaction(true, false, "ROLLBACK");
                             session.set_time_zone(&state.settings.current.timezone);
+                            session.set_search_path(&state.settings.current.search_path);
                             session
                                 .set_extra_float_digits(state.settings.current.extra_float_digits);
                             state.implicit = false;

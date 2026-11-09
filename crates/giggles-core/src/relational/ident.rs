@@ -61,14 +61,18 @@ impl Parser {
     }
     fn table_name_with_schema_error(&mut self, schema_error: SqlError) -> R<String> {
         let first = self.raw_name()?;
-        if !self.sym('.') {
+        let (schema, name) = if self.sym('.') {
+            (Some(first), self.name()?)
+        } else {
             ident(&first)?;
-            return Ok(first);
-        }
-        if first != "public" {
-            return Err(schema_error);
-        }
-        self.name()
+            (None, first)
+        };
+        self.relations.push(super::schemas::Reference {
+            name: name.clone(),
+            schema,
+            create: schema_error == SqlError::InvalidSchema,
+        });
+        Ok(name)
     }
     /// Resolve column, relation.column, or public.relation.column.
     pub(super) fn qualified_name(&mut self) -> R<(Option<String>, String)> {
@@ -83,9 +87,8 @@ impl Parser {
             ident(&second)?;
             return Ok((Some(first), second));
         }
-        if first != "public" {
-            return Err(SqlError::UnknownTable);
-        }
+        self.relations
+            .push(super::schemas::Reference::read(second.clone(), Some(first)));
         ident(&second)?;
         Ok((Some(second), self.name()?))
     }

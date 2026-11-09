@@ -52,7 +52,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
             .contains("noncanonical")
     );
     let mut unknown = bytes(V1);
-    unknown[..4].copy_from_slice(&5u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&6u32.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&unknown)
@@ -512,4 +512,60 @@ impl Relational {
     pub(crate) fn assert_legacy_format_for_catalog_ext_test(&self) {
         assert_eq!(self.format, 1);
     }
+}
+
+#[test]
+fn catalog_ext_v5_schema_encoding_is_frozen() {
+    let mut ext = CatalogExt {
+        ext_version: 5,
+        ..Default::default()
+    };
+    ext.schemas.insert(
+        "a".into(),
+        schemas::Schema {
+            id: 1,
+            owner: "giggles".into(),
+        },
+    );
+    ext.table_schemas.insert(2, "a".into());
+    let golden = "0000000500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000016100000000000000010000000000000007676967676c657300000000000000010000000000000002000000000000000161";
+    let bytes: Vec<_> = (0..golden.len())
+        .step_by(2)
+        .map(|n| u8::from_str_radix(&golden[n..n + 2], 16).unwrap())
+        .collect();
+    assert_eq!(codec().serialize(&ext).unwrap(), bytes);
+    assert_eq!(codec().deserialize::<CatalogExt>(&bytes).unwrap(), ext);
+    for n in 0..bytes.len() {
+        assert!(codec().deserialize::<CatalogExt>(&bytes[..n]).is_err());
+    }
+}
+
+#[test]
+fn catalog_ext_v5_preserves_the_complete_v4_prefix() {
+    let mut ext = CatalogExt::default();
+    ext.logical_kinds.insert(7, catalog_ext::LogicalKind::Uuid);
+    Relational::normalize_ext(&mut ext);
+    assert_eq!(ext.ext_version, 4);
+    let v4 = codec().serialize(&ext).unwrap();
+    let decoded = codec().deserialize::<CatalogExt>(&v4).unwrap();
+    assert!(decoded.schemas.is_empty() && decoded.table_schemas.is_empty());
+    assert_eq!(decoded, ext);
+    ext.schemas.insert(
+        "typed".into(),
+        schemas::Schema {
+            id: 1,
+            owner: "giggles".into(),
+        },
+    );
+    ext.table_schemas.insert(2, "typed".into());
+    Relational::normalize_ext(&mut ext);
+    assert_eq!(ext.ext_version, 5);
+    let v5 = codec().serialize(&ext).unwrap();
+    assert_eq!(&v5[4..v4.len()], &v4[4..]);
+    assert_eq!(codec().deserialize::<CatalogExt>(&v5).unwrap(), ext);
+    ext.schemas.clear();
+    ext.table_schemas.clear();
+    Relational::normalize_ext(&mut ext);
+    assert_eq!(ext.ext_version, 4);
+    assert_eq!(codec().serialize(&ext).unwrap(), v4);
 }

@@ -104,6 +104,8 @@ pub struct CatalogSnapshot {
     /// Freshly authorized application rows, supplied by the hosting session.
     pub user_relations: std::collections::BTreeMap<String, ResultSet>,
     pub tables: Vec<TableDef>,
+    pub schemas: std::collections::BTreeMap<String, (u32, u32)>,
+    pub table_schemas: std::collections::BTreeMap<u64, String>,
     pub indexes: Vec<IndexDef>,
     pub user: String,
     pub database: String,
@@ -117,11 +119,21 @@ pub struct CatalogSnapshot {
     /// Stable column ID to PostgreSQL typmod; omitted entries mean -1.
     pub column_typmods: std::collections::BTreeMap<u64, i32>,
 }
+impl CatalogSnapshot {
+    pub fn table_schema(&self, id: u64) -> (&str, u32) {
+        self.table_schemas
+            .get(&id)
+            .and_then(|name| self.schemas.get(name).map(|(oid, _)| (name.as_str(), *oid)))
+            .unwrap_or(("public", 2200))
+    }
+}
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
             user_relations: Default::default(),
             tables: Vec::new(),
+            schemas: Default::default(),
+            table_schemas: Default::default(),
             indexes: Vec::new(),
             user: "giggles".into(),
             database: "giggles".into(),

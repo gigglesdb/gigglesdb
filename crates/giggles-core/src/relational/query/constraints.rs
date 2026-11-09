@@ -209,6 +209,7 @@ fn expression(tokens: Vec<Token>) -> R<Filter> {
         tokens,
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let filter = Filter::parse(&mut p, 0, 0)?;
     if p.at != p.tokens.len() || !p.params.is_empty() {
@@ -240,6 +241,7 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
         tokens,
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let filter = Filter::parse(&mut p, 0, 0)?;
     if p.at != p.tokens.len() || !p.params.is_empty() {

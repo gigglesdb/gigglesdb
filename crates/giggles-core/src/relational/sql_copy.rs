@@ -10,6 +10,7 @@ pub enum CopyFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copy {
     pub table: String,
+    relation: schemas::Reference,
     pub columns: Vec<String>,
     pub format: CopyFormat,
     pub delimiter: u8,
@@ -137,6 +138,7 @@ impl Copy {
             tokens: lex(&sql[..end])?,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         p.need("copy")?;
         p.table_name().map(Some)
@@ -146,6 +148,7 @@ impl Copy {
             tokens: lex(sql)?,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         p.need("copy")?;
         if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
@@ -168,6 +171,7 @@ impl Copy {
             return Err(SqlError::Unsupported);
         }
         let mut copy = Self {
+            relation: p.relations[0].clone(),
             table,
             columns,
             format: CopyFormat::Text,
@@ -281,6 +285,9 @@ impl Copy {
             transaction: None,
             params: 0,
             parameter_types: vec![],
+            relations: vec![self.relation.clone()],
+            search_path: vec!["public".into()],
+            schema_user: "giggles".into(),
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 self.table.clone(),
                 self.columns.clone(),

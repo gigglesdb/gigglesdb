@@ -355,9 +355,11 @@ fn parse_source(p: &mut Parser) -> R<query::Query> {
         tokens,
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let source = query::Query::parse_insert_source(&mut parser)?;
     p.params.extend(parser.params);
+    p.relations.extend(parser.relations);
     p.at = end;
     Ok(source)
 }

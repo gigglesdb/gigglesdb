@@ -45,15 +45,42 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
 )]
 pub(crate) fn snapshot(
     session: &crate::Session,
+    epoch: u64,
     tables: Vec<giggles_core::relational::TableDef>,
     indexes: Vec<giggles_core::IndexInfo>,
     column_typmods: std::collections::BTreeMap<u64, i32>,
-) -> giggles_pg_catalog::CatalogSnapshot {
+) -> Result<giggles_pg_catalog::CatalogSnapshot> {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     let (roles, table_owners) = catalog_roles(session, &tables);
-    giggles_pg_catalog::CatalogSnapshot {
+    let metadata = session
+        .service.admin
+        .catalog_schema_metadata()
+        .map_err(|e| crate::service::sqlstate(&e))?;
+    if metadata.epoch != epoch {
+        return Err("40001");
+    }
+    let schemas = metadata
+        .schemas
+        .into_iter()
+        .map(|(name, (id, owner))| {
+            let oid = u32::try_from(id)
+                .ok()
+                .and_then(|id| id.checked_mul(4))
+                .and_then(|id| id.checked_add(65536))
+                .ok_or("54000")?;
+            let owner = roles.iter().find(|r| r.name == owner).map_or(10, |r| r.oid);
+            Ok((name, (oid, owner)))
+        })
+        .collect::<Result<_>>()?;
+    Ok(giggles_pg_catalog::CatalogSnapshot {
+        schemas,
+        table_schemas: metadata
+            .tables
+            .into_iter()
+            .filter(|(id, _)| visible.contains(id))
+            .collect(),
         roles,
         table_owners,
         user: match &session.role {
@@ -117,11 +144,12 @@ pub(crate) fn snapshot(
             .collect(),
         // Forward-compatible with CatalogSnapshot fields added by giggles-pg-catalog (track G).
         ..giggles_pg_catalog::CatalogSnapshot::default()
-    }
+    })
 }
 
 /// Only the finite catalog scalar types can enter its evaluator.
 pub(crate) fn application_schemas(
+    session: &crate::Session,
     snapshot: &giggles_pg_catalog::CatalogSnapshot,
 ) -> std::collections::BTreeMap<String, Vec<Field>> {
     use giggles_pg_catalog::ScalarType as S;
@@ -157,8 +185,15 @@ pub(crate) fn application_schemas(
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some((table.name.clone(), fields))
+            // NUL-delimited keys cannot collide with legal SQL identifiers.
+            let (schema, _) = snapshot.table_schema(table.id);
+            let mut entries = vec![(format!("\0{schema}\0{}", table.name), fields.clone())];
+            if session.sql.schema_in_search_path(schema) {
+                entries.push((table.name.clone(), fields));
+            }
+            Some(entries)
         })
+        .flatten()
         .collect()
 }
 
@@ -171,9 +206,15 @@ pub(crate) fn with_application_rows(
     let mut bytes = 0usize;
     for (name, fields) in plan.user_relations() {
         // Identifiers came from the binder; quote them again for the core parser.
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let target = if let Some(qualified) = name.strip_prefix('\0') {
+            let (schema, table) = qualified.split_once('\0').ok_or("XX000")?;
+            format!("{}.{}", quote(schema), quote(table))
+        } else {
+            quote(name)
+        };
         let sql = format!(
-            "SELECT * FROM public.\"{}\" LIMIT {}",
-            name.replace('"', "\"\""),
+            "SELECT * FROM {target} LIMIT {}",
             giggles_pg_catalog::MAX_ROWS + 1
         );
         let result = session

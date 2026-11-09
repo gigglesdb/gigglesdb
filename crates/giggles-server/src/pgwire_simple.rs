@@ -187,9 +187,11 @@ impl State {
         // A multi-statement Query needs settings changes before its next SQL
         // statement, rather than only at the enclosing protocol-frame boundary.
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
         session.set_time_zone(&self.settings.current.timezone);
+        session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
     }
@@ -334,13 +336,13 @@ impl State {
         } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
             self.diagnostic.phase = "catalog execution";
             self.settings.queried = session.in_transaction();
-            let (_, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
+            let (epoch, tables, indexes, typmods) = core(session.catalog_snapshot_with_typmods())?;
             let result = catalog_wire::execute(
                 &plan,
                 &catalog_wire::with_application_rows(
                     session,
                     &plan,
-                    catalog_wire::snapshot(session, tables, indexes, typmods),
+                    catalog_wire::snapshot(session, epoch, tables, indexes, typmods)?,
                 )?,
                 &[],
             )

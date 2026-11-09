@@ -53,6 +53,8 @@ pub enum CoreError {
     Limit,
     Policy(Error),
     Sql(relational::SqlError),
+    /// Schema DDL error outside the frozen, persisted scalar-error enum.
+    DuplicateSchema,
 }
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1684,6 +1686,8 @@ pub struct SqlSession {
     transaction_id: Option<u128>,
     transaction_clock_us: Option<i64>,
     extra_float_digits: i32,
+    search_path: Vec<String>,
+    schema_user: String,
     authority_managed: bool,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
@@ -1707,6 +1711,8 @@ impl Admin {
             transaction_id: None,
             transaction_clock_us: None,
             extra_float_digits: 1,
+            search_path: vec!["public".into()],
+            schema_user: "giggles".into(),
             authority_managed: false,
             staged_revision: 0,
             sequence_values: Default::default(),
@@ -1729,6 +1735,9 @@ impl Admin {
             Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()))
         })
     }
+    pub fn catalog_schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
+        self.inner.inspect(|s| Ok(s.sql.schema_metadata()))
+    }
     pub fn catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
         self.inner
             .inspect(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
@@ -1748,6 +1757,41 @@ impl Admin {
     }
 }
 impl SqlSession {
+    pub fn schema_in_search_path(&self, schema: &str) -> bool {
+        self.search_path.iter().any(|s| s == schema)
+    }
+    pub fn set_search_path(&mut self, path: &str, user: &str) {
+        self.schema_user = user.into();
+        self.search_path = relational::schema_search_path(path, user);
+    }
+    pub fn schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
+        let read = |s: &State| Ok(s.sql.schema_metadata());
+        match &self.staged {
+            Some(s) => read(s),
+            None => self.admin.inner.inspect(read),
+        }
+    }
+    pub fn relation_schema(&self, name: &str) -> Result<String, CoreError> {
+        let read = |s: &State| {
+            Ok(s.sql
+                .tables
+                .get(name)
+                .map_or("public", |t| s.sql.table_schema(t.id))
+                .to_owned())
+        };
+        match &self.staged {
+            Some(s) => read(s),
+            None => self.admin.inner.inspect(read),
+        }
+    }
+    pub fn creation_schema(&self, p: &relational::Prepared) -> Result<String, CoreError> {
+        let read = |s: &State| p.creation_schema(&s.sql).map_err(CoreError::Sql);
+        match &self.staged {
+            Some(s) => read(s),
+            None => self.admin.inner.inspect(read),
+        }
+    }
+
     /// Mark publications whose creator authority is maintained by the caller.
     /// Dropped names lose their authority unless the same managed publication
     /// creates a replacement whose authority the caller has installed.
@@ -2101,6 +2145,7 @@ impl SqlSession {
             })
         };
         if let Ok(p) = &mut result {
+            p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             p.transaction = self.transaction_id;
         }
         if result.is_err() && self.staged.is_some() {
@@ -2120,12 +2165,20 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             let copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
-            let prepare = |s: &State| copy.prepared(&s.sql, s.view.domain).map_err(CoreError::Sql);
+            let prepare = |s: &State| {
+                let mut p = copy
+                    .prepared(&s.sql, s.view.domain)
+                    .map_err(CoreError::Sql)?;
+                p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+                p.validate_schemas(&s.sql).map_err(CoreError::Sql)?;
+                Ok(p)
+            };
             let mut prepared = match &self.staged {
                 Some(s) => prepare(s)?,
                 None => self.admin.inner.inspect(prepare)?,
             };
             prepared.transaction = self.transaction_id;
+            prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             Ok((copy, prepared))
         })();
         if result.is_err() {
@@ -2360,6 +2413,11 @@ impl SqlSession {
         expected_version: Option<u64>,
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
+        if p.schema_context_differs(&self.search_path, &self.schema_user) {
+            let mut bound = p.clone();
+            bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+            return self.execute_bound_clocked(&bound, params, expected_version, clock);
+        }
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
             return self.execute_v2(&db, p, params, expected_version, clock);
@@ -2379,7 +2437,16 @@ impl SqlSession {
             }
         };
         let result = crate::cancellation::check()
-            .and_then(|()| self.run(p, params, expected_version, clock));
+            .and_then(|()| self.run(p, params, expected_version, clock))
+            .map_err(|e| {
+                if p.schema_ddl().is_some_and(|(_, _, create)| create)
+                    && e == CoreError::Sql(relational::SqlError::DuplicateObject)
+                {
+                    CoreError::DuplicateSchema
+                } else {
+                    e
+                }
+            });
         if result.is_err() && self.staged.is_some() {
             self.aborted = true;
         }

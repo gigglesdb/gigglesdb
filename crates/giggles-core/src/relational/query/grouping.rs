@@ -1070,6 +1070,7 @@ mod tests {
             tokens: lex(sql).unwrap(),
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         })
         .unwrap()
     }

@@ -202,6 +202,7 @@ impl InsertExpressions {
             tokens: lex(sql)?,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         let value = Scalar::parse_aggregate_argument(&mut parser, 0)?;
         if parser.at != parser.tokens.len() || !parser.params.is_empty() {

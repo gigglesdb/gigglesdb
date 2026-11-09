@@ -1189,20 +1189,35 @@ impl Compiler {
                 }
                 let p = object(name);
                 let n = p.last().ok_or(Error::Unsupported)?.clone();
-                if p.len() > 2
-                    || p.len() == 2
-                        && p[0]
-                            != if args.is_some() {
-                                "pg_catalog"
-                            } else {
-                                if self.user_relations.contains_key(&n) || p[0] == "public" {
-                                    "public"
-                                } else {
-                                    catalog::relation_namespace(&n)
-                                }
-                            }
-                {
+                let qualified = (p.len() == 2).then(|| format!("\0{}\0{n}", p[0]));
+                let user_key = match &qualified {
+                    Some(key) if self.user_relations.contains_key(key) => key.clone(),
+                    // Preserve the original public-only API for callers that
+                    // supply no schema-specific keys for this relation.
+                    Some(_)
+                        if p[0] == "public"
+                            && !self.user_relations.keys().any(|k| {
+                                k.starts_with('\0') && k.rsplit('\0').next() == Some(n.as_str())
+                            }) =>
+                    {
+                        n.clone()
+                    }
+                    Some(key) => key.clone(),
+                    None => n.clone(),
+                };
+                if p.len() > 2 || args.is_some() && p.len() == 2 && p[0] != "pg_catalog" {
                     return Err(Error::Unsupported);
+                }
+                if args.is_none()
+                    && p.len() == 2
+                    && !self.user_relations.contains_key(&user_key)
+                    && (p[0] == "public" || p[0] != catalog::relation_namespace(&n))
+                {
+                    return Err(if matches!(p[0].as_str(), "pg_catalog" | "information_schema") {
+                        Error::Unsupported
+                    } else {
+                        Error::MixedRelations
+                    });
                 }
                 if let Some(args) = args {
                     if n == "pg_available_extension_versions"
@@ -1304,9 +1319,9 @@ impl Compiler {
                         let q = self.ctes[&n].clone();
                         let fields = q.fields.clone();
                         (Source::Derived(q), fields, alias, n)
-                    } else if let Some(fields) = self.user_relations.get(&n) {
-                        self.used_relations.insert(n.clone(), fields.clone());
-                        (Source::Catalog(n.clone()), fields.clone(), alias, n)
+                    } else if let Some(fields) = self.user_relations.get(&user_key) {
+                        self.used_relations.insert(user_key.clone(), fields.clone());
+                        (Source::Catalog(user_key), fields.clone(), alias, n)
                     } else {
                         if p.len() == 1 && !unqualified_catalog(&n)
                             || p.len() == 2 && p[0] == "public"

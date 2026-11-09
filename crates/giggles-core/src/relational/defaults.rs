@@ -199,9 +199,8 @@ fn options(p: &mut Parser, spec: &mut SequenceSpec, parenthesized: bool, alter: 
                 p.punct('.')?;
                 let second = alter_table::raw_name(p)?;
                 if p.sym('.') {
-                    if first != "public" {
-                        spec.owned_by_error = Some(SqlError::UnknownTable);
-                    }
+                    p.relations
+                        .push(schemas::Reference::read(second.clone(), Some(first)));
                     let column = alter_table::raw_name(p)?;
                     spec.owned_by_error = spec
                         .owned_by_error
@@ -210,6 +209,8 @@ fn options(p: &mut Parser, spec: &mut SequenceSpec, parenthesized: bool, alter: 
                         .or_else(|| ident::ident(&column).err());
                     Some((second, column))
                 } else {
+                    p.relations
+                        .push(schemas::Reference::read(first.clone(), None));
                     spec.owned_by_error = ident::ident(&first)
                         .err()
                         .or_else(|| ident::ident(&second).err());
@@ -496,6 +497,7 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
                                     tokens,
                                     at: 0,
                                     params: BTreeSet::new(),
+                                    relations: Vec::new(),
                                 };
                                 parser.table_name().is_ok_and(|dependency| {
                                     dependency == *name && parser.at == parser.tokens.len()
@@ -701,6 +703,7 @@ pub(super) fn install_create(
                 tokens: lex(&format!("{default},"))?,
                 at: 0,
                 params: BTreeSet::new(),
+                relations: Vec::new(),
             };
             let mut value = expression(&mut parser, 0)?;
             value.resolve(&candidate)?;
@@ -736,6 +739,7 @@ pub(super) fn dependencies(sql: &str) -> R<Vec<String>> {
         tokens: lex(&format!("{sql},"))?,
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let value = expression(&mut parser, 0)?;
     if parser.at + 1 != parser.tokens.len() {
@@ -833,6 +837,7 @@ impl Expression {
                     tokens: lex(name)?,
                     at: 0,
                     params: BTreeSet::new(),
+                    relations: Vec::new(),
                 };
                 let normalized = p.table_name().map_err(|_| SqlError::UnknownTable)?;
                 if p.at != p.tokens.len() {
@@ -1095,6 +1100,7 @@ pub(super) fn evaluate_sql(
         tokens: lex(&format!("{sql},"))?,
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let value = expression(&mut parser, 0)?;
     if parser.at + 1 != parser.tokens.len()
@@ -1200,6 +1206,7 @@ pub(super) fn install_alter(
             tokens: lex(&format!("{sql},"))?,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         let mut value = expression(&mut parser, 0)?;
         value.resolve(state)?;
@@ -1315,12 +1322,14 @@ mod tests {
                 tokens: lex(&format!("{input},")).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
+                relations: Vec::new(),
             };
             assert_eq!(parse(&mut p, &target).unwrap(), expected, "{input}");
             let mut p = Parser {
                 tokens: lex(&format!("{expected},")).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
+                relations: Vec::new(),
             };
             assert_eq!(
                 parse(&mut p, &target).unwrap(),

@@ -884,6 +884,7 @@ struct Predicate {
 }
 #[derive(Debug, Clone)]
 enum Statement {
+    Schema(schemas::Ddl),
     Sequence(defaults::SequenceDdl),
     DropTable {
         name: String,
@@ -948,10 +949,14 @@ enum Statement {
     Release(String),
     RollbackTo(String),
 }
+mod schemas;
+pub use schemas::{SchemaMetadata, schema_search_path};
+
 struct Parser {
     tokens: Vec<Token>,
     at: usize,
     params: BTreeSet<usize>,
+    relations: Vec<schemas::Reference>,
 }
 impl Parser {
     fn word(&mut self, s: &str) -> bool {
@@ -1069,6 +1074,9 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if schemas::claims(&self.tokens) {
+            return schemas::parse(self).map(Statement::Schema);
+        }
         if matches!(self.tokens.get(self.at), Some(Token::Word(word)) if matches!(word.as_str(), "create" | "alter" | "drop"))
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(word)) if word == "sequence")
         {
@@ -1108,14 +1116,14 @@ impl Parser {
             let first = alter_table::raw_name(self)?;
             let (name, resolution_error) = if self.sym('.') {
                 let name = alter_table::raw_name(self)?;
-                let error = if first != "public" {
-                    Some(SqlError::UnknownTable)
-                } else {
-                    ident::ident(&name).err()
-                };
+                let error = ident::ident(&name).err();
+                self.relations
+                    .push(schemas::Reference::read(name.clone(), Some(first)));
                 (name, error)
             } else {
                 let error = ident::ident(&first).err();
+                self.relations
+                    .push(schemas::Reference::read(first.clone(), None));
                 (first, error)
             };
             let cascade = self.word("cascade");
@@ -1404,6 +1412,9 @@ pub struct Prepared {
     statement: Statement,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
+    relations: Vec<schemas::Reference>,
+    search_path: Vec<String>,
+    schema_user: String,
 }
 /// v2 refuses varchar/char columns (DD-0068 E1130). Exhaustive on purpose: a
 /// new DataType must be decided here.
@@ -1513,6 +1524,7 @@ impl Prepared {
             | Statement::Update { .. }
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
+            Statement::Schema(_) => V2Class::Refused("user schemas"),
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
             Statement::Create {
                 constraints,
@@ -1599,6 +1611,9 @@ impl Prepared {
             statement,
             params: 0,
             parameter_types: vec![],
+            relations: Vec::new(),
+            search_path: vec!["public".into()],
+            schema_user: "giggles".into(),
         }
     }
     pub(crate) fn create_engine(
@@ -1820,6 +1835,7 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
+        self.validate_schemas(state)?;
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -2044,7 +2060,8 @@ impl Prepared {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
-            Statement::Sequence(_)
+            Statement::Schema(_)
+                | Statement::Sequence(_)
                 | Statement::Create { .. }
                 | Statement::CreateIndex(_)
                 | Statement::AlterTable(_)
@@ -2071,6 +2088,13 @@ impl Prepared {
     }
     pub fn command(&self) -> &'static str {
         match self.statement {
+            Statement::Schema(ref ddl) => {
+                if ddl.create {
+                    "CREATE SCHEMA"
+                } else {
+                    "DROP SCHEMA"
+                }
+            }
             Statement::Sequence(ref ddl) => match ddl {
                 defaults::SequenceDdl::Create { .. } => "CREATE SEQUENCE",
                 defaults::SequenceDdl::Alter { .. } => "ALTER SEQUENCE",
@@ -2153,6 +2177,9 @@ impl Prepared {
             transaction: None,
             params: 0,
             parameter_types: vec![],
+            relations: Vec::new(),
+            search_path: vec!["public".into()],
+            schema_user: "giggles".into(),
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -2389,6 +2416,7 @@ impl Prepared {
             tokens,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         Ok(Some(alter_table::parse(&mut parser)?.table))
     }
@@ -2404,6 +2432,7 @@ impl Prepared {
             tokens,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         match parser.parse()? {
             Statement::DropTable { name, .. } => Ok(Some(name)),
@@ -2498,6 +2527,7 @@ impl Prepared {
             tokens: lex(sql)?,
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         };
         let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
@@ -2539,6 +2569,9 @@ impl Prepared {
             statement,
             params,
             parameter_types: vec![],
+            relations: p.relations,
+            search_path: vec!["public".into()],
+            schema_user: "giggles".into(),
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
@@ -2761,6 +2794,7 @@ impl Relational {
             ext.logical_kinds.remove(&column.id);
         }
         ext.constraints.remove(&table_id);
+        ext.table_schemas.remove(&table_id);
         for constraints in ext.constraints.values_mut() {
             let incoming = |constraint: &Constraint| matches!(&constraint.kind,ConstraintKind::ForeignKey {ref_table,..} if *ref_table == table_id);
             if !cascade && constraints.iter().any(incoming) {
@@ -3014,6 +3048,7 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
+        prepared.validate_schemas(self)?;
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -3121,6 +3156,9 @@ impl Relational {
                 transaction: prepared.transaction,
                 params: prepared.params,
                 parameter_types: vec![],
+                relations: Vec::new(),
+                search_path: vec!["public".into()],
+                schema_user: "giggles".into(),
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
@@ -3168,6 +3206,9 @@ impl Relational {
                     events,
                     injected_source,
                 );
+            }
+            Statement::Schema(ddl) => {
+                return self.schema_ddl(ddl, &prepared.schema_user);
             }
             Statement::Sequence(ddl) => {
                 if expected.is_some() {
@@ -3306,6 +3347,11 @@ impl Relational {
                     };
                 defaults::install_create(self, t, defaults, sequences, typmods, next_id, epoch)?;
                 let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
+                let schema = prepared.creation_schema(self)?;
+                if schema != "public" {
+                    self.ext.table_schemas.insert(table.id, schema);
+                    Self::normalize_ext(&mut self.ext);
+                }
                 if let Some(name) = chosen_primary {
                     constraint_primary_key::record_name(self, &table, &name)?;
                 }
@@ -3685,6 +3731,7 @@ mod arithmetic_lexer_tests {
                 tokens: lex(sql).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
+                relations: Vec::new(),
             };
             assert_eq!(
                 parser.expr().unwrap().value(&[]).unwrap(),

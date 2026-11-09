@@ -174,6 +174,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
         CoreError::Sql(S::InvalidSavepoint) => "3B001",
         CoreError::Sql(S::InvalidForeignKey) => "42830",
         CoreError::Sql(S::InvalidSchema) => "3F000",
+        CoreError::DuplicateSchema => "42P06",
         CoreError::Sql(S::DivisionByZero) => "22012",
         CoreError::Sql(S::InvalidEscapeSequence) => "22025",
         CoreError::Sql(S::InvalidTableDefinition) => "42P16",
@@ -410,6 +411,13 @@ pub struct Session {
 impl Session {
     pub(crate) fn zone(&self) -> Option<SessionZone> {
         self.zone
+    }
+    pub(crate) fn set_search_path(&mut self, path: &str) {
+        let user = match &self.role {
+            Role::Database { name } => name.as_str(),
+            _ => "giggles",
+        };
+        self.sql.set_search_path(path, user);
     }
     pub(crate) fn set_extra_float_digits(&mut self, value: i32) {
         self.sql.set_extra_float_digits(value);
@@ -657,9 +665,12 @@ impl Session {
             giggles_core::cancellation::check()?;
             // Table names originate from the validated engine catalog, not
             // client SQL. Prepare/Describe do not access application rows.
-            let prepared = self
-                .sql
-                .prepare(&format!("SELECT * FROM {} LIMIT 1", table.name))?;
+            let schema = self.sql.relation_schema(&table.name)?;
+            let prepared = self.sql.prepare(&format!(
+                "SELECT * FROM \"{}\".\"{}\" LIMIT 1",
+                schema.replace('"', "\"\""),
+                table.name.replace('"', "\"\"")
+            ))?;
             let description = self.sql.describe(&prepared)?;
             if description.columns != table.logical_columns().cloned().collect::<Vec<_>>() {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
@@ -943,9 +954,12 @@ impl Session {
                 return Err(CoreError::Policy(Error::Scope));
             }
             for table in tables {
-                if !session.sql.relation_exists(table)? {
-                    return Err(CoreError::Sql(relational::SqlError::UnknownTable));
-                }
+                let prepared = session
+                    .sql
+                    .prepare(&format!("SELECT * FROM {table} LIMIT 0"))?;
+                let table = prepared
+                    .table()
+                    .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))?;
                 let allowed = match &session.role {
                     Role::Database { name } => {
                         let role = session
@@ -977,6 +991,7 @@ impl Session {
                 if !allowed {
                     return Err(CoreError::Policy(Error::Scope));
                 }
+                session.sql.describe(&prepared)?;
             }
             // Serializable snapshots pin the dump's schema and reads against
             // concurrent DDL, so ACCESS SHARE needs validation, not a new lock.
@@ -1003,6 +1018,40 @@ impl Session {
             }))
     }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
+        if let Some((schema, owner, create)) = p.schema_ddl() {
+            let allowed = if let Role::Database { name } = &self.role {
+                let roles = self.service.admin.roles();
+                let role = roles
+                    .get(name)
+                    .map_err(|_| CoreError::Policy(Error::Authentication))?
+                    .filter(|r| r.login && r.generation == self.epoch)
+                    .ok_or(CoreError::Policy(Error::Authentication))?;
+                if let Some(owner) = owner
+                    && roles
+                        .get(owner)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?
+                        .is_none()
+                {
+                    return Err(CoreError::Sql(relational::SqlError::UndefinedObject));
+                }
+                role.superuser
+                    || (!create
+                        && self
+                            .sql
+                            .schema_metadata()?
+                            .schemas
+                            .get(schema)
+                            .is_some_and(|(_, owner)| owner == name))
+            } else {
+                false
+            };
+            if !allowed {
+                self.sql.abort();
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            return Ok(());
+        }
+
         for table in p.constraint_reference_tables() {
             self.authorize_alter_table(&table)?;
         }
@@ -1055,12 +1104,23 @@ impl Session {
                     .as_deref()
                     == Some(name.as_str())
             } else if p.is_ddl() {
-                self.service
-                    .admin
-                    .roles()
-                    .schema_privileges("public", name)
-                    .map_err(|_| CoreError::Policy(Error::Scope))?
-                    .contains(&roles::SchemaPrivilege::Create)
+                let schema = if p.command() == "CREATE TABLE" {
+                    self.sql.creation_schema(p)?
+                } else {
+                    self.sql.relation_schema(p.table().unwrap_or(""))?
+                };
+                self.sql
+                    .schema_metadata()?
+                    .schemas
+                    .get(&schema)
+                    .is_some_and(|(_, owner)| owner == name)
+                    || self
+                        .service
+                        .admin
+                        .roles()
+                        .schema_privileges(&schema, name)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?
+                        .contains(&roles::SchemaPrivilege::Create)
             } else if let Some(table) = p.table() {
                 if table == "giggles_join" {
                     joined_read

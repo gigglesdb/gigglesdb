@@ -127,6 +127,7 @@ fn returning_projection_reuses_binder_and_admits_total_output() {
         tokens: lex("RETURNING id, upper(txt) AS label").unwrap(),
         at: 0,
         params: BTreeSet::new(),
+        relations: Vec::new(),
     };
     let returning = Returning::parse(&mut parser, "r").unwrap().unwrap();
     let input = vec![Value::Int(3), Value::Int(4), Value::Text("hello".into())];

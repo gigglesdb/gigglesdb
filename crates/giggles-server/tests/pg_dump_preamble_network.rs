@@ -167,14 +167,15 @@ async fn exact_pg_dump_preamble_simple_and_extended_then_restore_sql() {
                 expected
             );
         }
-        c.simple_query("CREATE TABLE t (id integer PRIMARY KEY, body text)")
+        assert_eq!(code(c.simple_query("CREATE TABLE no_path(id integer)").await.unwrap_err()), "3F000");
+        c.simple_query("CREATE TABLE public.t (id integer PRIMARY KEY, body text)")
             .await
             .unwrap();
-        c.execute("INSERT INTO t VALUES (1, 'restored')", &[])
+        c.execute("INSERT INTO public.t VALUES (1, 'restored')", &[])
             .await
             .unwrap();
         assert_eq!(
-            values(&c.simple_query("SELECT body FROM t LIMIT 1").await.unwrap()),
+            values(&c.simple_query("SELECT body FROM public.t LIMIT 1").await.unwrap()),
             ["restored"]
         );
         c.query("RESET ALL", &[]).await.unwrap();
@@ -914,6 +915,98 @@ async fn copy_stdout_requires_select_and_a_real_table() {
         "42P01"
     );
     drop(reader);
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn dump_routes_resolve_schema_qualifiers_and_search_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn message(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        let tag = s.read_u8().await.unwrap();
+        let len = s.read_u32().await.unwrap();
+        let mut body = vec![0; (len - 4) as usize];
+        s.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    for sql in [
+        "CREATE SCHEMA dump_s",
+        "CREATE TABLE dump_s.t(id integer PRIMARY KEY)",
+        "INSERT INTO dump_s.t VALUES(9)",
+    ] {
+        c.batch_execute(sql).await.unwrap();
+    }
+    c.batch_execute("BEGIN; LOCK TABLE dump_s.t IN ACCESS SHARE MODE; COMMIT")
+        .await
+        .unwrap();
+    c.batch_execute("SET search_path TO dump_s,public")
+        .await
+        .unwrap();
+    c.batch_execute("BEGIN; LOCK TABLE t IN ACCESS SHARE MODE; COMMIT")
+        .await
+        .unwrap();
+    c.batch_execute("SET search_path TO public; BEGIN")
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.batch_execute("LOCK TABLE t IN ACCESS SHARE MODE")
+                .await
+                .unwrap_err()
+        ),
+        "42P01"
+    );
+    c.batch_execute("ROLLBACK; BEGIN").await.unwrap();
+    assert_eq!(
+        code(
+            c.batch_execute("LOCK TABLE public.t IN ACCESS SHARE MODE")
+                .await
+                .unwrap_err()
+        ),
+        "42P01"
+    );
+    c.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        code(c.simple_query("COPY public.t TO STDOUT").await.unwrap_err()),
+        "42P01"
+    );
+    let mut s = tokio::net::TcpStream::connect(f.pg.address).await.unwrap();
+    let mut startup = 196608u32.to_be_bytes().to_vec();
+    startup.extend(b"user\0owner\0database\0postgres\0\0");
+    s.write_u32((startup.len() + 4) as u32).await.unwrap();
+    s.write_all(&startup).await.unwrap();
+    loop {
+        if message(&mut s).await.0 == b'Z' {
+            break;
+        }
+    }
+    for sql in [
+        "COPY dump_s.t TO STDOUT",
+        "SET search_path TO dump_s,public",
+        "COPY t TO STDOUT",
+    ] {
+        let sql = format!("{sql}\0");
+        s.write_u8(b'Q').await.unwrap();
+        s.write_u32((sql.len() + 4) as u32).await.unwrap();
+        s.write_all(sql.as_bytes()).await.unwrap();
+        let mut data = Vec::new();
+        loop {
+            let (tag, body) = message(&mut s).await;
+            match tag {
+                b'd' => data.extend(body),
+                b'E' => panic!("{body:?}"),
+                b'Z' => break,
+                _ => {}
+            }
+        }
+        if sql.starts_with("COPY") {
+            assert_eq!(data, b"9\n");
+        }
+    }
+    s.shutdown().await.unwrap();
+    drop(s);
     drop(c);
     f.stop().await;
 }

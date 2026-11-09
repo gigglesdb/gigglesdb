@@ -779,6 +779,7 @@ impl Filter {
                         tokens: p.tokens[p.at..end].to_vec(),
                         at: 0,
                         params: BTreeSet::new(),
+                        relations: Vec::new(),
                     };
                     let distinct = child.tokens.get(1) == Some(&Token::Word("distinct".into()));
                     if distinct {
@@ -789,6 +790,7 @@ impl Filter {
                         query.set_distinct();
                     }
                     p.params.extend(child.params);
+                    p.relations.extend(child.relations);
                     p.at = end + 1;
                     Self::InSubquery {
                         value: a,
@@ -4703,6 +4705,7 @@ mod join_visit_budget_tests {
                 tokens: lex(sql).unwrap(),
                 at: 0,
                 params: BTreeSet::new(),
+                relations: Vec::new(),
             })
             .unwrap();
             let bound = query.bind(&state, 0, &[]).unwrap();
@@ -5048,6 +5051,7 @@ mod in_subquery_execution_tests {
             tokens: lex(sql).unwrap(),
             at: 0,
             params: BTreeSet::new(),
+            relations: Vec::new(),
         })
         .unwrap()
     }

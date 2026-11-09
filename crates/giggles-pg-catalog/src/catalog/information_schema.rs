@@ -148,13 +148,18 @@ pub(super) fn populate(
         if !matches!(&relation[3], Value::Text(kind) if kind == "r" || kind == "v") {
             continue;
         }
-        let namespace = if relation[2] == I(13293) {
-            "information_schema"
-        } else if relation[2] == I(2200) {
-            "public"
-        } else {
-            "pg_catalog"
-        };
+        let namespace = all["pg_namespace"]
+            .rows
+            .iter()
+            .find(|n| n[0] == relation[2])
+            .and_then(|n| {
+                if let Value::Text(name) = &n[1] {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .ok_or(Error::InvalidSnapshot)?;
         let view = relation[3] == s("v");
         generated.get_mut("tables").unwrap().push(vec![
             s(&snapshot.database),
@@ -195,13 +200,14 @@ pub(super) fn populate(
         }
     }
     for table in &snapshot.tables {
+        let (schema, _) = snapshot.table_schema(table.id);
         let mut constraint = |name: &str, kind: &str| {
             generated.get_mut("table_constraints").unwrap().push(vec![
                 s(&snapshot.database),
-                s("public"),
+                s(schema),
                 s(name),
                 s(&snapshot.database),
-                s("public"),
+                s(schema),
                 s(&table.name),
                 s(kind),
                 s("NO"),
@@ -220,10 +226,10 @@ pub(super) fn populate(
             for (position, index) in table.primary_key.iter().enumerate() {
                 generated.get_mut("key_column_usage").unwrap().push(vec![
                     s(&snapshot.database),
-                    s("public"),
+                    s(schema),
                     s(&key_names[&table.id]),
                     s(&snapshot.database),
-                    s("public"),
+                    s(schema),
                     s(&table.name),
                     s(&table.columns[*index].name),
                     I(position as i64 + 1),
