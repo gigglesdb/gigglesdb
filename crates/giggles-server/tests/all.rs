@@ -114,3 +114,8 @@ fn every_test_file_is_registered() {
 }
 #[path = "npgsql_get_schema_network.rs"]
 mod npgsql_get_schema_network;
+
+#[path = "transaction_isolation_reporting.rs"]
+mod transaction_isolation_reporting;
+#[path = "sql_cursors_network.rs"]
+mod sql_cursors_network;

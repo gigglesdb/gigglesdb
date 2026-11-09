@@ -88,3 +88,6 @@ mod npgsql_get_schema;
 
 #[path = "pg_dump_catalog.rs"]
 mod pg_dump_catalog;
+
+#[path = "compat_metadata.rs"]
+mod compat_metadata;

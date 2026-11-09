@@ -29,7 +29,9 @@ impl IsolationLevel {
     }
 }
 /// GD-0054 F3b (track F v2 engine) will add real READ COMMITTED (planned default)
-/// and REPEATABLE READ; change only this function (and the default) then.
+/// and REPEATABLE READ; change this default-setting normalization then.
+/// Explicit transaction modes retain the requested level for reporting only;
+/// the storage engine still executes every transaction at serializable.
 pub(crate) fn effective_isolation(requested: IsolationLevel) -> IsolationLevel {
     match requested {
         IsolationLevel::Serializable

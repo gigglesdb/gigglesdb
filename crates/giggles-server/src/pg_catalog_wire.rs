@@ -281,7 +281,7 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
         PgType::Int2 => T::SmallInt,
         PgType::Int4 => T::Integer,
         PgType::Int8 => T::BigInt,
-        PgType::Text | PgType::Name | PgType::Char => T::Text,
+        PgType::Text | PgType::Varchar | PgType::Name | PgType::Char => T::Text,
         PgType::Bytea => T::Bytes,
         PgType::Numeric => T::Numeric,
         PgType::Float4 => T::Real,
@@ -437,7 +437,7 @@ fn encode_with_extra(
                 v.to_be_bytes().to_vec()
             }
         }
-        (Value::Text(v), PgType::Text | PgType::Name | PgType::Char) => {
+        (Value::Text(v), PgType::Text | PgType::Varchar | PgType::Name | PgType::Char) => {
             if v.contains('\0')
                 || (ty == PgType::Char && v.len() > 1)
                 || (ty == PgType::Name && v.len() > 63)
@@ -494,7 +494,11 @@ fn encode_with_extra(
                             // Always quote text, including the string "NULL".
                             if matches!(
                                 scalar,
-                                PgType::Text | PgType::Name | PgType::Char | PgType::Bytea
+                                PgType::Text
+                                    | PgType::Varchar
+                                    | PgType::Name
+                                    | PgType::Char
+                                    | PgType::Bytea
                             ) {
                                 encoded.push(b'"');
                                 for byte in item {

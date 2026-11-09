@@ -13,6 +13,7 @@ pub(crate) enum Function {
     Current {
         name: String,
         missing_ok: bool,
+        from_settings: bool,
         column: String,
     },
 }
@@ -26,6 +27,11 @@ impl Function {
     pub fn has_row(&self, settings: &SessionSettings) -> bool {
         match self {
             Self::Set {
+                name,
+                from_settings: true,
+                ..
+            }
+            | Self::Current {
                 name,
                 from_settings: true,
                 ..
@@ -168,6 +174,28 @@ fn parse(sql: &str) -> Option<Function> {
         p.token(Token::Dot)?;
         function = p.word()?;
     }
+    // Bounded, case-sensitive pg_settings read using the same session values as SHOW.
+    if function == "setting" {
+        p.token(Token::Word("from".into()))?;
+        let mut relation = p.word()?;
+        if relation == "pg_catalog" {
+            p.token(Token::Dot)?;
+            relation = p.word()?;
+        }
+        if relation != "pg_settings" {
+            return None;
+        }
+        p.token(Token::Word("where".into()))?;
+        p.token(Token::Word("name".into()))?;
+        p.token(Token::Equals)?;
+        let name = p.text()?;
+        return (p.at == p.tokens.len()).then_some(Function::Current {
+            name,
+            missing_ok: true,
+            from_settings: true,
+            column: "setting".into(),
+        });
+    }
     if !matches!(function.as_str(), "set_config" | "current_setting") {
         return None;
     }
@@ -202,6 +230,7 @@ fn parse(sql: &str) -> Option<Function> {
         Function::Current {
             name,
             missing_ok,
+            from_settings: false,
             column: function,
         }
     };

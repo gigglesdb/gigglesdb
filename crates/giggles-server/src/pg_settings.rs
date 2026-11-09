@@ -281,9 +281,7 @@ impl Show {
             ),
             Self::TransactionIsolation => (
                 "transaction_isolation",
-                crate::pg_transaction::effective_isolation(settings.transaction_isolation)
-                    .name()
-                    .into(),
+                settings.transaction_isolation.name().into(),
             ),
             Self::DefaultTransactionIsolation => (
                 "default_transaction_isolation",
@@ -355,7 +353,8 @@ pub(crate) fn show(sql: &str) -> Result<Option<Show>> {
     let show = match name.as_str() {
         "application_name" => Show::ApplicationName,
         "extra_float_digits" => Show::ExtraFloatDigits,
-        "transaction_isolation" | "default_transaction_isolation" => Show::TransactionIsolation,
+        "transaction_isolation" => Show::TransactionIsolation,
+        "default_transaction_isolation" => Show::DefaultTransactionIsolation,
         "transaction" => {
             if !p.word().eq_ignore_ascii_case("ISOLATION")
                 || !p.word().eq_ignore_ascii_case("LEVEL")

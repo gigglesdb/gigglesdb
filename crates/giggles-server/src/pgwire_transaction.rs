@@ -45,7 +45,7 @@ pub(super) fn execute_mode(
             let actual = execute_control("BEGIN", session, implicit, settings, out)?;
             if starting {
                 if let Some(isolation) = modes.isolation {
-                    settings.current.transaction_isolation = effective_isolation(isolation);
+                    settings.current.transaction_isolation = isolation;
                 }
                 if let Some(read_only) = modes.read_only {
                     settings.current.transaction_read_only = read_only;
@@ -117,7 +117,7 @@ pub(super) fn execute_mode(
                     return Err("25001");
                 }
                 if let Some(isolation) = modes.isolation {
-                    settings.current.transaction_isolation = effective_isolation(isolation);
+                    settings.current.transaction_isolation = isolation;
                 }
                 if let Some(read_only) = modes.read_only {
                     settings.current.transaction_read_only = read_only;

@@ -23,6 +23,8 @@ mod settings_functions;
 mod simple;
 use copy_in::{CopyIn, is_copy_sql};
 use simple::{execute_settings, parse_settings, settings_status, show_settings};
+#[path = "pgwire_cursor.rs"]
+mod cursor;
 #[path = "pgwire_transaction.rs"]
 mod transaction;
 use transaction::{admin_command, execute_mode, parse_control, read_only_check};
@@ -689,6 +691,7 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
 #[derive(Clone)]
 enum Plan {
     Empty,
+    Cursor(cursor::Command),
     Admin(crate::auth::statements::AdminStatement),
     Control(crate::pg_transaction::Command),
     Settings(Vec<crate::pg_settings::Setting>),
@@ -725,7 +728,8 @@ impl Statement {
                 core(session.copy_columns(copy, p))?;
                 Ok(self.d.clone())
             }
-            Plan::Task(_)
+            Plan::Cursor(_)
+            | Plan::Task(_)
             | Plan::Admin(_)
             | Plan::Empty
             | Plan::Settings(_)
@@ -778,6 +782,7 @@ struct State {
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
     portals: BTreeMap<String, Portal>,
+    cursors: cursor::Cursors,
     drain: bool,
     copy: Option<CopyIn>,
     copy_completion: Vec<u8>,
@@ -883,6 +888,10 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         let result = self.handle_inner(tag, b, session, out, received);
+        if !session.in_transaction() {
+            self.cursors
+                .transaction_end(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        }
         session.set_time_zone(&self.settings.current.timezone);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
@@ -921,11 +930,13 @@ impl State {
                     self.implicit = false;
                     if session.is_aborted() {
                         session.sql.rollback();
+                        self.cursors.transaction_end("ROLLBACK");
                         self.settings.transaction(true, false, "ROLLBACK");
                     } else {
                         let commit = session.execute_sql("COMMIT", &[]);
                         if let Err(error) = commit {
                             session.sql.rollback();
+                            self.cursors.transaction_end("ROLLBACK");
                             self.settings.transaction(true, false, "ROLLBACK");
                             self.portals.clear();
                             return Err(crate::service::sqlstate(&error));
@@ -991,6 +1002,12 @@ impl State {
                             parameters: vec![],
                         },
                     )
+                } else if let Some(mut command) = cursor::parse(&sql)? {
+                    if !session.role.is_sql() {
+                        return Err("42501");
+                    }
+                    let d = self.cursors.describe(&mut command, session, &oids)?;
+                    (Plan::Cursor(command), d)
                 } else if let Some(stmt) = crate::auth::statements::parse(&sql) {
                     (
                         Plan::Admin(stmt),
@@ -1285,6 +1302,16 @@ impl State {
                         }
                     }
                     b'P' => {
+                        if let Some(d) = self.cursors.description(&name) {
+                            if !session.role.is_sql() {
+                                return Err("42501");
+                            }
+                            if session.is_aborted() {
+                                return Err("25P02");
+                            }
+                            row_description(d, &[], out)?;
+                            return Ok(true);
+                        }
                         let p = self.portals.get(&name).ok_or("34000")?;
                         self.diagnostic.query_id = p.s.query_id.clone();
                         let d = p.s.describe(session)?;
@@ -1311,6 +1338,22 @@ impl State {
                 let p = self.portals.get_mut(&name).ok_or("34000")?;
                 self.diagnostic.query_id = p.s.query_id.clone();
                 p.s.describe(session)?;
+                if let Plan::Cursor(command) = &p.s.p {
+                    if p.result.is_some() {
+                        return Err("55000");
+                    }
+                    self.cursors.execute(
+                        command,
+                        session,
+                        &p.params,
+                        &p.formats,
+                        &mut self.settings,
+                        false,
+                        out,
+                    )?;
+                    p.result = Some(SqlResult::default());
+                    return Ok(true);
+                }
                 if let Plan::Copy(copy, prepared) = &p.s.p {
                     if p.result.is_some() {
                         return Err("55000");
@@ -1420,6 +1463,9 @@ impl State {
                         &mut self.diagnostic,
                         out,
                     )?;
+                    if !session.in_transaction() {
+                        self.cursors.transaction_end(actual);
+                    }
                     p.result = Some(SqlResult::default());
                     complete(actual, &SqlResult::default(), out)?;
                     if !session.in_transaction() {
@@ -1577,6 +1623,7 @@ impl State {
                     }
                     b'P' => {
                         self.portals.remove(&name);
+                        self.cursors.close(&name);
                     }
                     _ => return Err("08P01"),
                 };
@@ -1679,6 +1726,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
         portals: BTreeMap::new(),
+        cursors: cursor::Cursors::default(),
         drain: false,
         copy: None,
         copy_completion: vec![],
@@ -1756,6 +1804,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                         session.set_time_zone(&state.settings.current.timezone);
                         session.set_extra_float_digits(state.settings.current.extra_float_digits);
                         state.implicit = false;
+                        state.cursors.transaction_end("ROLLBACK");
                         state.portals.clear();
                     }
                     if matches!(tag, b'Q' | b'S') {
@@ -1815,6 +1864,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                             session
                                 .set_extra_float_digits(state.settings.current.extra_float_digits);
                             state.implicit = false;
+                            state.cursors.transaction_end("ROLLBACK");
                             state.portals.clear();
                         }
                         let message = state.diagnostic.message.unwrap_or(match code {

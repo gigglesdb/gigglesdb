@@ -87,6 +87,7 @@ impl State {
         session.abort();
         if implicit {
             session.sql.rollback();
+            self.cursors.transaction_end("ROLLBACK");
             self.settings.transaction(true, false, "ROLLBACK");
             self.portals.clear();
         }
@@ -132,6 +133,11 @@ impl State {
         received: std::time::Instant,
         implicit: &mut bool,
     ) -> R<()> {
+        if let Some(command) = cursor::parse(sql)? {
+            self.cursors
+                .execute(&command, session, &[], &[], &mut self.settings, true, out)?;
+            return Ok(());
+        }
         if is_copy_sql(sql) {
             let (copy, prepared) = core(session.prepare_copy(sql))?;
             read_only_check("INSERT", &self.settings, session, &mut self.diagnostic)?;
@@ -204,6 +210,9 @@ impl State {
                 &mut self.diagnostic,
                 out,
             )?;
+            if !session.in_transaction() {
+                self.cursors.transaction_end(actual);
+            }
             complete(actual, &SqlResult::default(), out)?;
         } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
             let (description, result) = inspect(show, &self.settings.current, session)?;

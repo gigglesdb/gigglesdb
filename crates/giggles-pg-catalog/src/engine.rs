@@ -74,6 +74,7 @@ enum K {
     Subquery(Box<Query>),
     ArrayQuery(Box<Query>),
     ArrayAgg(Box<E>, Vec<Order>),
+    Count(Option<Box<E>>),
     RowNumber(Vec<E>, Vec<Order>),
     Expand(Box<E>),
     Unnest(Box<E>),
@@ -1381,7 +1382,7 @@ impl Compiler {
                             return Err(Error::Unsupported);
                         }
                         let value = self.expr(expr, schema)?;
-                        if !matches!(value.ty, PgType::Text | PgType::Name) {
+                        if !matches!(value.ty, PgType::Text | PgType::Varchar | PgType::Name) {
                             return Err(Error::Type);
                         }
                         Ok(value)
@@ -1392,8 +1393,8 @@ impl Compiler {
                 let lhs = operand(left)?;
                 let rhs = operand(right)?;
                 if (matches!(left, A::Collate { .. }) || matches!(right, A::Collate { .. }))
-                    && (!matches!(lhs.ty, PgType::Text | PgType::Name)
-                        || !matches!(rhs.ty, PgType::Text | PgType::Name))
+                    && (!matches!(lhs.ty, PgType::Text | PgType::Varchar | PgType::Name)
+                        || !matches!(rhs.ty, PgType::Text | PgType::Varchar | PgType::Name))
                 {
                     return Err(Error::Type);
                 }
@@ -1656,6 +1657,33 @@ impl Compiler {
                             ty: PgType::OidArray,
                         })),
                         ty: PgType::Oid,
+                    });
+                }
+                if n == "count" {
+                    let a::FunctionArguments::List(args) = &f.args else {
+                        return Err(Error::Unsupported);
+                    };
+                    if args.args.len() != 1
+                        || args.duplicate_treatment.is_some()
+                        || !args.clauses.is_empty()
+                        || f.over.is_some()
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    let arg = match &args.args[0] {
+                        a::FunctionArg::Unnamed(a::FunctionArgExpr::Wildcard) => None,
+                        _ => {
+                            let arg = self.args(&args.args, schema)?.remove(0);
+                            no_set_or_window(&arg)?;
+                            if has_aggregate(&arg) {
+                                return Err(Error::Unsupported);
+                            }
+                            Some(Box::new(arg))
+                        }
+                    };
+                    return Ok(E {
+                        kind: K::Count(arg),
+                        ty: PgType::Int8,
                     });
                 }
                 if n == "string_agg" {
@@ -2005,10 +2033,10 @@ fn array_type(t: PgType) -> R<PgType> {
     })
 }
 fn has_aggregate(e: &E) -> bool {
-    matches!(e.kind, K::ArrayAgg(..)) || children(e).into_iter().any(has_aggregate)
+    matches!(e.kind, K::ArrayAgg(..) | K::Count(_)) || children(e).into_iter().any(has_aggregate)
 }
 fn validate_group(e: &E, group: &[E]) -> R<()> {
-    if group.contains(e) || matches!(e.kind, K::ArrayAgg(..)) {
+    if group.contains(e) || matches!(e.kind, K::ArrayAgg(..) | K::Count(_)) {
         return Ok(());
     }
     if matches!(
@@ -2069,7 +2097,10 @@ fn acl_role_name(name: &str) -> String {
     }
 }
 fn textual(t: PgType) -> bool {
-    matches!(t, PgType::Text | PgType::Name | PgType::Char)
+    matches!(
+        t,
+        PgType::Text | PgType::Varchar | PgType::Name | PgType::Char
+    )
 }
 fn unknown(e: &E) -> bool {
     matches!(
@@ -2405,6 +2436,7 @@ fn children(e: &E) -> Vec<&E> {
         | K::Expand(a)
         | K::Unnest(a) => vec![a],
         K::InQuery(a, _, _) => vec![a],
+        K::Count(arg) => arg.iter().map(|a| a.as_ref()).collect(),
         K::Call(_, es) | K::Array(es) => es.iter().collect(),
         K::ArrayAgg(e, order) => std::iter::once(e.as_ref())
             .chain(order.iter().map(|o| &o.e))
@@ -2426,7 +2458,7 @@ fn has_expand(e: &E) -> bool {
 fn no_set_or_window(e: &E) -> R<()> {
     if matches!(
         e.kind,
-        K::Expand(_) | K::Unnest(_) | K::RowNumber(_, _) | K::ArrayAgg(..)
+        K::Expand(_) | K::Unnest(_) | K::RowNumber(_, _) | K::ArrayAgg(..) | K::Count(_)
     ) {
         return Err(Error::Unsupported);
     }
@@ -3271,6 +3303,19 @@ impl Runtime<'_> {
                 let rows = self.query(q, row)?;
                 Value::Array(rows.into_iter().map(|mut r| r.remove(0)).collect())
             }
+            K::Count(arg) => {
+                self.charge(all.len())?;
+                let mut count = 0i64;
+                for row in all {
+                    if let Some(arg) = arg
+                        && self.eval(arg, row, None, 0, &[], None)? == N
+                    {
+                        continue;
+                    }
+                    count += 1;
+                }
+                I(count)
+            }
             K::ArrayAgg(arg, order) => {
                 if all.is_empty() {
                     N
@@ -3895,7 +3940,7 @@ fn cast(v: Value, t: PgType) -> R<Value> {
             Value::Bytes(_) => Ok(v),
             _ => Err(Error::Type),
         },
-        PgType::Text | PgType::Name | PgType::Char => Ok(S(match v {
+        PgType::Text | PgType::Varchar | PgType::Name | PgType::Char => Ok(S(match v {
             S(s) => s,
             I(i) => i.to_string(),
             B(b) => b.to_string(),

@@ -326,7 +326,7 @@ fn rejects_unimplemented_even_empty() {
         "SELECT unknown FROM pg_attrdef",
         "SELECT * FROM pg_catalog.made_up",
         "SELECT * FROM pg_class FOR UPDATE",
-        "SELECT count(*) FROM pg_class",
+        "SELECT count(DISTINCT oid) FROM pg_class",
         "SELECT relname FROM pg_class INTERSECT SELECT relname FROM pg_class",
     ] {
         assert!(plan(sql).is_err(), "{sql}");

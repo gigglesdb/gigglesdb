@@ -293,7 +293,7 @@ fn all_view_columns_match_pg18_order_and_mapped_domain_types() {
                         "information_schema.sql_identifier" => PgType::Name,
                         "information_schema.cardinal_number" => PgType::Int4,
                         "information_schema.character_data" | "information_schema.yes_or_no" => {
-                            PgType::Text
+                            PgType::Varchar
                         }
                         other => panic!("unknown domain {other}"),
                     },
@@ -387,7 +387,7 @@ fn namespace_and_view_class_attribute_rowtype_registration_are_coherent() {
             let type_oid = match field.data_type {
                 PgType::Name => 19,
                 PgType::Int4 => 23,
-                PgType::Text => 25,
+                PgType::Varchar => 1043,
                 other => panic!("unexpected type {other:?}"),
             };
             assert_eq!(
