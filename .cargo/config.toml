@@ -1,0 +1,7 @@
+# Faster gates on Windows (GD-0001 E135): rust-lld links much faster than
+# link.exe, and line tables keep backtraces with far smaller debug info.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+[profile.dev]
+debug = "line-tables-only"
