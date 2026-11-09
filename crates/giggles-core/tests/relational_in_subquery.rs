@@ -191,6 +191,99 @@ fn binding_arity_types_and_correlation_errors() {
     );
 }
 #[test]
+fn bpchar_membership_is_rejected_during_binding() {
+    let mut db = Db::new();
+    let s = db.session();
+    run(s, "CREATE TABLE characters(id int PRIMARY KEY,c char(3))");
+    run(s, "CREATE TABLE strings(id int PRIMARY KEY,v text)");
+    run(s, "INSERT INTO characters VALUES(1,'abc'),(2,NULL)");
+    run(s, "INSERT INTO strings VALUES(1,'abc'),(2,NULL)");
+    for (outer, outer_filter, lhs, child, column) in [
+        ("characters", "", "c", "strings", "v"),
+        ("strings", "", "v", "characters", "c"),
+        ("characters", "id=2 AND ", "c", "strings", "v"),
+        ("strings", "", "NULL::text", "characters", "c"),
+        ("strings", "", "NULL", "characters", "c"),
+        ("strings", "", "'abc'", "characters", "c"),
+    ] {
+        for operator in ["IN", "NOT IN"] {
+            for child_filter in ["", " WHERE false"] {
+                let sql = format!(
+                    "SELECT id FROM {outer} WHERE {outer_filter}{lhs} {operator} (SELECT {column} FROM {child}{child_filter})"
+                );
+                let prepared = s.prepare(&sql).unwrap();
+                // Metadata binding rejects bpchar even with NULL operands or an empty child.
+                assert_eq!(
+                    s.describe(&prepared).unwrap_err(),
+                    CoreError::Sql(E::Unsupported),
+                    "{sql}"
+                );
+                assert_eq!(
+                    s.execute_prepared(&prepared, &[], None),
+                    Err(CoreError::Sql(E::Unsupported)),
+                    "{sql}"
+                );
+                error(s, &sql, E::Unsupported);
+            }
+        }
+    }
+}
+#[test]
+fn varchar_and_text_membership_preserve_postgres_string_and_null_semantics() {
+    let mut db = Db::new();
+    let s = db.session();
+    run(
+        s,
+        "CREATE TABLE strings(id int PRIMARY KEY,short varchar(3),wide text)",
+    );
+    run(
+        s,
+        "CREATE TABLE candidates(id int PRIMARY KEY,short varchar(3),wide text)",
+    );
+    run(
+        s,
+        "INSERT INTO strings VALUES(1,'abc','abc'),(2,'a ','a '),(3,'a','a'),(4,NULL,NULL)",
+    );
+    run(
+        s,
+        "INSERT INTO candidates VALUES(1,'a','a'),(2,NULL,NULL),(3,'xyz','xyz')",
+    );
+    // PG18.6: varchar/text comparisons preserve trailing spaces and SQL NULL semantics.
+    for (lhs, child) in [("short", "wide"), ("wide", "short")] {
+        for (predicate, expected) in [
+            (
+                format!("{lhs} IN (SELECT {child} FROM candidates)"),
+                vec![3],
+            ),
+            (
+                format!("{lhs} NOT IN (SELECT {child} FROM candidates)"),
+                vec![],
+            ),
+            (
+                format!("({lhs} IN (SELECT {child} FROM candidates)) IS NULL"),
+                vec![1, 2, 4],
+            ),
+            (
+                format!("{lhs} NOT IN (SELECT {child} FROM candidates WHERE id=1)"),
+                vec![1, 2],
+            ),
+            (
+                format!("{lhs} IN (SELECT {child} FROM candidates WHERE false)"),
+                vec![],
+            ),
+            (
+                format!("{lhs} NOT IN (SELECT {child} FROM candidates WHERE false)"),
+                vec![1, 2, 3, 4],
+            ),
+        ] {
+            let sql = format!("SELECT id FROM strings WHERE {predicate} ORDER BY id");
+            let prepared = s.prepare(&sql).unwrap();
+            s.describe(&prepared).unwrap();
+            assert_eq!(rows(s, &sql), ints(&expected), "{sql}");
+        }
+    }
+}
+#[test]
 fn unsupported_subquery_positions_remain_unsupported() {
     let mut db = Db::new();
     let s = db.session();
@@ -218,12 +311,11 @@ fn unsupported_subquery_positions_remain_unsupported() {
     ] {
         error(s, sql, E::Unsupported);
     }
-    // Source baseline HEAD: relational.rs:1079 and query/insert_values.rs:245
-    // require VALUES before parsing expressions; Parser::need returns Syntax.
+    // PG18.6: 23505.
     error(
         s,
         "INSERT INTO t SELECT id FROM u WHERE id IN (SELECT id FROM t)",
-        E::Syntax,
+        E::Duplicate,
     );
     // Unchanged from main 0ec7c954 (42601); not in this slice.
     error(

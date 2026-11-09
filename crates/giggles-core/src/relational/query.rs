@@ -564,12 +564,18 @@ impl Filter {
                     .1
                     .columns[0]
                     .data_type;
+                if *column_type == DataType::Bpchar {
+                    return Err(SqlError::Unsupported);
+                }
                 let value = if matches!(value, Scalar::Literal(Value::Null | Value::Text(_))) {
                     Scalar::Cast(Box::new(value.clone()), column_type.clone())
                 } else {
                     value.clone()
                 };
                 let bound = value.bind(resolve, tables, params)?;
+                if bound.ty == DataType::Bpchar {
+                    return Err(SqlError::Unsupported);
+                }
                 // Compare's existing type policy, using a typed parameter as the RHS.
                 let mut comparison_params = params.to_vec();
                 comparison_params.push(Some(column_type.clone()));
@@ -1225,6 +1231,7 @@ impl BoundFilter {
                         &execution.declared,
                         execution,
                         true,
+                        false,
                     )?;
                     let mut values = Vec::with_capacity(result.rows.len());
                     let mut keys = functions::join_key_supported(&value.ty, column_type)
@@ -1965,6 +1972,17 @@ impl Query {
             order: vec![],
             limit: None,
         })
+    }
+    pub(super) fn parse_insert_source(p: &mut Parser) -> R<Self> {
+        let distinct = p.tokens.get(p.at + 1) == Some(&Token::Word("distinct".into()));
+        if distinct {
+            p.tokens.remove(p.at + 1);
+        }
+        let mut query = Self::parse(p)?;
+        if distinct {
+            query.set_distinct();
+        }
+        Ok(query)
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
@@ -2731,6 +2749,200 @@ impl Query {
         parameters: Vec<Option<DataType>>,
     ) -> R<BoundQuery<'a>> {
         self.bind_seeded_inner(state, parameters, true, &[])
+    }
+    /// Preserve unknown INSERT output literals without treating expanded columns as unknown.
+    pub(super) fn insert_outputs(&self, state: &Relational) -> R<Vec<Option<Value>>> {
+        if !self.is_table_free() && state.sequence_by_name(self.target()).is_some() {
+            return Err(SqlError::Unsupported);
+        }
+        let mut outputs = Vec::new();
+        for (item, _) in &self.items {
+            match item {
+                Item::Star => {
+                    for source in &self.sources {
+                        let table = state
+                            .tables
+                            .get(&source.name)
+                            .ok_or(SqlError::UnknownTable)?;
+                        outputs.extend(table.logical_columns().map(|_| None));
+                    }
+                }
+                Item::Scalar(Scalar::Literal(value @ (Value::Text(_) | Value::Null))) => {
+                    outputs.push(Some(value.clone()));
+                }
+                _ => outputs.push(None),
+            }
+        }
+        Ok(outputs)
+    }
+    /// Only a bare output parameter with no other source context takes its target type.
+    pub(super) fn bind_insert_source<'a>(
+        &'a self,
+        state: &'a Relational,
+        targets: &[DataType],
+        parameters: &mut [Option<DataType>],
+        declared: &[Option<DataType>],
+    ) -> R<BoundQuery<'a>> {
+        let outputs = self.insert_outputs(state)?;
+        if outputs.len() != targets.len() {
+            return Err(SqlError::Syntax);
+        }
+        let mut contextual = self.clone();
+        for (item, _) in &mut contextual.items {
+            if matches!(item, Item::Scalar(Scalar::Param(_))) {
+                *item = Item::Scalar(Scalar::Literal(Value::Null));
+            }
+        }
+        let contextual = contextual.used_parameters();
+        let mut seed = parameters.to_vec();
+        for n in &contextual {
+            if declared.get(n - 1).is_none_or(Option::is_none) {
+                *seed.get_mut(n - 1).ok_or(SqlError::Parameters)? = None;
+            }
+        }
+        let mut output = 0;
+        for (item, _) in &self.items {
+            if let Item::Scalar(Scalar::Param(n)) = item
+                && !contextual.contains(n)
+                && declared.get(n - 1).is_none_or(Option::is_none)
+            {
+                let slot = seed.get_mut(n - 1).ok_or(SqlError::Parameters)?;
+                if slot.as_ref().is_some_and(|old| old != &targets[output]) {
+                    return Err(SqlError::Type);
+                }
+                *slot = Some(targets[output].clone());
+            }
+            output += if matches!(item, Item::Star) {
+                self.sources
+                    .iter()
+                    .map(|source| {
+                        state
+                            .tables
+                            .get(&source.name)
+                            .map(|table| table.logical_columns().count())
+                            .ok_or(SqlError::UnknownTable)
+                    })
+                    .collect::<R<Vec<_>>>()?
+                    .into_iter()
+                    .sum()
+            } else {
+                1
+            };
+        }
+        let used = self.used_parameters();
+        // Other INSERT clauses can own parameter slots absent from the SELECT.
+        for (index, slot) in seed.iter_mut().enumerate() {
+            if !used.contains(&(index + 1)) {
+                slot.get_or_insert(DataType::Text);
+            }
+        }
+        let mut bound = self.bind_seeded_inner(state, seed, false, &[])?;
+        // INSERT source ordinals name expanded output positions, including stars.
+        // Grouped queries already resolve ordinals in their grouping plan.
+        if bound.grouping.is_none() {
+            let mut projection = Vec::new();
+            for (item, _) in &self.items {
+                match item {
+                    Item::Scalar(scalar) => projection.push(Some(scalar)),
+                    Item::Star => {
+                        let width = bound
+                            .tables
+                            .iter()
+                            .map(|table| table.logical_columns().count())
+                            .sum();
+                        projection.extend(std::iter::repeat_n(None, width));
+                    }
+                    Item::Aggregate(..) => projection.push(None),
+                }
+            }
+            let tables = &bound.tables;
+            let resolve = |column: &ColumnRef, scope: usize| -> R<BoundColumn> {
+                if column.qualifier.as_ref().is_some_and(|qualifier| {
+                    !self
+                        .sources
+                        .iter()
+                        .take(scope)
+                        .any(|source| &source.alias == qualifier)
+                }) {
+                    return Err(SqlError::UnknownTable);
+                }
+                let mut found = None;
+                for (source, (syntax, table)) in
+                    self.sources.iter().zip(tables).take(scope).enumerate()
+                {
+                    if column
+                        .qualifier
+                        .as_ref()
+                        .is_some_and(|qualifier| qualifier != &syntax.alias)
+                    {
+                        continue;
+                    }
+                    if let Some(column) = table
+                        .logical_offsets()
+                        .into_iter()
+                        .find(|index| table.columns[*index].name == column.name)
+                    {
+                        if found.is_some() {
+                            return Err(SqlError::Duplicate);
+                        }
+                        found = Some(BoundColumn { source, column });
+                    }
+                }
+                found.ok_or(SqlError::UnknownColumn)
+            };
+            let parameter_types = bound
+                .parameters
+                .iter()
+                .cloned()
+                .map(Some)
+                .collect::<Vec<_>>();
+            for (index, (scalar, _, _)) in self.order.iter().enumerate() {
+                if let Scalar::Literal(Value::Int(position)) = scalar {
+                    let position = usize::try_from(*position)
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .ok_or(SqlError::Syntax)?;
+                    let item = bound.items.get(position).ok_or(SqlError::Syntax)?;
+                    bound.order[index].0 = match item {
+                        BoundItem::Scalar(_) => projection
+                            .get(position)
+                            .and_then(|scalar| *scalar)
+                            .ok_or(SqlError::Unsupported)?
+                            .bind(&resolve, tables, &parameter_types)?,
+                        BoundItem::Column(column) => Scalar::Column(ColumnRef {
+                            qualifier: None,
+                            name: String::new(),
+                        })
+                        .bind(
+                            &|_, _| Ok(*column),
+                            &bound.tables,
+                            &parameter_types,
+                        )?,
+                        BoundItem::Aggregate(..) => return Err(SqlError::Unsupported),
+                    };
+                }
+            }
+        }
+        for ((column, unknown), target) in bound.columns.iter().zip(outputs).zip(targets) {
+            if let Some(value) = unknown {
+                if !functions::zone_dependent_literal(&value, target) {
+                    assignment::literal(value, target, None)?;
+                }
+            } else if !assignment::compatible(&column.data_type, target) {
+                return Err(SqlError::Type);
+            }
+        }
+        for n in used {
+            if parameters[n - 1]
+                .as_ref()
+                .is_some_and(|old| old != &bound.parameters[n - 1])
+            {
+                return Err(SqlError::Type);
+            }
+            parameters[n - 1] = Some(bound.parameters[n - 1].clone());
+        }
+        bound.declared = declared.to_vec();
+        Ok(bound)
     }
     fn bind_seeded_inner<'a>(
         &'a self,
@@ -3620,8 +3832,23 @@ impl BoundQuery<'_> {
         declared: &[Option<DataType>],
     ) -> R<SqlResult> {
         let execution = Execution::new(cancel, declared);
-        self.execute_context(state, source, params, declared, &execution, false)
+        self.execute_context(state, source, params, declared, &execution, false, false)
     }
+    pub(super) fn execute_insert_source(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        cancel: &mut dyn FnMut() -> bool,
+        declared: &[Option<DataType>],
+    ) -> R<SqlResult> {
+        let execution = Execution::new(cancel, declared);
+        self.execute_context(state, source, params, declared, &execution, false, true)
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "query execution context and parameter ownership"
+    )]
     fn execute_context(
         &self,
         state: &Relational,
@@ -3630,13 +3857,14 @@ impl BoundQuery<'_> {
         declared: &[Option<DataType>],
         execution: &Execution<'_>,
         subquery: bool,
+        insert_source: bool,
     ) -> R<SqlResult> {
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
         if self.aggregate && cancel() {
             return Err(SqlError::Aborted);
         }
-        let used = subquery.then(|| self.query.used_parameters());
+        let used = (subquery || insert_source).then(|| self.query.used_parameters());
         for (index, (v, ty)) in params.iter().zip(&self.parameters).enumerate() {
             if used
                 .as_ref()
@@ -4866,7 +5094,7 @@ mod in_subquery_execution_tests {
             let mut cancel = || false;
             let execution = Execution::new(&mut cancel, &[]);
             execution.visits.set(MAX_JOIN_VISITS - remaining);
-            let result = bound.execute_context(&state, &source, &[], &[], &execution, false);
+            let result = bound.execute_context(&state, &source, &[], &[], &execution, false, false);
             if remaining == 3 {
                 assert_eq!(result.unwrap().rows.len(), 1);
                 assert_eq!(execution.visits.get(), MAX_JOIN_VISITS);

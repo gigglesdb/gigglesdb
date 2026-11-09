@@ -149,9 +149,29 @@ fn sql_insert_quoted_names_preserve_case() {
     assert!(matches!(p.statement, Statement::InsertMulti(_)));
 }
 #[test]
+fn sql_insert_select_on_conflict_do_nothing() {
+    let text = "INSERT INTO items SELECT 1,'a','x',10 ON CONFLICT DO NOTHING";
+    parsed(text);
+    let (_, mut s, _) = fixture();
+    assert_eq!(run(&mut s, text).affected, 1);
+    let got = rows(&mut s);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].values,
+        vec![
+            Value::Int(1),
+            Value::Text("a".into()),
+            Value::Text("x".into()),
+            Value::Int(10),
+        ]
+    );
+    assert_eq!(run(&mut s, text).affected, 0);
+    assert_eq!(rows(&mut s), got);
+}
+
+#[test]
 fn sql_insert_grammar_unsupported_matrix() {
     for text in [
-        "INSERT INTO items SELECT 1,'a','x',10 ON CONFLICT DO NOTHING",
         "INSERT INTO items VALUES (abs(1),'a','x',10),(2,'b','y',20)",
         "INSERT INTO items VALUES (1+1,'a','x',10),(2,'b','y',20)",
     ] {
@@ -742,6 +762,7 @@ fn admission_insert() -> Insert {
         overriding: None,
         conflict: None,
         returning: None,
+        source: None,
     }
 }
 fn create_wide_numeric_table(session: &mut SqlSession) {
@@ -862,6 +883,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         overriding: None,
         conflict: None,
         returning: None,
+        source: None,
     };
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Limit);
     // Fifty individually admitted numerics exceed the row's raw byte budget
@@ -888,6 +910,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         overriding: None,
         conflict: None,
         returning: None,
+        source: None,
     };
     assert_admission_rejected_without_copy(&mut state, &insert, &[], SqlError::Limit);
 }

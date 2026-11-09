@@ -15,6 +15,7 @@ pub(super) struct Insert {
     overriding: Option<bool>,
     conflict: Option<Conflict>,
     pub(super) returning: Option<returning::Returning>,
+    pub(super) source: Option<Box<query::Query>>,
 }
 #[derive(Debug, Clone)]
 struct Conflict {
@@ -57,7 +58,7 @@ impl Condition {
     }
 }
 
-/// Claim only multiple VALUES tuples or a top-level ON CONFLICT clause.
+/// Claim SELECT sources, multiple VALUES tuples or a top-level ON CONFLICT clause.
 pub(super) fn claims(tokens: &[Token]) -> bool {
     if tokens.iter().any(
         |token| matches!(token, Token::Word(word) if word == "default" || word == "overriding"),
@@ -66,8 +67,12 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
     }
     let mut depth = 0usize;
     let mut values_at = None;
+    let mut has_values_clause = false;
     for (index, token) in tokens.iter().enumerate() {
         match token {
+            Token::Word(word) if index >= 3 && word == "select" && !has_values_clause => {
+                return true;
+            }
             Token::Word(word) if depth == 0 && word == "on" => {
                 if matches!(tokens.get(index + 1), Some(Token::Word(word)) if word == "conflict") {
                     return true;
@@ -77,6 +82,7 @@ pub(super) fn claims(tokens: &[Token]) -> bool {
             // itself may legally be named values.
             Token::Word(word) if depth == 0 && index >= 3 && word == "values" => {
                 values_at.get_or_insert(index);
+                has_values_clause |= tokens.get(index - 1) != Some(&Token::Symbol('.'));
             }
             Token::Symbol('(') => depth += 1,
             Token::Symbol(')') => depth = depth.saturating_sub(1),
@@ -142,7 +148,10 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     p.need("into")?;
     let table = p.table_name()?;
     let alias = if p.word("as") { Some(p.name()?) } else { None };
-    let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
+    let columns = if p.tokens.get(p.at) == Some(&Token::Symbol('('))
+        && !matches!(p.tokens.get(p.at + 1), Some(Token::Word(word)) if word == "select")
+        && p.tokens.get(p.at + 1) != Some(&Token::Symbol('('))
+    {
         names(p)?
     } else {
         vec![]
@@ -160,16 +169,24 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         None
     };
     let default_values = p.word("default");
-    if !p.word("values") {
-        return Err(unsupported_or_syntax(p));
-    }
     let mut rows = Vec::new();
     let mut casts = BTreeMap::new();
     let mut defaults = Vec::new();
+    let source = if !default_values
+        && (matches!(p.tokens.get(p.at), Some(Token::Word(word)) if word == "select")
+            || p.tokens.get(p.at) == Some(&Token::Symbol('(')))
+    {
+        Some(Box::new(parse_source(p)?))
+    } else {
+        if !p.word("values") {
+            return Err(unsupported_or_syntax(p));
+        }
+        None
+    };
     if default_values {
         rows.push(vec![]);
         defaults.push(vec![]);
-    } else {
+    } else if source.is_none() {
         loop {
             p.punct('(')?;
             let mut row = Vec::new();
@@ -287,7 +304,62 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
         overriding,
         conflict,
         returning,
+        source,
     })
+}
+fn parse_source(p: &mut Parser) -> R<query::Query> {
+    let start = p.at;
+    let mut end = start;
+    let mut depth = 0usize;
+    while let Some(token) = p.tokens.get(end) {
+        match token {
+            Token::Word(word) if depth == 0 && word == "returning" => break,
+            Token::Word(word)
+                if depth == 0
+                    && word == "on"
+                    && matches!(p.tokens.get(end + 1), Some(Token::Word(word)) if word == "conflict")
+                    && (p.tokens.get(end + 2) == Some(&Token::Symbol('('))
+                        || matches!(p.tokens.get(end + 2), Some(Token::Word(word)) if word == "do")
+                        || matches!((p.tokens.get(end + 2), p.tokens.get(end + 3)),
+                            (Some(Token::Word(on)), Some(Token::Word(constraint))) if on == "on" && constraint == "constraint")) =>
+            {
+                break;
+            }
+            Token::Symbol(';') if depth == 0 => break,
+            Token::Symbol('(') => depth += 1,
+            Token::Symbol(')') => depth = depth.checked_sub(1).ok_or(SqlError::Syntax)?,
+            _ => {}
+        }
+        end += 1;
+    }
+    if depth != 0 {
+        return Err(SqlError::Syntax);
+    }
+    let mut tokens = p.tokens[start..end].to_vec();
+    while tokens.first() == Some(&Token::Symbol('(')) {
+        let mut nesting = 0usize;
+        let wraps = tokens.iter().enumerate().all(|(index, token)| {
+            match token {
+                Token::Symbol('(') => nesting += 1,
+                Token::Symbol(')') => nesting = nesting.saturating_sub(1),
+                _ => {}
+            }
+            nesting != 0 || index + 1 == tokens.len()
+        });
+        if !wraps || tokens.last() != Some(&Token::Symbol(')')) {
+            break;
+        }
+        tokens = tokens[1..tokens.len() - 1].to_vec();
+    }
+    let mut parser = Parser {
+        tokens,
+        at: 0,
+        params: BTreeSet::new(),
+    };
+    let source = query::Query::parse_insert_source(&mut parser)?;
+    p.params.extend(parser.params);
+    p.at = end;
+    Ok(source)
 }
 fn operand(p: &mut Parser) -> R<Operand> {
     if p.word("default") {
@@ -312,14 +384,28 @@ fn indexes(insert: &Insert, table: &TableDef) -> R<Vec<usize>> {
             .collect::<R<Vec<_>>>()?
     };
     unique(&indexes)?;
-    if insert.rows.iter().any(|row| row.len() != indexes.len()) {
+    if insert.source.is_none() && insert.rows.iter().any(|row| row.len() != indexes.len()) {
         return Err(SqlError::Type);
+    }
+    Ok(indexes)
+}
+fn source_indexes(insert: &Insert, state: &Relational, table: &TableDef) -> R<Vec<usize>> {
+    let mut indexes = indexes(insert, table)?;
+    if let Some(source) = &insert.source {
+        let width = source.insert_outputs(state)?.len();
+        if width > indexes.len() || !insert.columns.is_empty() && width < indexes.len() {
+            return Err(SqlError::Syntax);
+        }
+        indexes.truncate(width);
     }
     Ok(indexes)
 }
 impl Insert {
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
-        let mut dependencies = vec![];
+        let mut dependencies = self
+            .source
+            .as_ref()
+            .map_or_else(Vec::new, |source| source.sequence_dependencies());
         for expression in self.casts.values() {
             dependencies.extend(expression.sequence_dependencies());
         }
@@ -361,6 +447,7 @@ impl Insert {
             conflict: None,
             returning: None,
             copy_input: Some(types),
+            source: None,
         }
     }
     pub(super) fn replace_copy_rows(
@@ -398,9 +485,10 @@ impl Insert {
             .tables
             .get(&self.table)
             .ok_or(SqlError::UnknownTable)?;
-        let indexes = indexes(self, table)?;
+        let indexes = source_indexes(self, state, table)?;
         let mut dependencies = vec![];
-        for row_defaults in &self.defaults {
+        let source_defaults = self.source.as_ref().map(|_| vec![false; indexes.len()]);
+        for row_defaults in self.defaults.iter().chain(source_defaults.iter()) {
             for (index, column) in table.columns.iter().enumerate() {
                 if column.name == HIDDEN_ROWID {
                     continue;
@@ -445,7 +533,7 @@ impl Insert {
             .tables
             .get(&self.table)
             .ok_or(SqlError::UnknownTable)?;
-        let indexes = indexes(self, table)?;
+        let indexes = source_indexes(self, state, table)?;
         let mut parameters = vec![None; count];
         if declared.len() > count {
             return Err(SqlError::Parameters);
@@ -499,6 +587,18 @@ impl Insert {
                 )?;
             }
         }
+        if let Some(source) = &self.source {
+            let targets = indexes
+                .iter()
+                .map(|index| table.columns[*index].data_type.clone())
+                .collect::<Vec<_>>();
+            source.bind_insert_source(state, &targets, &mut parameters, declared)?;
+            if self.overriding.is_none() {
+                for index in &indexes {
+                    defaults::check_explicit(state, &table.columns[*index])?;
+                }
+            }
+        }
         if let Some(returning) = &self.returning {
             let (columns, parameters, typmods) = returning.describe(state, parameters)?;
             if duplicate {
@@ -523,6 +623,79 @@ impl Insert {
         })
     }
 }
+struct SourceRows {
+    insert: Insert,
+    types: Vec<Option<DataType>>,
+}
+fn materialize_source(
+    insert: &Insert,
+    state: &Relational,
+    params: &[Value],
+    declared: &[Option<DataType>],
+    clock: Option<&clock::ExecutionClock>,
+    cancel: &mut dyn FnMut() -> bool,
+    injected_source: Option<&dyn scan::RowSource>,
+) -> R<SourceRows> {
+    let source = insert.source.as_ref().ok_or(SqlError::Unsupported)?;
+    let table = state
+        .tables
+        .get(&insert.table)
+        .ok_or(SqlError::UnknownTable)?;
+    let indexes = source_indexes(insert, state, table)?;
+    let targets = indexes
+        .iter()
+        .map(|index| table.columns[*index].data_type.clone())
+        .collect::<Vec<_>>();
+    let mut parameters = insert
+        .describe(state, params.len(), declared)?
+        .parameters
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let bound = source
+        .bind_insert_source(state, &targets, &mut parameters, declared)?
+        .with_clock(clock);
+    let columns = bound.description(state).columns;
+    let unknown = source.insert_outputs(state)?;
+    // Input conversion is a binding obligation even when WHERE produces no rows.
+    for (value, target) in unknown.iter().zip(&targets) {
+        if let Some(value) = value {
+            query::assignment::literal(value.clone(), target, clock)?;
+        }
+    }
+    let legacy = scan::LegacyRows(state);
+    let result = bound.execute_insert_source(
+        state,
+        injected_source.unwrap_or(&legacy),
+        params,
+        cancel,
+        declared,
+    )?;
+    if result.rows.len() > MAX_ROWS {
+        return Err(SqlError::Limit);
+    }
+    let mut materialized = insert.clone();
+    materialized.source = None;
+    materialized.columns = indexes
+        .iter()
+        .map(|index| table.columns[*index].name.clone())
+        .collect();
+    materialized.rows = result
+        .rows
+        .into_iter()
+        .map(|row| row.values.into_iter().map(Expr::Literal).collect())
+        .collect();
+    materialized.defaults = vec![vec![false; indexes.len()]; materialized.rows.len()];
+    let types = columns
+        .into_iter()
+        .zip(unknown)
+        .map(|(column, unknown)| unknown.is_none().then_some(column.data_type))
+        .collect();
+    Ok(SourceRows {
+        insert: materialized,
+        types,
+    })
+}
 #[expect(
     clippy::too_many_arguments,
     reason = "shared INSERT row normalization inputs"
@@ -538,6 +711,7 @@ fn normalize_row(
     params: &[Value],
     declared: &[Option<DataType>],
     clock: Option<&clock::ExecutionClock>,
+    source_types: Option<&[Option<DataType>]>,
 ) -> R<Vec<Value>> {
     let hidden_rowid = table.hidden_rowid();
     let replaced = |index: usize, default: bool| {
@@ -555,7 +729,17 @@ fn normalize_row(
         values.iter().zip(indexes).zip(row_defaults).enumerate()
     {
         if !replaced(*index, *default) {
-            row[*index] = if let Some(expression) = insert.casts.get(&(row_index, slot)) {
+            row[*index] = if let Some(Some(source_type)) =
+                source_types.and_then(|types| types.get(slot))
+            {
+                // Allocate defaults in input order before a row's assignment can fail.
+                query::assignment::convert(
+                    expression.value(params)?,
+                    source_type,
+                    &table.columns[*index].data_type,
+                    clock,
+                )?
+            } else if let Some(expression) = insert.casts.get(&(row_index, slot)) {
                 let parameters = insert
                     .describe(state, params.len(), declared)?
                     .parameters
@@ -657,6 +841,7 @@ pub(super) fn normalize_copy(
             &[],
             &[],
             clock,
+            None,
         )?;
         output.push(
             table
@@ -739,13 +924,9 @@ impl<'a> ConflictPlan<'a> {
                 let column = &table.columns[index];
                 let value = match operand {
                     Operand::Default => BoundOperand::Default(defaults::default_sql(state, column)),
-                    Operand::Scalar(expression) => BoundOperand::Scalar(Box::new(expression.bind(
-                        table,
-                        alias,
-                        &column.data_type,
-                        &parameters,
-                        clock,
-                    )?)),
+                    Operand::Scalar(expression) => BoundOperand::Scalar(Box::new(
+                        expression.bind(table, alias, &column.data_type, &parameters, clock)?,
+                    )),
                 };
                 Ok((index, value))
             })
@@ -995,6 +1176,7 @@ pub(super) fn execute(
         cancel,
         &[],
         &mut Vec::new(),
+        None,
     )
 }
 
@@ -1012,10 +1194,29 @@ pub(super) fn execute_declared(
     cancel: &mut dyn FnMut() -> bool,
     declared: &[Option<DataType>],
     events: &mut Vec<constraints::Event>,
+    injected_source: Option<&dyn scan::RowSource>,
 ) -> R<SqlResult> {
     if cancel() {
         return Err(SqlError::Aborted);
     }
+    let materialized;
+    let (insert, source_types) = if insert.source.is_some() {
+        if expected.is_some() {
+            return Err(SqlError::Unsupported);
+        }
+        materialized = materialize_source(
+            insert,
+            state,
+            params,
+            declared,
+            clock,
+            cancel,
+            injected_source,
+        )?;
+        (&materialized.insert, Some(materialized.types.as_slice()))
+    } else {
+        (insert, None)
+    };
     admit_statement(insert, params)?;
     if cancel() {
         return Err(SqlError::Aborted);
@@ -1081,6 +1282,7 @@ pub(super) fn execute_declared(
             params,
             declared,
             clock,
+            source_types,
         )?;
         for value in &row {
             total = total

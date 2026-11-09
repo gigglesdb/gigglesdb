@@ -151,6 +151,7 @@ fn v2_statement_classes_and_reachable_refusals() {
             Refused("varchar/char types"),
         ),
         ("CREATE INDEX i ON t (n)", Refused("secondary indexes")),
+        ("INSERT INTO t SELECT id, n FROM t", Refused("INSERT ... SELECT")),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT UNIQUE)",
             Refused("secondary indexes"),

@@ -1461,6 +1461,11 @@ impl Prepared {
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
             Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
+            // INSERT ... SELECT reads other relations through the injected RowSource; v2 serves
+            // multi-table reads only from F8(c), so it stays refused until then.
+            Statement::InsertMulti(insert) if insert.source.is_some() => {
+                V2Class::Refused("INSERT ... SELECT")
+            }
             // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
             Statement::InsertMulti(_)
             | Statement::InsertExpressions(_)
@@ -1987,6 +1992,10 @@ impl Prepared {
     pub fn read_tables(&self) -> Vec<String> {
         match &self.statement {
             Statement::Query(query) => query.read_tables(),
+            Statement::InsertMulti(insert) => insert
+                .source
+                .as_ref()
+                .map_or_else(Vec::new, |source| source.read_tables()),
             Statement::Select { name, .. } => vec![name.clone()],
             _ => searched::target(self).map_or_else(Vec::new, query::Query::subquery_tables),
         }
@@ -3116,6 +3125,7 @@ impl Relational {
                     &mut cancel,
                     &prepared.parameter_types,
                     events,
+                    injected_source,
                 );
             }
             Statement::Sequence(ddl) => {

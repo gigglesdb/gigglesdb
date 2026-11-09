@@ -1,5 +1,5 @@
 use giggles_core::{
-    Admin, CoreError, Error, Limits,
+    Admin, CoreError, Error, Limits, Principal, TaskId,
     relational::Value,
     roles::{NewRole, TablePrivilege},
 };
@@ -13,6 +13,7 @@ use std::{
 
 const APP: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOTH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TASK: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 struct Directory(PathBuf);
 impl Drop for Directory {
     fn drop(&mut self) {
@@ -46,6 +47,7 @@ impl Fixture {
             ("reader", false),
             ("uowner", false),
             ("no_delete", false),
+            ("inserter", false),
         ] {
             admin
                 .roles()
@@ -74,13 +76,23 @@ impl Fixture {
         let application_service = |fingerprint: &str, tables| {
             Service::new(
                 admin.clone(),
-                vec![Binding {
-                    fingerprint: fingerprint.into(),
-                    role: Role::Application {
-                        domain: domain.clone(),
-                        tables,
+                vec![
+                    Binding {
+                        fingerprint: fingerprint.into(),
+                        role: Role::Application {
+                            domain: domain.clone(),
+                            tables,
+                        },
                     },
-                }],
+                    Binding {
+                        fingerprint: TASK.into(),
+                        role: Role::Task {
+                            domain: domain.clone(),
+                            task: TaskId(91),
+                            principal: Principal(92),
+                        },
+                    },
+                ],
                 Clock::new(0, 3600).unwrap(),
             )
             .unwrap()
@@ -94,6 +106,10 @@ impl Fixture {
                 .grant_table("t", name, &[TablePrivilege::Select, TablePrivilege::Delete])
                 .unwrap();
         }
+        admin
+            .roles()
+            .grant_table("t", "inserter", &[TablePrivilege::Insert])
+            .unwrap();
         admin.roles().set_table_owner("u", "uowner").unwrap();
         admin
             .roles()
@@ -265,5 +281,43 @@ fn native_table_free_routine_errors_remain_denied_before_classification() {
     for sql in ["SELECT nosuchfn()", "SELECT lower(body)"] {
         f.denied(&mut reader, sql);
         f.denied(&mut app, sql);
+    }
+}
+
+#[test]
+fn insert_select_requires_source_select_even_with_target_insert() {
+    let f = Fixture::new();
+    let mut inserter = f.role("inserter");
+    let sql = "INSERT INTO t(id) SELECT id FROM u WHERE id>3";
+    f.denied(&mut inserter, sql);
+    rows(
+        &mut f.role("root"),
+        "SELECT id FROM t ORDER BY id",
+        &[&[1], &[2], &[3]],
+    );
+    f.admin
+        .roles()
+        .grant_table("u", "inserter", &[TablePrivilege::Select])
+        .unwrap();
+    assert_eq!(inserter.execute_sql(sql, &[]).unwrap().affected, 1);
+    rows(
+        &mut f.role("root"),
+        "SELECT id FROM t ORDER BY id",
+        &[&[1], &[2], &[3], &[10]],
+    );
+}
+
+#[test]
+fn native_task_join_and_in_subquery_witnesses_remain_denied() {
+    let f = Fixture::new();
+    let mut task = f.service.session(TASK).unwrap();
+    // Inspect the prepare error as well as the task response's fixed envelope.
+    for sql in [
+        INNER,
+        READS[0],
+        "INSERT INTO t(id) SELECT id FROM u WHERE id>3",
+    ] {
+        f.denied(&mut task, sql);
+        assert!(!task.in_transaction(), "{sql}");
     }
 }

@@ -300,3 +300,8 @@ mod sql_text_order;
 
 #[path = "numeric_column_typmod.rs"]
 mod numeric_column_typmod;
+
+#[path = "relational_insert_select.rs"]
+mod relational_insert_select;
+#[path = "sql_insert_select_literals.rs"]
+mod sql_insert_select_literals;

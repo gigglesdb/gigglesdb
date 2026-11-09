@@ -1827,11 +1827,11 @@
               "interface": "sql",
               "kind": "statement",
               "expectation": "prepare-rejected",
-              "reason": "INSERT ... SELECT is not implemented; the current SQL INSERT accepts one VALUES tuple. The SQL lexer/grammar rejects this exact source before reaching the additionally reserved deliveries name.",
+              "reason": "INSERT ... SELECT is supported. This exact source is rejected because GigglesDB reserves the table name deliveries; PostgreSQL 18.6 accepts it as an ordinary name (known divergence).",
               "features": [
                 "sql_insert_from_read"
               ],
-              "prepare_error": "Syntax"
+              "prepare_error": "Reserved"
             }
           ]
         },
