@@ -104,8 +104,10 @@ class CorpusTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(path.read_bytes().startswith(b'\xef\xbb\xbf'))
                 text = path.read_text(encoding='utf-8')
-                self.assertIn('-- expect: compatible', text.splitlines())
                 case = corpus.parse_case(path)
+                self.assertIn(case['expect'], ('compatible', 'intentional'))
+                if case['expect'] == 'intentional':
+                    self.assertTrue(any(stmt.get('expected_sqlstate') for stmt in case['statements']))
                 self.assertFalse(case['warnings'])
                 self.assertTrue(case['statements'])
                 for statement in case['statements']:
@@ -208,6 +210,19 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(result['first_divergence']['index'], 1)
         pg = self.transcript(case, timed_out=True)
         self.assertEqual(corpus.compare_case(case, pg, giggles)['outcome'], 'HARNESS_ERROR')
+
+    def test_sqlstate_pin_is_enforced_for_intentional_cases(self):
+        case = self.parse('-- expect-sqlstate: 0A000\nSELECT 1;\n',
+                          '-- expect: intentional deliberate restriction\n')
+        pg = self.transcript(case)
+        self.assertEqual(corpus.compare_case(case, pg, self.transcript(case, ['0A000']))['outcome'], 'INTENTIONAL')
+        for state in ('42704', '00000'):
+            result = corpus.compare_case(case, pg, self.transcript(case, [state]))
+            self.assertEqual(result['outcome'], 'DIVERGENT')
+            self.assertEqual(result['sqlstate_pin_failures'][0]['actual'], state)
+        for sql in ('-- expect-sqlstate: BAD\nSELECT 1;', '-- expect-sqlstate: 0A000\n'):
+            with self.assertRaises(ValueError):
+                self.parse(sql)
 
     def test_summary(self):
         results = [dict(area='types', owner='A', outcome=o) for o in corpus.OUTCOMES]

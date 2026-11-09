@@ -69,6 +69,7 @@ def parse_case(path, area=None):
     path = Path(path)
     headers, statements, pending, parts = {}, [], False, []
     quote = None
+    expected_sqlstate = None
     for line in path.read_text(encoding='utf-8-sig').splitlines():
         if not quote and line.lstrip().startswith('--'):
             if re.fullmatch(r'\s*--\s*@error\s*', line):
@@ -76,6 +77,14 @@ def parse_case(path, area=None):
                     raise ValueError(f'{path}: misplaced @error')
                 pending = True
             else:
+                pin = re.fullmatch(r'\s*--\s*expect-sqlstate:\s*([0-9A-Z]{5})\s*', line)
+                if pin:
+                    if parts or expected_sqlstate is not None:
+                        raise ValueError(f'{path}: misplaced or duplicate SQLSTATE pin')
+                    expected_sqlstate = pin[1]
+                    continue
+                if re.match(r'\s*--\s*expect-sqlstate:', line):
+                    raise ValueError(f'{path}: invalid SQLSTATE pin')
                 m = re.fullmatch(r'\s*--\s*(case|title|owner|expect|compare|source):\s*(.*?)\s*', line)
                 if m:
                     if statements or parts or m[1] in headers:
@@ -91,9 +100,9 @@ def parse_case(path, area=None):
         if code.strip() or parts or quote or line.lstrip().startswith('/*'):
             parts.append(line.rstrip())
         if not quote and terminators:
-            statements.append(dict(index=len(statements) + 1, sql='\n'.join(parts), expected_error=pending))
-            parts, pending = [], False
-    if parts or quote or pending:
+            statements.append(dict(index=len(statements) + 1, sql='\n'.join(parts), expected_error=pending, expected_sqlstate=expected_sqlstate))
+            parts, pending, expected_sqlstate = [], False, None
+    if parts or quote or pending or expected_sqlstate:
         raise ValueError(f'{path}: unterminated SQL or dangling @error')
     if not statements:
         raise ValueError(f'{path}: empty case')
@@ -372,6 +381,10 @@ def compare_case(case, pg, giggles):
         harness = True
         result['harness_errors'].append(dict(reason='transcript statement count mismatch', index=None, sql=None))
     result['first_divergence'] = next(iter(result['differences']), None)
+    pin_failures = [dict(index=stmt['index'], expected=stmt['expected_sqlstate'], actual=g['sqlstate'])
+                    for stmt, g in zip(case['statements'], giggles['records'])
+                    if stmt.get('expected_sqlstate') and stmt['expected_sqlstate'] != g['sqlstate']]
+    result['sqlstate_pin_failures'] = pin_failures
     if harness:
         result['outcome'] = 'HARNESS_ERROR'
     elif result['first_divergence']:
@@ -383,6 +396,8 @@ def compare_case(case, pg, giggles):
             result['outcome'] = 'INTENTIONAL'
     elif case['expect'] == 'intentional':
         result['stale_expectation'] = True
+    if pin_failures and not harness:
+        result['outcome'] = 'DIVERGENT'
     return result
 
 

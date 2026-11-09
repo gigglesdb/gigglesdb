@@ -61,6 +61,8 @@ def differential_markdown(differential):
             lines += ['', f"- {case['id']}: {case['outcome']}; SQL: `{sql.replace('`', '')}`; PostgreSQL {pg.get('sqlstate','N/A')} vs GigglesDB {giggles.get('sqlstate','N/A')}."]
             if diff.get('reason'):
                 lines += ['  Harness reason: '+diff['reason']]
+            for pin in case.get('sqlstate_pin_failures', []):
+                lines += [f"  SQLSTATE pin at statement {pin['index']}: expected {pin['expected']}, observed {pin['actual']}."]
             error = giggles.get('stderr_first_line')
             if error:
                 lines += ['  First GigglesDB error: '+error]

@@ -150,7 +150,7 @@ def run_corpus_case(engine, client, client_pin, case, available, reason, data, r
     item = util.redact(item,[password])
     (directory/'result.json').write_text(json.dumps(item,indent=2)+'\n',encoding='utf-8')
     summary_keys = ('area','id','title','owner','expect','reason','outcome','compare','source',
-                    'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors','cleanup')
+                    'first_divergence','warnings','stale_expectation','row_counts','artifact_dir','harness_errors','cleanup','sqlstate_pin_failures')
     data['differential']['cases'].append({key:item.get(key) for key in summary_keys})
 
 

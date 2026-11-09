@@ -223,9 +223,12 @@ The retained-gap probes come from the DD68 [client gap source inventory](J:/gigg
 That read-only inventory identifies candidate boundaries; its historical evidence
 is not a measurement of these new cases. All cases explicitly declare
 `-- expect: compatible`: PostgreSQL behavior is the target, including errors
-marked with `-- @error`. Informational `-- expect-sqlstate: CODE` comments record
-the expected PostgreSQL code; the harness currently compares observed server
-states and does not enforce that comment as a separate assertion.
+marked with `-- @error`. Enforced `-- expect-sqlstate: CODE` annotations pin
+the GigglesDB code for the following statement. A mismatch is DIVERGENT even
+for an intentional case. `-- @error` independently marks an expected PostgreSQL
+error; omit it when PostgreSQL succeeds and GigglesDB deliberately rejects SQL.
+See [the compatibility matrix](MATRIX.md) for pinned R0 evidence and the
+additional intentional boundary cases.
 
 The parameter-typing gap for `SELECT position($1 IN $2)` with declared bytea
 parameters requires the H3 extended-protocol client lane. This simple-query SQL
