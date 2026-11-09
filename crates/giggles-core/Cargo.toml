@@ -2,6 +2,7 @@
 name = "giggles-core"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 
 [features]
 engine-rocksdb = ["dep:rocksdb"]
@@ -20,3 +21,27 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [dev-dependencies]
 giggles-model = { path = "../giggles-model" }
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[[test]]
+name = "accounting"
+path = "tests/accounting.rs"
+
+[[test]]
+name = "once"
+path = "tests/once.rs"
+
+[[test]]
+name = "process"
+path = "tests/process.rs"
+
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+
+[[test]]
+name = "relational_process"
+path = "tests/relational_process.rs"
