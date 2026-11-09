@@ -164,11 +164,19 @@ oracles) then show as modified or fail. Create and move worktrees with
 proof hashes from committed blobs (`git hash-object` / `git rev-parse <ref>:<path>`),
 never from CRLF working copies.
 
+The repository's `.cargo/config.toml` links with `rust-lld` and builds the dev
+profile with `debug = "line-tables-only"`. On giggles-core that cut the test
+build from 197s to 138s and the target directory from 21G to 11G, with
+backtraces keeping file and line numbers. Builds of any crate under the
+repository pick it up; do not override it per track, because a changed linker
+or debug level also misses the shared sccache.
+
 ## Integration test binaries
 
-giggles-core and giggles-language build their `tests/*.rs` files as a single
-test binary, `tests/all.rs` (`autotests = false`), because linking one binary
-per file dominated gate time. Build plus tests went from 620s to 249s for
+giggles-core, giggles-language, giggles-server, giggles-pg-catalog and
+giggles-pg-types build their `tests/*.rs` files as a single test binary,
+`tests/all.rs` (`autotests = false`), because linking one binary per file
+dominated gate time. Build plus tests went from 620s to 249s for
 giggles-core and from 115s to 67s for giggles-language; target directories
 shrank from 21G to 1.7G and 4.6G to 1.3G (GD-0001 E135-E137).
 
@@ -179,6 +187,26 @@ shrank from 21G to 1.7G and 4.6G to 1.3G (GD-0001 E135-E137).
 - Test names in the merged binary carry the file as a module prefix, so run
   one file with `cargo test --test all <file>::` and use
   `<file>::<test>` with `--exact`.
+
+## Landing with scripts/land-commit.sh
+
+`scripts/land-commit.sh` performs the steps of "Committing in the shared
+checkout" after a passing gate: private index seeded from the expected main,
+blobs hashed from an LF worktree (it refuses CR bytes in text files), the
+numstat printout, the `update-ref` compare-and-swap and its verification, the
+shared-index reset of the committed paths, and the K: sync, which leaves any
+K: copy with foreign edits alone and names it. It never pushes.
+
+```
+scripts/land-commit.sh --base <expected-old-main> --from <LF worktree>     --message-file <msg> <repo-relative path>...
+```
+
+Batch landings when several finished changes are ready. Stack them as
+separate commits in one worktree on the current main, run one full gate on the
+tip, then land them in order, passing each printed commit as the next
+`--base`. One gate then covers the whole stack instead of one gate per commit.
+If main moves first, rebase the stack and re-gate (or apply the disjoint-rebase
+rule).
 
 ## Cleaning up J:/gigglesdb-work
 
