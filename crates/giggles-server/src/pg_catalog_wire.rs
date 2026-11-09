@@ -52,7 +52,10 @@ pub(crate) fn snapshot(
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
+    let (roles, table_owners) = catalog_roles(session, &tables);
     giggles_pg_catalog::CatalogSnapshot {
+        roles,
+        table_owners,
         user: match &session.role {
             crate::Role::Database { name } => name.clone(),
             _ => "giggles".into(),
@@ -109,6 +112,64 @@ pub(crate) fn snapshot(
         // Forward-compatible with CatalogSnapshot fields added by giggles-pg-catalog (track G).
         ..giggles_pg_catalog::CatalogSnapshot::default()
     }
+}
+
+/// Presentation-only role rows and owners of the already authorization-filtered
+/// tables, read from the role registry so `pg_get_userbyid(relowner)` names the
+/// creating role as PostgreSQL does. OID 10 stays the bootstrap row; a registry
+/// role literally named `giggles` takes that slot. Registry failures fall back
+/// to the bootstrap-only default, which every caller already accepted.
+fn catalog_roles(
+    session: &crate::Session,
+    tables: &[giggles_core::relational::TableDef],
+) -> (
+    Vec<giggles_pg_catalog::RoleDef>,
+    std::collections::BTreeMap<u64, u32>,
+) {
+    let default = giggles_pg_catalog::CatalogSnapshot::default();
+    let registry = session.service.admin.roles();
+    let Ok(listed) = registry.list() else {
+        return (default.roles, default.table_owners);
+    };
+    let mut roles = default.roles;
+    let bootstrap = roles[0].name.clone();
+    let mut oids = std::collections::BTreeMap::new();
+    oids.insert(bootstrap.clone(), 10u32);
+    // Keep role-name bytes well under the catalog's 64 KiB snapshot input bound.
+    let mut name_bytes = bootstrap.len();
+    for role in listed {
+        if role.name == bootstrap {
+            roles[0].superuser = role.superuser;
+            roles[0].login = role.login;
+            roles[0].createrole = role.createrole;
+            continue;
+        }
+        name_bytes += role.name.len();
+        if role.name.starts_with("pg_") || role.oid == 10 || name_bytes > 32 * 1024 {
+            continue;
+        }
+        oids.insert(role.name.clone(), role.oid);
+        roles.push(giggles_pg_catalog::RoleDef {
+            oid: role.oid,
+            superuser: role.superuser,
+            login: role.login,
+            createrole: role.createrole,
+            createdb: role.superuser,
+            inherit: true,
+            replication: role.superuser,
+            bypassrls: role.superuser,
+            connlimit: -1,
+            name: role.name,
+        });
+    }
+    let owners = tables
+        .iter()
+        .filter_map(|table| {
+            let owner = registry.table_owner(&table.name).ok()??;
+            Some((table.id, *oids.get(&owner)?))
+        })
+        .collect();
+    (roles, owners)
 }
 
 fn is_vector(ty: PgType) -> bool {
