@@ -75,6 +75,75 @@ impl State {
         Ok(())
     }
 
+    fn copy_stdout(&mut self, select: &str, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
+        let prepared = core(session.prepare(select))?;
+        let description = core(session.describe(&prepared))?;
+        self.settings.queried = session.in_transaction();
+        let result = core(session.execute_prepared(&prepared, &[]))?;
+        let mut header = vec![0];
+        header.extend(
+            u16::try_from(description.columns.len())
+                .map_err(|_| "54000")?
+                .to_be_bytes(),
+        );
+        header.resize(header.len() + 2 * description.columns.len(), 0);
+        frame(b'H', &header, out)?;
+        for row in &result.rows {
+            let mut data = Vec::new();
+            for (i, (value, column)) in row.values.iter().zip(&description.columns).enumerate() {
+                if i > 0 {
+                    data.push(b'\t');
+                }
+                match encode(
+                    value,
+                    &column.data_type,
+                    0,
+                    self.settings.current.extra_float_digits,
+                    session.zone().unwrap_or(SessionZone::Fixed(0)),
+                )? {
+                    None => data.extend(b"\\N"),
+                    Some(value) => {
+                        let escaped = value
+                            .iter()
+                            .filter(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | 8 | 12 | 11))
+                            .count();
+                        let size = data
+                            .len()
+                            .checked_add(value.len())
+                            .and_then(|n| n.checked_add(escaped))
+                            .and_then(|n| n.checked_add(1))
+                            .ok_or("54000")?;
+                        if size > MAX_RESPONSE.saturating_sub(out.len()).saturating_sub(32) {
+                            return Err("54000");
+                        }
+                        data.try_reserve_exact(size - data.len())
+                            .map_err(|_| "54000")?;
+                        for b in value {
+                            match b {
+                                b'\\' => data.extend(b"\\\\"),
+                                b'\t' => data.extend(b"\\t"),
+                                b'\n' => data.extend(b"\\n"),
+                                b'\r' => data.extend(b"\\r"),
+                                8 => data.extend(b"\\b"),
+                                12 => data.extend(b"\\f"),
+                                11 => data.extend(b"\\v"),
+                                _ => data.push(b),
+                            }
+                        }
+                    }
+                }
+            }
+            data.push(b'\n');
+            frame(b'd', &data, out)?;
+        }
+        frame(b'c', &[], out)?;
+        complete(
+            &format!("COPY {}", result.rows.len()),
+            &SqlResult::default(),
+            out,
+        )
+    }
+
     fn simple_failure(
         &mut self,
         code: &'static str,
@@ -137,6 +206,16 @@ impl State {
             self.cursors
                 .execute(&command, session, &[], &[], &mut self.settings, true, out)?;
             return Ok(());
+        }
+        if let Some(tables) = crate::auth::statements::access_share_tables(sql)? {
+            if !session.in_transaction() || *implicit {
+                return Err("25P01");
+            }
+            core(session.validate_access_share(&tables))?;
+            return complete("LOCK TABLE", &SqlResult::default(), out);
+        }
+        if let Some(select) = crate::auth::statements::copy_stdout_select(sql)? {
+            return self.copy_stdout(&select, session, out);
         }
         if is_copy_sql(sql) {
             let (copy, prepared) = core(session.prepare_copy(sql))?;

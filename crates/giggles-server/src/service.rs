@@ -934,6 +934,56 @@ impl Session {
         }
         Ok(())
     }
+    pub(crate) fn validate_access_share(&mut self, tables: &[String]) -> Result<(), CoreError> {
+        self.authority_scope(|session| {
+            if session.is_aborted() {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if !session.role.is_sql() {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            for table in tables {
+                if !session.sql.relation_exists(table)? {
+                    return Err(CoreError::Sql(relational::SqlError::UnknownTable));
+                }
+                let allowed = match &session.role {
+                    Role::Database { name } => {
+                        let role = session
+                            .service
+                            .admin
+                            .roles()
+                            .get(name)
+                            .map_err(|_| CoreError::Policy(Error::Authentication))?
+                            .ok_or(CoreError::Policy(Error::Authentication))?;
+                        // PG18 accepts any of SELECT/INSERT/UPDATE/DELETE,
+                        // TRUNCATE or MAINTAIN; the latter two are not modeled.
+                        role.superuser
+                            || [
+                                roles::TablePrivilege::Select,
+                                roles::TablePrivilege::Insert,
+                                roles::TablePrivilege::Update,
+                                roles::TablePrivilege::Delete,
+                            ]
+                            .into_iter()
+                            .any(|privilege| {
+                                session
+                                    .table_privilege_allowed(table, name, Some(privilege))
+                                    .unwrap_or(false)
+                            })
+                    }
+                    Role::Application { tables, .. } => tables.contains(table),
+                    Role::Task { .. } => false,
+                };
+                if !allowed {
+                    return Err(CoreError::Policy(Error::Scope));
+                }
+            }
+            // Serializable snapshots pin the dump's schema and reads against
+            // concurrent DDL, so ACCESS SHARE needs validation, not a new lock.
+            Ok(())
+        })
+    }
+
     fn table_privilege_allowed(
         &self,
         table: &str,

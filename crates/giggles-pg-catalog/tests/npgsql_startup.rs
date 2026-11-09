@@ -55,6 +55,8 @@ const EXPECTED_TYPES: &str = r#"nspname|oid|typname|typtype|typnotnull|elemtypoi
 132|pg_catalog|1187|_interval|a|f|1186
 133|pg_catalog|1270|_timetz|a|f|1266
 136|pg_catalog|1231|_numeric|a|f|1700
+0|pg_catalog|3220|pg_lsn|b|f|
+0|pg_catalog|3221|_pg_lsn|a|f|3220
 "#;
 
 fn snapshot() -> CatalogSnapshot {
@@ -127,22 +129,22 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
             ("elemtypoid", 26)
         ]
     );
-    // G1-a2 tracks the known PG18 divergence: its 25 arrays report class a
+    // G1-a2 tracks the known PG18 divergence: its 26 arrays report class a
     // and an element OID. With pg_proc empty, G1-a reports b and NULL instead.
-    // The 26 base-type rows retain the exact PostgreSQL 18 reference values.
+    // The 27 base-type rows retain the exact PostgreSQL 18 reference values.
     assert_eq!(
         EXPECTED_TYPES
             .lines()
             .filter(|line| line.contains("|b|"))
             .count(),
-        26
+        27
     );
     assert_eq!(
         EXPECTED_TYPES
             .lines()
             .filter(|line| line.contains("|a|"))
             .count(),
-        25
+        26
     );
     let expected: BTreeSet<Vec<Value>> = EXPECTED_TYPES
         .lines()
@@ -166,8 +168,8 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
         })
         .collect();
     // E2a′: + bpchar, varchar, _bpchar, _varchar (ranks from the PG18.6 batch output).
-    assert_eq!(expected.len(), 51);
-    assert_eq!(types.rows.len(), 51);
+    assert_eq!(expected.len(), 53);
+    assert_eq!(types.rows.len(), 53);
     assert_eq!(
         types.rows.iter().cloned().collect::<BTreeSet<_>>(),
         expected

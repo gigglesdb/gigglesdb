@@ -30,6 +30,8 @@ enum Token {
     Text(String),
     Comma,
     Dot,
+    LParen,
+    RParen,
     Semi,
     Other,
 }
@@ -43,6 +45,8 @@ fn lex(sql: &str) -> Result<Vec<Token>, &'static str> {
         out.push(match c {
             ',' => Token::Comma,
             '.' => Token::Dot,
+            '(' => Token::LParen,
+            ')' => Token::RParen,
             ';' => Token::Semi,
             '\'' | '"' => {
                 let mut text = String::new();
@@ -537,6 +541,89 @@ pub(crate) fn execute(
             Ok(if *grant { "GRANT" } else { "REVOKE" })
         }
     }
+}
+
+// Parse the bounded pg_dump lock surface without granting admin authority.
+pub(crate) fn access_share_tables(sql: &str) -> Result<Option<Vec<String>>, &'static str> {
+    let tokens = match lex(sql) {
+        Ok(tokens) => tokens,
+        Err(_) => return Ok(None),
+    };
+    let mut p = Parser { tokens, pos: 0 };
+    if !p.kw("lock") {
+        return Ok(None);
+    }
+    p.kw("table");
+    let mut tables = Vec::new();
+    loop {
+        p.kw("only");
+        let mut name = p.ident()?;
+        if p.tokens.get(p.pos) == Some(&Token::Dot) {
+            p.pos += 1;
+            if name != "public" {
+                return Err("3F000");
+            }
+            name = p.ident()?;
+        }
+        tables.push(name);
+        if !p.comma() {
+            break;
+        }
+    }
+    if !p.kw("in") || !p.kw("access") || !p.kw("share") || !p.kw("mode") {
+        return Err("0A000");
+    }
+    p.kw("nowait");
+    if p.pos != p.tokens.len() {
+        return Err("42601");
+    }
+    Ok(Some(tables))
+}
+
+// COPY TO accepts only the text STDOUT envelope used by pg_dump.
+pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static str> {
+    let tokens = match lex(sql) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let mut p = Parser { tokens, pos: 0 };
+    if !p.kw("copy") || p.tokens.get(p.pos) == Some(&Token::LParen) {
+        return Ok(None);
+    }
+    let mut table = p.ident()?;
+    if p.tokens.get(p.pos) == Some(&Token::Dot) {
+        p.pos += 1;
+        if table != "public" {
+            return Err("3F000");
+        }
+        table = p.ident()?;
+    }
+    let mut columns = Vec::new();
+    if p.tokens.get(p.pos) == Some(&Token::LParen) {
+        p.pos += 1;
+        columns = p.names(false)?;
+        if p.tokens.get(p.pos) != Some(&Token::RParen) {
+            return Err("42601");
+        }
+        p.pos += 1;
+    }
+    if !p.kw("to") {
+        return Ok(None);
+    }
+    if !p.kw("stdout") || p.pos != p.tokens.len() {
+        return Err("0A000");
+    }
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let projection = if columns.is_empty() {
+        "*".into()
+    } else {
+        columns
+            .iter()
+            .map(|c| quoted(c))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Ok(Some(format!("SELECT {projection} FROM {}", quoted(&table))))
 }
 
 #[cfg(test)]

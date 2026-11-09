@@ -705,6 +705,7 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
 enum Plan {
     Empty,
     Cursor(cursor::Command),
+    AccessShare(Vec<String>),
     Admin(crate::auth::statements::AdminStatement),
     Control(crate::pg_transaction::Command),
     Settings(Vec<crate::pg_settings::Setting>),
@@ -743,6 +744,7 @@ impl Statement {
             }
             Plan::Cursor(_)
             | Plan::Task(_)
+            | Plan::AccessShare(_)
             | Plan::Admin(_)
             | Plan::Empty
             | Plan::Settings(_)
@@ -1005,7 +1007,18 @@ impl State {
                 if !is_copy_sql(&sql) {
                     core(session.authorize_sequence_sql(&sql))?;
                 }
-                let (mut p, mut d) = if is_copy_sql(&sql) {
+                let (mut p, mut d) = if let Some(tables) =
+                    crate::auth::statements::access_share_tables(&sql)?
+                {
+                    (
+                        Plan::AccessShare(tables),
+                        Description {
+                            typmods: vec![],
+                            columns: vec![],
+                            parameters: vec![],
+                        },
+                    )
+                } else if is_copy_sql(&sql) {
                     let (copy, prepared) = core(session.prepare_copy(&sql))?;
                     (
                         Plan::Copy(copy, Box::new(prepared)),
@@ -1463,6 +1476,14 @@ impl State {
                         retained,
                         out,
                     )?;
+                    return Ok(true);
+                }
+                if let Plan::AccessShare(tables) = &p.s.p {
+                    if !session.in_transaction() || self.implicit {
+                        return Err("25P01");
+                    }
+                    core(session.validate_access_share(tables))?;
+                    complete("LOCK TABLE", &SqlResult::default(), out)?;
                     return Ok(true);
                 }
                 if let Plan::Control(command) = &p.s.p {

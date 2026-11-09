@@ -157,6 +157,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
             "typacl",
             "typreceive",
             "typcollation",
+            "typstorage",
         ]
     );
     assert_eq!(result.fields[20].data_type, PgType::AclItemArray);
@@ -165,7 +166,7 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
         result
             .rows
             .iter()
-            .all(|r| r.len() == 23 && r[20] == Value::Null)
+            .all(|r| r.len() == 24 && r[20] == Value::Null)
     );
     // Scalar, array, nominal, nominal array, virtual composite and application
     // composite paths must all be represented with NULL, never invented grants.

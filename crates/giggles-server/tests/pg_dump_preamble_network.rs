@@ -61,11 +61,14 @@ impl Fixture {
         Self { service, pg, path }
     }
     async fn client(&self) -> Client {
+        self.client_as("owner").await
+    }
+    async fn client_as(&self, user: &str) -> Client {
         let (client, connection) = Config::new()
             .host("localhost")
             .hostaddr(self.pg.address.ip())
             .port(self.pg.address.port())
-            .user("owner")
+            .user(user)
             .dbname("postgres")
             .ssl_mode(SslMode::Disable)
             .connect(NoTls)
@@ -690,5 +693,227 @@ async fn pg_dump_set_config_from_pg_settings_simple_and_extended() {
         }
         drop(c);
     }
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn pg_dump_relation_inventory_statistics_simple_and_extended() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query("CREATE TABLE dump_stats (id integer PRIMARY KEY)")
+        .await
+        .unwrap();
+    let sql = "SELECT relpages,reltuples,relallvisible,relfrozenxid,relminmxid,relispopulated FROM pg_class WHERE relname='dump_stats'";
+    let messages = c.simple_query(sql).await.unwrap();
+    let row = messages
+        .iter()
+        .find_map(|m| {
+            if let SimpleQueryMessage::Row(r) = m {
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        (0..6).map(|i| row.get(i).unwrap()).collect::<Vec<_>>(),
+        ["0", "-1", "0", "2", "1", "t"]
+    );
+    let rows = c.query(sql, &[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i32>(0), 0);
+    assert_eq!(rows[0].get::<_, f32>(1), -1.0);
+    assert_eq!(rows[0].columns()[3].type_().oid(), 28);
+    assert!(rows[0].get::<_, bool>(5));
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn access_share_lock_validates_transactions_tables_and_any_write_grant() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query("CREATE TABLE lock_a (id integer PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.simple_query("CREATE TABLE lock_b (id integer PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.simple_query("CREATE ROLE lockreader LOGIN")
+        .await
+        .unwrap();
+    for extended in [false, true] {
+        for sql in [
+            "LOCK lock_a IN ACCESS SHARE MODE",
+            "LOCK TABLE ONLY public.lock_a, ONLY lock_b IN ACCESS SHARE MODE NOWAIT",
+        ] {
+            let error = if extended {
+                c.query(sql, &[]).await.unwrap_err()
+            } else {
+                c.simple_query(sql).await.unwrap_err()
+            };
+            assert_eq!(code(error), "25P01");
+            c.simple_query("BEGIN").await.unwrap();
+            if extended {
+                c.query(sql, &[]).await.unwrap();
+            } else {
+                c.simple_query(sql).await.unwrap();
+            }
+            c.simple_query("ROLLBACK").await.unwrap();
+        }
+        for (sql, state) in [
+            ("LOCK lock_a IN ACCESS EXCLUSIVE MODE", "0A000"),
+            ("LOCK lock_a, missing IN ACCESS SHARE MODE", "42P01"),
+        ] {
+            c.simple_query("BEGIN").await.unwrap();
+            let error = if extended {
+                c.query(sql, &[]).await.unwrap_err()
+            } else {
+                c.simple_query(sql).await.unwrap_err()
+            };
+            assert_eq!(code(error), state);
+            c.simple_query("ROLLBACK").await.unwrap();
+        }
+    }
+    let reader = f.client_as("lockreader").await;
+    reader.simple_query("BEGIN").await.unwrap();
+    assert_eq!(
+        code(
+            reader
+                .simple_query("LOCK lock_a IN ACCESS SHARE MODE")
+                .await
+                .unwrap_err()
+        ),
+        "42501"
+    );
+    reader.simple_query("ROLLBACK").await.unwrap();
+    c.simple_query("GRANT INSERT ON lock_a TO lockreader")
+        .await
+        .unwrap();
+    reader.simple_query("BEGIN").await.unwrap();
+    reader
+        .simple_query("LOCK lock_a IN ACCESS SHARE MODE NOWAIT")
+        .await
+        .unwrap();
+    reader.simple_query("ROLLBACK").await.unwrap();
+    drop(reader);
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn pg_dump_access_method_handlers_are_named_on_the_wire() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    assert_eq!(
+        values(
+            &c.simple_query("SELECT amhandler::pg_catalog.regproc FROM pg_am ORDER BY oid")
+                .await
+                .unwrap()
+        ),
+        ["heap_tableam_handler", "bthandler"]
+    );
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn text_copy_stdout_escapes_rows_and_preserves_nulls() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn message(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        let tag = s.read_u8().await.unwrap();
+        let len = s.read_u32().await.unwrap();
+        let mut body = vec![0; (len - 4) as usize];
+        s.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query("CREATE TABLE copy_out (id integer PRIMARY KEY, body text, data bytea)")
+        .await
+        .unwrap();
+    c.execute(
+        "INSERT INTO copy_out VALUES ($1,$2,$3)",
+        &[&1i32, &"tab\tline\nslash\\cr\r", &vec![0u8, 1, 255]],
+    )
+    .await
+    .unwrap();
+    c.simple_query("INSERT INTO copy_out VALUES (2,NULL,NULL)")
+        .await
+        .unwrap();
+    let mut s = tokio::net::TcpStream::connect(f.pg.address).await.unwrap();
+    let mut startup = 196608u32.to_be_bytes().to_vec();
+    startup.extend(b"user\0owner\0database\0postgres\0\0");
+    s.write_u32((startup.len() + 4) as u32).await.unwrap();
+    s.write_all(&startup).await.unwrap();
+    loop {
+        if message(&mut s).await.0 == b'Z' {
+            break;
+        }
+    }
+    let sql = b"COPY public.copy_out (id,body,data) TO stdout;\0";
+    s.write_u8(b'Q').await.unwrap();
+    s.write_u32((sql.len() + 4) as u32).await.unwrap();
+    s.write_all(sql).await.unwrap();
+    let mut data = Vec::new();
+    let mut done = false;
+    let mut complete = false;
+    loop {
+        let (tag, body) = message(&mut s).await;
+        match tag {
+            b'H' => assert_eq!(body, [0, 0, 3, 0, 0, 0, 0, 0, 0]),
+            b'd' => data.extend(body),
+            b'c' => done = true,
+            b'C' => {
+                assert_eq!(body, b"COPY 2\0");
+                complete = true;
+            }
+            b'Z' => break,
+            _ => panic!("unexpected COPY message: {tag} {body:?}"),
+        }
+    }
+    assert!(done && complete);
+    assert_eq!(
+        data,
+        b"1\ttab\\tline\\nslash\\\\cr\\r\t\\\\x0001ff\n2\t\\N\t\\N\n"
+    );
+    s.shutdown().await.unwrap();
+    drop(s);
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn copy_stdout_requires_select_and_a_real_table() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query("CREATE TABLE copy_private (id integer PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.simple_query("CREATE ROLE copyreader LOGIN")
+        .await
+        .unwrap();
+    c.simple_query("GRANT INSERT ON copy_private TO copyreader")
+        .await
+        .unwrap();
+    let reader = f.client_as("copyreader").await;
+    assert_eq!(
+        code(
+            reader
+                .simple_query("COPY copy_private TO stdout")
+                .await
+                .unwrap_err()
+        ),
+        "42501"
+    );
+    assert_eq!(
+        code(
+            c.simple_query("COPY missing_copy_table TO stdout")
+                .await
+                .unwrap_err()
+        ),
+        "42P01"
+    );
+    drop(reader);
+    drop(c);
     f.stop().await;
 }

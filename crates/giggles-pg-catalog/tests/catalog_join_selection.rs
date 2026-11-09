@@ -172,12 +172,12 @@ fn excluded_filters_and_join_shapes_keep_materialization() {
         &[],
     )
     .unwrap();
-    // pg_indexes adds its self-described composite row type to pg_type.
-    // The reflected type union includes K2c pg_indexes and G1-b (90 rows),
-    // plus G1-d pg_authid/pg_shadow and five information_schema composites (97 total), plus E2a′ varchar/bpchar and their arrays (101 total).
-    assert_eq!(lateral.rows.len(), 101);
+    // Every reflected catalog contributes a composite type; adding a truthful
+    // catalog must not change the join/correlation contract being tested.
+    let type_count = run("SELECT oid FROM pg_type", &[]).unwrap().rows.len();
+    assert_eq!(lateral.rows.len(), type_count);
     let correlated = run("SELECT t.oid FROM pg_type t WHERE t.oid=(SELECT e.oid FROM pg_type e,pg_namespace n WHERE e.oid=t.oid AND n.oid=11) ORDER BY t.oid", &[]).unwrap();
-    assert_eq!(correlated.rows.len(), 101);
+    assert_eq!(correlated.rows.len(), type_count);
 }
 
 #[test]

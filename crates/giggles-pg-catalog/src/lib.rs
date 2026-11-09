@@ -171,6 +171,10 @@ pub enum PgType {
     Regproc,
     /// Metadata descriptor only; non-NULL wire I/O is unsupported.
     PgNodeTree,
+    /// Metadata descriptor only; missing-value arrays are always NULL.
+    AnyArray,
+    /// Metadata descriptor only; subscription LSNs are always NULL.
+    PgLsn,
 }
 impl PgType {
     pub fn oid(self) -> u32 {
@@ -204,6 +208,8 @@ impl PgType {
             Self::Float8 => 701,
             Self::Regproc => 24,
             Self::PgNodeTree => 194,
+            Self::AnyArray => 2277,
+            Self::PgLsn => 3220,
         }
     }
     pub fn type_size(self) -> i16 {
@@ -211,7 +217,7 @@ impl PgType {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
             Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc => 4,
-            Self::Int8 | Self::Float8 => 8,
+            Self::Int8 | Self::Float8 | Self::PgLsn => 8,
             Self::Name => 64,
             _ => -1,
         }

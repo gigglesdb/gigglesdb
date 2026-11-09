@@ -590,7 +590,9 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
     assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
     for query in [
         "COPY app FROM STDIN WITH (FORMAT csv)",
-        "COPY app TO STDOUT",
+        // Text COPY TO is supported and covered by the raw-wire pg_dump test;
+        // simple_query cannot consume a successful COPY OUT response.
+        "COPY app TO STDOUT WITH (FORMAT csv)",
         "COPY app FROM 'file'",
     ] {
         assert_eq!(

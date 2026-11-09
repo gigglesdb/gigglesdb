@@ -102,6 +102,12 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("reloftype", T::Oid),
             ("relreplident", T::Char),
             ("reltoastrelid", T::Oid),
+            ("relpages", T::Int4),
+            ("reltuples", T::Float4),
+            ("relallvisible", T::Int4),
+            ("relfrozenxid", T::Xid),
+            ("relispopulated", T::Bool),
+            ("relminmxid", T::Xid),
         ],
         "pg_attribute" => &[
             ("attrelid", T::Oid),
@@ -120,6 +126,13 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("attndims", T::Int4),
             ("attislocal", T::Bool),
             ("attfdwoptions", T::TextArray),
+            ("attstattarget", T::Int4),
+            ("attstorage", T::Char),
+            ("attalign", T::Char),
+            ("attoptions", T::TextArray),
+            ("attcompression", T::Char),
+            ("atthasmissing", T::Bool),
+            ("attmissingval", T::AnyArray),
         ],
         "pg_type" => &[
             ("oid", T::Oid),
@@ -145,6 +158,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("typacl", T::AclItemArray),
             ("typreceive", T::Oid),
             ("typcollation", T::Oid),
+            ("typstorage", T::Char),
         ],
         "pg_index" => &[
             ("indexrelid", T::Oid),
@@ -255,6 +269,8 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("lanvalidator", T::Oid),
             ("xmin", T::Xid),
             ("lanacl", T::AclItemArray),
+            ("lanowner", T::Oid),
+            ("lanispl", T::Bool),
         ],
         "pg_roles" => &[
             ("rolname", T::Name),
@@ -357,6 +373,148 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("refobjid", T::Oid),
             ("refobjsubid", T::Int4),
             ("deptype", T::Char),
+        ],
+        // No extension initial privileges or SQL transforms are installed.
+        "pg_partitioned_table" => &[
+            ("partrelid", T::Oid),
+            ("partstrat", T::Char),
+            ("partnatts", T::Int2),
+            ("partdefid", T::Oid),
+            ("partattrs", T::Int2Vector),
+            ("partclass", T::OidVector),
+            ("partcollation", T::OidVector),
+            ("partexprs", T::PgNodeTree),
+        ],
+        "pg_statistic_ext" => &[
+            ("oid", T::Oid),
+            ("stxrelid", T::Oid),
+            ("stxname", T::Name),
+            ("stxnamespace", T::Oid),
+            ("stxowner", T::Oid),
+            ("stxkeys", T::Int2Vector),
+            ("stxstattarget", T::Int2),
+            ("stxkind", T::CharArray),
+            ("stxexprs", T::PgNodeTree),
+        ],
+        "pg_publication" => &[
+            ("oid", T::Oid),
+            ("pubname", T::Name),
+            ("pubowner", T::Oid),
+            ("puballtables", T::Bool),
+            ("pubinsert", T::Bool),
+            ("pubupdate", T::Bool),
+            ("pubdelete", T::Bool),
+            ("pubtruncate", T::Bool),
+            ("pubviaroot", T::Bool),
+            ("pubgencols", T::Char),
+        ],
+        "pg_publication_namespace" => &[("oid", T::Oid), ("pnpubid", T::Oid), ("pnnspid", T::Oid)],
+        "pg_publication_rel" => &[
+            ("oid", T::Oid),
+            ("prpubid", T::Oid),
+            ("prrelid", T::Oid),
+            ("prqual", T::PgNodeTree),
+            ("prattrs", T::Int2Vector),
+        ],
+        "pg_subscription" => &[
+            ("oid", T::Oid),
+            ("subdbid", T::Oid),
+            ("subskiplsn", T::PgLsn),
+            ("subname", T::Name),
+            ("subowner", T::Oid),
+            ("subenabled", T::Bool),
+            ("subbinary", T::Bool),
+            ("substream", T::Char),
+            ("subtwophasestate", T::Char),
+            ("subdisableonerr", T::Bool),
+            ("subpasswordrequired", T::Bool),
+            ("subrunasowner", T::Bool),
+            ("subfailover", T::Bool),
+            ("subconninfo", T::Text),
+            ("subslotname", T::Name),
+            ("subsynccommit", T::Text),
+            ("subpublications", T::TextArray),
+            ("suborigin", T::Text),
+        ],
+        "pg_seclabels" => &[
+            ("objoid", T::Oid),
+            ("classoid", T::Oid),
+            ("objsubid", T::Int4),
+            ("objtype", T::Text),
+            ("objnamespace", T::Oid),
+            ("objname", T::Text),
+            ("provider", T::Text),
+            ("label", T::Text),
+        ],
+        "pg_conversion" => &[
+            ("oid", T::Oid),
+            ("conname", T::Name),
+            ("connamespace", T::Oid),
+            ("conowner", T::Oid),
+            ("conforencoding", T::Int4),
+            ("contoencoding", T::Int4),
+            ("conproc", T::Regproc),
+            ("condefault", T::Bool),
+        ],
+        "pg_default_acl" => &[
+            ("oid", T::Oid),
+            ("defaclrole", T::Oid),
+            ("defaclnamespace", T::Oid),
+            ("defaclobjtype", T::Char),
+            ("defaclacl", T::AclItemArray),
+        ],
+        "pg_init_privs" => &[
+            ("objoid", T::Oid),
+            ("classoid", T::Oid),
+            ("objsubid", T::Int4),
+            ("privtype", T::Char),
+            ("initprivs", T::AclItemArray),
+        ],
+        "pg_transform" => &[
+            ("oid", T::Oid),
+            ("trftype", T::Oid),
+            ("trflang", T::Oid),
+            ("trffromsql", T::Regproc),
+            ("trftosql", T::Regproc),
+        ],
+        // No text-search configurations, dictionaries or parser runtimes are installed.
+        "pg_ts_config" => &[
+            ("oid", T::Oid),
+            ("cfgname", T::Name),
+            ("cfgnamespace", T::Oid),
+            ("cfgowner", T::Oid),
+            ("cfgparser", T::Oid),
+        ],
+        "pg_ts_config_map" => &[
+            ("mapcfg", T::Oid),
+            ("maptokentype", T::Int4),
+            ("mapseqno", T::Int4),
+            ("mapdict", T::Oid),
+        ],
+        "pg_ts_dict" => &[
+            ("oid", T::Oid),
+            ("dictname", T::Name),
+            ("dictnamespace", T::Oid),
+            ("dictowner", T::Oid),
+            ("dicttemplate", T::Oid),
+            ("dictinitoption", T::Text),
+        ],
+        "pg_ts_parser" => &[
+            ("oid", T::Oid),
+            ("prsname", T::Name),
+            ("prsnamespace", T::Oid),
+            ("prsstart", T::Regproc),
+            ("prstoken", T::Regproc),
+            ("prsend", T::Regproc),
+            ("prsheadline", T::Regproc),
+            ("prslextype", T::Regproc),
+        ],
+        "pg_ts_template" => &[
+            ("oid", T::Oid),
+            ("tmplname", T::Name),
+            ("tmplnamespace", T::Oid),
+            ("tmplinit", T::Regproc),
+            ("tmpllexize", T::Regproc),
         ],
         "pg_cast" => &[
             ("oid", T::Oid),
@@ -593,27 +751,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("evtenabled", T::Char),
             ("xmin", T::Xid),
         ],
-        "pg_statistic_ext" => &[
-            ("oid", T::Oid),
-            ("stxrelid", T::Oid),
-            ("stxnamespace", T::Oid),
-            ("stxname", T::Name),
-            ("stxkind", T::CharArray),
-            ("stxstattarget", T::Int2),
-        ],
-        "pg_publication" => &[
-            ("oid", T::Oid),
-            ("pubname", T::Name),
-            ("puballtables", T::Bool),
-        ],
-        "pg_publication_namespace" => &[("oid", T::Oid), ("pnpubid", T::Oid), ("pnnspid", T::Oid)],
-        "pg_publication_rel" => &[
-            ("oid", T::Oid),
-            ("prpubid", T::Oid),
-            ("prrelid", T::Oid),
-            ("prqual", T::PgNodeTree),
-            ("prattrs", T::Int2Vector),
-        ],
+
         _ => return None,
     }))
 }
@@ -653,6 +791,18 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_extension",
         "pg_depend",
         "pg_cast",
+        "pg_ts_config",
+        "pg_ts_config_map",
+        "pg_ts_dict",
+        "pg_ts_parser",
+        "pg_ts_template",
+        "pg_init_privs",
+        "pg_default_acl",
+        "pg_conversion",
+        "pg_seclabels",
+        "pg_subscription",
+        "pg_partitioned_table",
+        "pg_transform",
         "pg_inherits",
         "pg_foreign_table",
         "pg_opclass",
@@ -683,6 +833,7 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
         || matches!(
             name,
             "pg_indexes"
+                | "pg_seclabels"
                 | "pg_user"
                 | "pg_roles"
                 | "pg_shadow"
@@ -730,6 +881,25 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_extension" => 3079,
         "pg_depend" => 2608,
         "pg_cast" => 2605,
+        "pg_ts_config" => 3602,
+        "pg_ts_config_map" => 3603,
+        "pg_ts_dict" => 3600,
+        "pg_ts_parser" => 3601,
+        "pg_ts_template" => 3764,
+
+        "pg_init_privs" => 3394,
+        "pg_default_acl" => 826,
+        "pg_conversion" => 2607,
+        "pg_seclabels" => 12099,
+        "pg_subscription" => 6100,
+        "pg_publication" => 6104,
+        "pg_publication_namespace" => 6237,
+        "pg_publication_rel" => 6106,
+
+        "pg_partitioned_table" => 3350,
+        "pg_statistic_ext" => 3381,
+
+        "pg_transform" => 3576,
         "pg_inherits" => 2611,
         "pg_foreign_table" => 3118,
         "pg_opclass" => 2616,
@@ -1150,6 +1320,19 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             ],
         );
     }
+    // Nominal descriptors needed by NULL-only catalog fields, not new SQL types.
+    for (oid, name, len, kind, category, elem, array, input, receive) in [
+        (2277, "anyarray", -1, "p", "P", 0, 0, 2296, 2502),
+        (3220, "pg_lsn", 8, "b", "U", 0, 3221, 3229, 3238),
+        (3221, "_pg_lsn", -1, "b", "A", 3220, 0, 750, 2400),
+    ] {
+        let mut row = type_row(oid, name, len, elem, array, elem != 0);
+        row[4] = s(kind);
+        row[5] = s(category);
+        row[12] = I(input);
+        row[21] = I(receive);
+        add("pg_type", row);
+    }
     let mut ordered_tables = snapshot.tables.iter().collect::<Vec<_>>();
     ordered_tables.sort_by_key(|t| t.id);
     for t in ordered_tables {
@@ -1437,6 +1620,14 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             I(0),
             s(if row[3] == s("i") { "n" } else { "d" }),
             I(0),
+            I(0),
+            Value::Float4(giggles_pg_types::Float4::parse("-1").unwrap()),
+            I(0),
+            // FrozenTransactionId (2) and FirstMultiXactId (1): virtual
+            // relations have no heap transaction horizon to preserve in dumps.
+            I(if row[3] == s("r") { 2 } else { 0 }),
+            B(true),
+            I(if row[3] == s("r") { 1 } else { 0 }),
         ]);
     }
     for row in &mut all.get_mut("pg_type").unwrap().rows {
@@ -1449,6 +1640,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             25 | 1009 => 100,
             _ => 0,
         }));
+        row.push(s(type_layout(oid).0));
     }
     for row in &mut all.get_mut("pg_attribute").unwrap().rows {
         row[11] = I(match row[2] {
@@ -1456,6 +1648,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             I(25) => 100,
             _ => 0,
         });
+    }
+    for row in &mut all.get_mut("pg_attribute").unwrap().rows {
+        let oid = match row[2] {
+            I(oid) => oid,
+            _ => 0,
+        };
+        let (storage, align) = type_layout(oid);
+        // PG18 represents an unset statistics target as NULL; pg_dump's PG14
+        // query variant requires its equivalent -1 sentinel to suppress ALTERs.
+        row.extend([I(-1), s(storage), s(align), N, s(""), B(false), N]);
     }
     for row in &mut all.get_mut("pg_constraint").unwrap().rows {
         row.extend([I(0), B(false)]);
@@ -1483,6 +1685,41 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
     }
     Ok(all)
+}
+// PostgreSQL physical type layout is catalog presentation only; it does
+// not describe GigglesDB's persisted scalar encodings.
+fn type_layout(oid: i64) -> (&'static str, &'static str) {
+    let storage = match oid {
+        1700 => "m",
+        17
+        | 25
+        | 194
+        | 1042
+        | 1043
+        | 2249
+        | 2277
+        | 1000..=1034
+        | 1115
+        | 1182
+        | 1183
+        | 1185
+        | 1187
+        | 1231
+        | 1270
+        | 2951
+        | 3221 => "x",
+        n if n >= 32768 => "x",
+        _ => "p",
+    };
+    let align = match oid {
+        16 | 18 | 19 => "c",
+        21 => "s",
+        20 | 701 | 1016 | 1034 | 1083 | 1183 | 1114 | 1115 | 1184 | 1185 | 1186 | 1187 | 1266
+        | 1270 | 2249 | 2277 | 3220 | 3221 => "d",
+        n if n >= 32768 => "d",
+        _ => "i",
+    };
+    (storage, align)
 }
 fn type_len(t: PgType) -> i64 {
     t.type_size() as i64

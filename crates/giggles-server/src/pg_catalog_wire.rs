@@ -514,11 +514,17 @@ fn encode_with_extra(
                 v.to_be_bytes().to_vec()
             }
         }
-        (Value::Int(v), PgType::Oid | PgType::Regproc) if ty == PgType::Oid || *v == 330 => {
+        (Value::Int(v), PgType::Oid | PgType::Xid | PgType::Regproc)
+            if ty != PgType::Regproc || matches!(*v, 3 | 330) =>
+        {
             let v = u32::try_from(*v).map_err(|_| "22003")?;
             if format == 0 {
-                if ty == PgType::Regproc && v == 330 {
-                    b"bthandler".to_vec()
+                if ty == PgType::Regproc {
+                    if v == 3 {
+                        b"heap_tableam_handler".to_vec()
+                    } else {
+                        b"bthandler".to_vec()
+                    }
                 } else {
                     v.to_string().into_bytes()
                 }

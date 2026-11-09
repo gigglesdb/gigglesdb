@@ -76,6 +76,8 @@ enum K {
     In(Box<E>, Vec<E>, bool),
     InQuery(Box<E>, Box<Query>, bool),
     Subquery(Box<Query>),
+    Exists(Box<Query>, bool),
+    Distinct(Box<E>, Box<E>, bool),
     ArrayQuery(Box<Query>),
     ArrayAgg(Box<E>, Vec<Order>),
     Count(Option<Box<E>>),
@@ -101,6 +103,7 @@ enum Source {
     Series(E, E),
     Unnest(E, bool),
     Scalar(E),
+    Options(E),
     Filtered(Box<Source>, E),
     Join(Box<Source>, Box<Source>, E, bool, usize, bool),
 }
@@ -249,9 +252,6 @@ impl Visitor for Scan {
     type Break = Error;
     fn pre_visit_query(&mut self, q: &a::Query) -> ControlFlow<Error> {
         if let Some(with) = &q.with {
-            if with.recursive {
-                return ControlFlow::Break(Error::Unsupported);
-            }
             for cte in &with.cte_tables {
                 self.ctes.insert(ident(&cte.alias.name));
             }
@@ -261,14 +261,14 @@ impl Visitor for Scan {
     fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
         let p = object(n);
         let is_catalog = match p.as_slice() {
-            [n] => unqualified_catalog(n),
+            [n] => unqualified_catalog(n) || n == "pg_options_to_table",
             [s, _] => s == "pg_catalog" || s == "information_schema",
             _ => false,
         };
         if is_catalog {
             self.catalog = true;
             self.explicit_catalog = true;
-        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="unnest" || n=="pg_available_extension_versions" || self.ctes.contains(n))
+        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="unnest" || n=="pg_available_extension_versions" || n=="pg_options_to_table" || self.ctes.contains(n))
         {
             self.user = true
         }
@@ -436,6 +436,26 @@ fn plan_inner(
     if constructors > 256 {
         return flat_union::plan(tokens, gateway);
     }
+    // sqlparser 0.53 cannot parse OPERATOR(pg_catalog.=) ANY (...).
+    // Normalize only this built-in qualified operator, on tokens so literals
+    // and comments cannot be rewritten.
+    let mut tokens = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let mut i = 0;
+    while i + 5 < tokens.len() {
+        if matches!(&tokens[i], Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("operator"))
+            && tokens[i + 1] == Token::LParen
+            && matches!(&tokens[i + 2], Token::Word(w) if w.value == "pg_catalog")
+            && tokens[i + 3] == Token::Period
+            && tokens[i + 4] == Token::Eq
+            && tokens[i + 5] == Token::RParen
+        {
+            tokens.splice(i..i + 6, [Token::Eq]);
+        }
+        i += 1;
+    }
     let statements = Parser::new(&PostgreSqlDialect {})
         .with_recursion_limit(64)
         .with_tokens(tokens)
@@ -567,6 +587,21 @@ pub fn execute_with_startup(
         rows,
     })
 }
+fn definitely_empty(q: &Query) -> bool {
+    fn source(s: &Source) -> bool {
+        match s {
+            Source::Empty => true,
+            // No stored views/rules exist in this catalog model.
+            Source::Catalog(n) => n == "pg_rewrite",
+            Source::Derived(q) => definitely_empty(q),
+            Source::Filtered(s, _) => source(s),
+            Source::Join(l, r, _, left, _, _) => source(l) || !*left && source(r),
+            Source::Union(l, r, _) => definitely_empty(l) && definitely_empty(r),
+            _ => false,
+        }
+    }
+    q.limit == 0 || !q.aggregate && source(&q.source)
+}
 impl Compiler {
     fn query(&mut self, q: &a::Query, outer: &Schema) -> R<Query> {
         let previous = self.ctes.clone();
@@ -590,9 +625,6 @@ impl Compiler {
             return Err(Error::Unsupported);
         }
         if let Some(with) = &q.with {
-            if with.recursive {
-                return Err(Error::Unsupported);
-            }
             for cte in &with.cte_tables {
                 if !cte.alias.columns.is_empty() || cte.from.is_some() || cte.materialized.is_some()
                 {
@@ -602,7 +634,49 @@ impl Compiler {
                 if self.ctes.contains_key(&name) || unqualified_catalog(&name) {
                     return Err(Error::Unsupported);
                 }
-                let compiled = self.query(&cte.query, &vec![])?;
+                let compiled = if with.recursive {
+                    // Only eliminate recursion proven empty by absent catalog
+                    // features (e.g. pg_dump's materialized-view dependencies).
+                    // A potentially productive recursion remains unsupported.
+                    let a::SetExpr::SetOperation {
+                        op: a::SetOperator::Union,
+                        set_quantifier:
+                            a::SetQuantifier::None | a::SetQuantifier::All | a::SetQuantifier::Distinct,
+                        left,
+                        right,
+                    } = cte.query.body.as_ref()
+                    else {
+                        return Err(Error::Unsupported);
+                    };
+                    if cte.query.with.is_some()
+                        || cte.query.order_by.is_some()
+                        || cte.query.limit.is_some()
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    let mut branch = cte.query.clone();
+                    branch.body = left.clone();
+                    let mut seed = self.query(&branch, &vec![])?;
+                    if !definitely_empty(&seed) {
+                        return Err(Error::Unsupported);
+                    }
+                    seed.source = Source::Empty;
+                    self.ctes
+                        .insert(name.clone(), std::sync::Arc::new(seed.clone()));
+                    branch.body = right.clone();
+                    let step = self.query(&branch, &vec![])?;
+                    if !definitely_empty(&step) {
+                        return Err(Error::Unsupported);
+                    }
+                    if seed.fields.iter().map(|f| f.data_type).collect::<Vec<_>>()
+                        != step.fields.iter().map(|f| f.data_type).collect::<Vec<_>>()
+                    {
+                        return Err(Error::Type);
+                    }
+                    seed
+                } else {
+                    self.query(&cte.query, &vec![])?
+                };
                 self.ctes.insert(name, std::sync::Arc::new(compiled));
             }
         }
@@ -799,7 +873,12 @@ impl Compiler {
                 schema.extend(rs)
             }
             logical_columns.extend((operand_start..schema.len()).filter(|&i| !schema[i].system));
-            if has_natural && matches!(source, Source::Unnest(..) | Source::Scalar(_)) {
+            if has_natural
+                && matches!(
+                    source,
+                    Source::Unnest(..) | Source::Options(_) | Source::Scalar(_)
+                )
+            {
                 return Err(Error::Unsupported);
             }
             for j in &from.joins {
@@ -822,7 +901,10 @@ impl Compiler {
                             error
                         }
                     })?;
-                let lateral = matches!(rhs, Source::Unnest(..) | Source::Scalar(_));
+                let lateral = matches!(
+                    rhs,
+                    Source::Unnest(..) | Source::Options(_) | Source::Scalar(_)
+                );
                 if has_natural && lateral {
                     return Err(Error::Unsupported);
                 }
@@ -1142,6 +1224,29 @@ impl Compiler {
                             alias,
                             n,
                         )
+                    } else if n == "pg_options_to_table"
+                        && args.args.len() == 1
+                        && args.settings.is_none()
+                    {
+                        let mut es = self.args(&args.args, outer)?;
+                        let mut e = es.remove(0);
+                        expect(&mut e, PgType::TextArray)?;
+                        no_set_or_window(&e)?;
+                        (
+                            Source::Options(e),
+                            vec![
+                                Field {
+                                    name: "option_name".into(),
+                                    data_type: PgType::Text,
+                                },
+                                Field {
+                                    name: "option_value".into(),
+                                    data_type: PgType::Text,
+                                },
+                            ],
+                            alias,
+                            n,
+                        )
                     } else if n == "unnest" && args.args.len() == 1 && args.settings.is_none() {
                         let mut es = self.args(&args.args, outer)?;
                         let e = es.remove(0);
@@ -1408,6 +1513,7 @@ impl Compiler {
                         if parts.len() == 2 && parts[0] == "pg_catalog" =>
                     {
                         match parts[1].as_str() {
+                            "=" => Op::Eq,
                             "~" => Op::PGRegexMatch,
                             "!~" => Op::PGRegexNotMatch,
                             "~*" => Op::PGRegexIMatch,
@@ -1637,9 +1743,20 @@ impl Compiler {
                 match name {
                     "regclass" => (K::Regclass(e), PgType::Oid),
                     "regnamespace" => {
+                        if let K::Literal(Value::Text(name)) = &e.kind {
+                            let oid = match name.as_str() {
+                                "pg_catalog" => 11,
+                                "public" => 2200,
+                                "information_schema" => 13293,
+                                _ => return Err(Error::Unsupported),
+                            };
+                            return Ok(literal(Value::Int(oid), PgType::Oid));
+                        }
+
                         expect(&mut e, PgType::Oid)?;
                         (K::Call("_regnamespace".into(), vec![*e]), PgType::Name)
                     }
+                    "regproc" if e.ty == PgType::Regproc => return Ok(*e),
                     "regproc" => (K::Regproc(e), PgType::Oid),
                     "regoper" => (K::Regoper(e), PgType::Oid),
                     _ => {
@@ -1961,7 +2078,11 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 };
                 let e = self.expr(expr, schema)?;
-                let ty = array_element(e.ty)?;
+                let ty = if e.ty == PgType::Name {
+                    PgType::Char
+                } else {
+                    array_element(e.ty)?
+                };
                 (
                     K::Index(Box::new(e), Box::new(self.expr(index, schema)?)),
                     ty,
@@ -1984,11 +2105,27 @@ impl Compiler {
                 compare_op,
                 right,
                 ..
-            } if *compare_op == Op::Eq => (
-                K::Any(
-                    Box::new(self.expr(left, schema)?),
-                    compare_op.clone(),
-                    Box::new(self.expr(right, schema)?),
+            } if *compare_op == Op::Eq
+                || matches!(compare_op, Op::PGCustomBinaryOperator(parts) if parts.as_slice() == ["pg_catalog", "="]) =>
+            {
+                (
+                    K::Any(
+                        Box::new(self.expr(left, schema)?),
+                        Op::Eq,
+                        Box::new(self.expr(right, schema)?),
+                    ),
+                    PgType::Bool,
+                )
+            }
+            A::Exists { subquery, negated } => {
+                let q = self.query(subquery, schema)?;
+                (K::Exists(Box::new(q), *negated), PgType::Bool)
+            }
+            A::IsDistinctFrom(l, r) | A::IsNotDistinctFrom(l, r) => (
+                K::Distinct(
+                    Box::new(self.expr(l, schema)?),
+                    Box::new(self.expr(r, schema)?),
+                    matches!(e, A::IsNotDistinctFrom(..)),
                 ),
                 PgType::Bool,
             ),
@@ -2122,6 +2259,7 @@ fn validate_group(e: &E, group: &[E]) -> R<()> {
             | K::Expand(_)
             | K::Unnest(_)
             | K::Subquery(_)
+            | K::Exists(..)
             | K::InQuery(..)
             | K::ArrayQuery(_)
     ) {
@@ -2258,6 +2396,7 @@ fn coerce(e: &mut E, t: PgType) -> R<()> {
 }
 fn check_expr(e: &mut E) -> R<()> {
     match &mut e.kind {
+        K::Distinct(l, r, _) => compatible(l, r)?,
         K::Binary(l, op, r) => match op {
             Op::And | Op::Or => {
                 expect(l, PgType::Bool)?;
@@ -2327,6 +2466,10 @@ fn check_expr(e: &mut E) -> R<()> {
             e.ty = t;
         }
         K::Call(n, args) => match n.as_str() {
+            "array_remove" => {
+                let element = array_element(args[0].ty)?;
+                expect(&mut args[1], element)?;
+            }
             "acldefault" => {
                 expect(&mut args[0], PgType::Char)?;
                 coerce(&mut args[1], PgType::Oid)?;
@@ -2343,7 +2486,7 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(&mut args[0], PgType::Bytea)?;
                 expect(&mut args[1], PgType::Text)?;
             }
-            "quote_ident" => expect(&mut args[0], PgType::Text)?,
+            "quote_ident" | "quote_literal" => expect(&mut args[0], PgType::Text)?,
             "chr" => expect(&mut args[0], PgType::Int4)?,
             "pg_tablespace_location" | "pg_get_partkeydef" => expect(&mut args[0], PgType::Oid)?,
             "replace" | "translate" | "like" | "ilike" => {
@@ -2446,6 +2589,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("pg_is_in_recovery", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
         ("acldefault", 2) => PgType::AclItemArray,
+        ("array_remove", 2) => a[0].ty,
         ("replace" | "translate", 3)
         | ("pg_get_expr", 2 | 3)
         | ("format_type", 2)
@@ -2462,7 +2606,9 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         }
         ("pg_indexam_has_property", 2) | ("pg_relation_is_publishable", 1) => PgType::Bool,
         ("chr" | "upper", 1) => PgType::Text,
-        ("quote_ident" | "pg_tablespace_location" | "pg_get_partkeydef", 1) => PgType::Text,
+        ("quote_ident" | "quote_literal" | "pg_tablespace_location" | "pg_get_partkeydef", 1) => {
+            PgType::Text
+        }
         ("array_upper" | "array_lower" | "array_length", 2) | ("cardinality" | "length", 1) => {
             PgType::Int4
         }
@@ -2498,7 +2644,7 @@ fn find_expand(e: &E, out: &mut Option<E>) -> R<()> {
 }
 fn children(e: &E) -> Vec<&E> {
     match &e.kind {
-        K::Binary(a, _, b) | K::Any(a, _, b) | K::Index(a, b) => vec![a, b],
+        K::Binary(a, _, b) | K::Distinct(a, b, _) | K::Any(a, _, b) | K::Index(a, b) => vec![a, b],
         K::Not(a)
         | K::Neg(a)
         | K::Is(a, _, _)
@@ -2557,7 +2703,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 _ => return Err(Error::Type),
             });
         }
-        if let K::Subquery(q) | K::ArrayQuery(q) | K::InQuery(_, q, _) = &e.kind {
+        if let K::Subquery(q) | K::Exists(q, _) | K::ArrayQuery(q) | K::InQuery(_, q, _) = &e.kind {
             collect_parameters(q, types)?;
         }
         for c in children(e) {
@@ -2598,7 +2744,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 expr(a, types, None)?;
                 expr(b, types, None)?
             }
-            Source::Unnest(e, _) | Source::Scalar(e) => expr(e, types, None)?,
+            Source::Unnest(e, _) | Source::Options(e) | Source::Scalar(e) => expr(e, types, None)?,
             _ => {}
         }
         Ok(())
@@ -2762,6 +2908,25 @@ impl Runtime<'_> {
                 }
                 Ok(out)
             }
+            Source::Options(e) => match self.eval(e, outer, None, 0, &[], None)? {
+                Value::Null => Ok(vec![]),
+                Value::Array(values) => {
+                    let mut rows = Vec::new();
+                    let mut bytes = 0;
+                    for v in values {
+                        let Value::Text(option) = v else {
+                            return Err(Error::Unsupported);
+                        };
+                        self.charge(option.len().saturating_add(1))?;
+                        let (name, value) = option.split_once('=').unwrap_or((option.as_str(), ""));
+                        let row = vec![Value::Text(name.into()), Value::Text(value.into())];
+                        admit(&rows, &row, &mut bytes)?;
+                        rows.push(row);
+                    }
+                    Ok(rows)
+                }
+                _ => Err(Error::Type),
+            },
             Source::Unnest(e, ordinality) => match self.eval(e, outer, None, 0, &[], None)? {
                 Value::Null => Ok(vec![]),
                 Value::Array(values) => {
@@ -3270,6 +3435,30 @@ impl Runtime<'_> {
                 Value::Array(values)
             }
             K::Index(a, i) => {
+                if a.ty == PgType::Name {
+                    return match (ev(a)?, ev(i)?) {
+                        (N, _) | (_, N) => Ok(N),
+                        (S(name), I(index)) => {
+                            // PostgreSQL name subscripts address its fixed 64-byte
+                            // buffer, including zero padding; outside it is char zero.
+                            let byte = usize::try_from(index)
+                                .ok()
+                                .filter(|i| *i < 64)
+                                .and_then(|i| name.as_bytes().get(i))
+                                .copied()
+                                .unwrap_or(0);
+                            if !byte.is_ascii() {
+                                return Err(Error::Unsupported);
+                            }
+                            Ok(S(if byte == 0 {
+                                String::new()
+                            } else {
+                                char::from(byte).to_string()
+                            }))
+                        }
+                        _ => Err(Error::Type),
+                    };
+                }
                 let lower = if matches!(a.ty, PgType::Int2Vector | PgType::OidVector) {
                     0
                 } else {
@@ -3368,6 +3557,25 @@ impl Runtime<'_> {
                     B(b) => B(b ^ *negated),
                     _ => N,
                 }
+            }
+            K::Exists(q, negated) => {
+                // Keep original expressions in the plan for parameter typing,
+                // but EXISTS never evaluates its target values or sort keys.
+                let mut q = q.as_ref().clone();
+                q.projection = vec![literal(Value::Int(1), PgType::Int4)];
+                q.fields = vec![Field {
+                    name: "exists".into(),
+                    data_type: PgType::Int4,
+                }];
+                q.order.clear();
+                q.limit = q.limit.min(1);
+                B(!self.query(&q, row)?.is_empty() ^ *negated)
+            }
+            K::Distinct(l, r, negated) => {
+                let l = ev(l)?;
+                let r = ev(r)?;
+                self.charge(l.bytes().saturating_add(r.bytes()).saturating_add(1))?;
+                B((l != r) ^ *negated)
             }
             K::Subquery(q) => {
                 let rows = self.query(q, row)?;
@@ -3491,23 +3699,41 @@ impl Runtime<'_> {
             && !(n == "format_type" && v[0] != N)
             && !(n == "array_to_string" && v[0] != N && v[1] != N)
             && n != "_string_agg"
+            && n != "array_remove"
         {
             return Ok(N);
         }
         Ok(match n {
+            "array_remove" => match &v[0] {
+                N => N,
+                Value::Array(elements) => {
+                    self.charge(elements.len())?;
+                    Value::Array(elements.iter().filter(|e| **e != v[1]).cloned().collect())
+                }
+                _ => return Err(Error::Type),
+            },
             "acldefault" => {
                 // Defaults describe the object owner's initial rights, independently
                 // of actual catalog ACLs (which this snapshot does not model).
-                if text(v[0].clone())? != "n" {
-                    return Err(Error::Unsupported);
-                }
+                let privileges = match text(v[0].clone())?.as_str() {
+                    "n" => "UC",
+                    "r" => "arwdDxtm",
+                    "s" => "rwU",
+                    "f" => "X",
+                    "T" | "l" | "F" | "S" => "U",
+                    _ => return Err(Error::Unsupported),
+                };
                 let oid = integer(v[1].clone())?;
                 self.charge(self.snapshot.roles.len() + 16)?;
                 let owner = catalog::role_name(self.snapshot, oid)
                     .map(acl_role_name)
                     .unwrap_or_else(|| oid.to_string());
                 let grantee = if oid == 0 { "" } else { &owner };
-                Value::Array(vec![S(format!("{grantee}=UC/{owner}"))])
+                let mut acl = vec![S(format!("{grantee}={privileges}/{owner}"))];
+                if matches!(text(v[0].clone())?.as_str(), "f" | "T" | "l") {
+                    acl.insert(0, S(format!("={privileges}/{owner}")));
+                }
+                Value::Array(acl)
             }
             "encode" => {
                 let (Value::Bytes(input), S(format)) = (&v[0], &v[1]) else {
@@ -3683,6 +3909,40 @@ impl Runtime<'_> {
                 S(catalog::role_name(self.snapshot, oid)
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("unknown (OID={oid})")))
+            }
+            "quote_literal" => {
+                let S(input) = &v[0] else {
+                    return Err(Error::Type);
+                };
+                let slash = input.contains('\\');
+                let length = input
+                    .len()
+                    .checked_add(input.bytes().filter(|b| matches!(b, b'\'' | b'\\')).count())
+                    .and_then(|n| n.checked_add(2 + usize::from(slash)))
+                    .ok_or(Error::Limit)?;
+                if length
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(8))
+                    .ok_or(Error::Limit)?
+                    > remaining.unwrap_or(MAX_BYTES).min(MAX_BYTES)
+                {
+                    return Err(Error::Limit);
+                }
+                self.charge(input.len().saturating_add(length))?;
+                let mut output = String::new();
+                output.try_reserve_exact(length).map_err(|_| Error::Limit)?;
+                if slash {
+                    output.push('E');
+                }
+                output.push('\'');
+                for c in input.chars() {
+                    if matches!(c, '\'' | '\\') {
+                        output.push(c);
+                    }
+                    output.push(c);
+                }
+                output.push('\'');
+                S(output)
             }
             "quote_ident" => {
                 let name = text(v[0].clone())?;
@@ -4013,6 +4273,10 @@ fn cast(v: Value, t: PgType) -> R<Value> {
                 Ok(Value::Array(values))
             }
             _ => Err(Error::Type),
+        },
+        PgType::AclItemArray => match v {
+            S(s) if s == "{}" => Ok(Value::Array(Vec::new())),
+            _ => Err(Error::Unsupported),
         },
         PgType::Bytea => match v {
             Value::Bytes(_) => Ok(v),
