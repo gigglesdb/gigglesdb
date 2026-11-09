@@ -745,6 +745,14 @@ async fn access_share_lock_validates_transactions_tables_and_any_write_grant() {
     for extended in [false, true] {
         for sql in [
             "LOCK lock_a IN ACCESS SHARE MODE",
+            "LOCK lock_a IN ROW SHARE MODE",
+            "LOCK lock_a IN ROW EXCLUSIVE MODE",
+            "LOCK lock_a IN SHARE UPDATE EXCLUSIVE MODE",
+            "LOCK lock_a IN SHARE MODE",
+            "LOCK lock_a IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK lock_a IN EXCLUSIVE MODE",
+            "LOCK lock_a IN ACCESS EXCLUSIVE MODE",
+            "LOCK lock_a NOWAIT",
             "LOCK TABLE ONLY public.lock_a, ONLY lock_b IN ACCESS SHARE MODE NOWAIT",
         ] {
             let error = if extended {
@@ -762,8 +770,8 @@ async fn access_share_lock_validates_transactions_tables_and_any_write_grant() {
             c.simple_query("ROLLBACK").await.unwrap();
         }
         for (sql, state) in [
-            ("LOCK lock_a IN ACCESS EXCLUSIVE MODE", "0A000"),
             ("LOCK lock_a, missing IN ACCESS SHARE MODE", "42P01"),
+            ("LOCK missing IN EXCLUSIVE MODE", "42P01"),
         ] {
             c.simple_query("BEGIN").await.unwrap();
             let error = if extended {
@@ -796,6 +804,24 @@ async fn access_share_lock_validates_transactions_tables_and_any_write_grant() {
         .await
         .unwrap();
     reader.simple_query("ROLLBACK").await.unwrap();
+    reader.simple_query("BEGIN").await.unwrap();
+    assert_eq!(
+        code(
+            reader
+                .simple_query("LOCK lock_a IN SHARE MODE")
+                .await
+                .unwrap_err()
+        ),
+        "42501"
+    );
+    reader.simple_query("ROLLBACK").await.unwrap();
+    c.simple_query("GRANT UPDATE ON lock_a TO lockreader")
+        .await
+        .unwrap();
+    reader
+        .simple_query("BEGIN; LOCK lock_a IN ACCESS EXCLUSIVE MODE NOWAIT; ROLLBACK")
+        .await
+        .unwrap();
     drop(reader);
     drop(c);
     f.stop().await;
@@ -1007,6 +1033,100 @@ async fn dump_routes_resolve_schema_qualifiers_and_search_path() {
     }
     s.shutdown().await.unwrap();
     drop(s);
+    drop(c);
+    f.stop().await;
+}
+
+// Expected payloads captured from PostgreSQL 18.6 (Docker postgres:18.6).
+#[tokio::test]
+async fn copy_formats_match_pg18_bytes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn message(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        let tag = s.read_u8().await.unwrap();
+        let len = s.read_u32().await.unwrap();
+        let mut body = vec![0; (len - 4) as usize];
+        s.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query(
+        "CREATE TABLE copy_formats (id integer, body text, data bytea, n numeric, ts timestamptz)",
+    )
+    .await
+    .unwrap();
+    c.simple_query("INSERT INTO copy_formats VALUES (1,'a,b','\\x0001ff',12.50,'2001-01-01 00:00:00+00'),(2,'',NULL,NULL,NULL),(3,NULL,NULL,NULL,NULL)").await.unwrap();
+    for (format, expected) in [
+        (
+            "csv, HEADER",
+            &[
+                105, 100, 44, 98, 111, 100, 121, 44, 100, 97, 116, 97, 44, 110, 44, 116, 115, 10,
+                49, 44, 34, 97, 44, 98, 34, 44, 92, 120, 48, 48, 48, 49, 102, 102, 44, 49, 50, 46,
+                53, 48, 44, 50, 48, 48, 49, 45, 48, 49, 45, 48, 49, 32, 48, 48, 58, 48, 48, 58, 48,
+                48, 43, 48, 48, 10, 50, 44, 34, 34, 44, 44, 44, 10, 51, 44, 44, 44, 44, 10,
+            ][..],
+        ),
+        (
+            "binary",
+            &[
+                80, 71, 67, 79, 80, 89, 10, 255, 13, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0,
+                4, 0, 0, 0, 1, 0, 0, 0, 3, 97, 44, 98, 0, 0, 0, 3, 0, 1, 255, 0, 0, 0, 12, 0, 2, 0,
+                0, 0, 0, 0, 2, 0, 12, 19, 136, 0, 0, 0, 8, 0, 0, 28, 194, 169, 235, 64, 0, 0, 5, 0,
+                0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 0, 5, 0, 0, 0, 4, 0, 0, 0, 3, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            ][..],
+        ),
+        (
+            "csv, HEADER, DELIMITER '|', QUOTE '~', NULL 'nil'",
+            &[
+                105, 100, 124, 98, 111, 100, 121, 124, 100, 97, 116, 97, 124, 110, 124, 116, 115,
+                10, 49, 124, 97, 44, 98, 124, 92, 120, 48, 48, 48, 49, 102, 102, 124, 49, 50, 46,
+                53, 48, 124, 50, 48, 48, 49, 45, 48, 49, 45, 48, 49, 32, 48, 48, 58, 48, 48, 58,
+                48, 48, 43, 48, 48, 10, 50, 124, 124, 110, 105, 108, 124, 110, 105, 108, 124, 110,
+                105, 108, 10, 51, 124, 110, 105, 108, 124, 110, 105, 108, 124, 110, 105, 108, 124,
+                110, 105, 108, 10,
+            ][..],
+        ),
+    ] {
+        let mut s = tokio::net::TcpStream::connect(f.pg.address).await.unwrap();
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend(b"user\0owner\0database\0postgres\0\0");
+        s.write_u32((startup.len() + 4) as u32).await.unwrap();
+        s.write_all(&startup).await.unwrap();
+        loop {
+            if message(&mut s).await.0 == b'Z' {
+                break;
+            }
+        }
+        let sql =
+            format!("COPY (SELECT * FROM copy_formats ORDER BY id) TO STDOUT (FORMAT {format});\0");
+        let sql = sql.as_bytes();
+        s.write_u8(b'Q').await.unwrap();
+        s.write_u32((sql.len() + 4) as u32).await.unwrap();
+        s.write_all(sql).await.unwrap();
+        let mut data = Vec::new();
+        let mut done = false;
+        let mut complete = false;
+        loop {
+            let (tag, body) = message(&mut s).await;
+            match tag {
+                b'H' => assert_eq!(body[0], u8::from(format == "binary")),
+                b'd' => data.extend(body),
+                b'c' => done = true,
+                b'C' => {
+                    assert_eq!(body, b"COPY 3\0");
+                    complete = true;
+                }
+                b'Z' => break,
+                _ => panic!("unexpected COPY message: {tag} {body:?}"),
+            }
+        }
+        assert!(done && complete);
+        assert_eq!(data, expected, "{format}");
+        s.shutdown().await.unwrap();
+        drop(s);
+    }
     drop(c);
     f.stop().await;
 }

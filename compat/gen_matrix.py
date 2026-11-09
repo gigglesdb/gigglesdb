@@ -10,8 +10,6 @@ from pathlib import Path
 DIVERGENCES = (
     ('Relation names are globally unique across schemas', '42P07', 'global_relation_name'),
     ('Type names are globally unique across schemas', '42710', 'global_type_name'),
-    ('LOCK modes other than ACCESS SHARE', '0A000', 'lock_mode'),
-    ('COPY TO forms other than text STDOUT', '0A000', 'copy_to_csv'),
     ('Composite-typed columns', '0A000', 'composite_column'),
     ('DROP TYPE CASCADE', '0A000', 'drop_type_cascade'),
     ('Casts to a domain type', '42704', 'domain_cast'),

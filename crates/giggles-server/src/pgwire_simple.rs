@@ -75,33 +75,69 @@ impl State {
         Ok(())
     }
 
-    fn copy_stdout(&mut self, select: &str, session: &mut Session, out: &mut Vec<u8>) -> R<()> {
-        let prepared = core(session.prepare(select))?;
+    fn copy_stdout(
+        &mut self,
+        options: &crate::auth::statements::CopyOutput,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+    ) -> R<()> {
+        let prepared = core(session.prepare(&options.select))?;
         let description = core(session.describe(&prepared))?;
         self.settings.queried = session.in_transaction();
         let result = core(session.execute_prepared(&prepared, &[]))?;
-        let mut header = vec![0];
+        let mut header = vec![u8::from(options.format == 2)];
         header.extend(
             u16::try_from(description.columns.len())
                 .map_err(|_| "54000")?
                 .to_be_bytes(),
         );
-        header.resize(header.len() + 2 * description.columns.len(), 0);
+        for _ in &description.columns {
+            header.extend(i16::from(options.format == 2).to_be_bytes());
+        }
         frame(b'H', &header, out)?;
+        if options.format == 2 {
+            frame(b'd', b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", out)?;
+        }
+        if options.header {
+            let mut data = Vec::new();
+            for (i, column) in description.columns.iter().enumerate() {
+                if i > 0 {
+                    data.push(options.delimiter);
+                }
+                copy_csv_field(column.name.as_bytes(), options, &mut data);
+            }
+            data.push(b'\n');
+            frame(b'd', &data, out)?;
+        }
         for row in &result.rows {
             let mut data = Vec::new();
+            if options.format == 2 {
+                data.extend((description.columns.len() as i16).to_be_bytes());
+            }
             for (i, (value, column)) in row.values.iter().zip(&description.columns).enumerate() {
-                if i > 0 {
-                    data.push(b'\t');
+                if i > 0 && options.format != 2 {
+                    data.push(options.delimiter);
                 }
                 match encode(
                     value,
                     &column.data_type,
-                    0,
+                    u16::from(options.format == 2),
                     self.settings.current.extra_float_digits,
                     session.zone().unwrap_or(SessionZone::Fixed(0)),
                 )? {
-                    None => data.extend(b"\\N"),
+                    None if options.format == 2 => data.extend((-1i32).to_be_bytes()),
+                    Some(value) if options.format == 2 => {
+                        data.extend(
+                            i32::try_from(value.len())
+                                .map_err(|_| "54000")?
+                                .to_be_bytes(),
+                        );
+                        data.extend(value);
+                    }
+                    None => data.extend(&options.null),
+                    Some(value) if options.format == 1 => {
+                        copy_csv_field(&value, options, &mut data)
+                    }
                     Some(value) => {
                         let escaped = value
                             .iter()
@@ -127,14 +163,23 @@ impl State {
                                 8 => data.extend(b"\\b"),
                                 12 => data.extend(b"\\f"),
                                 11 => data.extend(b"\\v"),
+                                b if b == options.delimiter => {
+                                    data.push(b'\\');
+                                    data.push(b);
+                                }
                                 _ => data.push(b),
                             }
                         }
                     }
                 }
             }
-            data.push(b'\n');
+            if options.format != 2 {
+                data.push(b'\n');
+            }
             frame(b'd', &data, out)?;
+        }
+        if options.format == 2 {
+            frame(b'd', &(-1i16).to_be_bytes(), out)?;
         }
         frame(b'c', &[], out)?;
         complete(
@@ -213,7 +258,7 @@ impl State {
             if !session.in_transaction() || *implicit {
                 return Err("25P01");
             }
-            core(session.validate_access_share(&tables))?;
+            validate_lock(session, &tables.0, tables.1)?;
             return complete("LOCK TABLE", &SqlResult::default(), out);
         }
         if let Some(select) = crate::auth::statements::copy_stdout_select(sql)? {
@@ -623,6 +668,78 @@ pub(super) fn execute_settings(
         complete(assignment.tag(), &SqlResult::default(), out)?;
     }
     Ok(())
+}
+
+
+fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, out: &mut Vec<u8>) {
+    let quoted = value == options.null
+        || value == b"\\."
+        || value
+            .iter()
+            .any(|b| *b == options.delimiter || *b == options.quote || matches!(b, b'\n' | b'\r'));
+    if quoted {
+        out.push(options.quote);
+    }
+    for b in value {
+        if quoted && *b == options.quote {
+            out.push(*b);
+        }
+        out.push(*b);
+    }
+    if quoted {
+        out.push(options.quote);
+    }
+}
+
+// Serializable snapshots pin schema and reads; explicit table lock modes are
+// validated no-ops, with PostgreSQL's mode-dependent privilege requirements.
+pub(super) fn validate_lock(session: &mut Session, tables: &[String], strong: bool) -> R<()> {
+    use giggles_core::{Error, roles::TablePrivilege};
+    core(session.validate_access_share(tables))?;
+    if !strong {
+        return Ok(());
+    }
+    core(session.authority_scope(|session| {
+        for table in tables {
+            let prepared = session
+                .sql
+                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))?;
+            let table = prepared.table().ok_or(CoreError::Sql(
+                giggles_core::relational::SqlError::UnknownTable,
+            ))?;
+            let allowed = match &session.role {
+                Role::Database { name } => {
+                    let roles = session.service.admin.roles();
+                    let role = roles
+                        .get(name)
+                        .map_err(|_| CoreError::Policy(Error::Authentication))?
+                        .ok_or(CoreError::Policy(Error::Authentication))?;
+                    let authority = session.sql.table_authority_name(table)?;
+                    let owner = roles
+                        .table_owner(&authority)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                    let privileges = roles
+                        .table_privileges(&authority, name)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?;
+                    role.superuser
+                        || owner.as_deref() == Some(name)
+                        || if strong {
+                            privileges.contains(&TablePrivilege::Update)
+                                || privileges.contains(&TablePrivilege::Delete)
+                        } else {
+                            privileges.contains(&TablePrivilege::Select)
+                        }
+                }
+                Role::Application { tables, .. } => tables.contains(table),
+                Role::Task { .. } => false,
+            };
+            if !allowed {
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            session.sql.describe(&prepared)?;
+        }
+        Ok(())
+    }))
 }
 
 #[cfg(test)]

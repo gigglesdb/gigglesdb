@@ -54,8 +54,6 @@ The cases below pin GigglesDB SQLSTATEs separately from the historical R0 totals
 | --- | --- | --- |
 | Relation names are globally unique across schemas | `42P07` | [global_relation_name](corpus/known_gaps/global_relation_name.sql) |
 | Type names are globally unique across schemas | `42710` | [global_type_name](corpus/known_gaps/global_type_name.sql) |
-| LOCK modes other than ACCESS SHARE | `0A000` | [lock_mode](corpus/known_gaps/lock_mode.sql) |
-| COPY TO forms other than text STDOUT | `0A000` | [copy_to_csv](corpus/known_gaps/copy_to_csv.sql) |
 | Composite-typed columns | `0A000` | [composite_column](corpus/known_gaps/composite_column.sql) |
 | DROP TYPE CASCADE | `0A000` | [drop_type_cascade](corpus/known_gaps/drop_type_cascade.sql) |
 | Casts to a domain type | `42704` | [domain_cast](corpus/known_gaps/domain_cast.sql) |

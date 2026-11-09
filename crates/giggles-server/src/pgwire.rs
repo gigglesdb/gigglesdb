@@ -752,7 +752,7 @@ fn prepare_declared_sql(session: &mut Session, sql: &str, oids: &[u32]) -> R<(Pl
 enum Plan {
     Empty,
     Cursor(cursor::Command),
-    AccessShare(Vec<String>),
+    AccessShare((Vec<String>, bool)),
     Admin(crate::auth::statements::AdminStatement),
     Control(crate::pg_transaction::Command),
     Settings(Vec<crate::pg_settings::Setting>),
@@ -1544,7 +1544,7 @@ impl State {
                     if !session.in_transaction() || self.implicit {
                         return Err("25P01");
                     }
-                    core(session.validate_access_share(tables))?;
+                    simple::validate_lock(session, &tables.0, tables.1)?;
                     complete("LOCK TABLE", &SqlResult::default(), out)?;
                     return Ok(true);
                 }

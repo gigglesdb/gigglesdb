@@ -548,7 +548,7 @@ fn quote_relation(name: &str) -> String {
 }
 
 // Parse the bounded pg_dump lock surface without granting admin authority.
-pub(crate) fn access_share_tables(sql: &str) -> Result<Option<Vec<String>>, &'static str> {
+pub(crate) fn access_share_tables(sql: &str) -> Result<Option<(Vec<String>, bool)>, &'static str> {
     let tokens = match lex(sql) {
         Ok(tokens) => tokens,
         Err(_) => return Ok(None),
@@ -573,27 +573,101 @@ pub(crate) fn access_share_tables(sql: &str) -> Result<Option<Vec<String>>, &'st
             break;
         }
     }
-    if !p.kw("in") || !p.kw("access") || !p.kw("share") || !p.kw("mode") {
-        return Err("0A000");
+    let mut strong = true; // PostgreSQL defaults to ACCESS EXCLUSIVE.
+    if p.kw("in") {
+        let start = p.pos;
+        while p.pos < p.tokens.len() && p.tokens[p.pos] != Token::Word("mode".into()) {
+            p.pos += 1;
+        }
+        let mode = p.tokens[start..p.pos]
+            .iter()
+            .map(|t| match t {
+                Token::Word(w) => w.as_str(),
+                _ => "?",
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        strong = match mode.as_str() {
+            "access share" | "row share" => false,
+            "row exclusive"
+            | "share update exclusive"
+            | "share"
+            | "share row exclusive"
+            | "exclusive"
+            | "access exclusive" => true,
+            _ => return Err("42601"),
+        };
+        if !p.kw("mode") {
+            return Err("42601");
+        }
     }
     p.kw("nowait");
     if p.pos != p.tokens.len() {
         return Err("42601");
     }
-    Ok(Some(tables))
+    Ok(Some((tables, strong)))
 }
 
-// COPY TO accepts only the text STDOUT envelope used by pg_dump.
-pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static str> {
+pub(crate) struct CopyOutput {
+    pub select: String,
+    // 0 = text, 1 = csv, 2 = binary.
+    pub format: u8,
+    pub header: bool,
+    pub delimiter: u8,
+    pub quote: u8,
+    pub null: Vec<u8>,
+}
+
+pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<CopyOutput>, &'static str> {
     let tokens = match lex(sql) {
         Ok(t) => t,
         Err(_) => return Ok(None),
     };
     let mut p = Parser { tokens, pos: 0 };
-    if !p.kw("copy") || p.tokens.get(p.pos) == Some(&Token::LParen) {
+    if !p.kw("copy") {
         return Ok(None);
     }
-    let mut table = p.ident()?;
+    let mut query = None;
+    if p.tokens.get(p.pos) == Some(&Token::LParen) {
+        // Find the balanced query envelope in the original SQL, preserving all
+        // literals and expressions for the ordinary SELECT parser.
+        let start = sql.find('(').ok_or("42601")?;
+        let bytes = sql.as_bytes();
+        let mut depth = 1;
+        let mut i = start + 1;
+        let mut quote = None;
+        while i < bytes.len() && depth > 0 {
+            let c = bytes[i];
+            if let Some(q) = quote {
+                if c == q {
+                    if bytes.get(i + 1) == Some(&q) {
+                        i += 1;
+                    } else {
+                        quote = None;
+                    }
+                }
+            } else {
+                match c {
+                    b'\'' | b'"' => quote = Some(c),
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return Err("42601");
+        }
+        query = Some(sql[start + 1..i - 1].to_owned());
+        p.tokens = lex(&sql[i..])?;
+        p.pos = 0;
+    }
+    let mut table = if query.is_some() {
+        String::new()
+    } else {
+        p.ident()?
+    };
     table = if p.tokens.get(p.pos) == Some(&Token::Dot) {
         p.pos += 1;
         format!("{}.{}", quote_relation(&table), quote_relation(&p.ident()?))
@@ -612,8 +686,96 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static s
     if !p.kw("to") {
         return Ok(None);
     }
-    if !p.kw("stdout") || p.pos != p.tokens.len() {
+    if !p.kw("stdout") {
         return Err("0A000");
+    }
+    let mut options = CopyOutput {
+        select: String::new(),
+        format: 0,
+        header: false,
+        delimiter: b'\t',
+        quote: b'"',
+        null: b"\\N".to_vec(),
+    };
+    p.kw("with");
+    let mut delimiter = None;
+    let mut null = None;
+    let mut quote = None;
+    if p.tokens.get(p.pos) == Some(&Token::LParen) {
+        p.pos += 1;
+        loop {
+            let option = p.ident()?;
+            match option.as_str() {
+                "format" => {
+                    options.format = match p.ident()?.as_str() {
+                        "text" => 0,
+                        "csv" => 1,
+                        "binary" => 2,
+                        _ => return Err("22023"),
+                    }
+                }
+                "header" => {
+                    options.header = !p.kw("false");
+                    p.kw("true");
+                }
+                "delimiter" | "quote" | "null" => {
+                    let Some(Token::Text(value)) = p.tokens.get(p.pos) else {
+                        return Err("42601");
+                    };
+                    let value = value.as_bytes().to_vec();
+                    p.pos += 1;
+                    match option.as_str() {
+                        "delimiter" => delimiter = Some(value),
+                        "quote" => quote = Some(value),
+                        _ => null = Some(value),
+                    }
+                }
+                _ => return Err("42601"),
+            }
+            if !p.comma() {
+                break;
+            }
+        }
+        if p.tokens.get(p.pos) != Some(&Token::RParen) {
+            return Err("42601");
+        }
+        p.pos += 1;
+    }
+    if p.pos != p.tokens.len() {
+        return Err("42601");
+    }
+    if options.format == 2
+        && (delimiter.is_some() || null.is_some() || quote.is_some() || options.header)
+    {
+        return Err("42601");
+    }
+    if options.format != 1 && (quote.is_some() || options.header) {
+        return Err("0A000");
+    }
+    if options.format == 1 {
+        options.delimiter = b',';
+        options.null.clear();
+    }
+    if let Some(d) = delimiter {
+        if d.len() != 1 || matches!(d[0], b'\n' | b'\r') {
+            return Err("22023");
+        }
+        options.delimiter = d[0];
+    }
+    if let Some(q) = quote {
+        if q.len() != 1 || matches!(q[0], b'\n' | b'\r') {
+            return Err("22023");
+        }
+        options.quote = q[0];
+    }
+    if options.format == 1 && options.quote == options.delimiter {
+        return Err("22023");
+    }
+    if let Some(n) = null {
+        if n.iter().any(|b| matches!(b, b'\n' | b'\r')) {
+            return Err("22023");
+        }
+        options.null = n;
     }
     let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     let projection = if columns.is_empty() {
@@ -625,7 +787,8 @@ pub(crate) fn copy_stdout_select(sql: &str) -> Result<Option<String>, &'static s
             .collect::<Vec<_>>()
             .join(",")
     };
-    Ok(Some(format!("SELECT {projection} FROM {table}")))
+    options.select = query.unwrap_or_else(|| format!("SELECT {projection} FROM {table}"));
+    Ok(Some(options))
 }
 
 #[cfg(test)]
