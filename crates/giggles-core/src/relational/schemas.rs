@@ -1,4 +1,4 @@
-//! Schemas are attributes: relation names remain globally unique, unlike PostgreSQL.
+//! Relations share a namespace within each schema, matching PostgreSQL.
 //! Server policy: superusers create schemas; schema owners/superusers may drop them.
 //! Table creation permits superusers, schema owners, or explicit schema CREATE grants.
 //! Public retains its existing grant model. V2 explicitly refuses schema DDL.
@@ -104,6 +104,19 @@ impl Relational {
                 return Err(SqlError::Type);
             }
         }
+        for (key, table) in &self.tables {
+            if Some(table.id) != excluded {
+                ident(&table.name)?;
+                schema_binding::validate_key(key)?;
+                let schema = ext
+                    .table_schemas
+                    .get(&table.id)
+                    .map_or("public", String::as_str);
+                if *key != relation_key(schema, &table.name) {
+                    return Err(SqlError::Type);
+                }
+            }
+        }
         for (table, schema) in &ext.table_schemas {
             if Some(*table) == excluded
                 || !self.tables.values().any(|t| t.id == *table)
@@ -145,9 +158,9 @@ impl Relational {
             }
             let tables: Vec<_> = self
                 .tables
-                .values()
-                .filter(|t| self.table_schema(t.id) == ddl.name)
-                .map(|t| t.name.clone())
+                .iter()
+                .filter(|(_, t)| self.table_schema(t.id) == ddl.name)
+                .map(|(key, _)| key.clone())
                 .collect();
             let types: BTreeSet<_> = self
                 .ext
@@ -183,6 +196,9 @@ impl Relational {
             for table in tables {
                 self.drop_table_with_actions(&table, true)?;
             }
+            self.ext
+                .sequences
+                .retain(|_, sequence| split_key(&sequence.name).0 != ddl.name);
             self.ext.types.retain(|id, _| !types.contains(id));
             self.ext.schemas.remove(&ddl.name);
         }
@@ -236,27 +252,9 @@ impl Prepared {
                 self.creation_schema(state)?;
                 continue;
             }
-            if let Some(table) = state.tables.get(&r.name) {
-                let actual = state.table_schema(table.id);
-                if !r.schema.as_deref().map_or_else(
-                    || self.search_path.iter().any(|s| s == actual),
-                    |s| s == actual,
-                ) {
-                    return Err(SqlError::UnknownTable);
-                }
-            } else if self.relations.iter().any(|c| c.create && c.name == r.name) {
-                let actual = self.creation_schema(state)?;
-                if !r
-                    .schema
-                    .as_deref()
-                    .map_or_else(|| self.search_path.contains(&actual), |s| s == actual)
-                {
-                    return Err(SqlError::UnknownTable);
-                }
-            } else if r
-                .schema
+            if r.schema
                 .as_deref()
-                .is_some_and(|s| s != "public" && !state.ext.schemas.contains_key(s))
+                .is_some_and(|schema| schema != "public" && !state.ext.schemas.contains_key(schema))
             {
                 return Err(SqlError::UnknownTable);
             }

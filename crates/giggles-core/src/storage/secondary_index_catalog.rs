@@ -12,7 +12,7 @@ impl SqlSession {
             .staged
             .as_ref()
             .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
-        if state.sql.tables.get(&table.name) != Some(table) {
+        if state.sql.tables.get(&state.sql.table_key(table)) != Some(table) {
             return Err(CoreError::Sql(relational::SqlError::StaleSchema));
         }
         if table.hidden_rowid().is_some() {
@@ -71,7 +71,7 @@ impl SqlSession {
                 return Err(CoreError::Unsupported);
             }
             if table.hidden_rowid().is_some() {
-                if state.sql.tables.get(&table.name) != Some(table) {
+                if state.sql.tables.get(&state.sql.table_key(table)) != Some(table) {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
                 return Err(CoreError::Sql(relational::SqlError::Unsupported));
@@ -136,8 +136,10 @@ mod tests {
     fn native_secondary_read_and_index_creates_reject_heaps_but_accept_keyed_tables() {
         let mut token = [0; 16];
         getrandom::fill(&mut token).unwrap();
-        let path = crate::test_artifact_root()
-            .join(format!("heap-native-index-{:032x}", u128::from_be_bytes(token)));
+        let path = crate::test_artifact_root().join(format!(
+            "heap-native-index-{:032x}",
+            u128::from_be_bytes(token)
+        ));
         let admin = Admin::create(&path, crate::Limits::default()).unwrap();
         let mut session = admin.sql_session();
         for sql in [
@@ -149,11 +151,22 @@ mod tests {
             session.execute(sql, &[], None).unwrap();
         }
         let tables = admin.catalog().unwrap().1;
-        let heap = tables.iter().find(|table| table.name == "heap_items").unwrap();
-        let keyed = tables.iter().find(|table| table.name == "keyed_items").unwrap();
+        let heap = tables
+            .iter()
+            .find(|table| table.name == "heap_items")
+            .unwrap();
+        let keyed = tables
+            .iter()
+            .find(|table| table.name == "keyed_items")
+            .unwrap();
         for table in [heap, keyed] {
             session.begin_engine().unwrap();
-            let value = table.columns.iter().find(|column| column.name == "value").unwrap().id;
+            let value = table
+                .columns
+                .iter()
+                .find(|column| column.name == "value")
+                .unwrap()
+                .id;
             let equal = [(value, Value::Int(1))];
             let request = Request {
                 equal: &equal,
@@ -166,7 +179,10 @@ mod tests {
             };
             let result = session.secondary_read_native_engine(table, &request);
             if table.hidden_rowid().is_some() {
-                assert_eq!(result, Err(CoreError::Sql(relational::SqlError::Unsupported)));
+                assert_eq!(
+                    result,
+                    Err(CoreError::Sql(relational::SqlError::Unsupported))
+                );
             } else {
                 assert!(result.unwrap().rows.is_empty());
             }
@@ -179,7 +195,10 @@ mod tests {
                     session.create_index_engine(table, "native_value", &[value])
                 };
                 if table.hidden_rowid().is_some() {
-                    assert_eq!(result, Err(CoreError::Sql(relational::SqlError::Unsupported)));
+                    assert_eq!(
+                        result,
+                        Err(CoreError::Sql(relational::SqlError::Unsupported))
+                    );
                 } else {
                     assert!(result.is_ok());
                 }

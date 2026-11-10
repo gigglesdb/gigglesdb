@@ -79,10 +79,12 @@ impl Relational {
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        if epoch != self.epoch || self.tables.get(&table.name) != Some(table) {
+        if epoch != self.epoch || self.tables.get(&self.table_key(table)) != Some(table) {
             return Err(SqlError::StaleSchema);
         }
         ident(name)?;
+        let key = relation_key(self.table_schema(table.id), name);
+        let name = key.as_str();
         if columns.is_empty()
             || columns.len() > si::MAX_ARITY
             || self.secondary.descriptors().len() >= si::MAX_INDEXES
@@ -92,6 +94,9 @@ impl Relational {
         super::unique(columns.iter())?;
         if self.secondary.descriptors().iter().any(|d| d.name == name) {
             return Err(SqlError::Duplicate);
+        }
+        if self.relation_name_taken(name) {
+            return Err(SqlError::DuplicateTable);
         }
         if self
             .secondary

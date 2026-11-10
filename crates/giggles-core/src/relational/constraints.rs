@@ -69,9 +69,11 @@ pub(super) fn parse_foreign(
     let (parent, mut resolution_error) = if p.sym('.') {
         let parent = alter_table::raw_name(p)?;
         let error = ident::ident(&parent).err();
-        p.relations
-            .push(schemas::Reference::read(parent.clone(), Some(first)));
-        (parent, error)
+        p.relations.push(schemas::Reference::read(
+            parent.clone(),
+            Some(first.clone()),
+        ));
+        (format!("{first}\0{parent}"), error)
     } else {
         let error = ident::ident(&first).err();
         p.relations
@@ -243,12 +245,12 @@ pub(super) fn install_unique(
     }
     let name = explicit.clone().unwrap_or_else(|| {
         state.choose_constraint_name(
-            &table.name,
+            &state.table_key(table),
             &columns.iter().map(String::as_str).collect::<Vec<_>>(),
             AutoName::Key,
         )
     });
-    if state.relation_name_taken(&name) {
+    if state.relation_name_taken(&relation_key(state.table_schema(table.id), &name)) {
         return Err(SqlError::DuplicateTable);
     }
     if state.constraint_name_taken(table.id, &name) {
@@ -388,7 +390,7 @@ pub(super) fn install(
     };
     let name = explicit.clone().unwrap_or_else(|| {
         state.choose_constraint_name(
-            &table.name,
+            &state.table_key(table),
             &names.iter().map(String::as_str).collect::<Vec<_>>(),
             suffix,
         )

@@ -950,7 +950,11 @@ enum Statement {
     Release(String),
     RollbackTo(String),
 }
+mod schema_binding;
 mod schemas;
+#[doc(hidden)]
+pub use schema_binding::relation_key;
+pub(crate) use schema_binding::split_key;
 pub use schemas::{SchemaMetadata, schema_search_path};
 
 struct Parser {
@@ -1122,8 +1126,8 @@ impl Parser {
                 let name = alter_table::raw_name(self)?;
                 let error = ident::ident(&name).err();
                 self.relations
-                    .push(schemas::Reference::read(name.clone(), Some(first)));
-                (name, error)
+                    .push(schemas::Reference::read(name.clone(), Some(first.clone())));
+                (format!("{first}\0{name}"), error)
             } else {
                 let error = ident::ident(&first).err();
                 self.relations
@@ -1451,6 +1455,7 @@ pub struct Prepared {
     pub(crate) epoch: u64,
     pub(crate) transaction: Option<u128>,
     statement: Statement,
+    unbound_statement: Option<Box<Statement>>,
     params: usize,
     parameter_types: Vec<Option<DataType>>,
     relations: Vec<schemas::Reference>,
@@ -1618,6 +1623,7 @@ impl Prepared {
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            unbound_statement: None,
         }
     }
     pub(crate) fn create_engine(
@@ -1699,7 +1705,7 @@ impl Prepared {
     fn engine_table(table: &TableDef, state: &Relational) -> R<()> {
         // Callers cannot smuggle stale IDs, column types or unchecked key indexes
         // into the executor through a hand-built descriptor.
-        if state.tables.get(&table.name) != Some(table) {
+        if state.tables.get(&state.table_key(table)) != Some(table) {
             return Err(SqlError::StaleSchema);
         }
         Ok(())
@@ -1821,44 +1827,48 @@ impl Prepared {
         ))
     }
     pub(crate) fn validate_immutable_constants(&self, state: &Relational) -> R<()> {
-        if self.epoch != state.epoch {
+        let bound = self.bind_schemas(state)?;
+        let this = &bound;
+        if this.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
-        if let Statement::InsertExpressions(values) = &self.statement {
+        if let Statement::InsertExpressions(values) = &this.statement {
             return returning::validate_insert_constants(
                 values,
                 state,
-                self.params,
-                &self.parameter_types,
+                this.params,
+                &this.parameter_types,
             );
         }
-        if let Statement::Query(q) = &self.statement {
+        if let Statement::Query(q) = &this.statement {
             return q
-                .bind(state, self.params, &self.parameter_types)?
+                .bind(state, this.params, &this.parameter_types)?
                 .validate_immutable_constants();
         }
         Ok(())
     }
     pub(crate) fn describe(&self, state: &Relational) -> R<Description> {
-        self.validate_schemas(state)?;
-        if self.epoch != state.epoch {
+        let bound = self.bind_schemas(state)?;
+        let this = &bound;
+        this.validate_schemas(state)?;
+        if this.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
         if assign::has_duplicates(self) {
             assign::check_duplicate_literals(self, state)?;
-            self.describe_inner(state)?;
+            this.describe_inner(state)?;
             return Err(SqlError::Syntax);
         }
-        if let Statement::Create { user_types, .. } = &self.statement {
+        if let Statement::Create { user_types, .. } = &this.statement {
             for name in user_types.iter().flatten() {
                 state
-                    .resolve_type(name, &self.search_path)?
+                    .resolve_type(name, &this.search_path)?
                     .ok_or(SqlError::UndefinedObject)?
                     .1
                     .storage_type()?;
             }
         }
-        let mut description = self.describe_inner(state)?;
+        let mut description = this.describe_inner(state)?;
         if description.type_oids.is_empty() {
             description.type_oids = description
                 .columns
@@ -2219,6 +2229,7 @@ impl Prepared {
             relations: Vec::new(),
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            unbound_statement: None,
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -2615,6 +2626,7 @@ impl Prepared {
             relations: p.relations,
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            unbound_statement: None,
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
@@ -2919,8 +2931,8 @@ impl Relational {
         let mut ids = BTreeSet::new();
         let mut versions = BTreeSet::new();
         for (name, t) in &self.tables {
-            ident(name)?;
-            if name != &t.name
+            schema_binding::validate_key(name)?;
+            if name != &relation_key(self.table_schema(t.id), &t.name)
                 || t.id == 0
                 || t.id >= self.next_id
                 || !ids.insert(t.id)
@@ -3091,6 +3103,8 @@ impl Relational {
         injected_source: Option<&dyn scan::RowSource>,
         events: &mut Vec<constraints::Event>,
     ) -> R<SqlResult> {
+        let bound = prepared.bind_schemas(self)?;
+        let prepared = &bound;
         prepared.validate_schemas(self)?;
         user_types::clear_sql_error_message();
         if prepared.epoch != self.epoch {
@@ -3203,6 +3217,7 @@ impl Relational {
                 relations: Vec::new(),
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),
+                unbound_statement: None,
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),
@@ -3270,7 +3285,7 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                alter_table::execute(self, alter, clock, &mut cancel)?;
+                alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
             }
             Statement::DropTable {
                 name,
@@ -3297,7 +3312,7 @@ impl Relational {
                     && self
                         .secondary_descriptors_engine()
                         .iter()
-                        .any(|d| d.name == index.name)
+                        .any(|d| d.name == relation_key(split_key(&index.table).0, &index.name))
                 {
                     return Ok(result);
                 }
@@ -3352,7 +3367,7 @@ impl Relational {
                 }
                 let columns = &columns;
                 let typmods = &typmods;
-                if self.type_by_name(name).is_some() {
+                if self.type_by_name(split_key(name).1).is_some() {
                     return Err(SqlError::DuplicateObject);
                 }
                 if self.relation_name_taken(name) {
@@ -3382,11 +3397,11 @@ impl Relational {
                             .map_err(|_| SqlError::InvalidParameterValue)?;
                     }
                 }
-                validate_create_definition(name, columns, keys)?;
+                validate_create_definition(split_key(name).1, columns, keys)?;
                 let mut next_id = self.next_id;
                 let mut t = TableDef {
                     id: allocate(&mut next_id)?,
-                    name: name.clone(),
+                    name: split_key(name).1.into(),
                     columns: columns.clone(),
                     primary_key: vec![],
                 };
@@ -3416,13 +3431,17 @@ impl Relational {
                             self.choose_constraint_name(name, &[], AutoName::Pkey)
                         }))
                     };
-                defaults::install_create(self, t, defaults, sequences, typmods, next_id, epoch)?;
-                let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
                 let schema = prepared.creation_schema(self)?;
-                if schema != "public" {
-                    self.ext.table_schemas.insert(table.id, schema);
-                    Self::normalize_ext(&mut self.ext);
-                }
+                defaults::install_create(
+                    self,
+                    t,
+                    defaults,
+                    sequences,
+                    typmods,
+                    (next_id, epoch),
+                    (&schema, &prepared.search_path),
+                )?;
+                let table = self.tables.get(name).ok_or(SqlError::UnknownTable)?.clone();
                 self.mutate_ext(|ext, _| {
                     for (column, type_id) in table.columns.iter().zip(&type_ids) {
                         if let Some(id) = type_id {

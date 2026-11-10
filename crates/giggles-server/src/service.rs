@@ -436,6 +436,7 @@ impl Session {
         if self.sql.in_transaction() || self.sequence_owner_candidates.is_empty() {
             return Ok(());
         }
+        let schemas = self.sql.schema_metadata()?;
         let mut live: BTreeSet<_> = self
             .service
             .admin
@@ -444,16 +445,23 @@ impl Session {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        live.extend(
-            self.service
-                .admin
-                .catalog()?
-                .1
-                .into_iter()
-                .map(|table| table.name),
-        );
+        live.extend(self.service.admin.catalog()?.1.into_iter().map(|table| {
+            relational::relation_key(
+                schemas
+                    .tables
+                    .get(&table.id)
+                    .map_or("public", String::as_str),
+                &table.name,
+            )
+        }));
         let roles = self.service.admin.roles();
         for name in &self.sequence_owner_candidates {
+            if name
+                .split_once('\0')
+                .is_some_and(|(schema, _)| !schemas.schemas.contains_key(schema))
+            {
+                continue;
+            }
             if !live.contains(name) {
                 roles
                     .forget_table(name)
@@ -578,7 +586,24 @@ impl Session {
             }
             _ => None,
         };
-        let result = crate::auth::statements::execute(stmt, &self.service.admin, &actor)?;
+        let mut bound = stmt.clone();
+        match &mut bound {
+            crate::auth::statements::AdminStatement::DropTable(_, names)
+            | crate::auth::statements::AdminStatement::Grant {
+                schema: false,
+                objects: names,
+                ..
+            } => {
+                for name in names {
+                    *name = self
+                        .sql
+                        .resolve_relation_reference(name)
+                        .map_err(|e| sqlstate(&e))?;
+                }
+            }
+            _ => {}
+        }
+        let result = crate::auth::statements::execute(&bound, &self.service.admin, &actor)?;
         if let Some(before) = target {
             let after = self
                 .service
@@ -658,12 +683,19 @@ impl Session {
                 Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
             };
             let (epoch, catalog) = session.service.admin.catalog()?;
+            let schemas = session.sql.schema_metadata()?;
             let visible = catalog
                 .into_iter()
                 .filter(|table| {
-                    tables
-                        .as_ref()
-                        .is_none_or(|tables| tables.contains(&table.name))
+                    tables.as_ref().is_none_or(|tables| {
+                        tables.contains(&relational::relation_key(
+                            schemas
+                                .tables
+                                .get(&table.id)
+                                .map_or("public", String::as_str),
+                            &table.name,
+                        ))
+                    })
                 })
                 .collect::<Vec<_>>();
             let (index_epoch, indexes) = session.service.admin.secondary_index_catalog()?;
@@ -719,11 +751,15 @@ impl Session {
         if visible.len() > relational::MAX_TABLES {
             return Err(CoreError::Sql(relational::SqlError::Limit));
         }
+        let schemas = self.sql.schema_metadata()?;
         for table in &visible {
             giggles_core::cancellation::check()?;
             // Table names originate from the validated engine catalog, not
             // client SQL. Prepare/Describe do not access application rows.
-            let schema = self.sql.relation_schema(&table.name)?;
+            let schema = schemas
+                .tables
+                .get(&table.id)
+                .map_or("public", String::as_str);
             let prepared = self.sql.prepare(&format!(
                 "SELECT * FROM \"{}\".\"{}\" LIMIT 1",
                 schema.replace('"', "\"\""),
@@ -975,6 +1011,8 @@ impl Session {
         Ok(())
     }
     fn authorize_alter_table(&mut self, table: &str) -> Result<(), CoreError> {
+        let resolved = self.sql.resolve_relation_reference(table)?;
+        let table = resolved.as_str();
         let allowed = if let Role::Database { name } = &self.role {
             let roles = self.service.admin.roles();
             let role = roles
@@ -1250,8 +1288,8 @@ impl Session {
         } else {
             false
         };
-        let target = match relational::Copy::target(sql) {
-            Ok(Some(target)) => target,
+        let target = match relational::Copy::target_reference(sql) {
+            Ok(Some(target)) => self.sql.resolve_relation_reference(&target)?,
             result => {
                 self.abort();
                 if !unrestricted {
@@ -1392,6 +1430,8 @@ impl Session {
         params: &[Value],
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
+            let bound = session.sql.bind_relation_context(p)?;
+            let p = &bound;
             session.reconcile_sequence_owners()?;
             session.authorize(p)?;
             // Recovery must remain available even after the host clock latches.

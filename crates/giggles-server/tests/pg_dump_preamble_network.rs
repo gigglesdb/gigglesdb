@@ -167,7 +167,14 @@ async fn exact_pg_dump_preamble_simple_and_extended_then_restore_sql() {
                 expected
             );
         }
-        assert_eq!(code(c.simple_query("CREATE TABLE no_path(id integer)").await.unwrap_err()), "3F000");
+        assert_eq!(
+            code(
+                c.simple_query("CREATE TABLE no_path(id integer)")
+                    .await
+                    .unwrap_err()
+            ),
+            "3F000"
+        );
         c.simple_query("CREATE TABLE public.t (id integer PRIMARY KEY, body text)")
             .await
             .unwrap();
@@ -175,7 +182,11 @@ async fn exact_pg_dump_preamble_simple_and_extended_then_restore_sql() {
             .await
             .unwrap();
         assert_eq!(
-            values(&c.simple_query("SELECT body FROM public.t LIMIT 1").await.unwrap()),
+            values(
+                &c.simple_query("SELECT body FROM public.t LIMIT 1")
+                    .await
+                    .unwrap()
+            ),
             ["restored"]
         );
         c.query("RESET ALL", &[]).await.unwrap();
@@ -476,7 +487,9 @@ async fn public_qualified_names_are_core_gap_until_e1_a3() {
             let rows = c.query(&select, &[]).await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get::<_, i32>(0), 1);
-            c.simple_query("DROP TABLE t2").await.unwrap();
+            c.simple_query(&format!("DROP TABLE {table}"))
+                .await
+                .unwrap();
         }
     } else {
         // schema-qualified names: core/E1 (GD-0059)

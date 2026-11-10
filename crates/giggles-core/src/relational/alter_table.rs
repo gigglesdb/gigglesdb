@@ -44,8 +44,8 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
         let table = raw_name(p)?;
         let error = ident::ident(&table).err();
         p.relations
-            .push(schemas::Reference::read(table.clone(), Some(first)));
-        (table, error)
+            .push(schemas::Reference::read(table.clone(), Some(first.clone())));
+        (format!("{first}\0{table}"), error)
     } else {
         let error = ident::ident(&first).err();
         p.relations
@@ -242,6 +242,7 @@ fn position(table: &TableDef, name: &str) -> R<usize> {
 pub(super) fn execute(
     state: &mut Relational,
     alter: &AlterTable,
+    path: &[String],
     clock: Option<&clock::ExecutionClock>,
     cancel: &mut impl FnMut() -> bool,
 ) -> R<()> {
@@ -338,7 +339,7 @@ pub(super) fn execute(
                 if let Some(typmod) = typmod {
                     candidate.set_column_typmod(column.id, Some(*typmod))?;
                 }
-                defaults::install_alter(&mut candidate, &column, default.as_deref())?;
+                defaults::install_alter(&mut candidate, &column, default.as_deref(), path)?;
                 let mut rows = candidate.rows.get(&table.id).ok_or(SqlError::Type)?.clone();
                 for row in rows.values_mut() {
                     if cancel() {
@@ -397,18 +398,25 @@ pub(super) fn execute(
             }
             Action::RenameTable(new) => {
                 ident::ident(new)?;
-                if candidate.relation_name_taken(new) {
+                if candidate
+                    .relation_name_taken(&relation_key(candidate.table_schema(table.id), new))
+                {
                     return Err(SqlError::DuplicateTable);
                 }
                 constraint_primary_key::retain_name_before_rename(&mut candidate, &table)?;
                 candidate.tables.remove(&name);
-                name = new.clone();
-                table.name = name.clone();
+                name = relation_key(candidate.table_schema(table.id), new);
+                table.name = new.clone();
                 candidate.tables.insert(name.clone(), table.clone());
             }
             Action::Default(column, default) => {
                 let at = position(&table, column)?;
-                defaults::install_alter(&mut candidate, &table.columns[at], default.as_deref())?;
+                defaults::install_alter(
+                    &mut candidate,
+                    &table.columns[at],
+                    default.as_deref(),
+                    path,
+                )?;
             }
             Action::NotNull(column, set) => {
                 let at = position(&table, column)?;

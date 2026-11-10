@@ -9,12 +9,21 @@ impl Admin {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
         let (_, tables) = self.catalog()?;
+        let schemas = self.catalog_schema_metadata()?;
         if self.inner.sql_transactions.load(Ordering::Acquire) != 0 {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
         // Absence is decided at this catalog snapshot; a concurrent CREATE may
         // follow it. No whole-state write is needed for this result.
-        if !tables.iter().any(|table| table.name == name) {
+        if !tables.iter().any(|table| {
+            relational::relation_key(
+                schemas
+                    .tables
+                    .get(&table.id)
+                    .map_or("public", String::as_str),
+                &table.name,
+            ) == name
+        }) {
             return if if_exists {
                 Ok(false)
             } else {

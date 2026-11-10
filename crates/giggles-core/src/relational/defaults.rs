@@ -23,6 +23,33 @@ pub(super) enum SequenceDdl {
     },
 }
 impl SequenceDdl {
+    pub(super) fn bind_schema_names(
+        &mut self,
+        read: &impl Fn(&mut String),
+        create: &impl Fn(&str) -> R<String>,
+    ) -> R<()> {
+        match self {
+            Self::Create { name, spec, .. } => {
+                *name = create(name)?;
+                if let Some(Some((table, _))) = &mut spec.owned_by {
+                    read(table);
+                }
+            }
+            Self::Alter { name, spec, .. } => {
+                read(name);
+                if let Some(Some((table, _))) = &mut spec.owned_by {
+                    read(table);
+                }
+            }
+            Self::Drop { names, .. } => {
+                for name in names {
+                    read(name);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn copies_counter(&self) -> bool {
         matches!(self, Self::Alter { spec, .. } if spec.restart.is_none() && spec.rewrites_counter())
     }
@@ -106,22 +133,21 @@ pub(super) fn sequence_ddl(p: &mut Parser) -> R<SequenceDdl> {
 }
 fn sequence_name(p: &mut Parser, create: bool) -> R<(String, Option<SqlError>)> {
     let first = alter_table::raw_name(p)?;
-    if p.sym('.') {
-        let name = alter_table::raw_name(p)?;
-        let error = if first != "public" {
-            Some(if create {
-                SqlError::InvalidSchema
-            } else {
-                SqlError::UnknownTable
-            })
-        } else {
-            ident::ident(&name).err()
-        };
-        Ok((name, error))
+    let (schema, name) = if p.sym('.') {
+        (Some(first), alter_table::raw_name(p)?)
     } else {
-        let error = ident::ident(&first).err();
-        Ok((first, error))
-    }
+        (None, first)
+    };
+    let error = ident::ident(&name).err();
+    p.relations.push(schemas::Reference {
+        name: name.clone(),
+        schema: schema.clone(),
+        create,
+    });
+    Ok((
+        schema.map_or(name.clone(), |s| format!("{s}\0{name}")),
+        error,
+    ))
 }
 
 /// The same option parser is used by identity and standalone sequence DDL.
@@ -199,15 +225,17 @@ fn options(p: &mut Parser, spec: &mut SequenceSpec, parenthesized: bool, alter: 
                 p.punct('.')?;
                 let second = alter_table::raw_name(p)?;
                 if p.sym('.') {
-                    p.relations
-                        .push(schemas::Reference::read(second.clone(), Some(first)));
+                    p.relations.push(schemas::Reference::read(
+                        second.clone(),
+                        Some(first.clone()),
+                    ));
                     let column = alter_table::raw_name(p)?;
                     spec.owned_by_error = spec
                         .owned_by_error
                         .take()
                         .or_else(|| ident::ident(&second).err())
                         .or_else(|| ident::ident(&column).err());
-                    Some((second, column))
+                    Some((format!("{first}\0{second}"), column))
                 } else {
                     p.relations
                         .push(schemas::Reference::read(first.clone(), None));
@@ -500,7 +528,9 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
                                     relations: Vec::new(),
                                 };
                                 parser.table_name().is_ok_and(|dependency| {
-                                    dependency == *name && parser.at == parser.tokens.len()
+                                    relation_key(split_key(&dependency).0, split_key(&dependency).1)
+                                        == *name
+                                        && parser.at == parser.tokens.len()
                                 })
                             })
                         {
@@ -621,14 +651,22 @@ pub(super) fn install_create(
     defaults: &[Option<String>],
     sequences: &[Option<SequenceSpec>],
     typmods: &[Option<i32>],
-    next_id: u64,
-    epoch: u64,
+    version: (u64, u64),
+    context: (&str, &[String]),
 ) -> R<()> {
+    let (schema, path) = context;
+    let (next_id, epoch) = version;
     let mut candidate = state.clone();
     candidate.next_id = next_id;
     candidate.epoch = epoch;
     candidate.rows.insert(table.id, BTreeMap::new());
-    candidate.tables.insert(table.name.clone(), table.clone());
+    if schema != "public" {
+        candidate.ext.table_schemas.insert(table.id, schema.into());
+        Relational::normalize_ext(&mut candidate.ext);
+    }
+    candidate
+        .tables
+        .insert(relation_key(schema, &table.name), table.clone());
     for ((column, _default), (spec, typmod)) in table
         .columns
         .iter()
@@ -667,7 +705,7 @@ pub(super) fn install_create(
             candidate.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
         }
         if let Some(spec) = spec {
-            let name = candidate.choose_sequence_name(&table.name, &column.name);
+            let name = candidate.choose_sequence_name(&candidate.table_key(&table), &column.name);
             let definition = sequence_definition(
                 spec,
                 &column.data_type,
@@ -706,7 +744,7 @@ pub(super) fn install_create(
                 relations: Vec::new(),
             };
             let mut value = expression(&mut parser, 0)?;
-            value.resolve(&candidate)?;
+            value.resolve(&candidate, path)?;
             candidate.set_column_default(column.id, Some(value.canonical(&column.data_type)?))?;
         }
     }
@@ -788,6 +826,14 @@ fn quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 fn sequence_reference(name: &str) -> String {
+    if name.contains('\0') {
+        let (schema, name) = split_key(name);
+        return format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\"")
+        );
+    }
     if name
         .bytes()
         .enumerate()
@@ -811,6 +857,19 @@ enum Expression {
     Cast(Box<Expression>, DataType),
 }
 impl Expression {
+    fn qualify_stored_sequences(&mut self) -> R<()> {
+        match self {
+            Self::Sequence(name) => {
+                let normalized = crate::storage::sequences::sequence_name(name)?;
+                if !normalized.contains('\0') {
+                    *name = format!("\"public\".{}", sequence_reference(&normalized));
+                }
+            }
+            Self::Cast(value, _) | Self::Negative(value) => value.qualify_stored_sequences()?,
+            _ => {}
+        }
+        Ok(())
+    }
     fn numeric_literal(&self) -> bool {
         match self {
             Self::Number(_) => true,
@@ -830,7 +889,7 @@ impl Expression {
             _ => false,
         }
     }
-    fn resolve(&mut self, state: &Relational) -> R<()> {
+    fn resolve(&mut self, state: &Relational, path: &[String]) -> R<()> {
         match self {
             Self::Sequence(name) => {
                 let mut p = Parser {
@@ -840,6 +899,7 @@ impl Expression {
                     relations: Vec::new(),
                 };
                 let normalized = p.table_name().map_err(|_| SqlError::UnknownTable)?;
+                let normalized = state.resolve_relation_key(&normalized, path);
                 if p.at != p.tokens.len() {
                     return Err(SqlError::UnknownTable);
                 }
@@ -848,7 +908,7 @@ impl Expression {
                     .ok_or(SqlError::UnknownTable)?;
                 *name = sequence_reference(&sequence.name);
             }
-            Self::Cast(value, _) | Self::Negative(value) => value.resolve(state)?,
+            Self::Cast(value, _) | Self::Negative(value) => value.resolve(state, path)?,
             _ => {}
         }
         Ok(())
@@ -1102,7 +1162,8 @@ pub(super) fn evaluate_sql(
         params: BTreeSet::new(),
         relations: Vec::new(),
     };
-    let value = expression(&mut parser, 0)?;
+    let mut value = expression(&mut parser, 0)?;
+    value.qualify_stored_sequences()?;
     if parser.at + 1 != parser.tokens.len()
         || parser.tokens.get(parser.at) != Some(&Token::Symbol(','))
     {
@@ -1200,6 +1261,7 @@ pub(super) fn install_alter(
     state: &mut Relational,
     column: &ColumnDef,
     sql: Option<&str>,
+    path: &[String],
 ) -> R<()> {
     let value = if let Some(sql) = sql {
         let mut parser = Parser {
@@ -1209,7 +1271,7 @@ pub(super) fn install_alter(
             relations: Vec::new(),
         };
         let mut value = expression(&mut parser, 0)?;
-        value.resolve(state)?;
+        value.resolve(state, path)?;
         let sql = value.canonical(&column.data_type)?;
         query::InsertExpressions::default_value(&value.sql(), &column.data_type, None, false)?;
         Some(sql)

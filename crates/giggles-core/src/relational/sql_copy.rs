@@ -56,6 +56,11 @@ impl Copy {
     }
     /// Extract only the target, before unsupported options or malformed body classification.
     pub fn target(sql: &str) -> R<Option<String>> {
+        Self::target_reference(sql)
+            .map(|name| name.map(|name| relation_key(split_key(&name).0, split_key(&name).1)))
+    }
+    #[doc(hidden)]
+    pub fn target_reference(sql: &str) -> R<Option<String>> {
         if !Self::is_copy(sql) {
             return Ok(None);
         }
@@ -155,6 +160,7 @@ impl Copy {
             return Err(SqlError::Unsupported);
         }
         let table = p.table_name()?;
+        let table = relation_key(split_key(&table).0, split_key(&table).1);
         let mut columns = vec![];
         if p.sym('(') {
             columns.push(p.name()?);
@@ -275,8 +281,19 @@ impl Copy {
             .map(|i| table.columns[i].clone())
             .collect())
     }
+    pub(crate) fn schema_key(&self, state: &Relational, path: &[String]) -> String {
+        let name = self.relation.schema.as_ref().map_or_else(
+            || self.relation.name.clone(),
+            |schema| format!("{schema}\0{}", self.relation.name),
+        );
+        state.resolve_relation_key(&name, path)
+    }
     pub(crate) fn prepared(&self, state: &Relational, domain: u128) -> R<Prepared> {
-        let columns = self.columns_in(state)?;
+        let mut copy = self.clone();
+        if self.table.contains('\0') {
+            copy.table = relation_key(split_key(&self.table).0, split_key(&self.table).1);
+        }
+        let columns = copy.columns_in(state)?;
         let width = columns.len();
         let types = columns.into_iter().map(|c| c.data_type).collect();
         Ok(Prepared {
@@ -288,8 +305,13 @@ impl Copy {
             relations: vec![self.relation.clone()],
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
+            unbound_statement: None,
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
-                self.table.clone(),
+                format!(
+                    "{}\0{}",
+                    state.table_schema(state.tables[&copy.table].id),
+                    split_key(&copy.table).1
+                ),
                 self.columns.clone(),
                 types,
                 vec![vec![Value::Null; width]],
@@ -304,6 +326,9 @@ impl Prepared {
         clock: Option<&clock::ExecutionClock>,
     ) -> R<Self> {
         let mut prepared = self.clone();
+        prepared.unbound_statement = None;
+        // COPY rows belong to the target bound by the already accepted header.
+        prepared.relations.clear();
         let Statement::InsertMulti(insert) = &mut prepared.statement else {
             return Err(SqlError::Unsupported);
         };

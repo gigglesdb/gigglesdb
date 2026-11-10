@@ -2,7 +2,7 @@
 use super::*;
 use engine::{catalog::CatalogParts, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
-use relational::{SqlError, SqlRow, TableDef, row_sink::RowSink};
+use relational::{SqlError, SqlRow, TableDef, relation_key, row_sink::RowSink, split_key};
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
 mod sql_sequences;
@@ -153,16 +153,25 @@ impl SqlSession {
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
                         let parts = db.catalog().parts(txn)?;
-                        let mut names = p.read_tables().into_iter().collect::<BTreeSet<_>>();
-                        if let Some(name) = p.table() {
-                            names.insert(name.to_owned());
+                        let key = |name: &str| {
+                            let (schema, name) = split_key(name);
+                            relation_key(schema, name)
+                        };
+                        let target_name = p.table().map(key);
+                        let mut names = p
+                            .read_tables()
+                            .into_iter()
+                            .map(|name| key(&name))
+                            .collect::<BTreeSet<_>>();
+                        if let Some(name) = &target_name {
+                            names.insert(name.clone());
                         }
                         for name in &names {
                             if !parts.tables.contains_key(name) {
                                 // Preserve the legacy binder's SQL error precedence.
                                 continue;
                             }
-                            let target = p.table() == Some(name.as_str());
+                            let target = target_name.as_deref() == Some(name.as_str());
                             db.catalog()
                                 .resolve(
                                     txn,
@@ -184,7 +193,8 @@ impl SqlSession {
                         }
                         if writing
                             && !ddl
-                            && let Some(table) = p.table().and_then(|name| parts.tables.get(name))
+                            && let Some(table) =
+                                target_name.as_ref().and_then(|name| parts.tables.get(name))
                         {
                             // Empty PK cannot name a real row. Serialize SQL writers
                             // only on the destination; source readers remain MVCC.

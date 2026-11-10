@@ -33,7 +33,7 @@ impl SqlSession {
             .transaction_id
             .ok_or(CoreError::Sql(SqlError::Transaction))?;
         crate::cancellation::check()?;
-        if staged.sql.tables.get(&table.name) != Some(table) {
+        if staged.sql.tables.get(&staged.sql.table_key(table)) != Some(table) {
             return Err(CoreError::Sql(SqlError::StaleSchema));
         }
         if table.hidden_rowid().is_some() {
@@ -210,7 +210,12 @@ mod tests {
         with_sql_parser_forbidden(|| {
             session.begin_engine().unwrap();
             let complete = session.complete_table_engine(&keyed).unwrap();
-            assert!(session.consume_complete_engine(complete, &keyed).unwrap().is_empty());
+            assert!(
+                session
+                    .consume_complete_engine(complete, &keyed)
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(matches!(
                 session.complete_table_engine(&heap),
                 Err(CoreError::Sql(SqlError::Unsupported))
@@ -235,7 +240,12 @@ mod tests {
             let key = vec![V::Int(7), V::Int(1)];
             let version = session.row_version_engine(&keyed, &key).unwrap();
             session
-                .update_engine(&keyed, key.clone(), vec![(2, V::Text("two".into()))], version)
+                .update_engine(
+                    &keyed,
+                    key.clone(),
+                    vec![(2, V::Text("two".into()))],
+                    version,
+                )
                 .unwrap();
             let version = session.row_version_engine(&keyed, &key).unwrap();
             session.delete_engine(&keyed, key, version).unwrap();

@@ -221,6 +221,10 @@ fn descriptors(state: &Relational, ds: &[Descriptor], cancel: &mut impl FnMut() 
             si::MAX_INDEXES_PER_TABLE,
         )?;
         let t = table(state, d.table)?;
+        schema_binding::validate_key(&d.name)?;
+        if split_key(&d.name).0 != state.table_schema(t.id) {
+            return Err(SqlError::Type);
+        }
         if t.primary_key.is_empty() {
             return Err(SqlError::Type);
         }

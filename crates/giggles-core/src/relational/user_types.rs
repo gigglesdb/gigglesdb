@@ -290,6 +290,7 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             ty.set_schema(schema);
             let ty = &ty;
             if state.ext.types.values().any(|t| t.name() == ty.name())
+                || state.tables.values().any(|table| table.name == ty.name())
                 || state.relation_name_taken(ty.name())
             {
                 return Err(SqlError::DuplicateObject);

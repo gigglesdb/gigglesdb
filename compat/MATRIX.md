@@ -52,7 +52,6 @@ The cases below pin GigglesDB SQLSTATEs separately from the historical R0 totals
 
 | Behavior | GigglesDB SQLSTATE | Corpus case |
 | --- | --- | --- |
-| Relation names are globally unique across schemas | `42P07` | [global_relation_name](corpus/known_gaps/global_relation_name.sql) |
 | Type names are globally unique across schemas | `42710` | [global_type_name](corpus/known_gaps/global_type_name.sql) |
 | Composite-typed columns | `0A000` | [composite_column](corpus/known_gaps/composite_column.sql) |
 | DROP TYPE CASCADE | `0A000` | [drop_type_cascade](corpus/known_gaps/drop_type_cascade.sql) |

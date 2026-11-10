@@ -1,4 +1,4 @@
-//! Relation names are globally unique, a documented PostgreSQL divergence.
+//! Schema-qualified relation identity and schema lifecycle.
 use giggles_core::{
     Admin, CoreError, Limits, SqlSession,
     relational::{SqlError as E, Value},
@@ -28,14 +28,10 @@ fn schema_resolution_drop_and_reopen() {
         );
         run(&mut s, "CREATE SCHEMA b");
         run(&mut s, "CREATE TABLE a.t(id int PRIMARY KEY)");
-        error(
-            &mut s,
-            "CREATE TABLE b.t(id int PRIMARY KEY)",
-            E::DuplicateTable,
-        );
+        run(&mut s, "CREATE TABLE b.t(id int PRIMARY KEY)");
         error(&mut s, "INSERT INTO t VALUES(1)", E::UnknownTable);
         error(&mut s, "INSERT INTO public.t VALUES(1)", E::UnknownTable);
-        error(&mut s, "SELECT * FROM b.t", E::UnknownTable);
+        run(&mut s, "SELECT * FROM b.t");
         s.set_search_path("missing,a,public", "giggles");
         run(&mut s, "INSERT INTO t VALUES(1)");
         assert_eq!(
@@ -78,10 +74,7 @@ fn schema_resolution_drop_and_reopen() {
         assert_eq!(s.relation_schema("implicit").unwrap(), "a");
         let (_, p) = s.prepare_copy("COPY a.t(id) FROM STDIN").unwrap();
         s.describe(&p).unwrap();
-        assert!(matches!(
-            s.prepare_copy("COPY b.t(id) FROM STDIN"),
-            Err(CoreError::Sql(E::UnknownTable))
-        ));
+        s.prepare_copy("COPY b.t(id) FROM STDIN").unwrap();
         let prepared = s.prepare("SELECT * FROM t").unwrap();
         s.set_search_path("public", "giggles");
         assert!(matches!(

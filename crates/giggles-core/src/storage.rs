@@ -158,7 +158,7 @@ fn relation_names(state: &State) -> BTreeMap<(bool, u64), String> {
         .sql
         .tables
         .values()
-        .map(|table| ((false, table.id), table.name.clone()))
+        .map(|table| ((false, table.id), state.sql.table_key(table)))
         .chain(
             state
                 .sql
@@ -1775,6 +1775,31 @@ impl Admin {
     }
 }
 impl SqlSession {
+    pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
+        let resolve = |s: &State| Ok(s.sql.resolve_relation_key(name, &self.search_path));
+        match &self.staged {
+            Some(s) => resolve(s),
+            None => self.admin.inner.inspect(resolve),
+        }
+    }
+    /// Bind dependency identities to this session without surfacing semantic errors
+    /// before the caller has checked authority.
+    pub fn bind_relation_context(
+        &self,
+        prepared: &relational::Prepared,
+    ) -> Result<relational::Prepared, CoreError> {
+        let mut prepared = prepared.clone();
+        prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+        let bind = |s: &State| {
+            Ok(prepared
+                .bind_schemas(&s.sql)
+                .unwrap_or_else(|_| prepared.clone()))
+        };
+        match &self.staged {
+            Some(s) => bind(s),
+            None => self.admin.inner.inspect(bind),
+        }
+    }
     pub fn schema_in_search_path(&self, schema: &str) -> bool {
         self.search_path.iter().any(|s| s == schema)
     }
@@ -1793,7 +1818,7 @@ impl SqlSession {
         let read = |s: &State| {
             Ok(s.sql
                 .tables
-                .get(name)
+                .get(&s.sql.resolve_relation_key(name, &self.search_path))
                 .map_or("public", |t| s.sql.table_schema(t.id))
                 .to_owned())
         };
@@ -1847,7 +1872,12 @@ impl SqlSession {
         self.sequence_tables = tables;
     }
     pub fn normalize_sequence_reference(&self, text: &str) -> Result<String, CoreError> {
-        sequences::sequence_name(text).map_err(CoreError::Sql)
+        let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
+        let resolve = |s: &State| Ok(s.sql.resolve_relation_key(&name, &self.search_path));
+        match &self.staged {
+            Some(s) => resolve(s),
+            None => self.admin.inner.inspect(resolve),
+        }
     }
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
@@ -1863,7 +1893,7 @@ impl SqlSession {
                             .tables
                             .values()
                             .find(|t| t.id == id)
-                            .map(|t| t.name.clone())
+                            .map(|t| s.sql.table_key(t))
                     });
                     (d.name.clone(), owner)
                 })
@@ -2181,6 +2211,14 @@ impl SqlSession {
         if let Ok(p) = &mut result {
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             p.transaction = self.transaction_id;
+            let bind = |s: &State| Ok(p.bind_schemas(&s.sql).unwrap_or_else(|_| p.clone()));
+            let bound = match &self.staged {
+                Some(s) => bind(s),
+                None => self.admin.inner.inspect(bind),
+            };
+            if let Ok(bound) = bound {
+                *p = bound;
+            }
         }
         if result.is_err() && self.staged.is_some() {
             self.aborted = true;
@@ -2198,14 +2236,19 @@ impl SqlSession {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            let copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
+            let mut copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
+            let resolve = |s: &State| Ok(copy.schema_key(&s.sql, &self.search_path));
+            copy.table = match &self.staged {
+                Some(s) => resolve(s)?,
+                None => self.admin.inner.inspect(resolve)?,
+            };
             let prepare = |s: &State| {
                 let mut p = copy
                     .prepared(&s.sql, s.view.domain)
                     .map_err(CoreError::Sql)?;
                 p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
                 p.validate_schemas(&s.sql).map_err(CoreError::Sql)?;
-                Ok(p)
+                Ok(p.bind_schemas(&s.sql).unwrap_or(p))
             };
             let mut prepared = match &self.staged {
                 Some(s) => prepare(s)?,
@@ -2290,6 +2333,7 @@ impl SqlSession {
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
                     self.sequence_tables.clone(),
+                    self.search_path.clone(),
                 ));
             let output = state.sql.normalize_copy(prepared, rows, Some(&context));
             crate::cancellation::check()?;
@@ -2692,6 +2736,7 @@ impl SqlSession {
                 self.pending_sequences.clone(),
                 self.sequence_values.clone(),
                 self.sequence_tables.clone(),
+                self.search_path.clone(),
             ))
         });
         let clock = context.as_ref();
@@ -2867,7 +2912,7 @@ impl SqlSession {
                 .tables
                 .values()
                 .find(|candidate| candidate.id == table.id)
-                .map(|candidate| candidate.name.clone())
+                .map(|candidate| s.sql.table_key(candidate))
                 .unwrap_or_else(|| name.to_owned()))
         })
     }

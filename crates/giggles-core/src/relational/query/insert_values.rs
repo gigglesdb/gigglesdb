@@ -13,6 +13,13 @@ struct BoundValues {
     values: Vec<BoundScalar>,
     parameters: Vec<DataType>,
 }
+impl InsertExpressions {
+    pub(super) fn bind_value_schema_names(&mut self, bind: &impl Fn(&mut String)) {
+        for value in &mut self.values {
+            super::schema_names::scalar(value, bind);
+        }
+    }
+}
 pub(in super::super) struct Literals<'a> {
     roots: std::slice::Iter<'a, Scalar>,
     stack: [Option<(LiteralNode<'a>, usize)>; 64],

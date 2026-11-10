@@ -477,10 +477,10 @@ fn plan_unique_conflict_evaluated<'s>(
                         if semantics == Semantics::Native && table.primary_key.contains(index) {
                             return Err(Error::Unsupported.into());
                         }
-                        let value = expression.eval_conflict(
-                            &|index| &old.values[index],
-                            &|index| &proposal[index],
-                        )?;
+                        let value = expression
+                            .eval_conflict(&|index| &old.values[index], &|index| {
+                                &proposal[index]
+                            })?;
                         evaluated.push((*index, value));
                     }
                 }
@@ -893,7 +893,9 @@ impl Relational {
             }
         } else if let Some(name) = target.1 {
             if let Some(descriptor) = descriptors.iter().find(|descriptor| {
-                descriptor.table == table.id && descriptor.unique && descriptor.name == name
+                descriptor.table == table.id
+                    && descriptor.unique
+                    && crate::relational::split_key(&descriptor.name).1 == name
             }) {
                 Arbiter::Unique(descriptor)
             } else if src.primary_key_constraint_name(table).as_deref() == Some(name) {

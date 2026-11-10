@@ -1031,7 +1031,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }
     for t in &snapshot.tables {
         if !ids.insert(t.id)
-            || !names.insert(&t.name)
+            || !names.insert((snapshot.table_schema(t.id).0, &t.name))
             || t.name.is_empty()
             || t.columns.is_empty()
             || t.columns.len() > 64
@@ -1072,7 +1072,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     for i in &visible_indexes {
         let t = snapshot.tables.iter().find(|t| t.id == i.table).unwrap();
         if !descriptor_ids.insert(i.id)
-            || !descriptor_names.insert(&i.name)
+            || !descriptor_names.insert((snapshot.table_schema(i.table).0, &i.name))
             || i.name.is_empty()
             || i.columns.is_empty()
             || i.columns.len() > 64
@@ -1101,9 +1101,13 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut occupied = snapshot
         .tables
         .iter()
-        .map(|t| t.name.clone())
+        .map(|t| (snapshot.table_schema(t.id).0, t.name.clone()))
         .collect::<BTreeSet<_>>();
-    occupied.extend(visible_indexes.iter().map(|i| i.name.clone()));
+    occupied.extend(
+        visible_indexes
+            .iter()
+            .map(|i| (snapshot.table_schema(i.table).0, i.name.clone())),
+    );
     let mut key_names = BTreeMap::new();
     let mut sorted = snapshot.tables.iter().collect::<Vec<_>>();
     sorted.sort_by_key(|t| t.id);
@@ -1113,11 +1117,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
         let mut name = format!("{}_pkey", t.name);
         let mut suffix = 0usize;
-        while occupied.contains(&name) {
+        while occupied.contains(&(snapshot.table_schema(t.id).0, name.clone())) {
             name = format!("{}_pkey_{}_{}", t.name, t.id, suffix);
             suffix += 1;
         }
-        occupied.insert(name.clone());
+        occupied.insert((snapshot.table_schema(t.id).0, name.clone()));
         key_names.insert(t.id, name);
     }
     let mut all: BTreeMap<String, Relation> = known_names()

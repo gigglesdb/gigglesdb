@@ -125,7 +125,7 @@ impl Context for SnapshotContext {
         rows: Self::Input,
         table: &TableDef,
     ) -> std::result::Result<Vec<SqlRow>, CoreError> {
-        if self.state.sql.tables.get(&table.name) != Some(table) {
+        if self.state.sql.tables.get(&self.state.sql.table_key(table)) != Some(table) {
             return Err(CoreError::Sql(SqlError::StaleSchema));
         }
         Ok(rows)
@@ -242,7 +242,11 @@ pub(crate) fn execute_fenced(
     if description.contract_version != ENGINE_CONTRACT_VERSION
         || state.view.domain != description.database_domain
         || state.sql.epoch != description.catalog_epoch
-        || state.sql.tables.get(&description.table.name) != Some(&description.table)
+        || state
+            .sql
+            .tables
+            .get(&state.sql.table_key(&description.table))
+            != Some(&description.table)
         || request.table()? != description.table.name
     {
         return Err(core(CoreError::Sql(SqlError::StaleSchema)));

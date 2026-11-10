@@ -77,9 +77,9 @@ pub(super) fn add(
             ident::ident(name)?;
             name.to_owned()
         }
-        None => state.choose_constraint_name(&table.name, &[], AutoName::Pkey),
+        None => state.choose_constraint_name(&state.table_key(table), &[], AutoName::Pkey),
     };
-    if state.relation_name_taken(&name) {
+    if state.relation_name_taken(&relation_key(state.table_schema(table.id), &name)) {
         return Err(SqlError::DuplicateTable);
     }
     if state.constraint_name_taken(table.id, &name) {
@@ -108,7 +108,9 @@ pub(super) fn add(
             return Err(SqlError::Duplicate);
         }
     }
-    candidate.tables.insert(keyed.name.clone(), keyed.clone());
+    candidate
+        .tables
+        .insert(candidate.table_key(&keyed), keyed.clone());
     candidate.rows.insert(keyed.id, rows);
     record_name(&mut candidate, &keyed, &name)?;
     let descriptors = candidate.secondary_descriptors_engine().to_vec();

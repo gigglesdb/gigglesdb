@@ -22,7 +22,7 @@ impl Admin {
                 .map(|descriptor| IndexInfo {
                     id: descriptor.id,
                     table: descriptor.table,
-                    name: descriptor.name.clone(),
+                    name: crate::relational::split_key(&descriptor.name).1.into(),
                     columns: descriptor.columns.clone(),
                     unique: descriptor.unique,
                 })

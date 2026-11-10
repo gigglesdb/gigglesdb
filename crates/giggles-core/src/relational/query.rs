@@ -8,6 +8,7 @@ pub(super) use functions::assignment;
 pub(super) mod conflict;
 mod grouping;
 mod insert_values;
+mod schema_names;
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
@@ -1509,7 +1510,7 @@ impl Parser {
         {
             self.name()?
         } else {
-            name.clone()
+            split_key(&name).1.into()
         };
         Ok(Source { name, alias })
     }
@@ -1871,7 +1872,7 @@ impl Query {
             explain: false,
             sources: vec![Source {
                 name: table.into(),
-                alias: table.into(),
+                alias: split_key(table).1.into(),
             }],
             joins: vec![],
             items: vec![(Item::Star, None)],
@@ -1965,7 +1966,7 @@ impl Query {
             explain: false,
             sources: vec![Source {
                 name: table.into(),
-                alias: table.into(),
+                alias: split_key(table).1.into(),
             }],
             joins: vec![],
             items,

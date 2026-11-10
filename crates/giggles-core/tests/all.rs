@@ -315,3 +315,6 @@ mod user_schemas;
 
 #[path = "user_defined_types.rs"]
 mod user_defined_types;
+
+#[path = "per_schema_names.rs"]
+mod per_schema_names;

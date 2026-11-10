@@ -48,12 +48,12 @@ mod in_subquery_authority;
 mod multi_statement_network;
 #[path = "pg_dump_preamble_network.rs"]
 mod pg_dump_preamble_network;
-#[path = "psql_table_owner_network.rs"]
-mod psql_table_owner_network;
 #[path = "postgresql_network.rs"]
 mod postgresql_network;
 #[path = "primary_key_update_network.rs"]
 mod primary_key_update_network;
+#[path = "psql_table_owner_network.rs"]
+mod psql_table_owner_network;
 #[path = "qualified_routine_network.rs"]
 mod qualified_routine_network;
 #[path = "role_sessions.rs"]
@@ -97,7 +97,10 @@ fn every_test_file_is_registered() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("utf-8 name");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name");
         if stem == "all" {
             continue;
         }
@@ -115,14 +118,17 @@ fn every_test_file_is_registered() {
 #[path = "npgsql_get_schema_network.rs"]
 mod npgsql_get_schema_network;
 
-#[path = "transaction_isolation_reporting.rs"]
-mod transaction_isolation_reporting;
-#[path = "sql_cursors_network.rs"]
-mod sql_cursors_network;
-#[path = "mixed_catalog_app_query.rs"]
-mod mixed_catalog_app_query;
 #[path = "logical_columns.rs"]
 mod logical_columns;
+#[path = "mixed_catalog_app_query.rs"]
+mod mixed_catalog_app_query;
+#[path = "sql_cursors_network.rs"]
+mod sql_cursors_network;
+#[path = "transaction_isolation_reporting.rs"]
+mod transaction_isolation_reporting;
 
 #[path = "key_rotation.rs"]
 mod key_rotation;
+
+#[path = "per_schema_names.rs"]
+mod per_schema_names;

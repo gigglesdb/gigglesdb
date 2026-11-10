@@ -11,6 +11,8 @@ pub(super) fn callback(
     Arc::new(move |operation, name, value, called| {
         crate::cancellation::check()?;
         let name = sequences::sequence_name(name).map_err(CoreError::Sql)?;
+        let (schema, name) = split_key(&name);
+        let name = relation_key(schema, name);
         let (&id, def) = image
             .catalog_ext()
             .sequences

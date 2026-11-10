@@ -132,10 +132,7 @@ impl Parser {
             let mut name = self.ident()?;
             if tables && self.tokens.get(self.pos) == Some(&Token::Dot) {
                 self.pos += 1;
-                if name != "public" {
-                    return Err("3F000");
-                }
-                name = self.ident()?;
+                name = format!("{name}\0{}", self.ident()?);
             }
             names.push(name);
             if !self.comma() {
@@ -409,6 +406,7 @@ pub(crate) fn execute(
                 return Err("42501");
             }
             let tables = admin.catalog().map_err(|_| "XX000")?.1;
+            let schemas = admin.catalog_schema_metadata().map_err(|_| "XX000")?;
             let mut targets = std::collections::BTreeSet::new();
             for name in names {
                 let Some(target) = catalog.get(name).map_err(state)? else {
@@ -424,7 +422,15 @@ pub(crate) fn execute(
                     return Err("42501");
                 }
                 for t in &tables {
-                    if catalog.table_owner(&t.name).map_err(state)?.as_deref() == Some(name) {
+                    if catalog
+                        .table_owner(&giggles_core::relational::relation_key(
+                            schemas.tables.get(&t.id).map_or("public", String::as_str),
+                            &t.name,
+                        ))
+                        .map_err(state)?
+                        .as_deref()
+                        == Some(name)
+                    {
                         return Err("2BP01");
                     }
                 }
@@ -437,8 +443,17 @@ pub(crate) fn execute(
         }
         AdminStatement::DropTable(if_exists, names) => {
             let tables = admin.catalog().map_err(|e| crate::service::sqlstate(&e))?.1;
+            let schemas = admin.catalog_schema_metadata().map_err(|_| "XX000")?;
             for name in names {
-                if !tables.iter().any(|table| &table.name == name) {
+                if !tables.iter().any(|table| {
+                    &giggles_core::relational::relation_key(
+                        schemas
+                            .tables
+                            .get(&table.id)
+                            .map_or("public", String::as_str),
+                        &table.name,
+                    ) == name
+                }) {
                     if *if_exists {
                         continue;
                     }
@@ -487,9 +502,15 @@ pub(crate) fn execute(
                 return Err("42501");
             }
             let tables = admin.catalog().map_err(|_| "XX000")?.1;
+            let schemas = admin.catalog_schema_metadata().map_err(|_| "XX000")?;
             for object in objects {
                 if !schema {
-                    if !tables.iter().any(|t| &t.name == object) {
+                    if !tables.iter().any(|t| {
+                        &giggles_core::relational::relation_key(
+                            schemas.tables.get(&t.id).map_or("public", String::as_str),
+                            &t.name,
+                        ) == object
+                    }) {
                         return Err("42P01");
                     }
                     if !actor.superuser
@@ -866,7 +887,7 @@ mod tests {
             matches!(parse("DROP USER IF EXISTS a, \"B\";"),Some(AdminStatement::Drop(true,n)) if n == ["a","B"])
         );
         assert!(
-            matches!(parse("GRANT SELECT, UPDATE ON TABLE public.t, u TO a,b"),Some(AdminStatement::Grant { grant:true,schema:false,objects,roles,.. }) if objects == ["t","u"] && roles == ["a","b"])
+            matches!(parse("GRANT SELECT, UPDATE ON TABLE public.t, u TO a,b"),Some(AdminStatement::Grant { grant:true,schema:false,objects,roles,.. }) if objects == ["public\0t","u"] && roles == ["a","b"])
         );
         assert!(matches!(
             parse("REVOKE ALL PRIVILEGES ON SCHEMA public FROM a"),
@@ -882,7 +903,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("GRANT SELECT ON other.t TO a"),
-            Some(AdminStatement::Error("3F000"))
+            Some(AdminStatement::Grant { objects, .. }) if objects == ["other\0t"]
         ));
     }
     #[test]
@@ -892,7 +913,7 @@ mod tests {
             (
                 "  DrOp TaBlE IF EXISTS PUBLIC.Mixed, \"public\".\"A\"\"B\", _t$1; ",
                 true,
-                vec!["mixed", "A\"B", "_t$1"],
+                vec!["public\0mixed", "public\0A\"B", "_t$1"],
             ),
             ("DROP TABLE\"Case\";", false, vec!["Case"]),
         ] {
@@ -944,7 +965,7 @@ mod tests {
         }
         for sql in ["DROP TABLE other.t", "DROP TABLE \"Public\".t"] {
             assert!(
-                matches!(parse(sql), Some(AdminStatement::Error("3F000"))),
+                matches!(parse(sql), Some(AdminStatement::DropTable(_, _))),
                 "{sql}"
             );
         }

@@ -69,10 +69,10 @@ impl Parser {
         };
         self.relations.push(super::schemas::Reference {
             name: name.clone(),
-            schema,
+            schema: schema.clone(),
             create: schema_error == SqlError::InvalidSchema,
         });
-        Ok(name)
+        Ok(schema.map_or(name.clone(), |s| format!("{s}\0{name}")))
     }
     /// Resolve column, relation.column, or public.relation.column.
     pub(super) fn qualified_name(&mut self) -> R<(Option<String>, String)> {

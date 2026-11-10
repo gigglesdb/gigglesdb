@@ -7,6 +7,10 @@ pub(super) struct Returning {
 }
 
 impl Returning {
+    pub(super) fn bind_schema_names(&mut self, bind: &impl Fn(&mut String)) {
+        self.query.bind_schema_names(bind);
+    }
+
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         self.query.sequence_dependencies()
     }
@@ -69,6 +73,18 @@ impl Returning {
 }
 
 impl Prepared {
+    pub(super) fn returning_mut(&mut self) -> Option<&mut Returning> {
+        match &mut self.statement {
+            Statement::Insert { returning, .. }
+            | Statement::Update { returning, .. }
+            | Statement::UpdateExpressions { returning, .. }
+            | Statement::Delete { returning, .. } => returning.as_mut(),
+            Statement::InsertExpressions(values) => values.returning.as_mut(),
+            Statement::InsertMulti(insert) => insert.returning.as_mut(),
+            _ => None,
+        }
+    }
+
     pub(super) fn returning(&self) -> Option<&Returning> {
         match &self.statement {
             Statement::Insert { returning, .. }

@@ -154,7 +154,7 @@ pub(super) fn merge(s: &mut State, source: &BTreeMap<u64, SeqCounter>) {
     });
 }
 
-pub(super) fn sequence_name(text: &str) -> R<String> {
+pub(crate) fn sequence_name(text: &str) -> R<String> {
     let mut parts = Vec::new();
     let mut chars = text.trim().chars().peekable();
     loop {
@@ -198,7 +198,7 @@ pub(super) fn sequence_name(text: &str) -> R<String> {
     }
     match parts.as_slice() {
         [name] => Ok(name.clone()),
-        [schema, name] if schema == "public" => Ok(name.clone()),
+        [schema, name] => Ok(format!("{schema}\0{name}")),
         _ => Err(E::UnknownTable),
     }
 }
@@ -247,6 +247,7 @@ impl Inner {
         pending: Pending,
         values: SessionValues,
         allowed_tables: Option<std::collections::BTreeSet<String>>,
+        search_path: Vec<String>,
     ) -> relational::clock::SequenceCallback {
         let inner = self.clone();
         Arc::new(move |operation, text, value, called| {
@@ -257,6 +258,7 @@ impl Inner {
                 return Err(CoreError::Policy(Error::Scope));
             }
             let name = sequence_name(text).map_err(CoreError::Sql)?;
+            let name = snapshot.sql.resolve_relation_key(&name, &search_path);
             let (&id, def) = snapshot
                 .sql
                 .catalog_ext()
@@ -268,7 +270,9 @@ impl Inner {
                 let owner = def
                     .owned_by
                     .and_then(|(id, _)| snapshot.sql.tables.values().find(|t| t.id == id));
-                if !allowed.contains(&name) && owner.is_none_or(|t| !allowed.contains(&t.name)) {
+                if !allowed.contains(&name)
+                    && owner.is_none_or(|t| !allowed.contains(&snapshot.sql.table_key(t)))
+                {
                     return Err(CoreError::Policy(Error::Scope));
                 }
             }
@@ -389,9 +393,12 @@ mod tests {
     }
     #[test]
     fn reference_names_preserve_quoted_case() {
-        assert_eq!(sequence_name(" public . FOO "), Ok("foo".into()));
-        assert_eq!(sequence_name("\"public\".\"F\"\"oo\""), Ok("F\"oo".into()));
-        assert_eq!(sequence_name("other.s"), Err(E::UnknownTable));
+        assert_eq!(sequence_name(" public . FOO "), Ok("public\0foo".into()));
+        assert_eq!(
+            sequence_name("\"public\".\"F\"\"oo\""),
+            Ok("public\0F\"oo".into())
+        );
+        assert_eq!(sequence_name("other.s"), Ok("other\0s".into()));
         assert_eq!(sequence_name("public."), Err(E::InvalidTextRepresentation));
     }
 }

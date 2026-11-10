@@ -31,9 +31,12 @@ fn truncation_is_at_utf8_boundary_and_before_reserved_checks() {
 }
 #[test]
 fn schema_and_column_resolution() {
-    assert_eq!(parser("PUBLIC.\"Mixed\"").table_name().unwrap(), "Mixed");
+    assert_eq!(
+        parser("PUBLIC.\"Mixed\"").table_name().unwrap(),
+        "public\0Mixed"
+    );
     let mut p = parser("other.t");
-    assert_eq!(p.table_name().unwrap(), "t");
+    assert_eq!(p.table_name().unwrap(), "other\0t");
     assert_eq!(p.relations[0].schema.as_deref(), Some("other"));
     let mut p = parser("other.t.c");
     assert_eq!(p.qualified_name().unwrap(), (Some("t".into()), "c".into()));

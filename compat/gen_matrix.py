@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 
 DIVERGENCES = (
-    ('Relation names are globally unique across schemas', '42P07', 'global_relation_name'),
     ('Type names are globally unique across schemas', '42710', 'global_type_name'),
     ('Composite-typed columns', '0A000', 'composite_column'),
     ('DROP TYPE CASCADE', '0A000', 'drop_type_cascade'),

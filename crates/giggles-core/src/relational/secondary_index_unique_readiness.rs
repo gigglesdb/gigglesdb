@@ -226,8 +226,9 @@ fn metadata<'a, F: FnMut() -> bool>(
     let mut selected = None;
     for (name, t) in &state.tables {
         meter.checkpoint()?;
-        ident(name)?;
-        if name != &t.name
+        schema_binding::validate_key(name)?;
+        ident(&t.name)?;
+        if name != &state.table_key(t)
             || t.id == 0
             || t.id >= state.next_id
             || ids.contains(&t.id)
@@ -271,7 +272,7 @@ fn metadata<'a, F: FnMut() -> bool>(
     {
         return Err(SqlError::Type);
     }
-    ident(&d.name)?;
+    schema_binding::validate_key(&d.name)?;
     for p in &t.primary_key {
         legacy(&t.columns[*p].data_type)?;
     }

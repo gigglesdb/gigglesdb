@@ -78,7 +78,7 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     let name = match explicit_name {
         Some(value) => value,
         None => {
-            let table_part = ident::truncate(&table, 58);
+            let table_part = ident::truncate(split_key(&table).1, 58);
             let available = 63usize.saturating_sub(table_part.len() + 5);
             let column_part = columns.join("_");
             let column_part = ident::truncate(&column_part, available);

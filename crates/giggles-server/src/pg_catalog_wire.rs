@@ -373,7 +373,15 @@ fn catalog_roles(
     let owners = tables
         .iter()
         .filter_map(|table| {
-            let owner = registry.table_owner(&table.name).ok()??;
+            let schemas = session.sql.schema_metadata().ok()?;
+            let key = giggles_core::relational::relation_key(
+                schemas
+                    .tables
+                    .get(&table.id)
+                    .map_or("public", String::as_str),
+                &table.name,
+            );
+            let owner = registry.table_owner(&key).ok()??;
             Some((table.id, *oids.get(&owner)?))
         })
         .collect();

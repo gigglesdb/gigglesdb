@@ -175,6 +175,23 @@ fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTree
 }
 
 impl RoleCatalog {
+    fn validate_relation_name(&self, name: &str) -> Result<(), RoleError> {
+        if let Some((schema, relation)) = name.split_once('\0') {
+            validate_name(schema)?;
+            validate_name(relation)?;
+            if schema == "public"
+                || !self
+                    .inner
+                    .inspect(|s| Ok(s.sql.schema_metadata().schemas.contains_key(schema)))?
+            {
+                return Err(RoleError::Invalid);
+            }
+            Ok(())
+        } else {
+            validate_name(name)
+        }
+    }
+
     fn check_fenced(&self) -> Result<(), RoleError> {
         if self.inner.fenced.load(Ordering::Acquire) {
             return Err(CoreError::Fenced.into());
@@ -337,7 +354,7 @@ impl RoleCatalog {
                     return Err(RoleError::Dependent);
                 }
                 if (bytes.starts_with(b"tgrant/") || bytes.starts_with(b"sgrant/"))
-                    && bytes.split(|byte| *byte == 0).nth(1) == Some(name.as_bytes())
+                    && bytes.rsplit(|byte| *byte == 0).next() == Some(name.as_bytes())
                 {
                     remove.push(bytes.to_vec());
                 }
@@ -352,7 +369,7 @@ impl RoleCatalog {
 
     pub fn table_owner(&self, table: &str) -> Result<Option<String>, RoleError> {
         self.check_fenced()?;
-        validate_name(table)?;
+        self.validate_relation_name(table)?;
         self.read(|roles| match roles {
             Some(roles) => raw_get(roles, &key(b"owner/", table))?
                 .map(|value| {
@@ -366,7 +383,7 @@ impl RoleCatalog {
 
     pub fn set_table_owner(&self, table: &str, role: &str) -> Result<(), RoleError> {
         self.check_fenced()?;
-        validate_name(table)?;
+        self.validate_relation_name(table)?;
         validate_name(role)?;
         self.write(|roles| {
             require_role(roles, role)?;
@@ -379,7 +396,7 @@ impl RoleCatalog {
 
     pub fn forget_table(&self, table: &str) -> Result<(), RoleError> {
         self.check_fenced()?;
-        validate_name(table)?;
+        self.validate_relation_name(table)?;
         self.write(|roles| {
             let prefix = grant_key(b"tgrant/", table, "");
             let mut remove = Vec::new();
@@ -406,7 +423,11 @@ impl RoleCatalog {
         grant: bool,
     ) -> Result<(), RoleError> {
         self.check_fenced()?;
-        validate_name(object)?;
+        if prefix == b"tgrant/" {
+            self.validate_relation_name(object)?;
+        } else {
+            validate_name(object)?;
+        }
         validate_name(role)?;
         self.write(|table| {
             require_role(table, role)?;
@@ -438,7 +459,11 @@ impl RoleCatalog {
         role: &str,
     ) -> Result<BTreeSet<P>, RoleError> {
         self.check_fenced()?;
-        validate_name(object)?;
+        if prefix == b"tgrant/" {
+            self.validate_relation_name(object)?;
+        } else {
+            validate_name(object)?;
+        }
         validate_name(role)?;
         self.read(|table| match table {
             Some(table) => privileges(raw_get(table, &grant_key(prefix, object, role))?),
@@ -510,7 +535,7 @@ impl RoleCatalog {
                     let name = if let Some(name) = bytes.strip_prefix(b"owner/") {
                         (value.value() == role.as_bytes()).then_some(name)
                     } else if let Some(grant) = bytes.strip_prefix(b"tgrant/") {
-                        match grant.iter().position(|byte| *byte == 0) {
+                        match grant.iter().rposition(|byte| *byte == 0) {
                             Some(separator)
                                 if &grant[separator + 1..] == role.as_bytes()
                                     && !decode::<Vec<TablePrivilege>>(value.value())?
@@ -649,7 +674,12 @@ mod tests {
     }
 
     fn main_records(admin: &Admin) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let tx = admin.inner.db(super::super::ROLES).unwrap().begin_read().unwrap();
+        let tx = admin
+            .inner
+            .db(super::super::ROLES)
+            .unwrap()
+            .begin_read()
+            .unwrap();
         let table = tx.open_table(super::super::RECORDS).unwrap();
         table
             .iter()
@@ -672,7 +702,12 @@ mod tests {
             assert!(roles.table_privileges("t", "absent").unwrap().is_empty());
             assert!(roles.schema_privileges("s", "absent").unwrap().is_empty());
             assert!(roles.visible_tables("absent").unwrap().is_empty());
-            let tx = admin.inner.db(super::super::ROLES).unwrap().begin_read().unwrap();
+            let tx = admin
+                .inner
+                .db(super::super::ROLES)
+                .unwrap()
+                .begin_read()
+                .unwrap();
             assert!(matches!(
                 tx.open_table(ROLES),
                 Err(redb::TableError::TableDoesNotExist(_))

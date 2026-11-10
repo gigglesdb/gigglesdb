@@ -512,7 +512,7 @@ pub(crate) enum Action {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SequenceDef {
-    #[serde(deserialize_with = "name")]
+    #[serde(deserialize_with = "relation_name")]
     pub(crate) name: String,
     pub(crate) data_type: DataType,
     pub(crate) start: i64,
@@ -754,6 +754,9 @@ fn string<'de, D: serde::Deserializer<'de>, const N: usize>(d: D) -> Result<Stri
 pub(super) fn name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string::<D, 63>(d)
 }
+fn relation_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    string::<D, 127>(d)
+}
 fn expression<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     string::<D, MAX_EXPR>(d)
 }
@@ -881,7 +884,8 @@ impl Relational {
             } else {
                 format!("seq{attempt}")
             };
-            let name = constraint_object_name(table, column, &label);
+            let (schema, table) = split_key(table);
+            let name = relation_key(schema, &constraint_object_name(table, column, &label));
             if !self.relation_name_taken(&name) {
                 return name;
             }
@@ -906,7 +910,7 @@ impl Relational {
                 .secondary
                 .descriptors()
                 .iter()
-                .any(|d| d.table == table && d.unique && d.name == name)
+                .any(|d| d.table == table && d.unique && split_key(&d.name).1 == name)
     }
 
     pub(crate) fn choose_constraint_name(
@@ -932,22 +936,27 @@ impl Relational {
             } else {
                 format!("{suffix}{attempt}")
             };
+            let (schema, table) = split_key(table);
             let name = constraint_object_name(table, &columns, &label);
+            let key = relation_key(schema, &name);
             let constraint_taken = self
                 .ext
                 .constraints
-                .values()
-                .flatten()
+                .iter()
+                .filter(|(id, _)| self.table_schema(**id) == schema)
+                .flat_map(|(_, constraints)| constraints)
                 .any(|c| c.name == name)
                 || self.tables.values().any(|t| {
-                    constraint_primary_key::primary_key_name(self, t).is_some_and(|n| n == name)
+                    self.table_schema(t.id) == schema
+                        && constraint_primary_key::primary_key_name(self, t)
+                            .is_some_and(|n| n == name)
                 })
                 || self
                     .secondary
                     .descriptors()
                     .iter()
-                    .any(|d| d.unique && d.name == name);
-            if !constraint_taken && (!relation || !self.relation_name_taken(&name)) {
+                    .any(|d| d.unique && d.name == key);
+            if !constraint_taken && (!relation || !self.relation_name_taken(&key)) {
                 return name;
             }
         }
@@ -1156,8 +1165,12 @@ impl Relational {
             if *id == 0 || *id >= next_id || !used.insert(*id) || !names.insert(&s.name) {
                 return Err(SqlError::Type);
             }
-            ident(&s.name)?;
-            if s.name.len() > 63
+            schema_binding::validate_key(&s.name)?;
+            let schema = split_key(&s.name).0;
+            if schema != "public" && !ext.schemas.contains_key(schema) {
+                return Err(SqlError::Type);
+            }
+            if split_key(&s.name).1.len() > 63
                 || !matches!(
                     s.data_type,
                     DataType::SmallInt | DataType::Integer | DataType::BigInt
@@ -1179,7 +1192,10 @@ impl Relational {
                 return Err(SqlError::Type);
             }
             if let Some((t, c)) = s.owned_by
-                && !columns.get(&c).is_some_and(|(owner, _)| *owner == t)
+                && !columns.get(&c).is_some_and(|(owner, _)| {
+                    *owner == t
+                        && ext.table_schemas.get(&t).map_or("public", String::as_str) == schema
+                })
             {
                 return Err(SqlError::Type);
             }
