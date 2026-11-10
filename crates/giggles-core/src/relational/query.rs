@@ -1662,6 +1662,23 @@ impl Query {
         }
         found
     }
+    /// Only row-local SELECTs can be evaluated independently on source pages.
+    pub(super) fn pageable_insert(&self) -> bool {
+        self.sources.len() == 1
+            && self.joins.is_empty()
+            && self.order.is_empty()
+            && self.limit.is_none()
+            && self.offset().is_none()
+            && !self.distinct()
+            && self.group().is_empty()
+            && self.clauses().is_none_or(|c| c.having.is_none())
+            && !self.has_in_subquery()
+            && self.items.iter().all(|(item, _)| match item {
+                Item::Aggregate(..) => false,
+                Item::Scalar(s) => !grouping::contains_aggregate(s),
+                Item::Star => true,
+            })
+    }
     pub(super) fn subquery_tables(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(f) = &self.filter {

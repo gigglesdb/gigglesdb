@@ -1,0 +1,126 @@
+//! Append pages share the outer statement snapshot, locks and savepoint.
+use super::*;
+
+pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
+    let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
+        return false;
+    };
+    // A later input page may supply a self-referencing FK's parent. Keep that
+    // statement and deferred FKs on the complete-image executor for final checks.
+    if state
+        .ext
+        .constraints
+        .get(&table.id)
+        .into_iter()
+        .flatten()
+        .any(|c| {
+            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, deferral, .. }
+            if ref_table == table.id || deferral != catalog_ext::Deferral::NotDeferrable)
+        })
+    {
+        return false;
+    }
+    matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
+        && i.source.as_ref().is_none_or(|q| q.pageable_insert()
+            && q.read_tables().first().is_some_and(|name| state.tables.contains_key(name))
+            && !q.read_tables().contains(&i.table)))
+}
+
+pub(super) fn execute(
+    state: &mut Relational,
+    prepared: &Prepared,
+    params: &[Value],
+    clock: Option<&clock::ExecutionClock>,
+    sink: &mut impl RowSink,
+    version_end: u64,
+    mut deferred: Option<&mut DeferralState>,
+) -> Result<SqlResult, CoreError> {
+    let Statement::InsertMulti(insert) = &prepared.statement else {
+        unreachable!()
+    };
+    let mut template = prepared.clone();
+    template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?.parameters.into_iter().map(Some).collect();
+    template.statement = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
+    template.unbound_statement = None;
+    let mut output = scan::Retention::new(MAX_RESULT_BYTES);
+    let mut result = SqlResult::default();
+    let mut after = None;
+    let mut start = 0;
+    let first_version = state.next_version;
+    let table = state.tables[&insert.table].clone();
+    let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
+        .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+    loop {
+        let (input, done) = if let Some(query) = &insert.source {
+            let table = &state.tables[&query.read_tables()[0]];
+            let next = sink.read_page(table, after.take())?;
+            let done = next.is_none();
+            let (last, rows) = next.unwrap_or_default();
+            after = Some(last);
+            let mut source = state.clone();
+            source.rows.insert(table.id, rows);
+            (
+                insert
+                    .source_page(&source, params, &prepared.parameter_types, clock)
+                    .map_err(CoreError::Sql)?,
+                done,
+            )
+        } else {
+            if start == insert.row_count() {
+                break;
+            }
+            let end = (start + 200).min(insert.row_count());
+            let input = insert.batch(start, end);
+            start = end;
+            (input, false)
+        };
+        let mut page = state.clone();
+        // FK triggers run after all input has passed immediate uniqueness and
+        // row checks, including proposals on later pages (PostgreSQL timing).
+        if foreign_keys {
+            page.ext.constraints.get_mut(&table.id).expect("FK constraints")
+                .retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+        }
+        let mut batch = template.clone();
+        batch.statement = Statement::InsertMulti(Box::new(input));
+        let part = page.execute_with_sink(
+            &batch,
+            params,
+            None,
+            clock,
+            sink,
+            version_end,
+            deferred.as_deref_mut(),
+        )?;
+        state.next_version = page.next_version;
+        for row in &part.rows {
+            output
+                .charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?)
+                .map_err(CoreError::Sql)?;
+        }
+        result.columns = part.columns;
+        result.affected += part.affected;
+        result.rows.extend(part.rows);
+        if done {
+            break;
+        }
+    }
+    if foreign_keys {
+        let mut after = None;
+        while let Some((last, mut rows)) = sink.read_page(&table, after.take())? {
+            after = Some(last);
+            rows.retain(|_, row| row.version >= first_version && row.version < state.next_version);
+            if rows.is_empty() { continue; }
+            let mut page = state.clone();
+            page.rows.insert(table.id, rows);
+            let mut before = state.clone();
+            let mut retention = scan::Retention::new(scan::retention_limit());
+            while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
+                sink, &mut retention, true)? > 0 {}
+            rebuild(&mut page, &sink.indexes())?;
+            constraints::enforce(&mut page, &before, Vec::new(), &mut DeferralState::default(),
+                &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
+        }
+    }
+    Ok(result)
+}

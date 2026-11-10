@@ -156,6 +156,129 @@ fn returning_exceeds_legacy_row_cap_and_keeps_output_budget() {
     assert_eq!(row(&f, 0).unwrap(), before);
 }
 
+fn count(f: &Fixture, name: &str) -> usize {
+    let entry = TableEntry {
+        def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new(),
+    };
+    let mut txn = f.db().begin(Isolation::ReadCommitted);
+    f.db().rows.scan(&mut txn, &entry, Bound::Unbounded, Bound::Unbounded,
+        Direction::Forward, None).unwrap().map(Result::unwrap).count()
+}
+
+#[test]
+fn insert_select_200_000_and_late_failure() {
+    for index in [
+        "",
+        "CREATE INDEX ix ON dst(v)",
+        "CREATE UNIQUE INDEX ix ON dst(v)",
+    ] {
+        let f = super::large_ddl::large_table(200_000, false, false);
+        f.execute("CREATE TABLE dst (id bigint PRIMARY KEY, v bigint)");
+        if !index.is_empty() {
+            f.execute(index);
+        }
+        let mut s = f.admin().sql_session();
+        s.execute("BEGIN", &[], None).unwrap();
+        assert_eq!(
+            s.execute("INSERT INTO dst SELECT id,v FROM t", &[], None)
+                .unwrap()
+                .affected,
+            200_000
+        );
+        s.execute("ROLLBACK", &[], None).unwrap();
+        assert_eq!(count(&f, "dst"), 0);
+        // The final input conflicts with the first row after 999 successful pages.
+        assert_eq!(
+            s.execute(
+                "INSERT INTO dst SELECT CASE WHEN id = 199999 THEN 0 ELSE id END,v FROM t",
+                &[],
+                None
+            ),
+            Err(CoreError::Sql(SqlError::Duplicate))
+        );
+        assert_eq!(count(&f, "dst"), 0);
+        if index.contains("UNIQUE") {
+            assert_eq!(
+                s.execute(
+                    "INSERT INTO dst SELECT id,CASE WHEN id = 199999 THEN 0 ELSE v END FROM t",
+                    &[],
+                    None
+                ),
+                Err(CoreError::Sql(SqlError::Duplicate))
+            );
+            assert_eq!(count(&f, "dst"), 0);
+        }
+        assert_eq!(
+            s.execute("INSERT INTO dst SELECT id,v FROM t", &[], None)
+                .unwrap()
+                .affected,
+            200_000
+        );
+        assert_eq!(count(&f, "dst"), 200_000);
+    }
+}
+
+#[test]
+fn large_values_keeps_legacy_admission_and_atomicity() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v bigint)");
+    f.execute("CREATE UNIQUE INDEX ix ON t(v)");
+    let values = (0..2050)
+        .map(|id| format!("({id},{id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO t VALUES {values}");
+    let mut legacy = relational::Relational::default();
+    let p = relational::Prepared::parse(
+        "CREATE TABLE t (id bigint PRIMARY KEY, v bigint)",
+        1,
+        legacy.epoch,
+    )
+    .unwrap();
+    legacy.execute(&p, &[], None).unwrap();
+    let p = relational::Prepared::parse(&sql, 1, legacy.epoch).unwrap();
+    assert_eq!(legacy.execute(&p, &[], None), Err(SqlError::Limit));
+    let mut s = f.admin().sql_session();
+    assert_eq!(
+        s.execute(&format!("{sql},(2050,0)"), &[], None),
+        Err(CoreError::Sql(SqlError::Duplicate))
+    );
+    assert_eq!(count(&f, "t"), 0);
+    assert_eq!(s.execute(&sql, &[], None).unwrap().affected, 2050);
+}
+
+#[test]
+fn insert_200_000_fk_children_and_late_missing_parent() {
+    let f = super::large_ddl::large_table(200_000, false, false);
+    f.execute("CREATE TABLE p (id bigint PRIMARY KEY)");
+    f.execute("INSERT INTO p VALUES (1)");
+    f.execute("CREATE TABLE c (id bigint PRIMARY KEY, pid bigint REFERENCES p(id))");
+    let mut s = f.admin().sql_session();
+    assert_eq!(
+        s.execute(
+            "INSERT INTO c SELECT id,CASE WHEN id = 199999 THEN 2 ELSE 1 END FROM t",
+            &[],
+            None
+        ),
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation))
+    );
+    assert_eq!(count(&f, "c"), 0);
+    // Immediate uniqueness precedes a missing-parent trigger queued earlier.
+    assert_eq!(s.execute("INSERT INTO c SELECT CASE WHEN id = 199999 THEN 0 ELSE id END,CASE WHEN id = 0 THEN 2 ELSE 1 END FROM t", &[], None),
+        Err(CoreError::Sql(SqlError::Duplicate)));
+    assert_eq!(count(&f, "c"), 0);
+    assert_eq!(
+        s.execute("INSERT INTO c SELECT id,1 FROM t", &[], None)
+            .unwrap()
+            .affected,
+        200_000
+    );
+    assert_eq!(
+        s.execute("SELECT count(*) FROM c", &[], None).unwrap().rows[0].values,
+        vec![Int(200_000)]
+    );
+}
+
 #[test]
 #[ignore = "one-million-row DML qualification; run explicitly"]
 fn million_row_update() {

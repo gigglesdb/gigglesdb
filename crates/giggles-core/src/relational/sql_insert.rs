@@ -7,6 +7,7 @@ pub(super) struct Insert {
     pub table: String,
     alias: Option<String>,
     copy_input: Option<Vec<DataType>>,
+    source_types: Option<Vec<Option<DataType>>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
     casts: BTreeMap<(usize, usize), query::conflict::Expression>,
@@ -221,7 +222,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             }
             rows.push(row);
             defaults.push(row_defaults);
-            if rows.len() > MAX_ROWS {
+            if rows.len() > MAX_SQL {
                 return Err(SqlError::Limit);
             }
             if !p.sym(',') {
@@ -294,6 +295,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     }
     Ok(Insert {
         copy_input: None,
+        source_types: None,
         table,
         alias,
         columns,
@@ -403,6 +405,56 @@ fn source_indexes(insert: &Insert, state: &Relational, table: &TableDef) -> R<Ve
     Ok(indexes)
 }
 impl Insert {
+    pub(super) fn append_only(&self) -> bool {
+        self.conflict.is_none()
+    }
+    pub(super) fn needs_pages(&self) -> bool {
+        self.rows.len() > 200 || self.source.is_some()
+    }
+    pub(super) fn batch(&self, start: usize, end: usize) -> Self {
+        Self {
+            rows: self.rows[start..end].to_vec(),
+            defaults: self.defaults[start..end].to_vec(),
+            casts: self
+                .casts
+                .range((start, 0)..(end, 0))
+                .map(|((row, col), expr)| ((*row - start, *col), expr.clone()))
+                .collect(),
+            table: self.table.clone(),
+            alias: self.alias.clone(),
+            copy_input: self.copy_input.clone(),
+            columns: self.columns.clone(),
+            source_types: self.source_types.clone(),
+            default_values: self.default_values,
+            overriding: self.overriding,
+            conflict: self.conflict.clone(),
+            returning: self.returning.clone(),
+            source: None,
+        }
+    }
+    pub(super) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+    pub(super) fn source_page(
+        &self,
+        state: &Relational,
+        params: &[Value],
+        declared: &[Option<DataType>],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<Self> {
+        let materialized = materialize_source(
+            self,
+            state,
+            params,
+            declared,
+            clock,
+            &mut || crate::cancellation::check().is_err(),
+            None,
+        )?;
+        let mut insert = materialized.insert;
+        insert.source_types = Some(materialized.types);
+        Ok(insert)
+    }
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         let mut dependencies = self
             .source
@@ -449,6 +501,7 @@ impl Insert {
             conflict: None,
             returning: None,
             copy_input: Some(types),
+            source_types: None,
             source: None,
         }
     }
@@ -1219,7 +1272,7 @@ pub(super) fn execute_declared(
         )?;
         (&materialized.insert, Some(materialized.types.as_slice()))
     } else {
-        (insert, None)
+        (insert, insert.source_types.as_deref())
     };
     admit_statement(insert, params)?;
     if cancel() {

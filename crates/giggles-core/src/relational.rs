@@ -854,7 +854,10 @@ fn lex(s: &str) -> R<Vec<Token>> {
         } else {
             return Err(SqlError::Unsupported);
         }
-        if out.len() > 4096 {
+        // INSERT's executor retains the legacy 1,024-row admission limit;
+        // v2 can split larger VALUES lists within the existing SQL byte budget.
+        let insert = matches!(out.first(), Some(Token::Word(word)) if word == "insert");
+        if out.len() > if insert { MAX_SQL } else { 4096 } {
             return Err(SqlError::Limit);
         }
     }

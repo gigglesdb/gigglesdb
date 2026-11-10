@@ -863,7 +863,7 @@ fn sink_failure_rolls_back_partial_rekey_and_column_rewrite() {
 }
 
 #[test]
-fn mutation_limits_and_parameter_errors_match_legacy_without_rows() {
+fn mutation_limits_keep_legacy_cap_but_page_v2_values() {
     use relational::Value::{Int, Text};
     let f = Fixture::new();
     let path = f.path.with_extension("limits-legacy");
@@ -890,9 +890,10 @@ fn mutation_limits_and_parameter_errors_match_legacy_without_rows() {
         .join(",");
     let sql = format!("INSERT INTO t VALUES {tuples}");
     let left = a.execute(&sql, &[], None).unwrap_err();
-    assert_eq!(b.execute(&sql, &[], None), Err(left));
+    assert_eq!(left, CoreError::Sql(SqlError::Limit));
+    assert_eq!(b.execute(&sql, &[], None).unwrap().affected, 1025);
     assert!(values(&mut a, "SELECT * FROM t ORDER BY id").is_empty());
-    assert!(values(&mut b, "SELECT * FROM t ORDER BY id").is_empty());
+    assert_eq!(values(&mut b, "SELECT * FROM t ORDER BY id").len(), 1025);
     drop((a, b, legacy));
     fs::remove_dir_all(path).unwrap();
 }

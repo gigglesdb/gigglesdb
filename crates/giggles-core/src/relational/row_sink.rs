@@ -43,6 +43,13 @@ pub(crate) trait RowSink {
     fn streams_index_builds(&self) -> bool {
         false
     }
+    fn read_page(
+        &mut self,
+        _table: &TableDef,
+        _after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
     fn ddl_pages(
         &mut self,
         _table: &TableDef,
@@ -95,6 +102,24 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
+        if expected.is_none()
+            && sink.streams_index_builds()
+            && matches!(&prepared.statement, Statement::InsertMulti(i) if i.append_only())
+            && paged_insert::eligible(self, prepared)
+        {
+            return paged_insert::execute(
+                self,
+                prepared,
+                params,
+                clock,
+                sink,
+                version_end,
+                deferred,
+            );
+        }
+        let append = sink.streams_index_builds()
+            && matches!(&prepared.statement, Statement::InsertMulti(i)
+                if i.append_only() && i.source.is_none());
         if expected.is_none() && sink.streams_index_builds() && paged_dml::eligible(self, prepared)
         {
             return paged_dml::execute(self, prepared, params, clock, sink, version_end);
@@ -248,6 +273,11 @@ impl Relational {
                 continue;
             };
             let is_target = prepared.table() == Some(self.table_key(table).as_str());
+            // The physical publisher checks PK/UNIQUE occupancy against the
+            // transaction, including earlier pages. Inserts need no preimage.
+            if append && is_target {
+                continue;
+            }
             let rows = self
                 .rows
                 .get_mut(&table.id)
@@ -310,6 +340,7 @@ impl Relational {
                 self,
                 sink,
                 &mut retention,
+                append,
             )? > 0
             {}
         }
@@ -342,6 +373,15 @@ impl Relational {
                 )
                 .map_err(CoreError::Sql)?;
             if writing {
+                if append {
+                    let table = table.as_ref().expect("append target");
+                    let old = &before.rows[&table.id];
+                    let new = &self.rows[&table.id];
+                    // Preserve immediate PK/UNIQUE error precedence before
+                    // end-of-statement constraints. The savepoint owns rollback.
+                    sink.apply_indexes(table, Some(table), old, new, self.secondary_descriptors_engine())?;
+                    sink.apply(table, old, new)?;
+                }
                 let descriptors = self.secondary_descriptors_engine().to_vec();
                 let mut source_error = None;
                 let enforced = constraints::enforce_with_rows(
@@ -362,6 +402,7 @@ impl Relational {
                                     state,
                                     sink,
                                     &mut retention,
+                                    append,
                                 )? == 0
                                 {
                                     break;
@@ -395,6 +436,9 @@ impl Relational {
         }
         if writing {
             for table in before.tables.values() {
+                if append && prepared.table() == Some(before.table_key(table).as_str()) {
+                    continue;
+                }
                 let old = &before.rows[&table.id];
                 let empty = BTreeMap::new();
                 let after = self.rows.get(&table.id).unwrap_or(&empty);
@@ -430,6 +474,8 @@ impl Relational {
 mod constraint_rows;
 #[path = "row_sink_dml.rs"]
 mod paged_dml;
+#[path = "row_sink_insert.rs"]
+mod paged_insert;
 use constraint_rows::{hydrate, rebuild};
 
 #[cfg(test)]

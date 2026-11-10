@@ -636,6 +636,45 @@ impl RowSink for SqlRows<'_> {
     fn streams_index_builds(&self) -> bool {
         true
     }
+    fn read_page(
+        &mut self,
+        table: &TableDef,
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        crate::cancellation::check()?;
+        let entry = TableEntry {
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let rows = self
+            .db
+            .rows
+            .scan(
+                self.txn,
+                &entry,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+                engine::kv::Direction::Forward,
+                Some(200),
+            )?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let Some(last) = rows.last_key_value().map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let rows = rows
+            .into_values()
+            .map(|row| {
+                let row = SqlRow {
+                    values: row.values,
+                    version: row.version,
+                };
+                relational::row_sink::row_key(table, &row).map(|key| (key, row))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(CoreError::Sql)?;
+        Ok(Some((last, rows)))
+    }
     fn ddl_pages(
         &mut self,
         table: &TableDef,

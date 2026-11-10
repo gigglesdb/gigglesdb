@@ -18,6 +18,7 @@ pub(super) fn hydrate(
     staged: &mut Relational,
     sink: &mut impl RowSink,
     budget: &mut scan::Retention,
+    parents_only: bool,
 ) -> Result<usize, CoreError> {
     if edges
         .values()
@@ -43,6 +44,9 @@ pub(super) fn hydrate(
                 (*child_id, columns, *ref_table, ref_columns, true),
                 (*ref_table, ref_columns, *child_id, columns, false),
             ] {
+                if parents_only && !parent {
+                    continue;
+                }
                 let Some(source) = seeds.tables.values().find(|t| t.id == source_id) else {
                     continue;
                 };

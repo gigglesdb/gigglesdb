@@ -680,8 +680,7 @@ fn sql_insert_row_cap_and_expected_version_rejected() {
 
 #[test]
 fn sql_insert_parser_row_cap_1024_and_1025() {
-    // Lex individual tuples to test the row bound independently of the existing
-    // 4096-token SQL limit, which rejects a textual 1024-row statement first.
+    // Parse large VALUES lists, then check the unchanged legacy admission cap.
     let parser = |count: usize| {
         let mut tokens = lex("INSERT INTO items (id,n) VALUES").unwrap();
         for id in 0..count {
@@ -698,7 +697,7 @@ fn sql_insert_parser_row_cap_1024_and_1025() {
         }
     };
     assert_eq!(
-        parse(&mut parser(MAX_ROWS + 1)).unwrap_err(),
+        admit_statement(&parse(&mut parser(MAX_ROWS + 1)).unwrap(), &[]).unwrap_err(),
         SqlError::Limit
     );
     let insert = parse(&mut parser(MAX_ROWS)).unwrap();
@@ -742,6 +741,7 @@ fn admission_insert() -> Insert {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        source_types: None,
         table: "items".into(),
         columns: vec!["id".into(), "email".into(), "code".into(), "n".into()],
         rows: vec![
@@ -867,6 +867,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        source_types: None,
         table: "heavy".into(),
         columns: vec!["id".into(), "n".into()],
         rows: vec![
@@ -893,6 +894,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        source_types: None,
         table: "wide_numeric".into(),
         columns: std::iter::once("id".to_owned())
             .chain((0..50).map(|i| format!("n{i}")))
