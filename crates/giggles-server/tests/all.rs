@@ -138,3 +138,5 @@ mod streaming_cursor_network;
 
 #[path = "v2_ddl_authority.rs"]
 mod v2_ddl_authority;
+#[path = "v2_uuid.rs"]
+mod v2_uuid;

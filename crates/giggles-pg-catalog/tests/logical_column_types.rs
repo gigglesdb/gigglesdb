@@ -1,13 +1,20 @@
 use giggles_pg_catalog::{CatalogSnapshot, ColumnDef, ScalarType, TableDef, Value, execute, plan};
 
 #[test]
-fn logical_type_metadata_follows_visible_columns() {
+fn uuid_metadata_precedes_columns_and_jsonb_follows_visible_columns() {
     let mut snapshot = CatalogSnapshot::default();
     let query =
         plan("SELECT oid,typname FROM pg_type WHERE oid IN (2950,2951,3802,3807) ORDER BY oid")
             .unwrap()
             .unwrap();
-    assert!(execute(&query, &snapshot, &[]).unwrap().rows.is_empty());
+    // Built-in UUID types must be discoverable when Npgsql first connects.
+    assert_eq!(
+        execute(&query, &snapshot, &[]).unwrap().rows,
+        vec![
+            vec![Value::Int(2950), Value::Text("uuid".into())],
+            vec![Value::Int(2951), Value::Text("_uuid".into())],
+        ]
+    );
     snapshot.tables.push(TableDef {
         id: 1,
         name: "logical".into(),

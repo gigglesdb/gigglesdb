@@ -1331,7 +1331,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ScalarType::TimestampTz,
         ScalarType::Interval,
     ] {
-        if matches!(ty, ScalarType::Uuid | ScalarType::Jsonb)
+        // UUID must be visible before application DDL: drivers cache its type
+        // mapping when opening a connection to an empty database.
+        if matches!(ty, ScalarType::Jsonb)
             && !snapshot
                 .tables
                 .iter()
