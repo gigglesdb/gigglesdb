@@ -14,7 +14,12 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch};
 
-pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--reset-owner-password]";
+#[cfg(feature = "engine-rocksdb")]
+const DEFAULT_ENGINE: Engine = Engine::V2;
+#[cfg(not(feature = "engine-rocksdb"))]
+const DEFAULT_ENGINE: Engine = Engine::Legacy;
+
+pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--reset-owner-password] (creation default: v2 with engine-rocksdb, otherwise legacy)";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
@@ -33,7 +38,7 @@ impl Options {
         let mut options = Self {
             data: "giggles-data".into(),
             port: 5432,
-            engine: Engine::Legacy,
+            engine: DEFAULT_ENGINE,
             owner: "postgres".into(),
             database: "postgres".into(),
             trust_local: false,
@@ -205,7 +210,8 @@ fn password_notice(options: &Options) {
 
 fn open_existing(path: &std::path::Path) -> Result<Admin, Box<dyn std::error::Error>> {
     Admin::open(path, Limits::default()).map_err(|error| {
-        if matches!(&error, giggles_core::CoreError::Storage(detail) if detail.contains("Database already open. Cannot acquire lock."))
+        if matches!(&error, giggles_core::CoreError::Storage(detail) if detail.contains("Database already open. Cannot acquire lock.")
+                || detail.contains("database already open by another writer"))
         {
             io::Error::other(format!("{error}; stop the running server first")).into()
         } else {
@@ -348,7 +354,18 @@ mod tests {
     fn defaults_and_explicit_options() {
         let defaults = parse(&[]).unwrap();
         assert_eq!(defaults.port, 5432);
-        assert_eq!(defaults.engine, Engine::Legacy);
+        assert_eq!(
+            defaults.engine,
+            if cfg!(feature = "engine-rocksdb") {
+                Engine::V2
+            } else {
+                Engine::Legacy
+            }
+        );
+        assert_eq!(
+            parse(&["--engine", "legacy"]).unwrap().engine,
+            Engine::Legacy
+        );
         assert_eq!(parse(&["--engine", "v2"]).unwrap().engine, Engine::V2);
         assert_eq!(defaults.owner, "postgres");
         assert_eq!(defaults.database, "postgres");

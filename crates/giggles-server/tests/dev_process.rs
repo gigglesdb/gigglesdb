@@ -209,6 +209,11 @@ async fn dev_binary_crud_password_restart_and_filesystem_contract() {
         assert_eq!(rows[0].get::<_, String>(1), "after");
         drop(client);
         server.shutdown().await;
+        let admin =
+            giggles_core::Admin::open(root.join("data/db"), giggles_core::Limits::default())
+                .unwrap();
+        assert_eq!(admin.snapshot().is_err(), cfg!(feature = "engine-rocksdb"));
+        drop(admin);
         // Recovery is offline: even an occupied selected port must not prevent it.
         let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = reserved.local_addr().unwrap().port();
@@ -347,4 +352,48 @@ async fn existing_database_without_roles_prints_new_credentials_once() {
     let stderr = server.shutdown().await;
     assert!(stderr.contains("shown once"), "{stderr}");
     assert!(!stderr.contains("password unchanged"), "{stderr}");
+}
+
+#[tokio::test]
+async fn default_server_preserves_existing_legacy_engine_and_content() {
+    use giggles_core::{Admin, Limits};
+    let root = fixture();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    let path = root.join("data/db");
+    let admin = Admin::create(&path, Limits::default()).unwrap();
+    let metadata = admin.authority_metadata().unwrap();
+    let mut session = admin.sql_session();
+    session
+        .execute(
+            "CREATE TABLE kept (id BIGINT PRIMARY KEY, body TEXT)",
+            &[],
+            None,
+        )
+        .unwrap();
+    session
+        .execute("INSERT INTO kept VALUES (1, 'legacy')", &[], None)
+        .unwrap();
+    let before = session.execute("SELECT * FROM kept", &[], None).unwrap();
+    drop(session);
+    drop(admin);
+    let (server, url) = Server::start(&root, true).await;
+    let client = connect(&url).await;
+    let rows = client.query("SELECT * FROM kept", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, String>(1), "legacy");
+    drop(client);
+    server.shutdown().await;
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    assert_eq!(admin.authority_metadata().unwrap(), metadata);
+    assert!(admin.snapshot().is_ok());
+    assert_eq!(
+        admin
+            .sql_session()
+            .execute("SELECT * FROM kept", &[], None)
+            .unwrap(),
+        before
+    );
+    drop(admin);
+    std::fs::remove_dir_all(root).unwrap();
 }

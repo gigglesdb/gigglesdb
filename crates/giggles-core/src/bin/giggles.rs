@@ -61,9 +61,14 @@ fn run() -> local::Reply {
                     serde_json::json!({"permitted":permitted,"forbidden":forbidden}),
                 ))
             }
-            ["create", path] => {
-                let db = Admin::create(path, Limits::default())?;
-                Ok(local::admin(&db, br#"{"command":"metadata"}"#))
+            ["create", path] if *path != "--engine" => create(path, default_engine()),
+            ["create", "--engine", engine, path] => {
+                let engine = match *engine {
+                    "legacy" => Engine::Legacy,
+                    "v2" => Engine::V2,
+                    _ => return Err(CoreError::Unsupported),
+                };
+                create(path, engine)
             }
             ["restore", file, path] => {
                 let db = Admin::restore(file, path, Limits::default())?;
@@ -171,6 +176,20 @@ fn run() -> local::Reply {
         }
     };
     work().unwrap_or_else(local::failure)
+}
+fn default_engine() -> Engine {
+    if cfg!(feature = "engine-rocksdb") {
+        Engine::V2
+    } else {
+        Engine::Legacy
+    }
+}
+fn create(path: &str, engine: Engine) -> Result<local::Reply, CoreError> {
+    let db = Admin::create_engine(path, Limits::default(), engine)?;
+    Ok(match engine {
+        Engine::Legacy => local::admin(&db, br#"{"command":"metadata"}"#),
+        Engine::V2 => local::Reply::ok(serde_json::json!({"database": path, "engine": "v2"})),
+    })
 }
 fn main() {
     let reply = run();

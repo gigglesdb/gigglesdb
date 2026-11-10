@@ -138,6 +138,7 @@ fi
 [ -n "$work" ] || work=$work_root/ide
 work=$(py work "$work_root" "$work" "$windows")
 export CARGO_TARGET_DIR="$work/target" TEMP="$work/tmp" TMP="$work/tmp" TMPDIR="$work/tmp"
+# RocksDB builds inherit LIBCLANG_PATH; point it at your LLVM libclang directory.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS-1}"
 mkdir -p "$work" "$CARGO_TARGET_DIR" "$TEMP"
 profile=debug

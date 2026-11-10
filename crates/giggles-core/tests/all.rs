@@ -328,3 +328,6 @@ mod streaming_cursor;
 
 #[path = "r1_compat.rs"]
 mod r1_compat;
+
+#[path = "creation_defaults.rs"]
+mod creation_defaults;

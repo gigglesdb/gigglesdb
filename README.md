@@ -7,6 +7,24 @@ It is under active development. The embedded SQL shell is usable today;
 distributed features have different implementation and verification limits.
 This is not a production-qualified release or a PostgreSQL-compatible replacement.
 
+## Build prerequisites and engines
+
+Install Rust/Cargo and libclang/LLVM (required by the default RocksDB build).
+On Windows, set `LIBCLANG_PATH` to the directory containing `libclang.dll`
+before building or running `scripts/dev.ps1` or `scripts/dev.sh`. On macOS,
+install Xcode Command Line Tools or `brew install llvm` (set `LIBCLANG_PATH`
+to its `lib` directory if needed).
+
+New databases created by `giggles create <path>` and `giggles-server --dev`
+default to v2. Use `giggles create --engine legacy <path>` or the server's
+`--engine legacy` to choose legacy. Existing databases retain their engine;
+`giggles upgrade <path>` explicitly upgrades legacy databases to v2.
+`Admin::create` keeps its legacy default for embedders.
+
+For a legacy-only build without LLVM, run `cargo build --no-default-features`
+from `crates/giggles-core` or `crates/giggles-server`. Those binaries default
+to legacy and reject requests to create v2 databases.
+
 ## Run from IntelliJ
 
 Shared run configurations are included. Run **01 Setup local demo**, then

@@ -30,12 +30,22 @@ database is at `DIR/db`. Development mode disables TLS. The agent mTLS listener
 is available only through the `giggles-server CONFIG.json` configuration
 workflow below, which also supports TLS and scoped identities.
 
-To create a RocksDB v2 database, build from this crate with
-`cargo build --bin giggles-server --features engine-rocksdb`, then start
-`giggles-server --dev --data DIR --engine v2`. The default creation engine is
-`legacy`. `--engine` applies only to creation: opening an existing directory
-always detects its format. V2 supports SQL and catalog roles; native task
-operations, receipts, and export still return an unsupported-feature error.
+Build prerequisites: Rust/Cargo and libclang/LLVM. On Windows, set
+`LIBCLANG_PATH` to the directory containing `libclang.dll` before running
+Cargo or `scripts/dev.ps1` / `scripts/dev.sh`. On macOS, install Xcode Command
+Line Tools or `brew install llvm`; set `LIBCLANG_PATH` to its `lib` directory
+if needed. The scripts inherit this environment without machine-specific paths.
+
+`cargo build --bin giggles-server` enables RocksDB by default, and
+`giggles-server --dev --data DIR` creates v2 databases. Use `--engine legacy`
+to create legacy databases. For a legacy-only build without LLVM, use
+`cargo build --bin giggles-server --no-default-features`; its creation default
+is legacy and `--engine v2` returns an unsupported-engine error.
+`--engine` applies only to creation: opening an existing directory always
+detects its format. Upgrade is explicit with `giggles upgrade <path>` (the
+core CLI); neither binary upgrades on open. V2 supports SQL and catalog roles;
+native task operations, receipts, and export still return an unsupported-feature
+error.
 
 To reset the owner password offline, stop the server first, then run:
 

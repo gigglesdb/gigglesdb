@@ -20,6 +20,7 @@ $env:TEMP = Join-Path $Work 'tmp'
 $env:TMP = $env:TEMP
 New-Item -ItemType Directory -Force -Path $Work,$env:CARGO_TARGET_DIR,$env:TEMP | Out-Null
 $env:CARGO_BUILD_JOBS = '1'
+# RocksDB builds inherit LIBCLANG_PATH; point it at your LLVM libclang directory.
 $profile = 'debug'
 if ($Release) { $profile = 'release' }
 $statePath = Join-Path $Work 'current.json'

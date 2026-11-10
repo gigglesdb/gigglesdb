@@ -1052,7 +1052,9 @@ impl Admin {
             }
         }
     }
-    /// Explicit create-new directory. Existing paths, including empty ones, reject.
+    /// Explicit create-new legacy directory. Existing paths, including empty ones, reject.
+    /// The CLI and development server default to v2 when `engine-rocksdb` is enabled;
+    /// embedders keep the legacy default here and can opt in with `Self::create_engine`.
     pub fn create(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(io)?;

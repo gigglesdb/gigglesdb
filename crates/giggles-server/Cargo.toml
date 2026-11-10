@@ -5,12 +5,13 @@ edition = "2024"
 autotests = false
 
 [features]
+default = ["engine-rocksdb"]
 engine-rocksdb = ["giggles-core/engine-rocksdb"]
 
 [dependencies]
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-pg-catalog = { path = "../giggles-pg-catalog" }
-giggles-core = { path = "../giggles-core" }
+giggles-core = { path = "../giggles-core", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -38,7 +39,7 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-giggles-core = { path = "../giggles-core", features = ["test-sql-parser-trap"] }
+giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap"] }
 prost-types = "0.14"
 rcgen = "0.13"
 tokio-postgres = "=0.7.15"

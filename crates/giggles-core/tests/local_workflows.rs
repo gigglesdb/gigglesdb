@@ -65,7 +65,16 @@ impl Cli {
         v["data"].clone()
     }
     fn create(&mut self) {
-        self.call(vec!["create".into(), self.db.display().to_string()], 0, 0);
+        self.call(
+            vec![
+                "create".into(),
+                "--engine".into(),
+                "legacy".into(),
+                self.db.display().to_string(),
+            ],
+            0,
+            0,
+        );
     }
     fn admin(&mut self, v: Value, exit: i32, code: u32) -> Value {
         self.call(
