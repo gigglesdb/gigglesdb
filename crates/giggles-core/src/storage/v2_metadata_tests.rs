@@ -37,13 +37,8 @@ fn metadata_survives_reopen_and_unsupported_native_operations() {
         admin.roles().table_owner("items").unwrap().as_deref(),
         Some("owner")
     );
-    assert!(matches!(
-        admin.export(path.join("export")),
-        Err(CoreError::EngineUnsupported {
-            feature: "logical export",
-            ..
-        })
-    ));
+    admin.export(path.join("export")).unwrap();
+    Admin::verify_export(path.join("export")).unwrap();
     assert!(matches!(
         admin.task_resources(crate::TaskId(0)),
         Err(CoreError::EngineUnsupported {

@@ -15,6 +15,8 @@ mod secondary_index_public;
 mod sequence_counters;
 pub(crate) mod sequences;
 mod v2;
+#[cfg(feature = "engine-rocksdb")]
+mod v2_export;
 mod v2_sql;
 pub use cursor::Cursor;
 pub use secondary_index_public::IndexInfo;
@@ -1292,7 +1294,6 @@ impl Admin {
         Ok(())
     }
     pub fn export(&self, path: impl AsRef<Path>) -> Result<[u8; 32], CoreError> {
-        self.inner.db(LOGICAL_EXPORT)?;
         self.export_with_fault(path, RecoveryPoint::None)
     }
     /// Retains a unique sibling staging file even after successful publication.
@@ -1303,6 +1304,11 @@ impl Admin {
         path: impl AsRef<Path>,
         point: RecoveryPoint,
     ) -> Result<[u8; 32], CoreError> {
+        #[cfg(feature = "engine-rocksdb")]
+        if let Backend::V2(db) = &self.inner.backend {
+            let _ticket = self.inner.enter()?;
+            return v2_export::export(db, path.as_ref(), point);
+        }
         self.inner.db(LOGICAL_EXPORT)?;
         let path = path.as_ref();
         let (format, payload) = self.inner.inspect(|s| {
@@ -1399,6 +1405,10 @@ impl Admin {
         from_records(values)
     }
     pub fn verify_export(path: impl AsRef<Path>) -> Result<Snapshot, CoreError> {
+        #[cfg(feature = "engine-rocksdb")]
+        if v2_export::is_export(path.as_ref())? {
+            return v2_export::verify(path.as_ref());
+        }
         Ok(Self::read_export(path)?.view)
     }
     /// Fresh identity; task and approval authority is revoked, forensic outcomes
@@ -1416,6 +1426,10 @@ impl Admin {
         limits: Limits,
         point: RecoveryPoint,
     ) -> Result<Self, CoreError> {
+        #[cfg(feature = "engine-rocksdb")]
+        if v2_export::is_export(export.as_ref())? {
+            return v2_export::restore(export.as_ref(), path.as_ref(), limits, point);
+        }
         let mut s = Self::read_export(export)?;
         let old = s.view.domain;
         let mut bytes = [0u8; 16];

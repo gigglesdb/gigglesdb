@@ -264,10 +264,11 @@ fn lifecycle_and_public_refusals() {
         KERNEL_RECORDS,
     );
     denied(admin.bump_schema(), KERNEL_RECORDS);
-    denied(admin.export(path.join("export")), LOGICAL_EXPORT);
-    denied(
-        admin.export_with_fault(path.join("export"), RecoveryPoint::ExportWrite),
-        LOGICAL_EXPORT,
+    admin.export(path.join("export")).unwrap();
+    assert!(
+        admin
+            .export_with_fault(path.join("failed-export"), RecoveryPoint::ExportWrite)
+            .is_err()
     );
     denied(admin.logical_export_catalog(), LOGICAL_EXPORT);
     let prepared = relational::Prepared::parse("SELECT 1", 0, 0).unwrap();

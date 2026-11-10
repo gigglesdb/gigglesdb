@@ -1,4 +1,4 @@
-//! Legacy durable-boundary registry. A future engine adapter can reuse the protocol.
+//! Legacy durable-boundary registry and v2 logical recovery boundaries.
 mod common;
 use common::*;
 use giggles_core::{relational::Value, *};
@@ -396,11 +396,120 @@ fn every_legacy_durable_boundary() {
     }
     let report_path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
         .join("durable_boundaries_report.json");
-    fs::write(&report_path, serde_json::to_vec_pretty(&json!({"boundaries": report,
-        "missing_fault_points": []})).unwrap()).unwrap();
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&json!({"boundaries": report,
+        "missing_fault_points": []}))
+        .unwrap(),
+    )
+    .unwrap();
     println!(
         "legacy durable boundaries: {} passed; report={}",
         report.len(),
         report_path.display()
     );
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_recovery_worker() {
+    let Ok(mode) = std::env::var("GD_V2_RECOVERY_MODE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(std::env::var_os("GD_V2_RECOVERY_PATH").unwrap());
+    let Boundary::Recovery(point) = registry()[mode.parse::<usize>().unwrap()] else {
+        panic!("recovery only");
+    };
+    let a = Admin::open(root.join("db"), Limits::default()).unwrap();
+    let mut sql = a.sql_session();
+    sql.execute(
+        "CREATE TABLE boundary_rows (id BIGINT PRIMARY KEY, body TEXT)",
+        &[],
+        None,
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO boundary_rows VALUES (1,'one'),(2,'two')",
+        &[],
+        None,
+    )
+    .unwrap();
+    let export = root.join("source.export");
+    if recovery_step(point).starts_with("export-") {
+        assert!(a.export_with_fault(export, point).is_err());
+        assert_eq!(recovery_step(point), "export-error", "crash seam returned");
+    } else {
+        a.export(&export).unwrap();
+        let result =
+            Admin::restore_with_fault(export, root.join("installed"), Limits::default(), point);
+        if point == RecoveryPoint::None {
+            assert_eq!(rows(&result.unwrap()), rows(&a));
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    std::process::exit(86);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn every_v2_recovery_boundary() {
+    let mut count = 0;
+    for (index, boundary) in registry().into_iter().enumerate() {
+        let Boundary::Recovery(point) = boundary else {
+            continue;
+        };
+        let root = fresh("v2-recovery-boundary");
+        fs::create_dir(&root).unwrap();
+        drop(Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "v2_recovery_worker", "--nocapture"])
+            .env("GD_V2_RECOVERY_MODE", index.to_string())
+            .env("GD_V2_RECOVERY_PATH", &root)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86), "{point:?}: {output:?}");
+        let a = Admin::open(root.join("db"), Limits::default()).unwrap();
+        assert_eq!(rows(&a).len(), 2, "source changed: {point:?}");
+        let export = root.join("source.export");
+        if recovery_step(point).starts_with("export-") {
+            let stages: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().contains("source.export.staging-"))
+                .collect();
+            assert_eq!(stages.len(), 1);
+            assert_eq!(
+                Admin::verify_export(&stages[0]).is_ok(),
+                !matches!(
+                    point,
+                    RecoveryPoint::ExportWrite | RecoveryPoint::CrashExportWrite
+                )
+            );
+            assert_eq!(export.exists(), point == RecoveryPoint::CrashExportPublish);
+            if export.exists() {
+                let restored =
+                    Admin::restore(&export, root.join("checked"), Limits::default()).unwrap();
+                assert_eq!(rows(&restored), rows(&a));
+            }
+        } else {
+            Admin::verify_export(export).unwrap();
+            let installed = Admin::open(root.join("installed"), Limits::default());
+            if matches!(
+                point,
+                RecoveryPoint::None
+                    | RecoveryPoint::InstallCommitted
+                    | RecoveryPoint::CrashInstallCommitted
+            ) {
+                assert_eq!(rows(&installed.unwrap()), rows(&a));
+            } else {
+                assert!(installed.is_err(), "incomplete install opened: {point:?}");
+            }
+        }
+        drop(a);
+        fs::remove_dir_all(root).unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 15);
+    println!("v2 recovery boundaries: {count} passed");
 }
