@@ -753,6 +753,51 @@ pub(super) fn install_create(
     Ok(())
 }
 
+// Decode-only: R1 stored globally bound bare sequence names in default SQL.
+// Preserve that binding when moving an owned sequence into its owner's schema.
+pub(super) fn normalize_r1_sequence_defaults(
+    ext: &mut catalog_ext::CatalogExt,
+    renamed: &BTreeMap<String, String>,
+) -> R<()> {
+    fn rewrite(value: &mut Expression, renamed: &BTreeMap<String, String>) -> R<bool> {
+        match value {
+            Expression::Sequence(name) => {
+                let key = crate::storage::sequences::sequence_name(name)?;
+                if let Some(key) = renamed.get(&key) {
+                    *name = sequence_reference(key);
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Expression::Cast(value, _) | Expression::Negative(value) => rewrite(value, renamed),
+            _ => Ok(false),
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(());
+    }
+    for column in ext.columns.values_mut() {
+        if let Some(sql) = &mut column.default {
+            let mut parser = Parser {
+                tokens: lex(&format!("{sql},"))?,
+                at: 0,
+                params: BTreeSet::new(),
+                relations: Vec::new(),
+            };
+            let mut value = expression(&mut parser, 0)?;
+            if parser.at + 1 != parser.tokens.len()
+                || parser.tokens.get(parser.at) != Some(&Token::Symbol(','))
+            {
+                return Err(SqlError::Unsupported);
+            }
+            if rewrite(&mut value, renamed)? {
+                *sql = value.sql();
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn default_sql(state: &Relational, column: &ColumnDef) -> Option<String> {
     if let Some(identity) = state.column_identity(column.id) {
         state.ext.sequences.get(&identity.sequence_id).map(|seq| {

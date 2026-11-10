@@ -962,9 +962,10 @@ impl Relational {
     /// On every error (including the last cancellation fence) self is unchanged.
     pub(crate) fn secondary_restore_engine(
         &mut self,
-        pending: si::codec::PendingDecode,
+        mut pending: si::codec::PendingDecode,
         mut cancel: impl FnMut() -> bool,
     ) -> R<()> {
+        pending.normalize_r1_names(|id| self.table_schema(id));
         let ds = pending.descriptors();
         // A namespace8 record must contain an index, including on empty tables.
         // IDs belong to the persisted shared allocator, not a new registry.
@@ -1279,6 +1280,9 @@ impl<'de> Deserialize<'de> for Relational {
                             }
                         }
                     }
+                    value
+                        .normalize_r1_relation_names()
+                        .map_err(A::Error::custom)?;
                     value.validate_ext().map_err(|error| {
                         A::Error::custom(format!("relational catalog invariant: {error:?}"))
                     })?;

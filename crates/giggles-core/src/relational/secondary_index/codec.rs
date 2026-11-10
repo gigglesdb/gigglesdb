@@ -203,6 +203,19 @@ pub(crate) struct PendingDecode {
     candidate: Sidecar,
 }
 impl PendingDecode {
+    // Names are metadata only: IDs and encoded index entries stay unchanged.
+    // Complete catalog/row validation still runs after this decode-only upgrade.
+    pub(crate) fn normalize_r1_names<'a>(&mut self, schema: impl Fn(u64) -> &'a str) {
+        for descriptor in &mut self.candidate.descriptors {
+            if !descriptor.name.contains('\0') {
+                descriptor.name = super::super::schema_binding::relation_key(
+                    schema(descriptor.table),
+                    &descriptor.name,
+                );
+            }
+        }
+    }
+
     pub(crate) fn descriptors(&self) -> &[Descriptor] {
         self.candidate.descriptors()
     }

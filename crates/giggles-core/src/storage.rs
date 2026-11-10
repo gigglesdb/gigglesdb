@@ -5,6 +5,7 @@ mod drop_table;
 mod engine;
 mod feature_envelope;
 mod format_policy;
+mod legacy_open;
 pub(crate) mod native_once;
 pub(crate) mod operation_adapter;
 pub mod replica;
@@ -1136,17 +1137,29 @@ impl Admin {
                 }
             }
         }
+        if limits.admitted == 0 || limits.selected_keys == 0 {
+            return Err(CoreError::Limit);
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.as_ref().join("data.redb"))
+            .map_err(io)?;
+        let admission = legacy_open::Admission::new(file).map_err(io)?;
         let db = legacy_redb("opening database", || {
             Database::builder()
                 .set_cache_size(8 * 1024 * 1024)
-                .open(path.as_ref().join("data.redb"))
+                .create_with_backend(admission.clone())
                 .map_err(io)
         })?;
         // An opener delayed after the first check must not acquire the legacy
         // database in the Windows upgrade's close-before-rename interval.
         upgrade::check_startup(path.as_ref())?;
-        Self::attach(db, limits)
+        let admin = Self::attach(db, limits)?;
+        admission.accept().map_err(io)?;
+        Ok(admin)
     }
+
     pub fn snapshot(&self) -> Result<Snapshot, CoreError> {
         self.inner.db(KERNEL_RECORDS)?;
         self.inner.inspect(|s| Ok(s.view.clone()))

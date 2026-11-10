@@ -325,3 +325,6 @@ mod corruption_detection;
 
 #[path = "streaming_cursor.rs"]
 mod streaming_cursor;
+
+#[path = "r1_compat.rs"]
+mod r1_compat;

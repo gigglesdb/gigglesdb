@@ -26,6 +26,38 @@ pub(super) fn validate_key(key: &str) -> R<()> {
 }
 
 impl Relational {
+    // R1 used globally unique bare keys, with schema membership stored only in
+    // table_schemas. D2 changed keys without a wire-version bump. Normalize only
+    // that exact old spelling; mismatched qualified keys still fail validation.
+    pub(super) fn normalize_r1_relation_names(&mut self) -> Result<(), &'static str> {
+        let mut tables = BTreeMap::new();
+        for (key, table) in std::mem::take(&mut self.tables) {
+            let key = if key == table.name {
+                relation_key(self.table_schema(table.id), &table.name)
+            } else {
+                key
+            };
+            if tables.insert(key, table).is_some() {
+                return Err("duplicate normalized relation key");
+            }
+        }
+        self.tables = tables;
+        let mut renamed = BTreeMap::new();
+        for sequence in self.ext.sequences.values_mut() {
+            if !sequence.name.contains('\0')
+                && let Some((table, _)) = sequence.owned_by
+                && let Some(schema) = self.ext.table_schemas.get(&table)
+            {
+                let key = relation_key(schema, &sequence.name);
+                renamed.insert(sequence.name.clone(), key.clone());
+                sequence.name = key;
+            }
+        }
+        defaults::normalize_r1_sequence_defaults(&mut self.ext, &renamed)
+            .map_err(|_| "invalid R1 sequence default")?;
+        Ok(())
+    }
+
     pub(crate) fn table_key(&self, table: &TableDef) -> String {
         relation_key(self.table_schema(table.id), &table.name)
     }
