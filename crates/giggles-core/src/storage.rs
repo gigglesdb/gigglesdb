@@ -1749,6 +1749,7 @@ pub struct SqlSession {
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
     savepoints: Vec<SqlSavepoint>,
+    v2_savepoints: Vec<(String, engine::txn::Savepoint)>,
     savepoint_budget: u64,
     aborted: bool,
     transaction_id: Option<u128>,
@@ -1774,6 +1775,7 @@ impl Admin {
             staged: None,
             v2_transaction: None,
             savepoints: Vec::new(),
+            v2_savepoints: Vec::new(),
             savepoint_budget: SAVEPOINT_BYTES,
             aborted: false,
             transaction_id: None,
@@ -2301,7 +2303,8 @@ impl SqlSession {
         &mut self,
         sql: &str,
     ) -> Result<(relational::Copy, relational::Prepared), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
+        let inner = self.admin.inner.clone();
+        let _ticket = inner.enter_sql()?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted {
@@ -2311,7 +2314,7 @@ impl SqlSession {
             let resolve = |s: &State| Ok(copy.schema_key(&s.sql, &self.search_path));
             copy.table = match &self.staged {
                 Some(s) => resolve(s)?,
-                None => self.admin.inner.inspect(resolve)?,
+                None => self.inspect_metadata(resolve)?,
             };
             let prepare = |s: &State| {
                 let mut p = copy
@@ -2323,8 +2326,11 @@ impl SqlSession {
             };
             let mut prepared = match &self.staged {
                 Some(s) => prepare(s)?,
-                None => self.admin.inner.inspect(prepare)?,
+                None => self.inspect_metadata(prepare)?,
             };
+            if matches!(self.admin.inner.backend, Backend::V2(_)) {
+                prepared.epoch = 0;
+            }
             prepared.transaction = self.transaction_id;
             prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             Ok((copy, prepared))
@@ -2338,12 +2344,13 @@ impl SqlSession {
         &mut self,
         copy: &relational::Copy,
     ) -> Result<Vec<relational::ColumnDef>, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
+        let inner = self.admin.inner.clone();
+        let _ticket = inner.enter_sql()?;
         relational::assert_sql_frontend_allowed();
         let columns = |s: &State| copy.columns_in(&s.sql).map_err(CoreError::Sql);
         let result = match &self.staged {
             Some(s) => columns(s),
-            None => self.admin.inner.inspect(columns),
+            None => self.inspect_metadata(columns),
         };
         if result.is_err() {
             self.abort();
@@ -2359,8 +2366,12 @@ impl SqlSession {
         rows: Vec<Vec<relational::Value>>,
         clock: &relational::StatementClock,
     ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            return self.normalize_copy_v2(&db, prepared, rows, clock);
+        }
+        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             self.guard_clock(clock)?;
             crate::cancellation::check()?;
@@ -3025,6 +3036,7 @@ impl SqlSession {
         self.sequence_baseline.clear();
         self.deferral = Default::default();
         self.savepoints.clear();
+        self.v2_savepoints.clear();
         self.aborted = false;
         self.transaction_id = None;
         self.transaction_clock_us = None;

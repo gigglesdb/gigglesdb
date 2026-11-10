@@ -35,6 +35,51 @@ impl SqlSession {
         result
     }
 
+    pub(super) fn normalize_copy_v2(
+        &mut self,
+        db: &Arc<v2::V2Db>,
+        prepared: &relational::Prepared,
+        rows: Vec<Vec<relational::Value>>,
+        clock: &relational::StatementClock,
+    ) -> Result<(relational::Prepared, Vec<Vec<relational::Value>>), CoreError> {
+        let result = (|| {
+            let inner = self.admin.inner.clone();
+            let _ticket = inner.enter_sql()?;
+            self.guard_clock(clock)?;
+            crate::cancellation::check()?;
+            if self.aborted {
+                return Err(CoreError::Sql(SqlError::Aborted));
+            }
+            if prepared.domain != u128::from_be_bytes(db.meta.domain)
+                || prepared.epoch != 0
+                || (prepared.transaction.is_some() && prepared.transaction != self.transaction_id)
+            {
+                return Err(CoreError::Sql(SqlError::StaleSchema));
+            }
+            let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
+            state.sql.epoch = 0;
+            let context = relational::clock::ExecutionClock::new(clock)
+                .with_extra_float_digits(self.extra_float_digits)
+                .with_sequences(sql_sequences::callback(
+                    db.clone(),
+                    state.sql.clone(),
+                    self.sequence_baseline.clone(),
+                    self.pending_sequences.clone(),
+                    self.sequence_values.clone(),
+                ));
+            let output = state.sql.normalize_copy(prepared, rows, Some(&context));
+            crate::cancellation::check()?;
+            if let Some(error) = context.take_error() {
+                return Err(error);
+            }
+            output.map_err(CoreError::Sql)
+        })();
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
     pub(super) fn execute_v2(
         &mut self,
         db: &Arc<v2::V2Db>,
@@ -100,6 +145,34 @@ impl SqlSession {
                                 .map_err(|_| CoreError::Busy)?;
                             self.v2_transaction = Some(txn);
                             self.transaction_id = Some(u128::from_be_bytes(token));
+                        }
+                        "savepoint" | "release" | "rollback_to" => {
+                            let txn = self
+                                .v2_transaction
+                                .as_mut()
+                                .ok_or(CoreError::Sql(E::NoActiveTransaction))?;
+                            let name = p.savepoint_name().expect("named transaction control");
+                            if control == "savepoint" {
+                                if self.v2_savepoints.len() >= 64 {
+                                    return Err(CoreError::Sql(E::Limit));
+                                }
+                                self.v2_savepoints.push((name.to_owned(), txn.savepoint()));
+                            } else {
+                                let index = self
+                                    .v2_savepoints
+                                    .iter()
+                                    .rposition(|(saved, _)| saved == name)
+                                    .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
+                                let mark = self.v2_savepoints[index].1.clone();
+                                if control == "release" {
+                                    txn.release(mark)?;
+                                    self.v2_savepoints.truncate(index);
+                                } else {
+                                    txn.rollback_to(&mark)?;
+                                    self.v2_savepoints.truncate(index + 1);
+                                    self.aborted = false;
+                                }
+                            }
                         }
                         "commit" => {
                             // Publish live sequence positions before another session can

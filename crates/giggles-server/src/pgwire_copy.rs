@@ -12,6 +12,9 @@ pub(super) struct Decoder {
     delimiter: u8,
     null: Vec<u8>,
     binary: bool,
+    csv: bool,
+    csv_at: usize,
+    csv_quoted: bool,
     header: bool,
     ended: bool,
     total: usize,
@@ -25,11 +28,20 @@ impl Decoder {
             delimiter,
             null,
             binary: false,
+            csv: false,
+            csv_at: 0,
+            csv_quoted: false,
             header: false,
             ended: false,
             total: 0,
             rows: 0,
             pending: Vec::new(),
+        }
+    }
+    pub(super) fn csv(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
+        Self {
+            csv: true,
+            ..Self::text(columns, delimiter, null)
         }
     }
     pub(super) fn binary(columns: usize) -> Self {
@@ -53,6 +65,8 @@ impl Decoder {
         self.pending.extend_from_slice(bytes);
         if self.binary {
             self.binary_rows()
+        } else if self.csv {
+            self.csv_rows(false)
         } else {
             self.text_rows(false)
         }
@@ -73,9 +87,106 @@ impl Decoder {
                 self.ended = true;
             }
             Ok(rows)
+        } else if self.csv {
+            self.csv_rows(true)
         } else {
             self.text_rows(true)
         }
+    }
+    fn csv_rows(&mut self, eof: bool) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        let mut start = 0;
+        while self.csv_at < self.pending.len() {
+            let b = self.pending[self.csv_at];
+            if b == b'"' {
+                self.csv_quoted = !self.csv_quoted;
+            }
+            if !self.csv_quoted && matches!(b, b'\n' | b'\r') {
+                if b == b'\r' && self.csv_at + 1 == self.pending.len() && !eof {
+                    break;
+                }
+                let line = &self.pending[start..self.csv_at];
+                if line == b"\\." {
+                    self.ended = true;
+                    break;
+                }
+                if self.rows == giggles_core::relational::MAX_ROWS {
+                    return Err("54000");
+                }
+                rows.push(self.csv_row(line)?);
+                self.rows += 1;
+                self.csv_at += 1;
+                if b == b'\r' && self.pending.get(self.csv_at) == Some(&b'\n') {
+                    self.csv_at += 1;
+                }
+                start = self.csv_at;
+            } else {
+                self.csv_at += 1;
+            }
+        }
+        if self.ended {
+            self.pending.clear();
+        } else if eof {
+            if self.csv_quoted {
+                return Err(bad_format());
+            }
+            if start < self.pending.len() && &self.pending[start..] != b"\\." {
+                if self.rows == giggles_core::relational::MAX_ROWS {
+                    return Err("54000");
+                }
+                rows.push(self.csv_row(&self.pending[start..])?);
+                self.rows += 1;
+            }
+            self.pending.clear();
+            self.csv_at = 0;
+        } else {
+            self.pending.drain(..start);
+            self.csv_at -= start;
+        }
+        Ok(rows)
+    }
+    fn csv_row(&self, line: &[u8]) -> Result<Row> {
+        let mut fields = Vec::new();
+        let (mut at, mut start) = (0, 0);
+        while at <= line.len() {
+            let mut field = Vec::new();
+            let (mut quoted, mut was_quoted) = (false, false);
+            while at < line.len() && (quoted || line[at] != self.delimiter) {
+                let b = line[at];
+                at += 1;
+                if b == b'"' {
+                    was_quoted = true;
+                    if quoted && line.get(at) == Some(&b'"') {
+                        field.push(b'"');
+                        at += 1;
+                    } else {
+                        quoted = !quoted;
+                    }
+                } else {
+                    field.push(b);
+                }
+            }
+            if quoted {
+                return Err(bad_format());
+            }
+            if field.contains(&0) || std::str::from_utf8(&field).is_err() {
+                return Err("22021");
+            }
+            fields.push(if !was_quoted && line[start..at] == self.null {
+                None
+            } else {
+                Some(field)
+            });
+            if at == line.len() {
+                break;
+            }
+            at += 1;
+            start = at;
+        }
+        if fields.len() != self.columns {
+            return Err(bad_format());
+        }
+        Ok(fields)
     }
     fn text_rows(&mut self, eof: bool) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
@@ -305,6 +416,33 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn csv_every_split_and_invalid_input() {
+        let data = b"1,\"a,b\",\"\"\r\n2,\"line\n\"\"quote\"\"\",\r\n\\.\nignored";
+        for split in 0..=data.len() {
+            let mut d = Decoder::csv(3, b',', vec![]);
+            let mut rows = d.feed(&data[..split]).unwrap();
+            rows.extend(d.feed(&data[split..]).unwrap());
+            rows.extend(d.finish().unwrap());
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Some(b"1".to_vec()), Some(b"a,b".to_vec()), Some(vec![])],
+                    vec![Some(b"2".to_vec()), Some(b"line\n\"quote\"".to_vec()), None],
+                ],
+                "split {split}"
+            );
+        }
+        for (data, code) in [
+            (b"\"unterminated".as_slice(), "22P04"),
+            (b"a,b", "22P04"),
+            (b"a,\0,c", "22021"),
+        ] {
+            let mut d = Decoder::csv(3, b',', vec![]);
+            let result = d.feed(data).and_then(|_| d.finish());
+            assert_eq!(result.unwrap_err(), code);
+        }
+    }
     #[test]
     fn text_every_split() {
         let data = b"1\t\\N\t\\x41\\101\\b\\f\\v\\Q\\\\\r\n2\t\tend\\\n\n\\.\nignored";

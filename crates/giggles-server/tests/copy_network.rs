@@ -29,6 +29,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_engine(giggles_core::Engine::Legacy).await
+    }
+    async fn with_engine(engine: giggles_core::Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "copy-network-{}-{}-{}",
             std::process::id(),
@@ -39,7 +42,7 @@ impl Fixture {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
-        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        let admin = Admin::create_engine(path.join("db.redb"), Limits::default(), engine).unwrap();
         admin
             .roles()
             .create(NewRole {
@@ -59,7 +62,11 @@ impl Fixture {
             .unwrap();
         let mut sql = admin.sql_session();
         sql.execute(
-            "CREATE TABLE t (i INT PRIMARY KEY, x TEXT CHECK (x <> 'bad'), n BIGINT)",
+            if engine == giggles_core::Engine::Legacy {
+                "CREATE TABLE t (i INT PRIMARY KEY, x TEXT CHECK (x <> 'bad'), n BIGINT)"
+            } else {
+                "CREATE TABLE t (i INT PRIMARY KEY, x TEXT, n BIGINT)"
+            },
             &[],
             None,
         )
@@ -648,4 +655,65 @@ async fn copy_authority_precedes_classification_on_native_and_non_sql_surfaces()
     let path = f.path.clone();
     f.stop().await;
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn copy_formats_and_savepoint_recovery_legacy_v2_parity() {
+    let mut transcripts = Vec::new();
+    for engine in [giggles_core::Engine::Legacy, giggles_core::Engine::V2] {
+        let f = Fixture::with_engine(engine).await;
+        let mut s = f.connect().await;
+        let mut transcript = Vec::new();
+        for format in ["text", "csv", "binary"] {
+            transcript.push(query(&mut s, "BEGIN").await);
+            transcript.push(query(&mut s, "SAVEPOINT copy_mark").await);
+            start(&mut s, &format!("COPY t FROM STDIN (FORMAT {format})")).await;
+            let bytes = match format {
+                "text" => b"1\tone\t7\n2\t\\N\t8\n".to_vec(),
+                "csv" => b"1,\"o,ne\",7\n2,,8\n".to_vec(),
+                _ => {
+                    let mut b = b"PGCOPY\n\xff\r\n\0".to_vec();
+                    b.extend([0; 8]);
+                    for id in [1i32, 2] {
+                        b.extend(3i16.to_be_bytes());
+                        b.extend(4i32.to_be_bytes());
+                        b.extend(id.to_be_bytes());
+                        b.extend((-1i32).to_be_bytes());
+                        b.extend(8i32.to_be_bytes());
+                        b.extend(7i64.to_be_bytes());
+                    }
+                    b.extend((-1i16).to_be_bytes());
+                    b
+                }
+            };
+            for chunk in bytes.chunks(3) {
+                send(&mut s, b'd', chunk).await;
+            }
+            send(&mut s, b'c', b"").await;
+            let r = read(&mut s).await;
+            assert_eq!(tags(&r), b"CZ", "{engine:?} {format}: {r:?}");
+            assert_eq!(r[0].1, b"COPY 2\0");
+            transcript.push(r);
+            transcript.push(query(&mut s, "SELECT count(*) FROM t").await);
+            start(&mut s, "COPY t FROM STDIN").await;
+            send(&mut s, b'd', b"3\tthree\t9\n1\tduplicate\t0\n").await;
+            send(&mut s, b'c', b"").await;
+            let r = read(&mut s).await;
+            error(&r, "23505");
+            assert_eq!(r.last().unwrap().1, b"E");
+            // Error locations/messages may differ by engine; compare SQLSTATE/status.
+            transcript.push(vec![(b'E', b"23505".to_vec()), r.last().unwrap().clone()]);
+            transcript.push(query(&mut s, "ROLLBACK TO SAVEPOINT copy_mark").await);
+            let r = query(&mut s, "SELECT count(*) FROM t").await;
+            assert_eq!(r[1].1, b"\0\x01\0\0\0\x010");
+            transcript.push(r);
+            transcript.push(query(&mut s, "RELEASE SAVEPOINT copy_mark").await);
+            transcript.push(query(&mut s, "COMMIT").await);
+        }
+        transcripts.push(transcript);
+        drop(s);
+        f.stop().await;
+    }
+    assert_eq!(transcripts[0], transcripts[1]);
 }

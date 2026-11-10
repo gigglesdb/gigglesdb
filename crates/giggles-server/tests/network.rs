@@ -589,7 +589,7 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
     tokio::pin!(copy);
     assert_eq!(copy.as_mut().finish().await.unwrap(), 0);
     for query in [
-        "COPY app FROM STDIN WITH (FORMAT csv)",
+        "COPY app FROM STDIN WITH (FORMAT csv, HEADER true)",
         // STDOUT formats are covered by raw-wire pg_dump tests.
         "COPY app TO 'file' WITH (FORMAT csv)",
         "COPY app FROM 'file'",
@@ -1971,7 +1971,7 @@ async fn raw_wire_text_parameters_binary_results_close_and_error_drain() {
     pg_send(
         &mut s,
         b'P',
-        &parse("bad", "COPY app FROM STDIN WITH (FORMAT csv)"),
+        &parse("bad", "COPY app FROM STDIN WITH (FORMAT csv, HEADER true)"),
     )
     .await;
     pg_send(

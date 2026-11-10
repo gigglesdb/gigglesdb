@@ -1532,6 +1532,9 @@ impl Prepared {
             Statement::Begin => V2Class::Control("begin"),
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
+            Statement::Savepoint(_) => V2Class::Control("savepoint"),
+            Statement::Release(_) => V2Class::Control("release"),
+            Statement::RollbackTo(_) => V2Class::Control("rollback_to"),
             Statement::CompositeSelect(_) => V2Class::Read,
             Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
             // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
@@ -1593,11 +1596,7 @@ impl Prepared {
                 }
                 refusal.map_or(V2Class::Ddl, V2Class::Refused)
             }
-            // V2 has no deferred-constraint modes or savepoint stack yet.
-            Statement::SetConstraints(..)
-            | Statement::Savepoint(_)
-            | Statement::Release(_)
-            | Statement::RollbackTo(_) => V2Class::Refused("SQL statement"),
+            Statement::SetConstraints(..) => V2Class::Refused("SQL statement"),
         }
     }
 

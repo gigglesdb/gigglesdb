@@ -4,6 +4,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
     Text,
+    Csv,
     Binary,
 }
 
@@ -200,6 +201,8 @@ impl Copy {
                             }
                             copy.format = if p.word("text") {
                                 CopyFormat::Text
+                            } else if p.word("csv") {
+                                CopyFormat::Csv
                             } else if p.word("binary") {
                                 CopyFormat::Binary
                             } else {
@@ -248,6 +251,17 @@ impl Copy {
         p.sym(';');
         if p.at != p.tokens.len() {
             return Err(SqlError::Unsupported);
+        }
+        if copy.format == CopyFormat::Csv {
+            if !seen.contains("delimiter") {
+                copy.delimiter = b',';
+            }
+            if !seen.contains("null") {
+                copy.null.clear();
+            }
+            if copy.delimiter == b'"' || copy.null.contains('"') {
+                return Err(SqlError::InvalidParameterValue);
+            }
         }
         if copy.format == CopyFormat::Binary
             && (seen.contains("delimiter") || seen.contains("null"))

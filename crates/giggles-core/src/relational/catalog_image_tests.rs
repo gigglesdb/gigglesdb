@@ -182,9 +182,9 @@ fn v2_statement_classes_and_reachable_refusals() {
         ),
         ("ALTER TABLE t DROP CONSTRAINT c", Refused("SQL statement")),
         ("SET CONSTRAINTS ALL DEFERRED", Refused("SQL statement")),
-        ("SAVEPOINT s", Refused("SQL statement")),
-        ("RELEASE SAVEPOINT s", Refused("SQL statement")),
-        ("ROLLBACK TO SAVEPOINT s", Refused("SQL statement")),
+        ("SAVEPOINT s", Control("savepoint")),
+        ("RELEASE SAVEPOINT s", Control("release")),
+        ("ROLLBACK TO SAVEPOINT s", Control("rollback_to")),
         (
             "ALTER TABLE t ALTER COLUMN n SET DEFAULT 1, ADD COLUMN m BIGINT",
             Refused("ALTER TABLE row rewrite"),

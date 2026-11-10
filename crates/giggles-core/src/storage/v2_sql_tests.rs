@@ -1328,3 +1328,137 @@ fn schema_type_feature_is_transactional_and_old_catalog_stays_identical() {
         features
     );
 }
+
+#[test]
+fn sql_savepoints_match_legacy_including_aborted_recovery() {
+    let f = Fixture::new();
+    let legacy_path = f.path.with_extension("legacy");
+    let legacy = Admin::create(&legacy_path, Limits::default()).unwrap();
+    for admin in [&legacy, f.admin()] {
+        let mut sql = admin.sql_session();
+        assert!(matches!(
+            sql.execute("SAVEPOINT s", &[], None),
+            Err(CoreError::Sql(SqlError::NoActiveTransaction))
+        ));
+        for statement in [
+            "CREATE TABLE marks (id bigint PRIMARY KEY)",
+            "BEGIN",
+            "INSERT INTO marks VALUES (1)",
+            "SAVEPOINT s",
+            "INSERT INTO marks VALUES (2)",
+            "SAVEPOINT s",
+            "INSERT INTO marks VALUES (3)",
+            "SAVEPOINT child",
+        ] {
+            sql.execute(statement, &[], None).unwrap();
+        }
+        assert!(matches!(
+            sql.execute("INSERT INTO marks VALUES (1)", &[], None),
+            Err(CoreError::Sql(SqlError::Duplicate))
+        ));
+        assert!(matches!(
+            sql.execute("RELEASE s", &[], None),
+            Err(CoreError::Sql(SqlError::Aborted))
+        ));
+        sql.execute("ROLLBACK TO SAVEPOINT s", &[], None).unwrap();
+        assert!(!sql.is_aborted());
+        assert!(matches!(
+            sql.execute("ROLLBACK TO child", &[], None),
+            Err(CoreError::Sql(SqlError::InvalidSavepoint))
+        ));
+        sql.execute("ROLLBACK TO s", &[], None).unwrap();
+        sql.execute("RELEASE SAVEPOINT s", &[], None).unwrap();
+        sql.execute("ROLLBACK TO s", &[], None).unwrap();
+        sql.execute("INSERT INTO marks VALUES (4)", &[], None)
+            .unwrap();
+        sql.execute("ROLLBACK TO s", &[], None).unwrap();
+        sql.execute("RELEASE s", &[], None).unwrap();
+        sql.execute("COMMIT", &[], None).unwrap();
+        let result = sql
+            .execute("SELECT id FROM marks ORDER BY id", &[], None)
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values, [relational::Value::Int(1)]);
+        sql.execute("BEGIN", &[], None).unwrap();
+        assert!(matches!(
+            sql.execute("ROLLBACK TO s", &[], None),
+            Err(CoreError::Sql(SqlError::InvalidSavepoint))
+        ));
+        sql.rollback();
+    }
+    drop(legacy);
+    fs::remove_dir_all(legacy_path).unwrap();
+}
+
+#[test]
+fn normalized_copy_defaults_atomicity_and_savepoint_match_legacy() {
+    let f = Fixture::new();
+    let legacy_path = f.path.with_extension("legacy");
+    let legacy = Admin::create(&legacy_path, Limits::default()).unwrap();
+    for admin in [&legacy, f.admin()] {
+        use relational::Value as V;
+        let mut sql = admin.sql_session();
+        sql.execute("CREATE SEQUENCE copy_seq", &[], None).unwrap();
+        sql.execute(
+            "CREATE TABLE copied (id bigint PRIMARY KEY, v bigint DEFAULT nextval('copy_seq'))",
+            &[],
+            None,
+        )
+        .unwrap();
+        let clock = relational::StatementClock {
+            unavailable: None,
+            transaction_us: 0,
+            statement_us: 0,
+            zone: None,
+            wall: None,
+        };
+        sql.execute("BEGIN", &[], None).unwrap();
+        sql.execute("SAVEPOINT before_copy", &[], None).unwrap();
+        let (copy, p) = sql.prepare_copy("COPY copied(id) FROM STDIN").unwrap();
+        assert_eq!(sql.copy_columns(&copy).unwrap().len(), 1);
+        let (normalized, rows) = sql
+            .normalize_copy_rows_at(
+                &p,
+                vec![vec![V::Text("1".into())], vec![V::Text("2".into())]],
+                &clock,
+            )
+            .unwrap();
+        assert_eq!(
+            sql.ingest_copy_at(&normalized, rows, &clock)
+                .unwrap()
+                .affected,
+            2
+        );
+        sql.execute("ROLLBACK TO before_copy", &[], None).unwrap();
+        assert!(
+            sql.execute("SELECT * FROM copied", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let (_, p) = sql.prepare_copy("COPY copied(id) FROM STDIN").unwrap();
+        let (normalized, rows) = sql
+            .normalize_copy_rows_at(&p, vec![vec![V::Int(3)]], &clock)
+            .unwrap();
+        assert_eq!(rows[0], [V::Int(3), V::Int(3)]);
+        sql.ingest_copy_at(&normalized, rows, &clock).unwrap();
+        let (_, p) = sql.prepare_copy("COPY copied FROM STDIN").unwrap();
+        assert!(matches!(
+            sql.ingest_copy(
+                &p,
+                vec![vec![V::Int(4), V::Int(4)], vec![V::Int(3), V::Int(5)]]
+            ),
+            Err(CoreError::Sql(SqlError::Duplicate))
+        ));
+        sql.execute("ROLLBACK TO before_copy", &[], None).unwrap();
+        sql.execute("COMMIT", &[], None).unwrap();
+        assert!(
+            sql.execute("SELECT * FROM copied", &[], None)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+    drop(legacy);
+    fs::remove_dir_all(legacy_path).unwrap();
+}

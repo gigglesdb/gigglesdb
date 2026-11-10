@@ -33,8 +33,13 @@ fn envelope_grammar_and_rejections() {
             .format,
         CopyFormat::Binary
     );
+    assert_eq!(
+        Copy::parse("COPY items FROM STDIN (FORMAT csv)")
+            .unwrap()
+            .format,
+        CopyFormat::Csv
+    );
     for suffix in [
-        "WITH (FORMAT csv)",
         "WITH (HEADER true)",
         "WITH (QUOTE 'x')",
         "WITH (ESCAPE 'x')",

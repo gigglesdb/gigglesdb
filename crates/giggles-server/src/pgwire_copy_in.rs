@@ -130,6 +130,12 @@ impl State {
         let binary = matches!(descriptor.format, CopyFormat::Binary);
         let decoder = if binary {
             copy::Decoder::binary(columns.len())
+        } else if descriptor.format == CopyFormat::Csv {
+            copy::Decoder::csv(
+                columns.len(),
+                descriptor.delimiter,
+                descriptor.null.as_bytes().to_vec(),
+            )
         } else {
             copy::Decoder::text(
                 columns.len(),
