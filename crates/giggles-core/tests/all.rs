@@ -318,3 +318,5 @@ mod user_defined_types;
 
 #[path = "per_schema_names.rs"]
 mod per_schema_names;
+#[path = "corruption_detection.rs"]
+mod corruption_detection;

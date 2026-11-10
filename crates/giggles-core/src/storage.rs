@@ -65,6 +65,16 @@ impl std::error::Error for CoreError {}
 fn io(e: impl std::fmt::Display) -> CoreError {
     CoreError::Storage(e.to_string())
 }
+// Keep unwind containment inside the legacy redb boundary, below callers' locks.
+// Decode/validation and user callbacks must retain their ordinary panic behavior.
+fn legacy_redb<T>(
+    operation: &'static str,
+    f: impl FnOnce() -> Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
+        CoreError::Corrupt(format!("legacy redb panicked while {operation}"))
+    })?
+}
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -605,18 +615,22 @@ impl Inner {
         Ok(Ticket(&self.admitted))
     }
     fn read(&self) -> Result<State, CoreError> {
-        let tx = self.db(LEGACY_STORAGE)?.begin_read().map_err(io)?;
-        let t = tx.open_table(RECORDS).map_err(io)?;
-        let mut out = BTreeMap::new();
-        let mut total = 0u64;
-        for item in t.iter().map_err(io)? {
-            let (k, v) = item.map_err(io)?;
-            total += k.value().len() as u64 + v.value().len() as u64;
-            if total > MAX_BYTES {
-                return Err(CoreError::Limit);
+        let db = self.db(LEGACY_STORAGE)?;
+        let out = legacy_redb("reading records", || {
+            let tx = db.begin_read().map_err(io)?;
+            let t = tx.open_table(RECORDS).map_err(io)?;
+            let mut out = BTreeMap::new();
+            let mut total = 0u64;
+            for item in t.iter().map_err(io)? {
+                let (k, v) = item.map_err(io)?;
+                total += k.value().len() as u64 + v.value().len() as u64;
+                if total > MAX_BYTES {
+                    return Err(CoreError::Limit);
+                }
+                out.insert(k.value().to_vec(), v.value().to_vec());
             }
-            out.insert(k.value().to_vec(), v.value().to_vec());
-        }
+            Ok(out)
+        })?;
         let mut state =
             from_records_mode(out, &mut || crate::cancellation::check().is_err(), false)?;
         self.merge_live_sequences(&mut state)?;
@@ -1101,10 +1115,12 @@ impl Admin {
             }
         }
         Self::attach(
-            Database::builder()
-                .set_cache_size(8 * 1024 * 1024)
-                .open(path.as_ref().join("data.redb"))
-                .map_err(io)?,
+            legacy_redb("opening database", || {
+                Database::builder()
+                    .set_cache_size(8 * 1024 * 1024)
+                    .open(path.as_ref().join("data.redb"))
+                    .map_err(io)
+            })?,
             limits,
         )
     }
