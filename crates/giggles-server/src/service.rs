@@ -948,7 +948,7 @@ impl Session {
                     self.sql
                         .table_authority_name(table)
                         .is_ok_and(|durable_name| {
-                            roles
+                            self.sql
                                 .table_owner(&durable_name)
                                 .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
                         })
@@ -1026,7 +1026,7 @@ impl Session {
                 // The durable key follows staged renames; missing names remain
                 // ordinary absent ownership records and cannot leak 42P01.
                 let name_at_commit = self.sql.table_authority_name(table)?;
-                roles
+                self.sql
                     .table_owner(&name_at_commit)
                     .map_err(|_| CoreError::Policy(Error::Scope))?
                     .as_deref()
@@ -1101,14 +1101,14 @@ impl Session {
         name: &str,
         privilege: Option<roles::TablePrivilege>,
     ) -> Result<bool, CoreError> {
-        let roles = self.service.admin.roles();
         let name_at_commit = self.sql.table_authority_name(table)?;
-        let owner = roles
+        let owner = self
+            .sql
             .table_owner(&name_at_commit)
             .map_err(|_| CoreError::Policy(Error::Scope))?;
         Ok(owner.as_deref() == Some(name)
             || privilege.is_some_and(|privilege| {
-                roles
+                self.sql
                     .table_privileges(&name_at_commit, name)
                     .is_ok_and(|privileges| privileges.contains(&privilege))
             }))
@@ -1192,9 +1192,7 @@ impl Session {
             } else if p.is_alter_table() || p.is_drop_table() {
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
                 let name_at_commit = self.sql.table_authority_name(table)?;
-                self.service
-                    .admin
-                    .roles()
+                self.sql
                     .table_owner(&name_at_commit)
                     .map_err(|_| CoreError::Policy(Error::Scope))?
                     .as_deref()
@@ -1304,12 +1302,13 @@ impl Session {
             Role::Application { tables, .. } => tables.contains(&target),
             Role::Database { name } => {
                 let target = self.sql.table_authority_name(&target)?;
-                let roles = self.service.admin.roles();
                 unrestricted
-                    || roles
+                    || self
+                        .sql
                         .table_owner(&target)
                         .is_ok_and(|owner| owner.as_deref() == Some(name.as_str()))
-                    || roles
+                    || self
+                        .sql
                         .table_privileges(&target, name)
                         .is_ok_and(|privileges| privileges.contains(&roles::TablePrivilege::Insert))
             }
@@ -1505,7 +1504,11 @@ impl Session {
                 zone: session.zone,
                 wall: Some(Arc::new(move || service.clock.sql_micros())),
             };
-            let sequence_candidates = if p.is_ddl() {
+            let transactional_authority = session.sql.set_ddl_owner(match &session.role {
+                Role::Database { name } => Some(name),
+                _ => None,
+            });
+            let sequence_candidates = if p.is_ddl() && !transactional_authority {
                 session
                     .sql
                     .sequence_owners()?
@@ -1530,6 +1533,9 @@ impl Session {
                 session.transaction_us = Some(transaction_us);
             }
             let result = result?;
+            if transactional_authority {
+                return Ok(result);
+            }
             session
                 .sequence_owner_candidates
                 .extend(sequence_candidates.iter().cloned());

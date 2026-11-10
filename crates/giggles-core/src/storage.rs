@@ -1758,6 +1758,7 @@ pub struct SqlSession {
     search_path: Vec<String>,
     schema_user: String,
     authority_managed: bool,
+    ddl_owner: Option<String>,
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
     pending_sequences: sequences::Pending,
@@ -1784,6 +1785,7 @@ impl Admin {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             authority_managed: false,
+            ddl_owner: None,
             staged_revision: 0,
             sequence_values: Default::default(),
             pending_sequences: Default::default(),
@@ -1917,6 +1919,37 @@ impl SqlSession {
     /// creates a replacement whose authority the caller has installed.
     pub fn set_authority_managed(&mut self, managed: bool) {
         self.authority_managed = managed;
+    }
+
+    /// Configure the creator for atomic v2 DDL authority. Returns whether this
+    /// engine maintains DDL authority itself; legacy callers retain bookkeeping.
+    pub fn set_ddl_owner(&mut self, owner: Option<&str>) -> bool {
+        self.ddl_owner = owner.map(str::to_owned);
+        matches!(self.admin.inner.backend, Backend::V2(_))
+    }
+
+    /// Read authority including this session's uncommitted v2 DDL changes.
+    pub fn table_owner(&self, table: &str) -> Result<Option<String>, roles::RoleError> {
+        if let Some(txn) = &self.v2_transaction
+            && let Some(owner) = roles::engine::own_owner(txn, table)?
+        {
+            return Ok(owner);
+        }
+        self.admin.roles().table_owner(table)
+    }
+
+    /// Read grants including tombstones staged by v2 DROP/name reuse.
+    pub fn table_privileges(
+        &self,
+        table: &str,
+        role: &str,
+    ) -> Result<std::collections::BTreeSet<roles::TablePrivilege>, roles::RoleError> {
+        if let Some(txn) = &self.v2_transaction
+            && let Some(grants) = roles::engine::own_grants(txn, table, role)?
+        {
+            return Ok(grants);
+        }
+        self.admin.roles().table_privileges(table, role)
     }
 
     /// Set the precision used by SQL floating-point text conversions.
@@ -2985,14 +3018,16 @@ impl SqlSession {
 
     /// Resolve a staged table name to its durable owner key by stable table id.
     pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
-        let table_id = if matches!(self.admin.inner.backend, Backend::V2(_)) {
-            self.inspect_metadata(|s| Ok(s.sql.tables.get(name).map(|table| table.id)))?
-        } else {
-            self.staged
-                .as_ref()
-                .and_then(|s| s.sql.tables.get(name))
-                .map(|table| table.id)
-        };
+        // V2 reconciles authority keys inside each DDL statement, so staged
+        // names already are the authority names (including renames).
+        if matches!(self.admin.inner.backend, Backend::V2(_)) {
+            return Ok(name.to_owned());
+        }
+        let table_id = self
+            .staged
+            .as_ref()
+            .and_then(|s| s.sql.tables.get(name))
+            .map(|table| table.id);
         let Some(table_id) = table_id else {
             return Ok(name.to_owned());
         };

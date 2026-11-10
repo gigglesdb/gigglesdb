@@ -135,3 +135,6 @@ mod per_schema_names;
 
 #[path = "streaming_cursor_network.rs"]
 mod streaming_cursor_network;
+
+#[path = "v2_ddl_authority.rs"]
+mod v2_ddl_authority;

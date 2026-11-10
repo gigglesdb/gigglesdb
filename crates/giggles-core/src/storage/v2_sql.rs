@@ -393,6 +393,7 @@ impl SqlSession {
                         db.catalog().apply_diff(txn, &old, &new, &ids, None, &|| {
                             crate::cancellation::check().is_err()
                         })?;
+                        roles::engine::assign_created(txn, &old, &new, self.ddl_owner.as_deref())?;
                         Ok(result)
                     })();
                     if result.is_err() {

@@ -232,29 +232,25 @@ pub(crate) fn reconcile_tables(
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), CoreError> {
-    if old.tables == new.tables {
+    let old_objects = authority_objects(old);
+    let new_objects = authority_objects(new);
+    if old_objects == new_objects {
         return Ok(());
     }
-    let new_names: BTreeMap<_, _> = new
-        .tables
+    let new_names: BTreeMap<_, _> = new_objects.iter().map(|(name, id)| (*id, name)).collect();
+    let renames: Vec<_> = old_objects
         .iter()
-        .map(|(name, def)| (def.id, name))
-        .collect();
-    let renames: Vec<_> = old
-        .tables
-        .iter()
-        .filter_map(|(name, def)| {
+        .filter_map(|(name, id)| {
             new_names
-                .get(&def.id)
+                .get(id)
                 .filter(|next| **next != name)
                 .map(|next| (name.clone(), (*next).clone()))
         })
         .collect();
-    let mut clear: BTreeSet<_> = old
-        .tables
+    let mut clear: BTreeSet<_> = old_objects
         .keys()
-        .chain(new.tables.keys())
-        .filter(|name| old.tables.get(*name).map(|d| d.id) != new.tables.get(*name).map(|d| d.id))
+        .chain(new_objects.keys())
+        .filter(|name| old_objects.get(*name) != new_objects.get(*name))
         .cloned()
         .collect();
     clear.extend(renames.iter().map(|(_, new)| new.clone()));
@@ -309,4 +305,102 @@ pub(crate) fn reconcile_tables(
         RoleError::Core(e) => e,
         _ => corrupt("invalid role image"),
     })
+}
+
+fn authority_objects(parts: &CatalogParts) -> BTreeMap<String, u64> {
+    parts
+        .tables
+        .iter()
+        .map(|(name, def)| (name.clone(), def.id))
+        .chain(
+            parts
+                .ext
+                .sequences
+                .iter()
+                .map(|(id, def)| (def.name.clone(), *id)),
+        )
+        .collect()
+}
+
+/// apply_diff already holds the role lock and has cleared obsolete authority.
+/// Stage creator ownership in that same transaction before its implicit commit.
+pub(crate) fn assign_created(
+    txn: &mut Transaction,
+    old: &CatalogParts,
+    new: &CatalogParts,
+    owner: Option<&str>,
+) -> Result<(), CoreError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let old_ids: BTreeSet<_> = authority_objects(old).into_values().collect();
+    let created: Vec<_> = authority_objects(new)
+        .into_iter()
+        .filter(|(_, id)| !old_ids.contains(id))
+        .collect();
+    if created.is_empty() {
+        return Ok(());
+    }
+    let mut operation = || -> Result<(), RoleError> {
+        let before = load_txn(txn)?;
+        require_role(&before, owner)?;
+        let mut after = before.clone();
+        // Tables precede their dependent sequences when inheriting authority.
+        for (name, id) in &created {
+            if new.tables.values().any(|def| def.id == *id) {
+                after
+                    .0
+                    .insert(super::key(b"owner/", name), owner.as_bytes().to_vec());
+            }
+        }
+        for (name, id) in &created {
+            if let Some(sequence) = new.ext.sequences.get(id) {
+                let inherited = sequence
+                    .owned_by
+                    .and_then(|(table_id, _)| {
+                        let (table, _) = new.tables.iter().find(|(_, def)| def.id == table_id)?;
+                        after.0.get(&super::key(b"owner/", table)).cloned()
+                    })
+                    .unwrap_or_else(|| owner.as_bytes().to_vec());
+                after.0.insert(super::key(b"owner/", name), inherited);
+            }
+        }
+        stage(txn, &before, &after)
+    };
+    operation().map_err(|error| match error {
+        RoleError::Core(e) => e,
+        _ => CoreError::Policy(crate::Error::Scope),
+    })
+}
+
+pub(crate) fn own_owner(
+    txn: &Transaction,
+    table: &str,
+) -> Result<Option<Option<String>>, CoreError> {
+    txn.catalog_own(&encode_key(&super::key(b"owner/", table))?)
+        .map(|value| {
+            value
+                .as_ref()
+                .map(|v| {
+                    String::from_utf8(v[1..].to_vec())
+                        .map_err(|e| CoreError::Corrupt(e.to_string()))
+                })
+                .transpose()
+        })
+        .transpose()
+}
+
+pub(crate) fn own_grants(
+    txn: &Transaction,
+    table: &str,
+    role: &str,
+) -> Result<Option<BTreeSet<TablePrivilege>>, CoreError> {
+    txn.catalog_own(&encode_key(&grant_key(b"tgrant/", table, role))?)
+        .map(|value| {
+            value.as_ref().map_or_else(
+                || Ok(BTreeSet::new()),
+                |v| serde_json::from_slice(&v[1..]).map_err(|e| CoreError::Corrupt(e.to_string())),
+            )
+        })
+        .transpose()
 }
