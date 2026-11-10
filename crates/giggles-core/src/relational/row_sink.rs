@@ -118,8 +118,11 @@ impl Relational {
             );
         }
         let append = sink.streams_index_builds()
-            && matches!(&prepared.statement, Statement::InsertMulti(i)
-                if i.append_only() && i.source.is_none());
+            && match &prepared.statement {
+                Statement::Insert { .. } | Statement::InsertExpressions(_) => true,
+                Statement::InsertMulti(i) => i.append_only() && i.source.is_none(),
+                _ => false,
+            };
         if expected.is_none() && sink.streams_index_builds() && paged_dml::eligible(self, prepared)
         {
             return paged_dml::execute(self, prepared, params, clock, sink, version_end);
@@ -282,7 +285,10 @@ impl Relational {
                 .rows
                 .get_mut(&table.id)
                 .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
-            sink.scan(table, &mut |row| {
+            let point = is_target
+                .then(|| point_target(prepared, table, params, &sink.indexes()))
+                .flatten();
+            let mut visit = |row: SqlRow| {
                 if crate::cancellation::check().is_err() {
                     return Err(SqlError::Aborted);
                 }
@@ -299,7 +305,29 @@ impl Relational {
                     return Err(SqlError::Duplicate);
                 }
                 Ok(())
-            })?;
+            };
+            if let Some((columns, values)) = point {
+                sink.lookup(table, &columns, Some(&values), true, &mut visit)?;
+            } else {
+                sink.scan(table, &mut visit)?;
+            }
+        }
+        if matches!(prepared.v2_class(), V2Class::Read) && sink.streams_index_builds() {
+            // SqlRows already selected from the physical snapshot (including
+            // transaction-local writes). Legacy query execution consumes the
+            // hydrated row maps; it has no need for a transient index sidecar.
+            self.secondary = secondary_index::Sidecar::default();
+            return self
+                .execute_statement_inner(
+                    prepared,
+                    params,
+                    expected,
+                    || crate::cancellation::check().is_err(),
+                    clock,
+                    None,
+                    &mut Vec::new(),
+                )
+                .map_err(CoreError::Sql);
         }
         self.secondary = self
             .secondary_build_complete_engine(&sink.indexes(), || {
@@ -379,7 +407,13 @@ impl Relational {
                     let new = &self.rows[&table.id];
                     // Preserve immediate PK/UNIQUE error precedence before
                     // end-of-statement constraints. The savepoint owns rollback.
-                    sink.apply_indexes(table, Some(table), old, new, self.secondary_descriptors_engine())?;
+                    sink.apply_indexes(
+                        table,
+                        Some(table),
+                        old,
+                        new,
+                        self.secondary_descriptors_engine(),
+                    )?;
                     sink.apply(table, old, new)?;
                 }
                 let descriptors = self.secondary_descriptors_engine().to_vec();
@@ -470,6 +504,71 @@ impl Relational {
     }
 }
 
+// Only the parser's complete conjunction is eligible. Every primary-key column
+// needs an exact, type-checked equality; the executor still applies all residuals.
+fn point_target(
+    prepared: &Prepared,
+    table: &TableDef,
+    params: &[Value],
+    indexes: &[secondary_index::Descriptor],
+) -> Option<(Vec<u64>, Vec<Value>)> {
+    // Re-keying or changing a UNIQUE key needs the original occupancy image
+    // for immediate error precedence before referential actions execute.
+    let sets = match &prepared.statement {
+        Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+        _ => vec![],
+    };
+    if table.columns.iter().enumerate().any(|(offset, column)| {
+        sets.contains(&&column.name)
+            && (table.primary_key.contains(&offset)
+                || indexes
+                    .iter()
+                    .any(|d| d.table == table.id && d.unique && d.columns.contains(&column.id)))
+    }) {
+        return None;
+    }
+    let predicates = match &prepared.statement {
+        Statement::Update { predicates, .. }
+        | Statement::UpdateExpressions { predicates, .. }
+        | Statement::Delete { predicates, .. } => predicates,
+        _ => return None,
+    };
+    if table.hidden_rowid().is_some() || table.primary_key.is_empty() {
+        return None;
+    }
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for offset in &table.primary_key {
+        let column = &table.columns[*offset];
+        // Typed textual/numeric keys can need SQL canonicalization. Leave
+        // their complete-image path in place until probes bind typed values.
+        if !matches!(
+            column.data_type,
+            DataType::Boolean
+                | DataType::SmallInt
+                | DataType::Integer
+                | DataType::BigInt
+                | DataType::Text
+                | DataType::Varchar
+                | DataType::Bytes
+        ) {
+            return None;
+        }
+        let value = predicates.iter().find_map(|p| {
+            (p.column == column.name && p.op == "=")
+                .then(|| p.value.value(params).ok())
+                .flatten()
+        })?;
+        if value == Value::Null || check(&value, column).is_err() {
+            return None;
+        }
+        columns.push(column.id);
+        values.push(value);
+    }
+    Some((columns, values))
+}
+
 #[path = "row_sink_constraints.rs"]
 mod constraint_rows;
 #[path = "row_sink_dml.rs"]
@@ -511,6 +610,42 @@ mod tests {
             _: &BTreeMap<Vec<u8>, SqlRow>,
         ) -> Result<(), CoreError> {
             panic!("read-only statements must never publish");
+        }
+    }
+
+    #[test]
+    fn point_staging_requires_complete_conjunction_and_stable_keys() {
+        let mut image = Relational::default();
+        let ddl = Prepared::parse(
+            "CREATE TABLE t(a bigint,b bigint,v bigint,PRIMARY KEY(a,b))",
+            1,
+            image.epoch,
+        )
+        .unwrap();
+        image.execute(&ddl, &[], None).unwrap();
+        let table = image.tables.values().next().unwrap();
+        let mut typed = table.clone();
+        typed.columns[0].data_type = DataType::Uuid;
+        let uuid = Prepared::parse(
+            "DELETE FROM t WHERE a='550E8400-E29B-41D4-A716-446655440000' AND b=2",
+            1,
+            image.epoch,
+        )
+        .unwrap();
+        assert!(point_target(&uuid, &typed, &[], &[]).is_none());
+        for (sql, eligible) in [
+            ("DELETE FROM t WHERE a=1 AND b=2", true),
+            ("UPDATE t SET v=3 WHERE a=1 AND b=2 AND v=4", true),
+            ("DELETE FROM t WHERE a=1", false),
+            ("DELETE FROM t WHERE a=1 OR b=2", false),
+            ("UPDATE t SET a=3 WHERE a=1 AND b=2", false),
+        ] {
+            let p = Prepared::parse(sql, 1, image.epoch).unwrap();
+            assert_eq!(
+                point_target(&p, table, &[], &[]).is_some(),
+                eligible,
+                "{sql}"
+            );
         }
     }
 

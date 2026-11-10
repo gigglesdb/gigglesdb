@@ -11,6 +11,8 @@ use std::ops::Bound;
 mod large_ddl;
 #[path = "v2_large_dml_tests.rs"]
 mod large_dml;
+#[path = "v2_large_read_tests.rs"]
+mod large_read;
 
 struct Fixture {
     path: std::path::PathBuf,
