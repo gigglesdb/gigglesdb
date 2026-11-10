@@ -237,22 +237,13 @@ impl SqlSession {
                     txn.begin_statement();
                     let mark = txn.savepoint();
                     let result = (|| {
-                        // Table zero is an in-memory SQL sentinel, never a stored object.
-                        // Plain DML shares it; FK mutations and DDL exclude every SQL writer.
-                        // Recheck after waiting in case a concurrent DDL introduced an FK.
+                        // DDL stages a catalog-wide image (including schema cascades and
+                        // new FK edges), so retain its exclusive catalog barrier. DML
+                        // shares this sentinel regardless of whether any FK exists.
                         if writing {
-                            let has_fk = |parts: &CatalogParts| {
-                                parts.ext.constraints.values().flatten().any(|c| {
-                                    matches!(
-                                        c.kind,
-                                        relational::catalog_ext::ConstraintKind::ForeignKey { .. }
-                                    )
-                                })
-                            };
-                            let exclusive = ddl || has_fk(&db.catalog().parts(txn)?);
                             txn.acquire_lock(
                                 engine::locks::LockKey::Table(0),
-                                if exclusive {
+                                if ddl {
                                     LockMode::AccessExclusive
                                 } else {
                                     LockMode::RowExclusive
@@ -260,16 +251,8 @@ impl SqlSession {
                                 None,
                                 &|| crate::cancellation::check().is_err(),
                             )?;
+                            // Refresh AFTER waiting: DDL may have introduced an FK.
                             txn.begin_statement();
-                            if !exclusive && has_fk(&db.catalog().parts(txn)?) {
-                                txn.acquire_lock(
-                                    engine::locks::LockKey::Table(0),
-                                    LockMode::AccessExclusive,
-                                    None,
-                                    &|| crate::cancellation::check().is_err(),
-                                )?;
-                                txn.begin_statement();
-                            }
                         }
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
@@ -297,26 +280,66 @@ impl SqlSession {
                         if let Some(name) = &target_name {
                             names.insert(name.clone());
                         }
-                        for name in &names {
-                            if !parts.tables.contains_key(name) {
-                                // Preserve the legacy binder's SQL error precedence.
-                                continue;
+                        let target_id = target_name
+                            .as_ref()
+                            .and_then(|name| parts.tables.get(name))
+                            .map(|t| t.id);
+                        // Include the whole FK component: cascades can mutate children
+                        // and probe their other parents. Share conflicts with each
+                        // table's RowExclusive writer, while parent witnesses can share.
+                        let mut connected = target_id.into_iter().collect::<BTreeSet<_>>();
+                        if writing {
+                            loop {
+                                let count = connected.len();
+                                for (&child, constraints) in &parts.ext.constraints {
+                                    for c in constraints {
+                                        if let relational::catalog_ext::ConstraintKind::ForeignKey {
+                                            ref_table,
+                                            ..
+                                        } = &c.kind
+                                            && (connected.contains(&child)
+                                                || connected.contains(ref_table))
+                                        {
+                                            connected.extend([child, *ref_table]);
+                                        }
+                                    }
+                                }
+                                if connected.len() == count {
+                                    break;
+                                }
                             }
-                            let target = target_name.as_deref() == Some(name.as_str());
-                            db.catalog()
-                                .resolve(
-                                    txn,
-                                    name,
-                                    if target && ddl {
+                        }
+                        let mut locks = BTreeMap::new();
+                        for name in &names {
+                            if let Some(table) = parts.tables.get(name) {
+                                locks.insert(table.id, LockMode::AccessShare);
+                            }
+                        }
+                        if writing {
+                            for id in connected {
+                                locks.insert(
+                                    id,
+                                    if ddl {
                                         LockMode::AccessExclusive
-                                    } else if target && writing {
+                                    } else if Some(id) == target_id {
                                         LockMode::RowExclusive
                                     } else {
-                                        LockMode::AccessShare
+                                        LockMode::Share
                                     },
-                                    None,
-                                    &|| crate::cancellation::check().is_err(),
-                                )
+                                );
+                            }
+                        }
+                        // A single table-id order includes read sources and FK witnesses.
+                        let table_names = parts
+                            .tables
+                            .iter()
+                            .map(|(name, table)| (table.id, name))
+                            .collect::<BTreeMap<_, _>>();
+                        for (id, mode) in locks {
+                            db.catalog()
+                                .resolve(txn, table_names[&id], mode, None, &|| {
+                                    crate::cancellation::check().is_err()
+                                })
                                 .map_err(|e| match e {
                                     engine::catalog::CatalogError::Core(e) => e,
                                     engine::catalog::CatalogError::Txn(e) => e.into(),
@@ -589,6 +612,13 @@ struct SqlRows<'a> {
     params: &'a [relational::Value],
 }
 impl RowSink for SqlRows<'_> {
+    fn check_fk_snapshot(&self) -> Result<(), CoreError> {
+        if self.txn.isolation() != Isolation::ReadCommitted {
+            return Err(CoreError::Sql(SqlError::Conflict));
+        }
+        Ok(())
+    }
+
     fn lookup(
         &mut self,
         table: &TableDef,

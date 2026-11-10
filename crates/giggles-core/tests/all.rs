@@ -331,3 +331,6 @@ mod r1_compat;
 
 #[path = "creation_defaults.rs"]
 mod creation_defaults;
+
+#[path = "v2_sql_fk_lock_tests.rs"]
+mod v2_sql_fk_lock_tests;

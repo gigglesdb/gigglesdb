@@ -8,6 +8,11 @@ use super::*;
 use crate::CoreError;
 
 pub(crate) trait RowSink {
+    /// FK witnesses need a fresh snapshot after acquiring their table locks.
+    fn check_fk_snapshot(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
     fn scan(
         &mut self,
         table: &TableDef,

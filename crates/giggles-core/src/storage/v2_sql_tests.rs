@@ -1452,3 +1452,30 @@ mod table_free_tests;
 
 #[path = "v2_sql_ident_tests.rs"]
 mod ident_tests;
+
+#[test]
+fn fk_validation_rejects_non_read_committed_snapshot() {
+    for isolation in [Isolation::RepeatableRead, Isolation::Serializable] {
+        let f = Fixture::new();
+        f.execute("CREATE TABLE p(id int PRIMARY KEY)");
+        f.execute("CREATE TABLE c(id int PRIMARY KEY, p int REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)");
+        f.execute("INSERT INTO p VALUES(1)");
+        let mut s = f.admin().sql_session();
+        s.execute("BEGIN", &[], None).unwrap();
+        s.v2_transaction = Some(f.db().begin(isolation));
+        assert_eq!(
+            s.execute("INSERT INTO c VALUES(1,1)", &[], None),
+            Err(CoreError::Sql(SqlError::Conflict))
+        );
+        s.execute("ROLLBACK", &[], None).unwrap();
+        s.execute("BEGIN", &[], None).unwrap();
+        s.execute("INSERT INTO c VALUES(1,1)", &[], None).unwrap();
+        let mut pending = s.deferral.clone();
+        let mut txn = f.db().begin(isolation);
+        assert_eq!(
+            validate_pending(f.db(), &mut txn, &mut pending),
+            Err(CoreError::Sql(SqlError::Conflict))
+        );
+        s.execute("ROLLBACK", &[], None).unwrap();
+    }
+}

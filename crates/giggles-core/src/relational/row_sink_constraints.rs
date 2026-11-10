@@ -19,6 +19,14 @@ pub(super) fn hydrate(
     sink: &mut impl RowSink,
     budget: &mut scan::Retention,
 ) -> Result<usize, CoreError> {
+    if edges
+        .values()
+        .flatten()
+        .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }))
+    {
+        // Also reached by validate_pending at COMMIT / SET CONSTRAINTS.
+        sink.check_fk_snapshot()?;
+    }
     let mut added = 0;
     for (child_id, cs) in edges {
         for c in cs {
