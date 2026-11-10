@@ -1137,13 +1137,31 @@ impl Admin {
                 }
             }
         }
+        Self::open_legacy(path.as_ref(), limits, true)
+    }
+
+    /// Read legacy data without accepting admission. Buffered redb writes,
+    /// including close-time maintenance, are discarded on drop. This handle
+    /// must not be used for durable writes.
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn open_legacy_unaccepted(path: &Path, limits: Limits) -> Result<Self, CoreError> {
+        upgrade::check_startup(path)?;
+        if engine::meta::classify_dir(path).map_err(v2::format_error)?
+            != engine::meta::DirClass::Legacy
+        {
+            return Err(io("upgrade requires a legacy v1 database"));
+        }
+        Self::open_legacy(path, limits, false)
+    }
+
+    fn open_legacy(path: &Path, limits: Limits, accept: bool) -> Result<Self, CoreError> {
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
         }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.as_ref().join("data.redb"))
+            .open(path.join("data.redb"))
             .map_err(io)?;
         let admission = legacy_open::Admission::new(file).map_err(io)?;
         let db = legacy_redb("opening database", || {
@@ -1154,9 +1172,11 @@ impl Admin {
         })?;
         // An opener delayed after the first check must not acquire the legacy
         // database in the Windows upgrade's close-before-rename interval.
-        upgrade::check_startup(path.as_ref())?;
+        upgrade::check_startup(path)?;
         let admin = Self::attach(db, limits)?;
-        admission.accept().map_err(io)?;
+        if accept {
+            admission.accept().map_err(io)?;
+        }
         Ok(admin)
     }
 

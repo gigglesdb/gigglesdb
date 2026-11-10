@@ -1,3 +1,5 @@
+#[cfg(feature = "engine-rocksdb")]
+mod common;
 use giggles_core::*;
 
 #[cfg(not(feature = "engine-rocksdb"))]
@@ -116,8 +118,13 @@ mod rocks {
     fn realistic_upgrade_preserves_sql_catalog_roles_and_counters() {
         let path = fresh("realistic");
         let (domain, expected) = fixture(&path, true);
+        let original = std::fs::read(path.join("data.redb")).unwrap();
         let report = Admin::upgrade_to_v2(&path, Limits::default()).unwrap();
-        assert!(report.legacy.join("data.redb").exists());
+        assert_eq!(
+            std::fs::read(report.legacy.join("data.redb")).unwrap(),
+            original,
+            "upgrade changed the retained legacy database"
+        );
         assert_eq!(&std::fs::read(&report.export).unwrap()[..8], b"GDEXP001");
         assert_eq!(Admin::verify_export(&report.export).unwrap().domain, domain);
         let a = Admin::open(&path, Limits::default()).unwrap();
@@ -187,7 +194,13 @@ mod rocks {
         ] {
             let path = fresh(&format!("{point:?}"));
             let (domain, expected) = fixture(&path, false);
+            let original = std::fs::read(path.join("data.redb")).unwrap();
             assert!(Admin::upgrade_to_v2_with_fault(&path, Limits::default(), point).is_err());
+            assert_eq!(
+                std::fs::read(path.join("data.redb")).unwrap(),
+                original,
+                "failed upgrade at {point:?} changed the legacy database"
+            );
             let a = Admin::open(&path, Limits::default()).unwrap();
             assert_eq!(a.authority_metadata().unwrap().0, domain);
             assert_eq!(
@@ -197,6 +210,175 @@ mod rocks {
             drop(a);
             Admin::upgrade_to_v2(&path, Limits::default()).unwrap();
         }
+    }
+
+    // Hash every file, including lock files if present: these legacy fixtures
+    // use redb's in-file OS lock and require no lock-file exclusions.
+    fn file_hashes(root: &Path) -> std::collections::BTreeMap<PathBuf, [u8; 32]> {
+        use sha2::{Digest, Sha256};
+        fn visit(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, [u8; 32]>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(root).unwrap().into(),
+                        Sha256::digest(std::fs::read(path).unwrap()).into(),
+                    );
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        visit(root, root, &mut out);
+        out
+    }
+    fn refused_unchanged(path: &Path, kinds: &[&str]) {
+        // Include siblings so an unexpected export or staging file is caught too.
+        let root = path.parent().unwrap();
+        let before = file_hashes(root);
+        let error = Admin::upgrade_to_v2(path, Limits::default())
+            .unwrap_err()
+            .to_string();
+        for kind in kinds {
+            assert!(error.contains(&format!("{kind}: 1")), "{error}");
+        }
+        assert_eq!(file_hashes(root), before, "refusal changed files: {error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    fn refusal_fixture(label: &str, seed: impl FnOnce(&Admin)) -> PathBuf {
+        let path = fresh(label);
+        let admin = Admin::create(&path, Limits::default()).unwrap();
+        seed(&admin);
+        drop(admin);
+        path
+    }
+
+    #[test]
+    fn refuses_tasks_without_changing_files() {
+        let path = refusal_fixture("tasks", |a| {
+            a.grant(common::grant()).unwrap();
+        });
+        refused_unchanged(&path, &["tasks"]);
+    }
+
+    #[test]
+    fn refuses_receipts_without_changing_files() {
+        let path = refusal_fixture("receipts", |a| {
+            a.put(common::key(0), common::row()).unwrap();
+            a.grant(common::grant())
+                .unwrap()
+                .execute(common::request(1, &[0]), Time::Certified(10), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.snapshot().unwrap().operations.len(), 1);
+        });
+        refused_unchanged(&path, &["receipts", "protected operations"]);
+    }
+
+    #[test]
+    fn refuses_protected_rejections_without_changing_files() {
+        let path = refusal_fixture("protected-rejections", |a| {
+            let mut request = common::request(1, &[]);
+            request.selection = Selection::Keys(vec![Key {
+                tenant: TenantId(43),
+                row: RowId(0),
+            }]);
+            assert_eq!(
+                a.grant(common::grant())
+                    .unwrap()
+                    .execute(request, Time::Certified(10), None)
+                    .unwrap(),
+                Err(Error::Scope)
+            );
+            assert_eq!(a.snapshot().unwrap().operations.len(), 1);
+        });
+        refused_unchanged(&path, &["protected operations"]);
+    }
+
+    #[test]
+    fn refuses_approvals_without_changing_files() {
+        let path = refusal_fixture("approvals", |a| {
+            let executor = a.grant(common::grant()).unwrap();
+            let preview = executor
+                .preview(&common::request(1, &[]), Time::Certified(10))
+                .unwrap();
+            a.approve(Principal(3), preview, Time::Certified(10))
+                .unwrap();
+        });
+        refused_unchanged(&path, &["approvals"]);
+    }
+
+    #[test]
+    fn refuses_executor_ledger_without_changing_files() {
+        let path = refusal_fixture("executor-ledger", |a| {
+            a.grant(common::grant()).unwrap();
+            a.provision_task_resources(TaskId(1), TaskResources::default())
+                .unwrap();
+        });
+        refused_unchanged(&path, &["executor ledger"]);
+    }
+
+    #[test]
+    fn refuses_kernel_records_without_changing_files() {
+        let path = refusal_fixture("kernel-records", |a| {
+            a.put(common::key(0), common::row()).unwrap();
+            assert_eq!(a.snapshot().unwrap().rows.len(), 1);
+        });
+        refused_unchanged(&path, &["kernel records"]);
+    }
+
+    #[test]
+    fn refuses_native_outcomes_without_changing_files() {
+        use giggles_core::operations::{
+            Bindings, Engine, Request as NativeRequest, ValueExpr,
+            once::{ONCE_CONTRACT_VERSION, OnceBody, OnceIdentity, OnceRequest, OnceTime},
+        };
+        let path = refusal_fixture("native-outcomes", |a| {
+            run(
+                &mut a.sql_session(),
+                "CREATE TABLE items (id BIGINT PRIMARY KEY)",
+            );
+            let request = OnceRequest {
+                contract_version: ONCE_CONTRACT_VERSION,
+                identity: OnceIdentity {
+                    database_domain: a.snapshot().unwrap().domain,
+                    tenant: 42,
+                    namespace: "upgrade.fixture".into(),
+                    key: b"one".to_vec(),
+                },
+                retention_seconds: 60,
+                body: OnceBody::Operation(NativeRequest::Insert {
+                    table: "items".into(),
+                    values: vec![("id".into(), ValueExpr::Literal(Value::Int(1)))],
+                }),
+            };
+            let receipt = Engine::new(a.clone())
+                .execute_once(&request, &Bindings::new(), &|| {
+                    Ok(OnceTime {
+                        lower_unix_seconds: 1000,
+                        upper_unix_seconds: 1001,
+                        valid_until: std::time::Instant::now() + std::time::Duration::from_secs(10),
+                    })
+                })
+                .unwrap();
+            assert!(receipt.outcome.is_ok());
+        });
+        refused_unchanged(&path, &["once/outcome ledger"]);
+    }
+
+    #[test]
+    fn refuses_restore_origin_without_changing_files() {
+        let path = fresh("restore-origin");
+        let source = path.with_file_name("source");
+        let export = path.with_file_name("source.gdexp");
+        let admin = Admin::create(&source, Limits::default()).unwrap();
+        admin.export(&export).unwrap();
+        drop(admin);
+        let restored = Admin::restore(&export, &path, Limits::default()).unwrap();
+        assert!(restored.authority_metadata().unwrap().3.is_some());
+        drop(restored);
+        refused_unchanged(&path, &["restore origin"]);
     }
 
     #[test]

@@ -6,6 +6,8 @@ autotests = false
 
 [features]
 engine-rocksdb = ["dep:rocksdb"]
+# Abrupt-crash qualification only; never enable in production binaries.
+upgrade-fault-injection = []
 # Instrumentation proving native execution avoids SQL parsing/public dispatch.
 test-sql-parser-trap = []
 
@@ -53,4 +55,4 @@ path = "tests/durable_boundaries.rs"
 [[test]]
 name = "upgrade_crash"
 path = "tests/upgrade_crash.rs"
-required-features = ["engine-rocksdb"]
+required-features = ["engine-rocksdb", "upgrade-fault-injection"]

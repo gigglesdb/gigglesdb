@@ -168,13 +168,17 @@ impl Admin {
     }
 }
 
-// Explicit process-local qualification seam. Child tests set it; normal operation
-// never enables it. Termination uses the existing no-destructor crash primitive.
+// Explicit opt-in qualification seam. Termination uses the existing
+// no-destructor crash primitive; ordinary builds never read the environment.
+#[cfg(feature = "upgrade-fault-injection")]
 fn qualification_crash(point: &str) {
     if std::env::var("GD_UPGRADE_CRASH").as_deref() == Ok(point) {
         crash_now();
     }
 }
+
+#[cfg(not(feature = "upgrade-fault-injection"))]
+fn qualification_crash(_point: &str) {}
 
 #[cfg(feature = "engine-rocksdb")]
 fn refuse(s: &State) -> Result<(), CoreError> {
@@ -227,7 +231,7 @@ fn run(
     }
     // redb's exclusive file lock is held through verification. Windows requires
     // closing it before rename; the tmp sibling gates all startups during switch.
-    let legacy = Admin::open(path, limits)?;
+    let legacy = Admin::open_legacy_unaccepted(path, limits)?;
     let state = legacy.inner.read()?;
     refuse(&state)?;
     let roles = legacy.roles().upgrade_records()?;
