@@ -371,7 +371,7 @@ fn target_extraction_is_utf8_safe_before_malformed_body() {
     assert_eq!(
         Copy::parse(&format!(
             "COPY items FROM STDIN {}",
-            " ".repeat(giggles_core::relational::MAX_SQL)
+            " ".repeat(giggles_core::relational::MAX_STATEMENT_SQL)
         )),
         Err(E::Limit)
     );

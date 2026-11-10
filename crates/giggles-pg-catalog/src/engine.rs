@@ -139,6 +139,13 @@ fn ident(i: &a::Ident) -> String {
 fn object(n: &a::ObjectName) -> Vec<String> {
     n.0.iter().map(ident).collect()
 }
+pub fn catalog_identifier(name: &str) -> bool {
+    matches!(name, "pg_catalog" | "information_schema" | "pg_options_to_table" | "pg_get_sequence_data"
+        | "version" | "pg_postmaster_start_time" | "pg_backend_pid" | "pg_is_in_recovery"
+        | "current_database" | "current_schema" | "current_user" | "session_user"
+        | "user" | "current_role" | "current_catalog" | "current_schemas")
+        || unqualified_catalog(name)
+}
 fn unqualified_catalog(name: &str) -> bool {
     catalog::relation_namespace(name) == "pg_catalog" && catalog::schema(name).is_some()
 }

@@ -222,7 +222,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
             }
             rows.push(row);
             defaults.push(row_defaults);
-            if rows.len() > MAX_SQL {
+            if rows.len() > MAX_INSERT_TOKENS {
                 return Err(SqlError::Limit);
             }
             if !p.sym(',') {

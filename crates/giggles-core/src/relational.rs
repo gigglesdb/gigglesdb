@@ -59,6 +59,14 @@ pub use giggles_pg_types::{Float4, Float8, Numeric};
 pub use sql_copy::{Copy, CopyFormat};
 
 pub const MAX_SQL: usize = 64 * 1024;
+/// v2 SQL text budget. Flat token/VALUES storage is linear in this byte budget.
+pub const V2_MAX_SQL: usize = 64 * 1024 * 1024;
+#[cfg(feature = "engine-rocksdb")]
+pub const MAX_STATEMENT_SQL: usize = V2_MAX_SQL;
+#[cfg(not(feature = "engine-rocksdb"))]
+pub const MAX_STATEMENT_SQL: usize = MAX_SQL;
+/// INSERT uses flat tuples, never a recursively nested AST for the VALUES list.
+pub const MAX_INSERT_TOKENS: usize = 1_000_000;
 pub const MAX_ROWS: usize = 1024;
 pub const MAX_ROW_BYTES: usize = 64 * 1024;
 pub const MAX_COLUMNS: usize = 64;
@@ -680,12 +688,16 @@ enum Token {
     Op(String),
 }
 fn lex(s: &str) -> R<Vec<Token>> {
-    if s.len() > MAX_SQL {
+    let mut out = Vec::new();
+    lex_into(s, &mut out, false)?;
+    Ok(out)
+}
+fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
+    if s.len() > MAX_STATEMENT_SQL {
         return Err(SqlError::Limit);
     }
     let b = s.as_bytes();
     let mut i = 0;
-    let mut out = Vec::new();
     while i < b.len() {
         if b[i].is_ascii_whitespace() {
             i += 1;
@@ -737,6 +749,9 @@ fn lex(s: &str) -> R<Vec<Token>> {
             }
             if !closed {
                 return Err(SqlError::Syntax);
+            }
+            if v.len() > MAX_SQL {
+                return Err(SqlError::Limit);
             }
             out.push(Token::String(
                 String::from_utf8(v).map_err(|_| SqlError::Syntax)?,
@@ -806,9 +821,12 @@ fn lex(s: &str) -> R<Vec<Token>> {
                 i += 2;
                 let start = i;
                 let end = s[start..].find("$$").ok_or(SqlError::Syntax)? + start;
+                if end - start > MAX_SQL {
+                    return Err(SqlError::Limit);
+                }
                 out.push(Token::String(s[start..end].into()));
                 i = end + 2;
-                if out.len() > 4096 {
+                if out.len() > token_limit(out, routing) {
                     return Err(SqlError::Limit);
                 }
                 continue;
@@ -854,14 +872,18 @@ fn lex(s: &str) -> R<Vec<Token>> {
         } else {
             return Err(SqlError::Unsupported);
         }
-        // INSERT's executor retains the legacy 1,024-row admission limit;
-        // v2 can split larger VALUES lists within the existing SQL byte budget.
-        let insert = matches!(out.first(), Some(Token::Word(word)) if word == "insert");
-        if out.len() > if insert { MAX_SQL } else { 4096 } {
+        if out.len() > token_limit(out, routing) {
             return Err(SqlError::Limit);
         }
     }
-    Ok(out)
+    Ok(())
+}
+fn token_limit(tokens: &[Token], routing: bool) -> usize {
+    if routing || matches!(tokens.first(), Some(Token::Word(word)) if word == "insert") {
+        MAX_INSERT_TOKENS
+    } else {
+        4096
+    }
 }
 #[derive(Debug, Clone)]
 enum Expr {
@@ -2423,26 +2445,16 @@ impl Prepared {
     }
     /// Return the ALTER target only after parsing the complete statement.
     pub fn alter_table_target(sql: &str) -> R<Option<String>> {
-        let tokens = match lex(sql) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                // Lexing the body can fail after a leading comment. Inspect a complete
-                // leading token without changing non-ALTER error routing.
-                for (end, ch) in sql.char_indices() {
-                    if (ch.is_whitespace() || matches!(ch, ';' | '('))
-                        && let Ok(prefix) = lex(&sql[..end])
-                        && let Some(Token::Word(word)) = prefix.first()
-                    {
-                        return if word == "alter" {
-                            Err(error)
-                        } else {
-                            Ok(None)
-                        };
-                    }
-                }
-                return Ok(None);
-            }
-        };
+        let mut tokens = Vec::new();
+        if let Err(error) = lex_into(sql, &mut tokens, false) {
+            // Retain the leading token on failure; repeatedly re-lexing prefixes
+            // is quadratic for long comments/whitespace preceding a bad body.
+            return if matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
+                Err(error)
+            } else {
+                Ok(None)
+            };
+        }
         if !matches!(tokens.first(), Some(Token::Word(word)) if word == "alter") {
             return Ok(None);
         }
@@ -2483,6 +2495,17 @@ impl Prepared {
             matches!(&prepared.statement,
                 Statement::Query(query) if query.rejects_unsupported_table_free_scalar())
         })
+    }
+    /// Lexical routing hint only: no binding, routine classification or errors.
+    /// Every identifier is checked conservatively, including nested statements.
+    pub fn application_dml(sql: &str, catalog_identifier: impl Fn(&str) -> bool) -> bool {
+        let mut tokens = Vec::new();
+        if lex_into(sql, &mut tokens, true).is_err() { return false }
+        matches!(tokens.first(), Some(Token::Word(w)) if matches!(w.as_str(), "insert" | "update" | "delete"))
+            && !tokens.iter().any(|token| match token {
+                Token::Word(w) | Token::QuotedIdent(w) => catalog_identifier(w),
+                _ => false,
+            })
     }
     /// Parse FK dependencies before binding or relation lookup.
     pub fn constraint_references(sql: &str) -> R<Vec<String>> {

@@ -27,6 +27,7 @@
 //! General transaction IDs, timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
+pub use engine::catalog_identifier;
 mod engine;
 pub use engine::{
     Plan, describe, execute, execute_with_startup, plan, plan_gateway, plan_gateway_with_relations,

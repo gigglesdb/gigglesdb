@@ -506,7 +506,7 @@ impl State {
 // A boundary lexer, not a second SQL parser. Preserve quoted bytes exactly;
 // replace comments with whitespace so every dispatch path sees the same SQL.
 pub(super) fn split(sql: &str) -> R<Vec<String>> {
-    if sql.len() > giggles_core::relational::MAX_SQL {
+    if sql.len() > giggles_core::relational::MAX_STATEMENT_SQL {
         return Err("54000");
     }
     let b = sql.as_bytes();
@@ -836,6 +836,6 @@ mod tests {
             assert_eq!(split(sql), Err("42601"), "{sql}");
         }
         assert_eq!(split(&"/*".repeat(17)), Err("54000"));
-        assert_eq!(split(&" ".repeat(65537)), Err("54000"));
+        assert_eq!(split(&" ".repeat(giggles_core::relational::MAX_STATEMENT_SQL + 1)), Err("54000"));
     }
 }

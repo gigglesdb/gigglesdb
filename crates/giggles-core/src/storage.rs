@@ -2363,6 +2363,10 @@ impl SqlSession {
         if let Backend::V2(db) = &self.admin.inner.backend {
             return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
         }
+        if sql.len() > relational::MAX_SQL {
+            self.abort();
+            return Err(CoreError::Sql(relational::SqlError::Limit));
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let mut result = if let Some(s) = &self.staged {

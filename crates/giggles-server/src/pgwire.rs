@@ -674,6 +674,11 @@ fn catalog_plan(
     session: &mut Session,
 ) -> R<Option<giggles_pg_catalog::Plan>> {
     diagnostic.phase = "catalog planning";
+    // Core owns application DML admission and authorization. This hint only
+    // avoids catalog parsing; it neither binds names nor returns diagnostics.
+    if Prepared::application_dml(sql, giggles_pg_catalog::catalog_identifier) {
+        return Ok(None);
+    }
     // Dependency-bearing sequence calls use the SQL execution context, never
     // the immutable catalog evaluator or the positive table-free allowlist.
     if !Prepared::sequence_dependencies(sql).is_empty() {
@@ -1940,7 +1945,10 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let incoming = timeout(IO_TIMEOUT, async {
             let n = s.read_u32().await?;
-            if n < 4 || n as u64 > MAX_FRAME as u64 {
+            // SQL plus Parse's bounded name/type declarations and frame header.
+            // Other transports keep their existing frame budgets.
+            let maximum = (giggles_core::relational::MAX_STATEMENT_SQL + 2048).max(MAX_FRAME);
+            if n < 4 || n as u64 > maximum as u64 {
                 return Err(io::Error::other("wire frame limit"));
             }
             let mut b = vec![0; n as usize - 4];
