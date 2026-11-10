@@ -21,6 +21,7 @@ impl SqlSession {
                     return Err(CoreError::Sql(relational::SqlError::Aborted));
                 }
                 p.transaction = self.transaction_id;
+                p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
                 Ok(p)
             });
         if result.is_err() {

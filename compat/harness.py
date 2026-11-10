@@ -21,6 +21,7 @@ def parser():
     comparison.add_argument('--out', type=Path)
     run = sub.add_parser('run')
     run.add_argument('--server-bin', type=Path)
+    run.add_argument('--server-arg', action='append', default=[], help='extra server argument (use --server-arg=--flag)')
     run.add_argument('--build-root', default='J:/gigglesdb-work/r0-harness/builds')
     run.add_argument('--build-worktree', default='J:/gigglesdb-work/wt/r0-build')
     run.add_argument('--cargo-target', default='J:/gigglesdb-work/r0-harness/cargo-target')
@@ -268,7 +269,7 @@ def _run(args, capture):
         if not engine.image(pins.reference(pinned['postgres']), args.pull):
             raise RuntimeError('pinned oracle image unavailable: '+pins.reference(pinned['postgres'])+'; use --pull to permit fetching')
         network, pg_host, data['oracle'] = oracle.start(engine, pinned)
-        server = gigglesdb.Server(binary.resolve(strict=True), run, env, password)
+        server = gigglesdb.Server(binary.resolve(strict=True), run, env, password, server_args=args.server_arg)
         data['build'].update(server.meta)
         port = server.start()
         data['build'].update(server.meta)

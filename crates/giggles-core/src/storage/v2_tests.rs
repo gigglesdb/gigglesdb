@@ -279,10 +279,13 @@ fn lifecycle_and_public_refusals() {
         wall: None,
     };
     let mut session = admin.sql_session();
-    denied(session.describe(&prepared), SQL_SESSIONS);
-    denied(
+    assert!(matches!(
+        session.describe(&prepared),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema))
+    ));
+    assert_eq!(
         session.validate_immutable_constants(&prepared),
-        SQL_SESSIONS,
+        Err(CoreError::Sql(relational::SqlError::StaleSchema))
     );
     denied(
         session.scan(relational::Scan {

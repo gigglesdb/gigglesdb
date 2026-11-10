@@ -109,6 +109,37 @@ impl V2Db {
         &self.catalog
     }
 
+    /// Rows-free image used only by catalog/authority metadata helpers.
+    pub(super) fn metadata_state(
+        &self,
+        txn: Option<&engine::txn::Transaction>,
+    ) -> Result<super::State, CoreError> {
+        let mut committed;
+        let (parts, epoch) = match txn {
+            Some(txn) => (
+                self.catalog.metadata_parts(txn)?,
+                txn.current_snapshot_ts()
+                    .unwrap_or_else(|| self.sequencer.visible_ts())
+                    .0,
+            ),
+            None => {
+                committed = self.begin(engine::txn::Isolation::ReadCommitted);
+                let parts = self.catalog.parts(&mut committed)?;
+                (parts, committed.snapshot_ts().0)
+            }
+        };
+        let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
+        state.sql = crate::relational::Relational::catalog_image(
+            parts.tables,
+            parts.ext,
+            u64::MAX,
+            u64::MAX,
+        )
+        .map_err(CoreError::Sql)?;
+        state.sql.epoch = epoch;
+        Ok(state)
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self, CoreError> {
         if engine::meta::classify_dir(path).map_err(format_error)? != engine::meta::DirClass::V2 {
             return Err(CoreError::Corrupt("not a v2 directory".into()));
@@ -132,3 +163,7 @@ impl V2Db {
 #[cfg(test)]
 #[path = "v2_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_metadata_tests.rs"]
+mod metadata_tests;

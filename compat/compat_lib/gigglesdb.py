@@ -285,8 +285,9 @@ def parse_banner(line, url):
     return int(match[1])
 
 class Server:
-    def __init__(self, source, run, env, password):
+    def __init__(self, source, run, env, password, server_args=()):
         self.run, self.env, self.password = run, env.copy(), password
+        self.server_args = list(server_args)
         self.process = None
         self.thread = None
         (run/'bin').mkdir()
@@ -299,7 +300,7 @@ class Server:
         (self.run/'cwd').mkdir()
         self.env['GIGGLES_OWNER_PASSWORD'] = self.password
         self.stderr = (self.run/'server.stderr.log').open('w', encoding='utf-8')
-        self.process = subprocess.Popen([str(self.binary),'--dev','--data',str(self.run/'data'),'--port','0','--owner','postgres','--database','postgres'], cwd=self.run/'cwd', env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+        self.process = subprocess.Popen([str(self.binary),'--dev','--data',str(self.run/'data'),'--port','0','--owner','postgres','--database','postgres',*self.server_args], cwd=self.run/'cwd', env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         ready = queue.Queue()
         def drain():
             with (self.run/'server.stdout.log').open('w',encoding='utf-8') as log:

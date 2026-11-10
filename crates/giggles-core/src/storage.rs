@@ -71,9 +71,8 @@ fn legacy_redb<T>(
     operation: &'static str,
     f: impl FnOnce() -> Result<T, CoreError>,
 ) -> Result<T, CoreError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
-        CoreError::Corrupt(format!("legacy redb panicked while {operation}"))
-    })?
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| CoreError::Corrupt(format!("legacy redb panicked while {operation}")))?
 }
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
@@ -577,6 +576,20 @@ impl Inner {
                 engine: "v2",
                 feature,
             }),
+        }
+    }
+
+    /// Inspect metadata only. Native/task operations must keep using `db(feature)`.
+    fn inspect_metadata<T>(
+        &self,
+        f: impl FnOnce(&State) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        match &self.backend {
+            Backend::Legacy(_) => self.inspect(f),
+            Backend::V2(db) => {
+                let _ticket = self.enter()?;
+                f(&db.metadata_state(None)?)
+            }
         }
     }
 
@@ -1129,6 +1142,11 @@ impl Admin {
         self.inner.inspect(|s| Ok(s.view.clone()))
     }
     pub fn authority_metadata(&self) -> Result<(u128, u64, u64, Option<u128>), CoreError> {
+        // V2 has a durable SQL authority domain, but no native approval clock/ledger.
+        if let Backend::V2(db) = &self.inner.backend {
+            let _ticket = self.inner.enter()?;
+            return Ok((u128::from_be_bytes(db.meta.domain), 0, 0, None));
+        }
         self.inner
             .inspect(|s| Ok((s.view.domain, s.last_time, s.next_approval, s.origin)))
     }
@@ -1770,15 +1788,15 @@ impl Admin {
         })
     }
     pub fn catalog_schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
-        self.inner.inspect(|s| Ok(s.sql.schema_metadata()))
+        self.inner.inspect_metadata(|s| Ok(s.sql.schema_metadata()))
     }
     pub fn catalog(&self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
         self.inner
-            .inspect(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
+            .inspect_metadata(|s| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect())))
     }
     /// Read column typmods and their catalog epoch from one committed snapshot.
     pub fn catalog_typmods(&self) -> Result<(u64, BTreeMap<u64, i32>), CoreError> {
-        self.inner.inspect(|s| {
+        self.inner.inspect_metadata(|s| {
             let typmods = s
                 .sql
                 .catalog_ext()
@@ -1791,11 +1809,27 @@ impl Admin {
     }
 }
 impl SqlSession {
+    fn inspect_metadata<T>(
+        &self,
+        f: impl FnOnce(&State) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        match &self.admin.inner.backend {
+            Backend::Legacy(_) => match &self.staged {
+                Some(state) => f(state),
+                None => self.admin.inner.inspect(f),
+            },
+            Backend::V2(db) => {
+                let _ticket = self.admin.inner.enter()?;
+                f(&db.metadata_state(self.v2_transaction.as_ref())?)
+            }
+        }
+    }
+
     pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
         let resolve = |s: &State| Ok(s.sql.resolve_relation_key(name, &self.search_path));
         match &self.staged {
             Some(s) => resolve(s),
-            None => self.admin.inner.inspect(resolve),
+            None => self.inspect_metadata(resolve),
         }
     }
     /// Bind dependency identities to this session without surfacing semantic errors
@@ -1813,7 +1847,7 @@ impl SqlSession {
         };
         match &self.staged {
             Some(s) => bind(s),
-            None => self.admin.inner.inspect(bind),
+            None => self.inspect_metadata(bind),
         }
     }
     pub fn schema_in_search_path(&self, schema: &str) -> bool {
@@ -1827,7 +1861,7 @@ impl SqlSession {
         let read = |s: &State| Ok(s.sql.schema_metadata());
         match &self.staged {
             Some(s) => read(s),
-            None => self.admin.inner.inspect(read),
+            None => self.inspect_metadata(read),
         }
     }
     pub fn relation_schema(&self, name: &str) -> Result<String, CoreError> {
@@ -1840,14 +1874,14 @@ impl SqlSession {
         };
         match &self.staged {
             Some(s) => read(s),
-            None => self.admin.inner.inspect(read),
+            None => self.inspect_metadata(read),
         }
     }
     pub fn creation_schema(&self, p: &relational::Prepared) -> Result<String, CoreError> {
         let read = |s: &State| p.creation_schema(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
             Some(s) => read(s),
-            None => self.admin.inner.inspect(read),
+            None => self.inspect_metadata(read),
         }
     }
     pub fn user_type_catalog(&self) -> Result<relational::UserTypeCatalog, CoreError> {
@@ -1857,7 +1891,7 @@ impl SqlSession {
         if let Some(s) = &self.staged {
             return Ok(s.sql.user_type_catalog());
         }
-        self.admin.inner.inspect(|s| Ok(s.sql.user_type_catalog()))
+        self.inspect_metadata(|s| Ok(s.sql.user_type_catalog()))
     }
 
     /// Mark publications whose creator authority is maintained by the caller.
@@ -1877,11 +1911,10 @@ impl SqlSession {
         &self,
         p: &relational::Prepared,
     ) -> Result<Vec<Option<String>>, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let dependencies = |s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
             Some(s) => dependencies(s),
-            None => self.admin.inner.inspect(dependencies),
+            None => self.inspect_metadata(dependencies),
         }
     }
     pub fn set_sequence_tables(&mut self, tables: Option<std::collections::BTreeSet<String>>) {
@@ -1892,12 +1925,11 @@ impl SqlSession {
         let resolve = |s: &State| Ok(s.sql.resolve_relation_key(&name, &self.search_path));
         match &self.staged {
             Some(s) => resolve(s),
-            None => self.admin.inner.inspect(resolve),
+            None => self.inspect_metadata(resolve),
         }
     }
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let owners = |s: &State| {
             Ok(s.sql
                 .catalog_ext()
@@ -1917,7 +1949,7 @@ impl SqlSession {
         };
         match &self.staged {
             Some(s) => owners(s),
-            None => self.admin.inner.inspect(owners),
+            None => self.inspect_metadata(owners),
         }
     }
     /// Resolve metadata only. Never executes, stages, charges or publishes SQL.
@@ -1925,7 +1957,6 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && !p.allows_aborted_transaction() {
@@ -1938,12 +1969,16 @@ impl SqlSession {
                 if p.domain != s.view.domain {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
-                p.describe(&s.sql).map_err(CoreError::Sql)
+                let mut metadata_plan = p.clone();
+                if matches!(self.admin.inner.backend, Backend::V2(_)) {
+                    metadata_plan.epoch = s.sql.epoch;
+                }
+                metadata_plan.describe(&s.sql).map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
                 describe(s)
             } else {
-                self.admin.inner.inspect(describe)
+                self.inspect_metadata(describe)
             }
         })();
         if result.is_err() {
@@ -1956,7 +1991,6 @@ impl SqlSession {
         &mut self,
         p: &relational::Prepared,
     ) -> Result<(), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         relational::assert_sql_frontend_allowed();
         let result = (|| {
             if self.aborted && !p.allows_aborted_transaction() {
@@ -1969,13 +2003,18 @@ impl SqlSession {
                 if p.domain != s.view.domain {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
-                p.validate_immutable_constants(&s.sql)
+                let mut metadata_plan = p.clone();
+                if matches!(self.admin.inner.backend, Backend::V2(_)) {
+                    metadata_plan.epoch = s.sql.epoch;
+                }
+                metadata_plan
+                    .validate_immutable_constants(&s.sql)
                     .map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
                 describe(s)
             } else {
-                self.admin.inner.inspect(describe)
+                self.inspect_metadata(describe)
             }
         })();
         if result.is_err() {
@@ -2902,7 +2941,6 @@ impl SqlSession {
     }
     /// Check the session's staged relation namespace, or the committed catalog.
     pub fn relation_exists(&self, name: &str) -> Result<bool, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let exists = |state: &State| {
             state.sql.tables.contains_key(name)
                 || state
@@ -2914,20 +2952,28 @@ impl SqlSession {
         };
         match &self.staged {
             Some(state) => Ok(exists(state)),
-            None => self.admin.inner.inspect(|state| Ok(exists(state))),
+            None => self.inspect_metadata(|state| Ok(exists(state))),
         }
     }
 
     /// Resolve a staged table name to its durable owner key by stable table id.
     pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
-        let Some(table) = self.staged.as_ref().and_then(|s| s.sql.tables.get(name)) else {
+        let table_id = if matches!(self.admin.inner.backend, Backend::V2(_)) {
+            self.inspect_metadata(|s| Ok(s.sql.tables.get(name).map(|table| table.id)))?
+        } else {
+            self.staged
+                .as_ref()
+                .and_then(|s| s.sql.tables.get(name))
+                .map(|table| table.id)
+        };
+        let Some(table_id) = table_id else {
             return Ok(name.to_owned());
         };
-        self.admin.inner.inspect(|s| {
+        self.admin.inner.inspect_metadata(|s| {
             Ok(s.sql
                 .tables
                 .values()
-                .find(|candidate| candidate.id == table.id)
+                .find(|candidate| candidate.id == table_id)
                 .map(|candidate| s.sql.table_key(candidate))
                 .unwrap_or_else(|| name.to_owned()))
         })

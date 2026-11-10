@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 autotests = false
 
+[features]
+engine-rocksdb = ["giggles-core/engine-rocksdb"]
+
 [dependencies]
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-pg-catalog = { path = "../giggles-pg-catalog" }

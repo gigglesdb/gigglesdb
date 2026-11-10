@@ -5,7 +5,7 @@ use crate::{
     clock::Clock,
 };
 use giggles_core::{
-    Admin, Limits,
+    Admin, Engine, Limits,
     roles::{NewRole, RoleChanges},
 };
 use std::{
@@ -14,12 +14,14 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch};
 
-pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--owner NAME] [--database NAME] [--trust-local] [--reset-owner-password]";
+pub const USAGE: &str = "usage: giggles-server CONFIG.json | --dev [--data DIR] [--port N] [--engine legacy|v2] [--owner NAME] [--database NAME] [--trust-local] [--reset-owner-password]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     pub data: PathBuf,
     pub port: u16,
+    /// Creation only; existing directories are detected by their format.
+    pub engine: Engine,
     pub owner: String,
     pub database: String,
     pub trust_local: bool,
@@ -31,6 +33,7 @@ impl Options {
         let mut options = Self {
             data: "giggles-data".into(),
             port: 5432,
+            engine: Engine::Legacy,
             owner: "postgres".into(),
             database: "postgres".into(),
             trust_local: false,
@@ -41,13 +44,20 @@ impl Options {
             match flag.as_str() {
                 "--trust-local" => options.trust_local = true,
                 "--reset-owner-password" => options.reset_owner_password = true,
-                "--data" | "--port" | "--owner" | "--database" => {
+                "--data" | "--port" | "--owner" | "--database" | "--engine" => {
                     let value = args
                         .next()
                         .filter(|value| !value.is_empty() && !value.starts_with("--"))
                         .ok_or(USAGE)?;
                     match flag.as_str() {
                         "--data" => options.data = value.into(),
+                        "--engine" => {
+                            options.engine = match value.as_str() {
+                                "legacy" => Engine::Legacy,
+                                "v2" => Engine::V2,
+                                _ => return Err(USAGE),
+                            };
+                        }
                         "--port" => {
                             if !value.bytes().all(|byte| byte.is_ascii_digit()) {
                                 return Err(USAGE);
@@ -228,7 +238,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let admin = if existing {
         open_existing(&path)?
     } else {
-        Admin::create(&path, Limits::default())?
+        Admin::create_engine(&path, Limits::default(), options.engine)?
     };
     let password = bootstrap_owner(&admin, &options.owner)?;
     let service = Service::new(admin, Vec::new(), Clock::new(0, 3600)?)?;
@@ -338,6 +348,8 @@ mod tests {
     fn defaults_and_explicit_options() {
         let defaults = parse(&[]).unwrap();
         assert_eq!(defaults.port, 5432);
+        assert_eq!(defaults.engine, Engine::Legacy);
+        assert_eq!(parse(&["--engine", "v2"]).unwrap().engine, Engine::V2);
         assert_eq!(defaults.owner, "postgres");
         assert_eq!(defaults.database, "postgres");
         assert_eq!(defaults.data, PathBuf::from("giggles-data"));
@@ -364,10 +376,78 @@ mod tests {
         assert_eq!(options.owner, "_Owner1");
         assert!(options.trust_local);
     }
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn v2_service_reopens_and_serves_catalog_and_sql() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("v2-service-{:032x}", u128::from_be_bytes(nonce)));
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        admin
+            .roles()
+            .create(NewRole {
+                name: "owner".into(),
+                login: true,
+                superuser: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.role_session("owner").unwrap();
+        session
+            .execute_sql(
+                "CREATE TABLE items (id bigint PRIMARY KEY, label varchar(12))",
+                &[],
+            )
+            .unwrap();
+        session
+            .execute_sql("INSERT INTO items VALUES (1, 'hello')", &[])
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_sql("SELECT * FROM items", &[])
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        let (_, tables, _, typmods, _) = session.catalog_snapshot_with_typmods().unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(typmods.get(&tables[0].columns[1].id), Some(&16));
+        assert_eq!(
+            service
+                .admin
+                .roles()
+                .table_owner("items")
+                .unwrap()
+                .as_deref(),
+            Some("owner")
+        );
+        drop(session);
+        drop(service);
+        let admin = Admin::open(&path, Limits::default()).unwrap();
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.role_session("owner").unwrap();
+        assert_eq!(
+            session
+                .execute_sql("SELECT * FROM items", &[])
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        drop(session);
+        drop(service);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn malformed_cli_is_rejected() {
         for args in [
             vec!["--unknown"],
+            vec!["--engine"],
+            vec!["--engine", "rocks"],
             vec!["--data"],
             vec!["--port", "65536"],
             vec!["--port", "-1"],

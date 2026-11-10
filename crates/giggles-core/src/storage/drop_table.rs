@@ -8,6 +8,29 @@ impl Admin {
         if self.inner.sql_transactions.load(Ordering::Acquire) != 0 {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
+        if matches!(self.inner.backend, super::Backend::V2(_)) {
+            let mut session = self.sql_session();
+            // Match legacy's absence-at-preflight behavior. SQL DDL results have
+            // no affected-row count, so a successful nonoptional DROP means true.
+            if !session.relation_exists(name)? {
+                return if if_exists {
+                    Ok(false)
+                } else {
+                    Err(CoreError::Sql(relational::SqlError::UnknownTable))
+                };
+            }
+            let (schema, name) = relational::split_key(name);
+            let sql = format!(
+                "DROP TABLE \"{}\".\"{}\"",
+                schema.replace('"', "\"\""),
+                name.replace('"', "\"\""),
+            );
+            return match session.execute(&sql, &[], None) {
+                Ok(_) => Ok(true),
+                Err(CoreError::Sql(relational::SqlError::UnknownTable)) if if_exists => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         let (_, tables) = self.catalog()?;
         let schemas = self.catalog_schema_metadata()?;
         if self.inner.sql_transactions.load(Ordering::Acquire) != 0 {

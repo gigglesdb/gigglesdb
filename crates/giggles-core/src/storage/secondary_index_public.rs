@@ -13,7 +13,7 @@ impl Admin {
     /// Returns the committed catalog epoch and secondary indexes from one snapshot,
     /// using the same committed snapshot semantics as [`Admin::catalog`].
     pub fn secondary_index_catalog(&self) -> Result<(u64, Vec<IndexInfo>), CoreError> {
-        self.inner.inspect(|s| {
+        self.inner.inspect_metadata(|s| {
             crate::cancellation::check()?;
             let mut indexes = s
                 .sql

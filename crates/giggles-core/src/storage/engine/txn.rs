@@ -257,7 +257,6 @@ impl Transaction {
     pub(crate) fn set_validation_config(&mut self, config: ValidationConfig) {
         self.validation_config = config;
     }
-    #[cfg(test)]
     pub(crate) fn current_snapshot_ts(&self) -> Option<Ts> {
         self.snapshot.as_ref().map(SnapshotHandle::ts)
     }

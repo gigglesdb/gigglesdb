@@ -215,6 +215,23 @@ impl Catalog {
         Ok(overlay_view(&view, txn.catalog_writes())?.parts())
     }
 
+    /// Metadata reads include this transaction's private DDL without changing its snapshot.
+    pub(crate) fn metadata_parts(&self, txn: &Transaction) -> Result<CatalogParts, CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let ts = txn
+            .current_snapshot_ts()
+            .unwrap_or_else(|| self.sequencer.visible_ts());
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        let view = match cache.view_at(ts) {
+            Some(view) => view,
+            None => Arc::new(load_view(self.sequencer.kv(), ts)?),
+        };
+        Ok(overlay_view(&view, txn.catalog_writes())?.parts())
+    }
+
     pub(crate) fn apply_diff(
         &self,
         txn: &mut Transaction,

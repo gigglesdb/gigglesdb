@@ -24,6 +24,10 @@ pinned digest when absent; image inspection always happens first. `--keep` retai
 and prints this run's Docker objects. `--strict` returns 1 on client FAIL/HARNESS_ERROR or differential
 UNSUPPORTED/DIVERGENT/HARNESS_ERROR; INTENTIONAL is excluded.
 Ordinary completed runs return 0 even with failures; infrastructure failures return 2.
+To run an `engine-rocksdb` server binary against a fresh v2 database, add
+`--server-arg=--engine --server-arg=v2`. Repeat `--server-arg` to pass other
+individual arguments to the server's development-mode command.
+
 With `--server-bin`, the optional commit is an operator label; without a label,
 reports mark the supplied binary unverified. Without `--server-bin`, `--commit`
 defaults to HEAD and the harness resolves it to a full SHA and builds the committed

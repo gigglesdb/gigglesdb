@@ -30,6 +30,13 @@ database is at `DIR/db`. Development mode disables TLS. The agent mTLS listener
 is available only through the `giggles-server CONFIG.json` configuration
 workflow below, which also supports TLS and scoped identities.
 
+To create a RocksDB v2 database, build from this crate with
+`cargo build --bin giggles-server --features engine-rocksdb`, then start
+`giggles-server --dev --data DIR --engine v2`. The default creation engine is
+`legacy`. `--engine` applies only to creation: opening an existing directory
+always detects its format. V2 supports SQL and catalog roles; native task
+operations, receipts, and export still return an unsupported-feature error.
+
 To reset the owner password offline, stop the server first, then run:
 
 ```powershell
