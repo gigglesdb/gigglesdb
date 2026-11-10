@@ -149,6 +149,20 @@ pub(crate) fn schema(tables: &[Table], bounds: Bounds) -> Result<()> {
         let mut names = BTreeSet::new();
         for c in &t.columns {
             identifier(&c.name)?;
+            // Core serializes these logical kinds as Text. The current archive
+            // cannot preserve their identity, even for empty/all-NULL tables.
+            if matches!(
+                c.data_type,
+                DataType::Uuid
+                    | DataType::Jsonb
+                    | DataType::IntArray
+                    | DataType::BigIntArray
+                    | DataType::TextArray
+            ) {
+                return Err(invalid(
+                    "logical type is unsupported by the archive profile",
+                ));
+            }
             // CREATE TABLE interprets this leading token as a table constraint.
             // Reject it during archive preflight, before creating a destination.
             if c.name == "primary" {
@@ -499,6 +513,11 @@ pub(crate) fn create_sql(t: &Table) -> String {
                     DataType::Numeric => "NUMERIC",
                     DataType::Real => "REAL",
                     DataType::DoublePrecision => "DOUBLE PRECISION",
+                    DataType::Uuid => "UUID",
+                    DataType::Jsonb => "JSONB",
+                    DataType::IntArray => "INTEGER[]",
+                    DataType::BigIntArray => "BIGINT[]",
+                    DataType::TextArray => "TEXT[]",
                 },
                 if c.not_null { " NOT NULL" } else { "" }
             )
@@ -513,4 +532,134 @@ pub(crate) fn create_sql(t: &Table) -> String {
             .join(",")
     ));
     format!("CREATE TABLE {} ({})", t.name, parts.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_types_create_sql_roundtrip_and_archive_refusal() {
+        let path = std::env::temp_dir().join(format!(
+            "giggles-export-logical-types-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let admin = Admin::create(&path, Limits::default()).unwrap();
+        for (kind, sql_type, text) in [
+            (
+                DataType::Uuid,
+                "UUID",
+                "550e8400-e29b-41d4-a716-446655440000",
+            ),
+            (DataType::Jsonb, "JSONB", r#"{"nested":[1,null,"snow"]}"#),
+            (DataType::IntArray, "INTEGER[]", "{1,NULL,-2}"),
+            (
+                DataType::BigIntArray,
+                "BIGINT[]",
+                "{-9223372036854775808,9223372036854775807}",
+            ),
+            (DataType::TextArray, "TEXT[]", r#"{"a,b","NULL",NULL,""}"#),
+        ] {
+            let table = Table {
+                name: "restored".into(),
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Integer,
+                        not_null: true,
+                    },
+                    Column {
+                        name: "v".into(),
+                        data_type: kind.clone(),
+                        not_null: false,
+                    },
+                ],
+                primary_key: vec![0],
+            };
+            let sql = create_sql(&table);
+            assert_eq!(
+                sql,
+                format!(
+                    "CREATE TABLE restored (id INTEGER NOT NULL,v {sql_type},PRIMARY KEY (id))"
+                )
+            );
+            let mut session = admin.sql_session();
+            session
+                .execute(
+                    &format!("CREATE TABLE original (id INTEGER PRIMARY KEY,v {sql_type})"),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            session.execute(&sql, &[], None).unwrap();
+            for (id, value) in [Value::Text(text.into()), Value::Null]
+                .into_iter()
+                .enumerate()
+            {
+                session
+                    .execute(
+                        "INSERT INTO original VALUES ($1,$2)",
+                        &[Value::Int(id as i64), value],
+                        None,
+                    )
+                    .unwrap();
+            }
+            let original = session
+                .execute("SELECT id,v FROM original ORDER BY id", &[], None)
+                .unwrap();
+            for row in &original.rows {
+                session
+                    .execute("INSERT INTO restored VALUES ($1,$2)", &row.values, None)
+                    .unwrap();
+            }
+            let restored = session
+                .execute("SELECT id,v FROM restored ORDER BY id", &[], None)
+                .unwrap();
+            assert_eq!(
+                original.rows.iter().map(|r| &r.values).collect::<Vec<_>>(),
+                restored.rows.iter().map(|r| &r.values).collect::<Vec<_>>()
+            );
+            assert!(
+                admin
+                    .catalog()
+                    .unwrap()
+                    .1
+                    .iter()
+                    .all(|t| t.columns[1].data_type == kind)
+            );
+            assert!(matches!(
+                capture(&admin, Bounds::default()),
+                Err(Error::Core(CoreError::Unsupported))
+            ));
+            let output = path.join("copy.jsonl");
+            assert!(matches!(
+                export(&admin, &output, Bounds::default()),
+                Err(Error::Core(CoreError::Unsupported))
+            ));
+            assert!(!output.exists());
+            // Preflight must also reject caller-built archives before serde can
+            // erase the type, including empty and all-NULL data.
+            for rows in [
+                vec![],
+                vec![vec![Cell::Int("1".into()), Cell::Null]],
+                vec![vec![Cell::Int("1".into()), Cell::Text(text.into())]],
+            ] {
+                let archive = Archive {
+                    tables: vec![table.clone()],
+                    rows: vec![rows],
+                };
+                assert!(
+                    matches!(encode(&archive, Bounds::default()), Err(Error::Invalid(message)) if message.contains("logical type is unsupported"))
+                );
+            }
+            session.execute("DROP TABLE original", &[], None).unwrap();
+            session.execute("DROP TABLE restored", &[], None).unwrap();
+        }
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }
