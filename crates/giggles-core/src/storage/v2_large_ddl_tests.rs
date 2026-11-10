@@ -287,8 +287,7 @@ fn orphan_crash_worker() {
 
 #[test]
 fn orphaned_chunks_are_invisible_after_rollback_and_mid_build_crash() {
-    // Reclamation needs snapshot/active-builder coordination beyond this patch.
-    // Orphans remain physically present but reserved IDs are never republished.
+    // Reopen reclaims orphan prefixes left by rollback or process death.
     for crash in [false, true] {
         let mut f = large_table(401, false, false);
         if crash {
@@ -323,7 +322,7 @@ fn orphaned_chunks_are_invisible_after_rollback_and_mid_build_crash() {
             )
             .unwrap()
             .next()
-            .is_some()
+            .is_none()
         );
         USED_INDEX_SCAN.set(false);
         assert_eq!(
@@ -362,4 +361,198 @@ fn legacy_sidecar_boundary_does_not_limit_v2_backfill() {
         let f = large_table(count, false, false);
         f.execute("CREATE INDEX boundary_idx ON t(v)");
     }
+}
+
+fn physical_count(f: &Fixture, ks: Keyspace) -> usize {
+    f.db()
+        .kv
+        .range(ks, Bound::Unbounded, Bound::Unbounded, Direction::Forward)
+        .unwrap()
+        .try_fold(0, |count, pair| pair.map(|_| count + 1))
+        .unwrap()
+}
+
+#[test]
+fn reclaim_large_drop_and_snapshot_horizon() {
+    let f = large_table(200_000, false, false);
+    let mut reader = f.db().begin(Isolation::RepeatableRead);
+    let entry = TableEntry {
+        def: f.db().catalog().parts(&mut reader).unwrap().tables["t"].clone(),
+        heap: false,
+        columns_ext: BTreeMap::new(),
+    };
+    assert!(
+        f.db()
+            .rows
+            .get(&mut reader, &entry, &[Int(199999)])
+            .unwrap()
+            .is_some()
+    );
+    f.execute("DROP TABLE t");
+    assert_eq!(f.admin().reclaim_storage().unwrap().tables, 0);
+    assert_eq!(physical_count(&f, Keyspace::Rows), 200_000);
+    assert!(
+        f.db()
+            .rows
+            .get(&mut reader, &entry, &[Int(199999)])
+            .unwrap()
+            .is_some()
+    );
+    drop(reader);
+    assert_eq!(f.admin().reclaim_storage().unwrap().tables, 1);
+    assert_eq!(physical_count(&f, Keyspace::Rows), 0);
+    assert_eq!(f.admin().reclaim_storage().unwrap().tables, 0);
+}
+
+#[test]
+fn reclaim_retains_concurrent_builder_until_outer_transaction_ends() {
+    let f = large_table(401, false, false);
+    let admin = f.admin().clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let first = std::cell::Cell::new(true);
+        AFTER_INDEX_CHUNK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                if first.replace(false) {
+                    ready_tx.send(()).unwrap();
+                    go_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                }
+            }))
+        });
+        let mut session = admin.sql_session();
+        session.execute("BEGIN", &[], None).unwrap();
+        session
+            .execute("CREATE INDEX concurrent_idx ON t(v)", &[], None)
+            .unwrap();
+        AFTER_INDEX_CHUNK.with_borrow_mut(|hook| *hook = None);
+        session
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(physical_count(&f, Keyspace::Index), 200);
+    assert_eq!(f.admin().reclaim_storage().unwrap().indexes, 0);
+    go_tx.send(()).unwrap();
+    let mut session = worker.join().unwrap();
+    // All chunks exist, but the descriptor is still transaction-local.
+    assert_eq!(physical_count(&f, Keyspace::Index), 401);
+    assert_eq!(f.admin().reclaim_storage().unwrap().indexes, 0);
+    session.execute("COMMIT", &[], None).unwrap();
+    assert_eq!(f.admin().reclaim_storage().unwrap().indexes, 0);
+    assert_eq!(physical_count(&f, Keyspace::Index), 401);
+    f.execute("DROP INDEX concurrent_idx");
+    assert_eq!(physical_count(&f, Keyspace::Index), 0);
+}
+
+#[test]
+fn reclaim_crash_worker() {
+    let Ok(path) = std::env::var("P1_GC_CRASH_PATH") else {
+        return;
+    };
+    let admin = Admin::open(path, Limits::default()).unwrap();
+    // Keep pre-DROP snapshots until both prefixes are durable retirement candidates.
+    let db = match &admin.inner.backend {
+        Backend::V2(db) => db,
+        _ => unreachable!(),
+    };
+    let snapshot = db.sequencer.snapshot();
+    admin
+        .sql_session()
+        .execute("DROP TABLE t", &[], None)
+        .unwrap();
+    drop(snapshot);
+    v2::reclaim::CRASH_AFTER_RECLAIM.set(true);
+    admin.reclaim_storage().unwrap();
+    panic!("reclaim crash did not fire");
+}
+
+#[test]
+fn reclaim_resumes_after_crash_between_prefixes() {
+    let mut f = large_table(401, false, false);
+    f.execute("CREATE INDEX crash_idx ON t(v)");
+    f.admin.take();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "storage::v2_sql::tests::large_ddl::reclaim_crash_worker",
+            "--nocapture",
+        ])
+        .env("P1_GC_CRASH_PATH", &f.path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(86), "{out:?}");
+    f.reopen();
+    assert_eq!(physical_count(&f, Keyspace::Rows), 0);
+    assert_eq!(physical_count(&f, Keyspace::Index), 0);
+    assert!(f.parts().tables.is_empty());
+    assert_eq!(
+        f.admin().reclaim_storage().unwrap(),
+        ReclaimStats::default()
+    );
+}
+
+#[test]
+fn reclaim_schema_cascade_and_type_column_drop() {
+    let f = Fixture::new();
+    f.execute("CREATE SCHEMA s");
+    f.execute("CREATE TABLE s.t(id bigint PRIMARY KEY, v bigint)");
+    f.execute("INSERT INTO s.t VALUES(1,2)");
+    f.execute("CREATE INDEX s_idx ON s.t(v)");
+    f.execute("DROP SCHEMA s CASCADE");
+    assert_eq!(physical_count(&f, Keyspace::Rows), 0);
+    assert_eq!(physical_count(&f, Keyspace::Index), 0);
+    f.execute("CREATE TYPE mood AS ENUM ('ok')");
+    f.execute("CREATE TABLE t(id bigint PRIMARY KEY, m mood)");
+    f.execute("INSERT INTO t VALUES(1,'ok')");
+    f.execute("DROP TYPE mood CASCADE");
+    assert_eq!(
+        f.admin()
+            .sql_session()
+            .execute("SELECT * FROM t", &[], None)
+            .unwrap()
+            .rows[0]
+            .values,
+        vec![Int(1)]
+    );
+    assert_eq!(
+        f.admin().reclaim_storage().unwrap(),
+        ReclaimStats::default()
+    );
+}
+
+#[test]
+fn reclaim_is_best_effort_and_dml_skips_it() {
+    use v2::reclaim::{RECLAIM_ERROR, RECLAIM_PASSES};
+    let mut f = large_table(1, false, false);
+    let passes = RECLAIM_PASSES.get();
+    f.execute("INSERT INTO t VALUES(2,2)");
+    let mut session = f.admin().sql_session();
+    session.execute("BEGIN", &[], None).unwrap();
+    session
+        .execute("UPDATE t SET v=3 WHERE id=2", &[], None)
+        .unwrap();
+    session
+        .execute("DELETE FROM t WHERE id=2", &[], None)
+        .unwrap();
+    session.execute("COMMIT", &[], None).unwrap();
+    drop(session);
+    assert_eq!(RECLAIM_PASSES.get(), passes);
+    RECLAIM_ERROR.set(Some(CoreError::Storage("transient GC failure".into())));
+    f.execute("DROP TABLE t");
+    assert!(physical_count(&f, Keyspace::Rows) > 0);
+    assert_eq!(f.db().reclaim_errors.load(Ordering::Relaxed), 1);
+    RECLAIM_ERROR.set(Some(CoreError::Storage("transient open GC failure".into())));
+    f.reopen();
+    assert_eq!(f.db().reclaim_errors.load(Ordering::Relaxed), 1);
+    f.reopen();
+    assert_eq!(physical_count(&f, Keyspace::Rows), 0);
+    f.admin.take();
+    RECLAIM_ERROR.set(Some(CoreError::Corrupt("corrupt GC prefix".into())));
+    assert!(matches!(
+        Admin::open(&f.path, Limits::default()),
+        Err(CoreError::Corrupt(_))
+    ));
 }

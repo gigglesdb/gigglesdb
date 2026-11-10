@@ -671,7 +671,7 @@ fn dml_versions_rekey_reopen_and_mvcc_visibility() {
         vec![vec![Int(3), Int(20)]]
     );
     f.execute("DROP TABLE t");
-    // DROP unpublishes the table atomically; old rows await snapshot-safe GC.
+    // DROP unpublishes and reclaims rows once no older snapshot remains.
     let mut txn = f.db().begin(Isolation::ReadCommitted);
     assert!(
         txn.scan(
@@ -683,7 +683,7 @@ fn dml_versions_rekey_reopen_and_mvcc_visibility() {
         )
         .unwrap()
         .next()
-        .is_some()
+        .is_none()
     );
     drop(txn);
     f.reopen();

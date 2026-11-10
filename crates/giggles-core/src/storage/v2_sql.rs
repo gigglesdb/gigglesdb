@@ -369,8 +369,7 @@ impl SqlSession {
                         let old = db.catalog().parts(txn)?;
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
-                            db.catalog()
-                                .reserve_ids(3 * relational::MAX_COLUMNS as u64 + 64)?
+                            db.reserve_sql_ids(txn, 3 * relational::MAX_COLUMNS as u64 + 64)?
                         } else {
                             // DML/reads allocate no catalog objects. Derive only the
                             // validation ceiling, without a durable ID reservation.
@@ -472,6 +471,13 @@ impl SqlSession {
                             ext,
                             indexes,
                         };
+                        txn.reclaim_after_commit |=
+                            old.tables
+                                .values()
+                                .any(|table| !new.tables.values().any(|next| next.id == table.id))
+                                || old.indexes.iter().any(|index| {
+                                    !new.indexes.iter().any(|next| next.id == index.id)
+                                });
                         db.catalog().apply_diff(txn, &old, &new, &ids, None, &|| {
                             crate::cancellation::check().is_err()
                         })?;
@@ -520,9 +526,14 @@ fn commit_sql(db: &v2::V2Db, txn: Transaction, point: CrashPoint) -> Result<(), 
     if point == CrashPoint::ErrorBeforeCommit {
         return Err(CoreError::Storage("injected before commit".into()));
     }
+    let reclaim = txn.reclaim_after_commit;
     db.catalog().commit_ddl(txn).map_err(CoreError::from)?;
     if point == CrashPoint::AfterCommit {
         crash_now();
+    }
+    if reclaim {
+        // Durable publication must retain its successful acknowledgement.
+        let _ = db.reclaim_background();
     }
     Ok(())
 }
@@ -746,6 +757,12 @@ impl RowSink for SqlRows<'_> {
                 chunk.put(Keyspace::Index, key, pk)?;
             }
             chunk.commit()?;
+            #[cfg(test)]
+            AFTER_INDEX_CHUNK.with_borrow(|hook| {
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
             #[cfg(test)]
             if CRASH_AFTER_INDEX_CHUNK.replace(false) {
                 crash_now();
@@ -1042,6 +1059,7 @@ type TableScanHook = Box<dyn FnMut(&str)>;
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_INDEX_CHUNK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CRASH_AFTER_INDEX_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
     static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

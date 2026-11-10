@@ -951,6 +951,8 @@ pub struct Executor {
     inner: Arc<Inner>,
     credential: Credential,
 }
+pub use v2::reclaim::ReclaimStats;
+
 impl Admin {
     /// One-time trusted provisioning. A task's counters and caps cannot be reset.
     /// Missing provisioning (including legacy formats) denies remote disclosure.

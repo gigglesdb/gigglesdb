@@ -140,6 +140,7 @@ pub(crate) struct Transaction {
     snapshot: Option<SnapshotHandle>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
     features_or: u64,
+    pub(crate) reclaim_after_commit: bool,
     raw: Vec<RawOp>,
     write_bytes: usize,
     savepoint_owner: Arc<()>,
@@ -166,6 +167,7 @@ impl Transaction {
             snapshot: None,
             writes: BTreeMap::new(),
             features_or: 0,
+            reclaim_after_commit: false,
             raw: Vec::new(),
             write_bytes: 0,
             savepoint_owner: Arc::new(()),
@@ -181,6 +183,9 @@ impl Transaction {
             txn.begin_statement();
         }
         txn
+    }
+    pub(crate) fn lifetime(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.savepoint_owner)
     }
     /// Marks buffered writes; undo records, keys, and prior values count against
     /// the write-set limit while a savepoint remains live.

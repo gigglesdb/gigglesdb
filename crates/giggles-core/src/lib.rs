@@ -10,7 +10,7 @@ mod storage;
 pub use storage::replica;
 pub use storage::roles;
 pub use storage::{
-    Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits,
+    Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, ReclaimStats,
     RecoveryPoint, UpgradePoint, UpgradeReport,
 };
 pub use storage::{Cursor, SqlSession};

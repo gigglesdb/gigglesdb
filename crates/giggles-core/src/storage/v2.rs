@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, path::Path};
 
+#[path = "reclaim.rs"]
+pub(super) mod reclaim;
+
 #[allow(dead_code)]
 pub(crate) struct V2Db {
     pub(crate) kv: Arc<engine::kv::Kv>,
@@ -17,6 +20,8 @@ pub(crate) struct V2Db {
     pub(crate) sequences: Arc<engine::seq::SequenceAllocator>,
     pub(crate) sql_counters:
         std::sync::Mutex<std::collections::BTreeMap<u64, super::sequences::SeqCounter>>,
+    reclaim: std::sync::Mutex<reclaim::Registry>,
+    pub(super) reclaim_errors: AtomicU64,
     next_txn: AtomicU64,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
@@ -81,7 +86,7 @@ impl V2Db {
         let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
         let catalog =
             engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
-        Ok(Self {
+        let db = Self {
             kv,
             meta,
             sequencer,
@@ -90,8 +95,12 @@ impl V2Db {
             rows: engine::rows::RowStore::new(sequences.clone()),
             sequences,
             sql_counters: Default::default(),
+            reclaim: Default::default(),
+            reclaim_errors: AtomicU64::new(0),
             next_txn: AtomicU64::new(1),
-        })
+        };
+        db.reclaim_background()?;
+        Ok(db)
     }
 
     // F8a-3b routes v2 SQL sessions through this.
