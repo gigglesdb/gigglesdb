@@ -24,7 +24,6 @@ fn fixture() -> Relational {
 }
 
 fn plain_fixture() -> Relational {
-    // No CHECK/FK: v2 images refuse those until enforcement exists (E1 release).
     let mut state = Relational::default();
     run(
         &mut state,
@@ -116,19 +115,19 @@ fn v2_statement_classes_and_reachable_refusals() {
         ("CREATE TABLE t (id BIGINT PRIMARY KEY)", Ddl),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT CHECK (n > 0))",
-            Refused("SQL statement"),
+            Ddl,
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT, CHECK (n > 0))",
-            Refused("SQL statement"),
+            Ddl,
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, p BIGINT REFERENCES q(id))",
-            Refused("SQL statement"),
+            Ddl,
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, p BIGINT, FOREIGN KEY (p) REFERENCES q(id))",
-            Refused("SQL statement"),
+            Ddl,
         ),
         ("DROP TABLE t", Ddl),
         ("CREATE SEQUENCE s", Ddl),
@@ -156,17 +155,11 @@ fn v2_statement_classes_and_reachable_refusals() {
         ("ALTER TABLE t DROP COLUMN n", Ddl),
         ("ALTER TABLE t ALTER COLUMN n SET NOT NULL", Ddl),
         ("ALTER TABLE t ADD PRIMARY KEY (n)", Ddl),
-        ("ALTER TABLE t ADD CHECK (n > 0)", Refused("SQL statement")),
-        (
-            "ALTER TABLE t ADD FOREIGN KEY (n) REFERENCES u(id)",
-            Refused("SQL statement"),
-        ),
-        (
-            "ALTER TABLE t VALIDATE CONSTRAINT c",
-            Refused("SQL statement"),
-        ),
-        ("ALTER TABLE t DROP CONSTRAINT c", Refused("SQL statement")),
-        ("SET CONSTRAINTS ALL DEFERRED", Refused("SQL statement")),
+        ("ALTER TABLE t ADD CHECK (n > 0)", Ddl),
+        ("ALTER TABLE t ADD FOREIGN KEY (n) REFERENCES u(id)", Ddl),
+        ("ALTER TABLE t VALIDATE CONSTRAINT c", Ddl),
+        ("ALTER TABLE t DROP CONSTRAINT c", Ddl),
+        ("SET CONSTRAINTS ALL DEFERRED", Dml),
         ("SAVEPOINT s", Control("savepoint")),
         ("RELEASE SAVEPOINT s", Control("release")),
         ("ROLLBACK TO SAVEPOINT s", Control("rollback_to")),
@@ -202,8 +195,7 @@ fn v2_statement_classes_and_reachable_refusals() {
 }
 
 #[test]
-fn catalog_image_refuses_unenforced_check_and_foreign_key() {
-    // Valid catalogs (validate() passes) that carry CHECK or FK fail closed on v2.
+fn catalog_image_preserves_enforced_check_and_foreign_key() {
     for sql in [
         "CREATE TABLE c (id BIGINT PRIMARY KEY, n BIGINT CHECK (n > 0))",
         "CREATE TABLE f (id BIGINT PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
@@ -212,9 +204,11 @@ fn catalog_image_refuses_unenforced_check_and_foreign_key() {
         run(&mut state, sql);
         state.validate().unwrap();
         let (tables, ext, next_id, next_version) = state.catalog_parts();
+        let image =
+            Relational::catalog_image(tables.clone(), ext.clone(), next_id, next_version).unwrap();
         assert_eq!(
-            Relational::catalog_image(tables, ext, next_id, next_version).unwrap_err(),
-            SqlError::Unsupported,
+            image.catalog_parts(),
+            (tables, ext, next_id, next_version),
             "{sql}"
         );
     }

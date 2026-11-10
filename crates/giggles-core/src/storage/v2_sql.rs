@@ -156,12 +156,16 @@ impl SqlSession {
                                 if self.v2_savepoints.len() >= 64 {
                                     return Err(CoreError::Sql(E::Limit));
                                 }
-                                self.v2_savepoints.push((name.to_owned(), txn.savepoint()));
+                                self.v2_savepoints.push((
+                                    name.to_owned(),
+                                    txn.savepoint(),
+                                    self.deferral.clone(),
+                                ));
                             } else {
                                 let index = self
                                     .v2_savepoints
                                     .iter()
-                                    .rposition(|(saved, _)| saved == name)
+                                    .rposition(|(saved, _, _)| saved == name)
                                     .ok_or(CoreError::Sql(E::InvalidSavepoint))?;
                                 let mark = self.v2_savepoints[index].1.clone();
                                 if control == "release" {
@@ -169,6 +173,7 @@ impl SqlSession {
                                     self.v2_savepoints.truncate(index);
                                 } else {
                                     txn.rollback_to(&mark)?;
+                                    self.deferral = self.v2_savepoints[index].2.clone();
                                     self.v2_savepoints.truncate(index + 1);
                                     self.aborted = false;
                                 }
@@ -184,6 +189,12 @@ impl SqlSession {
                                 .ok_or(CoreError::Sql(E::Transaction))?;
                             inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
                             let mut txn = txn;
+                            let validation = validate_pending(db, &mut txn, &mut self.deferral);
+                            if validation.is_err() {
+                                drop(live);
+                                self.rollback();
+                                return validation.map(|()| Default::default());
+                            }
                             let committed =
                                 sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
                                     .and_then(|()| {
@@ -229,6 +240,40 @@ impl SqlSession {
                     txn.begin_statement();
                     let mark = txn.savepoint();
                     let result = (|| {
+                        // Table zero is an in-memory SQL sentinel, never a stored object.
+                        // Plain DML shares it; FK mutations and DDL exclude every SQL writer.
+                        // Recheck after waiting in case a concurrent DDL introduced an FK.
+                        if writing {
+                            let has_fk = |parts: &CatalogParts| {
+                                parts.ext.constraints.values().flatten().any(|c| {
+                                    matches!(
+                                        c.kind,
+                                        relational::catalog_ext::ConstraintKind::ForeignKey { .. }
+                                    )
+                                })
+                            };
+                            let exclusive = ddl || has_fk(&db.catalog().parts(txn)?);
+                            txn.acquire_lock(
+                                engine::locks::LockKey::Table(0),
+                                if exclusive {
+                                    LockMode::AccessExclusive
+                                } else {
+                                    LockMode::RowExclusive
+                                },
+                                None,
+                                &|| crate::cancellation::check().is_err(),
+                            )?;
+                            txn.begin_statement();
+                            if !exclusive && has_fk(&db.catalog().parts(txn)?) {
+                                txn.acquire_lock(
+                                    engine::locks::LockKey::Table(0),
+                                    LockMode::AccessExclusive,
+                                    None,
+                                    &|| crate::cancellation::check().is_err(),
+                                )?;
+                                txn.begin_statement();
+                            }
+                        }
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
                         let parts = db.catalog().parts(txn)?;
@@ -372,6 +417,11 @@ impl SqlSession {
                                 params,
                             },
                             versions.end,
+                            if self.transaction_id.is_some() {
+                                Some(&mut self.deferral)
+                            } else {
+                                None
+                            },
                         );
                         if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
                             return Err(error);
@@ -438,6 +488,47 @@ impl SqlSession {
     }
 }
 
+fn validate_pending(
+    db: &v2::V2Db,
+    txn: &mut Transaction,
+    deferred: &mut relational::DeferralState,
+) -> Result<(), CoreError> {
+    if deferred.pending.is_empty() {
+        return Ok(());
+    }
+    let parts = db.catalog().parts(txn)?;
+    let mut image = relational::Relational::catalog_image(
+        parts.tables.clone(),
+        parts.ext.clone(),
+        u64::MAX,
+        u64::MAX,
+    )
+    .map_err(CoreError::Sql)?;
+    let p = relational::Prepared::parse(
+        "SET CONSTRAINTS ALL IMMEDIATE",
+        u128::from_be_bytes(db.meta.domain),
+        0,
+    )
+    .map_err(CoreError::Sql)?;
+    image.execute_with_sink(
+        &p,
+        &[],
+        None,
+        None,
+        &mut SqlRows {
+            db,
+            txn,
+            parts: &parts,
+            writing: true,
+            prepared: &p,
+            params: &[],
+        },
+        u64::MAX,
+        Some(deferred),
+    )?;
+    Ok(())
+}
+
 /// DD-0068 X3: validate the post-statement image before `apply_diff` can write
 /// catalog changes. Unsupported features and invalid images must fail while the
 /// statement can still roll back without publishing an unenforced catalog.
@@ -472,6 +563,82 @@ struct SqlRows<'a> {
     params: &'a [relational::Value],
 }
 impl RowSink for SqlRows<'_> {
+    fn lookup(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: Option<&[relational::Value]>,
+        unique: bool,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        let entry = TableEntry {
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let Some(values) = values else {
+            return self.scan_all(&entry, visit);
+        };
+        let primary = table
+            .primary_key
+            .iter()
+            .map(|i| table.columns[*i].id)
+            .collect::<Vec<_>>();
+        let order = |ids: &[u64]| {
+            ids.iter()
+                .map(|id| columns.iter().position(|c| c == id))
+                .collect::<Option<Vec<_>>>()
+        };
+        let rows = if primary.len() == columns.len()
+            && let Some(order) = order(&primary)
+        {
+            self.db
+                .rows
+                .get(
+                    self.txn,
+                    &entry,
+                    &order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else if let Some((d, order)) = self
+            .parts
+            .indexes
+            .iter()
+            .filter(|d| {
+                d.table == table.id
+                    && d.columns.len() >= columns.len()
+                    && (!unique || d.unique && d.columns.len() == columns.len())
+            })
+            .find_map(|d| order(&d.columns[..columns.len()]).map(|order| (d, order)))
+        {
+            let values = order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
+            let tuple =
+                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
+            engine::indexes::scan(
+                self.txn,
+                &entry,
+                d,
+                Bound::Included(tuple.clone()),
+                Bound::Included(tuple),
+            )?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect()
+        } else if unique {
+            return Err(CoreError::Sql(SqlError::InvalidForeignKey));
+        } else {
+            return self.scan_all(&entry, visit);
+        };
+        for row in rows {
+            visit(SqlRow {
+                values: row.values,
+                version: row.version,
+            })
+            .map_err(CoreError::Sql)?;
+        }
+        Ok(())
+    }
     fn indexes(&self) -> Vec<relational::secondary_index::Descriptor> {
         self.parts.indexes.clone()
     }

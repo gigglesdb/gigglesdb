@@ -517,8 +517,32 @@ pub(super) fn enforce(
     cancel: &mut impl FnMut() -> bool,
     clock: Option<&clock::ExecutionClock>,
 ) -> R<()> {
+    enforce_with_rows(
+        state,
+        std::borrow::Cow::Borrowed(before),
+        captured,
+        deferred,
+        cancel,
+        clock,
+        None,
+    )
+    .map(|_| ())
+}
+type LoadRows<'a> = dyn FnMut(&mut Relational, &mut Relational) -> R<()> + 'a;
+pub(super) fn enforce_with_rows<'a>(
+    state: &mut Relational,
+    mut before: std::borrow::Cow<'a, Relational>,
+    captured: Vec<Event>,
+    deferred: &mut DeferralState,
+    cancel: &mut impl FnMut() -> bool,
+    clock: Option<&clock::ExecutionClock>,
+    mut load: Option<&mut LoadRows<'_>>,
+) -> R<std::borrow::Cow<'a, Relational>> {
     if state.ext.constraints.is_empty() {
-        return Ok(());
+        return Ok(before);
+    }
+    if let Some(load) = load.as_mut() {
+        load(state, before.to_mut())?;
     }
     let mut touched_old = captured
         .iter()
@@ -565,6 +589,9 @@ pub(super) fn enforce(
     let mut affected = 0usize;
     let mut parent_checks: BTreeMap<(u64, u64), BTreeSet<Vec<u8>>> = BTreeMap::new();
     while let Some(event) = events.pop_front() {
+        if let Some(load) = load.as_mut() {
+            load(state, before.to_mut())?;
+        }
         if cancel() {
             return Err(SqlError::Aborted);
         }
@@ -745,6 +772,9 @@ pub(super) fn enforce(
             }
         }
     }
+    if let Some(load) = load.as_mut() {
+        load(state, before.to_mut())?;
+    }
     for (table_id, cs) in &state.ext.constraints {
         let table = table_by_id(state, *table_id)?;
         let rows = state.rows.get(table_id).ok_or(SqlError::Type)?;
@@ -802,7 +832,7 @@ pub(super) fn enforce(
             }
         }
     }
-    Ok(())
+    Ok(before)
 }
 impl Relational {
     pub(crate) fn check_insert_candidate(&self, table: &TableDef, values: &[Value]) -> R<()> {

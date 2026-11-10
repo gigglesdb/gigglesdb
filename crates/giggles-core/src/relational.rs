@@ -443,16 +443,6 @@ impl Relational {
             ..Self::default()
         };
         image.validate()?;
-        // v2 does not enforce CHECK/FOREIGN KEY yet: fail closed on any catalog
-        // that carries them, so later DML can never run unenforced.
-        for constraint in image.ext.constraints.values().flatten() {
-            match constraint.kind {
-                ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. } => {
-                    return Err(SqlError::Unsupported);
-                }
-                ConstraintKind::PrimaryKey => {}
-            }
-        }
         Ok(image)
     }
     pub(crate) fn catalog_indexes(&mut self, descriptors: &[secondary_index::Descriptor]) -> R<()> {
@@ -1558,22 +1548,11 @@ impl Prepared {
             | Statement::Delete { .. } => V2Class::Dml,
             Statement::Schema(_) | Statement::TypeDdl(_) => V2Class::Ddl,
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
-            Statement::Create { constraints, .. } => {
-                if constraints.iter().any(|constraint| {
-                    matches!(
-                        constraint,
-                        constraints::Definition::Check { .. }
-                            | constraints::Definition::ForeignKey { .. }
-                    )
-                }) {
-                    V2Class::Refused("SQL statement")
-                } else {
-                    V2Class::Ddl
-                }
-            }
+            Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
-                let mut refusal = None;
+                // v2 supports every ALTER action. The exhaustive match makes any
+                // newly added action fail to compile until it is classified here.
                 for action in &alter.actions {
                     match action {
                         alter_table::Action::RenameColumn(..)
@@ -1588,20 +1567,17 @@ impl Prepared {
                             ..
                         })
                         | alter_table::Action::PrimaryKey(..) => (),
-                        // These constraint operations need v2 enforcement/validation support.
                         alter_table::Action::Constraint(
                             constraints::Definition::Check { .. }
                             | constraints::Definition::ForeignKey { .. },
                         )
                         | alter_table::Action::Validate(_)
-                        | alter_table::Action::DropConstraint(..) => {
-                            refusal.get_or_insert("SQL statement");
-                        }
+                        | alter_table::Action::DropConstraint(..) => (),
                     }
                 }
-                refusal.map_or(V2Class::Ddl, V2Class::Refused)
+                V2Class::Ddl
             }
-            Statement::SetConstraints(..) => V2Class::Refused("SQL statement"),
+            Statement::SetConstraints(..) => V2Class::Dml,
         }
     }
 

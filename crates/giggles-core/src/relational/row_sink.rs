@@ -14,6 +14,18 @@ pub(crate) trait RowSink {
         visit: &mut dyn FnMut(SqlRow) -> R<()>,
     ) -> Result<(), CoreError>;
 
+    /// Exact constraint key; None requests the bounded typed-comparison fallback.
+    fn lookup(
+        &mut self,
+        table: &TableDef,
+        _columns: &[u64],
+        _values: Option<&[Value]>,
+        _unique: bool,
+        visit: &mut dyn FnMut(SqlRow) -> R<()>,
+    ) -> Result<(), CoreError> {
+        self.scan(table, visit)
+    }
+
     fn indexes(&self) -> Vec<secondary_index::Descriptor> {
         Vec::new()
     }
@@ -37,6 +49,10 @@ pub(crate) trait RowSink {
 }
 
 impl Relational {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "statement inputs plus transaction-local deferral"
+    )]
     pub(crate) fn execute_with_sink(
         &mut self,
         prepared: &Prepared,
@@ -45,6 +61,7 @@ impl Relational {
         clock: Option<&clock::ExecutionClock>,
         sink: &mut impl RowSink,
         version_end: u64,
+        deferred: Option<&mut DeferralState>,
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
@@ -59,11 +76,23 @@ impl Relational {
                     .cloned()
             })
             .flatten();
-        let mut names = prepared.read_tables();
+        let mut names = if matches!(prepared.v2_class(), V2Class::Ddl) {
+            Vec::new()
+        } else {
+            prepared.read_tables()
+        };
         if let Some(table) = &table
             && !names.contains(&self.table_key(table))
         {
             names.push(self.table_key(table));
+        }
+        for (_, table_id) in deferred.as_ref().into_iter().flat_map(|d| d.pending.keys()) {
+            if let Some(table) = self.tables.values().find(|t| t.id == *table_id) {
+                let name = self.table_key(table);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
         }
         // One budget across ALL scanned relations, including nested subqueries.
         // The target preimage and legacy execution retain A1's separate bounds.
@@ -102,42 +131,159 @@ impl Relational {
                 crate::cancellation::check().is_err()
             })
             .map_err(CoreError::Sql)?;
-        let before = table.as_ref().map(|table| self.rows[&table.id].clone());
-        let result = self
-            .execute_clocked(
-                prepared,
-                params,
-                expected,
-                || crate::cancellation::check().is_err(),
-                clock,
-            )
+        let writing = !matches!(prepared.v2_class(), V2Class::Read);
+        let mut before = self.clone();
+        let mut edges = self.ext.constraints.clone();
+        // Resolve a new ALTER FK before its existing-row validation executes.
+        if let Statement::AlterTable(alter) = &prepared.statement {
+            let mut empty = self.clone();
+            empty.rows.values_mut().for_each(BTreeMap::clear);
+            empty.secondary = empty
+                .secondary_build_complete_engine(&sink.indexes(), || {
+                    crate::cancellation::check().is_err()
+                })
+                .map_err(CoreError::Sql)?;
+            for action in &alter.actions {
+                if let alter_table::Action::Constraint(
+                    definition @ constraints::Definition::ForeignKey { .. },
+                ) = action
+                    && let Some(table) = empty.tables.get(&alter.table).cloned()
+                {
+                    constraints::install(&mut empty, &table, definition, &mut || {
+                        crate::cancellation::check().is_err()
+                    })
+                    .map_err(CoreError::Sql)?;
+                    edges = empty.ext.constraints.clone();
+                }
+            }
+        }
+        if writing {
+            while hydrate(
+                &self.clone(),
+                &edges,
+                &mut before,
+                self,
+                sink,
+                &mut retention,
+            )? > 0
+            {}
+        }
+        rebuild(&mut before, &sink.indexes())?;
+        rebuild(self, &sink.indexes())?;
+        let mut pending = deferred.as_deref().cloned().unwrap_or_default();
+        let result = if let Some((names, mode)) = prepared.set_constraints() {
+            if deferred.is_none() {
+                return Err(CoreError::Sql(SqlError::NoActiveTransaction));
+            }
+            if !params.is_empty() || expected.is_some() {
+                return Err(CoreError::Sql(SqlError::Parameters));
+            }
+            self.set_constraints(&mut pending, names, mode, || {
+                crate::cancellation::check().is_err()
+            })
             .map_err(CoreError::Sql)?;
+            SqlResult::default()
+        } else {
+            let mut events = Vec::new();
+            let result = self
+                .execute_statement_inner(
+                    prepared,
+                    params,
+                    expected,
+                    || crate::cancellation::check().is_err(),
+                    clock,
+                    None,
+                    &mut events,
+                )
+                .map_err(CoreError::Sql)?;
+            if writing {
+                let descriptors = self.secondary_descriptors_engine().to_vec();
+                let mut source_error = None;
+                let enforced = constraints::enforce_with_rows(
+                    self,
+                    std::borrow::Cow::Owned(before),
+                    events,
+                    &mut pending,
+                    &mut || crate::cancellation::check().is_err(),
+                    clock,
+                    Some(&mut |state, old| {
+                        let result = (|| {
+                            loop {
+                                let seeds = state.clone();
+                                if hydrate(
+                                    &seeds,
+                                    &seeds.ext.constraints,
+                                    old,
+                                    state,
+                                    sink,
+                                    &mut retention,
+                                )? == 0
+                                {
+                                    break;
+                                }
+                                rebuild(old, &sink.indexes())?;
+                                rebuild(state, &descriptors)?;
+                            }
+                            Ok(())
+                        })();
+                        result.map_err(|error| {
+                            source_error = Some(error);
+                            SqlError::Aborted
+                        })
+                    }),
+                );
+                if let Some(error) = source_error {
+                    return Err(error);
+                }
+                before = enforced.map_err(CoreError::Sql)?.into_owned();
+                if deferred.is_none() {
+                    self.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
+                        .map_err(CoreError::Sql)?;
+                }
+            }
+            result
+        };
         if self.next_version > version_end {
             return Err(CoreError::Corrupt(
                 "v2 SQL exceeded row-version reservation".into(),
             ));
         }
-        if let (Some(table), Some(before)) = (&table, &before) {
-            let empty = BTreeMap::new();
-            let after = self.rows.get(&table.id).unwrap_or(&empty);
-            let after_table = self.tables.values().find(|t| t.id == table.id);
-            sink.apply_indexes(
-                table,
-                after_table,
-                before,
-                after,
-                self.secondary_descriptors_engine(),
-            )?;
-            // Index hook owns re-keyed rows, whose column layout differs.
-            if after_table.is_none_or(|new| {
-                new.primary_key == table.primary_key && new.columns.len() == table.columns.len()
-            }) {
-                sink.apply(table, before, after)?;
+        if writing {
+            for table in before.tables.values() {
+                let old = &before.rows[&table.id];
+                let empty = BTreeMap::new();
+                let after = self.rows.get(&table.id).unwrap_or(&empty);
+                let after_table = self.tables.values().find(|t| t.id == table.id);
+                if old == after
+                    && after_table == Some(table)
+                    && before.secondary_descriptors_engine() == self.secondary_descriptors_engine()
+                {
+                    continue;
+                }
+                sink.apply_indexes(
+                    table,
+                    after_table,
+                    old,
+                    after,
+                    self.secondary_descriptors_engine(),
+                )?;
+                if after_table.is_none_or(|new| {
+                    new.primary_key == table.primary_key && new.columns.len() == table.columns.len()
+                }) {
+                    sink.apply(table, old, after)?;
+                }
             }
+        }
+        if let Some(deferred) = deferred {
+            *deferred = pending;
         }
         Ok(result)
     }
 }
+
+#[path = "row_sink_constraints.rs"]
+mod constraint_rows;
+use constraint_rows::{hydrate, rebuild};
 
 #[cfg(test)]
 mod tests {
@@ -188,7 +334,7 @@ mod tests {
         let p = Prepared::parse("SELECT a.id,b.id FROM a JOIN b ON true", 1, image.epoch).unwrap();
         let mut sink = WideSources { scans: Vec::new() };
         assert_eq!(
-            image.execute_with_sink(&p, &[], None, None, &mut sink, u64::MAX),
+            image.execute_with_sink(&p, &[], None, None, &mut sink, u64::MAX, None),
             Err(CoreError::Sql(SqlError::Limit))
         );
         assert_eq!(sink.scans[0], ("a".into(), 600));

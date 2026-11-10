@@ -280,14 +280,7 @@ fn invalid_stored_constraint_fails_image_validation_without_catalog_writes() {
 }
 
 #[test]
-fn check_constraint_is_refused_without_catalog_changes() {
-    let f = Fixture::new();
-    f.execute("CREATE TABLE q (id bigint PRIMARY KEY, n bigint)");
-    // The classifier refuses these statements before the post-image gate is
-    // reachable. Direct check_post_image tests below exercise that gate; this
-    // SQL witness proves the earlier refusal leaves catalog bytes untouched.
-    // Every DDL form that would create an unenforced CHECK or FOREIGN KEY is
-    // refused with 0A000 and leaves the catalog byte-identical (DD-0068 X3 #2).
+fn check_and_foreign_key_ddl_persist() {
     for sql in [
         "CREATE TABLE t (id bigint PRIMARY KEY, n bigint CHECK (n > 0))",
         "CREATE TABLE t (id bigint PRIMARY KEY, n bigint, CHECK (n > 0))",
@@ -296,20 +289,20 @@ fn check_constraint_is_refused_without_catalog_changes() {
         "ALTER TABLE q ADD CHECK (n > 0)",
         "ALTER TABLE q ADD CONSTRAINT q_n_fkey FOREIGN KEY (n) REFERENCES q(id)",
     ] {
-        let before = f.parts();
-        let bytes = f.catalog_bytes();
+        let mut f = Fixture::new();
+        f.execute("CREATE TABLE q (id bigint PRIMARY KEY, n bigint)");
+        f.execute(sql);
+        let parts = f.parts();
         assert!(
-            matches!(
-                f.admin().sql_session().execute(sql, &[], None),
-                Err(CoreError::EngineUnsupported {
-                    engine: "v2",
-                    feature: "SQL statement"
-                })
-            ),
+            parts.ext.constraints.values().flatten().any(|c| matches!(
+                c.kind,
+                relational::catalog_ext::ConstraintKind::Check { .. }
+                    | relational::catalog_ext::ConstraintKind::ForeignKey { .. }
+            )),
             "{sql}"
         );
-        assert_eq!(f.parts(), before, "{sql}");
-        assert_eq!(f.catalog_bytes(), bytes, "{sql}");
+        f.reopen();
+        assert_eq!(f.parts(), parts, "{sql}");
     }
 }
 
@@ -351,16 +344,10 @@ fn post_image_invalid_constraint_is_corrupt() {
 }
 
 #[test]
-fn post_image_check_is_unsupported() {
+fn post_image_check_is_valid() {
     let (tables, ext, next_id, _) =
         created_catalog("CREATE TABLE t (id bigint PRIMARY KEY, n bigint CHECK (n > 0))");
-    assert!(matches!(
-        check_post_image(&tables, &ext, next_id),
-        Err(CoreError::EngineUnsupported {
-            engine: "v2",
-            feature: "SQL statement"
-        })
-    ));
+    check_post_image(&tables, &ext, next_id).unwrap();
 }
 
 #[test]
@@ -1456,3 +1443,6 @@ mod index_tests;
 
 #[path = "v2_sql_alter_tests.rs"]
 mod alter_tests;
+
+#[path = "v2_sql_constraint_tests.rs"]
+mod constraint_tests;

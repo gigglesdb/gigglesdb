@@ -1749,7 +1749,7 @@ pub struct SqlSession {
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
     savepoints: Vec<SqlSavepoint>,
-    v2_savepoints: Vec<(String, engine::txn::Savepoint)>,
+    v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState)>,
     savepoint_budget: u64,
     aborted: bool,
     transaction_id: Option<u128>,
