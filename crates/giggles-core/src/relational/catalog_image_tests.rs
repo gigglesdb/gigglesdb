@@ -144,10 +144,7 @@ fn v2_statement_classes_and_reachable_refusals() {
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n character varying(5))",
             Ddl,
         ),
-        (
-            "ALTER TABLE t ADD COLUMN n varchar(10)",
-            Refused("ALTER TABLE row rewrite"),
-        ),
+        ("ALTER TABLE t ADD COLUMN n varchar(10)", Ddl),
         ("CREATE INDEX i ON t (n)", Ddl),
         ("INSERT INTO t SELECT id, n FROM t", Dml),
         (
@@ -155,18 +152,9 @@ fn v2_statement_classes_and_reachable_refusals() {
             Ddl,
         ),
         ("ALTER TABLE t ADD UNIQUE (n)", Ddl),
-        (
-            "ALTER TABLE t ADD COLUMN n BIGINT",
-            Refused("ALTER TABLE row rewrite"),
-        ),
-        (
-            "ALTER TABLE t DROP COLUMN n",
-            Refused("ALTER TABLE row rewrite"),
-        ),
-        (
-            "ALTER TABLE t ALTER COLUMN n SET NOT NULL",
-            Refused("ALTER TABLE row rewrite"),
-        ),
+        ("ALTER TABLE t ADD COLUMN n BIGINT", Ddl),
+        ("ALTER TABLE t DROP COLUMN n", Ddl),
+        ("ALTER TABLE t ALTER COLUMN n SET NOT NULL", Ddl),
         ("ALTER TABLE t ADD PRIMARY KEY (n)", Ddl),
         ("ALTER TABLE t ADD CHECK (n > 0)", Refused("SQL statement")),
         (
@@ -184,16 +172,10 @@ fn v2_statement_classes_and_reachable_refusals() {
         ("ROLLBACK TO SAVEPOINT s", Control("rollback_to")),
         (
             "ALTER TABLE t ALTER COLUMN n SET DEFAULT 1, ADD COLUMN m BIGINT",
-            Refused("ALTER TABLE row rewrite"),
+            Ddl,
         ),
-        (
-            "ALTER TABLE t ADD COLUMN m BIGINT, ADD UNIQUE (n)",
-            Refused("ALTER TABLE row rewrite"),
-        ),
-        (
-            "ALTER TABLE t ADD UNIQUE (n), ADD COLUMN m BIGINT",
-            Refused("ALTER TABLE row rewrite"),
-        ),
+        ("ALTER TABLE t ADD COLUMN m BIGINT, ADD UNIQUE (n)", Ddl),
+        ("ALTER TABLE t ADD UNIQUE (n), ADD COLUMN m BIGINT", Ddl),
     ];
     for (sql, expected) in cases {
         let prepared =

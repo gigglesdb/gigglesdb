@@ -208,7 +208,7 @@ fn explicit_commit_rollback_and_failure_abort() {
 }
 
 #[test]
-fn implicit_failure_and_refusals_leave_catalog_unchanged() {
+fn implicit_failures_leave_catalog_unchanged() {
     let f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY)");
     let before = f.parts();
@@ -221,13 +221,10 @@ fn implicit_failure_and_refusals_leave_catalog_unchanged() {
     ));
     assert_eq!(f.parts(), before);
     assert_eq!(f.catalog_bytes(), bytes);
-    let sql = "ALTER TABLE t ADD COLUMN n bigint";
+    let sql = "ALTER TABLE t ADD COLUMN id bigint";
     assert!(matches!(
         f.admin().sql_session().execute(sql, &[], None),
-        Err(CoreError::EngineUnsupported {
-            engine: "v2",
-            feature: "ALTER TABLE row rewrite"
-        })
+        Err(CoreError::Sql(SqlError::DuplicateColumn))
     ));
     assert_eq!(f.parts(), before, "{sql}");
     assert_eq!(f.catalog_bytes(), bytes, "{sql}");
@@ -1456,3 +1453,6 @@ fn normalized_copy_defaults_atomicity_and_savepoint_match_legacy() {
 
 #[path = "v2_sql_index_tests.rs"]
 mod index_tests;
+
+#[path = "v2_sql_alter_tests.rs"]
+mod alter_tests;

@@ -272,20 +272,14 @@ impl Catalog {
                 _ => {}
             }
         }
+        // Column names are mutable and may be reused by DROP + ADD in one
+        // ALTER. The object-ID checks above preserve ownership and require a
+        // reserved ID for every newly added column.
         for (name, table) in &new.tables {
-            if let Some(previous) = old.tables.get(name) {
-                if previous.id != table.id {
-                    return Err(corrupt("existing table id changed"));
-                }
-                for column in &table.columns {
-                    if previous
-                        .columns
-                        .iter()
-                        .any(|c| c.name == column.name && c.id != column.id)
-                    {
-                        return Err(corrupt("existing column id changed"));
-                    }
-                }
+            if let Some(previous) = old.tables.get(name)
+                && previous.id != table.id
+            {
+                return Err(corrupt("existing table id changed"));
             }
         }
         if old_records == new_records {

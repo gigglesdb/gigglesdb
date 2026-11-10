@@ -1582,9 +1582,7 @@ impl Prepared {
                         | alter_table::Action::NotNull(_, false) => (),
                         alter_table::Action::Add(..)
                         | alter_table::Action::Drop(..)
-                        | alter_table::Action::NotNull(_, true) => {
-                            refusal = Some("ALTER TABLE row rewrite")
-                        }
+                        | alter_table::Action::NotNull(_, true) => (),
                         alter_table::Action::Unique(..)
                         | alter_table::Action::Constraint(constraints::Definition::Unique {
                             ..

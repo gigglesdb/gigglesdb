@@ -497,8 +497,9 @@ impl RowSink for SqlRows<'_> {
         if let Some(new) = after_table
             && (new.primary_key != table.primary_key || new.columns.len() != table.columns.len())
         {
-            // ALTER ADD PRIMARY KEY removes the hidden heap column and changes
-            // the physical key. Validate old witnesses using the old descriptor.
+            // ADD/DROP COLUMN and ADD PRIMARY KEY can shift the heap key or
+            // change its values. Validate old witnesses with the old layout,
+            // then publish the rewritten rows with the new descriptor.
             self.apply(table, before, &BTreeMap::new())?;
             self.apply(new, &BTreeMap::new(), after)?;
         }
