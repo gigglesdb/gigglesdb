@@ -2696,6 +2696,22 @@ impl Query {
                 Expr::Literal(_) | Expr::Param(_) => true,
             })
     }
+    // Reuse the parser's mandatory AND bounds; residual SQL is still evaluated.
+    pub(super) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
+        if self.sources.len() != 1 || !self.joins.is_empty() || self.has_in_subquery() {
+            return Vec::new();
+        }
+        self.predicates
+            .iter()
+            .filter_map(|(column, op, expr)| {
+                let value = match expr {
+                    Expr::Literal(value) => value.clone(),
+                    Expr::Param(n) => params.get(n.checked_sub(1)?)?.clone(),
+                };
+                Some((column.name.clone(), op.clone(), value))
+            })
+            .collect()
+    }
     pub(super) fn target(&self) -> &str {
         if !self.sources.is_empty() && self.sources.iter().all(|s| s.name == self.sources[0].name) {
             &self.sources[0].name

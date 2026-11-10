@@ -24,8 +24,9 @@ pub(crate) mod txn;
 
 pub(crate) mod catalog;
 pub(crate) mod catalog_codec;
-pub(crate) mod seq;
+pub(crate) mod indexes;
 pub(crate) mod rows;
+pub(crate) mod seq;
 pub(crate) mod ssi_validate;
 
 #[cfg(test)]

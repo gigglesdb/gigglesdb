@@ -234,7 +234,7 @@ impl SqlSession {
                         let parts = db.catalog().parts(txn)?;
                         // Bind from the original references, preserving explicit public
                         // qualification even when another schema shadows the bare name.
-                        let binding = relational::Relational::catalog_image(
+                        let mut binding = relational::Relational::catalog_image(
                             parts.tables.clone(),
                             parts.ext.clone(),
                             u64::MAX,
@@ -246,6 +246,9 @@ impl SqlSession {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
                         })?;
+                        binding
+                            .catalog_indexes(&parts.indexes)
+                            .map_err(CoreError::Sql)?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
                         let target_name = bound.table().map(str::to_owned);
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
@@ -309,6 +312,7 @@ impl SqlSession {
                                     std::iter::once(table.id)
                                         .chain(table.columns.iter().map(|column| column.id))
                                 })
+                                .chain(old.indexes.iter().map(|index| index.id))
                                 .chain(old.ext.constraints.values().flatten().map(|c| c.id))
                                 .chain(old.ext.sequences.keys().copied())
                                 .chain(old.ext.types.iter().map(|(&id, ty)| match ty {
@@ -342,6 +346,9 @@ impl SqlSession {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
                         })?;
+                        image
+                            .catalog_indexes(&old.indexes)
+                            .map_err(CoreError::Sql)?;
                         let context = clock.map(|clock| {
                             clock.with_sequences(sql_sequences::callback(
                                 db.clone(),
@@ -361,6 +368,8 @@ impl SqlSession {
                                 txn,
                                 parts: &old,
                                 writing,
+                                prepared: &bound,
+                                params,
                             },
                             versions.end,
                         );
@@ -380,16 +389,16 @@ impl SqlSession {
                         check_post_image(&tables, &ext, next_id)?;
                         let heap = tables
                             .values()
-                            .filter(|def| {
-                                if old.tables.values().any(|table| table.id == def.id) {
-                                    old.heap.contains(&def.id)
-                                } else {
-                                    def.hidden_rowid().is_some()
-                                }
-                            })
+                            .filter(|def| def.hidden_rowid().is_some())
                             .map(|def| def.id)
                             .collect();
-                        let new = CatalogParts { tables, heap, ext };
+                        let indexes = image.secondary_descriptors_engine().to_vec();
+                        let new = CatalogParts {
+                            tables,
+                            heap,
+                            ext,
+                            indexes,
+                        };
                         db.catalog().apply_diff(txn, &old, &new, &ids, None, &|| {
                             crate::cancellation::check().is_err()
                         })?;
@@ -459,8 +468,43 @@ struct SqlRows<'a> {
     txn: &'a mut Transaction,
     parts: &'a CatalogParts,
     writing: bool,
+    prepared: &'a relational::Prepared,
+    params: &'a [relational::Value],
 }
 impl RowSink for SqlRows<'_> {
+    fn indexes(&self) -> Vec<relational::secondary_index::Descriptor> {
+        self.parts.indexes.clone()
+    }
+    fn apply_indexes(
+        &mut self,
+        table: &TableDef,
+        after_table: Option<&TableDef>,
+        before: &BTreeMap<Vec<u8>, SqlRow>,
+        after: &BTreeMap<Vec<u8>, SqlRow>,
+        descriptors: &[relational::secondary_index::Descriptor],
+    ) -> Result<(), CoreError> {
+        engine::indexes::apply(
+            self.txn,
+            table,
+            after_table,
+            before,
+            after,
+            &self.parts.indexes,
+            descriptors,
+            None,
+            &|| crate::cancellation::check().is_err(),
+        )?;
+        if let Some(new) = after_table
+            && (new.primary_key != table.primary_key || new.columns.len() != table.columns.len())
+        {
+            // ALTER ADD PRIMARY KEY removes the hidden heap column and changes
+            // the physical key. Validate old witnesses using the old descriptor.
+            self.apply(table, before, &BTreeMap::new())?;
+            self.apply(new, &BTreeMap::new(), after)?;
+        }
+        Ok(())
+    }
+
     fn scan(
         &mut self,
         table: &TableDef,
@@ -471,15 +515,56 @@ impl RowSink for SqlRows<'_> {
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
-        for pair in self.db.rows.scan(
-            self.txn,
-            &entry,
-            Bound::Unbounded,
-            Bound::Unbounded,
-            engine::kv::Direction::Forward,
-            None,
-        )? {
-            let (_, row) = pair?;
+        let predicates = self.prepared.v2_index_predicates(self.params);
+        let candidate = (!self.writing)
+            .then(|| {
+                self.parts.indexes.iter().find_map(|d| {
+                    if d.table != table.id {
+                        return None;
+                    }
+                    let column = table.columns.iter().find(|c| c.id == d.columns[0])?;
+                    // User types can have a SQL order different from their storage type.
+                    if self
+                        .parts
+                        .ext
+                        .columns
+                        .get(&column.id)
+                        .is_some_and(|c| c.type_id.is_some())
+                    {
+                        return None;
+                    }
+                    predicates.iter().find_map(|(name, op, value)| {
+                        if *name != column.name
+                            || *value == relational::Value::Null
+                            || relational::check(value, column).is_err()
+                        {
+                            return None;
+                        }
+                        let tuple = codec::index_tuple_bytes(
+                            std::slice::from_ref(value),
+                            &[codec::Direction::Asc],
+                        )
+                        .ok()?;
+                        let (lo, hi) = match op.as_str() {
+                            "=" => (Bound::Included(tuple.clone()), Bound::Included(tuple)),
+                            ">" => (Bound::Excluded(tuple), Bound::Unbounded),
+                            ">=" => (Bound::Included(tuple), Bound::Unbounded),
+                            "<" => (Bound::Unbounded, Bound::Excluded(tuple)),
+                            "<=" => (Bound::Unbounded, Bound::Included(tuple)),
+                            _ => return None,
+                        };
+                        Some((d, lo, hi))
+                    })
+                })
+            })
+            .flatten();
+        let Some((descriptor, lo, hi)) = candidate else {
+            return self.scan_all(&entry, visit);
+        };
+        let rows = engine::indexes::scan(self.txn, &entry, descriptor, lo, hi)?;
+        #[cfg(test)]
+        USED_INDEX_SCAN.set(true);
+        for (_, row) in rows {
             visit(SqlRow {
                 values: row.values,
                 version: row.version,
@@ -563,11 +648,43 @@ impl RowSink for SqlRows<'_> {
     }
 }
 
+impl SqlRows<'_> {
+    fn scan_all(
+        &mut self,
+        entry: &TableEntry,
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
+        for pair in self.db.rows.scan(
+            self.txn,
+            entry,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            engine::kv::Direction::Forward,
+            None,
+        )? {
+            let (_, row) = pair?;
+            visit(SqlRow {
+                values: row.values,
+                version: row.version,
+            })
+            .map_err(CoreError::Sql)?;
+        }
+        #[cfg(test)]
+        AFTER_TABLE_SCAN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&entry.def.name);
+            }
+        });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 type TableScanHook = Box<dyn FnMut(&str)>;
 
 #[cfg(test)]
 thread_local! {
     static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
+    static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

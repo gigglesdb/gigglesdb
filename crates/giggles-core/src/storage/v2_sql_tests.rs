@@ -221,25 +221,16 @@ fn implicit_failure_and_refusals_leave_catalog_unchanged() {
     ));
     assert_eq!(f.parts(), before);
     assert_eq!(f.catalog_bytes(), bytes);
-    for (sql, feature) in [
-        ("CREATE INDEX idx ON t (id)", "secondary indexes"),
-        (
-            "CREATE TABLE u (id bigint PRIMARY KEY, n bigint UNIQUE)",
-            "secondary indexes",
-        ),
-        (
-            "ALTER TABLE t ADD COLUMN n bigint",
-            "ALTER TABLE row rewrite",
-        ),
-    ] {
-        assert!(
-            matches!(f.admin().sql_session().execute(sql, &[], None),
-            Err(CoreError::EngineUnsupported { engine: "v2", feature: got }) if got == feature),
-            "{sql}"
-        );
-        assert_eq!(f.parts(), before, "{sql}");
-        assert_eq!(f.catalog_bytes(), bytes, "{sql}");
-    }
+    let sql = "ALTER TABLE t ADD COLUMN n bigint";
+    assert!(matches!(
+        f.admin().sql_session().execute(sql, &[], None),
+        Err(CoreError::EngineUnsupported {
+            engine: "v2",
+            feature: "ALTER TABLE row rewrite"
+        })
+    ));
+    assert_eq!(f.parts(), before, "{sql}");
+    assert_eq!(f.catalog_bytes(), bytes, "{sql}");
 }
 
 #[test]
@@ -1462,3 +1453,6 @@ fn normalized_copy_defaults_atomicity_and_savepoint_match_legacy() {
     drop(legacy);
     fs::remove_dir_all(legacy_path).unwrap();
 }
+
+#[path = "v2_sql_index_tests.rs"]
+mod index_tests;

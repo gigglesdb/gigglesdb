@@ -148,13 +148,13 @@ fn v2_statement_classes_and_reachable_refusals() {
             "ALTER TABLE t ADD COLUMN n varchar(10)",
             Refused("ALTER TABLE row rewrite"),
         ),
-        ("CREATE INDEX i ON t (n)", Refused("secondary indexes")),
+        ("CREATE INDEX i ON t (n)", Ddl),
         ("INSERT INTO t SELECT id, n FROM t", Dml),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT UNIQUE)",
-            Refused("secondary indexes"),
+            Ddl,
         ),
-        ("ALTER TABLE t ADD UNIQUE (n)", Refused("secondary indexes")),
+        ("ALTER TABLE t ADD UNIQUE (n)", Ddl),
         (
             "ALTER TABLE t ADD COLUMN n BIGINT",
             Refused("ALTER TABLE row rewrite"),
@@ -167,10 +167,7 @@ fn v2_statement_classes_and_reachable_refusals() {
             "ALTER TABLE t ALTER COLUMN n SET NOT NULL",
             Refused("ALTER TABLE row rewrite"),
         ),
-        (
-            "ALTER TABLE t ADD PRIMARY KEY (n)",
-            Refused("SQL statement"),
-        ),
+        ("ALTER TABLE t ADD PRIMARY KEY (n)", Ddl),
         ("ALTER TABLE t ADD CHECK (n > 0)", Refused("SQL statement")),
         (
             "ALTER TABLE t ADD FOREIGN KEY (n) REFERENCES u(id)",
@@ -191,11 +188,11 @@ fn v2_statement_classes_and_reachable_refusals() {
         ),
         (
             "ALTER TABLE t ADD COLUMN m BIGINT, ADD UNIQUE (n)",
-            Refused("secondary indexes"),
+            Refused("ALTER TABLE row rewrite"),
         ),
         (
             "ALTER TABLE t ADD UNIQUE (n), ADD COLUMN m BIGINT",
-            Refused("secondary indexes"),
+            Refused("ALTER TABLE row rewrite"),
         ),
     ];
     for (sql, expected) in cases {
@@ -204,7 +201,7 @@ fn v2_statement_classes_and_reachable_refusals() {
         assert_eq!(prepared.v2_class(), expected, "{sql}");
     }
     // This shape currently has a dedicated AlterTable::Unique parser route;
-    // cover Definition::Unique too so either representation remains refused.
+    // cover Definition::Unique too so either representation is enabled.
     let prepared = Prepared::engine(
         Statement::AlterTable(alter_table::AlterTable {
             table: "t".into(),
@@ -219,7 +216,7 @@ fn v2_statement_classes_and_reachable_refusals() {
         1,
         0,
     );
-    assert_eq!(prepared.v2_class(), Refused("secondary indexes"));
+    assert_eq!(prepared.v2_class(), Ddl);
 }
 
 #[test]

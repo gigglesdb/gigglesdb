@@ -9,6 +9,7 @@ use std::{
 };
 
 pub(crate) const CURRENT_SUBVERSION: u32 = 1;
+pub(crate) const SECONDARY_INDEXES: u64 = 1 << 2;
 pub(crate) const TEXT_BACKED_COLUMN_TYPES: u64 = 1 << 10;
 pub(crate) const SCHEMAS_AND_USER_TYPES: u64 = 1 << 12;
 pub(crate) const FEATURE_TABLE: [(u64, &str); 13] = [

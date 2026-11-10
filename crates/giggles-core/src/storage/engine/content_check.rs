@@ -20,6 +20,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first().is_some_and(|kind| matches!(kind, 14 | 15)) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SCHEMAS_AND_USER_TYPES)
+    } else if key.first() == Some(&16) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::SECONDARY_INDEXES)
     } else {
         Ok(0)
     }
@@ -50,6 +53,10 @@ pub(crate) fn required_bits_for_catalog_value(
         // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
         // so the commit guard must refuse it too (DD-0068 X1).
         CatalogKind::RoleBootstrap => Ok(512),
+        CatalogKind::Index => {
+            super::indexes::decode_descriptor(value).map_err(corrupt)?;
+            Ok(super::meta::SECONDARY_INDEXES)
+        }
         CatalogKind::Name => Ok(if key[1..key.len() - 1].contains(&0) {
             super::meta::SCHEMAS_AND_USER_TYPES
         } else {
@@ -129,6 +136,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
                 catalog_codec::decode_type(value)
                     .map(|_| ())
                     .map_err(corrupt)?;
+            }
+            CatalogKind::Index => {
+                super::indexes::decode_descriptor(value).map_err(corrupt)?;
             }
             CatalogKind::Schema => {
                 catalog_codec::decode_schema(value).map_err(corrupt)?;

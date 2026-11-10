@@ -42,6 +42,7 @@ fn empty() -> CatalogParts {
     CatalogParts {
         tables: BTreeMap::new(),
         heap: BTreeSet::new(),
+        indexes: Vec::new(),
         ext: CatalogExt::default(),
     }
 }

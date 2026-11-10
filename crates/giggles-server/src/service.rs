@@ -1189,7 +1189,10 @@ impl Session {
             if role.superuser {
                 superuser = true;
                 true
-            } else if p.is_alter_table() || p.is_drop_table() {
+            } else if p.is_alter_table()
+                || p.is_drop_table()
+                || (p.command() == "DROP INDEX" && p.table().is_some())
+            {
                 let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
                 let name_at_commit = self.sql.table_authority_name(table)?;
                 self.sql
@@ -2188,6 +2191,48 @@ mod lifecycle_tests {
         assert!(service.reload_bindings(bindings.clone()).is_err());
         assert!(serde_json::to_value(&bindings[0]).is_err());
         assert!(serde_json::from_str::<Role>(r#"{"role":"Database","name":"owner"}"#).is_err());
+    }
+    #[test]
+    fn drop_index_requires_table_ownership_even_with_schema_create() {
+        let (service, _) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("owner", true), ("reader", false)] {
+            roles
+                .create(roles::NewRole {
+                    name: name.into(),
+                    login: true,
+                    superuser,
+                    ..roles::NewRole::default()
+                })
+                .unwrap();
+        }
+        let mut owner = service.role_session("owner").unwrap();
+        owner
+            .execute_sql("CREATE TABLE owned(id bigint PRIMARY KEY,v bigint)", &[])
+            .unwrap();
+        owner
+            .execute_sql("CREATE INDEX iv ON owned(v)", &[])
+            .unwrap();
+        roles
+            .grant_schema("public", "reader", &[roles::SchemaPrivilege::Create])
+            .unwrap();
+        let mut reader = service.role_session("reader").unwrap();
+        assert_eq!(
+            sqlstate(&reader.execute_sql("DROP INDEX iv", &[]).unwrap_err()),
+            "42501"
+        );
+        assert_eq!(service.admin.secondary_index_catalog().unwrap().1.len(), 1);
+        roles.set_table_owner("owned", "reader").unwrap();
+        let mut reader = service.role_session("reader").unwrap();
+        reader.execute_sql("DROP INDEX iv", &[]).unwrap();
+        assert!(
+            service
+                .admin
+                .secondary_index_catalog()
+                .unwrap()
+                .1
+                .is_empty()
+        );
     }
     #[test]
     fn database_catalog_snapshot_filters_owners_and_grants_and_rechecks_role() {

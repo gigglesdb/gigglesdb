@@ -140,6 +140,15 @@ impl Prepared {
                 }
             }
             Statement::CreateIndex(index) => read(&mut index.table),
+            Statement::DropIndex(index) => {
+                read(&mut index.name);
+                index.table = state
+                    .secondary_descriptors_engine()
+                    .iter()
+                    .find(|d| d.name == index.name)
+                    .and_then(|d| state.tables.values().find(|t| t.id == d.table))
+                    .map(|t| state.table_key(t));
+            }
             Statement::Sequence(ddl) => ddl.bind_schema_names(&read, &create)?,
             _ => {}
         }

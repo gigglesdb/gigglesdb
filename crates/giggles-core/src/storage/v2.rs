@@ -136,6 +136,10 @@ impl V2Db {
             u64::MAX,
         )
         .map_err(CoreError::Sql)?;
+        state
+            .sql
+            .catalog_indexes(&parts.indexes)
+            .map_err(CoreError::Sql)?;
         state.sql.epoch = epoch;
         Ok(state)
     }

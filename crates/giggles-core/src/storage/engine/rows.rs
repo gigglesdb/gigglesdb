@@ -80,6 +80,17 @@ impl RowStore {
         }
         let version = self.seq.next(3, 0)?;
         let encoded = codec::encode_row(&key, version, &values)?;
+        super::indexes::maintain(
+            txn,
+            &entry.def,
+            None,
+            Some(&Row {
+                values: values.clone(),
+                version,
+            }),
+            deadline,
+            cancel,
+        )?;
         txn.put(Keyspace::Rows, key, encoded)?;
         Ok(Row { values, version })
     }
@@ -126,6 +137,17 @@ impl RowStore {
         relational::row_check(&entry.def, &values).map_err(CoreError::Sql)?;
         let version = self.seq.next(3, 0)?;
         let encoded = codec::encode_row(&key, version, &values)?;
+        super::indexes::maintain(
+            txn,
+            &entry.def,
+            Some(&current),
+            Some(&Row {
+                values: values.clone(),
+                version,
+            }),
+            deadline,
+            cancel,
+        )?;
         txn.put(Keyspace::Rows, key, encoded)?;
         Ok(Some(Row { values, version }))
     }
@@ -147,6 +169,7 @@ impl RowStore {
         let current = decode(&key, &encoded, entry.def.columns.len())?;
         check_version(&current, expected_version)?;
         // MVCC owns deletion envelopes. A codec-level tombstone is never stored.
+        super::indexes::maintain(txn, &entry.def, Some(&current), None, deadline, cancel)?;
         txn.delete(Keyspace::Rows, key)?;
         Ok(Some(current))
     }
@@ -272,7 +295,7 @@ fn user_key(entry: &TableEntry, pk: &[Value]) -> Result<Vec<u8>, CoreError> {
     Ok(prefixed(&entry.def.id.to_be_bytes(), &codec::pk_bytes(pk)?))
 }
 
-fn decode(key: &[u8], encoded: &[u8], columns: usize) -> Result<Row, CoreError> {
+pub(super) fn decode(key: &[u8], encoded: &[u8], columns: usize) -> Result<Row, CoreError> {
     let record = codec::decode_row(key, encoded)?;
     if record.tombstone {
         return Err(CoreError::Corrupt("row record contains a tombstone".into()));

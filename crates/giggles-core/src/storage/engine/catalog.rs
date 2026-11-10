@@ -63,12 +63,14 @@ pub(crate) struct CatalogView {
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
     pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
+    pub(crate) indexes: BTreeMap<u64, relational::secondary_index::Descriptor>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogParts {
     pub(crate) tables: BTreeMap<String, TableDef>,
     pub(crate) heap: BTreeSet<u64>,
+    pub(crate) indexes: Vec<relational::secondary_index::Descriptor>,
     pub(crate) ext: CatalogExt,
 }
 impl CatalogView {
@@ -103,6 +105,7 @@ impl CatalogView {
             .iter()
             .map(|(id, cs)| (*id, cs.values().cloned().collect()))
             .collect();
+        parts.indexes = self.indexes.values().cloned().collect();
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
         parts.ext.schemas = self.schemas.clone();
@@ -297,6 +300,9 @@ impl Catalog {
             cancel,
         )?;
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
+        if !new.indexes.is_empty() {
+            txn.require_features(super::meta::SECONDARY_INDEXES);
+        }
         if !new.ext.is_empty() {
             txn.require_features(1 << 6);
         }
@@ -350,6 +356,13 @@ impl Catalog {
             match key[0] {
                 1 | 4 => {
                     tables.insert(decode_id(&key[1..9]).map_err(commit_error)?);
+                }
+                16 => {
+                    if let Some(value) = new_records.get(key).or_else(|| old_records.get(key)) {
+                        let descriptor =
+                            super::indexes::decode_descriptor(value).map_err(commit_error)?;
+                        tables.insert(descriptor.table);
+                    }
                 }
                 3 => {
                     let name = std::str::from_utf8(&key[1..key.len() - 1])
@@ -537,6 +550,7 @@ impl Catalog {
         let mut new = old.clone();
         new.tables.remove(name);
         new.heap.remove(&entry.def.id);
+        new.indexes.retain(|d| d.table != entry.def.id);
         for column in &entry.def.columns {
             new.ext.columns.remove(&column.id);
         }
@@ -797,6 +811,18 @@ fn apply_record(
                 view.schemas.remove(name);
             }
         }
+        CatalogKind::Index => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                let descriptor = super::indexes::decode_descriptor(value)?;
+                if descriptor.id != id {
+                    return Err(corrupt("index catalog key/id mismatch"));
+                }
+                view.indexes.insert(id, descriptor);
+            } else {
+                view.indexes.remove(&id);
+            }
+        }
         CatalogKind::RoleBootstrap => {}
         CatalogKind::Role
         | CatalogKind::RoleMembership
@@ -850,6 +876,19 @@ fn finish_view(
         view.by_name
             .insert(entry.def.name.clone(), Arc::new(entry.clone()));
     }
+    for descriptor in view.indexes.values() {
+        let table = view
+            .by_id
+            .get(&descriptor.table)
+            .ok_or_else(|| corrupt("index table absent"))?;
+        super::indexes::validate_descriptor(descriptor, &table.def)?;
+        if expected
+            .insert(descriptor.name.clone(), descriptor.id)
+            .is_some()
+        {
+            return Err(corrupt("duplicate catalog relation name"));
+        }
+    }
     for (id, seq) in &view.sequences {
         if expected.insert(seq.name.clone(), *id).is_some() {
             return Err(corrupt("duplicate catalog relation name"));
@@ -895,6 +934,9 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
         for c in cs {
             insert(c.id, (4, *table))?;
         }
+    }
+    for descriptor in &parts.indexes {
+        insert(descriptor.id, (16, descriptor.table))?;
     }
     for id in parts.ext.sequences.keys() {
         insert(*id, (5, 0))?;
@@ -968,6 +1010,25 @@ fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Cor
             catalog_codec::decode_constraint(&value, def)?;
             records.insert(catalog_codec::constraint_key(*table, c.id), value);
         }
+    }
+    for descriptor in &parts.indexes {
+        let table = parts
+            .tables
+            .values()
+            .find(|table| table.id == descriptor.table)
+            .ok_or_else(|| corrupt("index table absent"))?;
+        super::indexes::validate_descriptor(descriptor, table)?;
+        if !names.insert(descriptor.name.clone()) {
+            return Err(corrupt("duplicate catalog relation name"));
+        }
+        records.insert(
+            super::indexes::descriptor_key(descriptor.id),
+            super::indexes::encode_descriptor(descriptor)?,
+        );
+        records.insert(
+            name_key(&descriptor.name),
+            descriptor.id.to_be_bytes().to_vec(),
+        );
     }
     for (id, def) in &parts.ext.sequences {
         if !names.insert(def.name.clone()) {

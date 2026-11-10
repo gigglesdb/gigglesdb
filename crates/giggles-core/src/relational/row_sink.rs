@@ -14,6 +14,19 @@ pub(crate) trait RowSink {
         visit: &mut dyn FnMut(SqlRow) -> R<()>,
     ) -> Result<(), CoreError>;
 
+    fn indexes(&self) -> Vec<secondary_index::Descriptor> {
+        Vec::new()
+    }
+    fn apply_indexes(
+        &mut self,
+        _table: &TableDef,
+        _after_table: Option<&TableDef>,
+        _before: &BTreeMap<Vec<u8>, SqlRow>,
+        _after: &BTreeMap<Vec<u8>, SqlRow>,
+        _descriptors: &[secondary_index::Descriptor],
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
     /// Publish the difference atomically; the caller owns a statement savepoint.
     fn apply(
         &mut self,
@@ -84,6 +97,11 @@ impl Relational {
                 Ok(())
             })?;
         }
+        self.secondary = self
+            .secondary_build_complete_engine(&sink.indexes(), || {
+                crate::cancellation::check().is_err()
+            })
+            .map_err(CoreError::Sql)?;
         let before = table.as_ref().map(|table| self.rows[&table.id].clone());
         let result = self
             .execute_clocked(
@@ -102,7 +120,20 @@ impl Relational {
         if let (Some(table), Some(before)) = (&table, &before) {
             let empty = BTreeMap::new();
             let after = self.rows.get(&table.id).unwrap_or(&empty);
-            sink.apply(table, before, after)?;
+            let after_table = self.tables.values().find(|t| t.id == table.id);
+            sink.apply_indexes(
+                table,
+                after_table,
+                before,
+                after,
+                self.secondary_descriptors_engine(),
+            )?;
+            // Index hook owns re-keyed rows, whose column layout differs.
+            if after_table.is_none_or(|new| {
+                new.primary_key == table.primary_key && new.columns.len() == table.columns.len()
+            }) {
+                sink.apply(table, before, after)?;
+            }
         }
         Ok(result)
     }

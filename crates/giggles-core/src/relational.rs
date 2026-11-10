@@ -455,6 +455,12 @@ impl Relational {
         }
         Ok(image)
     }
+    pub(crate) fn catalog_indexes(&mut self, descriptors: &[secondary_index::Descriptor]) -> R<()> {
+        self.secondary = self.secondary_build_complete_engine(descriptors, || {
+            crate::cancellation::check().is_err()
+        })?;
+        Ok(())
+    }
     #[allow(dead_code)] // Awaiting v2 catalog integration.
     pub(crate) fn catalog_parts(&self) -> (BTreeMap<String, TableDef>, CatalogExt, u64, u64) {
         (
@@ -896,6 +902,7 @@ enum Statement {
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     CreateIndex(sql_index::CreateIndex),
+    DropIndex(sql_index::DropIndex),
     InsertMulti(Box<sql_insert::Insert>),
     Query(query::Query),
     Create {
@@ -1111,6 +1118,11 @@ impl Parser {
             && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index" || w == "unique")
         {
             return sql_index::parse(self).map(Statement::CreateIndex);
+        }
+        if matches!(self.tokens.get(self.at), Some(Token::Word(w)) if w == "drop")
+            && matches!(self.tokens.get(self.at + 1), Some(Token::Word(w)) if w == "index")
+        {
+            return sql_index::parse_drop(self).map(Statement::DropIndex);
         }
         let st = if self.word("drop") {
             if !self.word("table") {
@@ -1547,24 +1559,19 @@ impl Prepared {
             Statement::Schema(_) | Statement::TypeDdl(_) => V2Class::Ddl,
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
             Statement::Create { constraints, .. } => {
-                let (mut unique, mut unenforced) = (false, false);
-                for constraint in constraints {
-                    match constraint {
-                        constraints::Definition::Unique { .. } => unique = true,
-                        // v2 does not enforce CHECK/FK yet (same refusal as ALTER ADD).
+                if constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint,
                         constraints::Definition::Check { .. }
-                        | constraints::Definition::ForeignKey { .. } => unenforced = true,
-                    }
-                }
-                if unique {
-                    V2Class::Refused("secondary indexes")
-                } else if unenforced {
+                            | constraints::Definition::ForeignKey { .. }
+                    )
+                }) {
                     V2Class::Refused("SQL statement")
                 } else {
                     V2Class::Ddl
                 }
             }
-            Statement::CreateIndex(_) => V2Class::Refused("secondary indexes"),
+            Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
                 let mut refusal = None;
                 for action in &alter.actions {
@@ -1581,10 +1588,10 @@ impl Prepared {
                         alter_table::Action::Unique(..)
                         | alter_table::Action::Constraint(constraints::Definition::Unique {
                             ..
-                        }) => return V2Class::Refused("secondary indexes"),
+                        })
+                        | alter_table::Action::PrimaryKey(..) => (),
                         // These constraint operations need v2 enforcement/validation support.
-                        alter_table::Action::PrimaryKey(..)
-                        | alter_table::Action::Constraint(
+                        alter_table::Action::Constraint(
                             constraints::Definition::Check { .. }
                             | constraints::Definition::ForeignKey { .. },
                         )
@@ -2057,6 +2064,12 @@ impl Prepared {
             columns,
         })
     }
+    pub(crate) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
+        match &self.statement {
+            Statement::Query(query) => query.v2_index_predicates(params),
+            _ => Vec::new(),
+        }
+    }
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
@@ -2070,6 +2083,7 @@ impl Prepared {
             Statement::InsertExpressions(values) => Some(&values.name),
             Statement::AlterTable(alter) => Some(&alter.table),
             Statement::CreateIndex(index) => Some(&index.table),
+            Statement::DropIndex(index) => index.table.as_deref(),
             Statement::InsertMulti(insert) => Some(&insert.table),
             Statement::Create { name, .. }
             | Statement::DropTable { name, .. }
@@ -2103,6 +2117,7 @@ impl Prepared {
                 | Statement::TypeDdl(_)
                 | Statement::Create { .. }
                 | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
                 | Statement::AlterTable(_)
                 | Statement::DropTable { .. }
         )
@@ -2153,6 +2168,7 @@ impl Prepared {
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
+            Statement::DropIndex(_) => "DROP INDEX",
             Statement::Insert { .. }
             | Statement::InsertExpressions(_)
             | Statement::InsertMulti(_) => "INSERT",
@@ -3296,6 +3312,26 @@ impl Relational {
                 }
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
+            Statement::DropIndex(index) => {
+                let descriptor = self
+                    .secondary_descriptors_engine()
+                    .iter()
+                    .find(|d| d.name == index.name)
+                    .cloned();
+                if let Some(descriptor) = descriptor {
+                    let descriptors = self
+                        .secondary_descriptors_engine()
+                        .iter()
+                        .filter(|d| d.id != descriptor.id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.secondary =
+                        self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
+                    self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                } else if !index.optional {
+                    return Err(SqlError::UndefinedObject);
+                }
+            }
             Statement::CreateIndex(index) => {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);

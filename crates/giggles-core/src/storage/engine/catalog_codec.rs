@@ -745,6 +745,7 @@ pub(crate) enum CatalogKind {
     RoleOid,
     Schema,
     TypeDefinition,
+    Index,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
@@ -765,6 +766,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
             CatalogKind::Schema
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
+        Some(16) if key.len() == 9 => CatalogKind::Index,
         Some(4) if key.len() == 17 => CatalogKind::Constraint,
         Some(5) if key.len() == 9 => CatalogKind::Sequence,
         Some(6) if key.len() == 9 => CatalogKind::Type,

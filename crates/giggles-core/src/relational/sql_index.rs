@@ -96,6 +96,38 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DropIndex {
+    pub name: String,
+    pub table: Option<String>,
+    pub optional: bool,
+}
+pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
+    p.need("drop")?;
+    p.need("index")?;
+    if p.word("concurrently") {
+        return Err(SqlError::Unsupported);
+    }
+    let optional = p.word("if");
+    if optional {
+        p.need("exists")?;
+    }
+    let name = p.table_name()?;
+    if p.word("cascade") {
+        return Err(SqlError::Unsupported);
+    }
+    p.word("restrict");
+    p.sym(';');
+    if p.at != p.tokens.len() {
+        return Err(SqlError::Syntax);
+    }
+    Ok(DropIndex {
+        name,
+        table: None,
+        optional,
+    })
+}
+
 #[cfg(test)]
 #[path = "sql_index_tests.rs"]
 mod sql_index_tests;
