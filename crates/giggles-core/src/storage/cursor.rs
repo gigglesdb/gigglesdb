@@ -174,19 +174,11 @@ impl SqlSession {
                     txn.begin_statement();
                     let ts = txn.snapshot_ts();
                     let parts = db.catalog().parts(txn)?;
-                    let next_id = parts
-                        .tables
-                        .values()
-                        .flat_map(|t| std::iter::once(t.id).chain(t.columns.iter().map(|c| c.id)))
-                        .chain(parts.ext.constraints.values().flatten().map(|c| c.id))
-                        .chain(parts.ext.sequences.keys().copied())
-                        .chain(parts.ext.types.keys().copied())
-                        .max()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                        .ok_or(CoreError::Limit)?;
+                    // Cursors allocate no catalog IDs. Match metadata snapshots:
+                    // include every validated schema/type/enum-label ID without
+                    // duplicating the catalog allocator's object inventory.
                     let image =
-                        relational::Relational::catalog_image(parts.tables, parts.ext, next_id, 1)
+                        relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
                             .map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
