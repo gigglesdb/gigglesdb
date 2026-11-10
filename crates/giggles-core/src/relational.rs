@@ -452,16 +452,6 @@ impl Relational {
                 ConstraintKind::PrimaryKey => {}
             }
         }
-        // v2 does not persist varchar/char columns yet (DD-0068 E1130): fail closed
-        // so later DML can never bypass E2's column coercion (padding, 22001).
-        if image
-            .tables
-            .values()
-            .flat_map(|table| &table.columns)
-            .any(|column| v2_varchar_char(&column.data_type))
-        {
-            return Err(SqlError::Unsupported);
-        }
         Ok(image)
     }
     #[allow(dead_code)] // Awaiting v2 catalog integration.
@@ -1467,34 +1457,6 @@ pub struct Prepared {
     search_path: Vec<String>,
     schema_user: String,
 }
-/// v2 refuses varchar/char columns (DD-0068 E1130). Exhaustive on purpose: a
-/// new DataType must be decided here.
-fn v2_varchar_char(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Varchar
-        | DataType::Bpchar
-        | DataType::Uuid
-        | DataType::Jsonb
-        | DataType::IntArray
-        | DataType::BigIntArray
-        | DataType::TextArray => true,
-        DataType::Boolean
-        | DataType::SmallInt
-        | DataType::Integer
-        | DataType::BigInt
-        | DataType::Text
-        | DataType::Bytes
-        | DataType::Numeric
-        | DataType::Real
-        | DataType::DoublePrecision
-        | DataType::Date
-        | DataType::Time
-        | DataType::TimeTz
-        | DataType::Timestamp
-        | DataType::TimestampTz
-        | DataType::Interval => false,
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Awaiting v2 dispatch integration.
 pub(crate) enum V2Class {
@@ -1578,7 +1540,6 @@ impl Prepared {
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
             Statement::Create {
                 constraints,
-                columns,
                 user_types,
                 ..
             } => {
@@ -1598,12 +1559,6 @@ impl Prepared {
                     V2Class::Refused("secondary indexes")
                 } else if unenforced {
                     V2Class::Refused("SQL statement")
-                } else if columns
-                    .iter()
-                    .any(|column| v2_varchar_char(&column.data_type))
-                {
-                    // DD-0068 E1130: v2 does not persist varchar/char columns yet.
-                    V2Class::Refused("varchar/char types")
                 } else {
                     V2Class::Ddl
                 }
@@ -1617,11 +1572,6 @@ impl Prepared {
                         | alter_table::Action::RenameTable(_)
                         | alter_table::Action::Default(..)
                         | alter_table::Action::NotNull(_, false) => (),
-                        alter_table::Action::Add(column, ..)
-                            if v2_varchar_char(&column.data_type) =>
-                        {
-                            return V2Class::Refused("varchar/char types");
-                        }
                         alter_table::Action::Add(..)
                         | alter_table::Action::Drop(..)
                         | alter_table::Action::NotNull(_, true) => {

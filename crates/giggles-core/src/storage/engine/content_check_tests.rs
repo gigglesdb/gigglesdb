@@ -240,3 +240,28 @@ fn open_checks_runs_meta_gate_and_preserves_role_fixture() {
         Err(FormatError::Corrupt(_))
     ));
 }
+
+#[test]
+fn appended_column_tags_require_the_new_feature_on_open() {
+    for data_type in [
+        DataType::Varchar,
+        DataType::Bpchar,
+        DataType::Uuid,
+        DataType::Jsonb,
+        DataType::IntArray,
+        DataType::BigIntArray,
+        DataType::TextArray,
+    ] {
+        let (mut entry, _) = catalog_codec::decode_table(&table(false, false)).unwrap();
+        entry.def.primary_key.clear();
+        entry.def.columns[0].data_type = data_type;
+        let value = catalog_codec::encode_table(&entry, &BTreeMap::new()).unwrap();
+        let key = catalog_codec::table_key(1);
+        let required = required_bits_for_catalog_value(&key, &value).unwrap();
+        assert_ne!(required & meta::TEXT_BACKED_COLUMN_TYPES, 0);
+        let kv = MemKv::new();
+        catalog(&kv, key, 1, Some(value));
+        corrupt_check(&kv, required & !meta::TEXT_BACKED_COLUMN_TYPES);
+        check(&kv, required).unwrap();
+    }
+}

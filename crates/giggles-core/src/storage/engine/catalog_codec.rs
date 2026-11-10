@@ -6,7 +6,7 @@ use crate::{
         ColumnDef, DataType, MAX_COLUMNS, TableDef,
         catalog_ext::{
             Action, ColumnExt, Constraint, ConstraintKind, Deferral, Identity, SequenceDef,
-            TypeDef, validate_typmod,
+            TextKind, TypeDef, validate_typmod,
         },
         validate_create_definition,
     },
@@ -16,15 +16,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 fn corrupt(message: &str) -> CoreError {
     CoreError::Corrupt(message.into())
-}
-/// Fixed refusal feature (DD-0068 E1130): v2 does not persist varchar/char
-/// columns yet; carrying them is a later v2 DTO revision under pre-release.
-pub(crate) const V2_VARCHAR_CHAR: &str = "varchar/char types";
-fn varchar_char_unsupported() -> CoreError {
-    CoreError::EngineUnsupported {
-        engine: "v2",
-        feature: V2_VARCHAR_CHAR,
-    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableEntryV2Dto {
@@ -63,6 +54,14 @@ enum DataTypeDto {
     Timestamp,
     TimestampTz,
     Interval,
+    // Appended tags 15..=21 require meta feature bit 10.
+    Varchar,
+    Bpchar,
+    Uuid,
+    Jsonb,
+    IntArray,
+    BigIntArray,
+    TextArray,
 }
 impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
@@ -83,14 +82,13 @@ impl TryFrom<DataType> for DataTypeDto {
             DataType::Timestamp => Self::Timestamp,
             DataType::TimestampTz => Self::TimestampTz,
             DataType::Interval => Self::Interval,
-            // Explicit arms, no wildcard: a new live type must be decided here.
-            DataType::Varchar => return Err(varchar_char_unsupported()),
-            DataType::Bpchar
-            | DataType::Uuid
-            | DataType::Jsonb
-            | DataType::IntArray
-            | DataType::BigIntArray
-            | DataType::TextArray => return Err(varchar_char_unsupported()),
+            DataType::Varchar => Self::Varchar,
+            DataType::Bpchar => Self::Bpchar,
+            DataType::Uuid => Self::Uuid,
+            DataType::Jsonb => Self::Jsonb,
+            DataType::IntArray => Self::IntArray,
+            DataType::BigIntArray => Self::BigIntArray,
+            DataType::TextArray => Self::TextArray,
         })
     }
 }
@@ -112,6 +110,13 @@ impl From<DataTypeDto> for DataType {
             DataTypeDto::Timestamp => Self::Timestamp,
             DataTypeDto::TimestampTz => Self::TimestampTz,
             DataTypeDto::Interval => Self::Interval,
+            DataTypeDto::Varchar => Self::Varchar,
+            DataTypeDto::Bpchar => Self::Bpchar,
+            DataTypeDto::Uuid => Self::Uuid,
+            DataTypeDto::Jsonb => Self::Jsonb,
+            DataTypeDto::IntArray => Self::IntArray,
+            DataTypeDto::BigIntArray => Self::BigIntArray,
+            DataTypeDto::TextArray => Self::TextArray,
         }
     }
 }
@@ -233,15 +238,11 @@ impl TryFrom<ColumnExt> for ColumnExtDto {
             typmod,
             default,
             identity,
-            text_kind,
+            text_kind: _, // Reconstructed from the column tag, never a new wire field.
             type_id,
         } = v;
-        // Explicit: any Some(text_kind) (varchar/char) is not representable on v2.
         if type_id.is_some() {
             return Err(CoreError::Unsupported);
-        }
-        if text_kind.is_some() {
-            return Err(varchar_char_unsupported());
         }
         Ok(Self {
             typmod,
@@ -261,7 +262,7 @@ impl From<ColumnExtDto> for ColumnExt {
             typmod,
             default,
             identity: identity.map(Into::into),
-            // Decode stays closed: v2 bytes never carry a text kind.
+            // The enclosing table conversion restores this from its type tag.
             text_kind: None,
             type_id: None,
         }
@@ -534,13 +535,19 @@ impl TryFrom<TableEntryV2Dto> for (TableEntry, BTreeMap<u64, ColumnExt>) {
             heap,
             columns_ext,
         } = v;
-        let columns_ext: BTreeMap<u64, ColumnExt> = columns_ext
+        let def: TableDef = def.try_into()?;
+        let mut columns_ext: BTreeMap<u64, ColumnExt> = columns_ext
             .into_iter()
             .map(|(k, v)| (k, v.into()))
             .collect();
+        for column in &def.columns {
+            if let Some(kind) = text_kind(&column.data_type) {
+                columns_ext.entry(column.id).or_default().text_kind = Some(kind);
+            }
+        }
         Ok((
             TableEntry {
-                def: def.try_into()?,
+                def,
                 heap,
                 columns_ext: columns_ext.clone(),
             },
@@ -552,6 +559,17 @@ pub(crate) fn encode_table(
     entry: &TableEntry,
     ext: &BTreeMap<u64, ColumnExt>,
 ) -> Result<Vec<u8>, CoreError> {
+    for (id, column_ext) in ext {
+        let column = entry
+            .def
+            .columns
+            .iter()
+            .find(|column| column.id == *id)
+            .ok_or_else(|| corrupt("column extension references absent column"))?;
+        if column_ext.text_kind != text_kind(&column.data_type) {
+            return Err(corrupt("column text kind/type mismatch"));
+        }
+    }
     encode_version(2, &TableEntryV2Dto::try_from((entry.clone(), ext.clone()))?)
 }
 pub(crate) fn decode_table(
@@ -772,6 +790,31 @@ pub(crate) fn encode_counter(
     };
     super::super::encode(&(value, counter.is_called, counter.log_hw, counter.stamp))
 }
+
+/// Text semantics are redundant with the appended v2 column tag.
+fn text_kind(data_type: &DataType) -> Option<TextKind> {
+    match data_type {
+        DataType::Varchar => Some(TextKind::Varchar),
+        DataType::Bpchar => Some(TextKind::Bpchar),
+        _ => None,
+    }
+}
+
+pub(crate) fn requires_text_backed_types(def: &TableDef) -> bool {
+    def.columns.iter().any(|column| {
+        matches!(
+            column.data_type,
+            DataType::Varchar
+                | DataType::Bpchar
+                | DataType::Uuid
+                | DataType::Jsonb
+                | DataType::IntArray
+                | DataType::BigIntArray
+                | DataType::TextArray
+        )
+    })
+}
+
 #[cfg(test)]
 #[path = "catalog_codec_tests.rs"]
 mod tests;

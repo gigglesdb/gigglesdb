@@ -138,21 +138,15 @@ fn v2_statement_classes_and_reachable_refusals() {
         ("ALTER TABLE t ALTER COLUMN n SET DEFAULT 1", Ddl),
         ("ALTER TABLE t ALTER COLUMN n DROP NOT NULL", Ddl),
         ("ALTER TABLE t ALTER COLUMN n DROP DEFAULT", Ddl),
-        (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, n varchar(10))",
-            Refused("varchar/char types"),
-        ),
-        (
-            "CREATE TABLE t (id BIGINT PRIMARY KEY, n char(3))",
-            Refused("varchar/char types"),
-        ),
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY, n varchar(10))", Ddl),
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY, n char(3))", Ddl),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, n character varying(5))",
-            Refused("varchar/char types"),
+            Ddl,
         ),
         (
             "ALTER TABLE t ADD COLUMN n varchar(10)",
-            Refused("varchar/char types"),
+            Refused("ALTER TABLE row rewrite"),
         ),
         ("CREATE INDEX i ON t (n)", Refused("secondary indexes")),
         ("INSERT INTO t SELECT id, n FROM t", Dml),
@@ -234,9 +228,6 @@ fn catalog_image_refuses_unenforced_check_and_foreign_key() {
     for sql in [
         "CREATE TABLE c (id BIGINT PRIMARY KEY, n BIGINT CHECK (n > 0))",
         "CREATE TABLE f (id BIGINT PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-        // E1 r5: a legacy-created varchar/char column fails closed too.
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, v varchar(10))",
-        "CREATE TABLE b (id BIGINT PRIMARY KEY, v char(3))",
     ] {
         let mut state = plain_fixture();
         run(&mut state, sql);

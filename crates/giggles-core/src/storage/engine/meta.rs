@@ -9,7 +9,8 @@ use std::{
 };
 
 pub(crate) const CURRENT_SUBVERSION: u32 = 1;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 10] = [
+pub(crate) const TEXT_BACKED_COLUMN_TYPES: u64 = 1 << 10;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 11] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -20,6 +21,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 10] = [
     (128, "extended_types"),
     (256, "sequence_counters"),
     (512, "role_bootstrap"),
+    (TEXT_BACKED_COLUMN_TYPES, "text_backed_column_types"),
 ];
 const MARKER: &str = "GIGGLES_FORMAT";
 const TMP: &str = "GIGGLES_FORMAT.tmp";
@@ -247,7 +249,10 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     })
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    if bits & !1023 != 0 {
+    check_features_allowed(bits, 2047)
+}
+fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
+    if bits & !allowed != 0 {
         return Err(FormatError::Unsupported("feature bits".into()));
     }
     if bits & 256 != 0 && bits & 64 == 0 {

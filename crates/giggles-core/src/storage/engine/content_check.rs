@@ -19,10 +19,13 @@ pub(crate) fn required_bits_for_catalog_value(
 ) -> Result<u64, FormatError> {
     match catalog_codec::classify_catalog_key(key).map_err(corrupt)? {
         CatalogKind::Table => {
-            let (_, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
+            let (entry, ext) = catalog_codec::decode_table(value).map_err(corrupt)?;
             let mut required = if ext.is_empty() { 0 } else { 64 };
             if ext.values().any(|column| column.typmod.is_some()) {
                 required |= 128;
+            }
+            if catalog_codec::requires_text_backed_types(&entry.def) {
+                required |= super::meta::TEXT_BACKED_COLUMN_TYPES;
             }
             Ok(required)
         }

@@ -559,37 +559,62 @@ fn decoded_foreign_key_columns_belong_to_owning_table() {
 }
 
 #[test]
-fn varchar_char_refused_on_v2_without_changing_bytes() {
-    // DD-0068 E1130: live varchar/char never reaches v2 bytes.
-    let refused = |result: Result<Vec<u8>, CoreError>| {
-        assert!(matches!(
-            result,
-            Err(CoreError::EngineUnsupported {
-                engine: "v2",
-                feature: V2_VARCHAR_CHAR
-            })
-        ))
-    };
-    for data_type in [DataType::Varchar, DataType::Bpchar] {
+fn appended_column_type_tags_and_existing_typmod_round_trip() {
+    use crate::relational::catalog_ext::TextKind;
+    for (data_type, tag, kind, typmod) in [
+        (DataType::Varchar, 15u32, Some(TextKind::Varchar), Some(14)),
+        (DataType::Bpchar, 16, Some(TextKind::Bpchar), Some(7)),
+        (DataType::Uuid, 17, None, None),
+        (DataType::Jsonb, 18, None, None),
+        (DataType::IntArray, 19, None, None),
+        (DataType::BigIntArray, 20, None, None),
+        (DataType::TextArray, 21, None, None),
+    ] {
+        assert_eq!(
+            super::super::super::encode(&DataTypeDto::try_from(data_type.clone()).unwrap())
+                .unwrap(),
+            tag.to_be_bytes()
+        );
         let mut entry = table();
+        entry.def.primary_key.clear();
         entry.def.columns[0].data_type = data_type;
-        refused(encode_table(&entry, &BTreeMap::new()));
+        let mut ext = BTreeMap::new();
+        if kind.is_some() {
+            ext.insert(
+                2,
+                ColumnExt {
+                    typmod,
+                    text_kind: kind,
+                    ..ColumnExt::default()
+                },
+            );
+        }
+        entry.columns_ext = ext.clone();
+        let encoded = encode_table(&entry, &ext).unwrap();
+        assert_eq!(decode_table(&encoded).unwrap(), (entry, ext));
     }
-    let mut ext = BTreeMap::new();
-    ext.insert(
-        2,
-        ColumnExt {
-            typmod: None,
-            default: None,
-            identity: None,
-            text_kind: Some(crate::relational::catalog_ext::TextKind::Varchar),
-            type_id: None,
-        },
-    );
-    refused(encode_table(&table(), &ext));
-    // Unchanged frozen bytes for everything representable.
+    // All previously representable catalog bytes remain frozen.
     assert_eq!(
         encode_table(&table(), &BTreeMap::new()).unwrap(),
         hex(TABLE)
     );
+}
+
+#[test]
+fn inconsistent_text_kind_and_user_type_are_still_refused() {
+    let mut ext = BTreeMap::new();
+    ext.insert(
+        2,
+        ColumnExt {
+            text_kind: Some(TextKind::Varchar),
+            ..ColumnExt::default()
+        },
+    );
+    assert_corrupt(encode_table(&table(), &ext));
+    ext.get_mut(&2).unwrap().text_kind = None;
+    ext.get_mut(&2).unwrap().type_id = Some(42);
+    assert!(matches!(
+        encode_table(&table(), &ext),
+        Err(CoreError::Unsupported)
+    ));
 }

@@ -13,7 +13,7 @@ use crate::{
     CoreError,
     relational::{
         self, ColumnDef, SqlError, TableDef,
-        catalog_ext::{CatalogExt, ColumnExt, Constraint, SequenceDef, TypeDef},
+        catalog_ext::{CatalogExt, ColumnExt, Constraint, LogicalKind, SequenceDef, TypeDef},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,17 @@ impl CatalogView {
                 parts.heap.insert(entry.def.id);
             }
             parts.ext.columns.extend(entry.columns_ext.clone());
+            for column in &entry.def.columns {
+                let kind = match column.data_type {
+                    relational::DataType::Uuid => LogicalKind::Uuid,
+                    relational::DataType::Jsonb => LogicalKind::Jsonb,
+                    relational::DataType::IntArray => LogicalKind::IntArray,
+                    relational::DataType::BigIntArray => LogicalKind::BigIntArray,
+                    relational::DataType::TextArray => LogicalKind::TextArray,
+                    _ => continue,
+                };
+                parts.ext.logical_kinds.insert(column.id, kind);
+            }
         }
         parts.ext.constraints = self
             .constraints
@@ -91,6 +102,17 @@ impl CatalogView {
         parts.ext.types = self.types.clone();
         if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
             parts.ext.ext_version = 2;
+        }
+        if parts
+            .ext
+            .columns
+            .values()
+            .any(|column| column.text_kind.is_some())
+        {
+            parts.ext.ext_version = 3;
+        }
+        if !parts.ext.logical_kinds.is_empty() {
+            parts.ext.ext_version = 4;
         }
         parts
     }
@@ -243,6 +265,13 @@ impl Catalog {
         }
         if new.ext.columns.values().any(|c| c.typmod.is_some()) {
             txn.require_features(1 << 7);
+        }
+        if new
+            .tables
+            .values()
+            .any(catalog_codec::requires_text_backed_types)
+        {
+            txn.require_features(super::meta::TEXT_BACKED_COLUMN_TYPES);
         }
         for (id, def) in &old.ext.sequences {
             if !new.ext.sequences.contains_key(id) {

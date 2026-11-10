@@ -376,16 +376,20 @@ fn post_image_check_is_unsupported() {
 }
 
 #[test]
-fn post_image_varchar_is_unsupported() {
-    let (tables, ext, next_id, _) =
-        created_catalog("CREATE TABLE t (id bigint PRIMARY KEY, v varchar(10))");
-    assert!(matches!(
-        check_post_image(&tables, &ext, next_id),
-        Err(CoreError::EngineUnsupported {
-            engine: "v2",
-            feature: "SQL statement"
-        })
-    ));
+fn post_image_text_backed_column_types_are_valid() {
+    for ty in [
+        "varchar(10)",
+        "char(3)",
+        "uuid",
+        "jsonb",
+        "int[]",
+        "bigint[]",
+        "text[]",
+    ] {
+        let (tables, ext, next_id, _) =
+            created_catalog(&format!("CREATE TABLE t (id bigint PRIMARY KEY, v {ty})"));
+        check_post_image(&tables, &ext, next_id).unwrap();
+    }
 }
 
 #[test]
@@ -395,27 +399,160 @@ fn post_image_primary_key_is_valid() {
 }
 
 #[test]
-fn varchar_char_refusals_leave_catalog_bytes_unchanged() {
-    let f = Fixture::new();
-    f.execute("CREATE TABLE q (id bigint PRIMARY KEY)");
-    for sql in [
-        "CREATE TABLE t (id bigint PRIMARY KEY, v varchar(10))",
-        "CREATE TABLE t (id bigint PRIMARY KEY, v char(3))",
-        "ALTER TABLE q ADD COLUMN v varchar(10)",
+fn text_backed_columns_match_legacy_and_reopen() {
+    use relational::{DataType, Value};
+    for (ty, data_type, literal, typmod) in [
+        ("varchar(5)", DataType::Varchar, "'hello'", Some(9)),
+        ("char(3)", DataType::Bpchar, "'x'", Some(7)),
+        (
+            "uuid",
+            DataType::Uuid,
+            "'550E8400-E29B-41D4-A716-446655440000'",
+            None,
+        ),
+        ("jsonb", DataType::Jsonb, r#"'{"b":2,"a":1}'"#, None),
+        ("int[]", DataType::IntArray, "'{1,-2,NULL}'", None),
+        (
+            "bigint[]",
+            DataType::BigIntArray,
+            "'{9223372036854775807,-2,NULL}'",
+            None,
+        ),
+        ("text[]", DataType::TextArray, "'{hello,world,NULL}'", None),
     ] {
-        let bytes = f.catalog_bytes();
-        assert!(
-            matches!(
-                f.admin().sql_session().execute(sql, &[], None),
-                Err(CoreError::EngineUnsupported {
-                    engine: "v2",
-                    feature: "varchar/char types"
-                })
-            ),
-            "{sql}"
+        let mut f = Fixture::new();
+        let path = f.path.with_extension("column-types-legacy");
+        let legacy = Admin::create(&path, Limits::default()).unwrap();
+        let expected;
+        {
+            let mut a = legacy.sql_session();
+            let mut b = f.admin().sql_session();
+            parity(
+                &mut a,
+                &mut b,
+                &format!("CREATE TABLE t (id bigint PRIMARY KEY, v {ty})"),
+                &[],
+            )
+            .unwrap();
+            parity(
+                &mut a,
+                &mut b,
+                &format!("INSERT INTO t VALUES (1,{literal}),(2,NULL)"),
+                &[],
+            )
+            .unwrap();
+            expected = parity(&mut a, &mut b, "SELECT * FROM t ORDER BY id", &[]).unwrap();
+            assert!(matches!(expected.rows[0].values[1], Value::Text(_)), "{ty}");
+        }
+        let parts = f.parts();
+        let column = &parts.tables["t"].columns[1];
+        assert_eq!(column.data_type, data_type);
+        assert_eq!(
+            parts.ext.columns.get(&column.id).and_then(|ext| ext.typmod),
+            typmod
         );
-        assert_eq!(f.catalog_bytes(), bytes, "{sql}");
+        let features = engine::meta::validate_meta(f.db().kv.as_ref())
+            .unwrap()
+            .features;
+        assert_ne!(features & engine::meta::TEXT_BACKED_COLUMN_TYPES, 0);
+        f.reopen();
+        assert_eq!(f.parts(), parts, "{ty}");
+        assert_eq!(
+            values(&mut f.admin().sql_session(), "SELECT * FROM t ORDER BY id"),
+            expected
+                .rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            "{ty}"
+        );
+        let mut a = legacy.sql_session();
+        let mut b = f.admin().sql_session();
+        parity(
+            &mut a,
+            &mut b,
+            "UPDATE t SET v=NULL WHERE id=1 RETURNING *",
+            &[],
+        )
+        .unwrap();
+        parity(&mut a, &mut b, "SELECT * FROM t ORDER BY id", &[]).unwrap();
+        drop((a, b, legacy));
+        fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[test]
+fn text_column_revision_preserves_old_catalog_and_feature_bytes() {
+    let mut f = Fixture::new();
+    f.execute("CREATE TABLE q (id bigint PRIMARY KEY, v text)");
+    f.execute("INSERT INTO q VALUES (1,'old')");
+    let bytes = f.catalog_bytes();
+    let features = f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap();
+    assert_eq!(
+        u64::from_be_bytes(features.clone().try_into().unwrap())
+            & engine::meta::TEXT_BACKED_COLUMN_TYPES,
+        0
+    );
+    f.reopen();
+    assert_eq!(f.catalog_bytes(), bytes);
+    assert_eq!(
+        f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap(),
+        features
+    );
+    {
+        let mut session = f.admin().sql_session();
+        session.execute("BEGIN", &[], None).unwrap();
+        session
+            .execute(
+                "CREATE TABLE rolled (id bigint PRIMARY KEY, v varchar(5))",
+                &[],
+                None,
+            )
+            .unwrap();
+        session.execute("ROLLBACK", &[], None).unwrap();
+    }
+    assert_eq!(f.catalog_bytes(), bytes);
+    assert_eq!(
+        f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap(),
+        features
+    );
+    f.execute("CREATE TABLE added (id bigint PRIMARY KEY, v uuid)");
+    f.execute("DROP TABLE added");
+    f.reopen();
+    assert_ne!(
+        engine::meta::validate_meta(f.db().kv.as_ref())
+            .unwrap()
+            .features
+            & engine::meta::TEXT_BACKED_COLUMN_TYPES,
+        0
+    );
+}
+
+#[test]
+fn varchar_length_errors_match_legacy_after_reopen() {
+    let mut f = Fixture::new();
+    let path = f.path.with_extension("typmod-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    {
+        let mut a = legacy.sql_session();
+        let mut b = f.admin().sql_session();
+        parity(
+            &mut a,
+            &mut b,
+            "CREATE TABLE t (id bigint PRIMARY KEY, v varchar(2), c char(3))",
+            &[],
+        )
+        .unwrap();
+        parity(&mut a, &mut b, "INSERT INTO t VALUES (1,'ab','x')", &[]).unwrap();
+    }
+    f.reopen();
+    let mut a = legacy.sql_session();
+    let mut b = f.admin().sql_session();
+    parity(&mut a, &mut b, "INSERT INTO t VALUES (2,'abc','x')", &[]).unwrap_err();
+    parity(&mut a, &mut b, "INSERT INTO t VALUES (2,'ab','abcd')", &[]).unwrap_err();
+    parity(&mut a, &mut b, "SELECT * FROM t ORDER BY id", &[]).unwrap();
+    drop((a, b, legacy));
+    fs::remove_dir_all(path).unwrap();
 }
 
 fn values(session: &mut SqlSession, sql: &str) -> Vec<Vec<relational::Value>> {
