@@ -9,6 +9,8 @@ use std::ops::Bound;
 
 #[path = "v2_large_ddl_tests.rs"]
 mod large_ddl;
+#[path = "v2_large_dml_tests.rs"]
+mod large_dml;
 
 struct Fixture {
     path: std::path::PathBuf,

@@ -9,6 +9,10 @@ use crate::CoreError;
 
 pub(crate) type DdlRows = BTreeMap<Vec<u8>, SqlRow>;
 
+pub(crate) fn row_key(table: &TableDef, row: &SqlRow) -> R<Vec<u8>> {
+    pk(table, &row.values)
+}
+
 pub(crate) trait RowSink {
     /// FK witnesses need a fresh snapshot after acquiring their table locks.
     fn check_fk_snapshot(&self) -> Result<(), CoreError> {
@@ -43,6 +47,7 @@ pub(crate) trait RowSink {
         &mut self,
         _table: &TableDef,
         _after: &TableDef,
+        _mutating: bool,
         _page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
@@ -90,6 +95,10 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
+        if expected.is_none() && sink.streams_index_builds() && paged_dml::eligible(self, prepared)
+        {
+            return paged_dml::execute(self, prepared, params, clock, sink, version_end);
+        }
         let streamed_ddl = match &prepared.statement {
             Statement::DropIndex(_) | Statement::DropTable { .. } => true,
             Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
@@ -117,7 +126,7 @@ impl Relational {
                 .map_err(CoreError::Sql)?;
             if let Statement::AlterTable(alter) = &prepared.statement {
                 let table = &original.tables[&alter.table];
-                sink.ddl_pages(table, &self.tables[&alter.table], &mut |rows| {
+                sink.ddl_pages(table, &self.tables[&alter.table], false, &mut |rows| {
                     let mut page = original.clone();
                     page.rows.insert(table.id, rows);
                     page.execute_statement_inner(
@@ -419,6 +428,8 @@ impl Relational {
 
 #[path = "row_sink_constraints.rs"]
 mod constraint_rows;
+#[path = "row_sink_dml.rs"]
+mod paged_dml;
 use constraint_rows::{hydrate, rebuild};
 
 #[cfg(test)]

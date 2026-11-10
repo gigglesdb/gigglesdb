@@ -2,7 +2,7 @@
 use super::*;
 use relational::Value::Int;
 
-fn large_table(count: usize, duplicates: bool, indexed: bool) -> Fixture {
+pub(super) fn large_table(count: usize, duplicates: bool, indexed: bool) -> Fixture {
     let f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v bigint)");
     if indexed {

@@ -398,8 +398,7 @@ impl SqlSession {
                             floor..floor
                         };
                         let versions = if matches!(class, V2Class::Dml) {
-                            db.sequences
-                                .reserve_range(3, 0, relational::MAX_ROWS as u64 + 1)?
+                            db.sequences.reserve_range(3, 0, 1_000_001)?
                         } else {
                             1..u64::MAX
                         };
@@ -630,6 +629,7 @@ impl RowSink for SqlRows<'_> {
         &mut self,
         table: &TableDef,
         after: &TableDef,
+        mutating: bool,
         page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
     ) -> Result<(), CoreError> {
         let entry = TableEntry {
@@ -667,8 +667,16 @@ impl RowSink for SqlRows<'_> {
                 break;
             };
             lower = Bound::Excluded(last);
+            let rows = rows
+                .into_values()
+                .map(|row| relational::row_sink::row_key(table, &row).map(|key| (key, row)))
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(CoreError::Sql)?;
             let rewritten = page(rows.clone())?;
-            if table.columns.len() != after.columns.len() {
+            if mutating {
+                self.apply_indexes(table, Some(after), &rows, &rewritten, &self.indexes())?;
+                self.apply(table, &rows, &rewritten)?;
+            } else if table.columns.len() != after.columns.len() {
                 // The codec supplies NULL, not a frozen missing-column default.
                 // Rewrite bounded pages in the OUTER transaction: rows and the
                 // new layout become visible together, including after a crash.

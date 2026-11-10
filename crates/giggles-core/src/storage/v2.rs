@@ -67,11 +67,17 @@ impl V2Db {
         let sequencer = engine::commit::Sequencer::open(
             kv.clone(),
             Arc::new(engine::commit::SystemClock),
-            engine::commit::SequencerConfig::default(),
+            engine::commit::SequencerConfig {
+                // Atomic paged DML retains transaction writes and savepoint undo.
+                write_set_bytes: 1024 * 1024 * 1024,
+                ..Default::default()
+            },
         )?;
-        let locks = Arc::new(engine::locks::LockManager::new(
-            engine::locks::LockConfig::default(),
-        ));
+        let locks = Arc::new(engine::locks::LockManager::new(engine::locks::LockConfig {
+            // One million rows plus old/new keys for secondary indexes.
+            max_row_locks_per_txn: 8_000_000,
+            ..Default::default()
+        }));
         let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
         let catalog =
             engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;

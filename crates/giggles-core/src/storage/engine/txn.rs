@@ -459,12 +459,20 @@ impl Transaction {
             ts,
         )?
         .peekable();
-        let lo = start.clone();
-        let hi = end.clone();
+        // Paged mutations grow the overlay after every page. Seek directly to
+        // this range rather than re-filtering all earlier writes on each scan.
+        let own_bounds = if empty {
+            (Bound::Included((ks, vec![])), Bound::Excluded((ks, vec![])))
+        } else {
+            (
+                start.clone().map(|key| (ks, key)),
+                end.clone().map(|key| (ks, key)),
+            )
+        };
         let own = self
             .writes
-            .iter()
-            .filter(move |((space, key), _)| *space == ks && contains(&lo, &hi, key));
+            .range(own_bounds)
+            .filter(move |((space, _), _)| *space == ks);
         let own: OwnIter<'a> = match dir {
             Direction::Forward => Box::new(own),
             Direction::Reverse => Box::new(own.rev()),
@@ -565,17 +573,6 @@ impl Drop for Transaction {
         self.snapshot.take();
     }
 }
-fn contains(start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>, key: &[u8]) -> bool {
-    (match start {
-        Bound::Included(k) => key >= k.as_slice(),
-        Bound::Excluded(k) => key > k.as_slice(),
-        Bound::Unbounded => true,
-    }) && (match end {
-        Bound::Included(k) => key <= k.as_slice(),
-        Bound::Excluded(k) => key < k.as_slice(),
-        Bound::Unbounded => true,
-    })
-}
 type OwnEntry<'a> = (&'a (Keyspace, Vec<u8>), &'a Option<Vec<u8>>);
 type OwnIter<'a> = Box<dyn Iterator<Item = OwnEntry<'a>> + 'a>;
 pub(crate) struct TxnScan<'a> {
@@ -667,8 +664,8 @@ impl Iterator for TxnScan<'_> {
     }
 }
 #[cfg(test)]
-#[path = "txn_tests.rs"]
-mod tests;
-#[cfg(test)]
 #[path = "savepoint_tests.rs"]
 mod savepoint_tests;
+#[cfg(test)]
+#[path = "txn_tests.rs"]
+mod tests;
