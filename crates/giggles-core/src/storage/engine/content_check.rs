@@ -17,6 +17,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     if key.first().is_some_and(|kind| (8..=13).contains(kind)) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::super::roles::engine::FEATURE)
+    } else if key.first().is_some_and(|kind| matches!(kind, 14 | 15)) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::SCHEMAS_AND_USER_TYPES)
     } else {
         Ok(0)
     }
@@ -37,13 +40,24 @@ pub(crate) fn required_bits_for_catalog_value(
             if catalog_codec::requires_text_backed_types(&entry.def) {
                 required |= super::meta::TEXT_BACKED_COLUMN_TYPES;
             }
+            if ext.values().any(|column| column.type_id.is_some()) || entry.def.name.contains('\0')
+            {
+                required |= super::meta::SCHEMAS_AND_USER_TYPES;
+            }
             Ok(required)
         }
         CatalogKind::Constraint | CatalogKind::Sequence | CatalogKind::Type => Ok(64),
         // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
         // so the commit guard must refuse it too (DD-0068 X1).
         CatalogKind::RoleBootstrap => Ok(512),
-        CatalogKind::Name => Ok(0),
+        CatalogKind::Name => Ok(if key[1..key.len() - 1].contains(&0) {
+            super::meta::SCHEMAS_AND_USER_TYPES
+        } else {
+            0
+        }),
+        CatalogKind::Schema | CatalogKind::TypeDefinition => {
+            Ok(super::meta::SCHEMAS_AND_USER_TYPES)
+        }
         CatalogKind::Role
         | CatalogKind::RoleMembership
         | CatalogKind::TableOwner
@@ -111,10 +125,13 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
                     catalog_codec::decode_sequence(value).map_err(corrupt)?,
                 );
             }
-            CatalogKind::Type => {
+            CatalogKind::Type | CatalogKind::TypeDefinition => {
                 catalog_codec::decode_type(value)
                     .map(|_| ())
                     .map_err(corrupt)?;
+            }
+            CatalogKind::Schema => {
+                catalog_codec::decode_schema(value).map_err(corrupt)?;
             }
             // The role-bootstrap gate and its existing opaque payload fixture
             // are owned by validate_meta.

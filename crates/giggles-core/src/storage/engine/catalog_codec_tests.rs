@@ -308,7 +308,7 @@ fn catalog_keys() {
         (name_key("t"), CatalogKind::Name),
         (constraint_key(1, 2), CatalogKind::Constraint),
         (sequence_key(1), CatalogKind::Sequence),
-        (type_key(1), CatalogKind::Type),
+        (type_key(1), CatalogKind::TypeDefinition),
         (object_key(7, 1), CatalogKind::RoleBootstrap),
     ] {
         assert_eq!(classify_catalog_key(&key).unwrap(), kind);
@@ -467,7 +467,7 @@ fn decoded_typmods_are_checked_against_column_type() {
 
 #[test]
 fn decoded_table_and_column_names_follow_legacy_bounds() {
-    for name in [String::new(), "a".repeat(64), "é".repeat(32), "a\0b".into()] {
+    for name in [String::new(), "a".repeat(64), "é".repeat(32)] {
         let mut dto = table_dto();
         dto.def.name = name.clone();
         assert_bad_table(&dto);
@@ -601,7 +601,7 @@ fn appended_column_type_tags_and_existing_typmod_round_trip() {
 }
 
 #[test]
-fn inconsistent_text_kind_and_user_type_are_still_refused() {
+fn inconsistent_text_kind_is_refused_and_user_type_reference_roundtrips() {
     let mut ext = BTreeMap::new();
     ext.insert(
         2,
@@ -613,8 +613,58 @@ fn inconsistent_text_kind_and_user_type_are_still_refused() {
     assert_corrupt(encode_table(&table(), &ext));
     ext.get_mut(&2).unwrap().text_kind = None;
     ext.get_mut(&2).unwrap().type_id = Some(42);
-    assert!(matches!(
-        encode_table(&table(), &ext),
-        Err(CoreError::Unsupported)
-    ));
+    let bytes = encode_table(&table(), &ext).unwrap();
+    let (_, decoded) = decode_table(&bytes).unwrap();
+    assert_eq!(decoded[&2].type_id, Some(42));
+}
+
+#[test]
+fn schema_and_type_wire_extensions_are_append_only() {
+    use crate::relational::schemas::Schema;
+    assert_eq!(schema_key("app"), hex("0e61707000"));
+    assert_eq!(type_key(42), hex("0f000000000000002a"));
+    let schema = Schema {
+        id: 42,
+        owner: "owner".into(),
+    };
+    assert_eq!(
+        encode_schema(&schema).unwrap(),
+        hex("01000000000000002a00000000000000056f776e6572")
+    );
+    assert_eq!(
+        decode_schema(&encode_schema(&schema).unwrap()).unwrap(),
+        schema
+    );
+    let ty = TypeDef::Enum {
+        name: "e".into(),
+        schema: "app".into(),
+        labels: vec!["x".into(), "y".into()],
+    };
+    let mut expected = vec![1];
+    // Legacy v6 TypeDef payload: u32 enum tag, strings and vectors with u64 lengths.
+    expected.extend(0u32.to_be_bytes());
+    for value in ["e", "app"] {
+        expected.extend((value.len() as u64).to_be_bytes());
+        expected.extend(value.as_bytes());
+    }
+    expected.extend(2u64.to_be_bytes());
+    for value in ["x", "y"] {
+        expected.extend(1u64.to_be_bytes());
+        expected.extend(value.as_bytes());
+    }
+    assert_eq!(encode_type(ty.clone()).unwrap(), expected);
+    assert_eq!(decode_type(&expected).unwrap(), ty);
+    let mut reference = 22u32.to_be_bytes().to_vec();
+    reference.extend(42u64.to_be_bytes());
+    assert_eq!(
+        super::super::super::encode(&DataTypeDto::UserType(42)).unwrap(),
+        reference
+    );
+    assert_eq!(
+        classify_catalog_key(&name_key("app\0t")).unwrap(),
+        CatalogKind::Name
+    );
+    for name in ["\0t", "app\0", "app\0t\0bad", "public\0t"] {
+        assert_corrupt(classify_catalog_key(&name_key(name)));
+    }
 }

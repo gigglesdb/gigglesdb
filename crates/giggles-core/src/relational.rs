@@ -952,7 +952,7 @@ enum Statement {
     RollbackTo(String),
 }
 mod schema_binding;
-mod schemas;
+pub(crate) mod schemas;
 #[doc(hidden)]
 pub use schema_binding::relation_key;
 pub(crate) use schema_binding::split_key;
@@ -1532,7 +1532,7 @@ impl Prepared {
             Statement::Begin => V2Class::Control("begin"),
             Statement::Commit => V2Class::Control("commit"),
             Statement::Rollback => V2Class::Control("rollback"),
-            Statement::CompositeSelect(_) => V2Class::Refused("user types"),
+            Statement::CompositeSelect(_) => V2Class::Read,
             Statement::Select { .. } | Statement::Query(_) => V2Class::Read,
             // ON CONFLICT's unique-index dependency requires catalog/private conflict data.
             Statement::InsertMulti(_)
@@ -1541,17 +1541,9 @@ impl Prepared {
             | Statement::Update { .. }
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
-            Statement::Schema(_) => V2Class::Refused("user schemas"),
-            Statement::TypeDdl(_) => V2Class::Refused("user types"),
+            Statement::Schema(_) | Statement::TypeDdl(_) => V2Class::Ddl,
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
-            Statement::Create {
-                constraints,
-                user_types,
-                ..
-            } => {
-                if user_types.iter().any(Option::is_some) {
-                    return V2Class::Refused("user types");
-                }
+            Statement::Create { constraints, .. } => {
                 let (mut unique, mut unenforced) = (false, false);
                 for constraint in constraints {
                     match constraint {

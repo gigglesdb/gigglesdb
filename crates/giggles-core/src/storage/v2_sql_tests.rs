@@ -1154,3 +1154,177 @@ fn all_statement_sources_share_one_snapshot_despite_concurrent_commit() {
         }
     }
 }
+
+#[test]
+fn schemas_and_user_types_match_legacy_and_persist() {
+    use relational::Value;
+    let mut f = Fixture::new();
+    let path = f.path.with_extension("schema-types-legacy");
+    let legacy = Admin::create(&path, Limits::default()).unwrap();
+    let expected;
+    {
+        let mut a = legacy.sql_session();
+        let mut b = f.admin().sql_session();
+        for sql in [
+            "CREATE SCHEMA app",
+            "CREATE SCHEMA other",
+            "SELECT 1",
+            "CREATE TYPE app.mood AS ENUM ('sad','ok','happy')",
+            "SELECT 1",
+            "CREATE DOMAIN app.positive AS integer CHECK (VALUE > 0)",
+            "CREATE DOMAIN app.short_text AS varchar(3)",
+            "CREATE TYPE app.pair AS (n integer, label varchar(3))",
+            "CREATE TABLE public.t (id integer PRIMARY KEY, v text)",
+            "CREATE TABLE app.t (id integer PRIMARY KEY, m app.mood, n app.positive, s app.short_text)",
+            "CREATE TABLE other.t (id integer PRIMARY KEY, v text)",
+            "INSERT INTO public.t VALUES (1,'public')",
+            "INSERT INTO app.t VALUES (1,'happy',1,'abc'),(2,'sad',2,'x'),(3,'ok',3,NULL)",
+            "INSERT INTO other.t VALUES (1,'other')",
+            "SELECT id,m,n,s FROM app.t ORDER BY m",
+            "SELECT ROW(7,'abc')::app.pair",
+        ] {
+            parity(&mut a, &mut b, sql, &[]).unwrap();
+        }
+        assert_eq!(
+            parity(&mut a, &mut b, "CREATE SCHEMA app", &[]).unwrap_err(),
+            CoreError::DuplicateSchema
+        );
+        parity(&mut a, &mut b, "CREATE SCHEMA IF NOT EXISTS app", &[]).unwrap();
+        let ordered = values(&mut b, "SELECT m FROM app.t ORDER BY m");
+        assert_eq!(
+            ordered,
+            vec![
+                vec![Value::Text("sad".into())],
+                vec![Value::Text("ok".into())],
+                vec![Value::Text("happy".into())]
+            ]
+        );
+        let error = parity(
+            &mut a,
+            &mut b,
+            "INSERT INTO app.t VALUES (4,'ok',0,'a')",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Sql(relational::SqlError::CheckViolation)),
+            "{error:?}"
+        );
+        parity(
+            &mut a,
+            &mut b,
+            "INSERT INTO app.t VALUES (4,'bad',1,'a')",
+            &[],
+        )
+        .unwrap_err();
+        parity(
+            &mut a,
+            &mut b,
+            "INSERT INTO app.t VALUES (4,'ok',1,'long')",
+            &[],
+        )
+        .unwrap_err();
+        a.set_search_path("app,public", "postgres");
+        b.set_search_path("app,public", "postgres");
+        assert_eq!(
+            b.prepare("INSERT INTO t VALUES (4,'ok',1,'a')")
+                .unwrap()
+                .table(),
+            Some("app\0t")
+        );
+        parity(
+            &mut a,
+            &mut b,
+            "UPDATE public.t SET v='public2' WHERE id=1 RETURNING *",
+            &[],
+        )
+        .unwrap();
+        expected = parity(&mut a, &mut b, "SELECT id,m,n,s FROM t ORDER BY m", &[]).unwrap();
+        parity(
+            &mut a,
+            &mut b,
+            "UPDATE t SET n=n+1 WHERE id=1 RETURNING id,n",
+            &[],
+        )
+        .unwrap();
+        a.set_search_path("other,public", "postgres");
+        b.set_search_path("other,public", "postgres");
+        parity(&mut a, &mut b, "SELECT * FROM t", &[]).unwrap();
+        parity(
+            &mut a,
+            &mut b,
+            "CREATE TABLE chosen (id integer PRIMARY KEY)",
+            &[],
+        )
+        .unwrap();
+    }
+    let parts = f.parts();
+    assert!(parts.tables.contains_key("app\0t"));
+    assert!(parts.tables.contains_key("other\0chosen"));
+    let features = engine::meta::validate_meta(f.db().kv.as_ref())
+        .unwrap()
+        .features;
+    assert_ne!(features & engine::meta::SCHEMAS_AND_USER_TYPES, 0);
+    f.reopen();
+    assert_eq!(f.parts(), parts);
+    {
+        let mut a = legacy.sql_session();
+        let mut b = f.admin().sql_session();
+        a.set_search_path("app,public", "postgres");
+        b.set_search_path("app,public", "postgres");
+        let reopened = parity(&mut a, &mut b, "SELECT id,m,n,s FROM t ORDER BY m", &[]).unwrap();
+        assert_eq!(reopened.rows.len(), expected.rows.len());
+        parity(&mut a, &mut b, "SELECT ROW(7,'abc')::app.pair", &[]).unwrap();
+        parity(&mut a, &mut b, "DROP TYPE app.mood", &[]).unwrap_err();
+        parity(&mut a, &mut b, "DROP SCHEMA app", &[]).unwrap_err();
+        for sql in [
+            "DROP TABLE app.t",
+            "DROP TYPE app.mood",
+            "DROP DOMAIN app.positive",
+            "DROP DOMAIN app.short_text",
+            "DROP TYPE app.pair",
+            "DROP SCHEMA app",
+            "DROP SCHEMA other CASCADE",
+        ] {
+            parity(&mut a, &mut b, sql, &[]).unwrap();
+        }
+    }
+    f.reopen();
+    assert!(f.parts().ext.schemas.is_empty());
+    assert!(f.parts().ext.types.is_empty());
+    assert_ne!(
+        engine::meta::validate_meta(f.db().kv.as_ref())
+            .unwrap()
+            .features
+            & engine::meta::SCHEMAS_AND_USER_TYPES,
+        0
+    );
+    drop(legacy);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn schema_type_feature_is_transactional_and_old_catalog_stays_identical() {
+    let mut f = Fixture::new();
+    f.execute("CREATE TABLE t (id integer PRIMARY KEY)");
+    let bytes = f.catalog_bytes();
+    let features = f.db().kv.get(Keyspace::Meta, b"features").unwrap();
+    {
+        let mut s = f.admin().sql_session();
+        for sql in [
+            "BEGIN",
+            "CREATE SCHEMA rolled",
+            "CREATE TYPE e AS ENUM ('a','b')",
+            "ROLLBACK",
+        ] {
+            s.execute(sql, &[], None).unwrap();
+        }
+    }
+    assert_eq!(f.catalog_bytes(), bytes);
+    f.reopen();
+    assert_eq!(f.catalog_bytes(), bytes);
+    assert_eq!(
+        f.db().kv.get(Keyspace::Meta, b"features").unwrap(),
+        features
+    );
+}

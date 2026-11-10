@@ -62,6 +62,7 @@ pub(crate) struct CatalogView {
     pub(crate) constraints: BTreeMap<u64, BTreeMap<u64, Constraint>>,
     pub(crate) sequences: BTreeMap<u64, SequenceDef>,
     pub(crate) types: BTreeMap<u64, TypeDef>,
+    pub(crate) schemas: BTreeMap<String, relational::schemas::Schema>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -74,9 +75,13 @@ impl CatalogView {
     pub(crate) fn parts(&self) -> CatalogParts {
         let mut parts = CatalogParts::default();
         for entry in self.by_id.values() {
-            parts
-                .tables
-                .insert(entry.def.name.clone(), entry.def.clone());
+            let mut def = entry.def.clone();
+            let (schema, bare) = relational::split_key(&entry.def.name);
+            def.name = bare.into();
+            if schema != "public" {
+                parts.ext.table_schemas.insert(def.id, schema.into());
+            }
+            parts.tables.insert(entry.def.name.clone(), def);
             if entry.heap {
                 parts.heap.insert(entry.def.id);
             }
@@ -100,6 +105,7 @@ impl CatalogView {
             .collect();
         parts.ext.sequences = self.sequences.clone();
         parts.ext.types = self.types.clone();
+        parts.ext.schemas = self.schemas.clone();
         if parts.ext.constraints.values().flatten().any(|c| matches!(&c.kind, crate::relational::catalog_ext::ConstraintKind::ForeignKey { deferral, .. } if *deferral != crate::relational::catalog_ext::Deferral::NotDeferrable)) {
             parts.ext.ext_version = 2;
         }
@@ -113,6 +119,12 @@ impl CatalogView {
         }
         if !parts.ext.logical_kinds.is_empty() {
             parts.ext.ext_version = 4;
+        }
+        if !parts.ext.schemas.is_empty() {
+            parts.ext.ext_version = 5;
+        }
+        if !parts.ext.types.is_empty() {
+            parts.ext.ext_version = 6;
         }
         parts
     }
@@ -298,6 +310,9 @@ impl Catalog {
         {
             txn.require_features(super::meta::TEXT_BACKED_COLUMN_TYPES);
         }
+        if !new.ext.schemas.is_empty() || !new.ext.types.is_empty() {
+            txn.require_features(super::meta::SCHEMAS_AND_USER_TYPES);
+        }
         for (id, def) in &old.ext.sequences {
             if !new.ext.sequences.contains_key(id) {
                 txn.delete_counter(catalog_codec::counter_key(*id, def.incarnation))
@@ -442,7 +457,7 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
     ) -> Result<Arc<TableEntry>, CatalogError> {
         self.check()?;
-        validate_identifier(name)?;
+        validate_identifier(relational::split_key(name).1)?;
         if !matches!(
             mode,
             LockMode::AccessShare
@@ -515,7 +530,7 @@ impl Catalog {
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), CatalogError> {
         self.check()?;
-        validate_identifier(name)?;
+        validate_identifier(relational::split_key(name).1)?;
         self.lock_name(txn, name, deadline, cancel)?;
         let entry = self.resolve(txn, name, LockMode::AccessExclusive, deadline, cancel)?;
         let old = self.parts(txn)?;
@@ -760,12 +775,26 @@ fn apply_record(
                 view.sequences.remove(&id);
             }
         }
-        CatalogKind::Type => {
+        CatalogKind::Type => return Err(corrupt("unsupported historical type record")),
+        CatalogKind::TypeDefinition => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
                 view.types.insert(id, catalog_codec::decode_type(value)?);
             } else {
                 view.types.remove(&id);
+            }
+        }
+        CatalogKind::Schema => {
+            let name = std::str::from_utf8(&key[1..key.len() - 1])
+                .map_err(|_| corrupt("invalid schema name UTF-8"))?;
+            if let Some(value) = value {
+                view.schemas
+                    .insert(name.into(), catalog_codec::decode_schema(value)?);
+                if view.schemas.len() > MAX_TABLES {
+                    return Err(CoreError::Limit);
+                }
+            } else {
+                view.schemas.remove(name);
             }
         }
         CatalogKind::RoleBootstrap => {}
@@ -788,14 +817,38 @@ fn finish_view(
 ) -> Result<CatalogView, CoreError> {
     view.by_name.clear();
     let mut expected = BTreeMap::new();
-    for entry in view.by_id.values() {
+    for entry in view.by_id.values_mut() {
+        let entry = Arc::make_mut(entry);
+        for column in &mut entry.def.columns {
+            if let Some(id) = entry
+                .columns_ext
+                .get(&column.id)
+                .and_then(|ext| ext.type_id)
+            {
+                column.data_type = view
+                    .types
+                    .get(&id)
+                    .ok_or_else(|| corrupt("column user type absent"))?
+                    .storage_type()
+                    .map_err(|_| corrupt("unsupported user type column"))?;
+                let ext = entry.columns_ext.get_mut(&column.id).unwrap();
+                ext.text_kind = match column.data_type {
+                    relational::DataType::Varchar => {
+                        Some(relational::catalog_ext::TextKind::Varchar)
+                    }
+                    relational::DataType::Bpchar => Some(relational::catalog_ext::TextKind::Bpchar),
+                    _ => None,
+                };
+            }
+        }
         if expected
             .insert(entry.def.name.clone(), entry.def.id)
             .is_some()
         {
             return Err(corrupt("duplicate catalog relation name"));
         }
-        view.by_name.insert(entry.def.name.clone(), entry.clone());
+        view.by_name
+            .insert(entry.def.name.clone(), Arc::new(entry.clone()));
     }
     for (id, seq) in &view.sequences {
         if expected.insert(seq.name.clone(), *id).is_some() {
@@ -813,6 +866,14 @@ fn finish_view(
         return Err(corrupt("constraint table absent"));
     }
     view.names = names;
+    if !view.schemas.is_empty()
+        || !view.types.is_empty()
+        || view.by_name.keys().any(|name| name.contains('\0'))
+    {
+        let parts = view.parts();
+        relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
+            .map_err(|e| corrupt(&format!("invalid catalog image: {e:?}")))?;
+    }
     Ok(view)
 }
 fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreError> {
@@ -838,8 +899,20 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     for id in parts.ext.sequences.keys() {
         insert(*id, (5, 0))?;
     }
-    for id in parts.ext.types.keys() {
-        insert(*id, (6, 0))?;
+    for (id, ty) in &parts.ext.types {
+        insert(*id, (15, 0))?;
+        if let TypeDef::Enum { labels, .. } = ty {
+            for offset in 1..=labels.len() as u64 {
+                insert(
+                    id.checked_add(offset)
+                        .ok_or_else(|| corrupt("enum label id overflow"))?,
+                    (15, *id),
+                )?;
+            }
+        }
+    }
+    for schema in parts.ext.schemas.values() {
+        insert(schema.id, (14, 0))?;
     }
     Ok(result)
 }
@@ -850,7 +923,12 @@ fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Cor
     let mut columns = BTreeSet::new();
     let mut table_ids = BTreeSet::new();
     for (name, def) in &parts.tables {
-        if name != &def.name || !names.insert(name.clone()) {
+        let schema = parts
+            .ext
+            .table_schemas
+            .get(&def.id)
+            .map_or("public", String::as_str);
+        if *name != relational::relation_key(schema, &def.name) || !names.insert(name.clone()) {
             return Err(corrupt("catalog table name mismatch"));
         }
         table_ids.insert(def.id);
@@ -862,8 +940,10 @@ fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Cor
                 parts.ext.columns.get(&c.id).map(|v| (c.id, v.clone()))
             })
             .collect();
+        let mut stored_def = def.clone();
+        stored_def.name = name.clone();
         let entry = TableEntry {
-            def: def.clone(),
+            def: stored_def,
             heap: parts.heap.contains(&def.id),
             columns_ext: ext,
         };
@@ -898,10 +978,17 @@ fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Cor
         records.insert(catalog_codec::sequence_key(*id), value);
         records.insert(name_key(&def.name), id.to_be_bytes().to_vec());
     }
-    // User types currently belong to the namespace-5 ext-version-six layout.
-    // Refuse them rather than dropping metadata in the independent v2 codec.
-    if !parts.ext.types.is_empty() {
-        return Err(CoreError::Unsupported);
+    for (id, ty) in &parts.ext.types {
+        records.insert(
+            catalog_codec::type_key(*id),
+            catalog_codec::encode_type(ty.clone())?,
+        );
+    }
+    for (name, schema) in &parts.ext.schemas {
+        records.insert(
+            catalog_codec::schema_key(name),
+            catalog_codec::encode_schema(schema)?,
+        );
     }
     Ok(records)
 }

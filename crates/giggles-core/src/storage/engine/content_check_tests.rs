@@ -265,3 +265,33 @@ fn appended_column_tags_require_the_new_feature_on_open() {
         check(&kv, required).unwrap();
     }
 }
+
+#[test]
+fn schema_and_user_type_records_require_bit_twelve_even_when_tombstoned() {
+    let schema = crate::relational::schemas::Schema {
+        id: 1,
+        owner: "postgres".into(),
+    };
+    let ty = crate::relational::TypeDef::Enum {
+        name: "e".into(),
+        schema: "public".into(),
+        labels: vec!["a".into()],
+    };
+    for (key, value) in [
+        (
+            catalog_codec::schema_key("app"),
+            catalog_codec::encode_schema(&schema).unwrap(),
+        ),
+        (
+            catalog_codec::type_key(2),
+            catalog_codec::encode_type(ty).unwrap(),
+        ),
+    ] {
+        for live in [true, false] {
+            let kv = MemKv::new();
+            catalog(&kv, key.clone(), 1, live.then_some(value.clone()));
+            corrupt_check(&kv, 0x0FFF);
+            check(&kv, 0x1FFF).unwrap();
+        }
+    }
+}

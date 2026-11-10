@@ -1956,7 +1956,7 @@ mod f8a_commit_tests {
         for value in [
             vec![0; 7],
             256u64.to_be_bytes().to_vec(),
-            4096u64.to_be_bytes().to_vec(),
+            8192u64.to_be_bytes().to_vec(),
         ] {
             let (mem, seq) = fixture();
             drop(seq);

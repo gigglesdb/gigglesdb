@@ -22,6 +22,11 @@ impl SqlSession {
                 }
                 p.transaction = self.transaction_id;
                 p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+                // Match legacy preparation: authority sees bound dependency names,
+                // while semantic errors remain deferred until after authorization.
+                if let Ok(bound) = self.bind_relation_context(&p) {
+                    p = bound;
+                }
                 Ok(p)
             });
         if result.is_err() {
@@ -154,16 +159,23 @@ impl SqlSession {
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
                         let parts = db.catalog().parts(txn)?;
-                        let key = |name: &str| {
-                            let (schema, name) = split_key(name);
-                            relation_key(schema, name)
-                        };
-                        let target_name = p.table().map(key);
-                        let mut names = p
-                            .read_tables()
-                            .into_iter()
-                            .map(|name| key(&name))
-                            .collect::<BTreeSet<_>>();
+                        // Bind from the original references, preserving explicit public
+                        // qualification even when another schema shadows the bare name.
+                        let binding = relational::Relational::catalog_image(
+                            parts.tables.clone(),
+                            parts.ext.clone(),
+                            u64::MAX,
+                            u64::MAX,
+                        )
+                        .map_err(|error| match error {
+                            E::Unsupported => CoreError::Sql(E::Unsupported),
+                            error => {
+                                CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
+                            }
+                        })?;
+                        let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
+                        let target_name = bound.table().map(str::to_owned);
+                        let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
                         if let Some(name) = &target_name {
                             names.insert(name.clone());
                         }
@@ -226,7 +238,13 @@ impl SqlSession {
                                 })
                                 .chain(old.ext.constraints.values().flatten().map(|c| c.id))
                                 .chain(old.ext.sequences.keys().copied())
-                                .chain(old.ext.types.keys().copied())
+                                .chain(old.ext.types.iter().map(|(&id, ty)| match ty {
+                                    relational::TypeDef::Enum { labels, .. } => {
+                                        id.saturating_add(labels.len() as u64)
+                                    }
+                                    _ => id,
+                                }))
+                                .chain(old.ext.schemas.values().map(|schema| schema.id))
                                 .max()
                                 .unwrap_or(0)
                                 .checked_add(1)
@@ -318,6 +336,15 @@ impl SqlSession {
                 V2Class::Refused(feature) => Err(unsupported(feature)),
             }
         })();
+        let result = result.map_err(|error| {
+            if p.schema_ddl().is_some_and(|(_, _, create)| create)
+                && error == CoreError::Sql(E::DuplicateObject)
+            {
+                CoreError::DuplicateSchema
+            } else {
+                error
+            }
+        });
         if result.is_err() {
             self.abort();
         }

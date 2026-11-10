@@ -33,6 +33,8 @@ impl Relational {
         sink: &mut impl RowSink,
         version_end: u64,
     ) -> Result<SqlResult, CoreError> {
+        let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
+        let prepared = &bound;
         // Keep the mutation target separate from the read set: a join's first
         // source must never be published, and INSERT ... SELECT still needs its
         // destination's complete occupancy image for immediate PK checks.
@@ -46,9 +48,9 @@ impl Relational {
             .flatten();
         let mut names = prepared.read_tables();
         if let Some(table) = &table
-            && !names.contains(&table.name)
+            && !names.contains(&self.table_key(table))
         {
-            names.push(table.name.clone());
+            names.push(self.table_key(table));
         }
         // One budget across ALL scanned relations, including nested subqueries.
         // The target preimage and legacy execution retain A1's separate bounds.
@@ -58,6 +60,7 @@ impl Relational {
                 // Binding owns SQL error precedence (including unknown tables).
                 continue;
             };
+            let is_target = prepared.table() == Some(self.table_key(table).as_str());
             let rows = self
                 .rows
                 .get_mut(&table.id)
@@ -68,7 +71,7 @@ impl Relational {
                 }
                 // Only destination rows constrain its version allocator. A
                 // concurrent source writer may hold a newer reserved range.
-                if prepared.table() == Some(table.name.as_str()) {
+                if is_target {
                     self.next_version = self
                         .next_version
                         .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);

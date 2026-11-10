@@ -1,7 +1,7 @@
 //! Relations share a namespace within each schema, matching PostgreSQL.
 //! Server policy: superusers create schemas; schema owners/superusers may drop them.
 //! Table creation permits superusers, schema owners, or explicit schema CREATE grants.
-//! Public retains its existing grant model. V2 explicitly refuses schema DDL.
+//! Public retains its existing grant model across both storage engines.
 use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Schema {

@@ -62,6 +62,8 @@ enum DataTypeDto {
     IntArray,
     BigIntArray,
     TextArray,
+    // Appended tag 22 requires meta feature bit 12.
+    UserType(u64),
 }
 impl TryFrom<DataType> for DataTypeDto {
     type Error = CoreError;
@@ -117,6 +119,8 @@ impl From<DataTypeDto> for DataType {
             DataTypeDto::IntArray => Self::IntArray,
             DataTypeDto::BigIntArray => Self::BigIntArray,
             DataTypeDto::TextArray => Self::TextArray,
+            // Resolved against the type catalog before a view is published.
+            DataTypeDto::UserType(_) => Self::Text,
         }
     }
 }
@@ -239,11 +243,8 @@ impl TryFrom<ColumnExt> for ColumnExtDto {
             default,
             identity,
             text_kind: _, // Reconstructed from the column tag, never a new wire field.
-            type_id,
+            type_id: _,   // Stored in the enclosing column data-type tag.
         } = v;
-        if type_id.is_some() {
-            return Err(CoreError::Unsupported);
-        }
         Ok(Self {
             typmod,
             default,
@@ -495,13 +496,6 @@ impl From<SequenceDefDto> for SequenceDef {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum TypeDefDto {}
-impl From<TypeDefDto> for TypeDef {
-    fn from(v: TypeDefDto) -> Self {
-        match v {}
-    }
-}
 fn encode_version<T: Serialize>(version: u8, v: &T) -> Result<Vec<u8>, CoreError> {
     let mut out = vec![version];
     out.extend(super::super::encode(v)?);
@@ -517,8 +511,14 @@ impl TryFrom<(TableEntry, BTreeMap<u64, ColumnExt>)> for TableEntryV2Dto {
     type Error = CoreError;
     fn try_from((entry, ext): (TableEntry, BTreeMap<u64, ColumnExt>)) -> Result<Self, CoreError> {
         let TableEntry { def, heap, .. } = entry;
+        let mut def: TableDefDto = def.try_into()?;
+        for column in &mut def.columns {
+            if let Some(id) = ext.get(&column.id).and_then(|ext| ext.type_id) {
+                column.data_type = DataTypeDto::UserType(id);
+            }
+        }
         Ok(Self {
-            def: def.try_into()?,
+            def,
             heap,
             columns_ext: ext
                 .into_iter()
@@ -535,11 +535,28 @@ impl TryFrom<TableEntryV2Dto> for (TableEntry, BTreeMap<u64, ColumnExt>) {
             heap,
             columns_ext,
         } = v;
+        let type_ids: Vec<_> = def
+            .columns
+            .iter()
+            .filter_map(|column| {
+                if let DataTypeDto::UserType(id) = column.data_type {
+                    Some((column.id, id))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let def: TableDef = def.try_into()?;
         let mut columns_ext: BTreeMap<u64, ColumnExt> = columns_ext
             .into_iter()
             .map(|(k, v)| (k, v.into()))
             .collect();
+        for (column, id) in type_ids {
+            if id == 0 {
+                return Err(corrupt("zero user type id"));
+            }
+            columns_ext.entry(column).or_default().type_id = Some(id);
+        }
         for column in &def.columns {
             if let Some(kind) = text_kind(&column.data_type) {
                 columns_ext.entry(column.id).or_default().text_kind = Some(kind);
@@ -593,7 +610,7 @@ pub(crate) fn decode_table(
             .iter()
             .find(|column| column.id == *id)
             .ok_or_else(|| corrupt("column extension references absent column"))?;
-        if let Some(typmod) = column_ext.typmod {
+        if let Some(typmod) = column_ext.typmod.filter(|_| column_ext.type_id.is_none()) {
             validate_typmod(&column.data_type, typmod)
                 .map_err(|_| corrupt("invalid catalog column typmod"))?;
         }
@@ -630,7 +647,8 @@ fn validate_definition(def: &TableDef) -> Result<(), CoreError> {
         .filter(|&&offset| def.hidden_rowid() != Some(offset))
         .map(|&offset| def.columns[offset].name.clone())
         .collect();
-    validate_create_definition(&def.name, &columns, &keys)
+    validate_relation_name(&def.name)?;
+    validate_create_definition(crate::relational::split_key(&def.name).1, &columns, &keys)
         .map_err(|_| corrupt("invalid catalog table definition"))
 }
 pub(crate) fn encode_constraint(v: &Constraint, _table: &str) -> Result<Vec<u8>, CoreError> {
@@ -670,16 +688,46 @@ pub(crate) fn encode_sequence(v: &SequenceDef) -> Result<Vec<u8>, CoreError> {
 }
 pub(crate) fn decode_sequence(v: &[u8]) -> Result<SequenceDef, CoreError> {
     let dto: SequenceDefDto = decode_version(1, v)?;
-    if dto.name.is_empty() || dto.name.len() > 63 {
+    if validate_relation_name(&dto.name).is_err() {
         return Err(corrupt("sequence name limit"));
     }
     Ok(dto.into())
 }
-pub(crate) fn encode_type(_v: TypeDef) -> Result<Vec<u8>, CoreError> {
-    Err(CoreError::Unsupported)
+// Standalone legacy v6 TypeDef, prefixed with the independent record version.
+pub(crate) fn encode_type(v: TypeDef) -> Result<Vec<u8>, CoreError> {
+    encode_version(1, &v)
 }
 pub(crate) fn decode_type(v: &[u8]) -> Result<TypeDef, CoreError> {
-    Ok(decode_version::<TypeDefDto>(1, v)?.into())
+    decode_version(1, v)
+}
+pub(crate) fn schema_key(name: &str) -> Vec<u8> {
+    let mut key = vec![14];
+    key.extend(name.as_bytes());
+    key.push(0);
+    key
+}
+pub(crate) fn encode_schema(v: &crate::relational::schemas::Schema) -> Result<Vec<u8>, CoreError> {
+    encode_version(1, v)
+}
+pub(crate) fn decode_schema(v: &[u8]) -> Result<crate::relational::schemas::Schema, CoreError> {
+    let schema: crate::relational::schemas::Schema = decode_version(1, v)?;
+    if schema.id == 0 {
+        return Err(corrupt("zero schema id"));
+    }
+    Ok(schema)
+}
+fn validate_relation_name(name: &str) -> Result<(), CoreError> {
+    let (schema, bare) = crate::relational::split_key(name);
+    if schema.is_empty()
+        || schema.len() > 63
+        || bare.is_empty()
+        || bare.len() > 63
+        || bare.contains('\0')
+        || (name.contains('\0') && schema == "public")
+    {
+        return Err(corrupt("invalid catalog relation name"));
+    }
+    Ok(())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogKind {
@@ -695,19 +743,28 @@ pub(crate) enum CatalogKind {
     TableGrant,
     SchemaGrant,
     RoleOid,
+    Schema,
+    TypeDefinition,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
         Some(1) if key.len() == 9 => CatalogKind::Table,
-        Some(3)
+        Some(3) if key.len() >= 3 && key.last() == Some(&0) => {
+            let name = std::str::from_utf8(&key[1..key.len() - 1])
+                .map_err(|_| corrupt("invalid catalog name UTF-8"))?;
+            validate_relation_name(name)?;
+            CatalogKind::Name
+        }
+        Some(14)
             if key.len() >= 3
                 && key.len() <= 65
                 && key.last() == Some(&0)
                 && !key[1..key.len() - 1].contains(&0)
                 && std::str::from_utf8(&key[1..key.len() - 1]).is_ok() =>
         {
-            CatalogKind::Name
+            CatalogKind::Schema
         }
+        Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
         Some(4) if key.len() == 17 => CatalogKind::Constraint,
         Some(5) if key.len() == 9 => CatalogKind::Sequence,
         Some(6) if key.len() == 9 => CatalogKind::Type,
@@ -740,7 +797,7 @@ pub(crate) fn sequence_key(id: u64) -> Vec<u8> {
     object_key(5, id)
 }
 pub(crate) fn type_key(id: u64) -> Vec<u8> {
-    object_key(6, id)
+    object_key(15, id)
 }
 pub(crate) fn counter_key(id: u64, incarnation: u128) -> Vec<u8> {
     let mut key = object_key(2, id);

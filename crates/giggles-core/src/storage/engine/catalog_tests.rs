@@ -1210,3 +1210,25 @@ fn transaction_catalog_lock_accessor_uses_its_owner_and_rejects_other_lock_keys(
     assert!(locks.held(TxnId(41)).is_empty());
     assert_eq!(locks.waiting_count(), 0);
 }
+
+#[test]
+fn qualified_table_without_its_schema_is_corrupt() {
+    let mut def = table("missing\0t");
+    def.id = 1;
+    for (index, column) in def.columns.iter_mut().enumerate() {
+        column.id = index as u64 + 2;
+    }
+    let mut view = CatalogView::default();
+    view.by_id.insert(
+        1,
+        Arc::new(TableEntry {
+            def,
+            heap: false,
+            columns_ext: BTreeMap::new(),
+        }),
+    );
+    assert!(matches!(
+        finish_view(view, BTreeMap::from([("missing\0t".into(), 1)])),
+        Err(CoreError::Corrupt(_))
+    ));
+}
