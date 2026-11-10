@@ -182,3 +182,55 @@ fn subprocess_install_crashes_never_open_valid_empty_database() {
         assert_eq!(a.snapshot().unwrap(), s);
     }
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_restore_crashes_publish_only_complete_database_with_origin() {
+    let root = fresh("v2-crash-restore");
+    fs::create_dir(&root).unwrap();
+    let source = Admin::create_engine(root.join("source"), Limits::default(), Engine::V2).unwrap();
+    source
+        .sql_session()
+        .execute("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[], None)
+        .unwrap();
+    source
+        .sql_session()
+        .execute("INSERT INTO items VALUES (1),(2)", &[], None)
+        .unwrap();
+    let domain = source.authority_metadata().unwrap().0;
+    let file = root.join("backup");
+    source.export(&file).unwrap();
+    drop(source);
+    for mode in ["created", "staged", "committed"] {
+        let dest = root.join(mode);
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "restore_crash_worker", "--nocapture"])
+            .env("GD_RESTORE_MODE", mode)
+            .env("GD_EXPORT", &file)
+            .env("GD_DEST", &dest)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(86), "{mode}: {out:?}");
+        if mode == "committed" {
+            let restored = Admin::open(&dest, Limits::default()).unwrap();
+            let metadata = restored.authority_metadata().unwrap();
+            assert_ne!(metadata.0, domain);
+            assert_eq!(metadata.3, Some(domain));
+            let rows = restored
+                .sql_session()
+                .execute("SELECT id FROM items ORDER BY id", &[], None)
+                .unwrap()
+                .rows;
+            assert_eq!(rows[0].values, vec![relational::Value::Int(1)]);
+            assert_eq!(rows[1].values, vec![relational::Value::Int(2)]);
+            assert_eq!(rows.len(), 2);
+        } else {
+            assert!(Admin::open(&dest, Limits::default()).is_err());
+        }
+        assert!(matches!(
+            Admin::restore(&file, &dest, Limits::default()),
+            Err(CoreError::Exists)
+        ));
+    }
+    fs::remove_dir_all(root).unwrap();
+}

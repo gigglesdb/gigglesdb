@@ -19,6 +19,45 @@ fn rows(admin: &Admin) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn restore_preserves_immediate_origin_across_reopen_and_generations() {
+    let root = directory();
+    fs::create_dir(&root).unwrap();
+    let source = Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap();
+    source
+        .sql_session()
+        .execute("CREATE TABLE items (id BIGINT PRIMARY KEY)", &[], None)
+        .unwrap();
+    source
+        .sql_session()
+        .execute("INSERT INTO items VALUES (1),(2)", &[], None)
+        .unwrap();
+    let expected = rows(&source);
+    let mut domain = source.authority_metadata().unwrap().0;
+    drop(source);
+    for generation in 0..2 {
+        let from = if generation == 0 { "db" } else { "restored0" };
+        let source = Admin::open(root.join(from), Limits::default()).unwrap();
+        source.export(root.join("backup")).unwrap();
+        drop(source);
+        let path = root.join(format!("restored{generation}"));
+        let restored = Admin::restore(root.join("backup"), &path, Limits::default()).unwrap();
+        let fresh = restored.authority_metadata().unwrap().0;
+        assert_ne!(fresh, domain);
+        let check = |copy: Admin| {
+            assert_eq!(copy.authority_metadata().unwrap().3, Some(domain));
+            let BackupDb(db) = BackupDb::from_admin(&copy);
+            assert_eq!(db.metadata_state(None).unwrap().origin, Some(domain));
+            assert_eq!(rows(&copy), expected);
+        };
+        check(restored);
+        check(Admin::open(&path, Limits::default()).unwrap());
+        domain = fresh;
+        fs::remove_file(root.join("backup")).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pinned_export_allows_commits_and_restores_snapshot_roles_and_features() {
     let root = directory();
     fs::create_dir(&root).unwrap();

@@ -452,6 +452,15 @@ pub(super) fn restore(
     }
     let mut domain = [0; 16];
     getrandom::fill(&mut domain).map_err(io)?;
+    // Match legacy restore: provenance names the immediate source, not its origin.
+    let mut kernel = empty(u128::from_be_bytes(domain));
+    kernel.origin = Some(u128::from_be_bytes(read.domain));
+    let metadata = records(&kernel)?.remove(&vec![0]).expect("metadata record");
+    batch.put(
+        Keyspace::Kernel,
+        codec::user_key_seek_at(&[0], read.ts),
+        mvcc::encode_live(&metadata),
+    );
     for (key, value) in [
         (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
         (
