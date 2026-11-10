@@ -132,6 +132,8 @@ impl Diagnostic {
             &result,
             Err(CoreError::Sql(
                 giggles_core::relational::SqlError::CheckViolation
+                    | giggles_core::relational::SqlError::Null
+                    | giggles_core::relational::SqlError::Unsupported
             ))
         ) {
             self.wire_message = message;
@@ -635,6 +637,24 @@ fn rows(
     Ok(())
 }
 fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
+    for (message, detail) in giggles_core::relational::take_sql_notices() {
+        let mut body = vec![];
+        for (field, value) in [
+            (b'S', "NOTICE"),
+            (b'V', "NOTICE"),
+            (b'C', "00000"),
+            (b'M', message.as_str()),
+        ] {
+            body.push(field);
+            z(value, &mut body);
+        }
+        if let Some(detail) = detail {
+            body.push(b'D');
+            z(&detail, &mut body);
+        }
+        body.push(0);
+        frame(b'N', &body, out)?;
+    }
     let tag = match command {
         "SELECT" => format!("SELECT {}", r.rows.len()),
         "INSERT" => format!("INSERT 0 {}", r.affected),

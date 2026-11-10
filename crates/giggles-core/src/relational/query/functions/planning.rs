@@ -397,7 +397,8 @@ impl BoundScalar {
                     .as_ref()
                     .map_or(Ok(Some(Value::Null)), |result| result.plan_constant(budget))
             }
-            Node::EnumSort(..)
+            Node::Domain(..)
+            | Node::EnumSort(..)
             | Node::Param(_)
             | Node::Column(..)
             | Node::Clock(..)
@@ -481,7 +482,8 @@ impl BoundScalar {
                     .is_none_or(|result| result.constraint_immutable())
             }
             Node::EnumSort(..) | Node::Literal(_) | Node::Column(..) => true,
-            Node::Param(_)
+            Node::Domain(..)
+            | Node::Param(_)
             | Node::Clock(..)
             | Node::Sequence(..)
             | Node::SessionCast(..)
@@ -519,7 +521,9 @@ impl BoundScalar {
             Node::Literal(_) | Node::Param(_) => true,
             Node::EnumSort(..) | Node::Column(..) => false,
             Node::Clock(..) => true,
-            Node::SessionCast(value, _) | Node::TypmodCast(value, _) => value.insert_input_only(),
+            Node::SessionCast(value, _) | Node::TypmodCast(value, _) | Node::Domain(value, _) => {
+                value.insert_input_only()
+            }
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
             Node::Sequence(_, args, _) | Node::ZonedOperator(_, args, _) => {
                 args.iter().all(Self::insert_input_only)

@@ -263,7 +263,9 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
             Scalar::Param(_) => 0,
             Scalar::Literal(v) => value_bytes(v),
             Scalar::Column(c) => c.name.len() + c.qualifier.as_ref().map_or(0, String::len),
-            Scalar::Cast(inner, _) | Scalar::Unary(_, inner) => return cost(inner, nodes, bytes),
+            Scalar::Cast(inner, _) | Scalar::Domain(inner, ..) | Scalar::Unary(_, inner) => {
+                return cost(inner, nodes, bytes);
+            }
             Scalar::Binary(_, a, b) => {
                 cost(a, nodes, bytes)?;
                 cost(b, nodes, bytes)?;
@@ -399,7 +401,7 @@ fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
 fn walk_scalar(s: &Scalar, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
     visit(s)?;
     match s {
-        Scalar::Cast(a, _) | Scalar::Unary(_, a) => walk_scalar(a, visit)?,
+        Scalar::Cast(a, _) | Scalar::Domain(a, ..) | Scalar::Unary(_, a) => walk_scalar(a, visit)?,
         Scalar::Binary(_, a, b) => {
             walk_scalar(a, visit)?;
             walk_scalar(b, visit)?;
@@ -440,7 +442,9 @@ fn reject_scalar_subquery(s: &Scalar) -> R<()> {
                 reject_scalar_subquery(value)?;
             }
         }
-        Scalar::Cast(value, _) | Scalar::Unary(_, value) => reject_scalar_subquery(value)?,
+        Scalar::Cast(value, _) | Scalar::Domain(value, ..) | Scalar::Unary(_, value) => {
+            reject_scalar_subquery(value)?
+        }
         Scalar::Binary(_, a, b) => {
             reject_scalar_subquery(a)?;
             reject_scalar_subquery(b)?;
@@ -1594,7 +1598,9 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
         Scalar::Call(n, args) => {
             functions::is_deferred_routine_name(n) || args.iter().any(scalar_has_undefined_routine)
         }
-        Scalar::Unary(_, a) | Scalar::Cast(a, _) => scalar_has_undefined_routine(a),
+        Scalar::Unary(_, a) | Scalar::Cast(a, _) | Scalar::Domain(a, ..) => {
+            scalar_has_undefined_routine(a)
+        }
         Scalar::Binary(_, a, b) => {
             scalar_has_undefined_routine(a) || scalar_has_undefined_routine(b)
         }
@@ -1629,6 +1635,14 @@ impl Query {
             walk_scalar(s, visit)?;
         }
         Ok(())
+    }
+    pub(super) fn has_domain_expression(&self) -> bool {
+        let mut found = false;
+        let _ = self.walk_scalars(&mut |s| {
+            found |= matches!(s, Scalar::Domain(..));
+            Ok(())
+        });
+        found
     }
     fn has_volatile_call(&self) -> bool {
         let mut found = false;
@@ -2248,7 +2262,7 @@ impl Query {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
-                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
                 Scalar::Predicate(f) => filter(f),
@@ -2453,7 +2467,7 @@ impl Query {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
-                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::SubstringOrder(args) => args.iter().all(|s| scalar(s)),
                 Scalar::Predicate(f) => filter_ok(f),
@@ -2630,7 +2644,7 @@ impl Query {
             match s {
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 Scalar::Column(_) => false,
-                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s),
+                Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => scalar(s),
                 Scalar::Binary(_, a, b) => scalar(a) && scalar(b),
                 Scalar::Call(_, args) => args.iter().all(scalar),
                 Scalar::Predicate(f) => filter(f),

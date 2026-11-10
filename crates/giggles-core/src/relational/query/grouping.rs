@@ -23,7 +23,7 @@ pub(super) fn contains_aggregate(s: &Scalar) -> bool {
                 || aggregate(n).is_some()
                 || a.iter().any(contains_aggregate)
         }
-        Scalar::Unary(_, a) | Scalar::Cast(a, _) => contains_aggregate(a),
+        Scalar::Unary(_, a) | Scalar::Cast(a, _) | Scalar::Domain(a, ..) => contains_aggregate(a),
         Scalar::Binary(_, a, b) => contains_aggregate(a) || contains_aggregate(b),
         Scalar::SubstringOrder(a) => a.iter().any(|a| contains_aggregate(a)),
         Scalar::Predicate(f) => filter_contains_aggregate(f),
@@ -62,6 +62,9 @@ fn canonical(
             format!("column:{}:{}", c.source, c.column)
         }
         Scalar::Unary(op, a) => format!("unary:{op:?}:{}", canonical(a, resolve, scope, tables)?),
+        Scalar::Domain(a, name, _) => {
+            format!("domain:{name}:{}", canonical(a, resolve, scope, tables)?)
+        }
         Scalar::Cast(a, ty) => {
             // PostgreSQL grouping identity drops casts that keep the input type.
             // Parameter-only types are inferred later; unresolved bindings simply
@@ -240,6 +243,9 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
                 slot(index)
             }
             Scalar::Unary(op, a) => Scalar::Unary(*op, Box::new(self.scalar(a)?)),
+            Scalar::Domain(a, name, ty) => {
+                Scalar::Domain(Box::new(self.scalar(a)?), name.clone(), ty.clone())
+            }
             Scalar::Cast(a, ty) => Scalar::Cast(Box::new(self.scalar(a)?), ty.clone()),
             Scalar::Binary(op, a, b) => {
                 Scalar::Binary(*op, Box::new(self.scalar(a)?), Box::new(self.scalar(b)?))

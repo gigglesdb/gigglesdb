@@ -184,7 +184,35 @@ impl Relational {
                     .cloned()
             })
             .flatten();
-        let mut names = if matches!(prepared.v2_class(), V2Class::Ddl) {
+        let mut names = if let Statement::TypeDdl(user_types::Ddl::Drop {
+            names,
+            cascade: true,
+            ..
+        }) = &prepared.statement
+        {
+            let ids: BTreeSet<_> = names
+                .iter()
+                .filter_map(|name| {
+                    self.resolve_type(name, &prepared.search_path)
+                        .ok()
+                        .flatten()
+                        .map(|(id, _)| id)
+                })
+                .collect();
+            self.tables
+                .iter()
+                .filter(|(_, table)| {
+                    table.columns.iter().any(|column| {
+                        self.ext
+                            .columns
+                            .get(&column.id)
+                            .and_then(|c| c.type_id)
+                            .is_some_and(|id| ids.contains(&id))
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else if matches!(prepared.v2_class(), V2Class::Ddl) {
             Vec::new()
         } else {
             prepared.read_tables()

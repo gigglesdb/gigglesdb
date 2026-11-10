@@ -334,3 +334,6 @@ mod creation_defaults;
 
 #[path = "v2_sql_fk_lock_tests.rs"]
 mod v2_sql_fk_lock_tests;
+
+#[path = "domain_cast_cascade.rs"]
+mod domain_cast_cascade;

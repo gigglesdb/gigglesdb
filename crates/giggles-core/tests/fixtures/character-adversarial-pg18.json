@@ -9945,6 +9945,31 @@
       "classification": "known_gap",
       "expected_core_error": "UndefinedObject",
       "expected_core_stage": "prepare",
+      "expected_core_observation": {
+        "status": "ok",
+        "parameterTypes": [
+          25
+        ],
+        "resultOids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            "233",
+            "\u00e9Hello"
+          ]
+        ]
+      },
+      "metadata_gap": {
+        "field": "parameterTypes",
+        "core": [
+          25
+        ],
+        "pg": [
+          16441
+        ]
+      },
       "observation": {
         "parameterTypes": [
           16441
@@ -9971,7 +9996,7 @@
         "format": "PG text exact UTF8; numeric retained as text"
       },
       "raw_trace_reference": "oracle-raw.json#ADV_DOMAIN_TEXT",
-      "contract_note": "PostgreSQL domain executes successfully; CREATE DOMAIN now works, while scalar domain casts remain an UndefinedObject gap at prepare, not character function parity."
+      "contract_note": "Domain parameter-type metadata remains a gap: core reports base text OID 25 while PostgreSQL reports domain OID 16441."
     },
     {
       "id": "ADV_GAP_AGG_FILTER",

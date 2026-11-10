@@ -78,7 +78,9 @@ impl Relational {
 impl Prepared {
     pub(crate) fn bind_schemas(&self, state: &Relational) -> R<Self> {
         let mut bound = self.clone();
-        if self.relations.is_empty() {
+        if self.relations.is_empty()
+            && !matches!(&self.statement, Statement::Query(q) if q.has_domain_expression())
+        {
             return Ok(bound);
         }
         bound.statement = self
@@ -139,7 +141,7 @@ impl Prepared {
             Statement::Update { name, search, .. } | Statement::Delete { name, search, .. } => {
                 read(name);
                 if let Some(query) = search {
-                    query.bind_schema_names(&read);
+                    query.bind_schema_names(&read, state, &self.search_path);
                 }
             }
             Statement::UpdateExpressions {
@@ -147,20 +149,22 @@ impl Prepared {
             } => {
                 read(name);
                 if let Some(query) = search {
-                    query.bind_schema_names(&read);
+                    query.bind_schema_names(&read, state, &self.search_path);
                 }
                 for (_, value) in sets {
                     if let assign::Value::Scalar(query) = value {
-                        query.bind_schema_names(&read);
+                        query.bind_schema_names(&read, state, &self.search_path);
                     }
                 }
             }
-            Statement::Query(query) => query.bind_schema_names(&read),
-            Statement::InsertExpressions(insert) => insert.bind_schema_names(&read),
+            Statement::Query(query) => query.bind_schema_names(&read, state, &self.search_path),
+            Statement::InsertExpressions(insert) => {
+                insert.bind_schema_names(&read, state, &self.search_path)
+            }
             Statement::InsertMulti(insert) => {
                 read(&mut insert.table);
                 if let Some(query) = &mut insert.source {
-                    query.bind_schema_names(&read);
+                    query.bind_schema_names(&read, state, &self.search_path);
                 }
             }
             Statement::AlterTable(alter) => {
@@ -185,7 +189,7 @@ impl Prepared {
             _ => {}
         }
         if let Some(returning) = bound.returning_mut() {
-            returning.bind_schema_names(&read);
+            returning.bind_schema_names(&read, state, &self.search_path);
         }
         Ok(bound)
     }

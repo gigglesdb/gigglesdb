@@ -14,9 +14,14 @@ struct BoundValues {
     parameters: Vec<DataType>,
 }
 impl InsertExpressions {
-    pub(super) fn bind_value_schema_names(&mut self, bind: &impl Fn(&mut String)) {
+    pub(super) fn bind_value_schema_names(
+        &mut self,
+        bind: &impl Fn(&mut String),
+        state: &Relational,
+        path: &[String],
+    ) {
         for value in &mut self.values {
-            super::schema_names::scalar(value, bind);
+            super::schema_names::scalar(value, bind, state, path);
         }
     }
 }
@@ -77,7 +82,11 @@ impl<'a> Iterator for Literals<'a> {
                             self.depth -= 1;
                             return Some(out);
                         }
-                        Scalar::Cast(value, _) | Scalar::Unary(_, value) if cursor == 0 => {
+                        Scalar::Cast(value, _)
+                        | Scalar::Domain(value, ..)
+                        | Scalar::Unary(_, value)
+                            if cursor == 0 =>
+                        {
                             self.stack[self.depth - 1] = Some((node, 1));
                             Some(value.as_ref())
                         }
@@ -150,7 +159,9 @@ pub(super) fn shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<()> {
     }
     *nodes += 1;
     match value {
-        Scalar::Cast(child, _) | Scalar::Unary(_, child) => shape(child, depth + 1, nodes),
+        Scalar::Cast(child, _) | Scalar::Domain(child, ..) | Scalar::Unary(_, child) => {
+            shape(child, depth + 1, nodes)
+        }
         Scalar::Binary(_, a, b) => {
             shape(a, depth + 1, nodes)?;
             shape(b, depth + 1, nodes)
@@ -319,7 +330,9 @@ impl InsertExpressions {
                         *n = map.binary_search(n).unwrap() + 1;
                         Ok(())
                     }
-                    Scalar::Cast(value, _) | Scalar::Unary(_, value) => remap(value, map),
+                    Scalar::Cast(value, _)
+                    | Scalar::Domain(value, ..)
+                    | Scalar::Unary(_, value) => remap(value, map),
                     Scalar::Binary(_, a, b) => {
                         remap(a, map)?;
                         remap(b, map)

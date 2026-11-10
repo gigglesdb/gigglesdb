@@ -32,7 +32,11 @@ impl Expression {
         }))
     }
     #[cfg(test)]
-    pub(in crate::relational) fn admission_compare(a: Self, op: operations::Compare, b: Self) -> Self {
+    pub(in crate::relational) fn admission_compare(
+        a: Self,
+        op: operations::Compare,
+        b: Self,
+    ) -> Self {
         let op = match op {
             operations::Compare::Eq => "=",
             operations::Compare::Ne => "<>",
@@ -58,7 +62,9 @@ impl Expression {
         let expression = Self::parse(p)?;
         fn input(value: &Scalar) -> bool {
             match value {
-                Scalar::Cast(value, _) | Scalar::Unary(_, value) => input(value),
+                Scalar::Cast(value, _) | Scalar::Domain(value, ..) | Scalar::Unary(_, value) => {
+                    input(value)
+                }
                 Scalar::Literal(_) | Scalar::Param(_) => true,
                 _ => false,
             }
@@ -204,7 +210,9 @@ impl Expression {
                         scalar(s, params, visit)?;
                     }
                 }
-                Scalar::Cast(s, _) | Scalar::Unary(_, s) => scalar(s, params, visit)?,
+                Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => {
+                    scalar(s, params, visit)?
+                }
                 Scalar::Binary(_, a, b) => {
                     scalar(a, params, visit)?;
                     scalar(b, params, visit)?;

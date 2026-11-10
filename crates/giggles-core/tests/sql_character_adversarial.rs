@@ -185,6 +185,36 @@ fn character_adversarial_pg18_all_cases_values_oids_errors_and_visible_gaps() {
                 ));
             }
             assert_eq!(expected["sqlstate"], "22003");
+        } else if class == "known_gap" && case.get("expected_core_observation").is_some() {
+            gaps += 1;
+            let declared = &case["expected_core_observation"];
+            let gap = &case["metadata_gap"];
+            let field = gap["field"].as_str().unwrap();
+            assert_eq!(declared["status"], "ok", "{id}");
+            assert_eq!(field, "parameterTypes", "{id}");
+            let core = json!({
+                "status": actual["status"], "parameterTypes": actual["parameterTypes"],
+                "resultOids": actual["resultOids"], "rows": actual["rows"]
+            });
+            assert_eq!(&core, declared, "{id}: declared core observation");
+            let pg_oids: Vec<_> = expected["resultTypes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["oid"].clone())
+                .collect();
+            let pg = json!({
+                "status": expected["status"], "parameterTypes": expected["parameterTypes"],
+                "resultOids": pg_oids, "rows": expected["rows"]
+            });
+            assert_eq!(core[field], gap["core"], "{id}: core metadata gap");
+            assert_eq!(pg[field], gap["pg"], "{id}: PG metadata gap");
+            assert_ne!(gap["core"], gap["pg"], "{id}: gap remains visible");
+            assert_eq!(core["resultOids"], pg["resultOids"], "{id}");
+            assert_eq!(core["rows"], pg["rows"], "{id}");
+            let mut normalized = core;
+            normalized[field] = pg[field].clone();
+            assert_eq!(normalized, pg, "{id}: only the declared metadata differs");
         } else if class == "known_gap" || class == "known_gap_setup" {
             gaps += 1;
             let expected_error = if case["id"] == "ADV_GAP_CAST_TEXT" {

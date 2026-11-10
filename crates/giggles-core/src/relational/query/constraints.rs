@@ -42,7 +42,7 @@ fn without_case(s: &Scalar) -> R<()> {
     match s {
         Scalar::Case(_) => return Err(SqlError::Unsupported),
         Scalar::Predicate(f) => f.visit_scalars(&mut without_case)?,
-        Scalar::Cast(s, _) | Scalar::Unary(_, s) => without_case(s)?,
+        Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => without_case(s)?,
         Scalar::Binary(_, a, b) => {
             without_case(a)?;
             without_case(b)?;

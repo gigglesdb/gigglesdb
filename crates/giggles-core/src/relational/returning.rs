@@ -7,8 +7,13 @@ pub(super) struct Returning {
 }
 
 impl Returning {
-    pub(super) fn bind_schema_names(&mut self, bind: &impl Fn(&mut String)) {
-        self.query.bind_schema_names(bind);
+    pub(super) fn bind_schema_names(
+        &mut self,
+        bind: &impl Fn(&mut String),
+        state: &Relational,
+        path: &[String],
+    ) {
+        self.query.bind_schema_names(bind, state, path);
     }
 
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {

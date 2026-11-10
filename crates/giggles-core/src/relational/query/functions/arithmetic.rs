@@ -45,7 +45,9 @@ pub(super) fn admit_shape(value: &Scalar, depth: usize, nodes: &mut usize) -> R<
                 .as_ref()
                 .map_or(Ok(()), |result| admit_shape(result, depth + 1, nodes))
         }
-        Scalar::Cast(a, _) | Scalar::Unary(_, a) => admit_shape(a, depth + 1, nodes),
+        Scalar::Cast(a, _) | Scalar::Domain(a, ..) | Scalar::Unary(_, a) => {
+            admit_shape(a, depth + 1, nodes)
+        }
         Scalar::Binary(_, a, b) => {
             admit_shape(a, depth + 1, nodes)?;
             admit_shape(b, depth + 1, nodes)

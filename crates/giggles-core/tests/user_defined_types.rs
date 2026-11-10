@@ -80,7 +80,6 @@ fn enum_domain_composite_survive_reopen() {
             SqlError::DependentObjects,
         );
         error(&mut s, "DROP DOMAIN positive", SqlError::DependentObjects);
-        error(&mut s, "DROP TYPE mood CASCADE", SqlError::Unsupported);
         error(
             &mut s,
             "CREATE TABLE composite_column (p pair)",

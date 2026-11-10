@@ -350,3 +350,20 @@ pub(super) fn apply(value: Value, ty: &DataType, modifier: i32, budget: &mut usi
         _ => return Err(SqlError::Type),
     })
 }
+
+// Builtin grammar keeps its existing diagnostics; unknown names bind to domains.
+pub(super) fn parse_expression(p: &mut Parser, value: Scalar) -> R<Scalar> {
+    let start = p.at;
+    match super::cast_type(p) {
+        Ok(target) => Ok(expression(value, target)),
+        Err(error @ (SqlError::UndefinedObject | SqlError::Unsupported)) => {
+            p.at = start;
+            let name = user_types::parse_name(p)?;
+            if p.tokens.get(p.at) == Some(&Token::Symbol('(')) {
+                return Err(SqlError::Unsupported);
+            }
+            Ok(Scalar::Domain(Box::new(value), name, Err(error)))
+        }
+        Err(error) => Err(error),
+    }
+}

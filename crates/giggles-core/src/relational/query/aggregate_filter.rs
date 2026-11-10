@@ -69,7 +69,9 @@ fn coerce_scalar_conditions(s: &mut Scalar) {
                 coerce_scalar_conditions(s);
             }
         }
-        Scalar::Cast(s, _) | Scalar::Unary(_, s) => coerce_scalar_conditions(s),
+        Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => {
+            coerce_scalar_conditions(s)
+        }
         Scalar::Binary(_, a, b) => {
             coerce_scalar_conditions(a);
             coerce_scalar_conditions(b);
@@ -182,7 +184,9 @@ fn expand(s: &mut Scalar, replacements: &[Scalar], depth: usize, work: &mut usiz
                 expand(a, replacements, depth + 1, work)?
             }
         }
-        Scalar::Cast(a, _) | Scalar::Unary(_, a) => expand(a, replacements, depth + 1, work)?,
+        Scalar::Cast(a, _) | Scalar::Domain(a, ..) | Scalar::Unary(_, a) => {
+            expand(a, replacements, depth + 1, work)?
+        }
         Scalar::Binary(_, a, b) => {
             expand(a, replacements, depth + 1, work)?;
             expand(b, replacements, depth + 1, work)?;
@@ -393,7 +397,7 @@ fn replace_argument_aggregates(
                 replace_argument_aggregates(arg, parameters, resolve, tables)?;
             }
         }
-        Scalar::Cast(arg, _) | Scalar::Unary(_, arg) => {
+        Scalar::Cast(arg, _) | Scalar::Domain(arg, ..) | Scalar::Unary(_, arg) => {
             replace_argument_aggregates(arg, parameters, resolve, tables)?
         }
         Scalar::Binary(_, a, b) => {
@@ -456,7 +460,9 @@ fn uses_parameter(s: &Scalar, parameter: usize) -> bool {
         Scalar::Param(n) => *n == parameter,
         Scalar::Call(_, args) => args.iter().any(|s| uses_parameter(s, parameter)),
         Scalar::SubstringOrder(args) => args.iter().any(|s| uses_parameter(s, parameter)),
-        Scalar::Cast(s, _) | Scalar::Unary(_, s) => uses_parameter(s, parameter),
+        Scalar::Cast(s, _) | Scalar::Domain(s, ..) | Scalar::Unary(_, s) => {
+            uses_parameter(s, parameter)
+        }
         Scalar::Binary(_, a, b) => uses_parameter(a, parameter) || uses_parameter(b, parameter),
         Scalar::Predicate(f) => filter_uses_parameter(f, parameter),
         Scalar::Case(c) => {
@@ -506,7 +512,7 @@ fn validate_boolean_literal_casts(s: &Scalar) -> R<()> {
                 validate_boolean_literal_casts(arg)?;
             }
         }
-        Scalar::Unary(_, arg) => validate_boolean_literal_casts(arg)?,
+        Scalar::Unary(_, arg) | Scalar::Domain(arg, ..) => validate_boolean_literal_casts(arg)?,
         Scalar::Binary(_, a, b) => {
             validate_boolean_literal_casts(a)?;
             validate_boolean_literal_casts(b)?;
@@ -603,7 +609,7 @@ pub(super) fn validate_scalar(
                 validate_scalar(arg, parameters, resolve, tables)?;
             }
         }
-        Scalar::Unary(_, arg) | Scalar::Cast(arg, _) => {
+        Scalar::Unary(_, arg) | Scalar::Cast(arg, _) | Scalar::Domain(arg, ..) => {
             validate_scalar(arg, parameters, resolve, tables)?
         }
         Scalar::Binary(_, a, b) => {

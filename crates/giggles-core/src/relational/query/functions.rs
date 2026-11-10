@@ -77,6 +77,7 @@ pub(super) enum Scalar {
     Binary(BinaryOp, Box<Scalar>, Box<Scalar>),
     Param(usize),
     Cast(Box<Scalar>, DataType),
+    Domain(Box<Scalar>, String, R<TypeDef>),
     Column(ColumnRef),
     Literal(Value),
     Call(String, Vec<Scalar>),
@@ -93,6 +94,7 @@ pub(in crate::relational) struct BoundScalar {
 }
 enum Node {
     EnumSort(Box<BoundScalar>, Vec<String>),
+    Domain(Box<BoundScalar>, TypeDef),
     Predicate(Box<super::BoundFilter>),
     Case(
         Vec<(super::BoundFilter, BoundScalar)>,
@@ -356,7 +358,9 @@ impl Scalar {
                     arg.sequence_dependencies(out);
                 }
             }
-            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.sequence_dependencies(out),
+            Self::Cast(arg, _) | Self::Domain(arg, ..) | Self::Unary(_, arg) => {
+                arg.sequence_dependencies(out)
+            }
             Self::Binary(_, a, b) => {
                 a.sequence_dependencies(out);
                 b.sequence_dependencies(out);
@@ -384,7 +388,9 @@ impl Scalar {
                 deferred_routine_error(name).is_some()
                     || args.iter().any(Self::has_undefined_routine)
             }
-            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.has_undefined_routine(),
+            Self::Cast(arg, _) | Self::Domain(arg, ..) | Self::Unary(_, arg) => {
+                arg.has_undefined_routine()
+            }
             Self::Binary(_, left, right) => {
                 left.has_undefined_routine() || right.has_undefined_routine()
             }
@@ -418,7 +424,9 @@ impl Scalar {
             }
             Self::Call(_, args) => args.iter().try_for_each(Self::reject_nested_aggregate),
             Self::SubstringOrder(args) => args.iter().try_for_each(|a| a.reject_nested_aggregate()),
-            Self::Cast(arg, _) | Self::Unary(_, arg) => arg.reject_nested_aggregate(),
+            Self::Cast(arg, _) | Self::Domain(arg, ..) | Self::Unary(_, arg) => {
+                arg.reject_nested_aggregate()
+            }
             Self::Binary(_, a, b) => {
                 a.reject_nested_aggregate()?;
                 b.reject_nested_aggregate()
@@ -460,7 +468,9 @@ impl Scalar {
                     "nextval" | "setval" | "currval" | "random" | "clock_timestamp"
                 ) || args.iter().any(Self::has_volatile_call)
             }
-            Self::Cast(value, _) | Self::Unary(_, value) => value.has_volatile_call(),
+            Self::Cast(value, _) | Self::Domain(value, ..) | Self::Unary(_, value) => {
+                value.has_volatile_call()
+            }
             Self::Binary(_, left, right) => left.has_volatile_call() || right.has_volatile_call(),
             Self::SubstringOrder(args) => args.iter().any(|a| a.has_volatile_call()),
             Self::Param(_) | Self::Column(_) | Self::Literal(_) => false,
@@ -565,7 +575,7 @@ impl Scalar {
                 if casts > 32 {
                     return Err(SqlError::Limit);
                 }
-                value = cast::expression(value, cast_type(p)?);
+                value = cast::parse_expression(p, value)?;
             } else {
                 break;
             }
@@ -667,9 +677,9 @@ impl Scalar {
             p.punct('(')?;
             let value = Self::parse_context(p, depth + 1, aggregate_argument)?;
             p.need("as")?;
-            let ty = cast_type(p)?;
+            let value = cast::parse_expression(p, value)?;
             p.punct(')')?;
-            return Ok(cast::expression(value, ty));
+            return Ok(value);
         }
         if p.sym('(') {
             let value = Self::parse_expr(p, depth + 1, aggregate_argument)?;
@@ -1047,6 +1057,15 @@ impl Scalar {
                 parameters[*n - 1].clone().ok_or(SqlError::Parameters)?,
                 Node::Param(*n),
             ),
+            Self::Domain(a, _, target) => {
+                let ty = target.as_ref().map_err(Clone::clone)?;
+                let TypeDef::Domain { base, typmod, .. } = ty else {
+                    return Err(SqlError::Unsupported);
+                };
+                let inner = cast::expression(*a.clone(), (base.clone(), *typmod))
+                    .bind(resolve, tables, parameters)?;
+                (base.clone(), Node::Domain(Box::new(inner), ty.clone()))
+            }
             Self::Cast(a, ty) => {
                 if let Self::Literal(v @ (Value::Text(_) | Value::Null)) = a.as_ref()
                     && datetime_input::target(ty)
@@ -1714,7 +1733,9 @@ impl BoundScalar {
                 *target = clock.cloned();
                 args.iter_mut().for_each(|a| a.attach_clock(clock));
             }
-            Node::Cast(value) | Node::TypmodCast(value, _) => value.attach_clock(clock),
+            Node::Cast(value) | Node::TypmodCast(value, _) | Node::Domain(value, _) => {
+                value.attach_clock(clock)
+            }
             Node::Call(_, args) => args.iter_mut().for_each(|a| a.attach_clock(clock)),
             _ => {}
         }
@@ -1760,6 +1781,7 @@ impl BoundScalar {
             Node::Case(..) => "case",
             Node::CrossCompare(..) | Node::ZonedOperator(..) => "?column?",
             Node::Param(_) => "?column?",
+            Node::Domain(_, ty) => ty.name(),
             Node::TypmodCast(inner, _) => inner.name(),
             Node::Cast(a) | Node::SessionCast(a, _) => {
                 if let Some(name) = a.strong_name() {
@@ -1888,6 +1910,11 @@ impl BoundScalar {
                 let v = params.get(n - 1).ok_or(SqlError::Parameters)?;
                 charge(budget, v)?;
                 Ok(v.clone())
+            }
+            Node::Domain(a, ty) => {
+                let value = a.eval(row, params, budget)?;
+                user_types::coerce_domain(ty, &value)?;
+                Ok(value)
             }
             Node::SessionCast(a, clock) => {
                 let value = a.eval(row, params, budget)?;
@@ -2190,7 +2217,9 @@ impl Query {
                         return Err(SqlError::Limit);
                     }
                 }
-                Scalar::Cast(value, _) | Scalar::Unary(_, value) => admit(value, bytes)?,
+                Scalar::Cast(value, _) | Scalar::Domain(value, ..) | Scalar::Unary(_, value) => {
+                    admit(value, bytes)?
+                }
                 Scalar::Binary(_, a, b) => {
                     admit(a, bytes)?;
                     admit(b, bytes)?;
@@ -2538,6 +2567,12 @@ impl Scalar {
                     }
                     slot.get_or_insert_with(|| ty.clone());
                 }
+            }
+            Self::Domain(a, _, target) => {
+                let TypeDef::Domain { base, .. } = target.as_ref().map_err(Clone::clone)? else {
+                    return Err(SqlError::Unsupported);
+                };
+                Self::Cast(a.clone(), base.clone()).infer(expected, parameters, resolve, tables)?;
             }
             Self::Cast(a, ty) => {
                 // An explicit cast converts the already chosen input type; it

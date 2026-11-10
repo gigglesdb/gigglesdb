@@ -3,6 +3,7 @@ pub use super::catalog_ext::TypeDef;
 use super::*;
 
 thread_local! {
+    static SQL_NOTICES: std::cell::RefCell<Vec<(String, Option<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
     static SQL_ERROR_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 /// Consume the diagnostic immediately after a synchronous SQL call on this thread.
@@ -10,7 +11,11 @@ thread_local! {
 pub fn take_sql_error_message() -> Option<String> {
     SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
 }
+pub fn take_sql_notices() -> Vec<(String, Option<String>)> {
+    SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
+}
 pub(super) fn clear_sql_error_message() {
+    take_sql_notices();
     take_sql_error_message();
 }
 
@@ -29,7 +34,8 @@ pub fn type_oid(id: u64) -> R<u32> {
 pub(super) enum Ddl {
     Create(TypeDef),
     Drop {
-        name: String,
+        names: Vec<String>,
+        cascade: bool,
         domain: bool,
         optional: bool,
     },
@@ -91,13 +97,18 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
             (s.into(), n.into())
         });
     if !create {
-        if p.word("cascade") {
-            return Err(SqlError::Unsupported);
+        let mut names = vec![spelling];
+        while p.sym(',') {
+            names.push(parse_name(p)?);
         }
-        p.word("restrict");
+        let cascade = p.word("cascade");
+        if !cascade {
+            p.word("restrict");
+        }
         end(p)?;
         return Ok(Ddl::Drop {
-            name: spelling,
+            names,
+            cascade,
             domain,
             optional,
         });
@@ -309,27 +320,141 @@ pub(super) fn execute(state: &mut Relational, ddl: &Ddl, prepared: &Prepared) ->
             })?;
         }
         Ddl::Drop {
-            name,
+            names,
+            cascade,
             domain,
             optional,
         } => {
-            let Some((id, ty)) = state.resolve_type(name, &prepared.search_path)? else {
-                return if *optional {
-                    Ok(())
-                } else {
-                    Err(SqlError::UndefinedObject)
+            let mut ids = BTreeSet::new();
+            let mut notices = Vec::new();
+            for name in names {
+                let Some((id, ty)) = state.resolve_type(name, &prepared.search_path)? else {
+                    if !optional {
+                        return Err(SqlError::UndefinedObject);
+                    }
+                    notices.push((format!("type \"{name}\" does not exist, skipping"), None));
+                    continue;
                 };
-            };
-            if *domain && !matches!(ty, TypeDef::Domain { .. }) {
-                return Err(SqlError::WrongObjectType);
+                if *domain && !matches!(ty, TypeDef::Domain { .. }) {
+                    return Err(SqlError::WrongObjectType);
+                }
+                ids.insert(id);
             }
-            if state.ext.columns.values().any(|c| c.type_id == Some(id)) {
+            let columns: BTreeSet<_> = state
+                .ext
+                .columns
+                .iter()
+                .filter(|(_, c)| c.type_id.is_some_and(|id| ids.contains(&id)))
+                .map(|(id, _)| *id)
+                .collect();
+            if !cascade && !columns.is_empty() {
                 return Err(SqlError::DependentObjects);
             }
-            state.mutate_ext(|ext, _| {
-                ext.types.remove(&id);
-                Ok(())
-            })?;
+            let mut candidate = state.clone();
+            let mut detail = Vec::new();
+            let descriptors: Vec<_> = state
+                .secondary_descriptors_engine()
+                .iter()
+                .filter(|d| !d.columns.iter().any(|id| columns.contains(id)))
+                .cloned()
+                .collect();
+            for (key, original) in &state.tables {
+                if !original.columns.iter().any(|c| columns.contains(&c.id)) {
+                    continue;
+                }
+                let mut table = original.clone();
+                // The current table validator requires at least one logical column.
+                if table.logical_columns().all(|c| columns.contains(&c.id)) {
+                    SQL_ERROR_MESSAGE.with(|message| {
+                        *message.borrow_mut() =
+                            Some("DROP TYPE CASCADE cannot leave a zero-column table".into())
+                    });
+                    return Err(SqlError::Unsupported);
+                }
+                let heap = table
+                    .primary_key
+                    .iter()
+                    .any(|at| columns.contains(&table.columns[*at].id));
+                let mut rows = candidate.rows.remove(&table.id).ok_or(SqlError::Type)?;
+                for at in (0..table.columns.len()).rev() {
+                    let column = &table.columns[at];
+                    if !columns.contains(&column.id) {
+                        continue;
+                    }
+                    detail.push(format!(
+                        "drop cascades to column {} of table {}",
+                        column.name,
+                        if state.table_schema(table.id) == "public" {
+                            table.name.clone()
+                        } else {
+                            format!("{}.{}", state.table_schema(table.id), table.name)
+                        }
+                    ));
+                    candidate.drop_column_ext(column.id)?;
+                    table.columns.remove(at);
+                    table.primary_key.retain(|key| *key != at);
+                    for key in &mut table.primary_key {
+                        if *key > at {
+                            *key -= 1;
+                        }
+                    }
+                    for row in rows.values_mut() {
+                        row.values.remove(at);
+                    }
+                }
+                if heap {
+                    table.primary_key = vec![table.columns.len()];
+                    table.columns.push(ColumnDef {
+                        id: allocate(&mut candidate.next_id)?,
+                        name: HIDDEN_ROWID.into(),
+                        data_type: DataType::BigInt,
+                        not_null: true,
+                    });
+                    let mut rebuilt = BTreeMap::new();
+                    for (n, mut row) in rows.into_values().enumerate() {
+                        let id = Value::Int(i64::try_from(n + 1).map_err(|_| SqlError::Limit)?);
+                        row.values.push(id.clone());
+                        rebuilt.insert(encode_key(&[id])?, row);
+                    }
+                    rows = rebuilt;
+                }
+                candidate.tables.insert(key.clone(), table.clone());
+                let constraints = candidate
+                    .ext
+                    .constraints
+                    .get(&table.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let retained = constraints
+                    .into_iter()
+                    .filter(|c| match &c.kind {
+                        ConstraintKind::Check { expr, .. } => {
+                            query::constraint_validate(&candidate, &table, expr).is_ok()
+                        }
+                        ConstraintKind::PrimaryKey => !heap,
+                        _ => true,
+                    })
+                    .collect();
+                candidate.ext.constraints.insert(table.id, retained);
+                candidate.rows.insert(table.id, rows);
+            }
+            for constraints in candidate.ext.constraints.values_mut() {
+                constraints.retain(|c| !matches!(&c.kind, ConstraintKind::ForeignKey { columns: local, ref_columns, .. } if local.iter().chain(ref_columns).any(|id| columns.contains(id))));
+            }
+            candidate.ext.types.retain(|id, _| !ids.contains(id));
+            Relational::normalize_ext(&mut candidate.ext);
+            candidate.secondary =
+                candidate.secondary_build_complete_engine(&descriptors, &mut || false)?;
+            if detail.len() == 1 {
+                notices.push((detail[0].clone(), None));
+            } else if !detail.is_empty() {
+                notices.push((
+                    format!("drop cascades to {} other objects", detail.len()),
+                    Some(detail.join("\n")),
+                ));
+            }
+            *state = candidate;
+            SQL_NOTICES.with(|pending| pending.borrow_mut().extend(notices));
         }
     }
     state.epoch = state.epoch.checked_add(1).ok_or(SqlError::Limit)?;
@@ -369,7 +494,13 @@ impl Relational {
     }
 }
 pub(super) fn coerce(state: &Relational, column: &ColumnDef, value: &Value) -> R<()> {
-    match state.column_type(column.id) {
+    coerce_domain_opt(state.column_type(column.id), value)
+}
+pub(super) fn coerce_domain(ty: &TypeDef, value: &Value) -> R<()> {
+    coerce_domain_opt(Some(ty), value)
+}
+fn coerce_domain_opt(ty: Option<&TypeDef>, value: &Value) -> R<()> {
+    match ty {
         Some(TypeDef::Enum { labels, .. }) if *value != Value::Null => {
             if !matches!(value, Value::Text(v) if labels.contains(v)) {
                 return Err(SqlError::InvalidTextRepresentation);
@@ -385,6 +516,10 @@ pub(super) fn coerce(state: &Relational, column: &ColumnDef, value: &Value) -> R
             ..
         }) => {
             if *not_null && *value == Value::Null {
+                SQL_ERROR_MESSAGE.with(|message| {
+                    *message.borrow_mut() =
+                        Some(format!("domain {name} does not allow null values"))
+                });
                 return Err(SqlError::Null);
             }
             if let Some(expr) = check {

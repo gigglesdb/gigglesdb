@@ -15,7 +15,9 @@ mod constraint_lookup;
 mod constraint_primary_key;
 mod ddl_type;
 mod user_types;
-pub use user_types::{TypeDef, UserTypeCatalog, take_sql_error_message, type_oid};
+pub use user_types::{
+    TypeDef, UserTypeCatalog, take_sql_error_message, take_sql_notices, type_oid,
+};
 mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
