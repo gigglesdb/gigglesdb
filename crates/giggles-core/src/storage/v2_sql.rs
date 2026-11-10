@@ -195,14 +195,10 @@ impl SqlSession {
                                 self.rollback();
                                 return validation.map(|()| Default::default());
                             }
+                            let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
                             let committed =
                                 sql_sequences::stage_pending(db, &mut txn, &self.pending_sequences)
-                                    .and_then(|()| {
-                                        db.catalog()
-                                            .commit_ddl(txn)
-                                            .map(|_| ())
-                                            .map_err(CoreError::from)
-                                    });
+                                    .and_then(|()| commit_sql(db, txn, point));
                             if committed.is_ok() {
                                 live.extend(
                                     self.pending_sequences
@@ -214,6 +210,7 @@ impl SqlSession {
                             drop(live);
                             self.rollback();
                             committed?;
+                            acknowledge_sql_commit(point)?;
                             return Ok(Default::default());
                         }
                         "rollback" => {
@@ -460,9 +457,9 @@ impl SqlSession {
                     }
                     txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && result.is_ok() {
-                        db.catalog()
-                            .commit_ddl(implicit.take().expect("implicit transaction"))
-                            .map_err(CoreError::from)?;
+                        let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
+                        commit_sql(db, implicit.take().expect("implicit transaction"), point)?;
+                        acknowledge_sql_commit(point)?;
                     }
                     result
                 }
@@ -486,6 +483,35 @@ impl SqlSession {
         }
         result
     }
+}
+
+// SQL publication only: counter reservations and non-SQL engine commits do not
+// use this seam. None adds only the crash-point read and untaken fault branches.
+fn commit_sql(db: &v2::V2Db, txn: Transaction, point: CrashPoint) -> Result<(), CoreError> {
+    if point == CrashPoint::BeforeCommit {
+        crash_now();
+    }
+    if point == CrashPoint::ErrorBeforeCommit {
+        return Err(CoreError::Storage("injected before commit".into()));
+    }
+    db.catalog().commit_ddl(txn).map_err(CoreError::from)?;
+    if point == CrashPoint::AfterCommit {
+        crash_now();
+    }
+    Ok(())
+}
+
+fn acknowledge_sql_commit(point: CrashPoint) -> Result<(), CoreError> {
+    // ErrorAfterDecisionCommit is inapplicable: v2 has no kernel decisions.
+    // Publish live sequence positions and clear the explicit transaction before
+    // reporting a lost response, just as for a successfully acknowledged commit.
+    if point == CrashPoint::ErrorAfterCommit {
+        return Err(CoreError::Storage("injected lost commit response".into()));
+    }
+    if point == CrashPoint::BeforeAck {
+        crash_now();
+    }
+    Ok(())
 }
 
 fn validate_pending(

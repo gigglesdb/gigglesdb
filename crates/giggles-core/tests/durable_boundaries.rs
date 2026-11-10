@@ -1,4 +1,4 @@
-//! Legacy durable-boundary registry and v2 logical recovery boundaries.
+//! Legacy and v2 durable SQL commit and logical recovery boundaries.
 mod common;
 use common::*;
 use giggles_core::{relational::Value, *};
@@ -511,5 +511,348 @@ fn every_v2_recovery_boundary() {
         count += 1;
     }
     assert_eq!(count, 15);
+    assert_eq!(count + 2 * v2_commit_points().len(), 27);
     println!("v2 recovery boundaries: {count} passed");
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn v2_commit_points() -> Vec<CrashPoint> {
+    registry()
+        .into_iter()
+        .filter_map(|boundary| match boundary {
+            Boundary::Commit(point, true) => match point {
+                CrashPoint::None
+                | CrashPoint::BeforeCommit
+                | CrashPoint::AfterCommit
+                | CrashPoint::BeforeAck
+                | CrashPoint::ErrorBeforeCommit
+                | CrashPoint::ErrorAfterCommit => Some(point),
+                // v2 does not implement kernel decisions; this is not a SQL seam.
+                CrashPoint::ErrorAfterDecisionCommit => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn v2_execute(sql: &mut SqlSession, statement: &str) -> Result<relational::SqlResult, CoreError> {
+    // Sequence evaluation uses the same clocked entry point as the server.
+    sql.execute_at(
+        statement,
+        &[],
+        None,
+        &relational::StatementClock {
+            unavailable: None,
+            transaction_us: 0,
+            statement_us: 0,
+            zone: None,
+            wall: None,
+        },
+    )
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn v2_query(sql: &mut SqlSession, query: &str) -> Vec<Vec<Value>> {
+    v2_execute(sql, query)
+        .unwrap_or_else(|error| panic!("{query}: {error:?}"))
+        .rows
+        .into_iter()
+        .map(|row| row.values)
+        .collect()
+}
+
+#[cfg(feature = "engine-rocksdb")]
+fn v2_parent(sql: &mut SqlSession) -> Vec<Vec<Value>> {
+    v2_query(sql, "SELECT id,tag,code,qty FROM cb_parent ORDER BY id")
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_commit_worker() {
+    let Ok(mode) = std::env::var("GD_V2_COMMIT_MODE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(std::env::var_os("GD_V2_COMMIT_PATH").unwrap());
+    let mode = mode.parse::<usize>().unwrap();
+    let point = v2_commit_points()[mode / 2];
+    let ddl = mode % 2 == 1;
+    let a = Admin::open(root.join("db"), Limits::default()).unwrap();
+    let mut sql = a.sql_session();
+    for statement in [
+        "CREATE SEQUENCE cb_ids",
+        "CREATE TABLE cb_parent (id BIGINT PRIMARY KEY DEFAULT nextval('cb_ids'), tag BIGINT NOT NULL, code TEXT NOT NULL, qty BIGINT CHECK (qty > 0))",
+        "CREATE INDEX cb_tag ON cb_parent(tag)",
+        "CREATE UNIQUE INDEX cb_code ON cb_parent(code)",
+        "CREATE TABLE cb_child (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES cb_parent(id))",
+        "BEGIN",
+        "INSERT INTO cb_parent(tag,code,qty) VALUES (10,'one',1),(20,'two',2),(30,'three',3)",
+        "INSERT INTO cb_child VALUES (1,1)",
+        "COMMIT",
+    ] {
+        v2_execute(&mut sql, statement).unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+    }
+    ack(&root, "base", format!("{:?}", v2_parent(&mut sql)));
+    v2_execute(
+        &mut sql,
+        "INSERT INTO cb_parent(tag,code,qty) VALUES (40,'four',4)",
+    )
+    .unwrap();
+    ack(&root, "stable", format!("{:?}", v2_parent(&mut sql)));
+    if !ddl {
+        for statement in [
+            "BEGIN",
+            "INSERT INTO cb_parent(tag,code,qty) VALUES (50,'five',5)",
+            "INSERT INTO cb_child VALUES (2,5)",
+            "UPDATE cb_parent SET tag=25,code='changed' WHERE id=2",
+            "DELETE FROM cb_parent WHERE id=3",
+        ] {
+            v2_execute(&mut sql, statement)
+                .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+        }
+        ack(&root, "sequence", "5".into()); // default id returned/used before COMMIT
+    }
+    let seen = v2_query(&mut sql, "SELECT nextval('cb_ids')");
+    let Value::Int(seen) = seen[0][0] else {
+        panic!("sequence value")
+    };
+    ack(&root, "sequence", seen.to_string());
+    a.set_crash_point(point).unwrap();
+    let result = v2_execute(
+        &mut sql,
+        if ddl {
+            "CREATE INDEX cb_qty ON cb_parent(qty)"
+        } else {
+            "COMMIT"
+        },
+    );
+    match point {
+        CrashPoint::None => {
+            result.unwrap();
+            ack(&root, "final", format!("{:?}", v2_parent(&mut sql)));
+        }
+        CrashPoint::ErrorBeforeCommit | CrashPoint::ErrorAfterCommit => {
+            assert_eq!(
+                result.unwrap_err(),
+                CoreError::Storage(
+                    if point == CrashPoint::ErrorBeforeCommit {
+                        "injected before commit"
+                    } else {
+                        "injected lost commit response"
+                    }
+                    .into()
+                )
+            );
+        }
+        _ => panic!("abrupt commit seam returned: {point:?}: {result:?}"),
+    }
+    std::process::exit(86);
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn every_v2_commit_boundary() {
+    use relational::SqlError;
+    let mut report = Vec::new();
+    assert_eq!(v2_commit_points().len(), 6);
+    for (index, point) in v2_commit_points().into_iter().enumerate() {
+        for ddl in [false, true] {
+            let root = fresh("v2-commit-boundary");
+            fs::create_dir(&root).unwrap();
+            drop(Admin::create_engine(root.join("db"), Limits::default(), Engine::V2).unwrap());
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "v2_commit_worker", "--nocapture"])
+                .env(
+                    "GD_V2_COMMIT_MODE",
+                    (index * 2 + usize::from(ddl)).to_string(),
+                )
+                .env("GD_V2_COMMIT_PATH", &root)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{point:?}, ddl={ddl}: {output:?}"
+            );
+            let acks: Vec<Json> = fs::read_to_string(root.join("acks.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            // Admin::open -> meta::open_checks runs engine/content_check.rs.
+            let a = Admin::open(root.join("db"), Limits::default()).unwrap();
+            let mut sql = a.sql_session();
+            let row = |id, tag, code: &str, qty| {
+                vec![
+                    Value::Int(id),
+                    Value::Int(tag),
+                    Value::Text(code.into()),
+                    Value::Int(qty),
+                ]
+            };
+            let baseline = vec![
+                row(1, 10, "one", 1),
+                row(2, 20, "two", 2),
+                row(3, 30, "three", 3),
+                row(4, 40, "four", 4),
+            ];
+            assert_eq!(acks[0]["kind"], "base");
+            assert_eq!(acks[0]["value"], format!("{:?}", &baseline[..3]));
+            assert_eq!(acks[1]["kind"], "stable");
+            assert_eq!(acks[1]["value"], format!("{baseline:?}"));
+            let committed = !matches!(
+                point,
+                CrashPoint::BeforeCommit | CrashPoint::ErrorBeforeCommit
+            );
+            let expected = if committed && !ddl {
+                vec![
+                    baseline[0].clone(),
+                    row(2, 25, "changed", 2),
+                    baseline[3].clone(),
+                    row(5, 50, "five", 5),
+                ]
+            } else {
+                baseline.clone()
+            };
+            let actual = v2_parent(&mut sql);
+            assert_eq!(
+                actual, expected,
+                "partial transaction: {point:?}, ddl={ddl}"
+            );
+            // Both acknowledged commits' untouched rows survive, including lost replies.
+            for stable in [&baseline[0], &baseline[3]] {
+                assert!(actual.contains(stable));
+            }
+            let mut children = vec![vec![Value::Int(1), Value::Int(1)]];
+            if committed && !ddl {
+                children.push(vec![Value::Int(2), Value::Int(5)]);
+            }
+            assert_eq!(
+                v2_query(&mut sql, "SELECT id,parent_id FROM cb_child ORDER BY id"),
+                children
+            );
+            let final_ack = acks.iter().find(|ack| ack["kind"] == "final");
+            assert_eq!(final_ack.is_some(), point == CrashPoint::None);
+            if let Some(ack) = final_ack {
+                assert_eq!(ack["value"], format!("{actual:?}"));
+            }
+            // Check new catalog publication before creating a missing control index.
+            if ddl {
+                let probe = v2_execute(&mut sql, "CREATE INDEX cb_qty ON cb_parent(qty)");
+                if committed {
+                    assert_eq!(probe.unwrap_err(), CoreError::Sql(SqlError::Duplicate));
+                } else {
+                    probe.unwrap();
+                }
+            }
+            // The unfiltered query uses the heap; tag/code equality uses their
+            // indexes (qty too for DDL). Include old/deleted keys to catch ghosts.
+            for (column, position) in [("tag", 1), ("code", 2), ("qty", 3)] {
+                for value in baseline.iter().chain(&actual).map(|row| &row[position]) {
+                    let literal = match value {
+                        Value::Int(n) => n.to_string(),
+                        Value::Text(s) => format!("'{s}'"),
+                        _ => unreachable!(),
+                    };
+                    let indexed = v2_query(
+                        &mut sql,
+                        &format!(
+                            "SELECT id,tag,code,qty FROM cb_parent WHERE {column}={literal} ORDER BY id"
+                        ),
+                    );
+                    let full: Vec<_> = actual
+                        .iter()
+                        .filter(|row| &row[position] == value)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        indexed, full,
+                        "index/heap mismatch: {point:?}, ddl={ddl}, {column}={literal}"
+                    );
+                }
+            }
+            for (statement, error) in [
+                (
+                    "INSERT INTO cb_parent VALUES (99,99,'one',1)",
+                    SqlError::Duplicate,
+                ),
+                (
+                    "INSERT INTO cb_parent VALUES (99,99,'new',0)",
+                    SqlError::CheckViolation,
+                ),
+                (
+                    "INSERT INTO cb_child VALUES (99,99)",
+                    SqlError::ForeignKeyViolation,
+                ),
+                (
+                    "DELETE FROM cb_parent WHERE id=1",
+                    SqlError::ForeignKeyViolation,
+                ),
+            ] {
+                assert_eq!(
+                    v2_execute(&mut sql, statement).unwrap_err(),
+                    CoreError::Sql(error),
+                    "{statement}"
+                );
+            }
+            assert!(
+                actual
+                    .iter()
+                    .all(|row| matches!(row[3], Value::Int(n) if n > 0))
+            );
+            for child in &children {
+                assert!(actual.iter().any(|row| row[0] == child[1]));
+            }
+            let mut maximum = acks
+                .iter()
+                .filter(|ack| ack["kind"] == "sequence")
+                .map(|ack| ack["value"].as_str().unwrap().parse::<i64>().unwrap())
+                .max()
+                .unwrap();
+            assert_eq!(maximum, if ddl { 5 } else { 6 });
+            for _ in 0..2 {
+                let next = v2_query(&mut sql, "SELECT nextval('cb_ids')");
+                let Value::Int(next) = next[0][0] else {
+                    panic!("sequence value")
+                };
+                assert!(
+                    next > maximum,
+                    "sequence reused {next} after {maximum}: {point:?}"
+                );
+                maximum = next;
+            }
+            assert_eq!(
+                v2_parent(&mut sql),
+                actual,
+                "failed constraint probe changed data"
+            );
+            assert_eq!(
+                v2_query(&mut sql, "SELECT id,parent_id FROM cb_child ORDER BY id"),
+                children
+            );
+            report.push(json!({"boundary": commit_name(point), "engine": "v2",
+                "step": if ddl { "autocommit-create-index" } else { "sql-commit" },
+                "outcome": "pass", "committed": committed, "acknowledged": final_ack.is_some(),
+                "termination": match point {
+                    CrashPoint::None => "exit-after-ack-control",
+                    CrashPoint::ErrorBeforeCommit | CrashPoint::ErrorAfterCommit => "exit-after-returned-error",
+                    _ => "existing-abrupt-crash-seam",
+                }, "checks": ["atomicity", "earlier-acks", "index-heap", "unique", "fk", "check", "sequence", "open-content-check"]}));
+            drop(sql);
+            drop(a);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    assert_eq!(report.len(), 12);
+    let report_path = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
+        .join("v2_commit_boundaries_report.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(&json!({"boundaries": report,
+        "registered_v2_boundaries": 27, "missing_fault_points": [],
+        "not_applicable": [{"boundary": "ErrorAfterDecisionCommit", "reason": "v2 has no kernel decisions"}]
+    })).unwrap()).unwrap();
+    println!(
+        "v2 commit boundaries: {} passed; report={}",
+        report.len(),
+        report_path.display()
+    );
 }
