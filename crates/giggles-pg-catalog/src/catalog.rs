@@ -1331,17 +1331,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         ScalarType::TimestampTz,
         ScalarType::Interval,
     ] {
-        // UUID must be visible before application DDL: drivers cache its type
-        // mapping when opening a connection to an empty database.
-        if matches!(ty, ScalarType::Jsonb)
-            && !snapshot
-                .tables
-                .iter()
-                .flat_map(|table| &table.columns)
-                .any(|column| column.data_type == ty)
-        {
-            continue;
-        }
+        // Built-ins must be visible before application DDL: drivers cache
+        // type mappings when opening a connection to an empty database.
         let (oid, name, len, array) = scalar(ty);
         add("pg_type", type_row(oid, name, len, 0, array, false));
         add(

@@ -1078,13 +1078,9 @@ fn validate_definition(def: &TableDef) -> Result<(), SqlError> {
     Ok(())
 }
 fn validate_identifier(name: &str) -> Result<(), SqlError> {
-    if name.is_empty()
-        || name.len() > 63
-        || !name.as_bytes()[0].is_ascii_alphabetic()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
+    // Names are already parsed SQL identifiers, including quoted identifiers.
+    // Apply the same content rules as SQL rather than unquoted token syntax.
+    if name.is_empty() || name.len() > 63 || name.contains('\0') {
         return Err(SqlError::Syntax);
     }
     if [

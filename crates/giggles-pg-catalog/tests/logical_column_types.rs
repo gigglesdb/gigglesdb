@@ -1,18 +1,41 @@
 use giggles_pg_catalog::{CatalogSnapshot, ColumnDef, ScalarType, TableDef, Value, execute, plan};
 
 #[test]
-fn uuid_metadata_precedes_columns_and_jsonb_follows_visible_columns() {
+fn uuid_and_jsonb_metadata_precede_columns() {
     let mut snapshot = CatalogSnapshot::default();
     let query =
         plan("SELECT oid,typname FROM pg_type WHERE oid IN (2950,2951,3802,3807) ORDER BY oid")
             .unwrap()
             .unwrap();
-    // Built-in UUID types must be discoverable when Npgsql first connects.
+    // Built-in UUID and JSONB types must be discoverable when Npgsql first connects.
     assert_eq!(
         execute(&query, &snapshot, &[]).unwrap().rows,
         vec![
             vec![Value::Int(2950), Value::Text("uuid".into())],
             vec![Value::Int(2951), Value::Text("_uuid".into())],
+            vec![Value::Int(3802), Value::Text("jsonb".into())],
+            vec![Value::Int(3807), Value::Text("_jsonb".into())],
+        ]
+    );
+    // PostgreSQL 18.6 built-in rows, checked before any application DDL.
+    let metadata = plan("SELECT oid,typname,typtype,typelem,typarray FROM pg_type WHERE oid IN (3802,3807) ORDER BY oid").unwrap().unwrap();
+    assert_eq!(
+        execute(&metadata, &snapshot, &[]).unwrap().rows,
+        vec![
+            vec![
+                Value::Int(3802),
+                Value::Text("jsonb".into()),
+                Value::Text("b".into()),
+                Value::Int(0),
+                Value::Int(3807)
+            ],
+            vec![
+                Value::Int(3807),
+                Value::Text("_jsonb".into()),
+                Value::Text("b".into()),
+                Value::Int(3802),
+                Value::Int(0)
+            ],
         ]
     );
     snapshot.tables.push(TableDef {

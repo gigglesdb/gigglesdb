@@ -1449,3 +1449,6 @@ mod constraint_tests;
 
 #[path = "v2_sql_table_free_tests.rs"]
 mod table_free_tests;
+
+#[path = "v2_sql_ident_tests.rs"]
+mod ident_tests;
