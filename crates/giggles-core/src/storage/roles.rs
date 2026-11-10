@@ -6,7 +6,12 @@
 use super::{Admin, CoreError, Inner, io};
 use redb::{Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeSet, fmt, sync::Arc, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+    sync::atomic::Ordering,
+};
 
 pub const MAX_ROLE_NAME: usize = 63;
 pub const MAX_ROLES: usize = 1024;
@@ -15,8 +20,44 @@ pub const FIRST_ROLE_OID: u32 = 16384;
 
 const ROLES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("giggles_roles_v1");
 const NEXT_OID: &[u8] = b"meta/next_oid";
-type ReadTable = redb::ReadOnlyTable<&'static [u8], &'static [u8]>;
-type WriteTable<'a> = redb::Table<'a, &'static [u8], &'static [u8]>;
+// Both engines run the same catalog operations on one atomic image.
+#[derive(Clone, Default)]
+struct RoleTable(BTreeMap<Vec<u8>, Vec<u8>>);
+struct Bytes<'a>(&'a [u8]);
+impl Bytes<'_> {
+    fn value(&self) -> &[u8] {
+        self.0
+    }
+}
+impl RoleTable {
+    fn get(&self, key: &[u8]) -> Result<Option<Bytes<'_>>, CoreError> {
+        Ok(self.0.get(key).map(|v| Bytes(v)))
+    }
+    fn iter(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<(Bytes<'_>, Bytes<'_>), CoreError>>, CoreError> {
+        Ok(self.0.iter().map(|(k, v)| Ok((Bytes(k), Bytes(v)))))
+    }
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), CoreError> {
+        self.0.insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+    fn remove(&mut self, key: &[u8]) -> Result<(), CoreError> {
+        self.0.remove(key);
+        Ok(())
+    }
+    fn load(table: &impl ReadableTable<&'static [u8], &'static [u8]>) -> Result<Self, RoleError> {
+        let mut image = Self::default();
+        for entry in table.iter().map_err(io)? {
+            let (key, value) = entry.map_err(io)?;
+            image.0.insert(key.value().to_vec(), value.value().to_vec());
+        }
+        Ok(image)
+    }
+}
+
+#[path = "roles_engine.rs"]
+pub(super) mod engine;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogRole {
@@ -123,6 +164,21 @@ fn validate_name(name: &str) -> Result<(), RoleError> {
     Ok(())
 }
 
+// Public relations keep their existing bare-name identity; non-public relations
+// carry exactly one schema separator. Validate components, never the joined length.
+fn validate_relation_identity(name: &str) -> Result<(), RoleError> {
+    if let Some((schema, relation)) = name.split_once('\0') {
+        validate_name(schema)?;
+        validate_name(relation)?;
+        if schema == "public" {
+            return Err(RoleError::Invalid);
+        }
+        Ok(())
+    } else {
+        validate_name(name)
+    }
+}
+
 fn validate_verifier(verifier: Option<&str>) -> Result<(), RoleError> {
     if let Some(verifier) = verifier
         && (verifier.is_empty()
@@ -150,17 +206,14 @@ fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T, RoleError> {
     serde_json::from_slice(value).map_err(|error| CoreError::Corrupt(error.to_string()).into())
 }
 
-fn raw_get(
-    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    key: &[u8],
-) -> Result<Option<Vec<u8>>, RoleError> {
+fn raw_get(table: &RoleTable, key: &[u8]) -> Result<Option<Vec<u8>>, RoleError> {
     Ok(table
         .get(key)
         .map_err(io)?
         .map(|value| value.value().to_vec()))
 }
 
-fn require_role(table: &WriteTable<'_>, name: &str) -> Result<(), RoleError> {
+fn require_role(table: &RoleTable, name: &str) -> Result<(), RoleError> {
     if raw_get(table, &key(b"role/", name))?.is_none() {
         return Err(RoleError::Missing);
     }
@@ -176,20 +229,18 @@ fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTree
 
 impl RoleCatalog {
     fn validate_relation_name(&self, name: &str) -> Result<(), RoleError> {
-        if let Some((schema, relation)) = name.split_once('\0') {
-            validate_name(schema)?;
-            validate_name(relation)?;
-            if schema == "public"
-                || !self
-                    .inner
-                    .inspect(|s| Ok(s.sql.schema_metadata().schemas.contains_key(schema)))?
-            {
-                return Err(RoleError::Invalid);
-            }
-            Ok(())
-        } else {
-            validate_name(name)
+        validate_relation_identity(name)?;
+        if let Some((schema, _)) = name.split_once('\0')
+            && matches!(&self.inner.backend, super::Backend::Legacy(_))
+            && !self
+                .inner
+                .inspect(|s| Ok(s.sql.schema_metadata().schemas.contains_key(schema)))?
+        {
+            return Err(RoleError::Invalid);
         }
+        // V2 administrative metadata may precede the relation. Its schema DDL
+        // is still unsupported; do not route this check through legacy storage.
+        Ok(())
     }
 
     fn check_fenced(&self) -> Result<(), RoleError> {
@@ -201,13 +252,18 @@ impl RoleCatalog {
 
     fn read<T>(
         &self,
-        inspect: impl FnOnce(Option<&ReadTable>) -> Result<T, RoleError>,
+        inspect: impl FnOnce(Option<&RoleTable>) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
+        if let super::Backend::V2(db) = &self.inner.backend {
+            let image = engine::load(db)?;
+            self.check_fenced()?;
+            return inspect(Some(&image));
+        }
         let tx = self.inner.db(super::ROLES)?.begin_read().map_err(io)?;
         self.check_fenced()?;
         match tx.open_table(ROLES) {
-            Ok(table) => inspect(Some(&table)),
+            Ok(table) => inspect(Some(&RoleTable::load(&table)?)),
             Err(redb::TableError::TableDoesNotExist(_)) => inspect(None),
             Err(error) => Err(io(error).into()),
         }
@@ -215,15 +271,29 @@ impl RoleCatalog {
 
     fn write<T>(
         &self,
-        change: impl FnOnce(&mut WriteTable<'_>) -> Result<T, RoleError>,
+        change: impl FnOnce(&mut RoleTable) -> Result<T, RoleError>,
     ) -> Result<T, RoleError> {
         self.check_fenced()?;
+        if let super::Backend::V2(db) = &self.inner.backend {
+            return engine::write(db, || self.check_fenced(), change);
+        }
         let mut tx = self.inner.db(super::ROLES)?.begin_write().map_err(io)?;
         self.check_fenced()?;
         tx.set_durability(Durability::Immediate).map_err(io)?;
         let result = {
             let mut table = tx.open_table(ROLES).map_err(io)?;
-            change(&mut table)?
+            let before = RoleTable::load(&table)?;
+            let mut after = before.clone();
+            let result = change(&mut after)?;
+            for key in before.0.keys().filter(|key| !after.0.contains_key(*key)) {
+                table.remove(key.as_slice()).map_err(io)?;
+            }
+            for (key, value) in &after.0 {
+                if before.0.get(key) != Some(value) {
+                    table.insert(key.as_slice(), value.as_slice()).map_err(io)?;
+                }
+            }
+            result
         };
         tx.commit().map_err(io)?;
         Ok(result)
@@ -353,6 +423,12 @@ impl RoleCatalog {
                 if bytes.starts_with(b"owner/") && value.value() == name.as_bytes() {
                     return Err(RoleError::Dependent);
                 }
+                if bytes.strip_prefix(b"member/").is_some_and(|pair| {
+                    pair.split(|byte| *byte == 0)
+                        .any(|part| part == name.as_bytes())
+                }) {
+                    remove.push(bytes.to_vec());
+                }
                 if (bytes.starts_with(b"tgrant/") || bytes.starts_with(b"sgrant/"))
                     && bytes.rsplit(|byte| *byte == 0).next() == Some(name.as_bytes())
                 {
@@ -364,6 +440,77 @@ impl RoleCatalog {
             }
             table.remove(key(b"role/", name).as_slice()).map_err(io)?;
             Ok(())
+        })
+    }
+
+    /// Direct membership metadata; role SQL syntax is not yet exposed by the server.
+    pub fn grant_membership(&self, role: &str, member: &str) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
+        validate_name(member)?;
+        self.write(|table| {
+            require_role(table, role)?;
+            require_role(table, member)?;
+            let mut pending = vec![role.to_owned()];
+            let mut seen = BTreeSet::new();
+            while let Some(next) = pending.pop() {
+                if next == member {
+                    return Err(RoleError::Invalid);
+                }
+                if !seen.insert(next.clone()) {
+                    continue;
+                }
+                for key in table
+                    .0
+                    .keys()
+                    .filter_map(|key| key.strip_prefix(b"member/"))
+                {
+                    let (parent, child) =
+                        key.split_at(key.iter().position(|b| *b == 0).ok_or(RoleError::Invalid)?);
+                    if &child[1..] == next.as_bytes() {
+                        pending.push(String::from_utf8(parent.to_vec()).map_err(io)?);
+                    }
+                }
+            }
+            table
+                .insert(grant_key(b"member/", role, member).as_slice(), &[])
+                .map_err(io)?;
+            Ok(())
+        })
+    }
+
+    pub fn revoke_membership(&self, role: &str, member: &str) -> Result<(), RoleError> {
+        self.check_fenced()?;
+        validate_name(role)?;
+        validate_name(member)?;
+        self.write(|table| {
+            require_role(table, role)?;
+            require_role(table, member)?;
+            table
+                .remove(grant_key(b"member/", role, member).as_slice())
+                .map_err(io)?;
+            Ok(())
+        })
+    }
+
+    pub fn memberships(&self, member: &str) -> Result<BTreeSet<String>, RoleError> {
+        self.check_fenced()?;
+        validate_name(member)?;
+        self.read(|table| {
+            let mut out = BTreeSet::new();
+            if let Some(table) = table {
+                for key in table
+                    .0
+                    .keys()
+                    .filter_map(|key| key.strip_prefix(b"member/"))
+                {
+                    let separator = key.iter().position(|b| *b == 0).ok_or(RoleError::Invalid)?;
+                    if &key[separator + 1..] == member.as_bytes() {
+                        out.insert(String::from_utf8(key[..separator].to_vec()).map_err(io)?);
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -600,10 +747,11 @@ pub(super) fn rename_tables(
     let mut moves = Vec::new();
     for (old, new) in renames {
         let owner_key = key(b"owner/", old);
-        if let Some(value) = raw_get(&table, &owner_key).map_err(|e| match e {
-            RoleError::Core(e) => e,
-            _ => CoreError::Corrupt("invalid table owner metadata".into()),
-        })? {
+        if let Some(value) = table
+            .get(owner_key.as_slice())
+            .map_err(io)?
+            .map(|v| v.value().to_vec())
+        {
             moves.push((owner_key, key(b"owner/", new), value));
         }
         let old_prefix = grant_key(b"tgrant/", old, "");
@@ -1327,3 +1475,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "roles_v2_tests.rs"]
+mod v2_tests;

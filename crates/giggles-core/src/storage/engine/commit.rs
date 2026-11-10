@@ -493,6 +493,11 @@ fn process_group(
                 if *space != Keyspace::Catalog {
                     return false;
                 }
+                if super::content_check::required_bits_for_catalog_key(key)
+                    .map_or(true, |required| required & !next_features != 0)
+                {
+                    return true;
+                }
                 let Some(value) = value else {
                     return false;
                 };

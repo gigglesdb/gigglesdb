@@ -12,6 +12,16 @@ fn corrupt(error: impl std::fmt::Display) -> FormatError {
     FormatError::Corrupt(error.to_string())
 }
 
+/// New role kinds need their guard even when the physical value is a tombstone.
+pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatError> {
+    if key.first().is_some_and(|kind| (8..=13).contains(kind)) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::super::roles::engine::FEATURE)
+    } else {
+        Ok(0)
+    }
+}
+
 /// Required format bits for one live, unversioned catalog value.
 pub(crate) fn required_bits_for_catalog_value(
     key: &[u8],
@@ -34,6 +44,15 @@ pub(crate) fn required_bits_for_catalog_value(
         // so the commit guard must refuse it too (DD-0068 X1).
         CatalogKind::RoleBootstrap => Ok(512),
         CatalogKind::Name => Ok(0),
+        CatalogKind::Role
+        | CatalogKind::RoleMembership
+        | CatalogKind::TableOwner
+        | CatalogKind::TableGrant
+        | CatalogKind::SchemaGrant
+        | CatalogKind::RoleOid => {
+            super::super::roles::engine::validate_record(key, value).map_err(corrupt)?;
+            Ok(super::super::roles::engine::FEATURE)
+        }
     }
 }
 
@@ -58,6 +77,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
         // Classify even historical/tombstoned keys: unknown kinds cannot hide
         // behind a tombstone or behind a newer, valid physical version.
         let kind = catalog_codec::classify_catalog_key(user).map_err(corrupt)?;
+        required |= required_bits_for_catalog_key(user)?;
         if previous.as_deref() == Some(user) {
             continue;
         }
@@ -98,7 +118,13 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
             }
             // The role-bootstrap gate and its existing opaque payload fixture
             // are owned by validate_meta.
-            CatalogKind::RoleBootstrap => {}
+            CatalogKind::RoleBootstrap
+            | CatalogKind::Role
+            | CatalogKind::RoleMembership
+            | CatalogKind::TableOwner
+            | CatalogKind::TableGrant
+            | CatalogKind::SchemaGrant
+            | CatalogKind::RoleOid => {}
         }
     }
     for (id, value) in constraints {

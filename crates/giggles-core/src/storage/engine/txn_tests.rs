@@ -1943,12 +1943,12 @@ mod f8a_commit_tests {
     fn reopened_worker_preserves_existing_feature_mask() {
         let (mem, seq) = fixture();
         seq.submit(sequence_request()).unwrap();
-        seq.submit(request(192)).unwrap();
+        seq.submit(request(192 | 0xC00)).unwrap();
         drop(seq);
         let seq = reopen(Arc::new(mem.crash()));
         seq.write_counter(catalog_codec::counter_key(1, 7), counter_value(), 0)
             .unwrap();
-        assert_eq!(load_features(seq.kv()).unwrap(), 448);
+        assert_eq!(load_features(seq.kv()).unwrap(), 448 | 0xC00);
     }
 
     #[test]
@@ -1956,7 +1956,7 @@ mod f8a_commit_tests {
         for value in [
             vec![0; 7],
             256u64.to_be_bytes().to_vec(),
-            2048u64.to_be_bytes().to_vec(),
+            4096u64.to_be_bytes().to_vec(),
         ] {
             let (mem, seq) = fixture();
             drop(seq);

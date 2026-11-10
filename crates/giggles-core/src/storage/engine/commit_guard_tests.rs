@@ -273,3 +273,31 @@ fn counters_only_through_write_counter_which_always_sets_bit_8() {
     assert!(durable.get(Keyspace::Seq, &key).unwrap().is_some());
     assert_eq!(meta::open_checks(&durable).unwrap().features & 256, 256);
 }
+
+#[test]
+fn role_kinds_require_bit_11_including_tombstones() {
+    for (key, value) in [
+        (b"\x09g\0m\0".to_vec(), Some(vec![1])),
+        (b"\x0at\0".to_vec(), Some(b"\x01owner".to_vec())),
+        (b"\x0bt\0r\0".to_vec(), Some(b"\x01[\"Select\"]".to_vec())),
+        (b"\x0cs\0r\0".to_vec(), Some(b"\x01[\"Usage\"]".to_vec())),
+        (
+            vec![13],
+            Some([vec![1], 16385u32.to_be_bytes().to_vec()].concat()),
+        ),
+        (b"\x08r\0".to_vec(), None),
+    ] {
+        let (mem, seq) = fixture();
+        let before = dump(mem.as_ref());
+        let mut refused = request(0);
+        refused
+            .writes
+            .insert((Keyspace::Catalog, key.clone()), value.clone());
+        assert!(matches!(seq.submit(refused), Err(TxnError::Misuse)));
+        assert_eq!(dump(mem.as_ref()), before);
+        let mut accepted = request(1 << 11);
+        accepted.writes.insert((Keyspace::Catalog, key), value);
+        seq.submit(accepted).unwrap();
+        assert_eq!(meta::open_checks(mem.as_ref()).unwrap().features, 1 << 11);
+    }
+}

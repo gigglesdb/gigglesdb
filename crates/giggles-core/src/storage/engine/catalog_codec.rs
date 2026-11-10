@@ -689,6 +689,12 @@ pub(crate) enum CatalogKind {
     Sequence,
     Type,
     RoleBootstrap,
+    Role,
+    RoleMembership,
+    TableOwner,
+    TableGrant,
+    SchemaGrant,
+    RoleOid,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
@@ -707,6 +713,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         Some(6) if key.len() == 9 => CatalogKind::Type,
         // Existing role bootstrap fixture: engine/meta_tests.rs role().
         Some(7) if key.len() == 9 => CatalogKind::RoleBootstrap,
+        Some(8..=13) => super::super::roles::engine::classify_key(key)?,
         _ => return Err(corrupt("invalid catalog user key")),
     })
 }

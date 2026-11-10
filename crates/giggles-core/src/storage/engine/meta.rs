@@ -10,7 +10,7 @@ use std::{
 
 pub(crate) const CURRENT_SUBVERSION: u32 = 1;
 pub(crate) const TEXT_BACKED_COLUMN_TYPES: u64 = 1 << 10;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 11] = [
+pub(crate) const FEATURE_TABLE: [(u64, &str); 12] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -22,6 +22,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 11] = [
     (256, "sequence_counters"),
     (512, "role_bootstrap"),
     (TEXT_BACKED_COLUMN_TYPES, "text_backed_column_types"),
+    (2048, "role_catalog"),
 ];
 const MARKER: &str = "GIGGLES_FORMAT";
 const TMP: &str = "GIGGLES_FORMAT.tmp";
@@ -249,7 +250,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     })
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    check_features_allowed(bits, 2047)
+    check_features_allowed(bits, 4095)
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {

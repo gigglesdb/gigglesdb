@@ -259,6 +259,14 @@ impl Catalog {
         if old_records == new_records {
             return Ok(());
         }
+        super::super::roles::engine::reconcile_tables(
+            txn,
+            self.sequencer.kv(),
+            old,
+            new,
+            deadline,
+            cancel,
+        )?;
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
         if !new.ext.is_empty() {
             txn.require_features(1 << 6);
@@ -393,6 +401,17 @@ impl Catalog {
                 entry.def.id.to_be_bytes().to_vec(),
             ),
         ]);
+        let old = self.parts(txn)?;
+        let mut new = old.clone();
+        new.tables.insert(entry.def.name.clone(), entry.def.clone());
+        super::super::roles::engine::reconcile_tables(
+            txn,
+            self.sequencer.kv(),
+            &old,
+            &new,
+            deadline,
+            cancel,
+        )?;
         self.lock_and_write(txn, &BTreeMap::new(), &records, deadline, cancel)?;
         Ok(entry)
     }
@@ -733,6 +752,16 @@ fn apply_record(
             }
         }
         CatalogKind::RoleBootstrap => {}
+        CatalogKind::Role
+        | CatalogKind::RoleMembership
+        | CatalogKind::TableOwner
+        | CatalogKind::TableGrant
+        | CatalogKind::SchemaGrant
+        | CatalogKind::RoleOid => {
+            if let Some(value) = value {
+                super::super::roles::engine::validate_record(key, value)?;
+            }
+        }
     }
     Ok(())
 }
