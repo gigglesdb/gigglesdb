@@ -75,6 +75,12 @@ fn run() -> local::Reply {
                     serde_json::json!({"domain":s.domain.to_string(),"rows":s.rows.len()}),
                 ))
             }
+            ["upgrade", "--recover", path] => {
+                let outcome = Admin::recover_upgrade(path)?;
+                Ok(local::Reply::ok(
+                    serde_json::json!({"database": path, "recovery": outcome}),
+                ))
+            }
             ["upgrade", path] => {
                 let report = Admin::upgrade_to_v2(path, Limits::default())?;
                 Ok(local::Reply::ok(

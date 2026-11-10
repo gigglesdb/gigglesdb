@@ -49,3 +49,8 @@ path = "tests/relational_process.rs"
 [[test]]
 name = "durable_boundaries"
 path = "tests/durable_boundaries.rs"
+
+[[test]]
+name = "upgrade_crash"
+path = "tests/upgrade_crash.rs"
+required-features = ["engine-rocksdb"]

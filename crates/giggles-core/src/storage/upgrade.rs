@@ -28,8 +28,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 pub(super) fn check_startup(path: &Path) -> Result<(), CoreError> {
     // Never guess which copy an interrupted operator intended to publish. A tmp
     // sibling always blocks opening; a missing path with a retained v1 sibling
-    // also blocks. The operator restores v1 (or completes a verified switch),
-    // then removes tmp before reopening. Returned errors perform this rollback.
+    // also blocks. Explicit recovery resolves these states before reopening.
     let tmp = sibling(path, ".v2-upgrade-tmp");
     let retained = if !path.exists() {
         let prefix = format!(
@@ -52,15 +51,81 @@ pub(super) fn check_startup(path: &Path) -> Result<(), CoreError> {
     };
     if tmp.exists() || retained {
         return Err(CoreError::Storage(format!(
-            "upgrade in progress at {}; restore the retained v1 directory or finish the verified switch, then remove {}",
+            "upgrade in progress at {}; run giggles upgrade --recover {}",
             path.display(),
-            tmp.display()
+            path.display()
         )));
     }
     Ok(())
 }
 
 impl Admin {
+    /// Resolve an interrupted offline upgrade without discarding its v1 or export backup.
+    /// Each mutation leaves a state that this same operation can resolve again.
+    pub fn recover_upgrade(path: impl AsRef<Path>) -> Result<&'static str, CoreError> {
+        use engine::meta::{DirClass, classify_dir};
+        let path = path.as_ref();
+        let tmp = sibling(path, ".v2-upgrade-tmp");
+        if !path.exists() {
+            let prefix = sibling(path, ".v1-pre-upgrade-");
+            let prefix = prefix.file_name().unwrap().to_string_lossy();
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut retained = Vec::new();
+            match fs::read_dir(parent) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(io)?;
+                        if entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(prefix.as_ref())
+                        {
+                            retained.push(entry.path());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io(e)),
+            }
+            if retained.len() > 1 {
+                return Err(io(
+                    "upgrade recovery refuses multiple v1-pre-upgrade siblings",
+                ));
+            }
+            if let Some(legacy) = retained.first() {
+                if !tmp.is_dir()
+                    || classify_dir(legacy).map_err(v2::format_error)? != DirClass::Legacy
+                {
+                    return Err(io(
+                        "upgrade recovery requires a legacy retained copy and tmp directory",
+                    ));
+                }
+                // Roll forward would require re-verification. Q6/Q5 favours restoring
+                // the known v1 copy; rename first so interrupted cleanup can retry.
+                fs::rename(legacy, path).map_err(io)?;
+                qualification_crash("RecoveryRename");
+            } else if tmp.exists() {
+                return Err(io("upgrade recovery cannot find the original v1 database"));
+            } else {
+                return Ok("no upgrade in progress");
+            }
+        }
+        if !tmp.exists() {
+            return Ok("no upgrade in progress");
+        }
+        let outcome = match classify_dir(path).map_err(v2::format_error)? {
+            DirClass::Legacy => "rolled back",
+            DirClass::V2 => "completed",
+            DirClass::Empty => return Err(io("upgrade recovery refuses an empty active database")),
+        };
+        fs::remove_dir_all(&tmp).map_err(io)?;
+        qualification_crash("RecoveryDelete");
+        Ok(outcome)
+    }
+
     pub fn upgrade_to_v2(
         path: impl AsRef<Path>,
         limits: Limits,
@@ -100,6 +165,14 @@ impl Admin {
         {
             run(path.as_ref(), limits, &mut hook)
         }
+    }
+}
+
+// Explicit process-local qualification seam. Child tests set it; normal operation
+// never enables it. Termination uses the existing no-destructor crash primitive.
+fn qualification_crash(point: &str) {
+    if std::env::var("GD_UPGRADE_CRASH").as_deref() == Ok(point) {
+        crash_now();
     }
 }
 
@@ -255,7 +328,7 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
     )?)));
     let mut batch = WriteBatch::default();
     let mut bits = feature_envelope::feature_bits_present(s)?;
-    let mut put = |ks, key: Vec<u8>, value: Vec<u8>| {
+    let put = |batch: &mut WriteBatch, ks, key: Vec<u8>, value: Vec<u8>| {
         batch.put(
             ks,
             codec::user_key_seek_at(&key, Ts(1)),
@@ -270,20 +343,22 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
             engine::content_check::required_bits_for_catalog_key(&key).map_err(v2::format_error)?;
         bits |= engine::content_check::required_bits_for_catalog_value(&key, &value)
             .map_err(v2::format_error)?;
-        put(Keyspace::Catalog, key, value);
+        put(&mut batch, Keyspace::Catalog, key, value);
     }
     for table in s.sql.tables.values() {
         let rows = legacy_rows(s, table)?;
         for (pk, row) in &rows {
             let key = [table.id.to_be_bytes().as_slice(), pk].concat();
             let value = codec::encode_row(&key, row.version, &row.values)?;
-            put(Keyspace::Rows, key, value);
+            put(&mut batch, Keyspace::Rows, key, value);
         }
         for (key, value) in
             engine::indexes::entries(table, &rows, s.sql.secondary_descriptors_engine())?
         {
-            put(Keyspace::Index, key, value);
+            put(&mut batch, Keyspace::Index, key, value);
         }
+        kv.write(std::mem::take(&mut batch), Durability::Sync)?;
+        qualification_crash("BuildBatch");
     }
     for (&id, counter) in &s.seq {
         let def = &s.sql.catalog_ext().sequences[&id];
@@ -325,6 +400,7 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
     marker.write_all(b"giggles-v2\n").map_err(io)?;
     marker.sync_all().map_err(io)?;
     drop(marker);
+    qualification_crash("BeforeMarkerRename");
     fs::rename(path.join("GIGGLES_FORMAT.tmp"), path.join("GIGGLES_FORMAT")).map_err(io)?;
     Ok(())
 }
