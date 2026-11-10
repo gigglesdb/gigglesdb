@@ -1190,7 +1190,12 @@ impl Admin {
         // V2 has a durable SQL authority domain, but no native approval clock/ledger.
         if let Backend::V2(db) = &self.inner.backend {
             let _ticket = self.inner.enter()?;
-            return Ok((u128::from_be_bytes(db.meta.domain), 0, 0, None));
+            return Ok((
+                u128::from_be_bytes(db.meta.domain),
+                0,
+                0,
+                db.origin_at(db.sequencer.visible_ts())?,
+            ));
         }
         self.inner
             .inspect(|s| Ok((s.view.domain, s.last_time, s.next_approval, s.origin)))

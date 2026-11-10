@@ -129,6 +129,7 @@ impl V2Db {
             }
         };
         let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
+        state.origin = self.origin_at(engine::hlc::Ts(epoch))?;
         state.sql = crate::relational::Relational::catalog_image(
             parts.tables,
             parts.ext,
@@ -142,6 +143,21 @@ impl V2Db {
             .map_err(CoreError::Sql)?;
         state.sql.epoch = epoch;
         Ok(state)
+    }
+
+    /// Older SQL-only v2 databases have no kernel image. When present, its
+    /// existing metadata record carries restore provenance.
+    pub(super) fn origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
+        let Some(bytes) =
+            engine::mvcc::read_at(self.kv.as_ref(), engine::kv::Keyspace::Kernel, &[0], ts)?
+        else {
+            return Ok(None);
+        };
+        let metadata: super::Metadata = super::decode(&bytes)?;
+        if metadata.domain.to_be_bytes() != self.meta.domain {
+            return Err(CoreError::Corrupt("kernel metadata domain mismatch".into()));
+        }
+        Ok(metadata.origin)
     }
 
     pub(crate) fn open(path: &Path) -> Result<Self, CoreError> {

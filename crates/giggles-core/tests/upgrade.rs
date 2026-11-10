@@ -83,21 +83,7 @@ mod rocks {
             run(&mut s, "UPDATE child SET n = 999 WHERE id = 12");
             run(&mut s, "DELETE FROM child WHERE id = 120");
             run(&mut s, "DELETE FROM app.parent WHERE id = 120");
-            let roles = a.roles();
-            for name in ["owner", "reader"] {
-                roles
-                    .create(NewRole {
-                        name: name.into(),
-                        login: true,
-                        ..Default::default()
-                    })
-                    .unwrap();
-            }
-            roles.grant_membership("reader", "owner").unwrap();
-            roles.set_table_owner("child", "owner").unwrap();
-            roles
-                .grant_table("child", "reader", &[TablePrivilege::Select])
-                .unwrap();
+            fixture_roles(&a);
         }
         let queries = if realistic {
             vec![
@@ -112,6 +98,24 @@ mod rocks {
             a.authority_metadata().unwrap().0,
             queries.into_iter().map(|q| run(&mut s, q)).collect(),
         )
+    }
+
+    fn fixture_roles(a: &Admin) {
+        let roles = a.roles();
+        for name in ["owner", "reader"] {
+            roles
+                .create(NewRole {
+                    name: name.into(),
+                    login: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        roles.grant_membership("reader", "owner").unwrap();
+        roles.set_table_owner("child", "owner").unwrap();
+        roles
+            .grant_table("child", "reader", &[TablePrivilege::Select])
+            .unwrap();
     }
 
     #[test]
@@ -368,17 +372,73 @@ mod rocks {
     }
 
     #[test]
-    fn refuses_restore_origin_without_changing_files() {
+    fn restored_legacy_upgrade_preserves_domain_origin_rows_and_roles() {
         let path = fresh("restore-origin");
         let source = path.with_file_name("source");
         let export = path.with_file_name("source.gdexp");
+        let (source_domain, expected) = fixture(&source, true);
+        let admin = Admin::open(&source, Limits::default()).unwrap();
+        admin.export(&export).unwrap();
+        drop(admin);
+        let restored = Admin::restore(&export, &path, Limits::default()).unwrap();
+        // Legacy logical exports omit the separate role catalog. Populate the
+        // restored v1 source so upgrade must preserve nonempty role records.
+        fixture_roles(&restored);
+        let authority = restored.authority_metadata().unwrap();
+        assert_ne!(authority.0, source_domain);
+        assert_eq!(authority.3, Some(source_domain));
+        let roles = restored.roles().list().unwrap();
+        drop(restored);
+        Admin::upgrade_to_v2(&path, Limits::default()).unwrap();
+        for _ in 0..2 {
+            let upgraded = Admin::open(&path, Limits::default()).unwrap();
+            assert_eq!(upgraded.authority_metadata().unwrap(), authority);
+            assert_eq!(upgraded.roles().list().unwrap(), roles);
+            assert_eq!(
+                upgraded.roles().memberships("owner").unwrap(),
+                BTreeSet::from(["reader".into()])
+            );
+            let mut session = upgraded.sql_session();
+            assert_eq!(
+                session.table_owner("child").unwrap().as_deref(),
+                Some("owner")
+            );
+            assert_eq!(
+                session.table_privileges("child", "reader").unwrap(),
+                BTreeSet::from([TablePrivilege::Select])
+            );
+            for (query, rows) in [
+                "SELECT * FROM app.parent ORDER BY id",
+                "SELECT * FROM child ORDER BY id",
+                "SELECT n FROM heap ORDER BY n",
+            ]
+            .into_iter()
+            .zip(&expected)
+            {
+                assert_eq!(&run(&mut session, query), rows);
+            }
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn restored_legacy_with_tasks_still_refuses_only_tasks() {
+        let path = fresh("restore-origin-tasks");
+        let source = path.with_file_name("source");
+        let export = path.with_file_name("source.gdexp");
         let admin = Admin::create(&source, Limits::default()).unwrap();
+        admin.grant(common::grant()).unwrap();
         admin.export(&export).unwrap();
         drop(admin);
         let restored = Admin::restore(&export, &path, Limits::default()).unwrap();
         assert!(restored.authority_metadata().unwrap().3.is_some());
         drop(restored);
-        refused_unchanged(&path, &["restore origin"]);
+        let error = Admin::upgrade_to_v2(&path, Limits::default()).unwrap_err();
+        assert!(
+            matches!(&error, CoreError::Storage(message) if message == "upgrade cannot represent tasks: 1"),
+            "{error}"
+        );
+        refused_unchanged(&path, &["tasks"]);
     }
 
     #[test]

@@ -204,7 +204,6 @@ fn refuse(s: &State) -> Result<(), CoreError> {
         ("native schema counter", usize::from(s.view.schema != 0)),
         ("authority clock", usize::from(s.last_time != 0)),
         ("approval counter", usize::from(s.next_approval != 0)),
-        ("restore origin", usize::from(s.origin.is_some())),
     ];
     let found = unsupported
         .into_iter()
@@ -384,6 +383,14 @@ fn build(path: &Path, s: &State, roles: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<(
     ] {
         batch.put(Keyspace::Meta, key.to_vec(), value);
     }
+    if s.origin.is_some() {
+        // Reuse the kernel's existing namespace-0 metadata codec. No SQL or
+        // otherwise refused native records belong in this image.
+        let mut kernel = empty(s.view.domain);
+        kernel.origin = s.origin;
+        let metadata = records(&kernel)?.remove(&vec![0]).expect("metadata record");
+        put(&mut batch, Keyspace::Kernel, vec![0], metadata);
+    }
     engine::meta::put_features(&mut batch, bits).map_err(v2::format_error)?;
     kv.write(batch, Durability::Sync)?;
     let allocator = engine::seq::SequenceAllocator::new(kv.clone(), 0);
@@ -436,11 +443,15 @@ fn verify(
         .catalog_indexes(s.sql.secondary_descriptors_engine())
         .map_err(CoreError::Sql)?;
     expected.epoch = 1;
+    let metadata = db.metadata_state(None)?;
     if db.meta.domain != s.view.domain.to_be_bytes()
-        || db.metadata_state(None)?.sql != expected
+        || metadata.origin != s.origin
+        || metadata.sql != expected
         || &admin.roles().upgrade_records()? != roles
     {
-        return Err(io("upgrade verification catalog/domain/roles mismatch"));
+        return Err(io(
+            "upgrade verification catalog/domain/origin/roles mismatch",
+        ));
     }
     for (&id, counter) in &s.seq {
         let def = &s.sql.catalog_ext().sequences[&id];
