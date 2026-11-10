@@ -945,6 +945,7 @@ fn multitable_reads_and_mutations_match_legacy() {
         "SELECT a.id,b.id,c.id FROM a LEFT JOIN b ON a.k=b.k LEFT JOIN c ON b.id=c.bid ORDER BY 1,2,3",
         "SELECT x.id,y.id FROM a x JOIN a y ON x.k=y.k ORDER BY 1,2",
         "SELECT a.id,b.id FROM a JOIN b ON true ORDER BY 1,2 LIMIT 3",
+        "SELECT a.id,b.id FROM a JOIN b ON true ORDER BY 1,2 LIMIT 3 OFFSET 1",
         "SELECT a.id,count(*),count(b.id) FROM a LEFT JOIN b ON a.k=b.k GROUP BY a.id ORDER BY 1",
         "SELECT a.k,sum(b.id),min(b.id),max(b.id) FROM a JOIN b ON a.k=b.k GROUP BY a.k HAVING count(*)>1 ORDER BY 1",
         "SELECT id FROM a WHERE k IN (SELECT k FROM b) ORDER BY id",
@@ -995,7 +996,6 @@ fn multitable_reads_and_mutations_match_legacy() {
     }
     // Exact legacy errors, including statements that fail after source staging.
     for sql in [
-        "SELECT a.id,b.id FROM a JOIN b ON true ORDER BY 1,2 LIMIT 3 OFFSET 1",
         "SELECT missing FROM a JOIN b ON a.id=b.id",
         "SELECT a.id FROM a JOIN absent ON a.id=absent.id",
         "SELECT id FROM a WHERE k IN (SELECT v FROM b)",

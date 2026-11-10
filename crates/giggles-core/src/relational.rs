@@ -220,6 +220,10 @@ pub enum SqlError {
     InvalidTimeZoneDisplacementValue,
     /// 42702 ambiguous_column
     AmbiguousColumn,
+    /// 2201W invalid_row_count_in_limit_clause
+    InvalidRowCountInLimitClause,
+    /// 2201X invalid_row_count_in_result_offset_clause
+    InvalidRowCountInResultOffsetClause,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

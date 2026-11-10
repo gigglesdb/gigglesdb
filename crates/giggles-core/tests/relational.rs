@@ -440,7 +440,6 @@ fn strict_rejection_matrix_and_resource_bounds() {
         "SELECT * FROM safe; DELETE FROM safe WHERE id=1",
         "SELECT * FROM safe WHERE id=(SELECT id FROM safe)",
         "WITH x AS (DELETE FROM safe) SELECT * FROM x",
-        "SELECT * FROM safe LIMIT 1 OFFSET 1",
     ] {
         err(&mut s, q, E::Unsupported);
     }
@@ -462,7 +461,16 @@ fn strict_rejection_matrix_and_resource_bounds() {
         run(&mut s, "SELECT * FROM safe").rows
     );
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 1025").rows.is_empty());
-    err(&mut s, "SELECT * FROM safe LIMIT -1", E::Limit);
+    err(
+        &mut s,
+        "SELECT * FROM safe LIMIT -1",
+        E::InvalidRowCountInLimitClause,
+    );
+    assert!(
+        run(&mut s, "SELECT * FROM safe LIMIT 1 OFFSET 1")
+            .rows
+            .is_empty()
+    );
     assert!(run(&mut s, "SELECT * FROM safe LIMIT 0").rows.is_empty());
     // Table aliases are now part of the bounded query contract.
     assert!(run(&mut s, "SELECT * FROM safe s LIMIT 1").rows.is_empty());

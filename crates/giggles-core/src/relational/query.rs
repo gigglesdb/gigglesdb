@@ -1510,7 +1510,7 @@ impl Parser {
         let name = self.table_name()?;
         let alias = if self.word("as")
             || matches!(self.tokens.get(self.at), Some(Token::QuotedIdent(_)))
-            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()))
+            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "offset", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()))
         {
             self.name()?
         } else {
@@ -1617,6 +1617,13 @@ fn scalar_has_undefined_routine(s: &Scalar) -> bool {
         Scalar::Literal(_) | Scalar::Param(_) | Scalar::Column(_) => false,
     }
 }
+fn integer_width(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::SmallInt | DataType::Integer | DataType::BigInt
+    )
+}
+
 impl Query {
     fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
         for (item, _) in &self.items {
@@ -2126,7 +2133,11 @@ impl Query {
             }
         }
         let limit = if p.word("limit") {
-            Some(p.expr()?)
+            Some(if p.word("all") {
+                Expr::Literal(Value::Null)
+            } else {
+                p.expr()?
+            })
         } else {
             None
         };
@@ -2174,20 +2185,6 @@ impl Query {
         }
         for (s, _, _) in &order {
             reject_scalar_subquery(s)?;
-        }
-        // OFFSET is admitted by this work item only for grouped output.
-        // Preserve the existing rejection boundary for ordinary row queries.
-        if offset.is_some()
-            && group.is_empty()
-            && having.is_none()
-            && !items
-                .iter()
-                .any(|(item, _)| matches!(item, Item::Aggregate(..)))
-            && !order
-                .iter()
-                .any(|(s, _, _)| grouping::contains_aggregate(s))
-        {
-            return Err(SqlError::Unsupported);
         }
         p.sym(';');
         if p.at != p.tokens.len() {
@@ -3156,6 +3153,9 @@ impl Query {
             if let Expr::Param(n) = e {
                 let slot = parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?;
                 if let Some(old) = slot.as_ref().filter(|old| *old != ty) {
+                    if integer_width(old) && integer_width(ty) {
+                        return Ok(true);
+                    }
                     if functions::comparable(old, ty) {
                         // Cross-type comparisons run in the full filter. A
                         // converted column key can round and miss matching rows.
@@ -3170,7 +3170,10 @@ impl Query {
                 }
                 if !matches!(v, Value::Null | Value::Text(_)) {
                     let literal = Scalar::Literal(v.clone()).bind(&resolve, &tables, parameters)?;
-                    if literal.ty != *ty && functions::comparable(&literal.ty, ty) {
+                    if literal.ty != *ty
+                        && functions::comparable(&literal.ty, ty)
+                        && !(integer_width(&literal.ty) && integer_width(ty))
+                    {
                         return Ok(false);
                     }
                 }
@@ -3889,6 +3892,11 @@ impl BoundQuery<'_> {
                 }
                 match value {
                     Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
+                    Some(Value::Int(_)) => Err(if numeric {
+                        SqlError::InvalidRowCountInLimitClause
+                    } else {
+                        SqlError::InvalidRowCountInResultOffsetClause
+                    }),
                     None | Some(Value::Null) => Ok(default),
                     _ => Err(SqlError::Limit),
                 }
@@ -4104,6 +4112,15 @@ impl BoundQuery<'_> {
         if let Some(grouping) = &self.grouping {
             return grouping.execute(self, state, source, params, execution);
         }
+        let offset = match self.query.offset() {
+            Some(e) => match e.value(params)? {
+                Value::Int(n) if n >= 0 => n as u64,
+                Value::Int(_) => return Err(SqlError::InvalidRowCountInResultOffsetClause),
+                Value::Null => 0,
+                _ => return Err(SqlError::Limit),
+            },
+            None => 0,
+        };
         let limit = match &self.query.limit {
             Some(e) => {
                 let value = e.value(params)?;
@@ -4116,6 +4133,7 @@ impl BoundQuery<'_> {
                 };
                 match value {
                     Value::Int(n) if n >= 0 => Some(n as u64),
+                    Value::Int(_) => return Err(SqlError::InvalidRowCountInLimitClause),
                     Value::Null => None,
                     _ => return Err(SqlError::Limit),
                 }
@@ -4140,14 +4158,6 @@ impl BoundQuery<'_> {
                 columns: self.columns.iter().map(|c| c.name.clone()).collect(),
                 rows: vec![],
                 affected: 0,
-            };
-            let offset = match self.query.offset() {
-                Some(e) => match e.value(params)? {
-                    Value::Int(n) if n >= 0 => n as u64,
-                    Value::Null => 0,
-                    _ => return Err(SqlError::Limit),
-                },
-                None => 0,
             };
             if limit != Some(0) && offset == 0 {
                 let row = Tuple {
@@ -4282,14 +4292,6 @@ impl BoundQuery<'_> {
                 Err(e) => Some(Err(e)),
             }
         });
-        let offset = match self.query.offset() {
-            Some(e) => match e.value(params)? {
-                Value::Int(n) if n >= 0 => n as u64,
-                Value::Null => 0,
-                _ => return Err(SqlError::Limit),
-            },
-            None => 0,
-        };
         let page = scan::Page { offset, limit };
         let mut result = SqlResult {
             columns: self.columns.iter().map(|c| c.name.clone()).collect(),
@@ -5334,5 +5336,43 @@ mod in_subquery_execution_tests {
         assert!(!query.is_table_free());
         assert!(!query.deferred_routine_only());
         assert_eq!(query.read_tables(), vec!["in_inner"]);
+    }
+}
+
+#[cfg(test)]
+mod integer_bound_tests {
+    use super::*;
+    #[test]
+    fn integer_widths_keep_exact_point_and_range_access() {
+        let mut state = Relational::default();
+        for key in ["smallint", "integer", "bigint"] {
+            let ddl = Prepared::parse(
+                &format!("CREATE TABLE t_{key}(id {key} PRIMARY KEY)"),
+                1,
+                state.epoch,
+            )
+            .unwrap();
+            state
+                .execute_with_cancel(&ddl, &[], None, || false)
+                .unwrap();
+            for ty in [DataType::SmallInt, DataType::Integer, DataType::BigInt] {
+                for (predicate, count) in [("id = 10000", 0), ("id = $1", 1), ("id >= $1", 1)] {
+                    let p = Prepared::parse(
+                        &format!("SELECT id FROM t_{key} WHERE {predicate}"),
+                        1,
+                        state.epoch,
+                    )
+                    .unwrap();
+                    let Statement::Query(q) = p.statement else {
+                        panic!("query")
+                    };
+                    let declared = vec![Some(ty.clone()); count];
+                    let bound = q.bind(&state, count, &declared).unwrap();
+                    let (_, bounds) = bound.base_bounds(&vec![Value::Int(10000); count]).unwrap();
+                    assert_eq!(bounds.low, encode_key(&[Value::Int(10000)]).unwrap());
+                    assert_eq!(bounds.point, !predicate.contains(">="));
+                }
+            }
+        }
     }
 }

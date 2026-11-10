@@ -436,7 +436,7 @@ fn assignment_numeric_errors_and_declared_limit() {
     let input = value(&mut s, "'-1.5'::numeric", &c);
     assert_eq!(
         s.execute_prepared(&p, &[input], None),
-        Err(CoreError::Sql(SqlError::Limit))
+        Err(CoreError::Sql(SqlError::InvalidRowCountInLimitClause))
     );
     let input = value(&mut s, "'9223372036854775808'::numeric", &c);
     assert_eq!(

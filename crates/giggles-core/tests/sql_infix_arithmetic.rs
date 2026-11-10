@@ -456,7 +456,7 @@ fn signed_legacy_statements_and_limit_rejection() {
     );
     assert!(matches!(
         s.execute("SELECT * FROM signed_rows LIMIT -1", &[], None),
-        Err(CoreError::Sql(SqlError::Limit))
+        Err(CoreError::Sql(SqlError::InvalidRowCountInLimitClause))
     ));
     s.execute("DELETE FROM signed_rows WHERE id=-1", &[], None)
         .unwrap();

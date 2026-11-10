@@ -165,7 +165,7 @@ fn large_scan_limits_aggregates_parameters_explain_and_cancellation() {
     );
     assert_eq!(
         s.execute("SELECT id FROM scan_rows LIMIT -1", &[], None),
-        Err(CoreError::Sql(E::Limit))
+        Err(CoreError::Sql(E::InvalidRowCountInLimitClause))
     );
     let mut ordered: Vec<i64> = (0..3000).collect();
     ordered.sort_by_key(|i| (score(*i).is_none(), score(*i), *i));

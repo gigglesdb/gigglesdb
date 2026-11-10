@@ -662,7 +662,11 @@ fn future_join_scope_and_conflicting_parameter_types_reject_empty_tables() {
         "SELECT p.id FROM people p WHERE p.id=$2",
         E::Parameters,
     );
-    err(&mut s, "SELECT COUNT(*) FROM people p LIMIT -1", E::Limit);
+    err(
+        &mut s,
+        "SELECT COUNT(*) FROM people p LIMIT -1",
+        E::InvalidRowCountInLimitClause,
+    );
     assert_eq!(
         vals(run(&mut s, "SELECT COUNT(*) FROM people p LIMIT 1025")),
         vec![vec![V::Int(0)]]
