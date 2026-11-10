@@ -7,6 +7,9 @@ use engine::{
 };
 use std::ops::Bound;
 
+#[path = "v2_large_ddl_tests.rs"]
+mod large_ddl;
+
 struct Fixture {
     path: std::path::PathBuf,
     admin: Option<Admin>,
@@ -666,7 +669,7 @@ fn dml_versions_rekey_reopen_and_mvcc_visibility() {
         vec![vec![Int(3), Int(20)]]
     );
     f.execute("DROP TABLE t");
-    // DROP cascades row tombstones in the catalog transaction, not orphan rows.
+    // DROP unpublishes the table atomically; old rows await snapshot-safe GC.
     let mut txn = f.db().begin(Isolation::ReadCommitted);
     assert!(
         txn.scan(
@@ -678,7 +681,7 @@ fn dml_versions_rekey_reopen_and_mvcc_visibility() {
         )
         .unwrap()
         .next()
-        .is_none()
+        .is_some()
     );
     drop(txn);
     f.reopen();
@@ -819,13 +822,16 @@ fn clocked_serial_defaults_match_legacy_and_transactional_create_persists() {
 }
 
 #[test]
-fn sink_failure_rolls_back_partial_rekey_and_drop() {
+fn sink_failure_rolls_back_partial_rekey_and_column_rewrite() {
     use relational::Value::Int;
     let f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY,n bigint)");
     f.execute("INSERT INTO t VALUES (1,10),(2,20)");
     let mut s = f.admin().sql_session();
-    for sql in ["UPDATE t SET id=3 WHERE id=1", "DROP TABLE t"] {
+    for sql in [
+        "UPDATE t SET id=3 WHERE id=1",
+        "ALTER TABLE t ADD COLUMN d bigint DEFAULT 42",
+    ] {
         s.execute("BEGIN", &[], None).unwrap();
         s.execute("INSERT INTO t VALUES (4,40)", &[], None).unwrap();
         FAIL_AFTER_ROW_WRITE.set(true);

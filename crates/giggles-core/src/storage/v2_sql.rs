@@ -2,7 +2,11 @@
 use super::*;
 use engine::{catalog::CatalogParts, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
-use relational::{SqlError, SqlRow, TableDef, relation_key, row_sink::RowSink, split_key};
+use relational::{
+    SqlError, SqlRow, TableDef, relation_key,
+    row_sink::{DdlRows, RowSink},
+    split_key,
+};
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
 mod sql_sequences;
@@ -619,6 +623,128 @@ impl RowSink for SqlRows<'_> {
         Ok(())
     }
 
+    fn streams_index_builds(&self) -> bool {
+        true
+    }
+    fn ddl_pages(
+        &mut self,
+        table: &TableDef,
+        after: &TableDef,
+        page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
+    ) -> Result<(), CoreError> {
+        let entry = TableEntry {
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let mut lower = Bound::Unbounded;
+        loop {
+            crate::cancellation::check()?;
+            let rows = self
+                .db
+                .rows
+                .scan(
+                    self.txn,
+                    &entry,
+                    lower,
+                    Bound::Unbounded,
+                    engine::kv::Direction::Forward,
+                    Some(200),
+                )?
+                .map(|pair| {
+                    pair.map(|(key, row)| {
+                        (
+                            key,
+                            SqlRow {
+                                values: row.values,
+                                version: row.version,
+                            },
+                        )
+                    })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let Some(last) = rows.last_key_value().map(|(key, _)| key.clone()) else {
+                break;
+            };
+            lower = Bound::Excluded(last);
+            let rewritten = page(rows.clone())?;
+            if table.columns.len() != after.columns.len() {
+                // The codec supplies NULL, not a frozen missing-column default.
+                // Rewrite bounded pages in the OUTER transaction: rows and the
+                // new layout become visible together, including after a crash.
+                // Its existing write-set budget still bounds large rewrites.
+                // Existing index tuples and primary-key bytes are unchanged.
+                self.apply(table, &rows, &BTreeMap::new())?;
+                self.apply(after, &BTreeMap::new(), &rewritten)?;
+            }
+        }
+        Ok(())
+    }
+    fn backfill_index(
+        &mut self,
+        table: &TableDef,
+        index: &relational::secondary_index::Descriptor,
+    ) -> Result<(), CoreError> {
+        let entry = TableEntry {
+            def: table.clone(),
+            heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new(),
+        };
+        let mut lower = Bound::Unbounded;
+        loop {
+            crate::cancellation::check()?;
+            let rows = self
+                .db
+                .rows
+                .scan(
+                    self.txn,
+                    &entry,
+                    lower,
+                    Bound::Unbounded,
+                    engine::kv::Direction::Forward,
+                    Some(200),
+                )?
+                .map(|pair| {
+                    pair.map(|(key, row)| {
+                        (
+                            key,
+                            SqlRow {
+                                values: row.values,
+                                version: row.version,
+                            },
+                        )
+                    })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let Some(last) = rows.last_key_value().map(|(key, _)| key.clone()) else {
+                break;
+            };
+            lower = Bound::Excluded(last);
+            let entries = engine::indexes::entries(table, &rows, std::slice::from_ref(index))?;
+            // The outer transaction holds the DDL table locks. Chunk commits
+            // publish only entries under a fresh, durably reserved ID; queries
+            // cannot discover it until the outer catalog commit succeeds.
+            // Rollback/crash can leave unreachable entries, never a partial
+            // visible index. No catalog or row bytes are committed by a chunk.
+            let mut chunk = self.db.begin(Isolation::ReadCommitted);
+            chunk.require_features(engine::meta::SECONDARY_INDEXES);
+            for (key, pk) in entries {
+                let target = chunk.lock_for_write(Keyspace::Index, &key, None, &|| {
+                    crate::cancellation::check().is_err()
+                })?;
+                if target.current.is_some() {
+                    return Err(CoreError::Sql(SqlError::Duplicate));
+                }
+                chunk.put(Keyspace::Index, key, pk)?;
+            }
+            chunk.commit()?;
+            #[cfg(test)]
+            if CRASH_AFTER_INDEX_CHUNK.replace(false) {
+                crash_now();
+            }
+        }
+        Ok(())
+    }
     fn lookup(
         &mut self,
         table: &TableDef,
@@ -908,6 +1034,7 @@ type TableScanHook = Box<dyn FnMut(&str)>;
 
 #[cfg(test)]
 thread_local! {
+    static CRASH_AFTER_INDEX_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
     static USED_INDEX_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_AFTER_ROW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

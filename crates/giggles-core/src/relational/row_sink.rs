@@ -7,6 +7,8 @@
 use super::*;
 use crate::CoreError;
 
+pub(crate) type DdlRows = BTreeMap<Vec<u8>, SqlRow>;
+
 pub(crate) trait RowSink {
     /// FK witnesses need a fresh snapshot after acquiring their table locks.
     fn check_fk_snapshot(&self) -> Result<(), CoreError> {
@@ -33,6 +35,24 @@ pub(crate) trait RowSink {
 
     fn indexes(&self) -> Vec<secondary_index::Descriptor> {
         Vec::new()
+    }
+    fn streams_index_builds(&self) -> bool {
+        false
+    }
+    fn ddl_pages(
+        &mut self,
+        _table: &TableDef,
+        _after: &TableDef,
+        _page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
+    fn backfill_index(
+        &mut self,
+        _table: &TableDef,
+        _index: &secondary_index::Descriptor,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
     }
     fn apply_indexes(
         &mut self,
@@ -70,6 +90,89 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
+        let streamed_ddl = match &prepared.statement {
+            Statement::DropIndex(_) | Statement::DropTable { .. } => true,
+            Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
+                matches!(
+                    action,
+                    alter_table::Action::Add(..)
+                        | alter_table::Action::NotNull(..)
+                        | alter_table::Action::Constraint(constraints::Definition::Check { .. })
+                )
+            }),
+            _ => false,
+        };
+        if streamed_ddl && sink.streams_index_builds() {
+            let original = self.clone();
+            let result = self
+                .execute_statement_inner(
+                    prepared,
+                    params,
+                    expected,
+                    || crate::cancellation::check().is_err(),
+                    clock,
+                    None,
+                    &mut Vec::new(),
+                )
+                .map_err(CoreError::Sql)?;
+            if let Statement::AlterTable(alter) = &prepared.statement {
+                let table = &original.tables[&alter.table];
+                sink.ddl_pages(table, &self.tables[&alter.table], &mut |rows| {
+                    let mut page = original.clone();
+                    page.rows.insert(table.id, rows);
+                    page.execute_statement_inner(
+                        prepared,
+                        params,
+                        expected,
+                        || crate::cancellation::check().is_err(),
+                        clock,
+                        None,
+                        &mut Vec::new(),
+                    )
+                    .map_err(CoreError::Sql)?;
+                    Ok(page.rows.remove(&table.id).unwrap_or_default())
+                })?;
+            }
+            // Dropped rows/index entries are unreachable once the outer catalog
+            // transaction commits; physical reclamation is snapshot-safe GC work.
+            return Ok(result);
+        }
+        let index_build = match &prepared.statement {
+            Statement::CreateIndex(_) => true,
+            Statement::AlterTable(alter) => alter.actions.iter().all(|action| {
+                matches!(
+                    action,
+                    alter_table::Action::Constraint(constraints::Definition::Unique { .. })
+                        | alter_table::Action::Unique(_, _)
+                )
+            }),
+            _ => false,
+        };
+        if index_build && sink.streams_index_builds() {
+            let old = sink.indexes();
+            let result = self
+                .execute_statement_inner(
+                    prepared,
+                    params,
+                    expected,
+                    || crate::cancellation::check().is_err(),
+                    clock,
+                    None,
+                    &mut Vec::new(),
+                )
+                .map_err(CoreError::Sql)?;
+            for index in self.secondary_descriptors_engine() {
+                if !old.iter().any(|old| old.id == index.id) {
+                    let table = self
+                        .tables
+                        .values()
+                        .find(|table| table.id == index.table)
+                        .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
+                    sink.backfill_index(table, index)?;
+                }
+            }
+            return Ok(result);
+        }
         // Keep the mutation target separate from the read set: a join's first
         // source must never be published, and INSERT ... SELECT still needs its
         // destination's complete occupancy image for immediate PK checks.
