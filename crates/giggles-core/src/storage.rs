@@ -1846,6 +1846,21 @@ impl Admin {
             Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()))
         })
     }
+    /// Committed catalog epoch and catalog xid, read together. Legacy uses its
+    /// durable publication counter; V2 uses whole physical HLC seconds, avoiding
+    /// the raw timestamp's low-32-bit wrap every ~65 seconds. Recovered commit
+    /// timestamps keep this nondecreasing across restarts and wall-clock rollback.
+    /// V2 seconds fit u32 until 2106; differences stay below 2^31 for ~68 years.
+    /// Neither backend reads private DDL.
+    pub fn catalog_generation(&self) -> Result<(u64, u64), CoreError> {
+        self.inner.inspect_metadata(|s| {
+            let generation = match &self.inner.backend {
+                Backend::Legacy(_) => s.sql.generation,
+                Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
+            };
+            Ok((s.sql.epoch, generation))
+        })
+    }
     pub fn catalog_schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
         self.inner.inspect_metadata(|s| Ok(s.sql.schema_metadata()))
     }
@@ -1866,6 +1881,10 @@ impl Admin {
             Ok((s.sql.epoch, typmods))
         })
     }
+}
+/// One conversion point for the V2 catalog xid (physical milliseconds -> seconds).
+fn catalog_xid_from_hlc(epoch: u64) -> u64 {
+    (epoch >> 16) / 1000
 }
 impl SqlSession {
     fn inspect_metadata<T>(
@@ -3672,6 +3691,53 @@ pub(crate) fn crash_now() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn v2_catalog_xid_uses_seconds_across_low_bit_wrap_and_clock_restart() {
+        use super::engine::hlc::{HlcClock, Ts};
+        let now_ms = 1_800_000_000_000;
+        let mut clock = HlcClock::default();
+        let first = clock.next(now_ms).unwrap();
+        let second = clock.next(now_ms + 70_000).unwrap();
+        assert!(second.0 - first.0 > u64::from(u32::MAX));
+        let previous = catalog_xid_from_hlc(first.0) as u32;
+        let current = catalog_xid_from_hlc(second.0) as u32;
+        assert_eq!(current - previous, 70);
+        assert!((current.wrapping_sub(previous) as i32) >= 0);
+        // The sequencer restores its clock from the durable last_commit_ts.
+        let mut reopened = HlcClock::new(Ts(second.0));
+        assert_eq!(catalog_xid_from_hlc(reopened.last.0), u64::from(current));
+        let after = reopened.next(now_ms).unwrap();
+        assert!(catalog_xid_from_hlc(after.0) >= u64::from(current));
+        assert_eq!(
+            catalog_xid_from_hlc((now_ms << 16) | 65535),
+            u64::from(previous)
+        );
+    }
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn v2_catalog_xid_survives_database_reopen() {
+        let path = fresh("v2-catalog-xid-reopen");
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let before = admin.catalog_generation().unwrap().1;
+        admin
+            .sql_session()
+            .execute("CREATE TABLE xid_before (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        let committed = admin.catalog_generation().unwrap().1;
+        assert!(committed >= before);
+        drop(admin);
+        let admin = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(admin.catalog_generation().unwrap().1, committed);
+        admin
+            .sql_session()
+            .execute("CREATE TABLE xid_after (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert!(admin.catalog_generation().unwrap().1 >= committed);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn zero_row_heap_metadata_is_persisted_and_reopened() {
         struct Cleanup(std::path::PathBuf);

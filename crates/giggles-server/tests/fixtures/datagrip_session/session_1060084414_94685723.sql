@@ -1,0 +1,1 @@
+select round(extract(epoch from pg_postmaster_start_time() at time zone 'UTC')) as startup_time

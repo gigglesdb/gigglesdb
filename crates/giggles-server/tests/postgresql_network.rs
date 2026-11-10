@@ -517,3 +517,50 @@ async fn negotiation_is_bounded_and_gss_then_ssl_is_accepted() {
     }
     f.stop().await;
 }
+
+#[tokio::test]
+async fn datagrip_refresh_extended_protocol_uses_current_backend_tls_state() {
+    let f = Fixture::new(TlsMode::Optional, true, false).await;
+    let plain = f.plain("owner", None).await;
+    let secure = f.secure("owner", None, false).await;
+    let mut pids = Vec::new();
+    for (client, ssl) in [(&plain, false), (&secure, true)] {
+        // Explicit prepare exercises Parse/Describe, then Bind/Execute.
+        let statement = client
+            .prepare(include_str!(
+                "../../giggles-pg-catalog/tests/fixtures/datagrip_refresh/ssl.sql"
+            ))
+            .await
+            .unwrap();
+        let rows = client.query(&statement, &[]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, bool>(0), ssl);
+        let row = client.query_one("select pid, pg_backend_pid(), ssl, version, cipher, bits, client_dn, client_serial, issuer_dn from pg_stat_ssl", &[]).await.unwrap();
+        let pid: i32 = row.get(0);
+        assert!(pid > 0);
+        assert_eq!(row.get::<_, i32>(1), pid);
+        assert_eq!(row.get::<_, bool>(2), ssl);
+        pids.push(pid);
+        for sql in [
+            include_str!("../../giggles-pg-catalog/tests/fixtures/datagrip_refresh/locks.sql"),
+            include_str!(
+                "../../giggles-pg-catalog/tests/fixtures/datagrip_refresh/user_mapping.sql"
+            ),
+        ] {
+            let statement = client.prepare(sql).await.unwrap();
+            assert!(client.query(&statement, &[]).await.unwrap().is_empty());
+        }
+        let sql = include_str!(
+            "../../giggles-pg-catalog/tests/fixtures/datagrip_refresh/column_acls.sql"
+        )
+        .replace("?::oid", "$1::oid");
+        let statement = client.prepare(&sql).await.unwrap();
+        let rows = client.query(&statement, &[&2200u32]).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(statement.columns()[2].type_().oid(), 1034);
+    }
+    assert_ne!(pids[0], pids[1]);
+    drop(plain);
+    drop(secure);
+    f.stop().await;
+}

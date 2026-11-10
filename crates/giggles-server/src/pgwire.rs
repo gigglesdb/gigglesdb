@@ -1858,6 +1858,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let _close = Close(backend.clone());
+    session.backend_pid = backend.pid as i32;
     if !authenticated_already {
         frame(b'R', &0u32.to_be_bytes(), &mut out).map_err(io::Error::other)?;
     }

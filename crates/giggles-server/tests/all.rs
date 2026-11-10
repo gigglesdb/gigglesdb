@@ -28,6 +28,8 @@ mod clock_network;
 mod constraints_network;
 #[path = "copy_network.rs"]
 mod copy_network;
+#[path = "datagrip_session.rs"]
+mod datagrip_session;
 #[path = "declared_nonint_parameter_network.rs"]
 mod declared_nonint_parameter_network;
 #[path = "declared_parameter_network.rs"]

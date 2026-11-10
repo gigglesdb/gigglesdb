@@ -141,7 +141,7 @@ fn captured_application_discovery() {
             1 => {
                 assert_eq!(get(0, "table_name"), Value::Text("inventory".into()));
                 assert_eq!(get(0, "table_id"), Value::Int(65564));
-                assert_eq!(get(0, "table_state_number"), Value::Null);
+                assert_eq!(get(0, "table_state_number"), Value::Int(0));
                 assert_eq!(get(0, "ancestors"), Value::Null);
                 assert_eq!(get(0, "successors"), Value::Null);
                 assert_eq!(get(0, "is_partition"), Value::Bool(false));
@@ -154,7 +154,7 @@ fn captured_application_discovery() {
                     assert_eq!(get(row, "type_id"), Value::Int(ty));
                     assert_eq!(get(row, "mandatory"), Value::Bool(mandatory));
                     assert_eq!(get(row, "column_default_expression"), Value::Null);
-                    assert_eq!(get(row, "column_state_number"), Value::Null);
+                    assert_eq!(get(row, "column_state_number"), Value::Int(0));
                     assert_eq!(get(row, "column_is_inherited"), Value::Bool(false));
                 }
             }
@@ -169,7 +169,7 @@ fn captured_application_discovery() {
                 assert_eq!(get(0, "con_name"), Value::Text("inventory_pkey".into()));
                 assert_eq!(get(0, "con_kind"), Value::Text("p".into()));
                 assert_eq!(get(0, "con_columns"), Value::Array(vec![Value::Int(1)]));
-                assert_eq!(get(0, "con_state_id"), Value::Null);
+                assert_eq!(get(0, "con_state_id"), Value::Int(0));
                 assert_eq!(get(0, "con_expression"), Value::Null);
                 assert_eq!(get(0, "excl_operators_str"), Value::Array(vec![]));
             }

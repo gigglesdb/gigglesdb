@@ -358,6 +358,15 @@ fn left_eligible(e: &E, width: usize, parameters: &[PgType]) -> bool {
         K::Literal(_) => true,
         K::Column(i) => *i < width,
         K::Param(i) => parameters.get(*i) == Some(&e.ty),
+        // Execute binds this exact input type before reading any relation. A
+        // redundant explicit parameter cast cannot introduce a scan-time error.
+        K::Cast(inner, PgType::Oid) if matches!(inner.kind, K::Param(_)) => {
+            let K::Param(i) = inner.kind else {
+                unreachable!()
+            };
+            parameters.get(i) == Some(&PgType::Oid)
+                && (inner.ty == PgType::Oid || textual(inner.ty))
+        }
         K::Binary(
             l,
             Op::And

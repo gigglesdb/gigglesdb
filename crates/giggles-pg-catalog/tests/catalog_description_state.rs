@@ -48,14 +48,15 @@ fn empty_description_xmin_descriptor_and_left_join_null() {
         plan("SELECT xmin FROM pg_shdescription"),
         Err(Error::UnknownColumn)
     ));
-    assert!(matches!(
-        plan("SELECT age(xmin) FROM pg_description"),
-        Err(Error::Unsupported)
-    ));
+    assert!(
+        run("SELECT age(xmin) FROM pg_description", &[])
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
-fn exact_full_comments_and_original_incremental_blocker() {
+fn exact_full_and_incremental_comments() {
     // Exact processor INC=false SHA256 07d0e1477573babde4b5c6d765731da18d07d0a23bbe5c3ce05f6265f5416218; sequential JDBC placeholders converted separately.
     let r = run(
         r###"select D.objoid id, C.relkind::char as kind, D.objsubid sub_id, D.description
@@ -152,8 +153,7 @@ where C.relnamespace = $13::oid and D.classoid = 'pg_catalog.pg_policy'::regclas
     );
     assert!(r.rows.is_empty());
     // Original captured pinned JDBC INC=true SHA256 b696588af93cf44bafde2524bb36839c2ad90f7e17d31f0f9473e76ce275854c.
-    assert!(matches!(
-        plan(
+    let p = plan(
             r###"select D.objoid id, C.relkind::char as kind, D.objsubid sub_id, D.description
 from pg_catalog.pg_description D
   join pg_catalog.pg_class C on D.objoid = C.oid
@@ -236,7 +236,19 @@ where C.relnamespace = $21::oid and D.classoid = 'pg_catalog.pg_policy'::regclas
 and pg_catalog.age(D.xmin) <= coalesce(nullif(greatest(pg_catalog.age($22::varchar::xid), -1), -1), 2147483647)
 
 -- security policies (also by table name...)"###
-        ),
-        Err(Error::Unsupported)
-    ));
+        ).unwrap().unwrap();
+    let params = p
+        .parameter_types()
+        .iter()
+        .map(|ty| match ty {
+            PgType::Oid => Value::Int(2200),
+            _ => Value::Text("0".into()),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        execute(&p, &CatalogSnapshot::default(), &params)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }

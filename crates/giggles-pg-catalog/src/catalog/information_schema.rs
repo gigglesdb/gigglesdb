@@ -179,7 +179,7 @@ pub(super) fn populate(
             if attribute[0] != relation[0] {
                 continue;
             }
-            let (I(oid), I(position)) = (&attribute[2], &attribute[3]) else {
+            let (I(oid), I(position)) = (&attribute[2], &attribute[4]) else {
                 return Err(Error::InvalidSnapshot);
             };
             if *position <= 0 {
@@ -193,7 +193,7 @@ pub(super) fn populate(
                 *position,
                 *oid as u32,
                 &attribute[5],
-                attribute[4] == B(true),
+                attribute[11] == B(true),
                 !view,
                 all,
             ));

@@ -176,6 +176,7 @@ async fn serve_listener(
                             eprintln!("protocol={protocol} rejected stage=binding reason=client_certificate_not_authorized");return;
                         };
                         session.connection=Some(shared);
+                        session.backend_ssl=true;
                         let blocking=service.blocking.clone();
                         if pg {
                             if let Err(error)=crate::pgwire::run(&mut stream,session).await {

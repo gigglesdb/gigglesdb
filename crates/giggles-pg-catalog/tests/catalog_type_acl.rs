@@ -104,8 +104,8 @@ fn exact_full_acl_has_real_ordered_authorized_oids_and_null_acl() {
         Err(Error::Parameters)
     );
     assert_eq!(run("select oid, relname, reltype, relacl, xmin from pg_catalog.pg_class where relnamespace=2200 order by oid", &snapshot(), &[]).rows, vec![
-        vec![i(65564),s("inventory"),i(65567),Value::Null,Value::Null],
-        vec![i(65565),s("inventory_pkey"),i(0),Value::Null,Value::Null],
+        vec![i(65564),s("inventory"),i(65567),Value::Null,i(0)],
+        vec![i(65565),s("inventory_pkey"),i(0),Value::Null,i(0)],
     ]);
     assert_eq!(
         run(

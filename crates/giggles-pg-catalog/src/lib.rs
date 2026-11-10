@@ -23,7 +23,8 @@
 //! This is a finite virtual catalog, not a PostgreSQL server: application types
 //! are the seventeen `ScalarType` variants. Catalog arrays, vectors, and rowtype
 //! identities do not grant additional application SQL types. No PostgreSQL MVCC
-//! tuple exists (`xmin` is NULL); transaction IDs, general timestamp functions, procedural execution,
+//! tuple exists: `xmin` exposes the durable catalog generation for conservative refresh.
+//! General transaction IDs, timestamp functions, procedural execution,
 //! arbitrary SQL/data access, and unmodeled DataGrip discovery remain unsupported.
 mod catalog;
 mod engine;
@@ -113,6 +114,13 @@ pub struct UserType {
 /// none of this metadata establishes authentication, membership, or privileges.
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
+    /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
+    /// xmin exposes its low 32 bits; this is never a raw HLC timestamp.
+    pub generation: u64,
+    /// Current wire backend identity, supplied by the host (0 in offline snapshots).
+    pub backend_pid: i32,
+    /// Whether this connection actually completed a TLS handshake.
+    pub backend_ssl: bool,
     /// Freshly authorized application rows, supplied by the hosting session.
     pub user_relations: std::collections::BTreeMap<String, ResultSet>,
     pub user_types: Vec<UserType>,
@@ -146,6 +154,9 @@ impl CatalogSnapshot {
 impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
+            generation: 0,
+            backend_pid: 0,
+            backend_ssl: false,
             user_relations: Default::default(),
             user_types: Vec::new(),
             column_type_oids: std::collections::BTreeMap::new(),
@@ -212,6 +223,8 @@ pub enum PgType {
     AnyArray,
     /// Metadata descriptor only; subscription LSNs are always NULL.
     PgLsn,
+    /// Metadata descriptor only; lock wait timestamps are always NULL.
+    TimestampTz,
 }
 impl PgType {
     pub fn oid(self) -> u32 {
@@ -247,6 +260,7 @@ impl PgType {
             Self::PgNodeTree => 194,
             Self::AnyArray => 2277,
             Self::PgLsn => 3220,
+            Self::TimestampTz => 1184,
         }
     }
     pub fn type_size(self) -> i16 {
@@ -254,7 +268,7 @@ impl PgType {
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
             Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc => 4,
-            Self::Int8 | Self::Float8 | Self::PgLsn => 8,
+            Self::Int8 | Self::Float8 | Self::PgLsn | Self::TimestampTz => 8,
             Self::Name => 64,
             _ => -1,
         }
@@ -341,3 +355,36 @@ pub const MAX_SQL: usize = 65536;
 pub const MAX_ROWS: usize = 8192;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_WORK: usize = 2_000_000;
+
+/// PostgreSQL xidin's unsigned 32-bit input, including signed compatibility,
+/// C-style hexadecimal/octal prefixes and surrounding ASCII whitespace.
+pub fn parse_xid(text: &str) -> Result<u32, Error> {
+    let text = text.trim_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (negative, digits) = if let Some(digits) = text.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if digits.starts_with('0') && digits.len() > 1 {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+        return Err(Error::Type);
+    }
+    let value = u32::from_str_radix(digits, radix).map_err(|_| Error::Type)?;
+    if negative {
+        if value > 1 << 31 {
+            return Err(Error::Type);
+        }
+        Ok(0u32.wrapping_sub(value))
+    } else {
+        Ok(value)
+    }
+}

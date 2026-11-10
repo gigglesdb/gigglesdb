@@ -1,0 +1,1386 @@
+[
+ {
+  "session": "1060084413",
+  "statement": "94685720",
+  "tag": "unknown",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084413_94685720.sql"
+ },
+ {
+  "session": "1060084413",
+  "statement": "94685721",
+  "tag": "unknown",
+  "failed": true,
+  "detail": "Detail: phase=application prepare; query_id=ce55afd5c285256cee19c24138585f984372963ea0563f45304f188a55e868e6",
+  "file": "session_1060084413_94685721.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685722",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685722.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685723",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685723.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685724",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=11ea5a7167dc8f283e70839be3e325a76d73651104347388eba835b755e4849c",
+  "file": "session_1060084414_94685724.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685725",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685725.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685726",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685726.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685727",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685727.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685728",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685728.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685729",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685729.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685730",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685730.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685731",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685731.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685732",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685732.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685733",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685733.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685734",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685734.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685735",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685735.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685736",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685736.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685737",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685737.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685738",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685738.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685739",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=a531fd2c61434a20a5566159cd425d2cd68ef5f8efe7063f4b4f3ea3fb5c0cc6",
+  "file": "session_1060084414_94685739.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685740",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685740.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685741",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685741.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685742",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685742.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685743",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685743.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685744",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685744.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685745",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685745.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685746",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685746.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685747",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685747.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685748",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685748.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685749",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685749.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685750",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685750.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685751",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685751.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685752",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685752.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685753",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685753.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685754",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685754.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685755",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685755.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685756",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685756.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685757",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685757.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685758",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685758.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685759",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685759.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685760",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685760.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685761",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685761.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685762",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685762.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685763",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685763.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685764",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685764.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685765",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685765.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685766",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685766.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685767",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685767.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685768",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685768.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685769",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685769.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685770",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=dd9c1e167e9df273702fe9b35e7398a32fa02d343a0a06c44e90d3e44c25528f",
+  "file": "session_1060084414_94685770.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685771",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685771.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685772",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685772.sql"
+ },
+ {
+  "session": "1060084414",
+  "statement": "94685773",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084414_94685773.sql"
+ },
+ {
+  "session": "1060084415",
+  "statement": "94685774",
+  "tag": "refactoring",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084415_94685774.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685775",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685775.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685776",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=11ea5a7167dc8f283e70839be3e325a76d73651104347388eba835b755e4849c",
+  "file": "session_1060084416_94685776.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685777",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685777.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685778",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685778.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685779",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685779.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685780",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685780.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685781",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685781.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685782",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685782.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685783",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685783.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685784",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685784.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685785",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685785.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685786",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685786.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685787",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685787.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685788",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=a531fd2c61434a20a5566159cd425d2cd68ef5f8efe7063f4b4f3ea3fb5c0cc6",
+  "file": "session_1060084416_94685788.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685789",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685789.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685790",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685790.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685791",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685791.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685792",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685792.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685793",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685793.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685794",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685794.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685795",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685795.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685796",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685796.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685797",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685797.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685798",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685798.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685799",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685799.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685800",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=34b1ea167a173e172fae1c3a2ac80e4076c2bf3f42e1af5bf5b5db81e6d49c5e",
+  "file": "session_1060084416_94685800.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685801",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=ece534f0667ad10e4f5d104790124f3f47c4ee9c1444fb38e880b7bf75f1dedd",
+  "file": "session_1060084416_94685801.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685802",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=a8f74d48f3006182089f997927997ad59fab51dc87a79c2afb315db03de7f80c",
+  "file": "session_1060084416_94685802.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685803",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=846efda6a2cdf00821505abe9207feee6e75c4015d72f1d086a54901ae715450",
+  "file": "session_1060084416_94685803.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685804",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=c6584be9092703a9fa3935227e4003fd83d88a7de0efa6732c22fc2d452e072a",
+  "file": "session_1060084416_94685804.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685805",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=9af35577b4fabaab07f60296cbb94da41d9388cccae8d6e241b49d8147cad489",
+  "file": "session_1060084416_94685805.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685806",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d2945f697a8fa69b7dc88ab8eade70b58244a62860b9463a1bab87c1fa27927b",
+  "file": "session_1060084416_94685806.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685807",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=1e57be9a90a0c01d3be1c440d7209b8cdb9fc9b29ec4996234880afc0e21a719",
+  "file": "session_1060084416_94685807.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685808",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=2d84e7d255a3700d26030c94200a65933c6b6c807e1e1c18824db2bbf73e6949",
+  "file": "session_1060084416_94685808.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685809",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=dbbf5f85cc852b595639f0b7238524d4d4ed9b9a41400dcfd0f98be681a156c2",
+  "file": "session_1060084416_94685809.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685810",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=7f211452ced92719edeaa985a8544a6fca15490243100c9964e606e03f234285",
+  "file": "session_1060084416_94685810.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685811",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685811.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685812",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=5eac51e85dd289dcbde622a73aa349e27d5dee9d2fc60b3565c719ac8e8902bd",
+  "file": "session_1060084416_94685812.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685813",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685813.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685814",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=27ce3dfb983624dd33791c5faca51b311ca4b27bece24789d745fdd1262d8a1a",
+  "file": "session_1060084416_94685814.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685815",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=28b8f322169a8e685a258b14929819864c1cfc72d0a77bd98c4d9f120a3f5e7b",
+  "file": "session_1060084416_94685815.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685816",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685816.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685817",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=579c658578e8ff7d8b36d3118700c8ac0cacacf2c9e88c2090b2d0ef1f103865",
+  "file": "session_1060084416_94685817.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685818",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685818.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685819",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=2a5f0aada4f1e4f3807805027af397e8f7d35ee7669338312faed22b31b992b3",
+  "file": "session_1060084416_94685819.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685820",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685820.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685821",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d4429eca5dacbf4f674ef6e1b4336cde92ee0380a1b2dcbdab7fa820a4d8e5fc",
+  "file": "session_1060084416_94685821.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685822",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685822.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685823",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=16eeb3aee3f24bb0d3a0d07fa3c34e2bf28025dc1f4a2544ec0e1af9062542e9",
+  "file": "session_1060084416_94685823.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685824",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685824.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685825",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=21cb408b0ee1edaddb4a1b156ff06333fd5d82c0f1ed2fe3cd2c4ef527d71722",
+  "file": "session_1060084416_94685825.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685826",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685826.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685827",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=b696588af93cf44bafde2524bb36839c2ad90f7e17d31f0f9473e76ce275854c",
+  "file": "session_1060084416_94685827.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685828",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=76713614a883001afaf3bad5f205919f7c6b473db50a1d074e03c8670affd69e",
+  "file": "session_1060084416_94685828.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685829",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084416_94685829.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685830",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=f4529fc22a4042751d7917ff772175fc0e1a8ead9ad4b36c74f2c3d55931f1b5",
+  "file": "session_1060084416_94685830.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685831",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d5fd7719b9a015ab5d91a5b5d10fd4b2fca14e81a6e4292c9a8dbd98436907e2",
+  "file": "session_1060084416_94685831.sql"
+ },
+ {
+  "session": "1060084416",
+  "statement": "94685832",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=43d16fe33f2e1862f4a2b80a8333c27f76df9cf6f668618a1105093e6fdd63b6",
+  "file": "session_1060084416_94685832.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685833",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685833.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685834",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=11ea5a7167dc8f283e70839be3e325a76d73651104347388eba835b755e4849c",
+  "file": "session_1060084417_94685834.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685835",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685835.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685836",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685836.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685837",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685837.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685838",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685838.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685839",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685839.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685840",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685840.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685841",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685841.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685842",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685842.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685843",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685843.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685844",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685844.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685845",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685845.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685846",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685846.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685847",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685847.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685848",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=a531fd2c61434a20a5566159cd425d2cd68ef5f8efe7063f4b4f3ea3fb5c0cc6",
+  "file": "session_1060084417_94685848.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685849",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685849.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685850",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685850.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685851",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685851.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685852",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685852.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685853",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685853.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685854",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685854.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685855",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685855.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685856",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685856.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685857",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685857.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685858",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685858.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685859",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685859.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685860",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=34b1ea167a173e172fae1c3a2ac80e4076c2bf3f42e1af5bf5b5db81e6d49c5e",
+  "file": "session_1060084417_94685860.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685861",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=ece534f0667ad10e4f5d104790124f3f47c4ee9c1444fb38e880b7bf75f1dedd",
+  "file": "session_1060084417_94685861.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685862",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=a8f74d48f3006182089f997927997ad59fab51dc87a79c2afb315db03de7f80c",
+  "file": "session_1060084417_94685862.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685863",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=846efda6a2cdf00821505abe9207feee6e75c4015d72f1d086a54901ae715450",
+  "file": "session_1060084417_94685863.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685864",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=c6584be9092703a9fa3935227e4003fd83d88a7de0efa6732c22fc2d452e072a",
+  "file": "session_1060084417_94685864.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685865",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=9af35577b4fabaab07f60296cbb94da41d9388cccae8d6e241b49d8147cad489",
+  "file": "session_1060084417_94685865.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685866",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d2945f697a8fa69b7dc88ab8eade70b58244a62860b9463a1bab87c1fa27927b",
+  "file": "session_1060084417_94685866.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685867",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=1e57be9a90a0c01d3be1c440d7209b8cdb9fc9b29ec4996234880afc0e21a719",
+  "file": "session_1060084417_94685867.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685868",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=2d84e7d255a3700d26030c94200a65933c6b6c807e1e1c18824db2bbf73e6949",
+  "file": "session_1060084417_94685868.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685869",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=dbbf5f85cc852b595639f0b7238524d4d4ed9b9a41400dcfd0f98be681a156c2",
+  "file": "session_1060084417_94685869.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685870",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=7f211452ced92719edeaa985a8544a6fca15490243100c9964e606e03f234285",
+  "file": "session_1060084417_94685870.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685871",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685871.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685872",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=5eac51e85dd289dcbde622a73aa349e27d5dee9d2fc60b3565c719ac8e8902bd",
+  "file": "session_1060084417_94685872.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685873",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685873.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685874",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=27ce3dfb983624dd33791c5faca51b311ca4b27bece24789d745fdd1262d8a1a",
+  "file": "session_1060084417_94685874.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685875",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=28b8f322169a8e685a258b14929819864c1cfc72d0a77bd98c4d9f120a3f5e7b",
+  "file": "session_1060084417_94685875.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685876",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685876.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685877",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=579c658578e8ff7d8b36d3118700c8ac0cacacf2c9e88c2090b2d0ef1f103865",
+  "file": "session_1060084417_94685877.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685878",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685878.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685879",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=2a5f0aada4f1e4f3807805027af397e8f7d35ee7669338312faed22b31b992b3",
+  "file": "session_1060084417_94685879.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685880",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685880.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685881",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d4429eca5dacbf4f674ef6e1b4336cde92ee0380a1b2dcbdab7fa820a4d8e5fc",
+  "file": "session_1060084417_94685881.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685882",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685882.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685883",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=16eeb3aee3f24bb0d3a0d07fa3c34e2bf28025dc1f4a2544ec0e1af9062542e9",
+  "file": "session_1060084417_94685883.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685884",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685884.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685885",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=21cb408b0ee1edaddb4a1b156ff06333fd5d82c0f1ed2fe3cd2c4ef527d71722",
+  "file": "session_1060084417_94685885.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685886",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685886.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685887",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=b696588af93cf44bafde2524bb36839c2ad90f7e17d31f0f9473e76ce275854c",
+  "file": "session_1060084417_94685887.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685888",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=76713614a883001afaf3bad5f205919f7c6b473db50a1d074e03c8670affd69e",
+  "file": "session_1060084417_94685888.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685889",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084417_94685889.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685890",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=f4529fc22a4042751d7917ff772175fc0e1a8ead9ad4b36c74f2c3d55931f1b5",
+  "file": "session_1060084417_94685890.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685891",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=d5fd7719b9a015ab5d91a5b5d10fd4b2fca14e81a6e4292c9a8dbd98436907e2",
+  "file": "session_1060084417_94685891.sql"
+ },
+ {
+  "session": "1060084417",
+  "statement": "94685892",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=43d16fe33f2e1862f4a2b80a8333c27f76df9cf6f668618a1105093e6fdd63b6",
+  "file": "session_1060084417_94685892.sql"
+ }
+]

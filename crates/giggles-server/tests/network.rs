@@ -1,3 +1,7 @@
+#[path = "wire_support/mod.rs"]
+mod wire_support;
+use wire_support::{bind, cstr, execute, parse, parse_oids, pg_read, pg_send, pg_sync};
+
 use giggles_core::{
     Admin, Column, Grant, Key, Limits, OperationId, Policy, Principal, Row, RowId, Selection,
     Status, TaskId, TenantId, Time, relational::Value,
@@ -507,7 +511,7 @@ async fn pinned_driver_extended_binary_types_describe_and_rollback() {
             tokio_postgres::types::Type::BYTEA
         ]
     );
-    let body = "nul\0 unicode λ";
+    let body = "nul\0 unicode Î»";
     let bytes = vec![0u8, 255, 1];
     assert_eq!(
         c.execute(
@@ -1269,77 +1273,6 @@ async fn jdbc_startup_presentation_hints_are_bounded_and_do_not_grant_authority(
     }
     f.stop().await;
 }
-async fn pg_send<S: tokio::io::AsyncWrite + Unpin>(s: &mut S, tag: u8, b: &[u8]) {
-    s.write_u8(tag).await.unwrap();
-    s.write_u32((b.len() + 4) as u32).await.unwrap();
-    s.write_all(b).await.unwrap();
-    s.flush().await.unwrap();
-}
-async fn pg_read<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> (u8, Vec<u8>) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let tag = s.read_u8().await.unwrap();
-        let n = s.read_u32().await.unwrap();
-        assert!((4..=8 * 1024 * 1024).contains(&n));
-        let mut b = vec![0; n as usize - 4];
-        s.read_exact(&mut b).await.unwrap();
-        (tag, b)
-    })
-    .await
-    .expect("wire response timeout")
-}
-async fn pg_sync<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    s: &mut S,
-) -> Vec<(u8, Vec<u8>)> {
-    pg_send(s, b'S', &[]).await;
-    let mut frames = vec![];
-    loop {
-        let f = pg_read(s).await;
-        let end = f.0 == b'Z';
-        frames.push(f);
-        if end {
-            return frames;
-        }
-    }
-}
-fn cstr(s: &str, b: &mut Vec<u8>) {
-    b.extend(s.as_bytes());
-    b.push(0);
-}
-fn parse(name: &str, sql: &str) -> Vec<u8> {
-    let mut b = vec![];
-    cstr(name, &mut b);
-    cstr(sql, &mut b);
-    b.extend(0u16.to_be_bytes());
-    b
-}
-fn bind(portal: &str, stmt: &str, params: &[Option<&str>], binary_result: bool) -> Vec<u8> {
-    let mut b = vec![];
-    cstr(portal, &mut b);
-    cstr(stmt, &mut b);
-    b.extend(0u16.to_be_bytes());
-    b.extend((params.len() as u16).to_be_bytes());
-    for v in params {
-        if let Some(v) = v {
-            b.extend((v.len() as i32).to_be_bytes());
-            b.extend(v.as_bytes());
-        } else {
-            b.extend((-1i32).to_be_bytes());
-        }
-    }
-    b.extend(1u16.to_be_bytes());
-    b.extend(u16::from(binary_result).to_be_bytes());
-    b
-}
-fn parse_oids(name: &str, sql: &str, oids: &[u32]) -> Vec<u8> {
-    let mut b = Vec::new();
-    cstr(name, &mut b);
-    cstr(sql, &mut b);
-    b.extend((oids.len() as u16).to_be_bytes());
-    for oid in oids {
-        b.extend(oid.to_be_bytes());
-    }
-    b
-}
 #[tokio::test]
 async fn jdbc_varchar_and_integer_wire_widths_preserve_core_range_checks() {
     let f = Fixture::new().await;
@@ -1421,12 +1354,6 @@ async fn jdbc_varchar_and_integer_wire_widths_preserve_core_range_checks() {
     drop(client);
     connection.await.unwrap();
     f.stop().await;
-}
-fn execute(portal: &str, max: u32) -> Vec<u8> {
-    let mut b = vec![];
-    cstr(portal, &mut b);
-    b.extend(max.to_be_bytes());
-    b
 }
 fn has_code(frames: &[(u8, Vec<u8>)], code: &str) -> bool {
     frames
@@ -1753,7 +1680,7 @@ async fn idle_postgres_connection_survives_frame_deadline_and_boolean_text_is_ca
             Value::Bool(false)
         );
     }
-    for value in ["", "o", "truefalse", "2", "🦀"] {
+    for value in ["", "o", "truefalse", "2", "ðŸ¦€"] {
         assert!(
             giggles_server::pgwire::decode(
                 value.as_bytes(),
@@ -2857,7 +2784,11 @@ async fn rejected_queries_report_stage_and_fingerprint_without_sql_or_values() {
     let error = error.as_db_error().unwrap();
     // DD-0068 F9: pgwire follows PG 18 (42883/3F000) for deferred-routine-only queries; native surfaces keep 42501.
     assert_eq!(error.code().code(), "42883");
-    assert!(error.message().contains("request rejected; consult documented code"));
+    assert!(
+        error
+            .message()
+            .contains("request rejected; consult documented code")
+    );
     let detail = error.detail().unwrap();
     assert!(detail.contains("phase=application prepare"));
     assert!(detail.contains(&hex::encode(Sha256::digest(sql.as_bytes()))));
@@ -3149,3 +3080,19 @@ include!("routing_rejection_network.inc");
 include!("deferred_routine_surface_network.inc");
 
 include!("sql_upsert_network.inc");
+
+#[tokio::test]
+async fn datagrip_ssl_probe_reports_tls_on_certificate_listener() {
+    let f = Fixture::new().await;
+    let (pg, connection) = f.pg(f.app.clone()).await;
+    let statement = pg
+        .prepare("select ssl from pg_stat_ssl where pid = pg_backend_pid()")
+        .await
+        .unwrap();
+    let rows = pg.query(&statement, &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get::<_, bool>(0));
+    drop(pg);
+    connection.await.unwrap();
+    f.stop().await;
+}

@@ -351,6 +351,8 @@ impl Service {
             .ok_or(CoreError::Policy(Error::Authentication))?;
         Ok(Session {
             surface: Surface::Native,
+            backend_pid: 0,
+            backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("pgrole:{}", role.name),
             role: Role::Database { name: role.name },
@@ -379,6 +381,8 @@ impl Service {
             .ok_or(CoreError::Policy(Error::Authentication))?;
         Ok(Session {
             surface: Surface::Native,
+            backend_pid: 0,
+            backend_ssl: false,
             service: self.clone(),
             role,
             epoch,
@@ -406,6 +410,8 @@ pub(crate) enum Surface {
 }
 pub struct Session {
     pub(crate) surface: Surface,
+    pub(crate) backend_pid: i32,
+    pub(crate) backend_ssl: bool,
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
     pub(crate) database: Option<String>,

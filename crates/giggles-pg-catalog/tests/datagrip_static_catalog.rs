@@ -434,11 +434,11 @@ fn static_catalog_descriptors_and_empty_rows() {
 // E177 authorizes exact descriptor variants; semantic rejection is tested in
 // datagrip_catalog_descriptors.rs and the wire codec tests.
 #[test]
-fn catalog_identity_authorized_facts_and_null_xmin() {
+fn catalog_identity_authorized_facts_and_generation_xmin() {
     let ids = run("select oid from pg_catalog.pg_class", &[]).rows;
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
     assert_eq!(ids.len(), unique.len());
-    assert_eq!(run("select oid, relname, xmin from pg_catalog.pg_class where relnamespace = 2200 and relkind = 'r'", &[]).rows, vec![vec![Value::Int(65564), Value::Text("inventory".into()), Value::Null]]);
+    assert_eq!(run("select oid, relname, xmin from pg_catalog.pg_class where relnamespace = 2200 and relkind = 'r'", &[]).rows, vec![vec![Value::Int(65564), Value::Text("inventory".into()), Value::Int(0)]]);
     assert_eq!(
         run(
             "select indrelid, indkey, indisprimary from pg_catalog.pg_index",
@@ -458,16 +458,15 @@ fn catalog_identity_authorized_facts_and_null_xmin() {
     ));
     assert_eq!(
         run("select xmin from pg_catalog.pg_namespace", &[]).rows,
-        vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]]
+        vec![vec![Value::Int(0)]; 3]
     );
-    assert!(matches!(
-        plan("select age(xmin) from pg_catalog.pg_proc"),
-        Err(Error::Unsupported)
-    ));
-    assert!(matches!(
-        plan("select * from pg_catalog.pg_locks"),
-        Err(Error::Unsupported)
-    ));
+    assert!(
+        run("select age(xmin) from pg_catalog.pg_proc", &[])
+            .rows
+            .is_empty()
+    );
+    // The finite PG18 lock view is now modeled; no transaction xids are assigned.
+    assert!(run("select * from pg_catalog.pg_locks", &[]).rows.is_empty());
 }
 #[test]
 fn exact_static_captured_query_subset() {

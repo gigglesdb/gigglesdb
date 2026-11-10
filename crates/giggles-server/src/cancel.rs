@@ -53,8 +53,8 @@ impl Registry {
         loop {
             let mut bytes = [0; 8];
             getrandom::fill(&mut bytes).map_err(io::Error::other)?;
-            let pid = u32::from_be_bytes(bytes[..4].try_into().unwrap());
-            if !entries.used.insert(pid) {
+            let pid = u32::from_be_bytes(bytes[..4].try_into().unwrap()) & i32::MAX as u32;
+            if pid == 0 || !entries.used.insert(pid) {
                 continue;
             }
             let backend = Arc::new(Backend {

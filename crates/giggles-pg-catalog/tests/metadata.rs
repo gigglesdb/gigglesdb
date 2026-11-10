@@ -227,7 +227,7 @@ fn datagrip_list_schemas() {
         r.rows[0],
         vec![
             i(2200),
-            Value::Null,
+            i(0),
             s("public"),
             Value::Null,
             s("pg_database_owner")
@@ -593,10 +593,10 @@ fn exact_transport_and_parameter_descriptors() {
     );
 }
 #[test]
-fn no_postgres_mvcc_state_is_invented() {
+fn xmin_reports_current_catalog_generation() {
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").rows,
-        vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]]
+        vec![vec![Value::Int(0)]; 3]
     );
     assert_eq!(
         run("SELECT xmin FROM pg_namespace").fields[0]

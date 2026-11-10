@@ -119,7 +119,18 @@ pub(crate) fn snapshot(
             Ok((name, (oid, owner)))
         })
         .collect::<Result<_>>()?;
+    let (generation_epoch, generation) = session
+        .service
+        .admin
+        .catalog_generation()
+        .map_err(|e| crate::service::sqlstate(&e))?;
+    if generation_epoch != epoch {
+        return Err("40001");
+    }
     Ok(giggles_pg_catalog::CatalogSnapshot {
+        generation,
+        backend_pid: session.backend_pid,
+        backend_ssl: session.backend_ssl,
         schemas,
         table_schemas: metadata
             .tables
@@ -410,6 +421,7 @@ pub(crate) fn parameter_type(oid: u32) -> Result<PgType> {
         23 => PgType::Int4,
         25 | 1043 => PgType::Text,
         26 => PgType::Oid,
+        28 => PgType::Xid,
         1700 => PgType::Numeric,
         700 => PgType::Float4,
         701 => PgType::Float8,
@@ -436,7 +448,13 @@ pub(crate) fn decode(bytes: &[u8], ty: PgType, format: u16) -> Result<Value> {
     if format > 1 {
         return Err("08P01");
     }
-    if ty == PgType::Oid {
+    if ty == PgType::Xid && format == 0 {
+        let text = std::str::from_utf8(bytes).map_err(|_| "22021")?;
+        return giggles_pg_catalog::parse_xid(text)
+            .map(|v| Value::Int(v.into()))
+            .map_err(|_| "22P02");
+    }
+    if matches!(ty, PgType::Oid | PgType::Xid) {
         return if format == 0 {
             std::str::from_utf8(bytes)
                 .map_err(|_| "22021")?
@@ -904,6 +922,102 @@ mod tests {
             .unwrap(),
             Some(b"{\"giggles=UC/giggles\"}".to_vec())
         );
+    }
+
+    #[test]
+    fn catalog_refresh_generation_survives_restart_and_tracks_commits() {
+        use giggles_core::{Admin, Limits, roles::NewRole};
+        fn read(session: &mut crate::Session) -> giggles_pg_catalog::CatalogSnapshot {
+            let (epoch, tables, indexes, typmods, types) =
+                session.catalog_snapshot_with_typmods().unwrap();
+            snapshot(session, epoch, tables, indexes, typmods, types).unwrap()
+        }
+        fn make_service(admin: Admin) -> std::sync::Arc<crate::Service> {
+            crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap()
+        }
+        let path = crate::test_support::fixture_root().join(format!(
+            "datagrip-generation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let admin = Admin::create(&path, Limits::default()).unwrap();
+        admin
+            .roles()
+            .create(NewRole {
+                name: "refresh_owner".into(),
+                login: true,
+                superuser: true,
+                ..NewRole::default()
+            })
+            .unwrap();
+        let service = make_service(admin);
+        let mut session = service.role_session("refresh_owner").unwrap();
+        let before = read(&mut session).generation;
+        session
+            .execute_sql("CREATE TABLE refresh_table (id BIGINT PRIMARY KEY)", &[])
+            .unwrap();
+        let created = read(&mut session);
+        assert!(created.generation > before);
+        let p = giggles_pg_catalog::plan(
+            "select xmin, age(xmin) from pg_class where relname='refresh_table'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            execute(&p, &created, &[]).unwrap().rows,
+            [vec![
+                Value::Int(i64::from(created.generation as u32)),
+                Value::Int(0)
+            ]]
+        );
+        session
+            .execute_sql("INSERT INTO refresh_table VALUES (1)", &[])
+            .unwrap();
+        let committed = read(&mut session).generation;
+        assert!(committed > created.generation);
+        session.execute_sql("BEGIN", &[]).unwrap();
+        session
+            .execute_sql("INSERT INTO refresh_table VALUES (2)", &[])
+            .unwrap();
+        assert_eq!(read(&mut session).generation, committed);
+        session.execute_sql("ROLLBACK", &[]).unwrap();
+        assert_eq!(read(&mut session).generation, committed);
+        drop(session);
+        drop(service);
+        let reopened = make_service(Admin::open(&path, Limits::default()).unwrap());
+        let mut session = reopened.role_session("refresh_owner").unwrap();
+        assert_eq!(read(&mut session).generation, committed);
+        session
+            .execute_sql(
+                "CREATE TABLE refresh_after_restart (id BIGINT PRIMARY KEY)",
+                &[],
+            )
+            .unwrap();
+        assert!(read(&mut session).generation > committed);
+        drop(session);
+        drop(reopened);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn xid_parameters_round_trip_unsigned_text_and_binary() {
+        assert_eq!(parameter_type(28), Ok(PgType::Xid));
+        for xid in [0, 42, u32::MAX] {
+            let value = Value::Int(xid.into());
+            for format in [0, 1] {
+                let bytes = encode(&value, PgType::Xid, format).unwrap().unwrap();
+                assert_eq!(decode(&bytes, PgType::Xid, format), Ok(value.clone()));
+            }
+        }
+        assert_eq!(
+            decode(b" -1 ", PgType::Xid, 0),
+            Ok(Value::Int(u32::MAX.into()))
+        );
+        assert_eq!(decode(b"4294967296", PgType::Xid, 0), Err("22P02"));
+        assert_eq!(decode(&[0; 3], PgType::Xid, 1), Err("22P03"));
     }
 
     #[test]

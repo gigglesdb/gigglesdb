@@ -110,30 +110,34 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("relminmxid", T::Xid),
             ("relallfrozen", T::Int4),
         ],
+        // PostgreSQL 18 physical attribute order; synthetic xmin follows it.
         "pg_attribute" => &[
             ("attrelid", T::Oid),
             ("attname", T::Name),
             ("atttypid", T::Oid),
-            ("attnum", T::Int2),
-            ("attnotnull", T::Bool),
-            ("atttypmod", T::Int4),
             ("attlen", T::Int2),
-            ("attisdropped", T::Bool),
+            ("attnum", T::Int2),
+            ("atttypmod", T::Int4),
+            ("attndims", T::Int2),
+            ("attbyval", T::Bool),
+            ("attalign", T::Char),
+            ("attstorage", T::Char),
+            ("attcompression", T::Char),
+            ("attnotnull", T::Bool),
+            ("atthasdef", T::Bool),
+            ("atthasmissing", T::Bool),
             ("attidentity", T::Char),
             ("attgenerated", T::Char),
-            ("atthasdef", T::Bool),
-            ("attcollation", T::Oid),
-            ("xmin", T::Xid),
-            ("attndims", T::Int4),
+            ("attisdropped", T::Bool),
             ("attislocal", T::Bool),
-            ("attfdwoptions", T::TextArray),
-            ("attstattarget", T::Int4),
-            ("attstorage", T::Char),
-            ("attalign", T::Char),
+            ("attinhcount", T::Int2),
+            ("attcollation", T::Oid),
+            ("attstattarget", T::Int2),
+            ("attacl", T::AclItemArray),
             ("attoptions", T::TextArray),
-            ("attcompression", T::Char),
-            ("atthasmissing", T::Bool),
+            ("attfdwoptions", T::TextArray),
             ("attmissingval", T::AnyArray),
+            ("xmin", T::Xid),
         ],
         "pg_type" => &[
             ("oid", T::Oid),
@@ -344,6 +348,41 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("srvoptions", T::TextArray),
             ("srvacl", T::AclItemArray),
             ("xmin", T::Xid),
+        ],
+        "pg_user_mapping" => &[
+            ("oid", T::Oid),
+            ("umuser", T::Oid),
+            ("umserver", T::Oid),
+            ("umoptions", T::TextArray),
+        ],
+        // No PostgreSQL lock manager or assigned transaction xid is exposed.
+        "pg_locks" => &[
+            ("locktype", T::Text),
+            ("database", T::Oid),
+            ("relation", T::Oid),
+            ("page", T::Int4),
+            ("tuple", T::Int2),
+            ("virtualxid", T::Text),
+            ("transactionid", T::Xid),
+            ("classid", T::Oid),
+            ("objid", T::Oid),
+            ("objsubid", T::Int2),
+            ("virtualtransaction", T::Text),
+            ("pid", T::Int4),
+            ("mode", T::Text),
+            ("granted", T::Bool),
+            ("fastpath", T::Bool),
+            ("waitstart", T::TimestampTz),
+        ],
+        "pg_stat_ssl" => &[
+            ("pid", T::Int4),
+            ("ssl", T::Bool),
+            ("version", T::Text),
+            ("cipher", T::Text),
+            ("bits", T::Int4),
+            ("client_dn", T::Text),
+            ("client_serial", T::Numeric),
+            ("issuer_dn", T::Text),
         ],
         "pg_user_mappings" => &[
             ("umid", T::Oid),
@@ -791,6 +830,9 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_foreign_data_wrapper",
         "pg_foreign_server",
         "pg_user_mappings",
+        "pg_user_mapping",
+        "pg_locks",
+        "pg_stat_ssl",
         "pg_am",
         "pg_extension",
         "pg_depend",
@@ -844,6 +886,8 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
                 | "pg_timezone_names"
                 | "pg_timezone_abbrevs"
                 | "pg_user_mappings"
+                | "pg_locks"
+                | "pg_stat_ssl"
         )
     {
         None
@@ -881,6 +925,10 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_foreign_data_wrapper" => 2328,
         "pg_foreign_server" => 1417,
         "pg_user_mappings" => 12338,
+        "pg_user_mapping" => 1418,
+        // Stable virtual view identities, not persisted PostgreSQL catalog OIDs.
+        "pg_locks" => 12050,
+        "pg_stat_ssl" => 12051,
         "pg_am" => 2601,
         "pg_extension" => 3079,
         "pg_depend" => 2608,
@@ -1155,12 +1203,26 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
+    // Only this freshly authorized connection is visible. TLS details beyond
+    // the handshake status are not retained by the hosting session.
+    add(
+        "pg_stat_ssl",
+        vec![
+            I(i64::from(snapshot.backend_pid)),
+            B(snapshot.backend_ssl),
+            N,
+            N,
+            N,
+            N,
+            N,
+            N,
+        ],
+    );
     for (id, name, owner) in [
         (11, "pg_catalog", 10),
         (2200, "public", 6171),
         (13293, "information_schema", 10),
     ] {
-        // No PostgreSQL MVCC tuple exists: xmin is NULL, never a made-up transaction ID.
         add("pg_namespace", vec![I(id), s(name), I(owner), N, N]);
     }
     add(
@@ -1263,11 +1325,13 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(oid),
                 s(name),
                 I(namespace),
-                s(if name == "pg_indexes" || info.is_some() {
-                    "v"
-                } else {
-                    "r"
-                }),
+                s(
+                    if matches!(name, "pg_indexes" | "pg_locks" | "pg_stat_ssl") || info.is_some() {
+                        "v"
+                    } else {
+                        "r"
+                    },
+                ),
                 I(10),
                 I(fs.len() as i64),
                 B(false),
@@ -1779,8 +1843,53 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             _ => 0,
         };
         let (storage, align) = type_layout(oid);
-        // PG18 represents an unset statistics target as NULL.
-        row.extend([N, s(storage), s(align), N, s(""), B(false), N]);
+        // Builders above supply the structural fields in their original order.
+        // Project once into PG18's physical order, including NULL column ACLs.
+        let old = std::mem::take(row);
+        *row = vec![
+            old[0].clone(),
+            old[1].clone(),
+            old[2].clone(),
+            old[6].clone(),
+            old[3].clone(),
+            old[5].clone(),
+            old[13].clone(),
+            B(matches!(
+                oid,
+                16 | 18
+                    | 20
+                    | 21
+                    | 23
+                    | 24
+                    | 26
+                    | 28
+                    | 700
+                    | 701
+                    | 1082
+                    | 1083
+                    | 1114
+                    | 1184
+                    | 3220
+            )),
+            s(align),
+            s(storage),
+            s(""),
+            old[4].clone(),
+            old[10].clone(),
+            B(false),
+            old[8].clone(),
+            old[9].clone(),
+            old[7].clone(),
+            old[14].clone(),
+            I(0),
+            old[11].clone(),
+            N,
+            N,
+            N,
+            old[15].clone(),
+            N,
+            old[12].clone(),
+        ];
     }
     // PG18 discovers NOT NULL via pg_constraint rather than attnotnull.
     // These are snapshot-only identities; no persisted format is changed.
@@ -1837,6 +1946,19 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }
     for row in &mut all.get_mut("pg_database").unwrap().rows {
         row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N]);
+    }
+    // No per-object MVCC tuple exists. Reporting the current durable generation
+    // for every xmin makes DataGrip conservatively refresh every catalog object.
+    for relation in all.values_mut() {
+        if let Some(xmin) = relation
+            .fields
+            .iter()
+            .position(|field| field.name == "xmin")
+        {
+            for row in &mut relation.rows {
+                row[xmin] = I(i64::from(snapshot.generation as u32));
+            }
+        }
     }
     information_schema::populate(snapshot, &key_names, &mut all)?;
     let total: usize = all

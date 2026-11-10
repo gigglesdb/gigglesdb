@@ -303,6 +303,7 @@ impl Visitor for Scan {
                 n.as_str(),
                 "version"
                     | "pg_postmaster_start_time"
+                    | "pg_backend_pid"
                     | "pg_is_in_recovery"
                     | "current_database"
                     | "current_schema"
@@ -1225,11 +1226,13 @@ impl Compiler {
                     && !self.user_relations.contains_key(&user_key)
                     && (p[0] == "public" || p[0] != catalog::relation_namespace(&n))
                 {
-                    return Err(if matches!(p[0].as_str(), "pg_catalog" | "information_schema") {
-                        Error::Unsupported
-                    } else {
-                        Error::MixedRelations
-                    });
+                    return Err(
+                        if matches!(p[0].as_str(), "pg_catalog" | "information_schema") {
+                            Error::Unsupported
+                        } else {
+                            Error::MixedRelations
+                        },
+                    );
                 }
                 if let Some(args) = args {
                     if n == "pg_available_extension_versions"
@@ -2029,7 +2032,7 @@ impl Compiler {
                         ty,
                     });
                 }
-                let args = match &f.args {
+                let mut args = match &f.args {
                     a::FunctionArguments::None => vec![],
                     a::FunctionArguments::List(l)
                         if l.duplicate_treatment.is_none() && l.clauses.is_empty() =>
@@ -2088,6 +2091,15 @@ impl Compiler {
                         no_set_or_window(&args[0])?;
                         (K::Unnest(Box::new(args[0].clone())), PgType::Oid)
                     } else {
+                        if n == "age" && args.len() == 1 {
+                            expect(&mut args[0], PgType::Xid)?;
+                        }
+                        if n == "greatest" && !args.is_empty() {
+                            let ty = common_type(args.iter())?;
+                            for arg in &mut args {
+                                expect(arg, ty)?;
+                            }
+                        }
                         let ty = call_type(&n, &args)?;
                         (K::Call(n, args), ty)
                     }
@@ -2334,6 +2346,7 @@ fn cast_type(n: &str) -> R<PgType> {
         "int" | "integer" | "int4" => PgType::Int4,
         "bigint" | "int8" => PgType::Int8,
         "oid" => PgType::Oid,
+        "xid" => PgType::Xid,
         "numeric" | "decimal" => PgType::Numeric,
         "real" | "float4" => PgType::Float4,
         "double precision" | "float8" => PgType::Float8,
@@ -2642,6 +2655,9 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
             | "current_role" | "current_catalog",
             0,
         ) => PgType::Name,
+        ("pg_backend_pid", 0) => PgType::Int4,
+        ("age", 1) if a[0].ty == PgType::Xid => PgType::Int4,
+        ("greatest", n) if n > 0 => common_type(a.iter())?,
         ("version", 0) => PgType::Text,
         ("pg_is_in_recovery", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
@@ -3741,6 +3757,9 @@ impl Runtime<'_> {
         if n == "coalesce" {
             return Ok(v.into_iter().find(|v| *v != N).unwrap_or(N));
         }
+        if n == "greatest" {
+            return Ok(v.into_iter().filter(|v| *v != N).max().unwrap_or(N));
+        }
         if n == "nullif" {
             return Ok(if v[0] == v[1] { N } else { v[0].clone() });
         }
@@ -3761,6 +3780,13 @@ impl Runtime<'_> {
             return Ok(N);
         }
         Ok(match n {
+            "pg_backend_pid" => I(i64::from(self.snapshot.backend_pid)),
+            "age" => {
+                let xid = u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?;
+                I(i64::from(
+                    (self.snapshot.generation as u32).wrapping_sub(xid) as i32,
+                ))
+            }
             "array_remove" => match &v[0] {
                 N => N,
                 Value::Array(elements) => {
@@ -4045,7 +4071,7 @@ impl Runtime<'_> {
                                 self.catalogs["pg_attribute"]
                                     .rows
                                     .iter()
-                                    .find(|r| r[0] == constraint[4] && r[3] == *key)
+                                    .find(|r| r[0] == constraint[4] && r[4] == *key)
                                     .and_then(|r| match &r[1] {
                                         S(name) => Some(catalog::quote_identifier(name)),
                                         _ => None,
@@ -4110,7 +4136,7 @@ impl Runtime<'_> {
                         .iter()
                         .find(|r| {
                             r[0] == I(oid)
-                                && r[3] == I(column)
+                                && r[4] == I(column)
                                 && self.catalogs["pg_index"]
                                     .rows
                                     .iter()
@@ -4385,6 +4411,13 @@ fn cast(v: Value, t: PgType) -> R<Value> {
                 "false" | "f" => Ok(B(false)),
                 _ => Err(Error::Type),
             },
+            _ => Err(Error::Type),
+        },
+        PgType::Xid => match v {
+            I(i) => u32::try_from(i)
+                .map(|i| I(i.into()))
+                .map_err(|_| Error::Type),
+            S(s) => parse_xid(&s).map(|i| I(i.into())),
             _ => Err(Error::Type),
         },
         PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Oid => {

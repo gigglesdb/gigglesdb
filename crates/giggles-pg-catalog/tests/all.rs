@@ -99,3 +99,6 @@ mod compat_metadata;
 mod logical_column_types;
 #[path = "user_defined_types.rs"]
 mod user_defined_types;
+
+#[path = "datagrip_refresh.rs"]
+mod datagrip_refresh;
