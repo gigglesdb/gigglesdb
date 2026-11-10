@@ -228,6 +228,23 @@ fn privileges<P: DeserializeOwned + Ord>(value: Option<Vec<u8>>) -> Result<BTree
 }
 
 impl RoleCatalog {
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn upgrade_records(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+        self.read(|table| {
+            let mut records = BTreeMap::new();
+            if let Some(table) = table {
+                for (raw, payload) in &table.0 {
+                    let key = engine::encode_key(raw)?;
+                    let value = [vec![1], payload.clone()].concat();
+                    engine::validate_record(&key, &value)?;
+                    records.insert(key, value);
+                }
+            }
+            Ok(records)
+        })
+        .map_err(io)
+    }
+
     fn validate_relation_name(&self, name: &str) -> Result<(), RoleError> {
         validate_relation_identity(name)?;
         if let Some((schema, _)) = name.split_once('\0')

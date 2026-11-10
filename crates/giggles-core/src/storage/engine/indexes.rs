@@ -99,7 +99,7 @@ pub(crate) fn descriptors(txn: &mut Transaction, table: u64) -> Result<Vec<Descr
     .filter(|d| d.as_ref().map_or(true, |d| d.table == table))
     .collect()
 }
-fn entries(
+pub(crate) fn entries(
     table: &TableDef,
     rows: &BTreeMap<Vec<u8>, SqlRow>,
     ds: &[Descriptor],

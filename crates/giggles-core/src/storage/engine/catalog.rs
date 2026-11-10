@@ -952,7 +952,7 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     }
     Ok(result)
 }
-fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
     object_ids(parts)?;
     let mut records = BTreeMap::new();
     let mut names = BTreeSet::new();

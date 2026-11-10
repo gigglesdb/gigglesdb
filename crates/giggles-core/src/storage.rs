@@ -14,7 +14,9 @@ mod secondary_index_catalog;
 mod secondary_index_public;
 mod sequence_counters;
 pub(crate) mod sequences;
+mod upgrade;
 mod v2;
+pub use upgrade::{UpgradePoint, UpgradeReport};
 #[cfg(feature = "engine-rocksdb")]
 mod v2_export;
 mod v2_sql;
@@ -1024,6 +1026,7 @@ impl Admin {
         limits: Limits,
         engine: Engine,
     ) -> Result<Self, CoreError> {
+        upgrade::check_startup(path.as_ref())?;
         match engine {
             Engine::Legacy => Self::create(path, limits),
             Engine::V2 => {
@@ -1067,6 +1070,7 @@ impl Admin {
         state: State,
         point: RecoveryPoint,
     ) -> Result<Self, CoreError> {
+        upgrade::check_startup(path.as_ref())?;
         if limits.admitted == 0 || limits.selected_keys == 0 {
             return Err(CoreError::Limit);
         }
@@ -1117,6 +1121,7 @@ impl Admin {
     }
     /// Existing database only: no initialization or replacement on damage.
     pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
+        upgrade::check_startup(path.as_ref())?;
         if v2::has_traces(path.as_ref()) {
             match engine::meta::classify_dir(path.as_ref()).map_err(v2::format_error)? {
                 engine::meta::DirClass::V2 => {
@@ -1131,15 +1136,16 @@ impl Admin {
                 }
             }
         }
-        Self::attach(
-            legacy_redb("opening database", || {
-                Database::builder()
-                    .set_cache_size(8 * 1024 * 1024)
-                    .open(path.as_ref().join("data.redb"))
-                    .map_err(io)
-            })?,
-            limits,
-        )
+        let db = legacy_redb("opening database", || {
+            Database::builder()
+                .set_cache_size(8 * 1024 * 1024)
+                .open(path.as_ref().join("data.redb"))
+                .map_err(io)
+        })?;
+        // An opener delayed after the first check must not acquire the legacy
+        // database in the Windows upgrade's close-before-rename interval.
+        upgrade::check_startup(path.as_ref())?;
+        Self::attach(db, limits)
     }
     pub fn snapshot(&self) -> Result<Snapshot, CoreError> {
         self.inner.db(KERNEL_RECORDS)?;

@@ -75,6 +75,12 @@ fn run() -> local::Reply {
                     serde_json::json!({"domain":s.domain.to_string(),"rows":s.rows.len()}),
                 ))
             }
+            ["upgrade", path] => {
+                let report = Admin::upgrade_to_v2(path, Limits::default())?;
+                Ok(local::Reply::ok(
+                    serde_json::json!({"database": path, "export": report.export, "legacy": report.legacy}),
+                ))
+            }
             [
                 cmd @ ("admin" | "seed" | "grant" | "approve" | "revoke" | "revoke_approval"),
                 path,
