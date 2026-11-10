@@ -2827,12 +2827,14 @@ async fn catalog_and_application_pages_share_aggregate_cache_admission() {
     pg_send(&mut s, b'P', &parse("catalog", &query)).await;
     pg_send(&mut s, b'B', &bind("catalog_page", "catalog", &[], false)).await;
     pg_send(&mut s, b'E', &execute("catalog_page", 1)).await;
-    let denied = pg_sync(&mut s).await;
-    assert!(has_code(&denied, "54000"), "{denied:?}");
-    assert!(!denied.iter().any(|(tag, _)| *tag == b'D'));
+    let admitted = pg_sync(&mut s).await;
+    assert!(admitted.iter().any(|(tag, _)| *tag == b'D'));
+    assert!(admitted.iter().any(|(tag, _)| *tag == b's'));
+    assert!(!has_code(&admitted, "54000"));
+    assert_eq!(admitted.last(), Some(&(b'Z', vec![b'T'])));
     pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
     while pg_read(&mut s).await.0 != b'Z' {}
-    // The same catalog alone fits: rejection above is the shared cache, not SQL syntax.
+    // The same catalog also fits after the application portals are closed.
     pg_send(&mut s, b'P', &parse("catalog_alone", &query)).await;
     pg_send(&mut s, b'B', &bind("alone", "catalog_alone", &[], false)).await;
     pg_send(&mut s, b'E', &execute("alone", 1)).await;

@@ -1424,6 +1424,51 @@ impl Session {
             result
         })
     }
+    pub(crate) fn fetch_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<giggles_core::relational::SqlRow>, CoreError> {
+        if self.is_aborted() {
+            return Err(CoreError::Sql(giggles_core::relational::SqlError::Aborted));
+        }
+        let result = cursor.fetch(max_rows, max_bytes);
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    pub fn open_cursor(&mut self, p: &Prepared, params: &[Value]) -> Result<Cursor, CoreError> {
+        self.authority_scope(|session| {
+            let bound = session.sql.bind_relation_context(p)?;
+            session.reconcile_sequence_owners()?;
+            session.authorize(&bound)?;
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            }
+            let (statement_us, unavailable) = match session.service.clock.sql_micros() {
+                Ok(sample) => (sample, None),
+                Err(error) => (session.transaction_us.unwrap_or(0), Some(error)),
+            };
+            let transaction_us = session.transaction_us.unwrap_or(statement_us);
+            let service = session.service.clone();
+            let clock = StatementClock {
+                unavailable,
+                transaction_us,
+                statement_us,
+                zone: session.zone,
+                wall: Some(Arc::new(move || service.clock.sql_micros())),
+            };
+            let result = session.sql.open_cursor_at(&bound, params, &clock);
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            } else if clock.unavailable.is_none() {
+                session.transaction_us = Some(transaction_us);
+            }
+            result
+        })
+    }
     pub fn execute_prepared(
         &mut self,
         p: &Prepared,

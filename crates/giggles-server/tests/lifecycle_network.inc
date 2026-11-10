@@ -553,7 +553,7 @@ async fn executable_trusted_stdin_reload_invalid_atomicity_and_restart_config() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn aggregate_cached_result_limit_is_checked_before_any_row_is_released() {
+async fn streaming_portals_do_not_retain_complete_result_vectors() {
     let f = Fixture::new().await;
     let payload = "\u{0001}".repeat(16_000);
     let mut sql = f.admin.sql_session();
@@ -575,10 +575,12 @@ async fn aggregate_cached_result_limit_is_checked_before_any_row_is_released() {
     assert!(first.iter().any(|(tag, _)| *tag == b'D'));
     pg_send(&mut s, b'B', &bind("second", "s", &[], false)).await;
     pg_send(&mut s, b'E', &execute("second", 1)).await;
-    let denied = pg_sync(&mut s).await;
-    assert!(has_code(&denied, "54000"));
-    assert!(!denied.iter().any(|(tag, _)| *tag == b'D'));
-    // A rejected Execute aborts the explicit transaction; ROLLBACK recovers.
+    let second = pg_sync(&mut s).await;
+    assert!(second.iter().any(|(tag, _)| *tag == b'D'));
+    assert!(second.iter().any(|(tag, _)| *tag == b's'));
+    assert!(!has_code(&second, "54000"));
+    assert_eq!(second.last(), Some(&(b'Z', vec![b'T'])));
+    // Both streaming portals remain usable in the open transaction.
     pg_send(&mut s, b'Q', b"ROLLBACK\0").await;
     while pg_read(&mut s).await.0 != b'Z' {}
     assert_eq!(

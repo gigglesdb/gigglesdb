@@ -7,12 +7,12 @@ pub mod pg_serde;
 mod policy;
 mod scalar;
 mod storage;
-pub use storage::SqlSession;
 pub use storage::replica;
 pub use storage::roles;
 pub use storage::{
     Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, RecoveryPoint,
 };
+pub use storage::{Cursor, SqlSession};
 mod sql;
 pub use sql::parse_repair;
 

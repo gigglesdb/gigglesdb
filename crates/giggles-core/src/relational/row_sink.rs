@@ -52,7 +52,7 @@ impl Relational {
         }
         // One budget across ALL scanned relations, including nested subqueries.
         // The target preimage and legacy execution retain A1's separate bounds.
-        let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+        let mut retention = scan::Retention::new(scan::retention_limit());
         for name in names {
             let Some(table) = self.tables.get(&name) else {
                 // Binding owns SQL error precedence (including unknown tables).

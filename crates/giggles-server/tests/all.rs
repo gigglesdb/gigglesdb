@@ -132,3 +132,6 @@ mod key_rotation;
 
 #[path = "per_schema_names.rs"]
 mod per_schema_names;
+
+#[path = "streaming_cursor_network.rs"]
+mod streaming_cursor_network;

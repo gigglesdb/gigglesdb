@@ -330,3 +330,31 @@ pub(crate) fn sort_bounded<T>(
 #[cfg(test)]
 #[path = "scan_tests.rs"]
 mod tests;
+
+// Cursor execution has an independent retention budget. Native Vec-returning
+// entry points continue to use the original result and retention limits.
+thread_local! {
+    static CURSOR_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn with_cursor_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURSOR_LIMIT.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CURSOR_LIMIT.with(|c| c.replace(Some(limit))));
+    f()
+}
+pub(crate) fn result_limit() -> usize {
+    CURSOR_LIMIT.with(|c| c.get().unwrap_or(MAX_RESULT_BYTES))
+}
+pub(crate) fn retention_limit() -> usize {
+    CURSOR_LIMIT.with(|c| c.get().unwrap_or(MAX_RETAINED_BYTES))
+}
+pub(crate) fn query_row_limit() -> usize {
+    CURSOR_LIMIT.with(|c| {
+        c.get()
+            .map_or(MAX_QUERY_ROWS, |n| n / std::mem::size_of::<SqlRow>())
+    })
+}

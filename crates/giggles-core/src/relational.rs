@@ -29,9 +29,10 @@ mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
 use query::{TypmodSource, result_typmod};
+pub(crate) mod cursor;
 mod returning;
 pub(crate) mod row_sink;
-mod scan;
+pub(crate) mod scan;
 mod searched;
 #[cfg(test)]
 mod source_plumbing_tests;

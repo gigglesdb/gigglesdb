@@ -1173,7 +1173,7 @@ impl<'a> Execution<'a> {
             declared: declared.to_vec(),
             visits: Cell::new(0),
             subqueries: RefCell::new(BTreeMap::new()),
-            retention: RefCell::new(scan::Retention::new(scan::MAX_RETAINED_BYTES)),
+            retention: RefCell::new(scan::Retention::new(scan::retention_limit())),
         }
     }
     fn cancelled(&self) -> bool {
@@ -3606,7 +3606,7 @@ fn charge(bytes: &mut usize, value: &Value) -> R<()> {
     *bytes = bytes
         .checked_add(value_bytes(value))
         .ok_or(SqlError::Limit)?;
-    if *bytes > MAX_RESULT_BYTES {
+    if *bytes > scan::result_limit() {
         return Err(SqlError::Limit);
     }
     Ok(())
@@ -3756,6 +3756,172 @@ impl BoundQuery<'_> {
         };
         Ok((empty_input, bounds))
     }
+    pub(super) fn cursor_direction(&self) -> Option<scan::Direction> {
+        if self.tables.len() != 1
+            || !self.joins.is_empty()
+            || self.aggregate
+            || self.grouping.is_some()
+            || self.query.distinct()
+            || self.query.explain
+            || self.query.has_in_subquery()
+        {
+            return None;
+        }
+        if self.order.is_empty() {
+            return Some(scan::Direction::Forward);
+        }
+        let desc = self.order[0].1;
+        if self
+            .order
+            .iter()
+            .enumerate()
+            .all(|(i, (value, reverse, _))| {
+                let scalar = &self.query.order[i].0;
+                let ordinal;
+                let scalar = if let Scalar::Literal(Value::Int(n)) = scalar {
+                    let Ok(resolved) = self.query.order_ordinal(*n, &self.tables) else {
+                        return false;
+                    };
+                    ordinal = resolved;
+                    &ordinal
+                } else {
+                    scalar
+                };
+                *reverse == desc
+                    && matches!(scalar, Scalar::Column(c)
+                if self.tables[0].primary_key.get(i).is_some_and(|index|
+                    self.tables[0].columns[*index].name == c.name
+                    && self.tables[0].columns[*index].data_type == value.ty))
+            })
+        {
+            Some(if desc {
+                scan::Direction::Reverse
+            } else {
+                scan::Direction::Forward
+            })
+        } else {
+            None
+        }
+    }
+    pub(super) fn fetch_cursor(
+        &self,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        progress: &mut super::cursor::Progress,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> R<Vec<SqlRow>> {
+        use std::ops::Bound;
+        let direction = self.cursor_direction().ok_or(SqlError::Unsupported)?;
+        let volatile = self.query.has_volatile_call();
+        for (v, ty) in params.iter().zip(&self.parameters) {
+            check(
+                v,
+                &ColumnDef {
+                    id: 0,
+                    name: String::new(),
+                    data_type: ty.clone(),
+                    not_null: false,
+                },
+            )?;
+        }
+        if !progress.initialized {
+            let number = |expr: Option<&Expr>, default, numeric: bool| -> R<Option<u64>> {
+                let mut value = expr.map(|e| e.value(params)).transpose()?;
+                if numeric
+                    && let Some(Expr::Param(n)) = expr
+                    && self.declared.get(n - 1) == Some(&Some(DataType::Numeric))
+                    && let Some(v) = value.take()
+                {
+                    value = Some(assignment::convert(
+                        v,
+                        &DataType::Numeric,
+                        &DataType::BigInt,
+                        None,
+                    )?);
+                }
+                match value {
+                    Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
+                    None | Some(Value::Null) => Ok(default),
+                    _ => Err(SqlError::Limit),
+                }
+            };
+            progress.skip = number(self.query.offset(), Some(0), false)?.unwrap_or(0);
+            progress.remaining = number(self.query.limit.as_ref(), None, true)?;
+            progress.initialized = true;
+        }
+        let mut output = Vec::new();
+        let mut bytes = 0;
+        if let Some(row) = progress.pending.take() {
+            bytes = row.values.iter().map(value_bytes).sum();
+            if bytes > max_bytes {
+                progress.pending = Some(row);
+                return Err(SqlError::Limit);
+            }
+            output.push(row);
+        }
+        if progress.done {
+            return Ok(output);
+        }
+        let (empty, bounds) = self.base_bounds(params)?;
+        if empty || progress.remaining == Some(0) {
+            progress.done = true;
+            return Ok(output);
+        }
+        let mut range = scan::KeyRange::from_bounds(bounds);
+        if let Some(key) = &progress.after {
+            match direction {
+                scan::Direction::Forward => range.lo = Bound::Excluded(key.clone()),
+                scan::Direction::Reverse => range.hi = Bound::Excluded(key.clone()),
+            }
+        }
+        let mut input = source.scan(self.tables[0], &range, direction)?;
+        loop {
+            crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
+            let Some(row) = input.next() else {
+                progress.done = true;
+                break;
+            };
+            let row = row?;
+            progress.after = Some(row.key.into_owned());
+            let tuple = Tuple {
+                values: vec![row.row.values.clone()],
+                version: row.row.version,
+            };
+            let mut work = 0;
+            if let Some(filter) = &self.filter
+                && filter.eval(&tuple, params, &mut work)? != Some(true)
+            {
+                continue;
+            }
+            if progress.skip > 0 {
+                progress.skip -= 1;
+                continue;
+            }
+            let row = self.project_tuple(&tuple, params, &mut work, &mut 0)?;
+            let size = row.values.iter().map(value_bytes).sum::<usize>();
+            if let Some(n) = &mut progress.remaining {
+                *n -= 1;
+            }
+            if output.len() == max_rows || bytes.saturating_add(size) > max_bytes {
+                progress.pending = Some(row);
+                if output.is_empty() {
+                    return Err(SqlError::Limit);
+                }
+                break;
+            }
+            bytes += size;
+            output.push(row);
+            if progress.remaining == Some(0) {
+                progress.done = true;
+                break;
+            }
+            if volatile {
+                break;
+            }
+        }
+        Ok(output)
+    }
     /// Collect complete mutation rows in primary-key order, retaining their keys.
     pub(super) fn matching_rows(
         &self,
@@ -3811,7 +3977,7 @@ impl BoundQuery<'_> {
         let mut rows = Vec::new();
         for row in filtered {
             let row = row?;
-            if rows.len() >= scan::MAX_QUERY_ROWS.min(super::MAX_ROWS) {
+            if rows.len() >= scan::query_row_limit().min(super::MAX_ROWS) {
                 return Err(SqlError::Limit);
             }
             retention.charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
@@ -4089,7 +4255,7 @@ impl BoundQuery<'_> {
         let mut aggregate_work_bytes = 0usize;
         if self.query.distinct() && !self.aggregate {
             let mut seen = std::collections::BTreeSet::new();
-            let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+            let mut retention = scan::Retention::new(scan::retention_limit());
             let mut unique_rows = Vec::new();
             for row in filtered {
                 let row = row?;
@@ -4098,7 +4264,7 @@ impl BoundQuery<'_> {
                 if !seen.insert(key) {
                     continue;
                 }
-                if unique_rows.len() >= scan::MAX_QUERY_ROWS {
+                if unique_rows.len() >= scan::query_row_limit() {
                     return Err(SqlError::Limit);
                 }
                 let keys = self
@@ -4134,7 +4300,7 @@ impl BoundQuery<'_> {
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+            let mut retention = scan::Retention::new(scan::retention_limit());
             let mut auxiliary = aggregate_auxiliary(&self.items, &mut retention)?;
             retention.charge(aggregate_retained(&values))?;
             for row in filtered {
@@ -4183,7 +4349,7 @@ impl BoundQuery<'_> {
                         .collect::<R<Vec<_>>>()?;
                     Ok((row, keys))
                 });
-                let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+                let mut retention = scan::Retention::new(scan::retention_limit());
                 let sorted = scan::sort_bounded(
                     keyed,
                     page.keep(),
@@ -4231,7 +4397,7 @@ impl BoundQuery<'_> {
             for row in page.apply(rows) {
                 let row = row?;
                 let mut scalar_work_bytes = 0usize;
-                if result.rows.len() >= scan::MAX_QUERY_ROWS {
+                if result.rows.len() >= scan::query_row_limit() {
                     return Err(SqlError::Limit);
                 }
                 result.rows.push(self.project_tuple(
@@ -4769,7 +4935,7 @@ mod average_distinct_retention_tests {
     #[test]
     fn distinct_state_hits_production_retention_cap_without_scalar_budget() {
         let (items, columns) = aggregate_input(Aggregate::CountDistinct, DataType::Text);
-        let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+        let mut retention = scan::Retention::new(scan::retention_limit());
         let mut auxiliary = aggregate_auxiliary(&items, &mut retention).unwrap();
         let mut values = vec![Value::Int(0)];
         let row = Tuple {

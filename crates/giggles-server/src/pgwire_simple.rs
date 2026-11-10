@@ -20,6 +20,20 @@ impl State {
         if statements.len() == 1 {
             return self.simple_statement(&statements[0], session, out, received, &mut implicit);
         }
+        let output = self.output.take();
+        let result = self.simple_batch(statements, session, out, received);
+        self.output = output;
+        result
+    }
+
+    fn simple_batch(
+        &mut self,
+        statements: Vec<String>,
+        session: &mut Session,
+        out: &mut Vec<u8>,
+        received: std::time::Instant,
+    ) -> R<()> {
+        let mut implicit = false;
         // Role/ACL and DROP TABLE operations publish outside the SQL snapshot.
         // Like CREATE DATABASE in PostgreSQL, these must be the sole statement
         // in a Query message, even if the message contains explicit COMMITs.
@@ -250,8 +264,16 @@ impl State {
         implicit: &mut bool,
     ) -> R<()> {
         if let Some(command) = cursor::parse(sql)? {
-            self.cursors
-                .execute(&command, session, &[], &[], &mut self.settings, true, out)?;
+            self.cursors.execute(
+                &command,
+                session,
+                &[],
+                &[],
+                &mut self.settings,
+                true,
+                &self.output,
+                out,
+            )?;
             return Ok(());
         }
         if let Some(tables) = crate::auth::statements::access_share_tables(sql)? {
@@ -427,6 +449,37 @@ impl State {
                 let d = core(session.describe(&p))?;
                 read_only_check(p.command(), &self.settings, session, &mut self.diagnostic)?;
                 self.settings.queried = session.in_transaction();
+                if p.command() == "SELECT" {
+                    let mut cursor = self.diagnostic.core(session.open_cursor(&p, &[]))?;
+                    row_description(&d, &[], out)?;
+                    let mut count = 0;
+                    while !cursor.is_exhausted() {
+                        let chunk = self.diagnostic.core(session.fetch_cursor(
+                            &mut cursor,
+                            CURSOR_ROWS,
+                            CURSOR_BYTES,
+                        ))?;
+                        let n = chunk.len();
+                        let result = SqlResult {
+                            rows: chunk,
+                            ..SqlResult::default()
+                        };
+                        rows(
+                            self.settings.current.extra_float_digits,
+                            session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            &result,
+                            &d,
+                            &[],
+                            0,
+                            n,
+                            out,
+                        )?;
+                        count += n;
+                        flush_output(&self.output, out)?;
+                    }
+                    catalog_complete(count, out)?;
+                    return Ok(());
+                }
                 let result = self.diagnostic.core(session.execute_prepared(&p, &[]))?;
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
@@ -669,7 +722,6 @@ pub(super) fn execute_settings(
     }
     Ok(())
 }
-
 
 fn copy_csv_field(value: &[u8], options: &crate::auth::statements::CopyOutput, out: &mut Vec<u8>) {
     let quoted = value == options.null

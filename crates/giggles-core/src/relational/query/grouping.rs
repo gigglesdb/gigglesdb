@@ -812,7 +812,7 @@ impl Grouping {
             return Ok(result);
         }
         let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
-        let mut retention = scan::Retention::new(scan::MAX_RETAINED_BYTES);
+        let mut retention = scan::Retention::new(scan::retention_limit());
         if self.keys.is_empty() {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
@@ -839,7 +839,7 @@ impl Grouping {
                     .map(|s| s.eval(row, params, &mut key_work))
                     .collect::<R<Vec<_>>>()?);
                 if !groups.contains_key(&key) {
-                    if groups.len() >= scan::MAX_QUERY_ROWS {
+                    if groups.len() >= scan::query_row_limit() {
                         return Err(SqlError::Limit);
                     }
                     let mut initial = self.initial();

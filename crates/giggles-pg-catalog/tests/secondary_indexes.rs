@@ -404,7 +404,11 @@ fn all_pg18_index_flags_and_secondary_only_table() {
         run_on("SELECT relhasindex FROM pg_class WHERE oid=65576", &sn).rows,
         vec![vec![B(true)]]
     );
-    assert!(run_on("SELECT oid FROM pg_constraint WHERE contype='p'", &sn).rows.is_empty());
+    assert!(
+        run_on("SELECT oid FROM pg_constraint WHERE contype='p'", &sn)
+            .rows
+            .is_empty()
+    );
     sn.indexes.clear();
     assert_eq!(
         run_on("SELECT relhasindex FROM pg_class WHERE oid=65576", &sn).rows,
@@ -538,5 +542,49 @@ fn index_view_preserves_g1a_type_receive_metadata() {
     assert_eq!(
         run("SELECT relname,oid FROM pg_class WHERE relname IN ('pg_enum','pg_range') ORDER BY relname").rows,
         vec![vec![s("pg_enum"), I(3501)], vec![s("pg_range"), I(3541)]]
+    );
+}
+
+#[test]
+fn psql_index_summary_with_correlated_flags_at_catalog_scale() {
+    let mut sn = snapshot();
+    for i in 0..127 {
+        sn.tables.push(TableDef {
+            id: 100 + i,
+            name: format!("other_{i}"),
+            primary_key: vec![0],
+            columns: vec![ColumnDef {
+                id: 2000 + i,
+                name: "id".into(),
+                data_type: ScalarType::BigInt,
+                not_null: true,
+            }],
+        });
+    }
+    let query = r#"SELECT i.indisunique, i.indisprimary, i.indisclustered, i.indisvalid,
+  (NOT i.indimmediate) AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x') AND condeferrable) AS condeferrable,
+  (NOT i.indimmediate) AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x') AND condeferred) AS condeferred,
+i.indisreplident,
+i.indnullsnotdistinct,
+  a.amname, c2.relname, pg_catalog.pg_get_expr(i.indpred, i.indrelid, true)
+FROM pg_catalog.pg_index i, pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_am a
+WHERE i.indexrelid = c.oid AND c.oid = '65577' AND c.relam = a.oid
+AND i.indrelid = c2.oid;"#;
+    let result = execute(&plan(query).unwrap().unwrap(), &sn, &[]).unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            B(true),
+            B(true),
+            B(false),
+            B(true),
+            B(false),
+            B(false),
+            B(false),
+            B(false),
+            s("btree"),
+            s("t"),
+            N
+        ]]
     );
 }

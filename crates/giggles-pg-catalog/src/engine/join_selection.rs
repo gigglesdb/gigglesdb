@@ -64,9 +64,10 @@ fn place_inputs(source: &mut Source, width: usize, parameters: &[PgType]) {
                     false
                 } else if span.is_some_and(|(_, max)| max < left_width) && !*left {
                     push_one(l, &term, left_width)
+                        || push_join_key(l, &term, left_width, parameters)
                 } else if span.is_some_and(|(min, max)| min >= left_width && max < width) {
                     rebase(&mut term, left_width);
-                    if push_one(r, &term, *rwidth) {
+                    if push_one(r, &term, *rwidth) || push_join_key(r, &term, *rwidth, parameters) {
                         true
                     } else {
                         shift(&mut term, left_width);
@@ -137,6 +138,36 @@ fn push_one(source: &mut Source, term: &E, width: usize) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+// A comma join's WHERE may mention several earlier inputs. Put a mandatory,
+// total equality on their lowest inner join, rather than materializing their
+// Cartesian product before the final input's ON can reject it. LEFT, derived,
+// filtered and lateral inputs remain barriers, as do fallible predicates.
+fn push_join_key(source: &mut Source, term: &E, width: usize, parameters: &[PgType]) -> bool {
+    if !eligible(term, width, parameters) {
+        return false;
+    }
+    let Some((min, max)) = column_span(term) else {
+        return false;
+    };
+    let Source::Join(l, r, on, false, rwidth, false) = source else {
+        return false;
+    };
+    if max >= width || !left_eligible(on, width, parameters) {
+        return false;
+    }
+    let left_width = width - *rwidth;
+    if max < left_width {
+        push_join_key(l, term, left_width, parameters)
+    } else if min >= left_width {
+        let mut local = term.clone();
+        rebase(&mut local, left_width);
+        push_join_key(r, &local, *rwidth, parameters)
+    } else {
+        *on = binary(std::mem::replace(on, truth()), Op::And, term.clone());
+        true
     }
 }
 
@@ -212,7 +243,9 @@ pub(super) fn equality_key(on: &E, width: usize, rwidth: usize) -> Option<(usize
 
 fn nested_queries(expression: &mut E, parameters: &[PgType]) {
     walk(expression, &mut |e| match &mut e.kind {
-        K::Subquery(q) | K::Exists(q, _) | K::ArrayQuery(q) | K::InQuery(_, q, _) => place(q, parameters),
+        K::Subquery(q) | K::Exists(q, _) | K::ArrayQuery(q) | K::InQuery(_, q, _) => {
+            place(q, parameters)
+        }
         _ => {}
     });
 }

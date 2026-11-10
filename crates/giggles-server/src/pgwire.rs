@@ -806,6 +806,7 @@ struct Portal {
     params: Vec<Value>,
     formats: Vec<u16>,
     result: Option<SqlResult>,
+    cursor: Option<giggles_core::Cursor>,
     catalog_params: Vec<giggles_pg_catalog::Value>,
     catalog_result: Option<giggles_pg_catalog::ResultSet>,
     parameter_bytes: usize,
@@ -837,7 +838,21 @@ fn catalog_complete(count: usize, out: &mut Vec<u8>) -> R<()> {
     z(&format!("SELECT {count}"), &mut b);
     frame(b'C', &b, out)
 }
+const CURSOR_ROWS: usize = 256;
+const CURSOR_BYTES: usize = giggles_core::relational::MAX_RESULT_BYTES;
+type Output = Option<tokio::sync::mpsc::Sender<Vec<u8>>>;
+fn flush_output(output: &Output, out: &mut Vec<u8>) -> R<()> {
+    if let Some(output) = output
+        && !out.is_empty()
+    {
+        output
+            .blocking_send(std::mem::take(out))
+            .map_err(|_| "08006")?;
+    }
+    Ok(())
+}
 struct State {
+    output: Output,
     diagnostic: Diagnostic,
     admin_completed: bool,
     implicit: bool,
@@ -973,7 +988,11 @@ impl State {
             out.append(&mut self.copy_completion);
         }
         if self.copy.is_some() {
-            return self.copy_message(tag, b, session, out, received);
+            // Remaining statements after COPY belong to the same bounded batch.
+            let output = self.output.take();
+            let result = self.copy_message(tag, b, session, out, received);
+            self.output = output;
+            return result;
         }
         let mut r = Reader { b, at: 0 };
         if self.drain && tag != b'S' && tag != b'X' {
@@ -1355,6 +1374,7 @@ impl State {
                         params,
                         formats: output,
                         result: None,
+                        cursor: None,
                         catalog_params,
                         catalog_result: None,
                         parameter_bytes,
@@ -1432,6 +1452,7 @@ impl State {
                         &p.formats,
                         &mut self.settings,
                         false,
+                        &self.output,
                         out,
                     )?;
                     p.result = Some(SqlResult::default());
@@ -1654,6 +1675,50 @@ impl State {
                 let Plan::Sql(prepared) = &p.s.p else {
                     unreachable!()
                 };
+                if prepared.command() == "SELECT" {
+                    if p.cursor.is_none() {
+                        read_only_check("SELECT", &self.settings, session, &mut self.diagnostic)?;
+                        begin_implicit(session, &mut self.implicit, &mut self.settings)?;
+                        self.settings.queried = true;
+                        p.cursor = Some(
+                            self.diagnostic
+                                .core(session.open_cursor(prepared, &p.params))?,
+                        );
+                    }
+                    let cursor = p.cursor.as_mut().expect("opened cursor");
+                    let mut remaining = if max == 0 { usize::MAX } else { max as usize };
+                    while remaining > 0 && !cursor.is_exhausted() {
+                        let chunk = self.diagnostic.core(session.fetch_cursor(
+                            cursor,
+                            remaining.min(CURSOR_ROWS),
+                            CURSOR_BYTES,
+                        ))?;
+                        let count = chunk.len();
+                        let result = SqlResult {
+                            rows: chunk,
+                            ..SqlResult::default()
+                        };
+                        rows(
+                            self.settings.current.extra_float_digits,
+                            session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            &result,
+                            &p.s.d,
+                            &p.formats,
+                            0,
+                            count,
+                            out,
+                        )?;
+                        p.at += count;
+                        remaining -= count;
+                        flush_output(&self.output, out)?;
+                    }
+                    if cursor.is_exhausted() {
+                        catalog_complete(p.at, out)?;
+                    } else {
+                        frame(b's', &[], out)?;
+                    }
+                    return Ok(true);
+                }
                 if p.result.is_some() && p.s.d.columns.is_empty() {
                     return Err("55000");
                 }
@@ -1821,6 +1886,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     ready(&session, &mut out).map_err(io::Error::other)?;
     send(s, &out).await?;
     let mut state = State {
+        output: None,
         diagnostic: Diagnostic::default(),
         admin_completed: false,
         implicit: false,
@@ -1936,75 +2002,87 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
             },
             query_id: None,
         };
-        let (returned_session, returned_state, response, keep) = blocking
-            .run_admitted(permit, move || {
-                let mut out = Vec::new();
-                let keep = match active.context.scope(|| {
-                    active
-                        .context
-                        .check()
-                        .map_err(|e| crate::service::sqlstate(&e))?;
-                    // The authority gate covers cached portal output and the
-                    // actual core commit, not just Parse/Bind authorization.
-                    session
-                        .authority_scope(|session| {
-                            Ok(state.handle(tag, &b, session, &mut out, received))
-                        })
-                        .map_err(|e| crate::service::sqlstate(&e))?
-                }) {
-                    Ok(keep) => Ok(keep),
-                    Err(code) => {
-                        session.abort();
-                        // COMMIT may fail and finish rollback before returning
-                        // its error. No portal can outlive that transaction.
-                        if tag == b'Q' && !session.in_transaction() {
-                            state.portals.clear();
+        let (output, mut chunks) = tokio::sync::mpsc::channel(2);
+        state.output = Some(output);
+        let work = blocking.run_admitted(permit, move || {
+            let mut out = Vec::new();
+            let keep = match active.context.scope(|| {
+                active
+                    .context
+                    .check()
+                    .map_err(|e| crate::service::sqlstate(&e))?;
+                // The authority gate covers cached portal output and the
+                // actual core commit, not just Parse/Bind authorization.
+                session
+                    .authority_scope(|session| {
+                        Ok(state.handle(tag, &b, session, &mut out, received))
+                    })
+                    .map_err(|e| crate::service::sqlstate(&e))?
+            }) {
+                Ok(keep) => Ok(keep),
+                Err(code) => {
+                    session.abort();
+                    // COMMIT may fail and finish rollback before returning
+                    // its error. No portal can outlive that transaction.
+                    if tag == b'Q' && !session.in_transaction() {
+                        state.portals.clear();
+                    }
+                    if tag == b'S' && state.implicit {
+                        session.sql.rollback();
+                        state.settings.transaction(true, false, "ROLLBACK");
+                        session.set_time_zone(&state.settings.current.timezone);
+                        session.set_search_path(&state.settings.current.search_path);
+                        session.set_extra_float_digits(state.settings.current.extra_float_digits);
+                        state.implicit = false;
+                        state.cursors.transaction_end("ROLLBACK");
+                        state.portals.clear();
+                    }
+                    let message = state.diagnostic.message.unwrap_or(match code {
+                        "0A000" => {
+                            "unsupported SQL feature or parameter type in this server profile"
                         }
-                        if tag == b'S' && state.implicit {
-                            session.sql.rollback();
-                            state.settings.transaction(true, false, "ROLLBACK");
-                            session.set_time_zone(&state.settings.current.timezone);
-                            session.set_search_path(&state.settings.current.search_path);
-                            session
-                                .set_extra_float_digits(state.settings.current.extra_float_digits);
-                            state.implicit = false;
-                            state.cursors.transaction_end("ROLLBACK");
-                            state.portals.clear();
-                        }
-                        let message = state.diagnostic.message.unwrap_or(match code {
-                            "0A000" => {
-                                "unsupported SQL feature or parameter type in this server profile"
-                            }
-                            "42601" => {
-                                "statement syntax is not supported by this server SQL profile"
-                            }
-                            _ => "request rejected; consult documented code",
-                        });
-                        if state.copy.is_some() {
-                            state.copy_error(code, &mut session, &mut out);
-                            Ok(true)
+                        "42601" => "statement syntax is not supported by this server SQL profile",
+                        _ => "request rejected; consult documented code",
+                    });
+                    if state.copy.is_some() {
+                        state.copy_error(code, &mut session, &mut out);
+                        Ok(true)
+                    } else {
+                        diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
+                        if matches!(tag, b'Q' | b'S') {
+                            state.drain = false;
+                            ready(&session, &mut out)
+                                .map(|()| true)
+                                .map_err(io::Error::other)
                         } else {
-                            diagnostic_error(code, message, Some(&state.diagnostic), &mut out);
-                            if matches!(tag, b'Q' | b'S') {
-                                state.drain = false;
-                                ready(&session, &mut out)
-                                    .map(|()| true)
-                                    .map_err(io::Error::other)
-                            } else {
-                                state.drain = true;
-                                Ok(true)
-                            }
+                            state.drain = true;
+                            Ok(true)
                         }
                     }
-                };
-                if state.copy_receiving() {
-                    state.copy_active = Some(active);
-                } else {
-                    drop(active);
                 }
-                (session, state, out, keep)
-            })
-            .await?;
+            };
+            if state.copy_receiving() {
+                state.copy_active = Some(active);
+            } else {
+                drop(active);
+            }
+            state.output = None;
+            (session, state, out, keep)
+        });
+        tokio::pin!(work);
+        let completed = loop {
+            tokio::select! {
+                chunk = chunks.recv() => match chunk {
+                    Some(chunk) => send(s, &chunk).await?,
+                    None => break work.await?,
+                },
+                result = &mut work => break result?,
+            }
+        };
+        while let Some(chunk) = chunks.recv().await {
+            send(s, &chunk).await?;
+        }
+        let (returned_session, returned_state, response, keep) = completed;
         session = returned_session;
         state = returned_state;
         if !keep? {

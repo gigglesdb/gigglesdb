@@ -1,4 +1,4 @@
-//! Materialized SQL cursors, distinct from extended-protocol portals.
+//! Snapshot-backed SQL cursors, distinct from extended-protocol portals.
 use super::*;
 
 #[derive(Clone)]
@@ -18,7 +18,7 @@ pub(super) enum Command {
 }
 struct Cursor {
     description: Description,
-    result: SqlResult,
+    result: giggles_core::Cursor,
     at: usize,
     hold: bool,
     exhausted: bool,
@@ -232,6 +232,7 @@ impl Cursors {
         formats: &[u16],
         settings: &mut crate::pg_settings::SessionSettings,
         simple: bool,
+        output: &Output,
         out: &mut Vec<u8>,
     ) -> R<()> {
         if !session.role.is_sql() {
@@ -265,15 +266,7 @@ impl Cursors {
                 }
                 let mut description = core(session.describe(&p))?;
                 description.parameters.clear();
-                let result = core(session.execute_prepared(&p, params))?;
-                let bytes = serde_json::to_vec(&result).map_err(|_| "54000")?.len();
-                let retained = self.0.values().try_fold(bytes, |n, c| {
-                    n.checked_add(serde_json::to_vec(&c.result).map_err(|_| "54000")?.len())
-                        .ok_or("54000")
-                })?;
-                if retained > MAX_RESPONSE {
-                    return Err("54000");
-                }
+                let result = core(session.open_cursor(&p, params))?;
                 self.0.insert(
                     name.clone(),
                     Cursor {
@@ -298,24 +291,36 @@ impl Cursors {
                 if *count == 0 && !moving && current {
                     return Err("55000");
                 }
-                let end = c.at.saturating_add(*count).min(c.result.rows.len());
-                if !moving {
-                    // Simple Query needs RowDescription; Execute's Describe already sent it.
-                    if simple {
-                        row_description(&c.description, formats, out)?;
-                    }
-                    rows(
-                        settings.current.extra_float_digits,
-                        session.zone().unwrap_or(SessionZone::Fixed(0)),
-                        &c.result,
-                        &c.description,
-                        formats,
-                        c.at,
-                        end,
-                        out,
-                    )?;
+                if !moving && simple {
+                    row_description(&c.description, formats, out)?;
                 }
-                let fetched = end - c.at;
+                let mut fetched = 0usize;
+                while fetched < *count && !c.result.is_exhausted() {
+                    let chunk = core(session.fetch_cursor(
+                        &mut c.result,
+                        (*count - fetched).min(CURSOR_ROWS),
+                        CURSOR_BYTES,
+                    ))?;
+                    let n = chunk.len();
+                    if !moving {
+                        let result = SqlResult {
+                            rows: chunk,
+                            ..SqlResult::default()
+                        };
+                        rows(
+                            settings.current.extra_float_digits,
+                            session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            &result,
+                            &c.description,
+                            formats,
+                            0,
+                            n,
+                            out,
+                        )?;
+                        flush_output(output, out)?;
+                    }
+                    fetched += n;
+                }
                 if *count > fetched {
                     c.exhausted = true;
                 }
@@ -324,7 +329,7 @@ impl Cursors {
                 } else {
                     fetched
                 };
-                c.at = end;
+                c.at += fetched;
                 complete(
                     &format!("{} {count}", if *moving { "MOVE" } else { "FETCH" }),
                     &SqlResult::default(),

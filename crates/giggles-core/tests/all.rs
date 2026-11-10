@@ -320,3 +320,6 @@ mod user_defined_types;
 mod per_schema_names;
 #[path = "corruption_detection.rs"]
 mod corruption_detection;
+
+#[path = "streaming_cursor.rs"]
+mod streaming_cursor;

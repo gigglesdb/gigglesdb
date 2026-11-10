@@ -1,5 +1,6 @@
 use crate::*;
 mod catalog_inspection;
+mod cursor;
 mod drop_table;
 mod engine;
 mod feature_envelope;
@@ -15,6 +16,7 @@ mod sequence_counters;
 pub(crate) mod sequences;
 mod v2;
 mod v2_sql;
+pub use cursor::Cursor;
 pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
 use bincode::Options;
