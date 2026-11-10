@@ -537,3 +537,27 @@ whitespace, and PostgreSQL 18's random `\restrict`/`\unrestrict` guard tokens.
 SQL definitions remain intact. Each check keeps raw artifacts and records its
 PostgreSQL baseline: a failed baseline is `HARNESS_ERROR`; a failed GigglesDB
 operation against a working baseline is `FAIL`.
+
+## Mixed-version directory and export qualification
+
+Build OLD and NEW `giggles` and `giggles-server` binaries separately. NEW must
+include `--features engine-rocksdb` in both crates; OLD uses its legacy build.
+Run this bounded matrix with Docker available and `postgres:18.6` installed:
+
+```powershell
+python -I compat/mixed_version.py --old-cli J:/gigglesdb-work/p1-mv-old/target/debug/giggles.exe --new-cli J:/gigglesdb-work/p1-mv/target/debug/giggles.exe --old-server J:/gigglesdb-work/p1-mv-old/target/debug/giggles-server.exe --new-server J:/gigglesdb-work/p1-mv/target/debug/giggles-server.exe --out J:/gigglesdb-work/p1-mv/out
+```
+
+The runner creates fresh per-run directories beneath `--out`, leaves both source
+worktrees untouched, and writes `report.json` and `report.md`. Rows cover legacy
+reopens and writes, v2 rejection, upgrade retention, both GDEXP001 directions,
+and cross-version server startup. Every fixture includes PK and heap tables,
+an index, 200 initial rows per table, an UPDATE and a DELETE; optional schema,
+enum, sequence and role support is recorded. Refusals require a nonzero exit,
+a format/version/feature diagnostic and unchanged directory contents. Hashes
+include every filename, size and file content, including lock files. Silent
+misreads, panics and mutation after refusal stop the run with a FINDING; later
+cells are NOT RUN. Full command output and server logs remain in the evidence
+directory. No product files are changed, and the temporary psql container is
+removed on completion. The script does not build binaries or run upgrades on
+operator data.
