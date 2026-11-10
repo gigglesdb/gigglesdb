@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     echo 'Usage: dev.sh [--task|-Task TASK] [--crate|-Crate NAME] [--release|-Release] [--work|-Work PATH] [--port|-Port PORT]' >&2
-    echo 'Tasks: setup fresh-setup dev-server server ping server-query sql sql-query native-query capabilities backup export topology outbox-example failover distributed faultlab range-history check build test clippy fmt docs' >&2
+    echo 'Tasks: setup fresh-setup dev-server dev-server-v2 server ping server-query sql sql-query native-query capabilities backup export topology outbox-example failover distributed faultlab range-history check build test clippy fmt docs' >&2
     exit 2
 }
 die() { echo "$*" >&2; exit 1; }
@@ -23,7 +23,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 case "$task" in
-    setup|fresh-setup|dev-server|server|ping|server-query|sql|sql-query|native-query|capabilities|backup|export|topology|outbox-example|failover|distributed|faultlab|range-history|check|build|test|clippy|fmt|docs) ;;
+    setup|fresh-setup|dev-server|dev-server-v2|server|ping|server-query|sql|sql-query|native-query|capabilities|backup|export|topology|outbox-example|failover|distributed|faultlab|range-history|check|build|test|clippy|fmt|docs) ;;
     *) usage ;;
 esac
 case "$port" in ''|*[!0-9]*) usage ;; esac
@@ -212,6 +212,15 @@ case "$task" in
         done
         ;;
     dev-server) invoke_binary giggles-server giggles-server --dev --data "$work/dev-data" --port "$port" ;;
+    dev-server-v2)
+        # v2 (RocksDB) engine; needs libclang (Xcode Command Line Tools or brew llvm + LIBCLANG_PATH).
+        # Separate data folder: an existing folder keeps the engine that created it.
+        build=(build --locked --features engine-rocksdb --bin giggles-server)
+        if "$release"; then build+=(--release); fi
+        invoke_cargo giggles-server "${build[@]}"
+        status=0
+        "$CARGO_TARGET_DIR/$profile/giggles-server$suffix" --dev --engine v2 --data "$work/dev-data-v2" --port "$port" || status=$?
+        [ "$status" -eq 0 ] || die "giggles-server failed (exit $status)" ;;
     capabilities) invoke_binary giggles-language giggles-language capability-manifest ;;
     topology) invoke_binary giggles-topology giggles-topology analyze "$root/crates/giggles-topology/tests/fixtures/three-providers.json" baseline ;;
     outbox-example) destination=$(new_output); invoke_cargo giggles-outbox run --locked --example orders -- "$destination/orders.db" ;;
