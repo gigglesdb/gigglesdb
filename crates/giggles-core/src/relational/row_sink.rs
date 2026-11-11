@@ -101,6 +101,24 @@ pub(crate) trait RowSink {
 }
 
 impl Relational {
+    pub(crate) fn copy_input_page(&mut self, prepared: &Prepared, sink: &mut impl RowSink,
+        range: std::ops::Range<u64>, finish: bool, deferred: &mut DeferralState,
+        clock: Option<&clock::ExecutionClock>,
+    ) -> Result<(), CoreError> {
+        let table = self.tables.get(prepared.table().ok_or(CoreError::Sql(SqlError::Unsupported))?)
+            .ok_or(CoreError::Sql(SqlError::UnknownTable))?.clone();
+        if finish {
+            if !self.ext.constraints.get(&table.id).into_iter().flatten()
+                .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) { return Ok(()); }
+            paged_insert::validate_append(self, &table, range.start, range.end, sink, Some(deferred), clock)
+        } else {
+            for constraints in self.ext.constraints.values_mut() {
+                constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+            }
+            Ok(())
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "statement inputs plus transaction-local deferral"

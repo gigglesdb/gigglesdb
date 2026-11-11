@@ -1490,3 +1490,36 @@ fn fk_validation_rejects_non_read_committed_snapshot() {
         s.execute("ROLLBACK", &[], None).unwrap();
     }
 }
+
+#[test]
+fn copy_input_snapshot_savepoint_drop_and_forward_fk() {
+    use relational::Value as V;
+    let f = Fixture::new();
+    let mut sql = f.admin().sql_session();
+    sql.execute("CREATE TABLE copied (id INT PRIMARY KEY)", &[], None).unwrap();
+    let clock = relational::StatementClock { unavailable: None, transaction_us: 0,
+        statement_us: 0, zone: None, wall: None };
+    sql.execute("BEGIN", &[], None).unwrap();
+    sql.execute("INSERT INTO copied VALUES (1)", &[], None).unwrap();
+    sql.execute("SAVEPOINT before_copy", &[], None).unwrap();
+    let (_, p) = sql.prepare_copy("COPY copied FROM STDIN").unwrap();
+    assert!(sql.begin_copy_input().unwrap());
+    sql.feed_copy_input_at(&p, vec![vec![V::Int(2)]], &clock).unwrap();
+    let mut observer = f.admin().sql_session();
+    assert!(observer.execute("SELECT * FROM copied", &[], None).unwrap().rows.is_empty());
+    assert!(sql.feed_copy_input_at(&p, vec![vec![V::Int(1)]], &clock).is_err());
+    sql.execute("ROLLBACK TO before_copy", &[], None).unwrap();
+    assert_eq!(sql.execute("SELECT * FROM copied", &[], None).unwrap().rows.len(), 1);
+    sql.execute("COMMIT", &[], None).unwrap();
+    let (_, p) = sql.prepare_copy("COPY copied FROM STDIN").unwrap();
+    sql.begin_copy_input().unwrap();
+    sql.feed_copy_input_at(&p, vec![vec![V::Int(2)]], &clock).unwrap();
+    drop(sql);
+    assert_eq!(observer.execute("SELECT * FROM copied", &[], None).unwrap().rows.len(), 1);
+    observer.execute("CREATE TABLE tree (id INT PRIMARY KEY, parent INT REFERENCES tree(id))", &[], None).unwrap();
+    let (_, p) = observer.prepare_copy("COPY tree FROM STDIN").unwrap();
+    observer.begin_copy_input().unwrap();
+    observer.feed_copy_input_at(&p, vec![vec![V::Int(1), V::Int(2)]], &clock).unwrap();
+    observer.feed_copy_input_at(&p, vec![vec![V::Int(2), V::Null]], &clock).unwrap();
+    assert_eq!(observer.finish_copy_input_at(&p, &clock).unwrap().affected, 2);
+}

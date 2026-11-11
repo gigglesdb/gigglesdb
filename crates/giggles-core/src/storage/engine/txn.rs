@@ -282,9 +282,11 @@ impl Transaction {
             .and_then(|(_, value)| value))
     }
     pub(crate) fn catalog_writes(&self) -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> {
+        // Metadata reads must not walk the growing row/index overlay during COPY.
         self.writes
-            .iter()
-            .filter_map(|((ks, key), value)| (*ks == Keyspace::Catalog).then_some((key, value)))
+            .range((Keyspace::Catalog, Vec::new())..)
+            .take_while(|((ks, _), _)| *ks == Keyspace::Catalog)
+            .map(|((_, key), value)| (key, value))
     }
     pub(crate) fn acquire_lock(
         &self,

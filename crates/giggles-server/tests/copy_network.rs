@@ -717,3 +717,75 @@ async fn copy_formats_and_savepoint_recovery_legacy_v2_parity() {
     }
     assert_eq!(transcripts[0], transcripts[1]);
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[tokio::test]
+async fn bounded_copy_large_atomic_and_disconnect() {
+    let f = Fixture::with_engine(giggles_core::Engine::V2).await;
+    let mut s = f.connect().await;
+    for sql in [
+        "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, n INT)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id), n INT)",
+        "CREATE INDEX order_user ON orders(user_id)",
+        "CREATE TABLE rejected (id INT PRIMARY KEY, email TEXT UNIQUE, n INT)",
+        "CREATE TABLE orphans (id INT PRIMARY KEY, user_id INT REFERENCES users(id), n INT)",
+    ] { assert_eq!(tags(&query(&mut s, sql).await), b"CZ", "{sql}"); }
+    async fn load(s: &mut TcpStream, table: &str, count: usize, failure: &str) -> Vec<(u8, Vec<u8>)> {
+        start(s, &format!("COPY {table} FROM STDIN")).await;
+        for first in (1..=count).step_by(200) {
+            let mut data = String::new();
+            for id in first..=(first + 199).min(count) {
+                let value = if table == "users" || table == "rejected" {
+                    format!("u{}@example.test", if failure == "unique" && id == 49_999 { 1 } else { id })
+                } else { (if failure == "fk" && id == count { 999_999 } else { (id - 1) % 50_000 + 1 }).to_string() };
+                data.push_str(&format!("{id}\t{value}\t0\n"));
+            }
+            send(s, b'd', data.as_bytes()).await;
+        }
+        send(s, b'c', b"").await;
+        timeout(Duration::from_secs(600), s.readable()).await.unwrap().unwrap();
+        read(s).await
+    }
+    async fn count(s: &mut TcpStream, table: &str, expected: &str) {
+        let r = query(s, &format!("SELECT count(*) FROM {table}")).await;
+        assert_eq!(tags(&r), b"TDCZ", "{r:?}");
+        assert_eq!(&r[1].1[6..], expected.as_bytes());
+    }
+    assert_eq!(load(&mut s, "users", 50_000, "").await[0].1, b"COPY 50000\0");
+    let started = std::time::Instant::now();
+    assert_eq!(load(&mut s, "orders", 200_000, "").await[0].1, b"COPY 200000\0");
+    eprintln!("COPY orders: 200000 rows / {:.3}s = {:.0} rows/s", started.elapsed().as_secs_f64(), 200000.0 / started.elapsed().as_secs_f64());
+    count(&mut s, "orders", "200000").await;
+    // Existing UNIQUE/indexed destination already contains far more than 1,024 rows.
+    start(&mut s, "COPY users FROM STDIN").await;
+    send(&mut s, b'd', b"50001\tnew@example.test\t0\n").await;
+    send(&mut s, b'c', b"").await;
+    assert_eq!(read(&mut s).await[0].1, b"COPY 1\0");
+    error(&load(&mut s, "rejected", 50_000, "unique").await, "23505");
+    count(&mut s, "rejected", "0").await;
+    error(&load(&mut s, "orphans", 2_000, "fk").await, "23503");
+    count(&mut s, "orphans", "0").await;
+    start(&mut s, "COPY rejected FROM STDIN").await;
+    let data = (1..=400).map(|id| format!("{id}\tu{id}\t0\n")).collect::<String>();
+    send(&mut s, b'd', data.as_bytes()).await;
+    send(&mut s, b'f', b"cancel\0").await;
+    error(&read(&mut s).await, "57014");
+    count(&mut s, "rejected", "0").await;
+    let mut abandoned = f.connect().await;
+    start(&mut abandoned, "COPY rejected FROM STDIN").await;
+    let data = (1..=400).map(|id| format!("{id}\tu{id}\t0\n")).collect::<String>();
+    send(&mut abandoned, b'd', data.as_bytes()).await;
+    silent(&mut abandoned).await;
+    drop(abandoned);
+    count(&mut s, "rejected", "0").await;
+    start(&mut s, "COPY rejected FROM STDIN (FORMAT csv)").await;
+    send(&mut s, b'd', b"1,\"a,b\",0\n2,\"\",0\n3,,0\n").await;
+    send(&mut s, b'c', b"").await;
+    assert_eq!(read(&mut s).await[0].1, b"COPY 3\0");
+    let r = query(&mut s, "SELECT email FROM rejected ORDER BY id").await;
+    assert_eq!(r[1].1, b"\0\x01\0\0\0\x03a,b");
+    assert_eq!(r[2].1, b"\0\x01\0\0\0\0");
+    assert_eq!(r[3].1, b"\0\x01\xff\xff\xff\xff");
+    drop(s);
+    f.stop().await;
+}

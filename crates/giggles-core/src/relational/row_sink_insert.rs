@@ -113,12 +113,21 @@ pub(super) fn execute(
         }
     }
     if foreign_keys {
+        validate_append(state, &table, first_version, state.next_version, sink, deferred, clock)?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn validate_append(state: &Relational, table: &TableDef, first_version: u64,
+    version_end: u64, sink: &mut impl RowSink, deferred: Option<&mut DeferralState>, clock: Option<&clock::ExecutionClock>,
+) -> Result<(), CoreError> {
+        let immediate_mode = deferred.is_none();
         let mut immediate = DeferralState::default();
-        let pending = deferred.as_deref_mut().unwrap_or(&mut immediate);
+        let pending = match deferred { Some(deferred) => deferred, None => &mut immediate };
         let mut after = None;
-        while let Some((last, mut rows)) = sink.read_page(&table, after.take())? {
+        while let Some((last, mut rows)) = sink.read_page(table, after.take())? {
             after = Some(last);
-            rows.retain(|_, row| row.version >= first_version && row.version < state.next_version);
+            rows.retain(|_, row| row.version >= first_version && row.version < version_end);
             if rows.is_empty() { continue; }
             let mut page = state.clone();
             page.rows.insert(table.id, rows);
@@ -130,9 +139,8 @@ pub(super) fn execute(
             constraints::enforce(&mut page, &before, Vec::new(), pending,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
         }
-        if deferred.is_none() {
+        if immediate_mode {
             paged_pending(state, &mut immediate, &[], false, sink)?;
         }
-    }
-    Ok(result)
+    Ok(())
 }

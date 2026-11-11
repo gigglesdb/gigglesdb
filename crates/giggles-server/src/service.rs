@@ -1388,6 +1388,16 @@ impl Session {
             session.sql.normalize_copy_rows_at(prepared, rows, clock)
         })
     }
+    pub(crate) fn finish_copy_input(&mut self, authority: &Prepared, prepared: &Prepared,
+        clock: &StatementClock,
+    ) -> Result<SqlResult, CoreError> {
+        self.authority_scope(|session| {
+            session.authorize(authority)?;
+            let result = session.sql.finish_copy_input_at(prepared, clock);
+            if !session.sql.in_transaction() { session.transaction_us = None; }
+            result
+        })
+    }
     pub(crate) fn ingest_normalized_copy(
         &mut self,
         authority: &Prepared,

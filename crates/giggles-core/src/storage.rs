@@ -21,6 +21,8 @@ pub use upgrade::{UpgradePoint, UpgradeReport};
 #[cfg(feature = "engine-rocksdb")]
 mod v2_export;
 mod v2_sql;
+mod copy_input;
+use copy_input::CopyInput;
 pub use cursor::Cursor;
 pub use secondary_index_public::IndexInfo;
 mod unique_batch_bridge;
@@ -1796,6 +1798,7 @@ pub struct SqlSession {
     admin: Admin,
     staged: Option<State>,
     v2_transaction: Option<engine::txn::Transaction>,
+    copy_input: Option<CopyInput>,
     savepoints: Vec<SqlSavepoint>,
     v2_savepoints: Vec<(String, engine::txn::Savepoint, relational::DeferralState)>,
     savepoint_budget: u64,
@@ -1823,6 +1826,7 @@ impl Admin {
             admin: self.clone(),
             staged: None,
             v2_transaction: None,
+            copy_input: None,
             savepoints: Vec::new(),
             v2_savepoints: Vec::new(),
             savepoint_budget: SAVEPOINT_BYTES,
@@ -2142,6 +2146,7 @@ impl SqlSession {
     }
     /// A gateway parse/bind/authorization failure poisons an explicit transaction.
     pub fn abort(&mut self) {
+        self.abort_copy_input();
         if self.in_transaction() {
             self.aborted = true;
         }
@@ -3128,6 +3133,7 @@ impl SqlSession {
             })
     }
     pub fn rollback(&mut self) {
+        self.copy_input = None;
         let v2 = self.v2_transaction.take().is_some();
         if self.staged.take().is_some() || v2 {
             self.admin

@@ -93,6 +93,10 @@ impl SqlSession {
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::{SqlError as E, V2Class};
+        if self.copy_input.as_ref().is_some_and(|input| !input.executing) {
+            self.abort();
+            return Err(CoreError::Sql(E::Transaction));
+        }
         if self.aborted && !p.allows_aborted_transaction() {
             return Err(CoreError::Sql(E::Aborted));
         }
@@ -238,7 +242,7 @@ impl SqlSession {
                         Some(txn) => txn,
                         None => implicit.insert(db.begin(Isolation::ReadCommitted)),
                     };
-                    txn.begin_statement();
+                    if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
                     let mark = txn.savepoint();
                     let result = (|| {
                         // DDL stages a catalog-wide image (including schema cascades and
@@ -256,7 +260,7 @@ impl SqlSession {
                                 &|| crate::cancellation::check().is_err(),
                             )?;
                             // Refresh AFTER waiting: DDL may have introduced an FK.
-                            txn.begin_statement();
+                            if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
                         }
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
@@ -365,7 +369,7 @@ impl SqlSession {
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.
-                        txn.begin_statement();
+                        if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
                         let old = db.catalog().parts(txn)?;
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
@@ -397,7 +401,13 @@ impl SqlSession {
                             floor..floor
                         };
                         let versions = if matches!(class, V2Class::Dml) {
-                            db.sequences.reserve_range(3, 0, 1_000_001)?
+                            if let Some(range) = self.copy_input.as_ref().and_then(|input| input.versions.clone()) {
+                                range
+                            } else {
+                                let range = db.sequences.reserve_range(3, 0, 1_000_001)?;
+                                if let Some(input) = self.copy_input.as_mut() { input.versions = Some(range.clone()); }
+                                range
+                            }
                         } else {
                             1..u64::MAX
                         };
@@ -425,6 +435,19 @@ impl SqlSession {
                                 self.sequence_values.clone(),
                             ))
                         });
+                        if let Some(input) = self.copy_input.as_mut() {
+                            let table = bound.table().ok_or(CoreError::Sql(E::Unsupported))?;
+                            if input.table.as_ref().is_some_and(|saved| saved != table) {
+                                return Err(CoreError::Sql(E::Transaction));
+                            }
+                            input.table = Some(table.to_owned());
+                            let floor = *input.floor.get_or_insert(versions.start);
+                            image.copy_input_page(&bound,
+                                &mut SqlRows { conflict_floor: None, db, txn, parts: &old,
+                                    writing, prepared: &bound, params }, floor..versions.start,
+                                input.finishing, &mut self.deferral, context.as_ref())?;
+                            if input.finishing { return Ok(Default::default()); }
+                        }
                         let result = image.execute_with_sink(
                             p,
                             params,
@@ -450,6 +473,9 @@ impl SqlSession {
                             return Err(error);
                         }
                         let result = result?;
+                        if let Some(range) = self.copy_input.as_mut().and_then(|input| input.versions.as_mut()) {
+                            range.start = image.catalog_parts().3;
+                        }
                         if !ddl {
                             return Ok(result);
                         }

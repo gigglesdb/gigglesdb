@@ -7,6 +7,7 @@ pub(super) fn is_copy_sql(sql: &str) -> bool {
 }
 pub(super) struct CopyIn {
     descriptor: Copy,
+    streaming: bool,
     prepared: Box<Prepared>,
     normalized: Option<Prepared>,
     clock: giggles_core::relational::StatementClock,
@@ -20,6 +21,13 @@ pub(super) struct CopyIn {
     pub(super) remaining: Vec<String>,
 }
 impl CopyIn {
+    fn flush_page(&mut self, session: &mut Session, count: usize) -> R<()> {
+        let rows = self.rows.drain(..count).collect();
+        let (prepared, rows) = core(session.normalize_copy_rows(&self.prepared, rows, &self.clock))?;
+        core(session.sql.feed_copy_input_at(&prepared, rows, &self.clock))?;
+        self.normalized = Some(prepared);
+        Ok(())
+    }
     fn convert(&mut self, rows: Vec<Vec<Option<Vec<u8>>>>, session: &mut Session) -> R<()> {
         let zone = session.zone().unwrap_or(SessionZone::Fixed(0));
         let mut converted = vec![];
@@ -52,6 +60,11 @@ impl CopyIn {
                     })
                     .collect::<R<Vec<_>>>()?,
             );
+        }
+        if self.streaming {
+            self.rows.extend(converted);
+            while self.rows.len() >= 200 { self.flush_page(session, 200)?; }
+            return Ok(());
         }
         if self
             .rows
@@ -128,7 +141,7 @@ impl State {
     ) -> R<()> {
         let columns = core(session.copy_columns(&descriptor, &prepared))?;
         let binary = matches!(descriptor.format, CopyFormat::Binary);
-        let decoder = if binary {
+        let mut decoder = if binary {
             copy::Decoder::binary(columns.len())
         } else if descriptor.format == CopyFormat::Csv {
             copy::Decoder::csv(
@@ -152,12 +165,16 @@ impl State {
         for _ in &columns {
             response.extend(u16::from(binary).to_be_bytes());
         }
+        let clock = session.copy_clock();
+        let streaming = !binary && core(session.sql.begin_copy_input())?;
+        if streaming { decoder.stream(); }
         frame(b'G', &response, out)?;
         self.copy = Some(CopyIn {
             descriptor,
+            streaming,
             prepared,
             normalized: None,
-            clock: session.copy_clock(),
+            clock,
             columns,
             decoder,
             rows: vec![],
@@ -194,8 +211,10 @@ impl State {
             let result = (|| {
                 match tag {
                     b'd' => {
-                        let rows = copy.decoder.feed(b)?;
-                        copy.convert(rows, session)?;
+                        for bytes in b.chunks(if copy.streaming { 128 } else { b.len().max(1) }) {
+                            let rows = copy.decoder.feed(bytes)?;
+                            copy.convert(rows, session)?;
+                        }
                     }
                     b'c' => {
                         if !b.is_empty() {
@@ -203,12 +222,16 @@ impl State {
                         }
                         let rows = copy.decoder.finish()?;
                         copy.convert(rows, session)?;
-                        let result = core(session.ingest_normalized_copy(
+                        let result = if copy.streaming {
+                            if !copy.rows.is_empty() { copy.flush_page(session, copy.rows.len())?; }
+                            core(session.finish_copy_input(&copy.prepared,
+                                copy.normalized.as_ref().unwrap_or(&copy.prepared), &copy.clock))?
+                        } else { core(session.ingest_normalized_copy(
                             &copy.prepared,
                             copy.normalized.as_ref().unwrap_or(&copy.prepared),
                             std::mem::take(&mut copy.rows),
                             &copy.clock,
-                        ))?;
+                        ))? };
                         let mut body = vec![];
                         z(&format!("COPY {}", result.affected), &mut body);
                         if copy.simple {

@@ -9,6 +9,7 @@ type Result<T> = std::result::Result<T, &'static str>;
 const LIMIT: usize = giggles_core::operations::MAX_INSERT_BYTES;
 pub(super) struct Decoder {
     columns: usize,
+    streaming: bool,
     delimiter: u8,
     null: Vec<u8>,
     binary: bool,
@@ -25,6 +26,7 @@ impl Decoder {
     pub(super) fn text(columns: usize, delimiter: u8, null: Vec<u8>) -> Self {
         Self {
             columns,
+            streaming: false,
             delimiter,
             null,
             binary: false,
@@ -50,9 +52,10 @@ impl Decoder {
             ..Self::text(columns, b'\t', b"\\N".to_vec())
         }
     }
+    pub(super) fn stream(&mut self) { self.streaming = true; }
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Row>> {
         self.total = self.total.checked_add(bytes.len()).ok_or("54000")?;
-        if self.total > LIMIT {
+        if (if self.streaming { self.pending.len() + bytes.len() } else { self.total }) > LIMIT {
             return Err("54000");
         }
         if self.ended {
@@ -110,7 +113,7 @@ impl Decoder {
                     self.ended = true;
                     break;
                 }
-                if self.rows == giggles_core::relational::MAX_ROWS {
+                if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
                 rows.push(self.csv_row(line)?);
@@ -131,7 +134,7 @@ impl Decoder {
                 return Err(bad_format());
             }
             if start < self.pending.len() && &self.pending[start..] != b"\\." {
-                if self.rows == giggles_core::relational::MAX_ROWS {
+                if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
                 rows.push(self.csv_row(&self.pending[start..])?);
@@ -210,7 +213,7 @@ impl Decoder {
                     self.ended = true;
                     break;
                 }
-                if self.rows == giggles_core::relational::MAX_ROWS {
+                if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
                 rows.push(self.text_row(line)?);
@@ -231,7 +234,7 @@ impl Decoder {
         if eof && start < self.pending.len() {
             let line = &self.pending[start..];
             if line != b"\\." {
-                if self.rows == giggles_core::relational::MAX_ROWS {
+                if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                     return Err("54000");
                 }
                 rows.push(self.text_row(line)?);
@@ -378,7 +381,7 @@ impl Decoder {
             if count < 0 || count as usize != self.columns {
                 return Err(bad_format());
             }
-            if self.rows == giggles_core::relational::MAX_ROWS {
+            if !self.streaming && self.rows == giggles_core::relational::MAX_ROWS {
                 return Err("54000");
             }
             let mut row = Vec::new();
@@ -609,6 +612,21 @@ mod tests {
                 .unwrap_err(),
             "22P04"
         );
+    }
+    #[test]
+    fn streaming_retains_record_bounds_without_cumulative_caps() {
+        for csv in [false, true] {
+            let mut d = if csv { Decoder::csv(1, b',', vec![]) }
+                else { Decoder::text(1, b'\t', vec![]) };
+            d.stream();
+            for _ in 0..2000 {
+                assert_eq!(d.feed(b"1\n".repeat(300).as_slice()).unwrap().len(), 300);
+                assert!(d.pending.is_empty());
+            }
+            assert!(d.finish().unwrap().is_empty());
+            d.feed(&vec![b'x'; LIMIT]).unwrap();
+            assert_eq!(d.feed(b"x").unwrap_err(), "54000");
+        }
     }
     #[test]
     fn cumulative_row_limit_before_materializing_another_row() {
