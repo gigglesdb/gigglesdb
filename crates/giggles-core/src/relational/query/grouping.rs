@@ -403,7 +403,7 @@ pub(super) fn bind<'a>(
     tables: &[&'a TableDef],
     mut parameters: Vec<Option<DataType>>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
-    subqueries: Vec<(usize, BoundQuery<'a>)>,
+    subqueries: Subplans<'a>,
 ) -> R<BoundQuery<'a>> {
     let projection = projection(q, tables)?;
     if projection.len() > MAX_COLUMNS {

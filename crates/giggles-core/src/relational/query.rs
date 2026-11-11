@@ -9,6 +9,8 @@ pub(super) mod conflict;
 mod grouping;
 mod insert_values;
 mod schema_names;
+mod subplans;
+use subplans::{SubplanMode, Subplans};
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
@@ -391,7 +393,7 @@ fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
                 stack.push(sub);
                 if sub {
                     nested += 1;
-                    if nested > 32 {
+                    if nested > subplans::MAX_DEPTH {
                         return Err(SqlError::Limit);
                     }
                 }
@@ -528,19 +530,16 @@ impl Filter {
         params: &mut [Option<DataType>],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
-        subqueries: &[(usize, BoundQuery<'_>)],
+        subqueries: &Subplans<'_>,
     ) -> R<()> {
         match self {
             Self::InSubquery { value, query, .. } => {
-                let bound = subqueries
-                    .iter()
-                    .find(|(key, _)| *key == query.as_ref() as *const Query as usize)
-                    .ok_or(SqlError::Unsupported)?;
+                let bound = subqueries.get(query.as_ref() as *const Query as usize, SubplanMode::In)?;
                 let expected = if matches!(value, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
                 {
                     None
                 } else {
-                    Some(&bound.1.columns[0].data_type)
+                    Some(&bound.columns[0].data_type)
                 };
                 value.infer(expected, params, resolve, tables)
             }
@@ -559,7 +558,7 @@ impl Filter {
         params: &[Option<DataType>],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
-        subqueries: &[(usize, BoundQuery<'_>)],
+        subqueries: &Subplans<'_>,
     ) -> R<BoundFilter> {
         Ok(match self {
             Self::InSubquery {
@@ -568,13 +567,7 @@ impl Filter {
                 negated,
             } => {
                 let key = query.as_ref() as *const Query as usize;
-                let column_type = &subqueries
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                    .ok_or(SqlError::Unsupported)?
-                    .1
-                    .columns[0]
-                    .data_type;
+                let column_type = &subqueries.get(key, SubplanMode::In)?.columns[0].data_type;
                 if *column_type == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
                 }
@@ -1224,12 +1217,7 @@ impl BoundFilter {
                 clock,
             } => {
                 if !execution.subqueries.borrow().contains_key(query) {
-                    let child = &owner
-                        .subqueries
-                        .iter()
-                        .find(|(key, _)| key == query)
-                        .ok_or(SqlError::Unsupported)?
-                        .1;
+                    let child = owner.subqueries.get(*query, SubplanMode::In)?;
                     let result = child.execute_context(
                         state,
                         source,
@@ -1774,8 +1762,8 @@ impl Query {
         outer: &[Source],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
-    ) -> R<Vec<(usize, BoundQuery<'a>)>> {
-        let mut out = Vec::new();
+    ) -> R<Subplans<'a>> {
+        let mut out = Subplans::default();
         if let Some(f) = self.where_filter() {
             f.visit_subqueries(&mut |value, q| {
                 if let [(Item::Scalar(Scalar::Param(n)), _)] = q.items.as_slice()
@@ -1809,7 +1797,7 @@ impl Query {
                         *slot = Some(bound.parameters[n - 1].clone());
                     }
                 }
-                out.push((q as *const Query as usize, bound));
+                out.register(q as *const Query as usize, SubplanMode::In, bound)?;
                 Ok(())
             })?;
         }
@@ -3611,7 +3599,7 @@ pub(super) struct BoundQuery<'a> {
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
     distinct_order_slots: Vec<usize>,
-    subqueries: Vec<(usize, BoundQuery<'a>)>,
+    subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
 }
 struct Tuple {
@@ -4820,9 +4808,7 @@ impl BoundQuery<'_> {
         self
     }
     fn attach_execution_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
-        for (_, subquery) in &mut self.subqueries {
-            subquery.attach_execution_clock(clock);
-        }
+        self.subqueries.attach_clock(clock);
         if let Some(grouping) = &mut self.grouping {
             grouping.attach_clock(clock, &mut self.joins);
         } else {
