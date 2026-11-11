@@ -1,6 +1,44 @@
 //! Demand-driven EXISTS uses the caller's source and statement budgets.
 use super::*;
 
+// Each operator owns only its charges; child caches remain statement-owned.
+pub(super) struct RetentionScope<'a> {
+    ledger: &'a RefCell<scan::Retention>,
+    bytes: Cell<usize>,
+}
+impl<'a> RetentionScope<'a> {
+    pub(super) fn new(execution: &'a Execution<'_>) -> Self {
+        Self { ledger: &execution.retention, bytes: Cell::new(0) }
+    }
+    pub(super) fn borrow(&self) -> RetentionBorrow<'_> {
+        let ledger = self.ledger.borrow_mut();
+        let before = ledger.used();
+        RetentionBorrow { ledger, before, bytes: &self.bytes }
+    }
+}
+pub(super) struct RetentionBorrow<'a> {
+    ledger: std::cell::RefMut<'a, scan::Retention>,
+    before: usize,
+    bytes: &'a Cell<usize>,
+}
+impl std::ops::Deref for RetentionBorrow<'_> {
+    type Target = scan::Retention;
+    fn deref(&self) -> &Self::Target { &self.ledger }
+}
+impl std::ops::DerefMut for RetentionBorrow<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.ledger }
+}
+impl Drop for RetentionBorrow<'_> {
+    fn drop(&mut self) { self.bytes.set(self.bytes.get() + self.ledger.used() - self.before); }
+}
+impl Drop for RetentionScope<'_> {
+    fn drop(&mut self) { self.ledger.borrow_mut().release(self.bytes.get()); }
+}
+impl scan::RetentionBudget for RetentionScope<'_> {
+    fn charge(&mut self, bytes: usize) -> R<()> { self.borrow().charge(bytes) }
+    fn release(&mut self, bytes: usize) { self.borrow().release(bytes); }
+}
+
 impl BoundQuery<'_> {
     pub(super) fn outer_values(&self, execution: &Execution<'_>) -> Vec<Vec<Value>> {
         let mut outer = vec![vec![]; self.tables.len().saturating_sub(self.query.sources.len())];
@@ -39,6 +77,7 @@ impl BoundQuery<'_> {
         if let Some(grouping) = &self.grouping {
             return Ok(!grouping.execute(self, state, source, params, execution, true)?.rows.is_empty());
         }
+        let scope = RetentionScope::new(execution);
         let outer = self.outer_values(execution);
         let mut cancel = || execution.cancelled();
         let mut meter = scan::Meter::per_row(&mut cancel);
@@ -46,11 +85,31 @@ impl BoundQuery<'_> {
         let mut seen = BTreeSet::new();
         let mut distinct_bytes = 0;
         let result = (|| {
+        let mut values = self.items.iter().filter(|_| self.aggregate).map(|item| {
+            if matches!(item, BoundItem::Aggregate(a, _) if matches!(a.base(), Aggregate::Count)) {
+                Value::Int(0)
+            } else { Value::Null }
+        }).collect::<Vec<_>>();
+        let mut auxiliary = if self.aggregate {
+            scope.borrow().charge(aggregate_retained(&values))?;
+            aggregate_auxiliary(&self.items, &mut scope.borrow())?
+        } else { vec![] };
+        let mut work = 0;
         let mut accept = |row: &Tuple| -> R<bool> {
             let qualifies = self.filter.as_ref().map(|f| f.eval_with_subqueries(
                 row, params, &mut 0, self, state, source, execution)).transpose()?;
             if !matches!(qualifies, None | Some(Some(true))) { return Ok(false); }
-            if self.query.distinct() && offset > 0 && !self.aggregate {
+            if self.aggregate {
+                let mut retention = scope.borrow();
+                let before = aggregate_retained(&values);
+                update_aggregates(&self.items, &self.columns, &mut values, &mut auxiliary,
+                    &mut retention, row, params, &mut work)?;
+                let after = aggregate_retained(&values);
+                if after > before { retention.charge(after - before)?; }
+                else { retention.release(before - after); }
+                return Ok(false);
+            }
+            if self.query.distinct() && offset > 0 {
                 let key = grouping::Key(self.project_tuple(row, params, &mut 0, &mut 0)?.values);
                 if seen.contains(&key) { return Ok(false); }
                 distinct_bytes += distinct_charge(&key.0, &[], &mut execution.retention.borrow_mut())?;
@@ -61,15 +120,19 @@ impl BoundQuery<'_> {
         };
         if self.query.sources.is_empty() {
             meter.tick()?;
-            return accept(&Tuple { values: outer, version: 0 });
+            let accepted = accept(&Tuple { values: outer, version: 0 })?;
+            if !self.aggregate { return Ok(accepted); }
+        } else {
+            let (empty, bounds) = self.base_bounds(params)?;
+            if !empty {
+                let range = scan::KeyRange::from_bounds(bounds);
+                let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+                for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true) {
+                    if accept(&row?)? && !self.aggregate { return Ok(true); }
+                }
+            }
         }
-        let (empty, bounds) = self.base_bounds(params)?;
-        if empty { return Ok(self.aggregate && offset == 0); }
-        let range = scan::KeyRange::from_bounds(bounds);
-        let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
-        for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true) {
-            if accept(&row?)? && !self.aggregate { return Ok(true); }
-        }
+        if self.aggregate { finish_aggregates(&self.items, &mut values, &auxiliary, &mut work)?; }
         Ok(self.aggregate && offset == 0)
         })();
         execution.retention.borrow_mut().release(distinct_bytes);
@@ -90,9 +153,9 @@ impl Execution<'_> {
     ) -> R<bool> {
         let correlated = child.correlated(0);
         if !correlated && let Some(value) = self.exists.borrow().get(&key) { return Ok(*value); }
-        let bytes = row.values.iter().map(|v| std::mem::size_of_val(v.as_slice())
-            + v.iter().map(value_bytes).sum::<usize>()).sum::<usize>()
-            .checked_mul(2).ok_or(SqlError::Limit)?;
+        let bytes = (std::mem::size_of_val(row.values.as_slice()) + row.values.iter().map(|v| std::mem::size_of_val(v.as_slice())
+            + v.iter().map(value_bytes).sum::<usize>()).sum::<usize>())
+            .checked_mul(2).ok_or(SqlError::Limit)? + std::mem::size_of::<Vec<Vec<Value>>>();
         self.retention.borrow_mut().charge(bytes)?;
         self.frames.borrow_mut().push(row.values.clone());
         let result = child.exists(state, source, params, self);
@@ -187,4 +250,51 @@ mod tests {
             assert!(execution.frames.borrow().is_empty());
         }
     }
+    #[test]
+    fn aggregate_transitions_having_and_scoped_error_release() {
+        let state = state();
+        for (child, expected) in [
+            ("SELECT max(v) FROM i WHERE false", Ok(4)),
+            ("SELECT max(v) FROM i HAVING false", Ok(0)),
+            ("SELECT sum(1/(k-k)) FROM i", Err(SqlError::DivisionByZero)),
+            ("SELECT sum(1/(k-k)) FROM i OFFSET 1", Err(SqlError::DivisionByZero)),
+            ("SELECT sum(1/(k-k)) FROM i GROUP BY k", Err(SqlError::DivisionByZero)),
+            ("SELECT sum(1/(k-k)) FROM i LIMIT 0", Ok(0)),
+        ] {
+            let q = query(&format!("SELECT id FROM o WHERE EXISTS({child})"));
+            let bound = q.bind(&state, 0, &[]).unwrap();
+            let mut cancel = || false;
+            let execution = Execution::new(&mut cancel, &[]);
+            let actual = bound.execute_context(&state, &scan::LegacyRows(&state), &[], &[], &execution, false, false);
+            assert_eq!(actual.map(|r| r.rows.len()), expected, "{child}");
+            assert!(execution.frames.borrow().is_empty());
+            assert_eq!(execution.retention.borrow().used(), if expected.is_ok() { 64 } else { 0 });
+        }
+    }
+    #[test]
+    fn parent_sort_and_aggregate_share_child_budget() {
+        let mut state = state();
+        for sql in ["CREATE TABLE t(id int PRIMARY KEY, v text)".into(),
+            format!("INSERT INTO t VALUES(1,'{}'),(2,'{}')", "x".repeat(700), "y".repeat(700))] {
+            let p = Prepared::parse(&sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        for (sql, fails) in [
+            ("SELECT id FROM t ORDER BY id+0", false),
+            ("SELECT max(v) FROM t", false),
+            ("SELECT id FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id)", false),
+            ("SELECT id FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id) ORDER BY id+0", true),
+            ("SELECT max(v) FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id)", true),
+        ] {
+            let q = query(sql);
+            let mut cancel = || false;
+            let execution = Execution::new(&mut cancel, &[]);
+            *execution.retention.borrow_mut() = scan::Retention::new(2048);
+            let result = q.bind(&state, 0, &[]).unwrap().execute_context(&state, &scan::LegacyRows(&state), &[], &[], &execution, false, false);
+            if fails { assert_eq!(result, Err(SqlError::Limit), "{sql}"); }
+            else { assert!(result.is_ok(), "{sql}: {result:?}"); }
+            assert_eq!(execution.retention.borrow().used(), 0, "{sql}");
+        }
+    }
+
 }

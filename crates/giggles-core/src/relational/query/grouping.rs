@@ -860,15 +860,14 @@ impl Grouping {
             return Ok(result);
         }
         let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
-        let mut retention = execution.retention.borrow_mut();
-        let initial_bytes = retention.used();
+        let scope = RetentionScope::new(execution);
+        let mut retention = scope.borrow();
         if self.keys.is_empty() {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
             let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
             groups.insert(Key(vec![]), (initial, auxiliary));
         }
-        let mut group_bytes = retention.used() - initial_bytes;
         drop(retention);
         let mut aggregate_work = 0;
         let outer = query.outer_values(execution);
@@ -884,8 +883,7 @@ impl Grouping {
                 {
                     return Ok(());
                 }
-                let mut retention = execution.retention.borrow_mut();
-                let before_group = retention.used();
+                let mut retention = scope.borrow();
                 let mut key_work = 0;
                 let key = Key(self
                     .keys
@@ -923,7 +921,6 @@ impl Grouping {
                 } else {
                     retention.release(before - after);
                 }
-                group_bytes = group_bytes + retention.used() - before_group;
                 Ok(())
             };
             if query.query.sources.is_empty() {
@@ -943,8 +940,7 @@ impl Grouping {
                 }
             }
         }
-        let mut retention = execution.retention.borrow_mut();
-        let output_start = retention.used();
+        let mut retention = scope.borrow();
         let mut rows = vec![];
         let mut distinct = std::collections::BTreeSet::new();
         let mut skipped = 0;
@@ -969,7 +965,6 @@ impl Grouping {
             }
             if exists && (!query.query.distinct() || page.offset == 0) {
                 if skipped == page.offset {
-                    retention.release(group_bytes);
                     result.rows.push(SqlRow { values: vec![], version: 0 });
                     return Ok(result);
                 }
@@ -1051,8 +1046,6 @@ impl Grouping {
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        let output_bytes = retention.used() - output_start;
-        retention.release(group_bytes + output_bytes);
         Ok(result)
     }
     pub(super) fn typmods(&self, state: &Relational, tables: &[&TableDef]) -> Vec<i32> {

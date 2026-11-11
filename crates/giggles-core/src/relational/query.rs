@@ -13,6 +13,7 @@ mod subplans;
 mod outer;
 mod exists;
 use subplans::{SubplanMode, Subplans};
+use exists::RetentionScope;
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
 pub(super) use insert_values::InsertExpressions;
@@ -4562,11 +4563,12 @@ impl BoundQuery<'_> {
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut retention = scan::Retention::new(scan::retention_limit());
-            let mut auxiliary = aggregate_auxiliary(&self.items, &mut retention)?;
-            retention.charge(aggregate_retained(&values))?;
+            let scope = RetentionScope::new(execution);
+            let mut auxiliary = aggregate_auxiliary(&self.items, &mut scope.borrow())?;
+            scope.borrow().charge(aggregate_retained(&values))?;
             for row in filtered {
                 let row = row?;
+                let mut retention = scope.borrow();
                 let before = aggregate_retained(&values);
                 update_aggregates(
                     &self.items,
@@ -4611,7 +4613,7 @@ impl BoundQuery<'_> {
                         .collect::<R<Vec<_>>>()?;
                     Ok((row, keys))
                 });
-                let mut retention = scan::Retention::new(scan::retention_limit());
+                let mut retention = RetentionScope::new(execution);
                 let sorted = scan::sort_bounded(
                     keyed,
                     page.keep(),

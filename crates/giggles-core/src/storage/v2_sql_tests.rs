@@ -108,6 +108,41 @@ fn internal_exists_scale_and_own_writes() {
 }
 
 #[test]
+fn internal_exists_aggregate_semantics_and_combined_retention() {
+    use crate::relational::{Value, scan};
+    let f = Fixture::new();
+    f.execute("CREATE TABLE t(id int PRIMARY KEY, v text)");
+    f.execute(&format!("INSERT INTO t VALUES(1,'{}'),(2,'{}')", "x".repeat(700), "y".repeat(700)));
+    let mut session = f.admin().sql_session();
+    for (child, expected) in [
+        ("SELECT max(id) FROM t WHERE false", Ok(2)),
+        ("SELECT max(id) FROM t HAVING false", Ok(0)),
+        ("SELECT sum(1/(id-id)) FROM t", Err(CoreError::Sql(SqlError::DivisionByZero))),
+        ("SELECT sum(1/(id-id)) FROM t OFFSET 1", Err(CoreError::Sql(SqlError::DivisionByZero))),
+        ("SELECT sum(1/(id-id)) FROM t GROUP BY id", Err(CoreError::Sql(SqlError::DivisionByZero))),
+        ("SELECT sum(1/(id-id)) FROM t LIMIT 0", Ok(0)),
+    ] {
+        let mut p = session.prepare("SELECT id FROM t").unwrap();
+        p.exists_test_query(&format!("SELECT id FROM t WHERE EXISTS({child})"));
+        assert_eq!(session.execute_prepared(&p, &[], None).map(|r| r.rows.len()), expected, "{child}");
+    }
+    for (sql, fails) in [
+        ("SELECT id FROM t ORDER BY id+0", false),
+        ("SELECT max(v) FROM t", false),
+        ("SELECT id FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id)", false),
+        ("SELECT id FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id) ORDER BY id+0", true),
+        ("SELECT max(v) FROM t WHERE EXISTS(SELECT 1 FROM t i WHERE i.id=t.id)", true),
+    ] {
+        let mut p = session.prepare("SELECT id FROM t").unwrap();
+        p.exists_test_query(sql);
+        let result = scan::with_cursor_limit(2048, || session.execute_prepared(&p, &[], None));
+        if fails { assert_eq!(result, Err(CoreError::Sql(SqlError::Limit)), "{sql}"); }
+        else { assert!(result.is_ok(), "{sql}: {result:?}"); }
+    }
+    assert_eq!(session.execute("SELECT count(*) FROM t", &[], None).unwrap().rows[0].values, vec![Value::Int(2)]);
+}
+
+#[test]
 fn ddl_defaults_and_renames_persist() {
     let mut f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v text DEFAULT 'x')");

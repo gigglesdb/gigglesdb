@@ -258,17 +258,26 @@ where
     })
 }
 
+pub(crate) trait RetentionBudget {
+    fn charge(&mut self, bytes: usize) -> R<()>;
+    fn release(&mut self, bytes: usize);
+}
+impl RetentionBudget for Retention {
+    fn charge(&mut self, bytes: usize) -> R<()> { Retention::charge(self, bytes) }
+    fn release(&mut self, bytes: usize) { Retention::release(self, bytes); }
+}
+
 pub(crate) fn sort_bounded<T>(
     rows: impl Iterator<Item = R<T>>,
     keep: Option<usize>,
     size: impl Fn(&T) -> usize,
     cmp: impl Fn(&T, &T) -> Ordering,
-    retention: &mut Retention,
+    retention: &mut impl RetentionBudget,
 ) -> R<Vec<T>> {
     if keep == Some(0) {
         return Ok(Vec::new());
     }
-    let initial = retention.used;
+    let mut retained = 0;
     let result = (|| {
         let mut heap: Vec<(T, usize, usize)> = Vec::new();
         let compare =
@@ -290,7 +299,9 @@ pub(crate) fn sort_bounded<T>(
                 let bytes = size(&row);
                 if let Some(top) = heap.first_mut() {
                     retention.release(top.2);
+                    retained -= top.2;
                     retention.charge(bytes)?;
+                    retained += bytes;
                     *top = (row, sequence, bytes);
                 }
                 let mut parent = 0usize;
@@ -316,6 +327,7 @@ pub(crate) fn sort_bounded<T>(
             }
             let bytes = size(&row);
             retention.charge(bytes)?;
+            retained += bytes;
             heap.push((row, sequence, bytes));
             if keep.is_some() {
                 let mut child = heap.len() - 1;
@@ -332,7 +344,7 @@ pub(crate) fn sort_bounded<T>(
         heap.sort_by(compare);
         Ok(heap.into_iter().map(|(row, _, _)| row).collect())
     })();
-    retention.used = initial;
+    retention.release(retained);
     result
 }
 
