@@ -316,7 +316,7 @@ pub(crate) fn scan(
     }
     Ok(rows)
 }
-fn successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
     while let Some(last) = prefix.pop() {
         if let Some(next) = last.checked_add(1) {
             prefix.push(next);

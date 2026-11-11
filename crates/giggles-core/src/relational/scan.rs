@@ -69,7 +69,17 @@ pub(crate) struct SourceRow<'a> {
     pub(crate) key: Cow<'a, [u8]>,
     pub(crate) row: Cow<'a, SqlRow>,
 }
+pub(crate) type SourceRows<'s> = Box<dyn Iterator<Item = R<SourceRow<'s>>> + 's>;
 pub(crate) trait RowSource {
+    /// Optional unordered secondary access. Keys are opaque resume positions.
+    fn index_scan<'s>(
+        &'s self,
+        _table: &TableDef,
+        _predicates: &[(usize, &str, Value)],
+        _after: Option<&[u8]>,
+    ) -> R<Option<SourceRows<'s>>> {
+        Ok(None)
+    }
     /// Lazily reads rows only when pulled, ordered by key forward or reverse.
     fn scan<'s>(
         &'s self,

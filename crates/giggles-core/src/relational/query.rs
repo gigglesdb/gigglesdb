@@ -3924,13 +3924,55 @@ impl BoundQuery<'_> {
             return Ok(output);
         }
         let mut range = scan::KeyRange::from_bounds(bounds);
+        // Only unordered queries with no useful PK range may change access order.
+        let mut indexed = None;
+        if self.order.is_empty()
+            && range == scan::KeyRange::from_bounds(super::bounds(self.tables[0], &[], params)?)
+        {
+            let mut predicates = Vec::new();
+            // The generic bound list drops even exact integer-width comparisons.
+            // Recheck original predicates against this single, already-bound table.
+            for (c, op, expr) in &self.query.predicates {
+                let offset = col(self.tables[0], &c.name)?;
+                let column = &self.tables[0].columns[offset];
+                let mut value = expr.value(params)?;
+                if let Expr::Literal(literal) = expr
+                    && let Some(typed) = unknown_comparison_literal(literal, &column.data_type)?
+                {
+                    let Some(typed) = typed else { continue };
+                    value = typed;
+                }
+                if matches!(
+                    column.data_type,
+                    DataType::Boolean
+                        | DataType::SmallInt
+                        | DataType::Integer
+                        | DataType::BigInt
+                        | DataType::Text
+                        | DataType::Varchar
+                        | DataType::Bytes
+                        | DataType::Numeric
+                        | DataType::Real
+                        | DataType::DoublePrecision
+                ) && value != Value::Null
+                    && check(&value, column).is_ok()
+                    && !comparison_requires_filter(&value, &column.data_type)?
+                {
+                    predicates.push((offset, op.as_str(), value));
+                }
+            }
+            indexed = source.index_scan(self.tables[0], &predicates, progress.after.as_deref())?;
+        }
         if let Some(key) = &progress.after {
             match direction {
                 scan::Direction::Forward => range.lo = Bound::Excluded(key.clone()),
                 scan::Direction::Reverse => range.hi = Bound::Excluded(key.clone()),
             }
         }
-        let mut input = source.scan(self.tables[0], &range, direction)?;
+        let mut input = match indexed {
+            Some(input) => input,
+            None => source.scan(self.tables[0], &range, direction)?,
+        };
         loop {
             crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
             let Some(row) = input.next() else {

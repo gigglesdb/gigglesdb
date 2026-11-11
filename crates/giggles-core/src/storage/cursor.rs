@@ -138,11 +138,10 @@ impl SqlSession {
                 Backend::V2(db) => {
                     // The existing transaction API cannot fork its write overlay.
                     // Keep read-your-writes correct via the bounded bridge fallback.
-                    if self
-                        .v2_transaction
-                        .as_ref()
-                        .is_some_and(|t| t.writes_keyspace(engine::kv::Keyspace::Rows))
-                    {
+                    if self.v2_transaction.as_ref().is_some_and(|t| {
+                        t.writes_keyspace(engine::kv::Keyspace::Rows)
+                            || t.writes_keyspace(engine::kv::Keyspace::Index)
+                    }) {
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
                     }
                     if p.domain != u128::from_be_bytes(db.meta.domain) || p.epoch != 0 {
@@ -187,6 +186,9 @@ impl SqlSession {
                     (
                         image,
                         Some(V2Snapshot {
+                            #[cfg(test)]
+                            index_reads: std::cell::Cell::new(0),
+                            indexes: parts.indexes,
                             db: db.clone(),
                             _guard: guard,
                             ts,
@@ -262,6 +264,9 @@ impl SqlSession {
     }
 }
 struct V2Snapshot {
+    #[cfg(test)]
+    index_reads: std::cell::Cell<usize>,
+    indexes: Vec<relational::secondary_index::Descriptor>,
     db: Arc<v2::V2Db>,
     _guard: engine::commit::SnapshotHandle,
     ts: engine::hlc::Ts,
@@ -274,6 +279,79 @@ impl V2Snapshot {
     }
 }
 impl RowSource for V2Snapshot {
+    fn index_scan<'s>(
+        &'s self,
+        table: &relational::TableDef,
+        predicates: &[(usize, &str, Value)],
+        after: Option<&[u8]>,
+    ) -> Result<Option<scan::SourceRows<'s>>, SqlError> {
+        let Some(index) = self.indexes.iter().find(|d| {
+            d.table == table.id
+                && predicates
+                    .iter()
+                    .any(|(c, _, _)| d.columns.first() == Some(&table.columns[*c].id))
+        }) else {
+            return Ok(None);
+        };
+        let prefix = index.id.to_be_bytes().to_vec();
+        let mut lo = prefix.clone();
+        // NULL sorts last in this codec and cannot satisfy these comparisons.
+        let mut hi = prefix.clone();
+        hi.push(0xff);
+        for (_, op, value) in predicates
+            .iter()
+            .filter(|(c, _, _)| index.columns.first() == Some(&table.columns[*c].id))
+        {
+            let mut key = prefix.clone();
+            key.extend(
+                engine::codec::index_tuple_bytes(
+                    std::slice::from_ref(value),
+                    &[engine::codec::Direction::Asc],
+                )
+                .map_err(|e| self.error(e))?,
+            );
+            let next = || engine::indexes::successor(key.clone()).expect("index prefix");
+            match *op {
+                "=" => {
+                    lo = lo.max(key.clone());
+                    hi = hi.min(next());
+                }
+                ">=" => lo = lo.max(key.clone()),
+                ">" => lo = lo.max(next()),
+                "<=" => hi = hi.min(next()),
+                "<" => hi = hi.min(key.clone()),
+                _ => unreachable!(),
+            }
+        }
+        let lower = after.map_or(Bound::Included(lo.clone()), |key| {
+            if key >= lo.as_slice() {
+                Bound::Excluded(key.to_vec())
+            } else {
+                Bound::Included(lo.clone())
+            }
+        });
+        let iter = engine::mvcc::VersionedRange::new(
+            self.db.kv.as_ref(),
+            engine::kv::Keyspace::Index,
+            lower.as_ref().map(Vec::as_slice),
+            Bound::Excluded(hi.as_slice()),
+            engine::kv::Direction::Forward,
+            self.ts,
+        )
+        .map_err(|e| self.error(e))?;
+        let table = table.clone();
+        Ok(Some(Box::new(iter.map(move |pair| {
+            crate::cancellation::check().map_err(|e| self.error(e))?;
+            let (key, pk) = pair.map_err(|e| self.error(e))?;
+            #[cfg(test)]
+            self.index_reads.set(self.index_reads.get() + 1);
+            let mut row = self.get(&table, &pk)?.ok_or_else(|| {
+                self.error(CoreError::Corrupt("dangling cursor index entry".into()))
+            })?;
+            row.key = Cow::Owned(key);
+            Ok(row)
+        }))))
+    }
     fn scan<'s>(
         &'s self,
         table: &relational::TableDef,
@@ -355,6 +433,89 @@ impl RowSource for V2Snapshot {
 #[cfg(all(test, feature = "engine-rocksdb"))]
 mod tests {
     use super::*;
+    #[test]
+    fn secondary_cursor_matches_scan_and_resumes() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!("cursor-index-{:032x}", u128::from_be_bytes(nonce)));
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut s = admin.sql_session();
+        for sql in ["CREATE TABLE t (id bigint PRIMARY KEY, email text UNIQUE, user_id bigint)",
+            "CREATE INDEX users ON t (user_id, email)"] {
+            s.execute(sql, &[], None).unwrap();
+        }
+        let Backend::V2(db) = &admin.inner.backend else { unreachable!() };
+        let mut txn = db.begin(engine::txn::Isolation::ReadCommitted);
+        let entry = engine::catalog::TableEntry {
+            def: db.catalog().parts(&mut txn).unwrap().tables["t"].clone(),
+            heap: false, columns_ext: BTreeMap::new(),
+        };
+        let start = std::time::Instant::now();
+        for id in 0..50_000 {
+            db.rows.insert(&mut txn, &entry, vec![Value::Int(id),
+                if id == 49_999 { Value::Null } else { Value::Text(format!("e{id}")) },
+                if id == 49_999 { Value::Null } else { Value::Int(id / 4) }], None, &|| false).unwrap();
+        }
+        txn.commit().unwrap();
+        eprintln!("50k index fixture: {:?}", start.elapsed());
+        let drain = |mut cursor: Cursor| {
+            let mut rows = Vec::new();
+            while !cursor.is_exhausted() { rows.extend(cursor.fetch(7, 4096).unwrap()); }
+            (rows, cursor)
+        };
+        for (predicate, count, indexed) in [
+            ("email = 'e7'", 1, true), ("email = 'absent'", 0, true),
+            ("user_id = 7", 4, true), ("user_id < 6", 24, true),
+            ("user_id BETWEEN 3 AND 5", 12, true),
+            ("user_id = 7 AND id > '28'", 3, false),
+            ("user_id = 7 AND email <> 'e28'", 3, true),
+            ("email IS NULL", 1, false), ("user_id < 300", 1200, true),
+            ("user_id IS NULL", 1, false), ("user_id >= 12499", 3, true),
+            ("user_id = '7'", 4, true), ("user_id > 8 AND user_id < 2", 0, true),
+            ("user_id = 7 ORDER BY id DESC", 4, false),
+            ("user_id = 7.1", 0, false), ("user_id < 2.5", 12, false),
+        ] {
+            let p = s.prepare(&format!("SELECT id FROM t WHERE {predicate}")).unwrap();
+            let start = std::time::Instant::now();
+            let (mut actual, cursor) = drain(s.open_cursor(&p, &[]).unwrap());
+            let elapsed = start.elapsed();
+            let Data::Scan { source: Some(source), .. } = &cursor.data else { panic!("streaming") };
+            let reads = if predicate.contains("email <>") { 4 } else { count };
+            if indexed && count > 0 { assert_eq!(source.index_reads.get(), reads, "{predicate}"); }
+            if !indexed { assert_eq!(source.index_reads.get(), 0, "{predicate}"); }
+            let mut scan = s.open_cursor(&p, &[]).unwrap();
+            let Data::Scan { source: Some(source), .. } = &mut scan.data else { unreachable!() };
+            source.indexes.clear();
+            let start = std::time::Instant::now();
+            let (mut expected, _) = drain(scan);
+            eprintln!("{predicate}: index {elapsed:?}, scan {:?}", start.elapsed());
+            assert_eq!(actual.len(), count, "{predicate}");
+            if !predicate.contains("ORDER BY") {
+                actual.sort_by_key(|row| format!("{:?}", row.values));
+                expected.sort_by_key(|row| format!("{:?}", row.values));
+            }
+            assert_eq!(actual, expected, "{predicate}");
+        }
+        // The existing SQL write bridge caps indexed mutation images at 1024 rows.
+        for sql in ["CREATE TABLE u (id bigint PRIMARY KEY, email text UNIQUE, user_id bigint)",
+            "CREATE INDEX u_users ON u (user_id)",
+            "INSERT INTO u VALUES (28,'e28',7),(29,'e29',7),(30,'e30',7),(31,'e31',7)"] {
+            s.execute(sql, &[], None).unwrap();
+        }
+        let mut writer = admin.sql_session();
+        writer.execute("BEGIN", &[], None).unwrap();
+        writer.execute("INSERT INTO u VALUES (50000, 'pending', 7)", &[], None).unwrap();
+        let p = s.prepare("SELECT id FROM u WHERE user_id = 7").unwrap();
+        let cursor = s.open_cursor(&p, &[]).unwrap();
+        assert_eq!(drain(s.open_cursor(&p, &[]).unwrap()).0.len(), 4);
+        let own = writer.prepare("SELECT id FROM u WHERE email = 'pending'").unwrap();
+        assert_eq!(drain(writer.open_cursor(&own, &[]).unwrap()).0.len(), 1);
+        writer.execute("COMMIT", &[], None).unwrap();
+        assert_eq!(drain(cursor).0.len(), 4);
+        assert_eq!(drain(s.open_cursor(&p, &[]).unwrap()).0.len(), 5);
+        drop(writer); drop(s); drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[test]
     fn v2_streams_twenty_mib_and_preserves_snapshot() {
         let mut nonce = [0; 16];
