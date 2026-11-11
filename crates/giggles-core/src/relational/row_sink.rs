@@ -9,6 +9,21 @@ use crate::CoreError;
 
 pub(crate) type DdlRows = BTreeMap<Vec<u8>, SqlRow>;
 
+pub(crate) fn retained_bytes(key: &[u8], row: &SqlRow) -> R<usize> {
+    searched::retained_row_bytes(key, row)
+}
+
+pub(crate) fn reduction_range(table: &TableDef, p: &Prepared, params: &[Value]) -> Option<scan::KeyRange> {
+    let predicates = p.v2_index_predicates(params).into_iter().filter_map(|(column, op, value)| {
+        let c = table.columns.iter().find(|c| c.name == column)?;
+        if !table.primary_key.iter().any(|i| table.columns[*i].id == c.id)
+            || check(&value, c).is_err()
+            || query::comparison_requires_filter(&value, &c.data_type).ok()? { return None; }
+        Some(Predicate { column, op, value: Expr::Literal(value) })
+    }).collect::<Vec<_>>();
+    bounds(table, &predicates, params).ok().map(scan::KeyRange::from_bounds)
+}
+
 pub(crate) fn row_key(table: &TableDef, row: &SqlRow) -> R<Vec<u8>> {
     pk(table, &row.values)
 }
@@ -117,6 +132,22 @@ pub(crate) trait RowSink {
 }
 
 impl Relational {
+    pub(crate) fn streaming_reduction(&self, p: &Prepared) -> bool {
+        matches!(&p.statement, Statement::Query(q) if q.streaming_reduction())
+    }
+
+    pub(crate) fn execute_reduction(
+        &mut self,
+        p: &Prepared,
+        params: &[Value],
+        expected: Option<u64>,
+        clock: Option<&clock::ExecutionClock>,
+        source: &dyn scan::RowSource,
+    ) -> R<SqlResult> {
+        self.execute_statement_inner(p, params, expected,
+            || crate::cancellation::check().is_err(), clock, Some(source), &mut Vec::new())
+    }
+
     pub(crate) fn copy_input_page(
         &mut self,
         prepared: &Prepared,

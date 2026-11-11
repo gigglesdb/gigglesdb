@@ -10,6 +10,8 @@ use relational::{
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
 mod sql_sequences;
+#[path = "v2_reduction.rs"]
+mod reduction;
 
 impl SqlSession {
     pub(super) fn prepare_v2(
@@ -489,6 +491,17 @@ impl SqlSession {
                                 return Ok(Default::default());
                             }
                         }
+                        if !writing && image.streaming_reduction(&bound) {
+                            let source = reduction::Source::new(SqlRows {
+                                conflict_floor: None, db, txn, parts: &old,
+                                writing, prepared: &bound, params,
+                            });
+                            let result = image.execute_reduction(
+                                p, params, expected_version, context.as_ref(), &source);
+                            if let Some(error) = source.error.take() { return Err(error); }
+                            if let Some(error) = context.as_ref().and_then(|c| c.take_error()) { return Err(error); }
+                            return result.map_err(CoreError::Sql);
+                        }
                         let result = image.execute_with_sink(
                             p,
                             params,
@@ -712,6 +725,8 @@ mod tests;
 
 /// Transient statement images use legacy keys. Only this sink translates them
 /// into the existing v2 key/row codec; it never persists relational image bytes.
+type IndexRange = (relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>);
+
 struct SqlRows<'a> {
     db: &'a v2::V2Db,
     txn: &'a mut Transaction,
@@ -1110,53 +1125,11 @@ impl RowSink for SqlRows<'_> {
             heap: self.parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
-        let predicates = self.prepared.v2_index_predicates(self.params);
-        let candidate = (!self.writing)
-            .then(|| {
-                self.parts.indexes.iter().find_map(|d| {
-                    if d.table != table.id {
-                        return None;
-                    }
-                    let column = table.columns.iter().find(|c| c.id == d.columns[0])?;
-                    // User types can have a SQL order different from their storage type.
-                    if self
-                        .parts
-                        .ext
-                        .columns
-                        .get(&column.id)
-                        .is_some_and(|c| c.type_id.is_some())
-                    {
-                        return None;
-                    }
-                    predicates.iter().find_map(|(name, op, value)| {
-                        if *name != column.name
-                            || *value == relational::Value::Null
-                            || relational::check(value, column).is_err()
-                        {
-                            return None;
-                        }
-                        let tuple = codec::index_tuple_bytes(
-                            std::slice::from_ref(value),
-                            &[codec::Direction::Asc],
-                        )
-                        .ok()?;
-                        let (lo, hi) = match op.as_str() {
-                            "=" => (Bound::Included(tuple.clone()), Bound::Included(tuple)),
-                            ">" => (Bound::Excluded(tuple), Bound::Unbounded),
-                            ">=" => (Bound::Included(tuple), Bound::Unbounded),
-                            "<" => (Bound::Unbounded, Bound::Excluded(tuple)),
-                            "<=" => (Bound::Unbounded, Bound::Included(tuple)),
-                            _ => return None,
-                        };
-                        Some((d, lo, hi))
-                    })
-                })
-            })
-            .flatten();
+        let candidate = self.scan_index(table);
         let Some((descriptor, lo, hi)) = candidate else {
             return self.scan_all(&entry, visit);
         };
-        engine::indexes::visit(self.txn, &entry, descriptor, lo, hi, &mut |_, row| {
+        engine::indexes::visit(self.txn, &entry, &descriptor, lo, hi, &mut |_, row| {
             visit(SqlRow {
                 values: row.values,
                 version: row.version,
@@ -1274,6 +1247,51 @@ impl RowSink for SqlRows<'_> {
 }
 
 impl SqlRows<'_> {
+    fn scan_index(&self, table: &TableDef) -> Option<IndexRange> {
+        let predicates = self.prepared.v2_index_predicates(self.params);
+        (!self.writing)
+            .then(|| {
+                self.parts.indexes.iter().find_map(|d| {
+                    if d.table != table.id {
+                        return None;
+                    }
+                    let column = table.columns.iter().find(|c| c.id == d.columns[0])?;
+                    // User types can have a SQL order different from their storage type.
+                    if self
+                        .parts
+                        .ext
+                        .columns
+                        .get(&column.id)
+                        .is_some_and(|c| c.type_id.is_some())
+                    {
+                        return None;
+                    }
+                    predicates.iter().find_map(|(name, op, value)| {
+                        if *name != column.name
+                            || *value == relational::Value::Null
+                            || relational::check(value, column).is_err()
+                        {
+                            return None;
+                        }
+                        let tuple = codec::index_tuple_bytes(
+                            std::slice::from_ref(value),
+                            &[codec::Direction::Asc],
+                        )
+                        .ok()?;
+                        let (lo, hi) = match op.as_str() {
+                            "=" => (Bound::Included(tuple.clone()), Bound::Included(tuple)),
+                            ">" => (Bound::Excluded(tuple), Bound::Unbounded),
+                            ">=" => (Bound::Included(tuple), Bound::Unbounded),
+                            "<" => (Bound::Unbounded, Bound::Excluded(tuple)),
+                            "<=" => (Bound::Unbounded, Bound::Included(tuple)),
+                            _ => return None,
+                        };
+                        Some((d.clone(), lo, hi))
+                    })
+                })
+            })
+            .flatten()
+    }
     fn scan_all(
         &mut self,
         entry: &TableEntry,

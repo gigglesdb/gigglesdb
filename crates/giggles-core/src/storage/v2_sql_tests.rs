@@ -15,6 +15,8 @@ mod large_dml;
 mod large_read;
 #[path = "v2_fk_prefix_tests.rs"]
 mod fk_prefix;
+#[path = "v2_reduction_tests.rs"]
+mod reduction;
 
 struct Fixture {
     path: std::path::PathBuf,

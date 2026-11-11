@@ -1731,6 +1731,17 @@ impl Query {
         }
         found
     }
+    pub(super) fn streaming_reduction(&self) -> bool {
+        self.sources.len() == 1 && self.joins.is_empty()
+            && !self.distinct() && !self.has_in_subquery()
+            && (!self.group().is_empty()
+                || self.items.iter().any(|(item, _)| match item {
+                    Item::Aggregate(..) => true,
+                    Item::Scalar(s) => grouping::contains_aggregate(s),
+                    _ => false,
+                })
+                || (!self.order.is_empty() && self.limit.is_some()))
+    }
     /// Only row-local SELECTs can be evaluated independently on source pages.
     pub(super) fn pageable_insert(&self) -> bool {
         self.sources.len() == 1
@@ -4499,7 +4510,7 @@ impl BoundQuery<'_> {
             affected: 0,
         };
         let mut result_bytes = 0usize;
-        // Aggregate inputs keep the statement-wide scalar work budget (DD-0068
+        // Computed inputs and SUM/AVG keep the statement-wide scalar work budget (DD-0068
         // aggregate_scalar_work_budget_is_shared_over_full_input).
         let mut aggregate_work_bytes = 0usize;
         if self.query.distinct() && !self.aggregate {
@@ -4565,6 +4576,12 @@ impl BoundQuery<'_> {
                 .collect::<Vec<_>>();
             let scope = RetentionScope::new(execution);
             let mut auxiliary = aggregate_auxiliary(&self.items, &mut scope.borrow())?;
+            if source.streams_reductions() && self.items.iter().all(|item|
+                !matches!(item, BoundItem::Aggregate(a, _) if matches!(a.base(), Aggregate::Sum | Aggregate::Avg))) {
+                for (aux, (item, _)) in auxiliary.iter_mut().zip(&self.query.items) {
+                    aux.stream_column = matches!(item, Item::Aggregate(a, Some(Scalar::Column(_))) if !a.distinct());
+                }
+            }
             scope.borrow().charge(aggregate_retained(&values))?;
             for row in filtered {
                 let row = row?;
@@ -4905,6 +4922,7 @@ fn eval_like(
 }
 
 struct AggregateAuxiliary {
+    stream_column: bool,
     count: i64,
     distinct: std::collections::BTreeSet<grouping::Key>,
 }
@@ -4916,6 +4934,7 @@ fn aggregate_auxiliary(
     Ok(items
         .iter()
         .map(|_| AggregateAuxiliary {
+            stream_column: false,
             count: 0,
             distinct: std::collections::BTreeSet::new(),
         })
@@ -4993,7 +5012,16 @@ fn update_filtered_aggregates(
         {
             continue;
         }
-        let evaluated = c.as_ref().map(|e| e.eval(row, params, work)).transpose()?;
+        // A fixed-width column read allocates no scalar intermediate. V2 can keep
+        // this scratch row-local for COUNT/MIN/MAX. Computed arguments and every
+        // SUM/AVG query retain DD-0068's cumulative work budget unchanged.
+        let mut column_work = 0;
+        let evaluated = c.as_ref().map(|e| e.eval(row, params,
+            if auxiliary[index].stream_column && matches!(e.ty,
+                DataType::SmallInt | DataType::Integer | DataType::BigInt
+                | DataType::Boolean | DataType::Real | DataType::DoublePrecision) {
+                &mut column_work
+            } else { work })).transpose()?;
         let v = evaluated.as_ref();
         if v == Some(&Value::Null) {
             continue;

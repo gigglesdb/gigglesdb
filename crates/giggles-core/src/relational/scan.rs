@@ -71,6 +71,7 @@ pub(crate) struct SourceRow<'a> {
 }
 pub(crate) type SourceRows<'s> = Box<dyn Iterator<Item = R<SourceRow<'s>>> + 's>;
 pub(crate) trait RowSource {
+    fn streams_reductions(&self) -> bool { false }
     /// Optional unordered secondary access. Keys are opaque resume positions.
     fn index_scan<'s>(
         &'s self,

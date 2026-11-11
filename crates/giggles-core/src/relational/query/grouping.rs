@@ -6,6 +6,7 @@ pub(super) struct Grouping {
     keys: Vec<BoundScalar>,
     aggregates: Vec<BoundItem>,
     aggregate_filters: Vec<Option<BoundFilter>>,
+    direct_inputs: Vec<bool>,
     dependents: Vec<BoundColumn>,
     aggregate_columns: Vec<ColumnDef>,
     outputs: Vec<BoundScalar>,
@@ -563,6 +564,10 @@ pub(super) fn bind<'a>(
     let mut aggregates = vec![];
     let mut aggregate_columns = vec![];
     let mut aggregate_filters = vec![];
+    let direct_inputs = lower.aggregates.iter().map(|(a, arg, _)|
+        !a.distinct() && matches!(arg, Some(Scalar::Column(_)))
+        && lower.aggregates.iter().all(|(a, _, _)| !matches!(a.base(), Aggregate::Sum | Aggregate::Avg)))
+        .collect::<Vec<_>>();
     for (a, arg, filter) in lower.aggregates {
         aggregate_filters.push(
             filter
@@ -758,6 +763,7 @@ pub(super) fn bind<'a>(
             keys,
             aggregates,
             aggregate_filters,
+            direct_inputs,
             aggregate_columns,
             dependents: lower.dependents,
             outputs,
@@ -865,7 +871,12 @@ impl Grouping {
         if self.keys.is_empty() {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
-            let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+            if source.streams_reductions() {
+                for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
+                    aux.stream_column = *direct;
+                }
+            }
             groups.insert(Key(vec![]), (initial, auxiliary));
         }
         drop(retention);
@@ -899,7 +910,12 @@ impl Grouping {
                     retention.charge(
                         retained(&key.0) + retained(&initial) + 6 * std::mem::size_of::<usize>(),
                     )?;
-                    let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+                    let mut auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
+                    if source.streams_reductions() {
+                        for (aux, direct) in auxiliary.iter_mut().zip(&self.direct_inputs) {
+                            aux.stream_column = *direct;
+                        }
+                    }
                     groups.insert(key.clone(), (initial, auxiliary));
                 }
                 let (values, auxiliary) = groups.get_mut(&key).ok_or(SqlError::Limit)?;
