@@ -186,7 +186,7 @@ impl Decoder {
             at += 1;
             start = at;
         }
-        if fields.len() != self.columns {
+        if fields.len() > self.columns {
             return Err(bad_format());
         }
         Ok(fields)
@@ -262,7 +262,7 @@ impl Decoder {
             }
         }
         fields.push(self.field(&line[start..])?);
-        if fields.len() != self.columns {
+        if fields.len() > self.columns {
             return Err(bad_format());
         }
         Ok(fields)
@@ -438,13 +438,17 @@ mod tests {
         }
         for (data, code) in [
             (b"\"unterminated".as_slice(), "22P04"),
-            (b"a,b", "22P04"),
             (b"a,\0,c", "22021"),
         ] {
             let mut d = Decoder::csv(3, b',', vec![]);
             let result = d.feed(data).and_then(|_| d.finish());
             assert_eq!(result.unwrap_err(), code);
         }
+    }
+    #[test]
+    fn short_csv_row_is_converted_before_missing_column_error() {
+        assert_eq!(Decoder::csv(3, b',', vec![]).feed(b"a,b\n").unwrap(),
+            vec![vec![Some(b"a".to_vec()), Some(b"b".to_vec())]]);
     }
     #[test]
     fn text_every_split() {
@@ -603,8 +607,8 @@ mod tests {
         assert_eq!(
             Decoder::text(2, b'\t', b"\\N".to_vec())
                 .feed(b"a\n")
-                .unwrap_err(),
-            "22P04"
+                .unwrap(),
+            vec![vec![Some(b"a".to_vec())]]
         );
         assert_eq!(
             Decoder::text(1, b'\t', b"x\\.y".to_vec())

@@ -33,13 +33,13 @@ impl CopyIn {
         let mut converted = vec![];
         let format = u16::from(matches!(self.descriptor.format, CopyFormat::Binary));
         for row in rows {
-            if row.len() != self.columns.len() {
+            if row.len() > self.columns.len() {
                 return Err(crate::service::sqlstate(&CoreError::Sql(
                     giggles_core::relational::SqlError::BadCopyFileFormat,
                 )));
             }
-            converted.push(
-                row.into_iter()
+            let missing = row.len() < self.columns.len();
+            let row = row.into_iter()
                     .zip(&self.columns)
                     .map(|(value, column)| {
                         value.map_or(Ok(Value::Null), |bytes| {
@@ -58,8 +58,14 @@ impl CopyIn {
                             }
                         })
                     })
-                    .collect::<R<Vec<_>>>()?,
-            );
+                    .collect::<R<Vec<_>>>()?;
+            if missing {
+                // PG converts the supplied prefix before reporting missing data.
+                // Normalization rejects the short row before evaluating defaults.
+                core(session.normalize_copy_rows(&self.prepared, vec![row], &self.clock))?;
+                return Err("22P04");
+            }
+            converted.push(row);
         }
         if self.streaming {
             self.rows.extend(converted);

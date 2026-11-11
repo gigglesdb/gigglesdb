@@ -789,3 +789,32 @@ async fn bounded_copy_large_atomic_and_disconnect() {
     drop(s);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn missing_copy_columns_follow_supplied_field_conversion() {
+    let mut engines = vec![giggles_core::Engine::Legacy];
+    if cfg!(feature = "engine-rocksdb") { engines.push(giggles_core::Engine::V2); }
+    for engine in engines {
+        let f = Fixture::with_engine(engine).await;
+        let mut s = f.connect().await;
+        for csv in [false, true] {
+            let sql = if csv { "COPY t FROM STDIN (FORMAT csv)" } else { "COPY t FROM STDIN" };
+            for (data, code) in [
+                ("x\n", "22P02"), ("1\n", "22P04"),
+                (if csv { "x,bad,9,extra\n" } else { "x\tbad\t9\textra\n" }, "22P04"),
+            ] {
+                start(&mut s, sql).await;
+                send(&mut s, b'd', data.as_bytes()).await;
+                let r = read(&mut s).await;
+                assert_eq!(tags(&r), b"EZ");
+                error(&r, code);
+                send(&mut s, b'c', b"").await;
+                silent(&mut s).await;
+            }
+        }
+        let r = query(&mut s, "SELECT count(*) FROM t").await;
+        assert_eq!(r[1].1, b"\0\x01\0\0\0\x010");
+        drop(s);
+        f.stop().await;
+    }
+}

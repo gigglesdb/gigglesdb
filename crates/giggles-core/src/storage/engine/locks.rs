@@ -5,7 +5,7 @@
 //! a lock twice or bypass FIFO. Cancellation callbacks run outside that mutex and
 //! are polled at `deadlock_recheck`, since the callback has no notification channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,7 @@ struct State {
     // observes it. In particular release_all terminates pending calls Cancelled.
     completed: HashMap<u64, Result<(), LockError>>,
     row_counts: HashMap<TxnId, usize>,
+    held_keys: HashMap<TxnId, HashSet<LockKey>>,
     next_waiter: u64,
 }
 
@@ -290,8 +291,13 @@ impl LockManager {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        for locks in state.keys.values_mut() {
-            locks.holders.remove(&txn);
+        // Metadata transactions hold no locks. In particular, dropping one must
+        // not scan all row/index locks owned by an in-progress COPY statement.
+        let mut affected = state.held_keys.remove(&txn).unwrap_or_default();
+        for key in &affected {
+            if let Some(locks) = state.keys.get_mut(key) {
+                locks.holders.remove(&txn);
+            }
         }
         state.row_counts.remove(&txn);
         let pending: Vec<_> = state
@@ -300,15 +306,18 @@ impl LockManager {
             .filter_map(|(&id, waiter)| (waiter.txn == txn).then_some(id))
             .collect();
         for id in pending {
+            affected.insert(state.waiters[&id].key.clone());
             state.remove_waiter(id, Err(LockError::Cancelled));
         }
-        let keys: Vec<_> = state.keys.keys().cloned().collect();
-        for key in keys {
+        // Only releasing a holder or cancelling a queued request can unblock
+        // this key's waiters. Leave unrelated queues and holders untouched.
+        for key in affected {
             state.drain_queue(&key, self.config.max_row_locks_per_txn);
+            if state.keys.get(&key).is_some_and(|locks|
+                locks.holders.is_empty() && locks.queue.is_empty()) {
+                state.keys.remove(&key);
+            }
         }
-        state
-            .keys
-            .retain(|_, locks| !locks.holders.is_empty() || !locks.queue.is_empty());
         self.changed.notify_all();
     }
 
@@ -358,6 +367,9 @@ impl State {
                 return Err(LockError::Limit);
             }
             *count += 1;
+        }
+        if previous.is_none() {
+            self.held_keys.entry(txn).or_default().insert(key.clone());
         }
         self.keys
             .entry(key.clone())

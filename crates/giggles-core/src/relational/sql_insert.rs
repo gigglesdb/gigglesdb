@@ -572,16 +572,21 @@ impl Insert {
         let rows = rows
             .into_iter()
             .map(|row| {
-                if row.len() != types.len() {
-                    return Err(SqlError::Type);
+                if row.len() > types.len() {
+                    return Err(SqlError::BadCopyFileFormat);
                 }
-                row.into_iter()
+                let missing = row.len() < types.len();
+                let row = row.into_iter()
                     .zip(types)
                     .map(|(value, ty)| match value {
                         Value::Text(text) => sql_copy::copy_text_field(text, ty, clock),
                         other => Ok(other),
                     })
-                    .collect::<R<Vec<_>>>()
+                    .collect::<R<Vec<_>>>()?;
+                if missing {
+                    return Err(SqlError::BadCopyFileFormat);
+                }
+                Ok(row)
             })
             .collect::<R<Vec<_>>>()?;
         *self = Self::copy(

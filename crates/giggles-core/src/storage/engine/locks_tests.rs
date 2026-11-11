@@ -872,3 +872,33 @@ fn concurrent_random_transactions_preserve_lock_compatibility() {
         assert!(lm.held(TxnId(txn)).is_empty());
     }
 }
+
+#[test]
+fn release_all_visits_only_affected_keys_and_releases_queued_grants() {
+    let lm = manager();
+    acquire(&lm, 1, row(1), LockMode::Exclusive);
+    acquire(&lm, 2, row(2), LockMode::Exclusive);
+    let first = spawn_waiter(&lm, 3, row(1), LockMode::Exclusive);
+    let second = spawn_waiter(&lm, 4, row(2), LockMode::Exclusive);
+    until(|| lm.waiting_count() == 2);
+    // A read-only metadata transaction cannot disturb either queue.
+    lm.release_all(TxnId(5));
+    first.pending();
+    second.pending();
+    lm.release_all(TxnId(1));
+    first.granted();
+    second.pending();
+    // A grant from drain_queue must be tracked just like an immediate grant.
+    lm.release_all(TxnId(3));
+    assert!(!lm.state.lock().unwrap().keys.contains_key(&row(1)));
+    assert_eq!(lm.held(TxnId(2)), vec![(row(2), LockMode::Exclusive)]);
+    lm.release_all(TxnId(2));
+    second.granted();
+    lm.release_all(TxnId(4));
+    let state = lm.state.lock().unwrap();
+    assert!(state.keys.is_empty());
+    assert!(state.held_keys.is_empty());
+    drop(state);
+    first.finish();
+    second.finish();
+}
