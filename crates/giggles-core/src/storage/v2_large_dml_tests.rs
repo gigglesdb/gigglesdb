@@ -384,3 +384,92 @@ fn million_row_update() {
         String::from_utf8_lossy(&memory.stdout).trim()
     );
 }
+
+#[test]
+fn primary_key_moves_stream_audit_subqueries_and_own_writes() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE bare(id bigint PRIMARY KEY)");
+    f.execute("CREATE TABLE users(id bigint PRIMARY KEY, email text UNIQUE)");
+    for (name, count) in [("bare", 100_000), ("users", 50_000)] {
+        let entry = TableEntry { def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        for start in (0..count).step_by(200) {
+            let mut txn = f.db().begin(Isolation::ReadCommitted);
+            for id in start..(start + 200).min(count) {
+                let mut values = vec![Int(id)];
+                if name == "users" { values.push(relational::Value::Text(format!("u{id}"))); }
+                f.db().rows.insert(&mut txn, &entry, values, None, &|| false).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+    }
+    let mut s = f.admin().sql_session();
+    let sql = "UPDATE bare SET id=id WHERE id IN (SELECT id FROM users WHERE id=10000)";
+    let started = std::time::Instant::now();
+    assert_eq!(s.execute(sql, &[], None).unwrap().affected, 1);
+    println!("PK audit bare=100000 users=50000: {:?}", started.elapsed());
+    assert_eq!(s.execute("UPDATE bare SET id=id WHERE EXISTS (SELECT id FROM users WHERE id=10000)", &[], None).unwrap().affected, 100_000);
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO users VALUES(-1,'own')", &[], None).unwrap();
+    s.execute("INSERT INTO bare VALUES(-1)", &[], None).unwrap();
+    assert_eq!(s.execute("UPDATE bare SET id=-2 WHERE id IN (SELECT id FROM users WHERE email='own')", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("SELECT id FROM bare WHERE id=-2", &[], None).unwrap().rows[0].values, vec![Int(-2)]);
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(count(&f, "bare"), 100_000);
+}
+
+#[test]
+fn primary_key_moves_keep_indexes_and_immediate_collision_rollback() {
+    let f = super::large_ddl::large_table(50_000, false, true);
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.execute("UPDATE t SET id=id+1000000 WHERE id<5000", &[], None).unwrap().affected, 5000);
+    assert!(row(&f, 0).is_none());
+    assert_eq!(row(&f, 1004999).unwrap().values, vec![Int(1004999), Int(4999)]);
+    assert_eq!(s.execute("SELECT id FROM t WHERE v=4999", &[], None).unwrap().rows[0].values, vec![Int(1004999)]);
+    assert_eq!(s.execute("SELECT count(*) FROM t WHERE v<5000", &[], None).unwrap().rows[0].values, vec![Int(5000)]);
+    // Several pages publish before the final collision; all must roll back.
+    assert_eq!(s.execute("UPDATE t SET id=CASE WHEN id=1004999 THEN 5000 ELSE id+1000000 END WHERE id>=1000000", &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+    assert_eq!(row(&f, 1000000).unwrap().values, vec![Int(1000000), Int(0)]);
+    assert!(row(&f, 2000000).is_none());
+    assert_eq!(s.execute("SELECT id FROM t WHERE v=0", &[], None).unwrap().rows[0].values, vec![Int(1000000)]);
+    f.execute("CREATE TABLE dense(id bigint PRIMARY KEY)");
+    f.execute("INSERT INTO dense VALUES(1),(2),(3)");
+    for sql in ["UPDATE dense SET id=id+1", "UPDATE dense SET id=4-id"] {
+        assert_eq!(s.execute(sql, &[], None), Err(CoreError::Sql(SqlError::Duplicate)), "{sql}");
+    }
+    assert_eq!(s.execute("UPDATE dense SET id=id-1", &[], None).unwrap().affected, 3);
+    assert_eq!(s.execute("SELECT id FROM dense ORDER BY id", &[], None).unwrap().rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(), vec![vec![Int(0)],vec![Int(1)],vec![Int(2)]]);
+}
+
+#[test]
+fn primary_key_moves_keep_incoming_and_outgoing_foreign_keys() {
+    for action in ["NO ACTION", "CASCADE"] {
+        let f = super::large_ddl::large_table(2050, false, true);
+        f.execute(&format!("CREATE TABLE child(id bigint PRIMARY KEY, parent bigint REFERENCES t(id) ON UPDATE {action})"));
+        f.execute("INSERT INTO child VALUES(1,0),(2,2049)");
+        let mut s = f.admin().sql_session();
+        let moved = s.execute("UPDATE t SET id=id+1000000", &[], None);
+        if action == "NO ACTION" {
+            assert_eq!(moved, Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+            assert!(row(&f, 0).is_some());
+            assert!(row(&f, 1000000).is_none());
+        } else {
+            assert_eq!(moved.unwrap().affected, 2050);
+            assert_eq!(s.execute("SELECT parent FROM child ORDER BY id", &[], None).unwrap().rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(), vec![vec![Int(1000000)],vec![Int(1002049)]]);
+        }
+    }
+    let f = Fixture::new();
+    f.execute("CREATE TABLE parent(id bigint PRIMARY KEY)");
+    f.execute("CREATE TABLE child(id bigint PRIMARY KEY REFERENCES parent(id))");
+    f.execute("INSERT INTO parent VALUES(1),(2)");
+    f.execute("INSERT INTO child VALUES(1)");
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.execute("UPDATE child SET id=2", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("UPDATE child SET id=3", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert_eq!(s.execute("SELECT id FROM child", &[], None).unwrap().rows[0].values, vec![Int(2)]);
+    f.execute("CREATE TABLE deferred_child(id bigint PRIMARY KEY, parent bigint REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    f.execute("INSERT INTO deferred_child VALUES(1,1)");
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("UPDATE parent SET id=10 WHERE id=1", &[], None).unwrap();
+    s.execute("UPDATE deferred_child SET parent=10", &[], None).unwrap();
+    s.execute("COMMIT", &[], None).unwrap();
+}

@@ -1,6 +1,16 @@
 //! Bounded statement images; all pages share the caller's transaction/savepoint.
 use super::*;
 
+fn moves_primary_key(state: &Relational, prepared: &Prepared) -> bool {
+    let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
+    let names = match &prepared.statement {
+        Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+        _ => return false,
+    };
+    table.primary_key.iter().any(|i| names.contains(&&table.columns[*i].name))
+}
+
 pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
         return false;
@@ -129,7 +139,7 @@ type MutationSelection = (Prepared, Option<BTreeSet<Vec<u8>>>);
 fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
 ) -> Result<MutationSelection, CoreError> {
-    let keys = searched::target(prepared).filter(|q| q.has_in_subquery())
+    let keys = searched::target(prepared).filter(|q| moves_primary_key(state, prepared) || q.has_in_subquery())
         .map(|_| sink.mutation_keys(state, prepared, params, clock)).transpose()?;
     let mut template = prepared.clone();
     if keys.is_some() {
@@ -141,7 +151,7 @@ fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
             | Statement::UpdateExpressions { predicates, search, .. }
             | Statement::Delete { predicates, search, .. } => {
                 predicates.clear();
-                search.as_mut().expect("IN target").clear_mutation_filter();
+                search.as_mut().expect("mutation target").clear_mutation_filter();
             }
             _ => unreachable!(),
         }
@@ -149,7 +159,7 @@ fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
     Ok((template, keys))
 }
 
-// Follow both delete and update edges; NO ACTION graphs retain the legacy fallback.
+// PK moves use the same bounded publisher and referential-action queue.
 pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool {
     if eligible(state, prepared)
         || !matches!(prepared.statement, Statement::Delete { .. } | Statement::Update { .. } | Statement::UpdateExpressions { .. })
@@ -158,7 +168,8 @@ pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool 
     }
     let Some(target) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
     let mut connected = BTreeSet::from([(target.id, !matches!(prepared.statement, Statement::Delete { .. }))]);
-    let mut cascade = false;
+    let pk_move = moves_primary_key(state, prepared);
+    let mut cascade = pk_move;
     loop {
         let count = connected.len();
         for (child_id, cs) in &state.ext.constraints {
@@ -167,7 +178,10 @@ pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool 
                 let events = connected.iter().filter(|(id, _)| id == ref_table).copied().collect::<Vec<_>>();
                 for (_, update) in events {
                     let action = if update { on_update } else { on_delete };
-                    if *action == catalog_ext::Action::NoAction { return false; }
+                    if *action == catalog_ext::Action::NoAction {
+                        if pk_move { continue; }
+                        return false;
+                    }
                     let child = state.tables.values().find(|t| t.id == *child_id).unwrap();
                     let parent = state.tables.values().find(|t| t.id == *ref_table).unwrap();
                     if columns.iter().zip(ref_columns).any(|(a, b)| {
@@ -192,7 +206,10 @@ pub(super) fn cascade(
     clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
     deferred: Option<&mut DeferralState>, version_end: u64,
 ) -> Result<SqlResult, CoreError> {
-    sink.check_fk_snapshot()?;
+    if state.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) {
+        sink.check_fk_snapshot()?;
+    }
+    let pk_move = moves_primary_key(state, prepared);
     let pending = deferred.as_deref().cloned().unwrap_or_default();
     let table = state.tables[prepared.table().unwrap()].clone();
     let descriptors = sink.indexes();
@@ -209,22 +226,29 @@ pub(super) fn cascade(
         after = Some(last);
         // Own writes can move a primary key ahead of the physical cursor.
         rows.retain(|key, row| row.version < first_version && keys.as_ref().is_none_or(|keys| keys.contains(key)));
-        let mut page = state.clone();
-        page.rows.insert(table.id, rows.clone());
-        for cs in page.ext.constraints.values_mut() {
-            cs.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+        // Immediate PK/UNIQUE checks precede evaluation of the next logical row.
+        // Single-row publication also sees keys vacated by earlier rows/pages.
+        let batches = if pk_move {
+            rows.into_iter().map(|entry| DdlRows::from([entry])).collect::<Vec<_>>()
+        } else { vec![rows] };
+        for rows in batches {
+            let mut page = state.clone();
+            page.rows.insert(table.id, rows.clone());
+            for cs in page.ext.constraints.values_mut() {
+                cs.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+            }
+            rebuild(&mut page, &descriptors)?;
+            let mut events = Vec::new();
+            let batch = page.execute_statement_inner(prepared, params, None,
+                || crate::cancellation::check().is_err(), clock, None, &mut events).map_err(CoreError::Sql)?;
+            for row in &batch.rows {
+                output.charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?).map_err(CoreError::Sql)?;
+            }
+            result.affected += batch.affected;
+            result.rows.extend(batch.rows);
+            state.next_version = page.next_version;
+            work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, &descriptors, version_end)?;
         }
-        rebuild(&mut page, &descriptors)?;
-        let mut events = Vec::new();
-        let batch = page.execute_statement_inner(prepared, params, None,
-            || crate::cancellation::check().is_err(), clock, None, &mut events).map_err(CoreError::Sql)?;
-        for row in &batch.rows {
-            output.charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?).map_err(CoreError::Sql)?;
-        }
-        result.affected += batch.affected;
-        result.rows.extend(batch.rows);
-        state.next_version = page.next_version;
-        work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, &descriptors, version_end)?;
     }
     while let Some((parent_id, old, new)) = work.queue.pop_front() {
         crate::cancellation::check()?;
@@ -239,11 +263,23 @@ pub(super) fn cascade(
                 if values.contains(&Value::Null) || new_values.as_ref() == Some(&values) { continue; }
                 let action = if new.is_some() { on_update } else { on_delete };
                 let child = state.tables.values().find(|t| t.id == child_id).unwrap().clone();
+                let mut no_action = DeferralState::default();
                 let mut after = None;
                 while let Some((last, rows)) = sink.child_page(&child, columns, &values, after)? {
                     after = Some(last);
                     if !rows.is_empty() && *action == catalog_ext::Action::Restrict {
                         return Err(CoreError::Sql(SqlError::RestrictViolation));
+                    }
+                    if *action == catalog_ext::Action::NoAction {
+                        let ConstraintKind::ForeignKey { deferral, .. } = &c.kind else { unreachable!() };
+                        let deferred = *deferral != Deferral::NotDeferrable && work.pending.modes.get(&c.id)
+                            .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
+                        let pending = if deferred { &mut work.pending } else { &mut no_action };
+                        for key in rows.keys() {
+                            work.retention.charge(key.len() + 96).map_err(CoreError::Sql)?;
+                            pending.pending.entry((c.id, child_id)).or_default().insert(key.clone());
+                        }
+                        continue;
                     }
                     let mut changed = DdlRows::new();
                     let mut events = Vec::new();
@@ -270,6 +306,8 @@ pub(super) fn cascade(
                     }
                     work.publish(state, sink, &child, rows, changed, events, Some(c.id), &descriptors, version_end)?;
                 }
+                // Definition order decides NO ACTION versus a later RESTRICT.
+                if !no_action.pending.is_empty() { paged_pending(state, &mut no_action, &[], false, sink)?; }
         }
         work.retention.release(searched::retained_row_bytes(&[], &old).map_err(CoreError::Sql)?
             + new.as_ref().map(|r| searched::retained_row_bytes(&[], r)).transpose().map_err(CoreError::Sql)?.unwrap_or(0));
@@ -301,6 +339,10 @@ impl ActionWork {
             }
         }
         for constraints::Event { old, new, .. } in events {
+            if force.is_none() && new.as_ref().is_some_and(|row| row.values == old.values)
+                || !state.ext.constraints.iter().any(|(owner, cs)| cs.iter().any(|c|
+                    matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. }
+                        if *owner == table.id || *ref_table == table.id))) { continue; }
             let key = &pk(table, &old.values).map_err(CoreError::Sql)?;
             if self.visited.contains(&(table.id, old.version)) { continue; }
             self.retention.charge(searched::retained_row_bytes(&[], &old).map_err(CoreError::Sql)?
