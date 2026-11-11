@@ -111,6 +111,13 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
+        if sink.streams_index_builds() && let Some((names, mode)) = prepared.set_constraints() {
+            let deferred = deferred.ok_or(CoreError::Sql(SqlError::NoActiveTransaction))?;
+            if !params.is_empty() || expected.is_some() {
+                return Err(CoreError::Sql(SqlError::Parameters));
+            }
+            return paged_pending(self, deferred, names, mode, sink);
+        }
         if expected.is_none()
             && sink.streams_index_builds()
             && matches!(&prepared.statement, Statement::InsertMulti(_))
@@ -230,12 +237,15 @@ impl Relational {
                     .cloned()
             })
             .flatten();
+        let mut normalized = prepared.clone();
         let conflict_rows = if sink.streams_index_builds() {
-            if let Statement::InsertMulti(insert) = &prepared.statement {
+            if let Statement::InsertMulti(insert) = &mut normalized.statement {
                 insert.witness_rows(self, params, &prepared.parameter_types, clock)
                     .map_err(CoreError::Sql)?
             } else { None }
         } else { None };
+        if conflict_rows.is_some() { normalized.unbound_statement = None; }
+        let prepared = &normalized;
         let mut names = if let Statement::TypeDdl(user_types::Ddl::Drop {
             names,
             cascade: true,
@@ -274,7 +284,8 @@ impl Relational {
         {
             names.push(self.table_key(table));
         }
-        for (_, table_id) in deferred.as_ref().into_iter().flat_map(|d| d.pending.keys()) {
+        for (_, table_id) in deferred.as_ref().filter(|_| !sink.streams_index_builds())
+            .into_iter().flat_map(|d| d.pending.keys()) {
             if let Some(table) = self.tables.values().find(|t| t.id == *table_id) {
                 let name = self.table_key(table);
                 if !names.contains(&name) {
@@ -593,7 +604,7 @@ mod constraint_rows;
 mod paged_dml;
 #[path = "row_sink_insert.rs"]
 mod paged_insert;
-use constraint_rows::{hydrate, rebuild};
+use constraint_rows::{hydrate, paged_pending, rebuild};
 
 #[cfg(test)]
 mod tests {

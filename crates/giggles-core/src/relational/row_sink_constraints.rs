@@ -34,8 +34,7 @@ pub(super) fn hydrate(
             let ConstraintKind::ForeignKey {
                 columns,
                 ref_table,
-                ref_columns,
-                ..
+                ref_columns, on_delete, on_update, deferral, ..
             } = &c.kind
             else {
                 continue;
@@ -133,13 +132,37 @@ pub(super) fn hydrate(
                     if !keys.insert(signature) {
                         continue;
                     }
+                    // RESTRICT and immediate NO ACTION need an existence witness,
+                    // not every sibling. Keep action queues/deferred parents unchanged.
+                    let existence = !parent && [on_delete, on_update].iter().all(|action|
+                        matches!(action, catalog_ext::Action::Restrict)
+                        || matches!(action, catalog_ext::Action::NoAction)
+                            && *deferral == catalog_ext::Deferral::NotDeferrable);
+                    let mut witnessed = false;
                     sink.lookup(
                         &target,
                         target_columns,
                         converted.as_deref(),
                         parent,
                         &mut |row| {
+                            if existence && witnessed { return Ok(()); }
                             let key = pk(&target, &row.values)?;
+                            // A scan fallback may include nonmatching keys. Compare
+                            // in the FK's supported child -> parent direction.
+                            let effective = staged.rows.get(&target.id).and_then(|rows| rows.get(&key));
+                            let candidate = effective.unwrap_or(&row);
+                            if existence && before.rows[&target.id].contains_key(&key) && effective.is_none() {
+                                return Ok(());
+                            }
+                            if !parent {
+                                for ((a, b), value) in targets.iter().zip(&positions).zip(&values) {
+                                    if query::constraint_key(&candidate.values[*a], &target.columns[*a].data_type,
+                                        &source.columns[*b].data_type)?.as_ref() != Some(value) {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            witnessed = true;
                             let old = before
                                 .rows
                                 .get_mut(&target.id)
@@ -171,4 +194,49 @@ pub(super) fn hydrate(
         }
     }
     Ok(added)
+}
+
+/// Validate transaction-local pending keys in physical pages, including own writes.
+pub(super) fn paged_pending(
+    state: &Relational, deferred: &mut DeferralState, names: &[String], mode: bool,
+    sink: &mut impl RowSink,
+) -> Result<SqlResult, CoreError> {
+    // The isolation fence applies even when pending keys are absent at this snapshot.
+    if state.ext.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) {
+        sink.check_fk_snapshot()?;
+    }
+    let mut selected = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
+    state.set_constraints(&mut selected, names, mode, || crate::cancellation::check().is_err())
+        .map_err(CoreError::Sql)?;
+    if !mode {
+        for table in state.tables.values() {
+            let checks = deferred.pending.iter().filter(|((id, table_id), _)| *table_id == table.id
+                && state.ext.constraints.get(table_id).is_some_and(|cs| cs.iter().any(|c|
+                    c.id == *id && (names.is_empty() || names.contains(&c.name))))).collect::<Vec<_>>();
+            if checks.is_empty() { continue; }
+            let mut after = None;
+            while let Some((last, rows)) = sink.read_page(table, after.take())? {
+                after = Some(last);
+                let mut pending = DeferralState { modes: deferred.modes.clone(), pending: BTreeMap::new() };
+                for ((id, table_id), keys) in &checks {
+                    let keys = rows.keys().filter(|key| keys.contains(*key)).cloned().collect::<BTreeSet<_>>();
+                    if !keys.is_empty() { pending.pending.insert((*id, *table_id), keys); }
+                }
+                if pending.pending.is_empty() { continue; }
+                let mut page = state.clone();
+                page.rows.insert(table.id, rows);
+                let mut before = state.clone();
+                let mut retention = scan::Retention::new(scan::retention_limit());
+                while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
+                    sink, &mut retention, true)? > 0 {}
+                rebuild(&mut page, &sink.indexes())?;
+                page.set_constraints(&mut pending, names, false, || crate::cancellation::check().is_err())
+                    .map_err(CoreError::Sql)?;
+            }
+        }
+        deferred.pending.retain(|(id, table_id), _| !state.ext.constraints.get(table_id)
+            .is_some_and(|cs| cs.iter().any(|c| c.id == *id && (names.is_empty() || names.contains(&c.name)))));
+    }
+    deferred.modes = selected.modes;
+    Ok(SqlResult::default())
 }

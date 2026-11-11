@@ -257,3 +257,79 @@ fn physical_conflicts_and_fk_witnesses_at_app_scale() {
     s.execute("ROLLBACK", &[], None).unwrap();
     assert!(values(&mut s, "SELECT id FROM orders WHERE id=200001").is_empty());
 }
+
+#[test]
+fn identity_partial_cast_and_select_upserts_probe_once() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users (id bigint PRIMARY KEY, email text UNIQUE)");
+    seed(&f, "users", 50_000);
+    f.execute("CREATE TABLE identity_users (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text UNIQUE, marker bigint DEFAULT 7)");
+    let mut s = f.admin().sql_session();
+    let clock = relational::StatementClock { unavailable: None, transaction_us: 1,
+        statement_us: 1, zone: None, wall: None };
+    let batch = (0..2000).map(|n| format!("('u{n}@test'::text)")).collect::<Vec<_>>().join(",");
+    assert_eq!(s.execute_at(&format!("INSERT INTO identity_users(email) VALUES {batch} ON CONFLICT(email) DO UPDATE SET marker=excluded.marker"),
+        &[], None, &clock).unwrap().affected, 2000);
+    let explicit = (1..=2000).map(|n| format!("({n},'u{}@test')", n-1)).collect::<Vec<_>>().join(",");
+    assert_eq!(s.execute_at(&format!("INSERT INTO identity_users(id,email) OVERRIDING SYSTEM VALUE VALUES {explicit} ON CONFLICT(id) DO UPDATE SET marker=excluded.marker"),
+        &[], None, &clock).unwrap().affected, 2000);
+    assert_eq!(s.execute_at("INSERT INTO identity_users(email) SELECT email FROM users WHERE id<2000 ON CONFLICT(email) DO UPDATE SET marker=excluded.marker",
+        &[], None, &clock).unwrap().affected, 2000);
+    assert_eq!(s.execute_at("INSERT INTO identity_users(email) VALUES ('next') ON CONFLICT(email) DO NOTHING RETURNING id,marker", &[], None, &clock).unwrap().rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+        vec![vec![Int(4001), Int(7)]]);
+    let repeated = (0..201).map(|n| format!("('u{}@test')", n % 200)).collect::<Vec<_>>().join(",");
+    assert_eq!(s.execute_at(&format!("INSERT INTO identity_users(email) VALUES {repeated} ON CONFLICT(email) DO UPDATE SET marker=9"),
+        &[], None, &clock), Err(CoreError::Sql(SqlError::Duplicate)));
+    assert_eq!(values(&mut s, "SELECT marker FROM identity_users WHERE id=1"), vec![vec![Int(7)]]);
+}
+
+#[test]
+fn large_immediate_fk_fanout_uses_existence_witnesses() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users (id bigint PRIMARY KEY, email text UNIQUE)");
+    f.execute("CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users(id), status bigint)");
+    seed(&f, "users", 50_000);
+    seed(&f, "orders", 200_000);
+    f.execute("CREATE TABLE fanout (id bigint PRIMARY KEY, user_id bigint REFERENCES users(id))");
+    f.execute("CREATE INDEX fanout_user ON fanout(user_id)");
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.execute("INSERT INTO fanout SELECT id,0 FROM orders", &[], None).unwrap().affected, 200_000);
+    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert_eq!(values(&mut s, "SELECT id FROM users WHERE id=0"), vec![vec![Int(0)]]);
+    s.execute("DROP INDEX fanout_user", &[], None).unwrap();
+    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    f.execute("CREATE TABLE restrict_parent (id bigint PRIMARY KEY)");
+    f.execute("INSERT INTO restrict_parent VALUES (0)");
+    f.execute("CREATE TABLE restricted (id bigint PRIMARY KEY, user_id bigint REFERENCES restrict_parent(id) ON DELETE RESTRICT)");
+    f.execute("CREATE INDEX restricted_user ON restricted(user_id)");
+    s.execute("INSERT INTO restricted SELECT id,0 FROM orders WHERE id<2000", &[], None).unwrap();
+    assert_eq!(s.execute("DELETE FROM restrict_parent WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::RestrictViolation)));
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM fanout"), vec![vec![Int(200_000)]]);
+}
+
+#[test]
+fn deferred_200000_pending_keys_validate_in_pages_and_rollback() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users (id bigint PRIMARY KEY, email text UNIQUE)");
+    f.execute("CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint, status bigint)");
+    seed(&f, "users", 50_000);
+    seed(&f, "orders", 200_000);
+    f.execute("CREATE TABLE p (id bigint PRIMARY KEY)");
+    f.execute("CREATE TABLE pending (id bigint PRIMARY KEY, p bigint, CONSTRAINT pending_fk FOREIGN KEY(p) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)");
+    let mut s = f.admin().sql_session();
+    s.execute("BEGIN", &[], None).unwrap();
+    assert_eq!(s.execute("INSERT INTO pending SELECT id,0 FROM orders", &[], None).unwrap().affected, 200_000);
+    s.execute("SAVEPOINT before_check", &[], None).unwrap();
+    assert_eq!(s.execute("SET CONSTRAINTS pending_fk IMMEDIATE", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    s.execute("ROLLBACK TO before_check", &[], None).unwrap();
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM pending"), vec![vec![Int(200_000)]]);
+    s.execute("INSERT INTO p VALUES (0)", &[], None).unwrap();
+    s.execute("SET CONSTRAINTS pending_fk IMMEDIATE", &[], None).unwrap();
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM pending"), vec![vec![Int(0)]]);
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO p VALUES (0)", &[], None).unwrap();
+    s.execute("INSERT INTO pending SELECT id,0 FROM orders", &[], None).unwrap();
+    s.execute("COMMIT", &[], None).unwrap();
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM pending"), vec![vec![Int(200_000)]]);
+}

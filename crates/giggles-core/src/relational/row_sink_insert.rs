@@ -6,7 +6,7 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         return false;
     };
     // A later input page may supply a self-referencing FK's parent. Keep that
-    // statement and deferred FKs on the complete-image executor for final checks.
+    // statement on the complete-image executor for final checks.
     if state
         .ext
         .constraints
@@ -14,8 +14,8 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         .into_iter()
         .flatten()
         .any(|c| {
-            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, deferral, .. }
-            if ref_table == table.id || deferral != catalog_ext::Deferral::NotDeferrable)
+            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. }
+            if ref_table == table.id)
         })
     {
         return false;
@@ -113,6 +113,8 @@ pub(super) fn execute(
         }
     }
     if foreign_keys {
+        let mut immediate = DeferralState::default();
+        let pending = deferred.as_deref_mut().unwrap_or(&mut immediate);
         let mut after = None;
         while let Some((last, mut rows)) = sink.read_page(&table, after.take())? {
             after = Some(last);
@@ -125,8 +127,11 @@ pub(super) fn execute(
             while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
                 sink, &mut retention, true)? > 0 {}
             rebuild(&mut page, &sink.indexes())?;
-            constraints::enforce(&mut page, &before, Vec::new(), &mut DeferralState::default(),
+            constraints::enforce(&mut page, &before, Vec::new(), pending,
                 &mut || crate::cancellation::check().is_err(), clock).map_err(CoreError::Sql)?;
+        }
+        if deferred.is_none() {
+            paged_pending(state, &mut immediate, &[], false, sink)?;
         }
     }
     Ok(result)

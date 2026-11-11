@@ -741,6 +741,7 @@ fn admission_insert() -> Insert {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        normalized: None,
         source_types: None,
         table: "items".into(),
         columns: vec!["id".into(), "email".into(), "code".into(), "n".into()],
@@ -867,6 +868,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        normalized: None,
         source_types: None,
         table: "heavy".into(),
         columns: vec!["id".into(), "n".into()],
@@ -894,6 +896,7 @@ fn sql_insert_admission_rejects_oversized_literals_before_copy() {
         alias: None,
         casts: BTreeMap::new(),
         copy_input: None,
+        normalized: None,
         source_types: None,
         table: "wide_numeric".into(),
         columns: std::iter::once("id".to_owned())

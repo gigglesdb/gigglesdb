@@ -7,6 +7,7 @@ pub(super) struct Insert {
     pub table: String,
     alias: Option<String>,
     copy_input: Option<Vec<DataType>>,
+    normalized: Option<Vec<Vec<Value>>>,
     source_types: Option<Vec<Option<DataType>>>,
     columns: Vec<String>,
     rows: Vec<Vec<Expr>>,
@@ -295,6 +296,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Insert> {
     }
     Ok(Insert {
         copy_input: None,
+        normalized: None,
         source_types: None,
         table,
         alias,
@@ -405,30 +407,46 @@ fn source_indexes(insert: &Insert, state: &Relational, table: &TableDef) -> R<Ve
     Ok(indexes)
 }
 impl Insert {
-    /// Pure, fully supplied proposals can identify physical conflict witnesses.
-    /// Defaults and identities stay on the original path; evaluating them twice
-    /// could consume a sequence or produce a different proposed key.
+    /// Normalize once: probing must reuse defaults/identities consumed by execution.
     pub(super) fn witness_rows(
-        &self, state: &Relational, params: &[Value], declared: &[Option<DataType>],
+        &mut self, state: &Relational, params: &[Value], declared: &[Option<DataType>],
         clock: Option<&clock::ExecutionClock>,
     ) -> R<Option<Vec<Vec<Value>>>> {
         let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
-        if self.rows.len() > 200 || !self.can_witness(state) { return Ok(None); }
+        if self.rows.len() > 200 || self.source.is_some() || !self.can_witness(state) {
+            return Ok(None);
+        }
         let indexes = indexes(self, table)?;
         admit_statement(self, params)?;
-        self.rows.iter().zip(&self.defaults).enumerate().map(|(i, (row, defaults))| {
+        self.check_explicit(state, table, &indexes)?;
+        let rows = self.rows.iter().zip(&self.defaults).enumerate().map(|(i, (row, defaults))| {
             normalize_row(state, table, self, &indexes, row, i, defaults, params,
                 declared, clock, self.source_types.as_deref())
-        }).collect::<R<Vec<_>>>().map(Some)
+        }).collect::<R<Vec<_>>>()?;
+        self.normalized = Some(rows.clone());
+        Ok(Some(rows))
     }
 
     pub(super) fn can_witness(&self, state: &Relational) -> bool {
-        let Some(table) = state.tables.get(&self.table) else { return false; };
-        self.conflict.is_some() && self.source.is_none() && table.hidden_rowid().is_none()
-            && self.overriding.is_none() && self.casts.is_empty()
-            && !table.columns.iter().any(|c| state.column_identity(c.id).is_some())
-            && !self.defaults.iter().flatten().any(|d| *d)
-            && indexes(self, table).is_ok_and(|i| i.len() == table.columns.len())
+        state.tables.get(&self.table).is_some_and(|table|
+            self.conflict.is_some() && table.hidden_rowid().is_none())
+    }
+    fn check_explicit(&self, state: &Relational, table: &TableDef, indexes: &[usize]) -> R<()> {
+        if let Some(update) = self.conflict.as_ref().and_then(|c| c.update.as_ref()) {
+            for (name, operand) in &update.sets {
+                if !matches!(operand, Operand::Default) {
+                    defaults::check_explicit(state, &table.columns[col(table, name)?])?;
+                }
+            }
+        }
+        for row_defaults in &self.defaults {
+            for (index, default) in indexes.iter().zip(row_defaults) {
+                if !default && self.overriding.is_none() {
+                    defaults::check_explicit(state, &table.columns[*index])?;
+                }
+            }
+        }
+        Ok(())
     }
     pub(super) fn stable_referenced_keys(&self, state: &Relational, table: &TableDef) -> bool {
         self.conflict.as_ref().and_then(|c| c.update.as_ref()).is_none_or(|u| {
@@ -461,6 +479,7 @@ impl Insert {
             table: self.table.clone(),
             alias: self.alias.clone(),
             copy_input: self.copy_input.clone(),
+            normalized: None,
             columns: self.columns.clone(),
             source_types: self.source_types.clone(),
             default_values: self.default_values,
@@ -539,6 +558,7 @@ impl Insert {
             conflict: None,
             returning: None,
             copy_input: Some(types),
+            normalized: None,
             source_types: None,
             source: None,
         }
@@ -1343,30 +1363,13 @@ pub(super) fn execute_declared(
     Relational::sql_insert_test_event(1);
     let mut incoming = Vec::with_capacity(insert.rows.len());
     let mut total = 0usize;
-    if let Some(Conflict {
-        update: Some(update),
-        ..
-    }) = &insert.conflict
-    {
-        for (name, operand) in &update.sets {
-            if !matches!(operand, Operand::Default) {
-                defaults::check_explicit(state, &table.columns[col(&table, name)?])?;
-            }
-        }
-    }
-    for row_defaults in &insert.defaults {
-        for (index, default) in indexes.iter().zip(row_defaults) {
-            if !default && insert.overriding.is_none() {
-                defaults::check_explicit(state, &table.columns[*index])?;
-            }
-        }
-    }
+    insert.check_explicit(state, &table, &indexes)?;
     for (row_index, (values, row_defaults)) in insert.rows.iter().zip(&insert.defaults).enumerate()
     {
         if cancel() {
             return Err(SqlError::Aborted);
         }
-        let row = normalize_row(
+        let row = if let Some(rows) = &insert.normalized { rows[row_index].clone() } else { normalize_row(
             state,
             &table,
             insert,
@@ -1378,7 +1381,7 @@ pub(super) fn execute_declared(
             declared,
             clock,
             source_types,
-        )?;
+        )? };
         for value in &row {
             total = total
                 .checked_add(value_bytes(value))
