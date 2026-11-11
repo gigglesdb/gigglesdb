@@ -683,7 +683,7 @@ fn qualified_correlation_and_local_shadowing_errors() {
         "SELECT a.id FROM t a WHERE a.id IN (SELECT id FROM u WHERE a.missing=1)",
         "SELECT id FROM t WHERE id IN (SELECT id FROM u WHERE t.missing=1)",
     ] {
-        error(s, sql, E::Unsupported);
+        error(s, sql, E::UnknownColumn);
     }
     error(
         s,

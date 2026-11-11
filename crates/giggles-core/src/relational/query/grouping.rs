@@ -459,7 +459,7 @@ pub(super) fn bind<'a>(
         .iter()
         .enumerate()
         .map(|(source, table)| {
-            table.hidden_rowid().is_none()
+            source >= q.sources.len() || table.hidden_rowid().is_none()
                 && !table.primary_key.is_empty()
                 && table
                     .primary_key
@@ -640,7 +640,7 @@ pub(super) fn bind<'a>(
     for (index, c) in lower.dependents.iter().enumerate() {
         let mut column = tables[c.source].columns[c.column].clone();
         column.name = format!("__dependent_slot_{index}");
-        if c.source > 0 && q.joins[c.source - 1].left {
+        if c.source > 0 && q.joins.get(c.source - 1).is_some_and(|j| j.left) {
             column.not_null = false;
         }
         slots.push(column);
@@ -700,7 +700,7 @@ pub(super) fn bind<'a>(
         .map(|(((b, (i, alias)), source), output_name)| {
             let mut column = if let Some(c) = source {
                 let mut column = tables[c.source].columns[c.column].clone();
-                if c.source > 0 && q.joins[c.source - 1].left {
+                if c.source > 0 && q.joins.get(c.source - 1).is_some_and(|j| j.left) {
                     column.not_null = false;
                 }
                 column
@@ -751,6 +751,7 @@ pub(super) fn bind<'a>(
         order: vec![],
         aggregate: true,
         subqueries,
+        outer_slots: vec![],
         declared: vec![],
         distinct_order_slots: vec![],
         grouping: Some(Grouping {

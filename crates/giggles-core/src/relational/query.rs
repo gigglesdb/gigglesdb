@@ -10,6 +10,7 @@ mod grouping;
 mod insert_values;
 mod schema_names;
 mod subplans;
+mod outer;
 use subplans::{SubplanMode, Subplans};
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
@@ -1759,7 +1760,7 @@ impl Query {
         &'a self,
         state: &'a Relational,
         parameters: &mut [Option<DataType>],
-        outer: &[Source],
+        outer: &[&[Source]],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
         tables: &[&TableDef],
     ) -> R<Subplans<'a>> {
@@ -1784,7 +1785,7 @@ impl Query {
                         }
                     })
                     .collect();
-                let scopes: Vec<_> = self.sources.iter().chain(outer).cloned().collect();
+                let scopes: Vec<_> = std::iter::once(self.sources.as_slice()).chain(outer.iter().copied()).collect();
                 let bound = q.bind_seeded_inner(state, seed, false, &scopes)?;
                 if bound.columns.len() != 1 {
                     return Err(SqlError::Syntax);
@@ -3053,7 +3054,7 @@ impl Query {
         state: &'a Relational,
         mut parameters: Vec<Option<DataType>>,
         classify_plain_columns: bool,
-        outer: &[Source],
+        outer: &[&[Source]],
     ) -> R<BoundQuery<'a>> {
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
@@ -3079,57 +3080,18 @@ impl Query {
             .iter()
             .map(|s| state.tables.get(&s.name).ok_or(SqlError::UnknownTable))
             .collect::<R<Vec<_>>>()?;
-        let missing = |c: &ColumnRef, error| {
-            let correlated = if let Some(q) = &c.qualifier {
-                !self.sources.iter().any(|s| q == &s.alias)
-                    && outer.iter().any(|s| q == &s.alias || q == &s.name)
-            } else {
-                let has_column = |source: &Source| {
-                    state.tables.get(&source.name).is_some_and(|t| {
-                        t.columns
-                            .iter()
-                            .enumerate()
-                            .any(|(n, column)| column.name == c.name && t.hidden_rowid() != Some(n))
-                    })
-                };
-                !self.sources.iter().any(has_column) && outer.iter().any(has_column)
-            };
-            if correlated {
-                SqlError::Unsupported
-            } else {
-                error
+        if outer.len() > subplans::MAX_DEPTH {
+            return Err(SqlError::Limit);
+        }
+        let mut tables = tables;
+        for scope in outer {
+            for source in *scope {
+                tables.push(state.tables.get(&source.name).ok_or(SqlError::UnknownTable)?);
             }
-        };
-        let resolve = |c: &ColumnRef, scope: usize| -> R<BoundColumn> {
-            if c.qualifier
-                .as_ref()
-                .is_some_and(|q| !self.sources.iter().take(scope).any(|s| q == &s.alias))
-            {
-                return Err(missing(c, SqlError::UnknownTable));
-            }
-            let mut found = None;
-            for (source, (s, t)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
-                if c.qualifier.as_ref().is_some_and(|q| q != &s.alias) {
-                    continue;
-                }
-                if let Some(column) = t.columns.iter().enumerate().find_map(|(n, v)| {
-                    (v.name == c.name && t.hidden_rowid() != Some(n)).then_some(n)
-                }) {
-                    if found.is_some() {
-                        return Err(SqlError::Duplicate);
-                    }
-                    found = Some(BoundColumn { source, column });
-                }
-            }
-            if found.is_none() && c.name == "ctid" {
-                for (source, (source_def, table)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
-                    if c.qualifier.as_ref().is_some_and(|q| q != &source_def.alias) { continue; }
-                    let column = table.hidden_rowid().ok_or(SqlError::Unsupported)?;
-                    if found.is_some() { return Err(SqlError::Duplicate); }
-                    found = Some(BoundColumn { source, column });
-                }
-            }
-            found.ok_or_else(|| missing(c, SqlError::UnknownColumn))
+        }
+        let outer_slots = RefCell::new(Vec::new());
+        let resolve = |c: &ColumnRef, scope: usize| {
+            outer::resolve(self, outer, &tables, c, scope, &outer_slots)
         };
         if self.has_in_subquery()
             && let Some(f) = self.where_filter()
@@ -3176,7 +3138,10 @@ impl Query {
             join.on.infer(&mut parameters, &scoped, &tables)?;
         }
         if grouped {
-            return grouping::bind(self, &tables, parameters, &resolve, subqueries);
+            let mut bound = grouping::bind(self, &tables, parameters, &resolve, subqueries)?;
+            bound.outer_slots = outer_slots.into_inner();
+            if bound.outer_slots.is_empty() { bound.tables.truncate(self.sources.len()); }
+            return Ok(bound);
         }
         let distinct_order = self
             .distinct()
@@ -3394,7 +3359,7 @@ impl Query {
                     let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
                         let c = resolve(c, tables.len())?;
                         let mut d = tables[c.source].columns[c.column].clone();
-                        if c.source > 0 && self.joins[c.source - 1].left {
+                        if c.source > 0 && self.joins.get(c.source - 1).is_some_and(|j| j.left) {
                             d.not_null = false;
                         }
                         (Some(c), d)
@@ -3485,7 +3450,7 @@ impl Query {
                 }
                 Item::Star | Item::QualifiedStar { .. } => {
                     let sources = self.star_sources(item)?;
-                    if tables.is_empty() {
+                    if self.sources.is_empty() {
                         return Err(SqlError::Unsupported);
                     }
                     if alias.is_some() {
@@ -3548,6 +3513,7 @@ impl Query {
             .into_iter()
             .map(|p| p.ok_or(SqlError::Parameters))
             .collect::<R<Vec<_>>>()?;
+        if outer_slots.borrow().is_empty() { tables.truncate(self.sources.len()); }
         Ok(BoundQuery {
             query: self,
             tables,
@@ -3561,6 +3527,7 @@ impl Query {
             aggregate,
             grouping: None,
             distinct_order_slots,
+            outer_slots: outer_slots.into_inner(),
             subqueries,
             declared: vec![],
         })
@@ -3599,6 +3566,7 @@ pub(super) struct BoundQuery<'a> {
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
     distinct_order_slots: Vec<usize>,
+    outer_slots: Vec<outer::OuterSlot>,
     subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
 }
@@ -4146,6 +4114,12 @@ impl BoundQuery<'_> {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Vec<(Vec<u8>, SqlRow)>> {
         let execution = Execution::new(cancel, &self.declared);
+        if !self.outer_slots.is_empty() {
+            return Err(SqlError::Unsupported); // C4 supplies outer tuples.
+        }
+        self.subqueries.visit(&mut |_, child| {
+            if child.outer_slots.is_empty() { Ok(()) } else { Err(SqlError::Unsupported) }
+        })?;
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
         if self.tables.len() != 1 || !self.joins.is_empty() || self.aggregate {
@@ -4245,6 +4219,12 @@ impl BoundQuery<'_> {
         subquery: bool,
         insert_source: bool,
     ) -> R<SqlResult> {
+        if !self.outer_slots.is_empty() {
+            return Err(SqlError::Unsupported); // C4 supplies outer tuples.
+        }
+        self.subqueries.visit(&mut |_, child| {
+            if child.outer_slots.is_empty() { Ok(()) } else { Err(SqlError::Unsupported) }
+        })?;
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
         if self.aggregate && cancel() {

@@ -113,8 +113,11 @@ impl BoundQuery<'_> {
     #[allow(dead_code)] // C8 scaffold, including synthetic children.
     pub(super) fn dependencies(&self) -> R<Dependencies> {
         let mut out = self.query.dependencies()?;
-        self.subqueries
-            .visit(&mut |_, child| child.query.collect_dependencies(&mut out))?;
+        out.relations.extend(self.outer_slots.iter().map(|s| self.tables[s.slot].name.clone()));
+        self.subqueries.visit(&mut |_, child| {
+            out.relations.extend(child.outer_slots.iter().map(|s| child.tables[s.slot].name.clone()));
+            child.query.collect_dependencies(&mut out)
+        })?;
         Ok(out)
     }
 }
@@ -212,4 +215,78 @@ mod tests {
         ));
         assert!(parent.entries.is_empty());
     }
+    #[test]
+    fn lexical_outer_bindings_and_synthetic_exists() {
+        let mut state = Relational::default();
+        for sql in ["CREATE TABLE a(id int PRIMARY KEY, v text)",
+            "CREATE TABLE b(id bigint PRIMARY KEY)", "CREATE TABLE c(other int PRIMARY KEY)"] {
+            let create = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&create, &[], None, || false).unwrap();
+        }
+        let root = query("SELECT id FROM a o");
+        let middle = query("SELECT id FROM b m");
+        let child = query("SELECT abs(id) FROM c WHERE o.id = $1");
+        let bound = child.bind_seeded_inner(&state, vec![None], false,
+            &[&middle.sources, &root.sources]).unwrap();
+        assert_eq!(bound.columns[0].data_type, DataType::BigInt);
+        assert_eq!(bound.parameters, vec![DataType::Integer]);
+        assert!(bound.outer_slots.iter().any(|s| s.depth == 1 && s.source == 0
+            && s.column == 0 && s.data_type == DataType::BigInt && s.slot == 1));
+        assert!(bound.outer_slots.iter().any(|s| s.depth == 2 && s.data_type == DataType::Integer));
+        let mut parent = root.bind(&state, 1, &[Some(DataType::Integer)]).unwrap();
+        parent.subqueries.register(9, SubplanMode::Exists, bound).unwrap();
+        let deps = parent.dependencies().unwrap();
+        assert_eq!(deps.relations, ["a", "b", "c"].map(String::from).into());
+        assert_eq!(deps.routines, ["abs".into()].into());
+        let declared = query("SELECT $2 FROM c WHERE o.id = $1");
+        let bound = declared.bind_seeded_inner(&state,
+            vec![Some(DataType::Integer), Some(DataType::Text)], false, &[&root.sources]).unwrap();
+        assert_eq!(bound.parameters, vec![DataType::Integer, DataType::Text]);
+        assert_eq!(bound.columns[0].data_type, DataType::Text);
+        for (sql, error) in [
+            ("SELECT id FROM a x JOIN b y ON x.id=y.id", SqlError::AmbiguousColumn),
+            ("SELECT id FROM c", SqlError::AmbiguousColumn),
+            ("SELECT o.id FROM c o", SqlError::UnknownColumn),
+            ("SELECT absent FROM c", SqlError::UnknownColumn),
+            ("SELECT absent.id FROM c", SqlError::UnknownTable),
+        ] {
+            let q = query(sql);
+            let ambiguous = query("SELECT x.id FROM a x JOIN b y ON x.id=y.id");
+            let scopes = if sql == "SELECT id FROM c" { &ambiguous.sources } else { &root.sources };
+            assert!(matches!(q.bind_seeded_inner(&state, vec![], false, &[scopes]),
+                Err(actual) if actual == error), "{sql}");
+        }
+        for sql in ["SELECT o.id, count(*) FROM c", "SELECT o.id FROM c GROUP BY o.id"] {
+            let q = query(sql);
+            let bound = q.bind_seeded_inner(&state, vec![], false, &[&root.sources]).unwrap();
+            assert_eq!(bound.outer_slots.len(), 1);
+            assert_eq!(bound.columns[0].data_type, DataType::Integer);
+        }
+        let shadow = query("SELECT o.id FROM b o");
+        let bound = shadow.bind_seeded_inner(&state, vec![], false, &[&root.sources]).unwrap();
+        assert!(bound.outer_slots.is_empty());
+        assert_eq!(bound.columns[0].data_type, DataType::BigInt);
+        let q = query("SELECT o.id");
+        assert!(q.bind_seeded_inner(&state, vec![], false,
+            &vec![root.sources.as_slice(); MAX_DEPTH]).is_ok());
+        assert!(matches!(q.bind_seeded_inner(&state, vec![], false,
+            &vec![root.sources.as_slice(); MAX_DEPTH + 1]), Err(SqlError::Limit)));
+        for sql in ["SELECT id FROM a WHERE id IN (SELECT 1)",
+            "SELECT id FROM a WHERE id IN (SELECT count(*))"] {
+            let q = query(sql);
+            q.bind(&state, 0, &[]).unwrap().subqueries.visit(&mut |_, child| {
+                assert!(child.outer_slots.is_empty());
+                assert!(child.tables.is_empty());
+                Ok(())
+            }).unwrap();
+        }
+        let sql = "SELECT id FROM a o WHERE id IN (SELECT o.id FROM c)";
+        let q = query(sql);
+        assert_eq!(q.bind(&state, 0, &[]).unwrap().subqueries
+            .get(match q.where_filter().unwrap() { Filter::InSubquery { query, .. } => query.as_ref() as *const Query as usize,
+                _ => panic!("IN child") }, SubplanMode::In).unwrap().outer_slots.len(), 1);
+        let prepared = Prepared::parse(sql, 1, state.epoch).unwrap();
+        assert!(matches!(state.execute_with_cancel(&prepared, &[], None, || false), Err(SqlError::Unsupported)));
+    }
+
 }
