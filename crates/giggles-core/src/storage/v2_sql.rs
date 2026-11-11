@@ -921,6 +921,16 @@ impl RowSink for SqlRows<'_> {
         let Some(values) = values else {
             return self.scan_all(&entry, visit);
         };
+        if !unique {
+            let mut after = None;
+            while let Some((last, rows)) = self.child_page(table, columns, values, after)? {
+                after = Some(last);
+                for row in rows.into_values() {
+                    visit(row).map_err(CoreError::Sql)?;
+                }
+            }
+            return Ok(());
+        }
         let primary = table
             .primary_key
             .iter()
@@ -985,61 +995,58 @@ impl RowSink for SqlRows<'_> {
         }
         Ok(())
     }
-    fn child_page(
-        &mut self,
-        table: &TableDef,
-        columns: &[u64],
-        values: &[relational::Value],
-        after: Option<Vec<u8>>,
-    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        let descriptor = self.parts.indexes.iter().find(|d| {
-            d.table == table.id
-                && d.columns.len() == columns.len()
-                && d.columns.iter().all(|id| columns.contains(id))
-        });
-        if let Some(d) = descriptor {
-            let values = d
-                .columns
-                .iter()
-                .map(|id| values[columns.iter().position(|c| c == id).unwrap()].clone())
-                .collect::<Vec<_>>();
-            let tuple =
-                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
-            let entry = TableEntry {
-                def: table.clone(),
-                heap: self.parts.heap.contains(&table.id),
-                columns_ext: BTreeMap::new(),
-            };
+    fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
+        after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        crate::cancellation::check()?;
+        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
+        let matches = |ids: &[u64]| ids.len() >= columns.len()
+            && ids[..columns.len()].iter().all(|id| columns.contains(id));
+        let primary_matches = matches(&primary) && !values.contains(&relational::Value::Null);
+        let descriptor = self.parts.indexes.iter().find(|d| d.table == table.id
+            && d.columns.len() == columns.len() && matches(&d.columns))
+            .or_else(|| (!primary_matches).then(|| self.parts.indexes.iter()
+                .find(|d| d.table == table.id && matches(&d.columns))).flatten());
+        let page = if descriptor.is_some() || primary_matches {
+            let ids = descriptor.map_or(primary.as_slice(), |d| d.columns.as_slice());
+            let ordered = ids[..columns.len()].iter().map(|id|
+                values[columns.iter().position(|c| c == id).unwrap()].clone()).collect::<Vec<_>>();
+            let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
             let mut rows = DdlRows::new();
-            let last = engine::indexes::visit_page(
-                self.txn,
-                &entry,
-                d,
-                Bound::Included(tuple.clone()),
-                Bound::Included(tuple),
-                after,
-                &mut |_, row| {
-                    let row = SqlRow {
-                        values: row.values,
-                        version: row.version,
-                    };
-                    rows.insert(
-                        relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?,
-                        row,
-                    );
-                    Ok(())
-                },
-            )?;
-            return Ok(last.map(|last| (last, rows)));
-        }
-        let Some((last, mut rows)) = self.read_page(table, after)? else {
-            return Ok(None);
+            let mut collect = |row: engine::rows::Row| {
+                let row = SqlRow { values: row.values, version: row.version };
+                rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
+                Ok(())
+            };
+            let last = if let Some(d) = descriptor {
+                let tuple = codec::index_tuple_bytes(&ordered, &vec![codec::Direction::Asc; ordered.len()])?;
+                // Included upper tuple bounds already use the prefix successor,
+                // covering every trailing index component and PK suffix.
+                engine::indexes::visit_page(self.txn, &entry, d,
+                    Bound::Included(tuple.clone()), Bound::Included(tuple), after,
+                    &mut |_, row| collect(row))?
+            } else {
+                // pk_bytes concatenates components without an arity/header suffix.
+                // Scan the same transaction so snapshot and own writes agree.
+                let prefix = codec::pk_bytes(&ordered)?;
+                let upper = engine::indexes::successor(prefix.clone())
+                    .map_or(Bound::Unbounded, Bound::Excluded);
+                let mut last = None;
+                for pair in self.db.rows.scan(self.txn, &entry,
+                    after.map_or(Bound::Included(prefix), Bound::Excluded), upper,
+                    engine::kv::Direction::Forward, Some(200))? {
+                    let (key, row) = pair?;
+                    last = Some(key);
+                    collect(row)?;
+                }
+                last
+            };
+            last.map(|last| (last, rows))
+        } else {
+            self.read_page(table, after)?
         };
-        rows.retain(|_, row| {
-            columns.iter().zip(values).all(|(id, value)| {
-                row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value
-            })
-        });
+        let Some((last, mut rows)) = page else { return Ok(None); };
+        rows.retain(|_, row| columns.iter().zip(values).all(|(id, value)|
+            row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value));
         Ok(Some((last, rows)))
     }
 
