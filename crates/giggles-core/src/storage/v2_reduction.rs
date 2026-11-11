@@ -35,6 +35,7 @@ impl Source<'_> {
         range: &scan::KeyRange,
         dir: scan::Direction,
         index: Option<IndexRange>,
+        page_rows: usize,
     ) -> Result<scan::SourceRows<'s>, SqlError> {
         if range.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -88,7 +89,7 @@ impl Source<'_> {
                         lower.clone(),
                         upper.clone(),
                         after.take(),
-                        &mut accept,
+                        &mut accept, page_rows,
                     )?;
                     done = after.is_none();
                     #[cfg(test)]
@@ -105,7 +106,7 @@ impl Source<'_> {
                         lo.clone(),
                         hi.clone(),
                         direction,
-                        Some(200),
+                        Some(page_rows),
                     )? {
                         let (key, row) = pair?;
                         match dir {
@@ -146,7 +147,7 @@ impl RowSource for Source<'_> {
             range = primary;
         }
         drop(rows);
-        self.pages(table, &range, dir, index)
+        self.pages(table, &range, dir, index, 200)
     }
     fn index_input<'s>(&'s self, table: &TableDef, predicates: &[(usize, &str, relational::Value)])
         -> Result<Option<scan::SourceRows<'s>>, SqlError> {
@@ -154,10 +155,11 @@ impl RowSource for Source<'_> {
             (table.columns[*i].name.clone(), (*op).to_owned(), value.clone())).collect::<Vec<_>>();
         let index = self.rows.borrow().scan_index_predicates(table, &predicates);
         index.map(|index| self.pages(table, &scan::KeyRange { lo: Bound::Unbounded, hi: Bound::Unbounded },
-            scan::Direction::Forward, Some(index))).transpose()
+            scan::Direction::Forward, Some(index), 200)).transpose()
     }
-    fn join_probe<'s>(&'s self, table: &TableDef, keys: &[(usize, Option<relational::Value>)])
+    fn join_probe<'s>(&'s self, table: &TableDef, keys: &[(usize, Option<relational::Value>)], first: bool)
         -> Result<Option<scan::SourceRows<'s>>, SqlError> {
+        let page_rows = if first { 1 } else { 200 };
         let rows = self.rows.borrow();
         let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
         let prefix = |ids: &[u64]| ids.iter().take_while(|id| keys.iter().any(|(i, _)|
@@ -179,13 +181,13 @@ impl RowSource for Source<'_> {
             let Ok(tuple) = codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])
                 else { return Ok(None); };
             return self.pages(table, &scan::KeyRange { lo: Bound::Unbounded, hi: Bound::Unbounded },
-                scan::Direction::Forward, Some((descriptor.clone(), Bound::Included(tuple.clone()), Bound::Included(tuple)))).map(Some);
+                scan::Direction::Forward, Some((descriptor.clone(), Bound::Included(tuple.clone()), Bound::Included(tuple))), page_rows).map(Some);
         } else {
             let Ok(prefix) = codec::pk_bytes(&values) else { return Ok(None); };
             scan::KeyRange { lo: Bound::Included(prefix.clone()),
                 hi: engine::indexes::successor(prefix).map_or(Bound::Unbounded, Bound::Excluded) }
         };
-        self.pages(table, &range, scan::Direction::Forward, None).map(Some)
+        self.pages(table, &range, scan::Direction::Forward, None, page_rows).map(Some)
     }
     fn get<'s>(
         &'s self,

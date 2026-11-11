@@ -193,3 +193,31 @@ fn buffered_parity_and_secondary_range() {
     }
     assert!(super::super::v2_sql::USED_INDEX_SCAN.get());
 }
+
+#[test]
+fn exists_probes_share_statement_snapshot() {
+    use super::super::v2_sql::{AFTER_TABLE_SCAN, USED_INDEX_SCAN};
+    struct Guard;
+    impl Drop for Guard { fn drop(&mut self) { AFTER_TABLE_SCAN.with_borrow_mut(|h| *h = None); } }
+    let f = Fixture::new();
+    for sql in ["CREATE TABLE users(id int PRIMARY KEY)", "INSERT INTO users VALUES(1)",
+        "CREATE TABLE orders(id int PRIMARY KEY,user_id int)",
+        "CREATE INDEX orders_user ON orders(user_id)", "INSERT INTO orders VALUES(1,1)"] { f.execute(sql); }
+    let admin = f.admin().clone();
+    let mut first = true;
+    AFTER_TABLE_SCAN.with_borrow_mut(|h| *h = Some(Box::new(move |name| {
+        if name == "users" && first {
+            first = false;
+            let admin = admin.clone();
+            std::thread::spawn(move || { admin.sql_session().execute("DELETE FROM orders", &[], None).unwrap(); }).join().unwrap();
+        }
+    })));
+    let guard = Guard;
+    USED_INDEX_SCAN.set(false);
+    let mut s = f.admin().sql_session();
+    let sql = "SELECT id FROM users u WHERE EXISTS(SELECT 1 FROM orders o WHERE o.user_id=u.id)";
+    assert_eq!(values(&mut s, sql), vec![vec![Int(1)]]);
+    assert!(USED_INDEX_SCAN.get());
+    drop(guard);
+    assert!(values(&mut s, sql).is_empty());
+}

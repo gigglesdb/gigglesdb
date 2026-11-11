@@ -278,7 +278,7 @@ pub(crate) fn visit(
 ) -> Result<(), CoreError> {
     let mut after = None;
     loop {
-        after = visit_page(txn, table, descriptor, lower.clone(), upper.clone(), after, visitor)?;
+        after = visit_page(txn, table, descriptor, lower.clone(), upper.clone(), after, visitor, 200)?;
         if after.is_none() { return Ok(()); }
     }
 }
@@ -292,6 +292,7 @@ pub(crate) fn visit_page(
     upper: Bound<Vec<u8>>,
     after: Option<Vec<u8>>,
     visitor: &mut dyn FnMut(Vec<u8>, super::rows::Row) -> Result<(), CoreError>,
+    page_rows: usize,
 ) -> Result<Option<Vec<u8>>, CoreError> {
     validate_descriptor(descriptor, &table.def)?;
     let prefix = descriptor.id.to_be_bytes().to_vec();
@@ -319,7 +320,7 @@ pub(crate) fn visit_page(
         let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
         let mut entries = Vec::new();
         for pair in txn.scan(Keyspace::Index, after.as_ref().map(Vec::as_slice),
-            hi.as_ref().map(Vec::as_slice), Direction::Forward, Some(200))? {
+            hi.as_ref().map(Vec::as_slice), Direction::Forward, Some(page_rows))? {
             let (key, pk) = pair?;
             retention.charge(key.len().saturating_add(pk.len()).saturating_add(64))
                 .map_err(CoreError::Sql)?;

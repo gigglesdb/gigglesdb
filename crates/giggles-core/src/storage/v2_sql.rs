@@ -1051,7 +1051,7 @@ impl RowSink for SqlRows<'_> {
                 // covering every trailing index component and PK suffix.
                 engine::indexes::visit_page(self.txn, &entry, d,
                     Bound::Included(tuple.clone()), Bound::Included(tuple), after,
-                    &mut |_, row| collect(row))?
+                    &mut |_, row| collect(row), 200)?
             } else {
                 // pk_bytes concatenates components without an arity/header suffix.
                 // Scan the same transaction so snapshot and own writes agree.

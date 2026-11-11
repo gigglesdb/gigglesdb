@@ -1,6 +1,44 @@
 //! Demand-driven EXISTS uses the caller's source and statement budgets.
 use super::*;
 
+pub(super) type ProbeKey = (usize, Option<BoundColumn>, BoundScalar, DataType);
+
+// Only mandatory equalities with row-independent operands can narrow source zero.
+pub(super) fn probe_keys(
+    query: &Query, tables: &[&TableDef], parameters: &[Option<DataType>],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+) -> R<Vec<ProbeKey>> {
+    fn equalities<'a>(f: &'a Filter, out: &mut Vec<(&'a Scalar, &'a Scalar)>) {
+        match f {
+            Filter::Compare(a, op, b) if op == "=" => { out.push((a, b)); out.push((b, a)); }
+            Filter::Logic(a, true, b) => { equalities(a, out); equalities(b, out); }
+            _ => {}
+        }
+    }
+    let mut pairs = vec![];
+    if let Some(filter) = query.where_filter() { equalities(filter, &mut pairs); }
+    let mut keys = vec![];
+    for (column, value) in pairs {
+        let Scalar::Column(column) = column else { continue; };
+        let column = resolve(column, query.sources.len())?;
+        if column.source != 0 { continue; }
+        match value {
+            Scalar::Column(c) if resolve(c, tables.len())?.source >= query.sources.len() => {}
+            Scalar::Literal(_) | Scalar::Param(_) => {}
+            _ => continue,
+        }
+        let outer = if let Scalar::Column(c) = value { Some(resolve(c, tables.len())?) } else { None };
+        let ty = &tables[0].columns[column.column].data_type;
+        let value = if matches!(value, Scalar::Literal(Value::Text(_) | Value::Null)) {
+            Scalar::Cast(Box::new(value.clone()), ty.clone()).bind(resolve, tables, parameters)?
+        } else { value.bind(resolve, tables, parameters)? };
+        if functions::join_key_supported(&value.ty, ty) {
+            keys.push((column.column, outer, value, ty.clone()));
+        }
+    }
+    Ok(keys)
+}
+
 // Each operator owns only its charges; child caches remain statement-owned.
 pub(super) struct RetentionScope<'a> {
     ledger: &'a RefCell<scan::Retention>,
@@ -51,6 +89,22 @@ impl BoundQuery<'_> {
     pub(super) fn correlated(&self, depth: usize) -> bool {
         self.outer_slots.iter().any(|s| s.depth > depth)
             || self.subqueries.correlated(depth + 1)
+    }
+    pub(super) fn exists_input<'s>(&'s self, source: &'s dyn scan::RowSource, params: &[Value],
+        outer: &[Vec<Value>], range: &scan::KeyRange) -> R<scan::SourceRows<'s>> {
+        if range.is_empty() { return Ok(Box::new(std::iter::empty())); }
+        let keys = if source.streams_reductions() {
+            let tuple = Tuple { values: vec![], version: 0 };
+            self.exists_keys.iter().map(|(column, slot, value, ty)| {
+                let operand = slot.map(|c| &outer[c.source - self.query.sources.len()][c.column]);
+                let evaluated;
+                let operand = if let Some(value) = operand { value }
+                    else { evaluated = value.eval(&tuple, params, &mut 0)?; &evaluated };
+                Ok((*column, functions::join_key(operand, &value.ty, ty)?))
+            }).collect::<R<Vec<_>>>()?
+        } else { vec![] };
+        if let Some(rows) = source.join_probe(self.tables[0], &keys, true)? { Ok(rows) }
+            else { source.scan(self.tables[0], range, scan::Direction::Forward) }
     }
     fn exists(
         &self,
@@ -126,7 +180,7 @@ impl BoundQuery<'_> {
             let (empty, bounds) = self.base_bounds(params)?;
             if !empty {
                 let range = scan::KeyRange::from_bounds(bounds);
-                let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+                let input = self.exists_input(source, params, &outer, &range)?;
                 for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true) {
                     if accept(&row?)? && !self.aggregate { return Ok(true); }
                 }

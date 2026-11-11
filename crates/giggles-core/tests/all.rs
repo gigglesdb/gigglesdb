@@ -361,3 +361,6 @@ mod truncate;
 
 #[path = "exists_public.rs"]
 mod exists_public;
+
+#[path = "exists_probe.rs"]
+mod exists_probe;

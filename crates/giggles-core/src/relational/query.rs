@@ -1732,6 +1732,11 @@ impl Query {
         found
     }
     pub(super) fn streaming_reduction(&self) -> bool {
+        let mut exists = false;
+        if let Some(filter) = self.where_filter() {
+            let _ = filter.visit_subqueries(&mut |value, _| { exists |= value.is_none(); Ok(()) });
+        }
+        if exists { return true; }
         if !self.joins.is_empty() { return true; }
         self.sources.len() == 1
             && !self.distinct() && !self.has_in_subquery()
@@ -3210,6 +3215,8 @@ impl Query {
         }
         if grouped {
             let mut bound = grouping::bind(self, &tables, parameters, &resolve, subqueries)?;
+            bound.exists_keys = exists::probe_keys(self, &tables,
+                &bound.parameters.iter().cloned().map(Some).collect::<Vec<_>>(), &resolve)?;
             bound.outer_slots = outer_slots.into_inner();
             if bound.outer_slots.is_empty() { bound.tables.truncate(self.sources.len()); }
             return Ok(bound);
@@ -3580,6 +3587,7 @@ impl Query {
                 Ok((bound, *d, *n))
             })
             .collect::<R<Vec<_>>>()?;
+        let exists_keys = exists::probe_keys(self, &tables, &parameters, &resolve)?;
         let parameters = parameters
             .into_iter()
             .map(|p| p.ok_or(SqlError::Parameters))
@@ -3597,6 +3605,7 @@ impl Query {
             order,
             aggregate,
             grouping: None,
+            exists_keys,
             distinct_order_slots,
             outer_slots: outer_slots.into_inner(),
             subqueries,
@@ -3637,6 +3646,7 @@ pub(super) struct BoundQuery<'a> {
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
     distinct_order_slots: Vec<usize>,
+    exists_keys: Vec<exists::ProbeKey>,
     outer_slots: Vec<outer::OuterSlot>,
     subqueries: Subplans<'a>,
     declared: Vec<Option<DataType>>,
@@ -3747,7 +3757,7 @@ fn join_rows<'a>(
                         .map(|(outer, inner, outer_ty, inner_ty)|
                             Ok((inner.column, functions::join_key(row.get(*outer), outer_ty, inner_ty)?)))
                         .collect::<R<Vec<_>>>()?;
-                    if let Some(rows) = source.join_probe(table, &keys)? { rows } else { source.scan(
+                    if let Some(rows) = source.join_probe(table, &keys, false)? { rows } else { source.scan(
                         table,
                         &scan::KeyRange {
                             lo: std::ops::Bound::Unbounded,

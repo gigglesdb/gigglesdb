@@ -73,7 +73,8 @@ pub(crate) type SourceRows<'s> = Box<dyn Iterator<Item = R<SourceRow<'s>>> + 's>
 pub(crate) trait RowSource {
     fn streams_reductions(&self) -> bool { false }
     /// Optional indexed inner candidates; None preserves the scan fallback.
-    fn join_probe<'s>(&'s self, _table: &TableDef, _keys: &[(usize, Option<Value>)])
+    /// `first` requests one-row pages for demand-driven EXISTS.
+    fn join_probe<'s>(&'s self, _table: &TableDef, _keys: &[(usize, Option<Value>)], _first: bool)
         -> R<Option<SourceRows<'s>>> { Ok(None) }
     /// Optional paged statement input; resume positions remain private to it.
     fn index_input<'s>(&'s self, _table: &TableDef, _predicates: &[(usize, &str, Value)])

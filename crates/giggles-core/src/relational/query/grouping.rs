@@ -769,6 +769,7 @@ pub(super) fn bind<'a>(
         aggregate: true,
         subqueries,
         outer_slots: vec![],
+        exists_keys: vec![],
         declared: vec![],
         distinct_order_slots: vec![],
         grouping: Some(Grouping {
@@ -966,7 +967,8 @@ impl Grouping {
                     let (empty, bounds) = query.base_bounds(params)?;
                     let range = if empty { scan::KeyRange { lo: std::ops::Bound::Excluded(vec![]), hi: std::ops::Bound::Excluded(vec![]) } }
                         else { scan::KeyRange::from_bounds(bounds) };
-                    query.input_rows(source, params, &range, empty)?
+                    if exists { query.exists_input(source, params, &outer, &range)? }
+                    else { query.input_rows(source, params, &range, empty)? }
                 } else { source.scan(query.tables[0], &range, scan::Direction::Forward)? };
                 for row in join_rows(query, source, input, params, &mut meter, &execution.visits, &outer, exists) {
                     accept(&row?)?;
