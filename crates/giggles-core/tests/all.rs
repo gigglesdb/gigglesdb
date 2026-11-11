@@ -346,3 +346,6 @@ mod select_distinct;
 
 #[path = "qualified_wildcard.rs"]
 mod qualified_wildcard;
+
+#[path = "ctid.rs"]
+mod ctid;

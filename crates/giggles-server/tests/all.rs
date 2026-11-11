@@ -147,3 +147,6 @@ mod bulk_wire_admission;
 
 #[path = "qualified_wildcard.rs"]
 mod qualified_wildcard;
+
+#[path = "ctid_wire.rs"]
+mod ctid_wire;

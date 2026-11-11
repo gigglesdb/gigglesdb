@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
+mod ctid;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
 mod catalog_image_tests;
@@ -1878,20 +1879,15 @@ impl Prepared {
         }
         let mut description = this.describe_inner(state)?;
         if description.type_oids.is_empty() {
-            description.type_oids = description
-                .columns
-                .iter()
-                .map(
-                    |c| match state.ext.columns.get(&c.id).and_then(|c| c.type_id) {
-                        Some(id)
-                            if matches!(state.ext.types.get(&id), Some(TypeDef::Enum { .. })) =>
-                        {
-                            type_oid(id)
-                        }
-                        _ => Ok(0),
-                    },
-                )
-                .collect::<R<_>>()?;
+            description.type_oids = vec![0; description.columns.len()];
+        }
+        for (oid, column) in description.type_oids.iter_mut().zip(&description.columns) {
+            if *oid == 0
+                && let Some(id) = state.ext.columns.get(&column.id).and_then(|c| c.type_id)
+                && matches!(state.ext.types.get(&id), Some(TypeDef::Enum { .. }))
+            {
+                *oid = type_oid(id)?;
+            }
         }
         Ok(description)
     }
@@ -3422,6 +3418,9 @@ impl Relational {
                 }
                 let mut column_names = BTreeSet::new();
                 for column in columns {
+                    if column.name == "ctid" {
+                        return Err(SqlError::DuplicateColumn);
+                    }
                     if !column_names.insert(&column.name) {
                         return Err(SqlError::DuplicateColumn);
                     }

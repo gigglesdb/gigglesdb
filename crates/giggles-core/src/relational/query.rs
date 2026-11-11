@@ -3034,7 +3034,7 @@ impl Query {
                             &bound.tables,
                             &parameter_types,
                         )?,
-                        BoundItem::Aggregate(..) => return Err(SqlError::Unsupported),
+                        BoundItem::Ctid(_) | BoundItem::Aggregate(..) => return Err(SqlError::Unsupported),
                     };
                 }
             }
@@ -3130,6 +3130,14 @@ impl Query {
                     if found.is_some() {
                         return Err(SqlError::Duplicate);
                     }
+                    found = Some(BoundColumn { source, column });
+                }
+            }
+            if found.is_none() && c.name == "ctid" {
+                for (source, (source_def, table)) in self.sources.iter().zip(&tables).take(scope).enumerate() {
+                    if c.qualifier.as_ref().is_some_and(|q| q != &source_def.alias) { continue; }
+                    let column = table.hidden_rowid().ok_or(SqlError::Unsupported)?;
+                    if found.is_some() { return Err(SqlError::Duplicate); }
                     found = Some(BoundColumn { source, column });
                 }
             }
@@ -3385,6 +3393,15 @@ impl Query {
             };
             match item {
                 Item::Scalar(e) => {
+                    if let Scalar::Column(c) = e
+                        && c.name == "ctid"
+                    {
+                        let column = resolve(c, tables.len())?;
+                        if tables[column.source].hidden_rowid() == Some(column.column) {
+                            push(BoundItem::Ctid(column), ColumnDef { id: 0, name: "ctid".into(), data_type: DataType::Text, not_null: true });
+                            continue;
+                        }
+                    }
                     let e = e.bind(&resolve, &tables, &parameters)?;
                     let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
                         let c = resolve(c, tables.len())?;
@@ -3568,6 +3585,7 @@ struct BoundColumn {
     column: usize,
 }
 enum BoundItem {
+    Ctid(BoundColumn),
     Scalar(BoundScalar),
     Column(BoundColumn),
     Aggregate(Aggregate, Option<BoundScalar>),
@@ -3781,6 +3799,15 @@ impl BoundQuery<'_> {
                     charge(bytes, value)?;
                     Ok(value.clone())
                 }
+                BoundItem::Ctid(column) => match row.get(*column) {
+                    Value::Int(rowid) => {
+                        let value = Value::Text(super::ctid::format(*rowid)?);
+                        charge(bytes, &value)?;
+                        Ok(value)
+                    }
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(SqlError::Type),
+                },
                 BoundItem::Aggregate(..) => Err(SqlError::GroupingError),
             })
             .collect::<R<Vec<_>>>()?;
@@ -3843,7 +3870,11 @@ impl BoundQuery<'_> {
     }
     pub(super) fn description(&self, state: &Relational) -> Description {
         Description {
-            type_oids: vec![],
+            type_oids: if self.items.iter().any(|item| matches!(item, BoundItem::Ctid(_))) {
+                self.items.iter().map(|item| if matches!(item, BoundItem::Ctid(_)) { 27 } else { 0 }).collect()
+            } else {
+                vec![]
+            },
             parameters: self.parameters.clone(),
             typmods: if self.query.explain {
                 vec![result_typmod(state, TypmodSource::Other)]
@@ -3858,7 +3889,7 @@ impl BoundQuery<'_> {
                                 &self.tables[column.source].columns[column.column],
                             ),
                             BoundItem::Scalar(value) => TypmodSource::Scalar(value),
-                            BoundItem::Aggregate(..) => TypmodSource::Other,
+                            BoundItem::Ctid(_) | BoundItem::Aggregate(..) => TypmodSource::Other,
                         };
                         result_typmod(state, source)
                     })

@@ -287,6 +287,9 @@ pub(super) fn execute(
                         .map_err(|_| SqlError::InvalidParameterValue)?;
                 }
                 ident::ident(&column.name)?;
+                if column.name == "ctid" {
+                    return Err(SqlError::DuplicateColumn);
+                }
                 if table.columns.iter().any(|c| c.name == column.name) {
                     return Err(SqlError::DuplicateColumn);
                 }
