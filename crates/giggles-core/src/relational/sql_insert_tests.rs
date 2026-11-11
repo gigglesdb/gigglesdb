@@ -513,7 +513,7 @@ fn sql_insert_in_statement_update_duplicate_target_is_atomic() {
     fail(
         &mut s,
         "INSERT INTO items VALUES (1,'a','x',10),(1,'b','y',20) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n",
-        SqlError::Duplicate,
+        SqlError::CardinalityViolation,
     );
     assert!(rows(&mut s).is_empty());
     run(&mut s, "INSERT INTO items VALUES (1,'a','x',10)");
@@ -521,7 +521,7 @@ fn sql_insert_in_statement_update_duplicate_target_is_atomic() {
     fail(
         &mut s,
         "INSERT INTO items VALUES (2,'b','y',20),(1,'c','z',30),(1,'d','w',40) ON CONFLICT (id) DO UPDATE SET n=EXCLUDED.n",
-        SqlError::Duplicate,
+        SqlError::CardinalityViolation,
     );
     assert_eq!(rows(&mut s), before);
 }

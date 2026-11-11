@@ -941,7 +941,7 @@ impl RowSink for SqlRows<'_> {
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>) -> Result<(), CoreError> {
         let floor = self.conflict_floor;
         self.lookup(table, columns, Some(values), true, &mut |row| {
-            if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::Duplicate); }
+            if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::CardinalityViolation); }
             visit(row)
         })
     }

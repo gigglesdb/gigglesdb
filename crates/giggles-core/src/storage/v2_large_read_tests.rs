@@ -228,7 +228,7 @@ fn physical_conflicts_and_fk_witnesses_at_app_scale() {
     // A conflict from an earlier page must retain the bounded planner's duplicate-target error.
     let batch = (0..201).map(|n| format!("({},'changed{}@test')", n % 200, n % 200)).collect::<Vec<_>>().join(",");
     assert_eq!(s.execute(&format!("INSERT INTO users VALUES {batch} ON CONFLICT(id) DO UPDATE SET email=excluded.email"),
-        &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+        &[], None), Err(CoreError::Sql(SqlError::CardinalityViolation)));
     assert_eq!(values(&mut s, "SELECT email FROM users WHERE id=0"), vec![vec![Text("batch0@test".into())]]);
     assert_eq!(s.execute("INSERT INTO orders VALUES (200000,0,0)", &[], None).unwrap().affected, 1);
     assert_eq!(s.execute("INSERT INTO orders VALUES (200001,999999,0)", &[], None),
@@ -248,7 +248,8 @@ fn physical_conflicts_and_fk_witnesses_at_app_scale() {
     assert_eq!(buffered(&mut s, "SELECT count(*) FROM orders WHERE user_id>=0"), vec![vec![Int(200001)]]);
     f.execute("CREATE TABLE restricted(id bigint PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE RESTRICT)");
     s.execute("INSERT INTO restricted VALUES (1,0)", &[], None).unwrap();
-    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::RestrictViolation)));
+    // PG18.6: orders' NO ACTION FK was defined before restricted's RESTRICT FK.
+    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
     s.execute("BEGIN", &[], None).unwrap();
     s.execute("INSERT INTO users VALUES (60000,'own@test')", &[], None).unwrap();
     s.execute("INSERT INTO users VALUES (60001,'own@test') ON CONFLICT(email) DO NOTHING", &[], None).unwrap();
@@ -279,7 +280,7 @@ fn identity_partial_cast_and_select_upserts_probe_once() {
         vec![vec![Int(4001), Int(7)]]);
     let repeated = (0..201).map(|n| format!("('u{}@test')", n % 200)).collect::<Vec<_>>().join(",");
     assert_eq!(s.execute_at(&format!("INSERT INTO identity_users(email) VALUES {repeated} ON CONFLICT(email) DO UPDATE SET marker=9"),
-        &[], None, &clock), Err(CoreError::Sql(SqlError::Duplicate)));
+        &[], None, &clock), Err(CoreError::Sql(SqlError::CardinalityViolation)));
     assert_eq!(values(&mut s, "SELECT marker FROM identity_users WHERE id=1"), vec![vec![Int(7)]]);
 }
 

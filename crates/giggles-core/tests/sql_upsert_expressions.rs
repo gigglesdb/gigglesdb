@@ -135,7 +135,7 @@ fn pg186_literal_oracle_aliases_functions_guard_tuple_default_and_returning() {
             ),
             (
                 "INSERT INTO c (k, count) VALUES ('a', 1), ('a', 2) ON CONFLICT (k) DO UPDATE SET count = excluded.count",
-                E::Duplicate,
+                E::CardinalityViolation,
             ),
             (
                 "INSERT INTO c (k, count) VALUES ('a', $$5$$::int) ON CONFLICT (k) DO UPDATE SET count = c.count * excluded.count, updated = now() IS NOT NULL OR true RETURNING count",

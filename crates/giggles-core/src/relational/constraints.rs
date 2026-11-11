@@ -626,7 +626,7 @@ pub(super) fn enforce_with_rows<'a>(
         if affected > MAX_ROWS {
             return Err(SqlError::Limit);
         }
-        let incoming = state
+        let mut incoming = state
             .ext
             .constraints
             .iter()
@@ -639,6 +639,8 @@ pub(super) fn enforce_with_rows<'a>(
                 })
             })
             .collect::<Vec<_>>();
+        // IDs preserve FK definition order across child tables and ALTER TABLE.
+        incoming.sort_by_key(|(_, constraint)| constraint.id);
         for (child_id, constraint) in incoming {
             let ConstraintKind::ForeignKey {
                 columns,
@@ -677,6 +679,23 @@ pub(super) fn enforce_with_rows<'a>(
                 on_delete
             };
             if matches!(action, catalog_ext::Action::Restrict) && !children.is_empty() {
+                // The statement already fails: report an earlier immediate
+                // NO ACTION trigger first, without changing deferred checks.
+                for ((id, table_id), keys) in &parent_checks {
+                    let prior = state.ext.constraints[table_id]
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .unwrap();
+                    if !deferred.deferred(*id, &prior.kind) {
+                        validate_kind(
+                            state,
+                            table_by_id(state, *table_id)?,
+                            &prior.kind,
+                            Some(keys),
+                            cancel,
+                        )?;
+                    }
+                }
                 return Err(SqlError::RestrictViolation);
             }
             if matches!(action, catalog_ext::Action::NoAction) {

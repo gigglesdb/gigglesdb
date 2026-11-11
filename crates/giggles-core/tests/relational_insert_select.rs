@@ -19,12 +19,15 @@ struct Db {
 }
 impl Db {
     fn new() -> Self {
+        Self::new_engine(Engine::Legacy)
+    }
+    fn new_engine(engine: Engine) -> Self {
         let path = std::env::temp_dir().join(format!(
             "gd-insert-select-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let admin = Admin::create(&path, Limits::default()).unwrap();
+        let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
         let session = admin.sql_session();
         Self {
             session: Some(session),
@@ -508,7 +511,7 @@ fn self_insert_reads_pre_statement_snapshot_and_duplicates_are_atomic() {
     error(
         s,
         "INSERT INTO self_copy SELECT 1 FROM src ON CONFLICT(id) DO UPDATE SET id=excluded.id",
-        E::Duplicate,
+        E::CardinalityViolation,
     );
     assert_eq!(run(s, "SELECT id FROM self_copy ORDER BY id").rows, before);
 }
@@ -876,4 +879,81 @@ fn source_and_conflict_sequence_dependencies_preserve_target_alias() {
         "{dependencies:?}"
     );
     assert_eq!(rows(s, sql), vec![vec![V::Int(1), V::Int(11)]]);
+}
+
+fn constraint_count(s: &mut SqlSession, sql: &str) -> Vec<Vec<V>> {
+    let prepared = s.prepare(sql).unwrap();
+    s.open_cursor(&prepared, &[]).unwrap().fetch(1, 1024).unwrap()
+        .into_iter().map(|row| row.values).collect()
+}
+
+fn constraint_cases() -> Vec<(Engine, usize)> {
+    let mut cases = vec![(Engine::Legacy, 2), (Engine::Legacy, 201)];
+    if cfg!(feature = "engine-rocksdb") {
+        cases.extend([2, 201, 1100].map(|count| (Engine::V2, count)));
+    }
+    cases
+}
+
+#[test]
+fn repeated_upsert_targets_are_cardinality_errors_and_statement_atomic() {
+    for (engine, count) in constraint_cases() {
+        for select in [false, true] {
+            for existing in [false, true] {
+                let mut db = Db::new_engine(engine);
+                let s = db.session();
+                run(s, "CREATE TABLE dst(k bigint PRIMARY KEY,v bigint)");
+                run(s, "CREATE TABLE src(seq bigint PRIMARY KEY,k bigint,v bigint)");
+                if existing { run(s, "INSERT INTO dst VALUES(0,7)"); }
+                let proposals = (0..=count).map(|n| format!("({},9)", n % count))
+                    .collect::<Vec<_>>().join(",");
+                let input = if select {
+                    let source = (0..=count).map(|n| format!("({n},{},9)", n % count))
+                        .collect::<Vec<_>>().join(",");
+                    run(s, &format!("INSERT INTO src VALUES {source}"));
+                    "SELECT k,v FROM src".to_owned()
+                } else { format!("VALUES {proposals}") };
+                error(s, &format!("INSERT INTO dst {input} ON CONFLICT(k) DO UPDATE SET v=excluded.v"),
+                    E::CardinalityViolation);
+                assert_eq!(constraint_count(s, "SELECT count(*) FROM dst"), ints(&[i64::from(existing)]));
+                if existing { assert_eq!(rows(s, "SELECT v FROM dst WHERE k=0"), ints(&[7])); }
+                assert_eq!(run(s, &format!("INSERT INTO dst {input} ON CONFLICT(k) DO NOTHING")).affected,
+                    (count - usize::from(existing)) as u64);
+                assert_eq!(constraint_count(s, "SELECT count(*) FROM dst"), ints(&[count as i64]));
+                assert_eq!(rows(s, "SELECT v FROM dst WHERE k=0"), ints(&[if existing { 7 } else { 9 }]));
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_fk_errors_follow_definition_order_not_child_table_order() {
+    // PG18.6: first NO ACTION -> 23503; first RESTRICT -> 23001.
+    // The existing monotonic constraint IDs retain ALTER's definition order.
+    for (engine, count) in constraint_cases() {
+        for restrict_first in [false, true] {
+            let mut db = Db::new_engine(engine);
+            let s = db.session();
+            run(s, "CREATE TABLE p(id bigint PRIMARY KEY)");
+            run(s, "INSERT INTO p VALUES(0)");
+            // Deliberately create the later FK's table first.
+            let children = if restrict_first { ["na", "r"] } else { ["r", "na"] };
+            for child in children {
+                run(s, &format!("CREATE TABLE {child}(id bigint PRIMARY KEY,pid bigint)"));
+            }
+            for child in children.into_iter().rev() {
+                let action = if child == "r" { "RESTRICT" } else { "NO ACTION" };
+                run(s, &format!("ALTER TABLE {child} ADD FOREIGN KEY(pid) REFERENCES p(id) ON DELETE {action} ON UPDATE {action}"));
+                let batch = (0..count).map(|n| format!("({n},0)")).collect::<Vec<_>>().join(",");
+                run(s, &format!("INSERT INTO {child} VALUES {batch}"));
+            }
+            let expected = if restrict_first { E::RestrictViolation } else { E::ForeignKeyViolation };
+            error(s, "DELETE FROM p WHERE id=0", expected.clone());
+            error(s, "UPDATE p SET id=1 WHERE id=0", expected);
+            assert_eq!(rows(s, "SELECT id FROM p"), ints(&[0]));
+            for child in children {
+                assert_eq!(constraint_count(s, &format!("SELECT count(*) FROM {child} WHERE pid=0")), ints(&[count as i64]));
+            }
+        }
+    }
 }

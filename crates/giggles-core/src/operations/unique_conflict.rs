@@ -769,7 +769,7 @@ fn into_sql(error: PlanError) -> SqlError {
     match error {
         PlanError::Sql(error) => error,
         PlanError::Engine(error) => match error {
-            Error::DuplicateTarget => SqlError::Duplicate,
+            Error::DuplicateTarget => SqlError::CardinalityViolation,
             Error::Unsupported => SqlError::Unsupported,
             Error::Type => SqlError::Type,
             Error::DivisionByZero => SqlError::DivisionByZero,
