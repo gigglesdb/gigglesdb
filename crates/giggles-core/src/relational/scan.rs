@@ -195,7 +195,6 @@ impl Retention {
     pub(crate) fn release(&mut self, bytes: usize) {
         self.used = self.used.saturating_sub(bytes);
     }
-    #[cfg(test)]
     pub(crate) fn used(&self) -> usize {
         self.used
     }

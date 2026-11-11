@@ -340,3 +340,6 @@ mod domain_cast_cascade;
 
 #[path = "key_bounds_offset.rs"]
 mod key_bounds_offset;
+
+#[path = "select_distinct.rs"]
+mod select_distinct;

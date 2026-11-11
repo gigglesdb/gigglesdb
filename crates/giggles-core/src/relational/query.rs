@@ -786,14 +786,7 @@ impl Filter {
                         params: BTreeSet::new(),
                         relations: Vec::new(),
                     };
-                    let distinct = child.tokens.get(1) == Some(&Token::Word("distinct".into()));
-                    if distinct {
-                        child.tokens.remove(1);
-                    }
-                    let mut query = Query::parse(&mut child)?;
-                    if distinct {
-                        query.set_distinct();
-                    }
+                    let query = Query::parse(&mut child)?;
                     p.params.extend(child.params);
                     p.relations.extend(child.relations);
                     p.at = end + 1;
@@ -1789,19 +1782,7 @@ impl Query {
     fn distinct(&self) -> bool {
         self.clauses().is_some_and(|c| c.distinct)
     }
-    fn set_distinct(&mut self) {
-        if let Some(Filter::Clauses(c)) = &mut self.filter {
-            c.distinct = true;
-        } else {
-            self.filter = Some(Filter::Clauses(Box::new(QueryClauses {
-                distinct: true,
-                filter: self.filter.take(),
-                group: vec![],
-                having: None,
-                offset: None,
-            })));
-        }
-    }
+
     fn clauses(&self) -> Option<&QueryClauses> {
         match &self.filter {
             Some(Filter::Clauses(c)) => Some(c),
@@ -2015,21 +1996,17 @@ impl Query {
         })
     }
     pub(super) fn parse_insert_source(p: &mut Parser) -> R<Self> {
-        let distinct = p.tokens.get(p.at + 1) == Some(&Token::Word("distinct".into()));
-        if distinct {
-            p.tokens.remove(p.at + 1);
-        }
-        let mut query = Self::parse(p)?;
-        if distinct {
-            query.set_distinct();
-        }
-        Ok(query)
+        Self::parse(p)
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
         admit_subquery_forms(&p.tokens[p.at..])?;
         let explain = p.word("explain");
         p.need("select")?;
+        let distinct = p.word("distinct");
+        if distinct && p.word("on") {
+            return Err(SqlError::Unsupported);
+        }
         preprocess_aggregates(p)?;
         let aggregate_filters = aggregate_filter::normalize(p)?;
         let mut items = Self::parse_items(p)?;
@@ -2196,11 +2173,11 @@ impl Query {
             joins,
             items,
             predicates,
-            filter: if group.is_empty() && having.is_none() && offset.is_none() {
+            filter: if !distinct && group.is_empty() && having.is_none() && offset.is_none() {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
-                    distinct: false,
+                    distinct,
                     filter,
                     group,
                     having,
@@ -3113,6 +3090,27 @@ impl Query {
         if grouped {
             return grouping::bind(self, &tables, parameters, &resolve, subqueries);
         }
+        let distinct_order = self
+            .distinct()
+            .then(|| {
+                let projection = grouping::projection(self, &tables);
+                self.order
+                    .iter()
+                    .map(|(s, _, _)| {
+                        grouping::output_order(self, s, &projection, &resolve, &tables)
+                    })
+                    .collect::<R<Vec<_>>>()
+            })
+            .transpose()?;
+        let distinct_order_slots = if let Some(order) = &distinct_order {
+            let projection = grouping::projection(self, &tables);
+            order
+                .iter()
+                .map(|s| grouping::output_slot(s, &projection, &resolve, &tables))
+                .collect::<R<Vec<_>>>()?
+        } else {
+            vec![]
+        };
         let mut items = vec![];
         let mut unresolved_count_parameters = Vec::new();
         for (item, _) in &self.items {
@@ -3146,7 +3144,8 @@ impl Query {
         if let Some(f) = self.where_filter() {
             f.infer_with_subqueries(&mut parameters, &resolve, &tables, &subqueries)?;
         }
-        for (e, _, _) in &self.order {
+        for (i, (e, _, _)) in self.order.iter().enumerate() {
+            let e = distinct_order.as_ref().map_or(e, |order| &order[i]);
             e.infer(None, &mut parameters, &resolve, &tables)?;
         }
         let bind_expr = |e: &Expr, ty: &DataType, parameters: &mut [Option<DataType>]| -> R<bool> {
@@ -3426,9 +3425,12 @@ impl Query {
         let order = self
             .order
             .iter()
-            .map(|(e, d, n)| {
+            .enumerate()
+            .map(|(i, (e, d, n))| {
                 let ordinal;
-                let e = if let Scalar::Literal(Value::Int(k)) = e {
+                let e = if let Some(order) = &distinct_order {
+                    &order[i]
+                } else if let Scalar::Literal(Value::Int(k)) = e {
                     ordinal = self.order_ordinal(*k, &tables)?;
                     &ordinal
                 } else {
@@ -3459,6 +3461,7 @@ impl Query {
             order,
             aggregate,
             grouping: None,
+            distinct_order_slots,
             subqueries,
             declared: vec![],
         })
@@ -3495,6 +3498,7 @@ pub(super) struct BoundQuery<'a> {
     order: Vec<(BoundScalar, bool, bool)>,
     aggregate: bool,
     grouping: Option<grouping::Grouping>,
+    distinct_order_slots: Vec<usize>,
     subqueries: Vec<(usize, BoundQuery<'a>)>,
     declared: Vec<Option<DataType>>,
 }
@@ -4346,28 +4350,41 @@ impl BoundQuery<'_> {
         let mut aggregate_work_bytes = 0usize;
         if self.query.distinct() && !self.aggregate {
             let mut seen = std::collections::BTreeSet::new();
-            let mut retention = scan::Retention::new(scan::retention_limit());
             let mut unique_rows = Vec::new();
+            let mut distinct_bytes = 0;
             for row in filtered {
                 let row = row?;
                 let projected = self.project_tuple(&row, params, &mut 0, &mut 0)?;
-                let key = grouping::Key(projected.values.clone());
-                if !seen.insert(key) {
+                let key = grouping::Key(projected.values);
+                if seen.contains(&key) {
                     continue;
                 }
                 if unique_rows.len() >= scan::query_row_limit() {
                     return Err(SqlError::Limit);
                 }
+                distinct_bytes += distinct_charge(
+                    &key.0,
+                    &self.distinct_order_slots,
+                    &mut execution.retention.borrow_mut(),
+                )?;
                 let keys = self
                     .order
                     .iter()
-                    .map(|(s, _, _)| s.eval(&row, params, &mut 0))
+                    .enumerate()
+                    .map(|(i, (s, _, _))| {
+                        let slot = self.distinct_order_slots[i];
+                        if self.columns[slot].data_type != s.ty {
+                            s.eval(&row, params, &mut 0)
+                        } else {
+                            Ok(key.0[slot].clone())
+                        }
+                    })
                     .collect::<R<Vec<_>>>()?;
-                retention.charge(
-                    projected.values.iter().map(value_bytes).sum::<usize>() * 2
-                        + keys.iter().map(value_bytes).sum::<usize>()
-                        + 8 * std::mem::size_of::<Value>(),
-                )?;
+                let projected = SqlRow {
+                    values: key.0.clone(),
+                    version: projected.version,
+                };
+                seen.insert(key);
                 unique_rows.push((projected, keys));
             }
             unique_rows.sort_by(|(_, a), (_, b)| order_values(a, b, &self.order));
@@ -4377,6 +4394,7 @@ impl BoundQuery<'_> {
                 }
                 result.rows.push(row);
             }
+            execution.retention.borrow_mut().release(distinct_bytes);
             return Ok(result);
         }
         if self.aggregate {
@@ -4545,6 +4563,30 @@ impl Query {
         }
         Err(SqlError::UnknownColumn)
     }
+}
+
+fn distinct_charge(values: &[Value], slots: &[usize], retention: &mut scan::Retention) -> R<usize> {
+    let retained = |values: &[Value]| {
+        std::mem::size_of_val(values)
+            + values
+                .iter()
+                .map(|v| match v {
+                    Value::Numeric(n) => n.display_byte_bound(),
+                    _ => value_bytes(v),
+                })
+                .sum::<usize>()
+    };
+    let keys = slots
+        .iter()
+        .map(|i| retained(&values[*i..=*i]).max(std::mem::size_of::<Value>() + 9))
+        .sum::<usize>();
+    let bytes = 2 * retained(values)
+        + keys
+        + 4 * std::mem::size_of::<(SqlRow, Vec<Value>)>()
+        + 12 * std::mem::size_of::<grouping::Key>()
+        + 12 * std::mem::size_of::<usize>();
+    retention.charge(bytes)?;
+    Ok(bytes)
 }
 
 fn order_values(a: &[Value], b: &[Value], order: &[(BoundScalar, bool, bool)]) -> Ordering {
@@ -5315,6 +5357,34 @@ mod in_subquery_execution_tests {
             relations: Vec::new(),
         })
         .unwrap()
+    }
+    #[test]
+    fn duplicates_fit_one_key_and_tiny_budget_fails_before_state_allocation() {
+        let state = state();
+        let q = query("SELECT DISTINCT id-id FROM in_outer LIMIT 1");
+        let bound = q.bind(&state, 0, &[]).unwrap();
+        let mut meter = scan::Retention::new(4096);
+        let one_key = distinct_charge(&[Value::Int(0)], &[], &mut meter).unwrap();
+        for cap in [1, one_key] {
+            let mut cancel = || false;
+            let execution = Execution::new(&mut cancel, &[]);
+            *execution.retention.borrow_mut() = scan::Retention::new(cap);
+            let result = bound.execute_context(
+                &state,
+                &scan::LegacyRows(&state),
+                &[],
+                &[],
+                &execution,
+                false,
+                false,
+            );
+            if cap == 1 {
+                assert_eq!(result, Err(SqlError::Limit));
+            } else {
+                assert_eq!(result.unwrap().rows.len(), 1);
+            }
+            assert_eq!(execution.retention.borrow().used(), 0);
+        }
     }
     #[test]
     fn subquery_cache_is_once_per_execution_and_cancel_stops_child_scan() {

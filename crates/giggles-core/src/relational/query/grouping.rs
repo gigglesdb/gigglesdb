@@ -10,6 +10,7 @@ pub(super) struct Grouping {
     aggregate_columns: Vec<ColumnDef>,
     outputs: Vec<BoundScalar>,
     output_sources: Vec<Option<BoundColumn>>,
+    order_slots: Vec<usize>,
     having: Option<BoundFilter>,
     order: Vec<(BoundScalar, bool, bool)>,
 }
@@ -345,13 +346,7 @@ fn resolve_output(
     }
     Ok(s.clone())
 }
-pub(super) fn bind<'a>(
-    q: &'a Query,
-    tables: &[&'a TableDef],
-    mut parameters: Vec<Option<DataType>>,
-    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
-    subqueries: Vec<(usize, BoundQuery<'a>)>,
-) -> R<BoundQuery<'a>> {
+pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> Vec<(Item, Option<String>)> {
     let mut projection = vec![];
     for (item, alias) in &q.items {
         if matches!(item, Item::Star) {
@@ -372,6 +367,44 @@ pub(super) fn bind<'a>(
             projection.push((item.clone(), alias.clone()));
         }
     }
+    projection
+}
+pub(super) fn output_order(
+    q: &Query,
+    s: &Scalar,
+    projection: &[(Item, Option<String>)],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+) -> R<Scalar> {
+    let s = resolve_output(s, projection, false, resolve, tables.len(), tables)?;
+    if q.distinct() {
+        output_slot(&s, projection, resolve, tables)?;
+    }
+    Ok(s)
+}
+pub(super) fn output_slot(
+    s: &Scalar,
+    projection: &[(Item, Option<String>)],
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    tables: &[&TableDef],
+) -> R<usize> {
+    let identity = canonical(s, resolve, tables.len(), tables)?;
+    for (i, (item, _)) in projection.iter().enumerate() {
+        if canonical(&output_scalar(item)?, resolve, tables.len(), tables)? == identity {
+            return Ok(i);
+        }
+    }
+    // InvalidColumnReference/42P10 awaits the separate error-variant slice.
+    Err(SqlError::GroupingError)
+}
+pub(super) fn bind<'a>(
+    q: &'a Query,
+    tables: &[&'a TableDef],
+    mut parameters: Vec<Option<DataType>>,
+    resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+    subqueries: Vec<(usize, BoundQuery<'a>)>,
+) -> R<BoundQuery<'a>> {
+    let projection = projection(q, tables);
     if projection.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
@@ -455,19 +488,23 @@ pub(super) fn bind<'a>(
         })
         .collect::<R<Vec<_>>>()?;
     let having_syntax = q.having().map(|f| lower.filter(f)).transpose()?;
+    let order_slots = if q.distinct() {
+        q.order
+            .iter()
+            .map(|(s, _, _)| {
+                let s = output_order(q, s, &projection, resolve, tables)?;
+                output_slot(&s, &projection, resolve, tables)
+            })
+            .collect::<R<Vec<_>>>()?
+    } else {
+        vec![]
+    };
     let order_syntax = q
         .order
         .iter()
         .map(|(s, d, n)| {
             Ok((
-                lower.scalar(&resolve_output(
-                    s,
-                    &projection,
-                    false,
-                    resolve,
-                    tables.len(),
-                    tables,
-                )?)?,
+                lower.scalar(&output_order(q, s, &projection, resolve, tables)?)?,
                 *d,
                 *n,
             ))
@@ -714,6 +751,7 @@ pub(super) fn bind<'a>(
         aggregate: true,
         subqueries,
         declared: vec![],
+        distinct_order_slots: vec![],
         grouping: Some(Grouping {
             keys,
             aggregates,
@@ -722,6 +760,7 @@ pub(super) fn bind<'a>(
             dependents: lower.dependents,
             outputs,
             output_sources,
+            order_slots,
             having,
             order,
         }),
@@ -818,13 +857,16 @@ impl Grouping {
             return Ok(result);
         }
         let mut groups = BTreeMap::<Key, (Vec<Value>, Vec<AggregateAuxiliary>)>::new();
-        let mut retention = scan::Retention::new(scan::retention_limit());
+        let mut retention = execution.retention.borrow_mut();
+        let initial_bytes = retention.used();
         if self.keys.is_empty() {
             let initial = self.initial();
             retention.charge(retained(&initial) + std::mem::size_of::<Key>())?;
             let auxiliary = aggregate_auxiliary(&self.aggregates, &mut retention)?;
             groups.insert(Key(vec![]), (initial, auxiliary));
         }
+        let mut group_bytes = retention.used() - initial_bytes;
+        drop(retention);
         let mut aggregate_work = 0;
 
         {
@@ -838,6 +880,8 @@ impl Grouping {
                 {
                     return Ok(());
                 }
+                let mut retention = execution.retention.borrow_mut();
+                let before_group = retention.used();
                 let mut key_work = 0;
                 let key = Key(self
                     .keys
@@ -875,6 +919,7 @@ impl Grouping {
                 } else {
                     retention.release(before - after);
                 }
+                group_bytes = group_bytes + retention.used() - before_group;
                 Ok(())
             };
             if query.tables.is_empty() {
@@ -894,6 +939,8 @@ impl Grouping {
                 }
             }
         }
+        let mut retention = execution.retention.borrow_mut();
+        let output_start = retention.used();
         let mut rows = vec![];
         let mut distinct = std::collections::BTreeSet::new();
         for (key, (mut values, auxiliary)) in groups {
@@ -921,21 +968,34 @@ impl Grouping {
                 .iter()
                 .map(|s| s.eval(&row, params, &mut work))
                 .collect::<R<Vec<_>>>()?;
-            if query.query.distinct() {
-                let key = Key(values.clone());
+            let values = if query.query.distinct() {
+                let key = Key(values);
                 if distinct.contains(&key) {
                     continue;
                 }
-                retention.charge(retained(&values) + 4 * std::mem::size_of::<usize>())?;
+                distinct_charge(&key.0, &self.order_slots, &mut retention)?;
+                let values = key.0.clone();
                 distinct.insert(key);
-            }
+                values
+            } else {
+                values
+            };
             let mut work = 0;
             let keys = self
                 .order
                 .iter()
-                .map(|(s, _, _)| s.eval(&row, params, &mut work))
+                .enumerate()
+                .map(|(i, (s, _, _))| {
+                    if query.query.distinct() {
+                        Ok(values[self.order_slots[i]].clone())
+                    } else {
+                        s.eval(&row, params, &mut work)
+                    }
+                })
                 .collect::<R<Vec<_>>>()?;
-            retention.charge(retained(&values) + retained(&keys))?;
+            if !query.query.distinct() {
+                retention.charge(retained(&values) + retained(&keys))?;
+            }
             rows.push((SqlRow { values, version: 0 }, keys));
         }
         rows.sort_by(|(_, a), (_, b)| {
@@ -977,6 +1037,8 @@ impl Grouping {
         if cancel() {
             return Err(SqlError::Aborted);
         }
+        let output_bytes = retention.used() - output_start;
+        retention.release(group_bytes + output_bytes);
         Ok(result)
     }
     pub(super) fn typmods(&self, state: &Relational, tables: &[&TableDef]) -> Vec<i32> {
