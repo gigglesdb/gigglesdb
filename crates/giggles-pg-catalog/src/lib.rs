@@ -340,6 +340,7 @@ pub enum Error {
     Mutation,
     UnknownColumn,
     AmbiguousColumn,
+    DivisionByZero,
     Type,
     Parameters,
     InvalidSnapshot,

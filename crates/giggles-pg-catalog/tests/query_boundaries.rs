@@ -88,7 +88,7 @@ fn detected_identity_and_startup_are_truthful_and_execution_scoped() {
         "select version(1)",
         "select pg_postmaster_start_time()",
         "select round(extract(epoch from pg_postmaster_start_time() at time zone 'PST'))",
-        "select txid_current()",
+        "select txid_current(1)",
     ] {
         assert!(plan(sql).is_err(), "{sql}");
     }

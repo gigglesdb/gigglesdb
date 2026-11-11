@@ -32,6 +32,7 @@ pub(crate) fn error(error: giggles_pg_catalog::Error) -> &'static str {
         E::UnknownColumn => "42703",
         E::AmbiguousColumn => "42702",
         E::Type => "42804",
+        E::DivisionByZero => "22012",
         E::Parameters => "08P01",
         E::Limit => "54000",
         E::InvalidSnapshot => "55000",
@@ -891,6 +892,15 @@ pub(crate) fn execute(
 mod tests {
     use super::*;
     use tokio_postgres::types::{FromSql, Type};
+
+    #[test]
+    fn catalog_remainder_by_zero_has_postgresql_sqlstate() {
+        let plan = giggles_pg_catalog::plan("SELECT pg_catalog.txid_current() % 0::bigint")
+            .unwrap()
+            .unwrap();
+        let failure = giggles_pg_catalog::execute(&plan, &Default::default(), &[]).unwrap_err();
+        assert_eq!(error(failure), "22012");
+    }
 
     #[test]
     fn acl_defaults_encode_as_text_arrays_with_acl_and_array_quoting() {

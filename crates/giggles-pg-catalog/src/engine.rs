@@ -140,11 +140,26 @@ fn object(n: &a::ObjectName) -> Vec<String> {
     n.0.iter().map(ident).collect()
 }
 pub fn catalog_identifier(name: &str) -> bool {
-    matches!(name, "pg_catalog" | "information_schema" | "pg_options_to_table" | "pg_get_sequence_data"
-        | "version" | "pg_postmaster_start_time" | "pg_backend_pid" | "pg_is_in_recovery"
-        | "current_database" | "current_schema" | "current_user" | "session_user"
-        | "user" | "current_role" | "current_catalog" | "current_schemas")
-        || unqualified_catalog(name)
+    matches!(
+        name,
+        "pg_catalog"
+            | "information_schema"
+            | "pg_options_to_table"
+            | "pg_get_sequence_data"
+            | "version"
+            | "pg_postmaster_start_time"
+            | "pg_backend_pid"
+            | "pg_is_in_recovery"
+            | "txid_current"
+            | "current_database"
+            | "current_schema"
+            | "current_user"
+            | "session_user"
+            | "user"
+            | "current_role"
+            | "current_catalog"
+            | "current_schemas"
+    ) || unqualified_catalog(name)
 }
 fn unqualified_catalog(name: &str) -> bool {
     catalog::relation_namespace(name) == "pg_catalog" && catalog::schema(name).is_some()
@@ -312,6 +327,7 @@ impl Visitor for Scan {
                     | "pg_postmaster_start_time"
                     | "pg_backend_pid"
                     | "pg_is_in_recovery"
+                    | "txid_current"
                     | "current_database"
                     | "current_schema"
                     | "current_user"
@@ -621,10 +637,6 @@ impl Compiler {
         result
     }
     fn query_scoped(&mut self, q: &a::Query, outer: &Schema) -> R<Query> {
-        self.qcount += 1;
-        if self.qcount > 32 {
-            return Err(Error::Limit);
-        }
         if q.fetch.is_some()
             || !q.locks.is_empty()
             || q.offset.is_some()
@@ -691,26 +703,31 @@ impl Compiler {
                 self.ctes.insert(name, std::sync::Arc::new(compiled));
             }
         }
+        self.query_body(&q.body, q.order_by.as_ref(), q.limit.as_ref(), outer)
+    }
+    fn query_body(
+        &mut self,
+        body: &a::SetExpr,
+        order_by: Option<&a::OrderBy>,
+        limit: Option<&A>,
+        outer: &Schema,
+    ) -> R<Query> {
         if let a::SetExpr::SetOperation {
             op: a::SetOperator::Union,
             set_quantifier,
             left,
             right,
-        } = q.body.as_ref()
+        } = body
         {
             let distinct = match set_quantifier {
                 a::SetQuantifier::All => false,
                 a::SetQuantifier::Distinct | a::SetQuantifier::None => true,
                 _ => return Err(Error::Unsupported),
             };
-            let mut branch = q.clone();
-            branch.order_by = None;
-            branch.with = None;
-            branch.limit = None;
-            branch.body = left.clone();
-            let l = self.query(&branch, outer)?;
-            branch.body = right.clone();
-            let r = self.query(&branch, outer)?;
+            // Borrow each subtree: cloning the remaining left-deep chain at
+            // every UNION node would use quadratic AST memory.
+            let l = self.query_body(left, None, None, outer)?;
+            let r = self.query_body(right, None, None, outer)?;
             if l.fields.len() != r.fields.len()
                 || l.fields
                     .iter()
@@ -726,7 +743,7 @@ impl Compiler {
                 .map(|(i, f)| column(i, f.data_type))
                 .collect();
             let mut order = vec![];
-            if let Some(o) = &q.order_by {
+            if let Some(o) = order_by {
                 if o.interpolate.is_some() {
                     return Err(Error::Unsupported);
                 }
@@ -765,7 +782,7 @@ impl Compiler {
                     let _ = f;
                 }
             }
-            let limit = match &q.limit {
+            let limit = match limit {
                 None => MAX_ROWS,
                 Some(A::Value(a::Value::Number(n, _))) => {
                     n.parse::<usize>().map_err(|_| Error::Limit)?
@@ -789,7 +806,7 @@ impl Compiler {
                 aggregate: false,
             });
         }
-        if let a::SetExpr::Values(values) = q.body.as_ref() {
+        if let a::SetExpr::Values(values) = body {
             // A single VALUES row has exactly SELECT-without-FROM semantics.
             // Retain the enclosing ORDER/LIMIT and the ordinary expression binder.
             if values.rows.len() != 1 || values.rows[0].is_empty() {
@@ -808,12 +825,16 @@ impl Compiler {
                 .cloned()
                 .map(a::SelectItem::UnnamedExpr)
                 .collect();
-            let mut rewritten = q.clone();
-            rewritten.with = None;
-            *rewritten.body = a::SetExpr::Select(select);
-            return self.query_scoped(&rewritten, outer);
+            return self.query_body(&a::SetExpr::Select(select), order_by, limit, outer);
         }
-        let a::SetExpr::Select(s) = q.body.as_ref() else {
+        // Count leaf queries, including nested subqueries, against the same
+        // 32-query budget. UNION operators do not consume a query: 32 leaves
+        // (31 UNION nodes) fit, leaving 13 leaves beyond DataGrip's 19.
+        self.qcount += 1;
+        if self.qcount > 32 {
+            return Err(Error::Limit);
+        }
+        let a::SetExpr::Select(s) = body else {
             return Err(Error::Unsupported);
         };
         if s.into.is_some() {
@@ -1112,7 +1133,7 @@ impl Compiler {
             }
         }
         let mut order = vec![];
-        if let Some(o) = &q.order_by {
+        if let Some(o) = order_by {
             if o.interpolate.is_some() {
                 return Err(Error::Unsupported);
             }
@@ -1159,7 +1180,7 @@ impl Compiler {
                 });
             }
         }
-        let limit = match &q.limit {
+        let limit = match limit {
             None => MAX_ROWS,
             Some(A::Value(a::Value::Number(n, _))) => {
                 n.parse::<usize>().map_err(|_| Error::Limit)?
@@ -2663,6 +2684,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
             0,
         ) => PgType::Name,
         ("pg_backend_pid", 0) => PgType::Int4,
+        ("txid_current", 0) => PgType::Int8,
         ("age", 1) if a[0].ty == PgType::Xid => PgType::Int4,
         ("greatest", n) if n > 0 => common_type(a.iter())?,
         ("version", 0) => PgType::Text,
@@ -3877,6 +3899,7 @@ impl Runtime<'_> {
             // A standalone GigglesDB server is always a primary, never a
             // standby replaying WAL.
             "pg_is_in_recovery" => B(false),
+            "txid_current" => I(i64::from(self.snapshot.generation as u32)),
             "_service_start_epoch" => {
                 I(self.startup.filter(|v| *v >= 0).ok_or(Error::Unsupported)?)
             }
@@ -4485,11 +4508,17 @@ fn binary_value(l: Value, op: &Op, r: Value) -> R<Value> {
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo
     ) {
         let (l, r) = (integer(l)?, integer(r)?);
+        if matches!(op, Op::Divide | Op::Modulo) && r == 0 {
+            return Err(Error::DivisionByZero);
+        }
         return Ok(I(match op {
             Op::Plus => l.checked_add(r),
             Op::Minus => l.checked_sub(r),
             Op::Multiply => l.checked_mul(r),
             Op::Divide => l.checked_div(r),
+            // PostgreSQL returns zero even for MIN % -1, whose quotient
+            // would overflow the signed integer type.
+            Op::Modulo if r == -1 => Some(0),
             Op::Modulo => l.checked_rem(r),
             _ => None,
         }

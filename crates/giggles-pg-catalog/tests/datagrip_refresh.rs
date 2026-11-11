@@ -462,3 +462,101 @@ fn standalone_relations_have_postgresql_18_column_order_and_types() {
     assert_eq!(T::TimestampTz.oid(), 1184);
     assert_eq!(T::TimestampTz.type_size(), 8);
 }
+
+#[test]
+fn reconnect_txid_and_catalog_union_match_the_snapshot() {
+    let txid = plan_gateway(include_str!("fixtures/datagrip_refresh/current_txid.sql"))
+        .unwrap()
+        .unwrap();
+    let union = plan_gateway(include_str!("fixtures/datagrip_refresh/catalog_union.sql"))
+        .unwrap()
+        .unwrap();
+    for generation in [42, u64::from(u32::MAX), (1 << 32) + 42] {
+        let snapshot = snapshot(generation);
+        let xid = Value::Int(i64::from(generation as u32));
+        let current = execute(&txid, &snapshot, &[]).unwrap();
+        assert_eq!(current.fields, describe(&txid).unwrap());
+        assert_eq!(current.fields.len(), 1);
+        assert_eq!(current.fields[0].name, "current_txid");
+        assert_eq!(current.fields[0].data_type, PgType::Int8);
+        assert_eq!(current.rows, [vec![xid.clone()]]);
+        let catalogs = execute(&union, &snapshot, &[]).unwrap();
+        assert_eq!(catalogs.fields, describe(&union).unwrap());
+        assert_eq!(
+            catalogs
+                .fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.data_type))
+                .collect::<Vec<_>>(),
+            [("oid", PgType::Oid), ("xmin", PgType::Xid)]
+        );
+        assert_eq!(catalogs.rows, [vec![Value::Int(2200), xid.clone()]]);
+        let direct = plan_gateway(
+            "SELECT txid_current(), pg_catalog.txid_current(), age(txid_current()::varchar::xid)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            execute(&direct, &snapshot, &[]).unwrap().rows,
+            [vec![xid.clone(), xid, Value::Int(0)]]
+        );
+    }
+    assert!(catalog_identifier("txid_current"));
+    assert!(plan("SELECT pg_catalog.txid_current(1)").is_err());
+}
+
+#[test]
+fn catalog_union_leaf_budget_accepts_32_and_rejects_larger_chains() {
+    // These constant leaves avoid the independent 32-source budget and stay
+    // beneath the token/constructor guards, exercising the query budget itself.
+    let leaf = "SELECT pg_catalog.txid_current()";
+    let allowed = plan_gateway(&[leaf; 32].join(" UNION ")).unwrap().unwrap();
+    assert_eq!(
+        execute(&allowed, &snapshot(42), &[]).unwrap().rows,
+        [vec![Value::Int(42)]]
+    );
+    for count in [33, 64] {
+        assert!(matches!(
+            plan_gateway(&vec![leaf; count].join(" UNION ")),
+            Err(Error::Limit)
+        ));
+    }
+    // Removing recursive AST clones must preserve the enclosing UNION's
+    // ORDER BY/LIMIT, and WITH bindings must remain visible in both arms.
+    let p = plan("WITH n AS (SELECT oid FROM pg_namespace WHERE oid IN (11,2200)) SELECT oid FROM n UNION SELECT oid FROM n ORDER BY oid DESC LIMIT 1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        execute(&p, &snapshot(42), &[]).unwrap().rows,
+        [vec![Value::Int(2200)]]
+    );
+}
+
+#[test]
+fn bigint_remainder_preserves_sign_nulls_and_zero_errors() {
+    let p = plan("SELECT -5::bigint % 4::bigint, 5::bigint % -4::bigint, '-9223372036854775808'::bigint % -1::bigint, NULL::bigint % 0::bigint, pg_catalog.txid_current() % 4294967296::bigint")
+        .unwrap()
+        .unwrap();
+    assert!(
+        describe(&p)
+            .unwrap()
+            .iter()
+            .all(|f| f.data_type == PgType::Int8)
+    );
+    assert_eq!(
+        execute(&p, &snapshot(42), &[]).unwrap().rows,
+        [vec![
+            Value::Int(-1),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Null,
+            Value::Int(42)
+        ]]
+    );
+    for op in ["%", "/"] {
+        let p = plan(&format!("SELECT pg_catalog.txid_current() {op} 0::bigint"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(execute(&p, &snapshot(42), &[]), Err(Error::DivisionByZero));
+    }
+}

@@ -19,7 +19,9 @@ use std::{
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use wire_support::{bind, cstr, execute, parse, parse_oids, pg_read, pg_send, pg_sync};
 
-const QUERY_IDS: [&str; 4] = [
+const QUERY_IDS: [&str; 6] = [
+    "7209c469ae70459683e52463ffca8884ef6749fee3a10938a86038e2d6847ee1",
+    "5c38acc809e7448b4431731bff8bb4a57f1b810f5130eddb043a75c947328af6",
     "ce55afd5c285256cee19c24138585f984372963ea0563f45304f188a55e868e6",
     "11ea5a7167dc8f283e70839be3e325a76d73651104347388eba835b755e4849c",
     "a531fd2c61434a20a5566159cd425d2cd68ef5f8efe7063f4b4f3ea3fb5c0cc6",
@@ -155,7 +157,10 @@ impl ResultSet {
             .enumerate()
             .filter(|(_, name)| {
                 name.ends_with("state_number")
-                    || matches!(name.as_str(), "con_state_id" | "transaction_id" | "xid")
+                    || matches!(
+                        name.as_str(),
+                        "con_state_id" | "transaction_id" | "current_txid" | "xmin" | "xid"
+                    )
             })
             .flat_map(|(at, _)| {
                 self.rows.iter().filter_map(move |row| {
@@ -246,15 +251,29 @@ async fn query(
 }
 
 async fn replay(engine: Engine) {
-    let captures: Vec<Capture> =
+    let mut captures: Vec<Capture> =
         serde_json::from_str(include_str!("fixtures/datagrip_session/manifest.json")).unwrap();
     assert_eq!(captures.len(), 173);
+    let reconnect: Vec<Capture> =
+        serde_json::from_str(include_str!("fixtures/datagrip_reconnect/manifest.json")).unwrap();
+    assert_eq!(reconnect.len(), 107);
+    assert_eq!(
+        reconnect
+            .iter()
+            .map(|c| c.session.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["1060084418", "1060084419", "1060084420"])
+    );
+    captures.extend(reconnect);
+    let reconnect_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/datagrip_reconnect");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/datagrip_session");
     let fixture = Fixture::new(engine).await;
     let mut stream = fixture.connect().await;
     let mut session = captures[0].session.clone();
     let mut sessions = vec![session.clone()];
     let mut max_xid = None;
+    let mut initial_xid = None;
     let mut refresh_xid = None;
     let mut hashes = BTreeSet::new();
     let mut created = false;
@@ -267,8 +286,17 @@ async fn replay(engine: Engine) {
             stream = fixture.connect().await;
             session.clone_from(&capture.session);
             sessions.push(session.clone());
+            if matches!(session.as_str(), "1060084418" | "1060084419" | "1060084420") {
+                refresh_xid = max_xid;
+            }
         }
-        let sql = std::fs::read_to_string(root.join(&capture.file)).unwrap();
+        let capture_root = if matches!(session.as_str(), "1060084418" | "1060084419" | "1060084420")
+        {
+            &reconnect_root
+        } else {
+            &root
+        };
+        let sql = std::fs::read_to_string(capture_root.join(&capture.file)).unwrap();
         assert!(!sql.contains('\r'), "LF fixture {}", capture.file);
         let (sql, oids) = jdbc_sql(&sql);
         // The server hashes the trimmed PostgreSQL SQL, after JDBC renumbering.
@@ -282,6 +310,7 @@ async fn replay(engine: Engine) {
             assert!(!created);
             assert_eq!(session, "1060084415");
             refresh_xid = Some(max_xid.expect("initial load returned catalog xid"));
+            initial_xid = refresh_xid;
             created = true;
         }
         let result = query(
@@ -292,6 +321,11 @@ async fn replay(engine: Engine) {
             refresh_xid.or(max_xid).unwrap_or(0),
         )
         .await;
+        // On reconnect JDBC saves current_txid for the following xid filters.
+        // Fall back to the last state seen until that result arrives.
+        if let Some(xid) = result.values("current_txid").next() {
+            refresh_xid = Some(xid.parse::<u32>().expect("current transaction xid"));
+        }
         if let Some(xid) = result.max_xid() {
             max_xid = Some(max_xid.unwrap_or(0).max(xid));
         }
@@ -299,7 +333,10 @@ async fn replay(engine: Engine) {
             assert!(!result.values("table_name").any(|name| name == "table_name"));
             assert!(!result.values("column_name").any(|name| name == "test"));
         }
-        if matches!(capture.statement.as_str(), "94685802" | "94685862") {
+        if matches!(
+            capture.statement.as_str(),
+            "94685802" | "94685862" | "94685924" | "94685976"
+        ) {
             assert!(sql.contains("pg_catalog.age("), "incremental tables query");
             assert!(
                 result.values("table_name").any(|name| name == "table_name"),
@@ -327,7 +364,10 @@ async fn replay(engine: Engine) {
             "1060084414",
             "1060084415",
             "1060084416",
-            "1060084417"
+            "1060084417",
+            "1060084418",
+            "1060084419",
+            "1060084420"
         ]
     );
     for expected in QUERY_IDS {
@@ -337,12 +377,33 @@ async fn replay(engine: Engine) {
         );
     }
     let refresh_sessions = BTreeSet::from(["1060084416".to_owned(), "1060084417".to_owned()]);
-    assert_eq!(refreshed_tables, refresh_sessions);
     assert_eq!(refreshed_columns, refresh_sessions);
+    assert_eq!(
+        refreshed_tables,
+        BTreeSet::from([
+            "1060084416".to_owned(),
+            "1060084417".to_owned(),
+            "1060084418".to_owned(),
+            "1060084419".to_owned(),
+        ])
+    );
+    let visible = query(
+        &mut stream,
+        captures.last().unwrap(),
+        "SELECT relname AS table_name FROM pg_catalog.pg_class WHERE relname='table_name'",
+        &[],
+        max_xid.unwrap(),
+    )
+    .await;
+    assert!(
+        visible
+            .values("table_name")
+            .any(|name| name == "table_name")
+    );
     println!(
-        "DataGrip {engine:?}: {} statements, zero ErrorResponses; initial xid {}, final xid {}; table_name/test found in both refresh sessions",
+        "DataGrip {engine:?}: {} statements, zero ErrorResponses; initial xid {}, final xid {}; table_name/test found in refresh sessions; table_name visible after all reconnects",
         captures.len(),
-        refresh_xid.unwrap(),
+        initial_xid.unwrap(),
         max_xid.unwrap()
     );
     pg_send(&mut stream, b'X', &[]).await;

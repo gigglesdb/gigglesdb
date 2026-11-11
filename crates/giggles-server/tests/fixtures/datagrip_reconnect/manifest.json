@@ -1,0 +1,858 @@
+[
+ {
+  "session": "1060084418",
+  "statement": "94685893",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685893.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685894",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685894.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685895",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685895.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685896",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=7209c469ae70459683e52463ffca8884ef6749fee3a10938a86038e2d6847ee1",
+  "file": "session_1060084418_94685896.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685897",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685897.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685898",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685898.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685899",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685899.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685900",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685900.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685901",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685901.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685902",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685902.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685903",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685903.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685904",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685904.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685905",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685905.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685906",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685906.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685907",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685907.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685908",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685908.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685909",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685909.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685910",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685910.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685911",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685911.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685912",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685912.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685913",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685913.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685914",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685914.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685915",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685915.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685916",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685916.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685917",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685917.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685918",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685918.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685919",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685919.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685920",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685920.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685921",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685921.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685922",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685922.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685923",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685923.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685924",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685924.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685925",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685925.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685926",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685926.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685927",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685927.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685928",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685928.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685929",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685929.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685930",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685930.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685931",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685931.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685932",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685932.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685933",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685933.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685934",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685934.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685935",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685935.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685936",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685936.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685937",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685937.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685938",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685938.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685939",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685939.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685940",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685940.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685941",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685941.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685942",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685942.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685943",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685943.sql"
+ },
+ {
+  "session": "1060084418",
+  "statement": "94685944",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084418_94685944.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685945",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685945.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685946",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685946.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685947",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685947.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685948",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=7209c469ae70459683e52463ffca8884ef6749fee3a10938a86038e2d6847ee1",
+  "file": "session_1060084419_94685948.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685949",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685949.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685950",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685950.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685951",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685951.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685952",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685952.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685953",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685953.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685954",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685954.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685955",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685955.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685956",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685956.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685957",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685957.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685958",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685958.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685959",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685959.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685960",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685960.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685961",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685961.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685962",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685962.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685963",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685963.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685964",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685964.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685965",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685965.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685966",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685966.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685967",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685967.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685968",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685968.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685969",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685969.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685970",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685970.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685971",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685971.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685972",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685972.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685973",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685973.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685974",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685974.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685975",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685975.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685976",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685976.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685977",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685977.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685978",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685978.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685979",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685979.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685980",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685980.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685981",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685981.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685982",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685982.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685983",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685983.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685984",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685984.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685985",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685985.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685986",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685986.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685987",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685987.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685988",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685988.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685989",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685989.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685990",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685990.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685991",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685991.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685992",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685992.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685993",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685993.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685994",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685994.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685995",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685995.sql"
+ },
+ {
+  "session": "1060084419",
+  "statement": "94685996",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084419_94685996.sql"
+ },
+ {
+  "session": "1060084420",
+  "statement": "94685997",
+  "tag": "introspection",
+  "failed": false,
+  "detail": null,
+  "file": "session_1060084420_94685997.sql"
+ },
+ {
+  "session": "1060084420",
+  "statement": "94685998",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=7209c469ae70459683e52463ffca8884ef6749fee3a10938a86038e2d6847ee1",
+  "file": "session_1060084420_94685998.sql"
+ },
+ {
+  "session": "1060084420",
+  "statement": "94685999",
+  "tag": "introspection",
+  "failed": true,
+  "detail": "Detail: phase=catalog planning; query_id=5c38acc809e7448b4431731bff8bb4a57f1b810f5130eddb043a75c947328af6",
+  "file": "session_1060084420_94685999.sql"
+ }
+]
