@@ -144,3 +144,6 @@ mod v2_ddl_authority;
 mod v2_uuid;
 #[path = "bulk_wire_admission.rs"]
 mod bulk_wire_admission;
+
+#[path = "qualified_wildcard.rs"]
+mod qualified_wildcard;

@@ -343,3 +343,6 @@ mod key_bounds_offset;
 
 #[path = "select_distinct.rs"]
 mod select_distinct;
+
+#[path = "qualified_wildcard.rs"]
+mod qualified_wildcard;

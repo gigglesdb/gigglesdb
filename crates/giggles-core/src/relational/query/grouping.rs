@@ -308,7 +308,7 @@ fn output_scalar(item: &Item) -> R<Scalar> {
             a.call_name(),
             vec![arg.clone().unwrap_or(Scalar::Literal(Value::Int(1)))],
         )),
-        Item::Star => Err(SqlError::GroupingError),
+        Item::Star | Item::QualifiedStar { .. } => Err(SqlError::GroupingError),
     }
 }
 fn resolve_output(
@@ -346,11 +346,13 @@ fn resolve_output(
     }
     Ok(s.clone())
 }
-pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> Vec<(Item, Option<String>)> {
+pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> R<Vec<(Item, Option<String>)>> {
     let mut projection = vec![];
     for (item, alias) in &q.items {
-        if matches!(item, Item::Star) {
-            for (source, table) in q.sources.iter().zip(tables) {
+        if matches!(item, Item::Star | Item::QualifiedStar { .. }) {
+            for index in q.star_sources(item)? {
+                let source = &q.sources[index];
+                let table = tables[index];
                 for (n, column) in table.columns.iter().enumerate() {
                     if table.hidden_rowid() != Some(n) {
                         projection.push((
@@ -367,7 +369,7 @@ pub(super) fn projection(q: &Query, tables: &[&TableDef]) -> Vec<(Item, Option<S
             projection.push((item.clone(), alias.clone()));
         }
     }
-    projection
+    Ok(projection)
 }
 pub(super) fn output_order(
     q: &Query,
@@ -403,7 +405,7 @@ pub(super) fn bind<'a>(
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
     subqueries: Vec<(usize, BoundQuery<'a>)>,
 ) -> R<BoundQuery<'a>> {
-    let projection = projection(q, tables);
+    let projection = projection(q, tables)?;
     if projection.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }

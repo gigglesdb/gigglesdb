@@ -131,6 +131,10 @@ enum Item {
     Aggregate(Aggregate, Option<Scalar>),
     Scalar(Scalar),
     Star,
+    QualifiedStar {
+        schema: Option<String>,
+        relation: String,
+    },
 }
 #[derive(Debug, Clone)]
 struct Join {
@@ -176,6 +180,8 @@ struct QueryClauses {
     group: Vec<Scalar>,
     having: Option<Filter>,
     offset: Option<Expr>,
+    // Explicit aliases hide schema-qualified relation names, even `FROM t AS t`.
+    aliased_sources: Vec<usize>,
 }
 #[derive(Debug, Clone)]
 enum Filter {
@@ -1499,17 +1505,17 @@ impl Parser {
         let (qualifier, name) = self.qualified_name()?;
         Ok(ColumnRef { qualifier, name })
     }
-    fn source(&mut self) -> R<Source> {
+    fn source(&mut self) -> R<(Source, bool)> {
         let name = self.table_name()?;
-        let alias = if self.word("as")
+        let aliased = self.word("as")
             || matches!(self.tokens.get(self.at), Some(Token::QuotedIdent(_)))
-            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "offset", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()))
-        {
+            || matches!(self.tokens.get(self.at), Some(Token::Word(w)) if !["inner", "left", "join", "where", "order", "limit", "offset", "group", "having", "on", "right", "full", "cross"].contains(&w.as_str()));
+        let alias = if aliased {
             self.name()?
         } else {
             split_key(&name).1.into()
         };
-        Ok(Source { name, alias })
+        Ok((Source { name, alias }, aliased))
     }
 }
 
@@ -1618,6 +1624,36 @@ fn integer_width(ty: &DataType) -> bool {
 }
 
 impl Query {
+    /// Resolve wildcard scope after schema binding; aliases hide base names.
+    fn star_sources(&self, item: &Item) -> R<Vec<usize>> {
+        let Item::QualifiedStar { schema, relation } = item else {
+            return Ok((0..self.sources.len()).collect());
+        };
+        let mut found = Vec::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            let matches = if let Some(schema) = schema {
+                let (source_schema, source_name) = split_key(&source.name);
+                source_schema == schema
+                    && source_name == relation
+                    && !self
+                        .clauses()
+                        .is_some_and(|c| c.aliased_sources.contains(&index))
+            } else {
+                &source.alias == relation
+            };
+            if matches {
+                found.push(index);
+            }
+        }
+        if found.is_empty() {
+            return Err(SqlError::UnknownTable);
+        }
+        if found.len() > 1 {
+            return Err(SqlError::Duplicate);
+        }
+        Ok(found)
+    }
+
     fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
         for (item, _) in &self.items {
             match item {
@@ -1676,7 +1712,7 @@ impl Query {
             && self.items.iter().all(|(item, _)| match item {
                 Item::Aggregate(..) => false,
                 Item::Scalar(s) => !grouping::contains_aggregate(s),
-                Item::Star => true,
+                Item::Star | Item::QualifiedStar { .. } => true,
             })
     }
     pub(super) fn subquery_tables(&self) -> Vec<String> {
@@ -1810,6 +1846,8 @@ impl Query {
             let item_start = p.at;
             let mut item = if p.sym('*') {
                 Item::Star
+            } else if let Some(item) = Self::parse_qualified_star(p)? {
+                item
             } else {
                 let aggregate = match p.tokens.get(p.at) {
                     Some(Token::Word(w)) if p.tokens.get(p.at + 1) == Some(&Token::Symbol('(')) => {
@@ -1871,6 +1909,31 @@ impl Query {
             }
         }
         Ok(items)
+    }
+    fn parse_qualified_star(p: &mut Parser) -> R<Option<Item>> {
+        let tokens = &p.tokens[p.at..];
+        let (schema, relation_at, width) = match tokens {
+            [
+                Token::Word(_) | Token::QuotedIdent(_),
+                Token::Symbol('.'),
+                Token::Symbol('*'),
+                ..,
+            ] => (None, p.at, 3),
+            [
+                Token::Word(schema) | Token::QuotedIdent(schema),
+                Token::Symbol('.'),
+                Token::Word(_) | Token::QuotedIdent(_),
+                Token::Symbol('.'),
+                Token::Symbol('*'),
+                ..,
+            ] => (Some(ident::truncate(schema, 63).to_owned()), p.at + 2, 5),
+            _ => return Ok(None),
+        };
+        let end = p.at + width;
+        p.at = relation_at;
+        let relation = p.name()?;
+        p.at = end;
+        Ok(Some(Item::QualifiedStar { schema, relation }))
     }
     pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
@@ -1978,7 +2041,7 @@ impl Query {
             match item {
                 Item::Aggregate(..) => return Err(SqlError::GroupingError),
                 Item::Scalar(value) => reject_nested_aggregate(value)?,
-                Item::Star => {}
+                Item::Star | Item::QualifiedStar { .. } => {}
             }
         }
         Ok(Self {
@@ -2011,8 +2074,13 @@ impl Query {
         let aggregate_filters = aggregate_filter::normalize(p)?;
         let mut items = Self::parse_items(p)?;
         let mut sources = vec![];
+        let mut aliased_sources = vec![];
         if p.word("from") {
-            sources.push(p.source()?);
+            let (source, aliased) = p.source()?;
+            if aliased {
+                aliased_sources.push(0);
+            }
+            sources.push(source);
         }
         let mut joins = vec![];
         loop {
@@ -2027,13 +2095,29 @@ impl Query {
                 break;
             };
             p.need("join")?;
-            sources.push(p.source()?);
+            let (source, aliased) = p.source()?;
+            if aliased {
+                aliased_sources.push(sources.len());
+            }
+            sources.push(source);
             if sources.len() > MAX_SOURCES {
                 return Err(SqlError::Limit);
             }
             p.need("on")?;
             let on = Filter::parse(p, 0, 0)?;
             joins.push(Join { left, on });
+        }
+        // Only schema-qualified wildcards need explicit-alias metadata.
+        if !items.iter().any(|(item, _)| {
+            matches!(
+                item,
+                Item::QualifiedStar {
+                    schema: Some(_),
+                    ..
+                }
+            )
+        }) {
+            aliased_sources.clear();
         }
         let mut filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
@@ -2173,7 +2257,12 @@ impl Query {
             joins,
             items,
             predicates,
-            filter: if !distinct && group.is_empty() && having.is_none() && offset.is_none() {
+            filter: if !distinct
+                && group.is_empty()
+                && having.is_none()
+                && offset.is_none()
+                && aliased_sources.is_empty()
+            {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
@@ -2182,6 +2271,7 @@ impl Query {
                     group,
                     having,
                     offset,
+                    aliased_sources,
                 })))
             },
             order,
@@ -2442,7 +2532,7 @@ impl Query {
             && items.iter().all(|(item, _)| match item {
                 Item::Scalar(s) => scalar(s),
                 Item::Aggregate(_, arg) => arg.as_ref().is_none_or(scalar),
-                Item::Star => false,
+                Item::Star | Item::QualifiedStar { .. } => false,
             })
             && predicate.as_ref().is_none_or(filter)
             && order.iter().all(|(s, _, _)| scalar(s))
@@ -2515,7 +2605,7 @@ impl Query {
             && items.iter().all(|(item, _)| match item {
                 Item::Scalar(s) | Item::Aggregate(_, Some(s)) => scalar(s),
                 Item::Aggregate(_, None) => true,
-                Item::Star => false,
+                Item::Star | Item::QualifiedStar { .. } => false,
             })
             && filter.as_ref().is_none_or(filter_ok)
             && order.iter().all(|(s, _, _)| scalar(s))
@@ -2693,7 +2783,7 @@ impl Query {
             && predicates.is_empty()
             && items.iter().all(|(item, _)| match item {
                 Item::Scalar(s) => operand(s),
-                Item::Aggregate(_, _) | Item::Star => false,
+                Item::Aggregate(_, _) | Item::Star | Item::QualifiedStar { .. } => false,
             })
             && predicate.as_ref().is_none_or(filter)
             && order.iter().all(|(s, _, _)| operand(s))
@@ -2782,8 +2872,9 @@ impl Query {
         let mut outputs = Vec::new();
         for (item, _) in &self.items {
             match item {
-                Item::Star => {
-                    for source in &self.sources {
+                Item::Star | Item::QualifiedStar { .. } => {
+                    for source in self.star_sources(item)? {
+                        let source = &self.sources[source];
                         let table = state
                             .tables
                             .get(&source.name)
@@ -2836,10 +2927,11 @@ impl Query {
                 }
                 *slot = Some(targets[output].clone());
             }
-            output += if matches!(item, Item::Star) {
-                self.sources
-                    .iter()
+            output += if matches!(item, Item::Star | Item::QualifiedStar { .. }) {
+                self.star_sources(item)?
+                    .into_iter()
                     .map(|source| {
+                        let source = &self.sources[source];
                         state
                             .tables
                             .get(&source.name)
@@ -2868,11 +2960,11 @@ impl Query {
             for (item, _) in &self.items {
                 match item {
                     Item::Scalar(scalar) => projection.push(Some(scalar)),
-                    Item::Star => {
-                        let width = bound
-                            .tables
-                            .iter()
-                            .map(|table| table.logical_columns().count())
+                    Item::Star | Item::QualifiedStar { .. } => {
+                        let width = self
+                            .star_sources(item)?
+                            .into_iter()
+                            .map(|source| bound.tables[source].logical_columns().count())
                             .sum();
                         projection.extend(std::iter::repeat_n(None, width));
                     }
@@ -3093,7 +3185,7 @@ impl Query {
         let distinct_order = self
             .distinct()
             .then(|| {
-                let projection = grouping::projection(self, &tables);
+                let projection = grouping::projection(self, &tables)?;
                 self.order
                     .iter()
                     .map(|(s, _, _)| {
@@ -3103,7 +3195,7 @@ impl Query {
             })
             .transpose()?;
         let distinct_order_slots = if let Some(order) = &distinct_order {
-            let projection = grouping::projection(self, &tables);
+            let projection = grouping::projection(self, &tables)?;
             order
                 .iter()
                 .map(|s| grouping::output_slot(s, &projection, &resolve, &tables))
@@ -3386,14 +3478,16 @@ impl Query {
                         },
                     );
                 }
-                Item::Star => {
+                Item::Star | Item::QualifiedStar { .. } => {
+                    let sources = self.star_sources(item)?;
                     if tables.is_empty() {
                         return Err(SqlError::Unsupported);
                     }
                     if alias.is_some() {
                         return Err(SqlError::Unsupported);
                     }
-                    for (source, t) in tables.iter().enumerate() {
+                    for source in sources {
+                        let t = tables[source];
                         for (column, d) in t.columns.iter().enumerate() {
                             if t.hidden_rowid() == Some(column) {
                                 continue;
@@ -4531,8 +4625,10 @@ impl Query {
         let mut n = 0i64;
         for (item, _) in &self.items {
             match item {
-                Item::Star => {
-                    for (source, table) in self.sources.iter().zip(tables) {
+                Item::Star | Item::QualifiedStar { .. } => {
+                    for index in self.star_sources(item)? {
+                        let source = &self.sources[index];
+                        let table = tables[index];
                         for (i, column) in table.columns.iter().enumerate() {
                             if table.hidden_rowid() == Some(i) {
                                 continue;
