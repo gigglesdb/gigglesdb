@@ -821,6 +821,7 @@ impl Grouping {
         source: &dyn scan::RowSource,
         params: &[Value],
         execution: &Execution<'_>,
+        exists: bool,
     ) -> R<SqlResult> {
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
@@ -870,6 +871,7 @@ impl Grouping {
         let mut group_bytes = retention.used() - initial_bytes;
         drop(retention);
         let mut aggregate_work = 0;
+        let outer = query.outer_values(execution);
 
         {
             let mut meter = scan::Meter::per_row(cancel);
@@ -924,10 +926,10 @@ impl Grouping {
                 group_bytes = group_bytes + retention.used() - before_group;
                 Ok(())
             };
-            if query.tables.is_empty() {
+            if query.query.sources.is_empty() {
                 meter.tick()?;
                 accept(&Tuple {
-                    values: vec![],
+                    values: outer.clone(),
                     version: 0,
                 })?;
             } else {
@@ -936,7 +938,7 @@ impl Grouping {
                     hi: std::ops::Bound::Unbounded,
                 };
                 let input = source.scan(query.tables[0], &range, scan::Direction::Forward)?;
-                for row in join_rows(query, source, input, params, &mut meter, &execution.visits) {
+                for row in join_rows(query, source, input, params, &mut meter, &execution.visits, &outer, exists) {
                     accept(&row?)?;
                 }
             }
@@ -945,6 +947,7 @@ impl Grouping {
         let output_start = retention.used();
         let mut rows = vec![];
         let mut distinct = std::collections::BTreeSet::new();
+        let mut skipped = 0;
         for (key, (mut values, auxiliary)) in groups {
             finish_aggregates(
                 &self.aggregates,
@@ -962,6 +965,15 @@ impl Grouping {
             if let Some(h) = &self.having
                 && h.eval(&row, params, &mut work)? != Some(true)
             {
+                continue;
+            }
+            if exists && (!query.query.distinct() || page.offset == 0) {
+                if skipped == page.offset {
+                    retention.release(group_bytes);
+                    result.rows.push(SqlRow { values: vec![], version: 0 });
+                    return Ok(result);
+                }
+                skipped += 1;
                 continue;
             }
             let mut work = 0;

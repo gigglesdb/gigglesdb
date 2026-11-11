@@ -1,0 +1,190 @@
+//! Demand-driven EXISTS uses the caller's source and statement budgets.
+use super::*;
+
+impl BoundQuery<'_> {
+    pub(super) fn outer_values(&self, execution: &Execution<'_>) -> Vec<Vec<Value>> {
+        let mut outer = vec![vec![]; self.tables.len().saturating_sub(self.query.sources.len())];
+        let frames = execution.frames.borrow();
+        for slot in &self.outer_slots {
+            outer[slot.slot - self.query.sources.len()] = frames[frames.len() - slot.depth][slot.source].clone();
+        }
+        outer
+    }
+    pub(super) fn correlated(&self, depth: usize) -> bool {
+        self.outer_slots.iter().any(|s| s.depth > depth)
+            || self.subqueries.correlated(depth + 1)
+    }
+    fn exists(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+        execution: &Execution<'_>,
+    ) -> R<bool> {
+        if execution.cancelled() { return Err(SqlError::Aborted); }
+        let number = |e: Option<&Expr>, default, limit| -> R<Option<u64>> {
+            let mut value = e.map(|e| e.value(params)).transpose()?;
+            if limit && matches!(e, Some(Expr::Param(n)) if execution.declared.get(n-1) == Some(&Some(DataType::Numeric))) {
+                value = value.map(|v| assignment::convert(v, &DataType::Numeric, &DataType::BigInt, None)).transpose()?;
+            }
+            match value {
+                Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
+                Some(Value::Int(_)) => Err(if limit { SqlError::InvalidRowCountInLimitClause } else { SqlError::InvalidRowCountInResultOffsetClause }),
+                None | Some(Value::Null) => Ok(default),
+                _ => Err(SqlError::Limit),
+            }
+        };
+        let offset = number(self.query.offset(), Some(0), false)?.unwrap_or(0);
+        if number(self.query.limit.as_ref(), None, true)? == Some(0) { return Ok(false); }
+        if let Some(grouping) = &self.grouping {
+            return Ok(!grouping.execute(self, state, source, params, execution, true)?.rows.is_empty());
+        }
+        let outer = self.outer_values(execution);
+        let mut cancel = || execution.cancelled();
+        let mut meter = scan::Meter::per_row(&mut cancel);
+        let mut skipped = 0;
+        let mut seen = BTreeSet::new();
+        let mut distinct_bytes = 0;
+        let result = (|| {
+        let mut accept = |row: &Tuple| -> R<bool> {
+            let qualifies = self.filter.as_ref().map(|f| f.eval_with_subqueries(
+                row, params, &mut 0, self, state, source, execution)).transpose()?;
+            if !matches!(qualifies, None | Some(Some(true))) { return Ok(false); }
+            if self.query.distinct() && offset > 0 && !self.aggregate {
+                let key = grouping::Key(self.project_tuple(row, params, &mut 0, &mut 0)?.values);
+                if seen.contains(&key) { return Ok(false); }
+                distinct_bytes += distinct_charge(&key.0, &[], &mut execution.retention.borrow_mut())?;
+                seen.insert(key);
+            }
+            if skipped < offset { skipped += 1; return Ok(false); }
+            Ok(true)
+        };
+        if self.query.sources.is_empty() {
+            meter.tick()?;
+            return accept(&Tuple { values: outer, version: 0 });
+        }
+        let (empty, bounds) = self.base_bounds(params)?;
+        if empty { return Ok(self.aggregate && offset == 0); }
+        let range = scan::KeyRange::from_bounds(bounds);
+        let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+        for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true) {
+            if accept(&row?)? && !self.aggregate { return Ok(true); }
+        }
+        Ok(self.aggregate && offset == 0)
+        })();
+        execution.retention.borrow_mut().release(distinct_bytes);
+        result
+    }
+}
+
+impl Execution<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn exists_filter(
+        &self,
+        child: &BoundQuery<'_>,
+        key: usize,
+        row: &Tuple,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+    ) -> R<bool> {
+        let correlated = child.correlated(0);
+        if !correlated && let Some(value) = self.exists.borrow().get(&key) { return Ok(*value); }
+        let bytes = row.values.iter().map(|v| std::mem::size_of_val(v.as_slice())
+            + v.iter().map(value_bytes).sum::<usize>()).sum::<usize>()
+            .checked_mul(2).ok_or(SqlError::Limit)?;
+        self.retention.borrow_mut().charge(bytes)?;
+        self.frames.borrow_mut().push(row.values.clone());
+        let result = child.exists(state, source, params, self);
+        self.frames.borrow_mut().pop();
+        self.retention.borrow_mut().release(bytes);
+        let value = result?;
+        if self.cancelled() { return Err(SqlError::Aborted); }
+        if !correlated {
+            self.retention.borrow_mut().charge(64)?;
+            self.exists.borrow_mut().insert(key, value);
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+impl Prepared {
+    pub(crate) fn exists_test_query(&mut self, sql: &str) {
+        self.unbound_statement = None;
+        self.statement = Statement::Query(Query::parse(&mut Parser {
+            tokens: lex(sql).unwrap(), at: 0, params: BTreeSet::new(), relations: vec![],
+        }).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn state() -> Relational {
+        let mut state = Relational::default();
+        for sql in ["CREATE TABLE o(id int)", "CREATE TABLE i(k int, v int)",
+            "INSERT INTO o VALUES(1),(2),(3),(NULL)",
+            "INSERT INTO i VALUES(1,NULL),(2,20),(2,21),(NULL,99)"] {
+            let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&p, &[], None, || false).unwrap();
+        }
+        state
+    }
+    fn query(sql: &str) -> Query {
+        let mut p = Prepared::parse("SELECT 1", 1, 0).unwrap();
+        p.exists_test_query(sql);
+        let Statement::Query(q) = p.statement else { unreachable!() }; q
+    }
+    #[test]
+    fn oracle_filters_projection_elision_and_nested_scopes() {
+        let state = state();
+        for (term, count) in [
+            ("EXISTS(SELECT NULL FROM i WHERE k=o.id)", 2),
+            ("NOT EXISTS(SELECT NULL FROM i WHERE k=o.id)", 2),
+            ("EXISTS(SELECT 1/0 FROM i WHERE k=o.id)", 2),
+            ("EXISTS(SELECT 1 FROM i LIMIT 0)", 0),
+            ("EXISTS(SELECT count(*) FROM i WHERE false)", 4),
+            ("EXISTS(SELECT count(*) FROM i WHERE false HAVING count(*)=0)", 4),
+            ("EXISTS(SELECT 1 FROM i x WHERE EXISTS(SELECT NULL WHERE x.k=o.id))", 2),
+            ("EXISTS(SELECT 1 FROM i o WHERE o.k=1)", 4),
+            ("EXISTS(SELECT DISTINCT k FROM i WHERE k=2 OFFSET 1)", 0),
+            ("EXISTS(SELECT DISTINCT count(*) FROM i OFFSET 1)", 0),
+            ("EXISTS(SELECT count(*) FROM i WHERE k=o.id GROUP BY k HAVING count(*)>0)", 2),
+        ] {
+            let q = query(&format!("SELECT id FROM o WHERE {term}"));
+            assert_eq!(q.bind(&state, 0, &[]).unwrap().execute(&state,
+                &scan::LegacyRows(&state), &[], &mut || false).unwrap().rows.len(), count, "{term}");
+        }
+        assert!(Prepared::parse("SELECT 1 WHERE EXISTS(SELECT NULL)", 1, state.epoch).is_err());
+        for (negation, expected) in [("", vec![Value::Int(1), Value::Int(2)]),
+            ("NOT ", vec![Value::Int(3), Value::Null])] {
+            let q = query(&format!("SELECT id FROM o WHERE {negation}EXISTS(SELECT v FROM i WHERE k=o.id) ORDER BY id"));
+            let rows = q.bind(&state, 0, &[]).unwrap().execute(&state, &scan::LegacyRows(&state), &[], &mut || false).unwrap().rows;
+            assert_eq!(rows.into_iter().map(|r| r.values[0].clone()).collect::<Vec<_>>(), expected);
+        }
+        let q = query("SELECT id FROM o WHERE EXISTS(SELECT 1 FROM i WHERE k=o.id)");
+        assert_eq!(q.bind(&state, 0, &[]).unwrap().matching_rows(&state, &scan::LegacyRows(&state), &[],
+            &mut scan::Retention::new(scan::retention_limit()), &mut || false).unwrap().len(), 2);
+    }
+    #[test]
+    fn cache_visits_cancellation_and_retention_are_statement_wide() {
+        let state = state();
+        let source = scan::LegacyRows(&state);
+        let q = query("SELECT id FROM o WHERE EXISTS(SELECT 1/0 FROM i)");
+        let bound = q.bind(&state, 0, &[]).unwrap();
+        let mut cancel = || false;
+        let execution = Execution::new(&mut cancel, &[]);
+        assert_eq!(bound.execute_context(&state, &source, &[], &[], &execution, false, false).unwrap().rows.len(), 4);
+        assert_eq!(execution.visits.get(), 1);
+        assert_eq!(bound.execute(&state, &source, &[], &mut || true), Err(SqlError::Aborted));
+        for budget in [true, false] {
+            let mut cancel = || false;
+            let execution = Execution::new(&mut cancel, &[]);
+            if budget { execution.visits.set(MAX_JOIN_VISITS); }
+            else { *execution.retention.borrow_mut() = scan::Retention::new(1); }
+            assert_eq!(bound.execute_context(&state, &source, &[], &[], &execution, false, false), Err(SqlError::Limit));
+            assert!(execution.frames.borrow().is_empty());
+        }
+    }
+}

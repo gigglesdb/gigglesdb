@@ -11,6 +11,7 @@ mod insert_values;
 mod schema_names;
 mod subplans;
 mod outer;
+mod exists;
 use subplans::{SubplanMode, Subplans};
 pub(super) use functions::comparison_requires_filter;
 use functions::{BoundScalar, Scalar};
@@ -223,7 +224,6 @@ enum BoundFilter {
         negated: bool,
         clock: Option<super::clock::ExecutionClock>,
     },
-    #[allow(dead_code)] // Execution belongs to C4; public admission remains off.
     Exists {
         query: usize,
         negated: bool,
@@ -1197,12 +1197,16 @@ struct Execution<'a> {
     subqueries: RefCell<BTreeMap<usize, MaterializedSubquery>>,
     retention: RefCell<scan::Retention>,
     declared: Vec<Option<DataType>>,
+    exists: RefCell<BTreeMap<usize, bool>>,
+    frames: RefCell<Vec<Vec<Vec<Value>>>>,
 }
 impl<'a> Execution<'a> {
     fn new(cancel: &'a mut dyn FnMut() -> bool, declared: &[Option<DataType>]) -> Self {
         Self {
             cancel: RefCell::new(cancel),
             declared: declared.to_vec(),
+            exists: RefCell::new(BTreeMap::new()),
+            frames: RefCell::new(Vec::new()),
             visits: Cell::new(0),
             subqueries: RefCell::new(BTreeMap::new()),
             retention: RefCell::new(scan::Retention::new(scan::retention_limit())),
@@ -1245,6 +1249,9 @@ impl BoundFilter {
         execution: &Execution<'_>,
     ) -> R<Option<bool>> {
         match self {
+            Self::Exists { query, negated } => Ok(Some(execution.exists_filter(
+                owner.subqueries.get(*query, SubplanMode::Exists)?, *query, row, state, source, params,
+            )? != *negated)),
             Self::InSubquery {
                 value,
                 query,
@@ -3629,6 +3636,7 @@ impl Tuple {
 pub(super) const MAX_JOIN_VISITS: usize = 1 << 24;
 // Depth-first streaming expansion retains one candidate per joined source. The
 // statement budget caps candidate visits over consumed input, including point hits.
+#[allow(clippy::too_many_arguments)]
 fn join_rows<'a>(
     query: &'a BoundQuery<'_>,
     source: &'a dyn scan::RowSource,
@@ -3636,6 +3644,8 @@ fn join_rows<'a>(
     params: &'a [Value],
     meter: &'a mut scan::Meter<'_>,
     visits: &'a Cell<usize>,
+    outer: &'a [Vec<Value>],
+    charge_base: bool,
 ) -> impl Iterator<Item = R<Tuple>> + 'a {
     struct Frame<'a> {
         rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
@@ -3665,7 +3675,7 @@ fn join_rows<'a>(
                 let candidate = frames[depth].rows.next();
                 if let Some(candidate) = candidate {
                     meter.tick()?;
-                    if depth > 0 {
+                    if depth > 0 || charge_base {
                         charge_candidate(visits)?;
                     }
                     let candidate = candidate?;
@@ -3675,6 +3685,8 @@ fn join_rows<'a>(
                     let equality_match = depth == 0
                         || query.joins[depth - 1].matches(&row, &candidate.row.values)?;
                     row.values.push(candidate.row.values.clone());
+                    row.values.resize_with(query.query.sources.len(), Vec::new);
+                    row.values.extend_from_slice(outer);
                     if depth > 0 {
                         let mut work = 0;
                         if !equality_match
@@ -3694,6 +3706,8 @@ fn join_rows<'a>(
                     frames[depth].extended = true;
                     row.values
                         .push(vec![Value::Null; query.tables[depth].columns.len()]);
+                    row.values.resize_with(query.query.sources.len(), Vec::new);
+                    row.values.extend_from_slice(outer);
                     row.version = 0;
                 } else {
                     frames.pop();
@@ -4158,11 +4172,12 @@ impl BoundQuery<'_> {
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Vec<(Vec<u8>, SqlRow)>> {
         let execution = Execution::new(cancel, &self.declared);
+        execution.retention.borrow_mut().charge(retention.used())?;
         if !self.outer_slots.is_empty() {
             return Err(SqlError::Unsupported); // C4 supplies outer tuples.
         }
-        self.subqueries.visit(&mut |_, child| {
-            if child.outer_slots.is_empty() { Ok(()) } else { Err(SqlError::Unsupported) }
+        self.subqueries.visit(&mut |mode, child| {
+            if mode == SubplanMode::Exists || !child.correlated(0) { Ok(()) } else { Err(SqlError::Unsupported) }
         })?;
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
@@ -4213,6 +4228,7 @@ impl BoundQuery<'_> {
                 return Err(SqlError::Limit);
             }
             retention.charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
+            execution.retention.borrow_mut().charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
             rows.push((row.key.into_owned(), row.row.into_owned()));
         }
         Ok(rows)
@@ -4266,8 +4282,8 @@ impl BoundQuery<'_> {
         if !self.outer_slots.is_empty() {
             return Err(SqlError::Unsupported); // C4 supplies outer tuples.
         }
-        self.subqueries.visit(&mut |_, child| {
-            if child.outer_slots.is_empty() { Ok(()) } else { Err(SqlError::Unsupported) }
+        self.subqueries.visit(&mut |mode, child| {
+            if mode == SubplanMode::Exists || !child.correlated(0) { Ok(()) } else { Err(SqlError::Unsupported) }
         })?;
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
@@ -4293,7 +4309,7 @@ impl BoundQuery<'_> {
             )?;
         }
         if let Some(grouping) = &self.grouping {
-            return grouping.execute(self, state, source, params, execution);
+            return grouping.execute(self, state, source, params, execution, false);
         }
         let offset = match self.query.offset() {
             Some(e) => match e.value(params)? {
@@ -4447,7 +4463,7 @@ impl BoundQuery<'_> {
         } else {
             scan::Meter::new(cancel)
         };
-        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits);
+        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits, &[], false);
         let filtered = joined.filter_map(|row| {
             let row = match row {
                 Ok(row) => row,
@@ -5165,7 +5181,7 @@ mod join_visit_budget_tests {
                         scan::Direction::Forward,
                     )
                     .unwrap();
-                let result = join_rows(&bound, &source, input, &[], &mut meter, &visits)
+                let result = join_rows(&bound, &source, input, &[], &mut meter, &visits, &[], false)
                     .collect::<R<Vec<_>>>();
                 if remaining == candidates {
                     assert_eq!(result.unwrap().len(), outputs);

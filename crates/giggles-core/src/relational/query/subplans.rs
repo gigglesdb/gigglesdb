@@ -22,6 +22,9 @@ pub(super) struct Subplans<'a> {
 }
 
 impl<'a> Subplans<'a> {
+    pub(super) fn correlated(&self, depth: usize) -> bool {
+        self.entries.iter().any(|entry| entry.query.correlated(depth))
+    }
     pub(super) fn register(
         &mut self,
         key: usize,

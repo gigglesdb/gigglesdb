@@ -76,6 +76,38 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn internal_exists_scale_and_own_writes() {
+    use crate::relational::Value;
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users(id int PRIMARY KEY)");
+    f.execute("CREATE TABLE orders(id int PRIMARY KEY, user_id int)");
+    let parts = f.parts();
+    let mut txn = f.db().begin(Isolation::ReadCommitted);
+    for (name, count) in [("users", 5000), ("orders", 20000)] {
+        let entry = engine::catalog::TableEntry { def: parts.tables[name].clone(),
+            heap: false, columns_ext: BTreeMap::new() };
+        for id in 1..=count {
+            let mut values = vec![Value::Int(id)];
+            if name == "orders" { values.push(Value::Int((id - 1) % 5000 + 1)); }
+            f.db().rows.insert(&mut txn, &entry, values, None, &|| false).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    let mut session = f.admin().sql_session();
+    let mut p = session.prepare("SELECT count(*) FROM users").unwrap();
+    p.exists_test_query("SELECT count(*) FROM users u WHERE EXISTS(SELECT 1/0 FROM orders o WHERE o.user_id=u.id)");
+    let started = std::time::Instant::now();
+    assert_eq!(session.execute_prepared(&p, &[], None).unwrap().rows[0].values, vec![Value::Int(5000)]);
+    eprintln!("C4 v2 users=5000 orders=20000 elapsed={:?}", started.elapsed());
+    session.execute("BEGIN", &[], None).unwrap();
+    session.execute("INSERT INTO users VALUES(5001)", &[], None).unwrap();
+    session.execute("INSERT INTO orders VALUES(20001,5001)", &[], None).unwrap();
+    assert_eq!(session.execute_prepared(&p, &[], None).unwrap().rows[0].values, vec![Value::Int(5001)]);
+    session.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(session.execute_prepared(&p, &[], None).unwrap().rows[0].values, vec![Value::Int(5000)]);
+}
+
+#[test]
 fn ddl_defaults_and_renames_persist() {
     let mut f = Fixture::new();
     f.execute("CREATE TABLE t (id bigint PRIMARY KEY, v text DEFAULT 'x')");
