@@ -394,8 +394,7 @@ pub(super) fn output_slot(
             return Ok(i);
         }
     }
-    // InvalidColumnReference/42P10 awaits the separate error-variant slice.
-    Err(SqlError::GroupingError)
+    Err(SqlError::InvalidColumnReference)
 }
 pub(super) fn bind<'a>(
     q: &'a Query,

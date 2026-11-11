@@ -162,6 +162,11 @@ fn diagnostic_error(
     diagnostic: Option<&Diagnostic>,
     out: &mut Vec<u8>,
 ) {
+    let message = match code {
+        "21000" => "more than one row returned by a subquery used as an expression",
+        "42P10" => "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+        _ => message,
+    };
     // Never log request text or values. Messages are fixed server diagnostics.
     let detail = diagnostic.map(|d| {
         format!(
@@ -2258,6 +2263,33 @@ fn logical_binary_input(ty: &DataType, b: &[u8]) -> R<Value> {
 #[cfg(test)]
 mod logical_wire_tests {
     use super::*;
+    #[test]
+    fn subquery_and_distinct_error_wire_identities() {
+        use giggles_core::relational::SqlError;
+        for (error, code, message) in [
+            (
+                SqlError::CardinalityViolation,
+                "21000",
+                "more than one row returned by a subquery used as an expression",
+            ),
+            (
+                SqlError::InvalidColumnReference,
+                "42P10",
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+            ),
+        ] {
+            let mapped = crate::service::sqlstate(&CoreError::Sql(error));
+            assert_eq!(mapped, code);
+            for diagnostic in [None, Some(&Diagnostic::default())] {
+                let mut out = Vec::new();
+                diagnostic_error(mapped, "fallback", diagnostic, &mut out);
+                assert_eq!(out[0], b'E');
+                let fields: Vec<_> = out[5..].split(|b| *b == 0).collect();
+                assert!(fields.contains(&format!("C{code}").as_bytes()));
+                assert!(fields.contains(&format!("M{message}").as_bytes()));
+            }
+        }
+    }
     #[test]
     fn binary_outputs_roundtrip() {
         for (ty, text) in [

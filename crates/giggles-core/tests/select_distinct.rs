@@ -67,7 +67,7 @@ fn exercise(engine: Engine) {
     ] {
         assert_eq!(
             s.execute(sql, &[], None),
-            Err(giggles_core::CoreError::Sql(SqlError::GroupingError)),
+            Err(giggles_core::CoreError::Sql(SqlError::InvalidColumnReference)),
             "{sql}"
         );
     }

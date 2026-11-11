@@ -224,6 +224,10 @@ pub enum SqlError {
     InvalidRowCountInLimitClause,
     /// 2201X invalid_row_count_in_result_offset_clause
     InvalidRowCountInResultOffsetClause,
+    /// 21000 cardinality_violation
+    CardinalityViolation,
+    /// 42P10 invalid_column_reference
+    InvalidColumnReference,
 }
 type R<T> = Result<T, SqlError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

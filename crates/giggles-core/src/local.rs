@@ -134,6 +134,8 @@ pub fn failure(e: CoreError) -> Reply {
                 relational::SqlError::AmbiguousColumn => 53,
                 relational::SqlError::InvalidRowCountInLimitClause => 54,
                 relational::SqlError::InvalidRowCountInResultOffsetClause => 55,
+                relational::SqlError::CardinalityViolation => 56,
+                relational::SqlError::InvalidColumnReference => 57,
             }
         }
     };

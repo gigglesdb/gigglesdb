@@ -38,8 +38,8 @@ fn bytea_closed_29_goldens() {
     assert_eq!(be.serialize(&division).unwrap(), [0, 0, 0, 43]);
     assert_eq!(le.deserialize::<E>(&[43, 0, 0, 0]).unwrap(), division);
     assert_eq!(be.deserialize::<E>(&[0, 0, 0, 43]).unwrap(), division);
-    assert!(le.deserialize::<E>(&[56, 0, 0, 0]).is_err());
-    assert!(be.deserialize::<E>(&[0, 0, 0, 56]).is_err());
+    assert!(le.deserialize::<E>(&[58, 0, 0, 0]).is_err());
+    assert!(be.deserialize::<E>(&[0, 0, 0, 58]).is_err());
     assert!(le.deserialize::<E>(&[28, 0, 0, 0, 0]).is_err());
     assert!(be.deserialize::<E>(&[0, 0, 0, 28, 0]).is_err());
     for value in [
