@@ -333,3 +333,88 @@ fn deferred_200000_pending_keys_validate_in_pages_and_rollback() {
     s.execute("COMMIT", &[], None).unwrap();
     assert_eq!(buffered(&mut s, "SELECT count(*) FROM pending"), vec![vec![Int(200_000)]]);
 }
+
+
+fn seed_cascade(f: &Fixture, name: &str, count: usize, parent: impl Fn(usize) -> usize) {
+    let entry = TableEntry { def: f.parts().tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+    for start in (0..count).step_by(200) {
+        let mut txn = f.db().begin(Isolation::ReadCommitted);
+        for n in start..(start + 200).min(count) {
+            f.db().rows.insert(&mut txn, &entry, vec![Int(n as i64), Int(parent(n) as i64)], None, &|| false).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+}
+
+#[test]
+fn cascade_5000_users_three_levels_returning_and_late_rollback() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users (id bigint PRIMARY KEY, email text UNIQUE)");
+    f.execute("CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE CASCADE, status bigint)");
+    f.execute("CREATE INDEX by_user ON orders(user_id)");
+    f.execute("CREATE TABLE items (id bigint PRIMARY KEY, order_id bigint REFERENCES orders(id) ON DELETE CASCADE)");
+    f.execute("CREATE INDEX by_order ON items(order_id)");
+    seed(&f, "users", 6000);
+    seed(&f, "orders", 24000);
+    seed_cascade(&f, "items", 72000, |n| n / 3);
+    f.execute("CREATE TABLE blocked (id bigint PRIMARY KEY, item_id bigint REFERENCES items(id) ON DELETE RESTRICT)");
+    f.execute("INSERT INTO blocked VALUES (1,59999)");
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.execute("DELETE FROM users WHERE id<5000 RETURNING id", &[], None), Err(CoreError::Sql(SqlError::RestrictViolation)));
+    for (table, count) in [("users",6000), ("orders",24000), ("items",72000)] {
+        assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM {table}")), vec![vec![Int(count)]]);
+    }
+    s.execute("DELETE FROM blocked", &[], None).unwrap();
+    eprintln!("X8 cascade-start");
+    let start = std::time::Instant::now();
+    let deleted = s.execute("DELETE FROM users WHERE id<5000 RETURNING id", &[], None).unwrap();
+    eprintln!("X8 5000-user/20000-order/60000-item cascade: {:?}", start.elapsed());
+    assert_eq!(deleted.affected, 5000);
+    assert_eq!(deleted.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), (0..5000).map(|n| vec![Int(n)]).collect::<Vec<_>>());
+    for (table, count) in [("users",1000), ("orders",4000), ("items",12000)] {
+        assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM {table}")), vec![vec![Int(count)]]);
+    }
+    assert_eq!(s.execute("DELETE FROM users WHERE id=5000 RETURNING id", &[], None).unwrap().affected, 1);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM items"), vec![vec![Int(11988)]]);
+}
+
+#[test]
+fn cascade_large_fanout_self_reference_cycle_and_own_writes() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE nodes (id bigint PRIMARY KEY, parent bigint REFERENCES nodes(id) ON DELETE CASCADE)");
+    f.execute("CREATE INDEX by_parent ON nodes(parent)");
+    seed_cascade(&f, "nodes", 1500, |_| 0);
+    let mut s = f.admin().sql_session();
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO nodes VALUES (1500,0)", &[], None).unwrap();
+    assert_eq!(s.execute("DELETE FROM nodes WHERE id=0 RETURNING id", &[], None).unwrap().affected, 1);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM nodes"), vec![vec![Int(0)]]);
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM nodes"), vec![vec![Int(1500)]]);
+    f.execute("CREATE TABLE a(id bigint PRIMARY KEY, b bigint)");
+    f.execute("CREATE TABLE b(id bigint PRIMARY KEY, a bigint REFERENCES a(id) ON DELETE CASCADE)");
+    f.execute("ALTER TABLE a ADD FOREIGN KEY(b) REFERENCES b(id) ON DELETE CASCADE");
+    seed_cascade(&f, "a", 1500, |n| n);
+    seed_cascade(&f, "b", 1500, |n| n);
+    assert_eq!(s.execute("DELETE FROM a RETURNING id", &[], None).unwrap().affected, 1500);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM b"), vec![vec![Int(0)]]);
+}
+
+
+#[test]
+fn cascade_diamond_deduplicates_and_unindexed_fanout_pages() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE p(id bigint PRIMARY KEY)");
+    f.execute("CREATE TABLE c(id bigint PRIMARY KEY, p bigint REFERENCES p(id) ON DELETE CASCADE)");
+    f.execute("CREATE TABLE d(id bigint PRIMARY KEY, p bigint REFERENCES p(id) ON DELETE CASCADE)");
+    f.execute("CREATE TABLE leaf(id bigint PRIMARY KEY, c bigint REFERENCES c(id) ON DELETE CASCADE, d bigint REFERENCES d(id) ON DELETE CASCADE)");
+    f.execute("INSERT INTO p VALUES(0)");
+    seed_cascade(&f, "c", 1500, |_| 0);
+    seed_cascade(&f, "d", 1500, |_| 0);
+    let mut s = f.admin().sql_session();
+    s.execute("INSERT INTO leaf SELECT id,id,id FROM c", &[], None).unwrap();
+    assert_eq!(s.execute("DELETE FROM p", &[], None).unwrap().affected, 1);
+    for table in ["p", "c", "d", "leaf"] {
+        assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM {table}")), vec![vec![Int(0)]]);
+    }
+}

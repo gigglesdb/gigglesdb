@@ -887,6 +887,29 @@ impl RowSink for SqlRows<'_> {
         }
         Ok(())
     }
+    fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
+        after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        let descriptor = self.parts.indexes.iter().find(|d| d.table == table.id
+            && d.columns.len() == columns.len() && d.columns.iter().all(|id| columns.contains(id)));
+        if let Some(d) = descriptor {
+            let values = d.columns.iter().map(|id| values[columns.iter().position(|c| c == id).unwrap()].clone()).collect::<Vec<_>>();
+            let tuple = codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
+            let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
+            let mut rows = DdlRows::new();
+            let last = engine::indexes::visit_page(self.txn, &entry, d,
+                Bound::Included(tuple.clone()), Bound::Included(tuple), after, &mut |_, row| {
+                    let row = SqlRow { values: row.values, version: row.version };
+                    rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
+                    Ok(())
+                })?;
+            return Ok(last.map(|last| (last, rows)));
+        }
+        let Some((last, mut rows)) = self.read_page(table, after)? else { return Ok(None); };
+        rows.retain(|_, row| columns.iter().zip(values).all(|(id, value)|
+            row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value));
+        Ok(Some((last, rows)))
+    }
+
     fn begin_conflict_pages(&mut self, floor: u64) { self.conflict_floor = Some(floor); }
     fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
         visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>) -> Result<(), CoreError> {

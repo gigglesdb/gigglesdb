@@ -276,6 +276,23 @@ pub(crate) fn visit(
     upper: Bound<Vec<u8>>,
     visitor: &mut dyn FnMut(Vec<u8>, super::rows::Row) -> Result<(), CoreError>,
 ) -> Result<(), CoreError> {
+    let mut after = None;
+    loop {
+        after = visit_page(txn, table, descriptor, lower.clone(), upper.clone(), after, visitor)?;
+        if after.is_none() { return Ok(()); }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn visit_page(
+    txn: &mut Transaction,
+    table: &super::catalog::TableEntry,
+    descriptor: &Descriptor,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+    after: Option<Vec<u8>>,
+    visitor: &mut dyn FnMut(Vec<u8>, super::rows::Row) -> Result<(), CoreError>,
+) -> Result<Option<Vec<u8>>, CoreError> {
     validate_descriptor(descriptor, &table.def)?;
     let prefix = descriptor.id.to_be_bytes().to_vec();
     let prefix_key = |tuple: Vec<u8>| {
@@ -288,7 +305,7 @@ pub(crate) fn visit(
         Bound::Included(tuple) => Bound::Included(prefix_key(tuple)),
         Bound::Excluded(tuple) => match successor(prefix_key(tuple)) {
             Some(key) => Bound::Included(key),
-            None => return Ok(()),
+            None => return Ok(None),
         },
     };
     let hi = match upper {
@@ -298,8 +315,7 @@ pub(crate) fn visit(
         }
         Bound::Excluded(tuple) => Bound::Excluded(prefix_key(tuple)),
     };
-    let mut after = lo;
-    loop {
+    let after = after.map_or(lo, Bound::Excluded);
         let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
         let mut entries = Vec::new();
         for pair in txn.scan(Keyspace::Index, after.as_ref().map(Vec::as_slice),
@@ -309,8 +325,7 @@ pub(crate) fn visit(
                 .map_err(CoreError::Sql)?;
             entries.push((key, pk));
         }
-        let Some((last, _)) = entries.last() else { break; };
-        after = Bound::Excluded(last.clone());
+        let last = entries.last().map(|(key, _)| key.clone());
         for (key, pk) in entries {
         crate::cancellation::check()?;
         if !key.starts_with(&prefix) {
@@ -346,8 +361,7 @@ pub(crate) fn visit(
         }
         visitor(pk, row)?;
         }
-    }
-    Ok(())
+    Ok(last)
 }
 pub(crate) fn successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
     while let Some(last) = prefix.pop() {

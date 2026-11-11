@@ -37,6 +37,12 @@ pub(crate) trait RowSink {
         self.scan(table, visit)
     }
 
+    /// One physical FK page, with an opaque resume key and transaction own writes.
+    fn child_page(&mut self, _table: &TableDef, _columns: &[u64], _values: &[Value],
+        _after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
+
     fn begin_conflict_pages(&mut self, _floor: u64) {}
     fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[Value],
         visit: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
@@ -132,6 +138,9 @@ impl Relational {
                 version_end,
                 deferred,
             );
+        }
+        if expected.is_none() && sink.streams_index_builds() && paged_dml::cascade_eligible(self, prepared) {
+            return paged_dml::delete_cascade(self, prepared, params, clock, sink, deferred);
         }
         let append = sink.streams_index_builds()
             && match &prepared.statement {
