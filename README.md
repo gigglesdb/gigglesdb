@@ -35,10 +35,58 @@ See [IntelliJ setup and run guide](scripts/README.md) for requirements and detai
 
 ## Start a server
 
-For a local server you can connect to and query, use **`giggles-server`**. It opens
-one existing embedded database and exposes a JSON protocol and a bounded
-PostgreSQL wire interface. Both require mutual TLS: the server and client each
-present a certificate. There is no password-only or plaintext mode.
+### Quick start: PostgreSQL clients (DataGrip, psql, apps)
+
+Start the development server from the repository root:
+
+```powershell
+./scripts/dev.ps1 -Task dev-server -Port 5432
+```
+
+Or run `giggles-server --dev --data DIR --port 5432` directly. Development
+mode uses SCRAM-SHA-256 password authentication over plaintext on loopback.
+On first start, it generates a random 24-character owner password and prints
+it once in a connection URL. Save it. Set a nonempty `GIGGLES_OWNER_PASSWORD`
+before first start to choose the password. Restarting the same data directory
+keeps the password and does not print it again.
+
+Replace `PASSWORD` with that password (URL-encode special characters):
+
+```text
+postgres://postgres:PASSWORD@127.0.0.1:5432/postgres?sslmode=disable
+```
+
+In DataGrip, choose PostgreSQL and enter these fields:
+
+| Field | Value |
+| --- | --- |
+| Host | `127.0.0.1` |
+| Port | `5432` (or the port you chose) |
+| User | `postgres` |
+| Password | The owner password |
+| Database | `postgres` |
+| SSL | Disabled |
+
+To reset the password, stop the server and run
+`giggles-server --dev --data DIR --reset-owner-password` against the same data
+directory. Add `--owner NAME` for a nondefault owner. The command uses a nonempty
+`GIGGLES_OWNER_PASSWORD` or generates a new password, then prints the connection
+URL. Restart the server afterward.
+
+Add `--trust-local` to the direct development command to allow connections
+without a password. Warning: any local process, Docker container arriving via
+loopback, or port-forwarded peer can connect as any role; use only on a
+single-user machine.
+
+See the [server guide](crates/giggles-server/README.md) for details and limits,
+and the [app-style SQL load tester](scripts/app-loadtest/README.md).
+
+### Configured mTLS listener: agent/service workflow
+
+For the second workflow, run `giggles-server CONFIG.json`. It opens an existing
+embedded database and exposes a JSON protocol and a bounded PostgreSQL wire
+interface. These configured mTLS listeners require server and client
+certificates; they do not offer password fallback or plaintext connections.
 
 Optional HTTPS/JSON and typed gRPC listeners expose structured native reads,
 guarded writes, claims and atomic blocks, alongside parameterized SQL and scoped
@@ -46,7 +94,7 @@ task operations. Native and SQL calls share persistent transactions, mTLS
 bindings and service limits. See the
 [HTTP/gRPC guide](crates/giggles-server/API.md) for configuration and runnable clients.
 
-The quickest working setup uses the existing fixture generator, which creates
+For this mTLS workflow, use the existing fixture generator, which creates
 the database, application table, certificates and matching authorization bindings.
 The following commands use **PowerShell**, starting at the repository root.
 
@@ -130,9 +178,9 @@ Here, “native” means the framed JSON transport; `Sql` requests still contain
 See the [native language guide](crates/giggles-language/README.md) for the separate
 embedded language frontend.
 
-### PostgreSQL clients and configuration
+### PostgreSQL clients and configuration for the mTLS listener
 
-Port **7433** implements a bounded PostgreSQL wire subset. Tested clients include
+In the mTLS fixture above, port **7433** implements a bounded PostgreSQL wire subset. Tested clients include
 `tokio-postgres 0.7.15` with `tokio-postgres-rustls 0.13` and bounded pgJDBC 42.7.3
 query/transaction cases. TLS is required, hostname
 `localhost`, user/database `giggles`, and the same application certificate/key/CA.

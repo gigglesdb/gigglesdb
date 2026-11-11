@@ -8,7 +8,7 @@ is no row-level tenant sharing or generic task table grant.
 
 | Surface | Implemented/tested | Rejected or remaining |
 | --- | --- | --- |
-| TLS/auth | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext, password fallback, unbound/wrong-CA/no certificate; CRL/CA/server-certificate hot rotation remain; trusted live binding reload supported |
+| TLS/auth (mTLS listener; the [dev listener](README.md#quick-start-postgresql-clients) uses SCRAM-SHA-256 password authentication) | Mandatory mutual TLS, CA chain/time validation by rustls, exact SHA256 leaf binding, TLS hostname validation | Plaintext and password fallback on the mTLS listener, unbound/wrong-CA/no certificate; CRL/CA/server-certificate hot rotation remain; trusted live binding reload supported |
 | Startup | SSLRequest then v3, fixed giggles user/database, UTF8, bounded application_name/DateStyle/TimeZone/extra_float_digits | Direct TLS, GSS, replication, options, alternate users/databases |
 | Simple query | One inherited statement; typed rows; empty/comment-only queries; bounded JDBC initialization SET batches | General multi-statements, COPY, arbitrary SET, catalog SQL outside the bounded metadata profile |
 | Extended | Parse/Bind/Describe/Execute/Sync/Close/Flush; named and unnamed objects; pipeline error drain to Sync | COPY, arbitrary PostgreSQL syntax |
