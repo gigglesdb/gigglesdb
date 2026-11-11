@@ -431,6 +431,7 @@ impl SqlSession {
                             expected_version,
                             context.as_ref(),
                             &mut SqlRows {
+                                conflict_floor: None,
                                 db,
                                 txn,
                                 parts: &old,
@@ -579,6 +580,7 @@ fn validate_pending(
         None,
         None,
         &mut SqlRows {
+            conflict_floor: None,
             db,
             txn,
             parts: &parts,
@@ -622,6 +624,7 @@ struct SqlRows<'a> {
     txn: &'a mut Transaction,
     parts: &'a CatalogParts,
     writing: bool,
+    conflict_floor: Option<u64>,
     prepared: &'a relational::Prepared,
     params: &'a [relational::Value],
 }
@@ -861,16 +864,15 @@ impl RowSink for SqlRows<'_> {
             let values = order.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
             let tuple =
                 codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
-            engine::indexes::scan(
+            return engine::indexes::visit(
                 self.txn,
                 &entry,
                 d,
                 Bound::Included(tuple.clone()),
                 Bound::Included(tuple),
-            )?
-            .into_iter()
-            .map(|(_, row)| row)
-            .collect()
+                &mut |_, row| visit(SqlRow { values: row.values, version: row.version })
+                    .map_err(CoreError::Sql),
+            );
         } else if unique {
             return Err(CoreError::Sql(SqlError::InvalidForeignKey));
         } else {
@@ -884,6 +886,15 @@ impl RowSink for SqlRows<'_> {
             .map_err(CoreError::Sql)?;
         }
         Ok(())
+    }
+    fn begin_conflict_pages(&mut self, floor: u64) { self.conflict_floor = Some(floor); }
+    fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>) -> Result<(), CoreError> {
+        let floor = self.conflict_floor;
+        self.lookup(table, columns, Some(values), true, &mut |row| {
+            if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::Duplicate); }
+            visit(row)
+        })
     }
     fn indexes(&self) -> Vec<relational::secondary_index::Descriptor> {
         self.parts.indexes.clone()
@@ -975,16 +986,11 @@ impl RowSink for SqlRows<'_> {
         let Some((descriptor, lo, hi)) = candidate else {
             return self.scan_all(&entry, visit);
         };
-        let rows = engine::indexes::scan(self.txn, &entry, descriptor, lo, hi)?;
+        engine::indexes::visit(self.txn, &entry, descriptor, lo, hi, &mut |_, row| {
+            visit(SqlRow { values: row.values, version: row.version }).map_err(CoreError::Sql)
+        })?;
         #[cfg(test)]
         USED_INDEX_SCAN.set(true);
-        for (_, row) in rows {
-            visit(SqlRow {
-                values: row.values,
-                version: row.version,
-            })
-            .map_err(CoreError::Sql)?;
-        }
         #[cfg(test)]
         AFTER_TABLE_SCAN.with(|hook| {
             if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -992,6 +998,20 @@ impl RowSink for SqlRows<'_> {
             }
         });
         Ok(())
+    }
+    fn check_occupancy(&mut self, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
+        after: &BTreeMap<Vec<u8>, SqlRow>) -> Result<(), CoreError> {
+        for (key, row) in after {
+            if before.contains_key(key) { continue; }
+            let mut physical = table.id.to_be_bytes().to_vec();
+            physical.extend(codec::pk_bytes(&table.primary_key.iter()
+                .map(|i| row.values[*i].clone()).collect::<Vec<_>>())?);
+            if self.txn.lock_for_write(Keyspace::Rows, &physical, None,
+                &|| crate::cancellation::check().is_err())?.current.is_some() {
+                return Err(CoreError::Sql(SqlError::Duplicate));
+            }
+        }
+        engine::indexes::check_occupancy(self.txn, table, before, after, &self.parts.indexes)
     }
     fn apply(
         &mut self,

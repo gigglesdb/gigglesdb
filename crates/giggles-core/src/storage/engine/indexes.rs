@@ -190,6 +190,23 @@ pub(crate) fn apply(
     }
     Ok(())
 }
+/// Lock proposed UNIQUE owners without publishing, preserving FK error precedence.
+pub(crate) fn check_occupancy(
+    txn: &mut Transaction, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
+    after: &BTreeMap<Vec<u8>, SqlRow>, ds: &[Descriptor],
+) -> Result<(), CoreError> {
+    let old = entries(table, before, ds)?;
+    for (key, pk) in entries(table, after, ds)? {
+        if old.get(&key) == Some(&pk) { continue; }
+        let target = txn.lock_for_write(Keyspace::Index, &key, None,
+            &|| crate::cancellation::check().is_err())?;
+        if target.current.is_some() && target.current.as_ref() != old.get(&key) {
+            return Err(CoreError::Sql(SqlError::Duplicate));
+        }
+    }
+    Ok(())
+}
+
 /// Row-store operations use the same entry publisher as SQL statements.
 pub(crate) fn maintain(
     txn: &mut Transaction,
@@ -238,6 +255,27 @@ pub(crate) fn scan(
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
 ) -> Result<Vec<(Vec<u8>, super::rows::Row)>, CoreError> {
+    let mut rows = Vec::new();
+    let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+    visit(txn, table, descriptor, lower, upper, &mut |pk, row| {
+        retention.charge(row.values.iter().map(relational::value_bytes).sum::<usize>())
+            .map_err(CoreError::Sql)?;
+        if rows.len() >= relational::MAX_ROWS { return Err(CoreError::Limit); }
+        rows.push((pk, row));
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+/// Page index witnesses before fetching their rows, releasing the scan borrow.
+pub(crate) fn visit(
+    txn: &mut Transaction,
+    table: &super::catalog::TableEntry,
+    descriptor: &Descriptor,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+    visitor: &mut dyn FnMut(Vec<u8>, super::rows::Row) -> Result<(), CoreError>,
+) -> Result<(), CoreError> {
     validate_descriptor(descriptor, &table.def)?;
     let prefix = descriptor.id.to_be_bytes().to_vec();
     let prefix_key = |tuple: Vec<u8>| {
@@ -250,7 +288,7 @@ pub(crate) fn scan(
         Bound::Included(tuple) => Bound::Included(prefix_key(tuple)),
         Bound::Excluded(tuple) => match successor(prefix_key(tuple)) {
             Some(key) => Bound::Included(key),
-            None => return Ok(Vec::new()),
+            None => return Ok(()),
         },
     };
     let hi = match upper {
@@ -260,26 +298,20 @@ pub(crate) fn scan(
         }
         Bound::Excluded(tuple) => Bound::Excluded(prefix_key(tuple)),
     };
-    let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
-    let mut entries = Vec::new();
-    for pair in txn.scan(
-        Keyspace::Index,
-        lo.as_ref().map(Vec::as_slice),
-        hi.as_ref().map(Vec::as_slice),
-        Direction::Forward,
-        Some(relational::MAX_ROWS + 1),
-    )? {
-        let (key, pk) = pair?;
-        retention
-            .charge(key.len().saturating_add(pk.len()).saturating_add(64))
-            .map_err(CoreError::Sql)?;
-        entries.push((key, pk));
-    }
-    if entries.len() > relational::MAX_ROWS {
-        return Err(CoreError::Limit);
-    }
-    let mut rows = Vec::with_capacity(entries.len());
-    for (key, pk) in entries {
+    let mut after = lo;
+    loop {
+        let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+        let mut entries = Vec::new();
+        for pair in txn.scan(Keyspace::Index, after.as_ref().map(Vec::as_slice),
+            hi.as_ref().map(Vec::as_slice), Direction::Forward, Some(200))? {
+            let (key, pk) = pair?;
+            retention.charge(key.len().saturating_add(pk.len()).saturating_add(64))
+                .map_err(CoreError::Sql)?;
+            entries.push((key, pk));
+        }
+        let Some((last, _)) = entries.last() else { break; };
+        after = Bound::Excluded(last.clone());
+        for (key, pk) in entries {
         crate::cancellation::check()?;
         if !key.starts_with(&prefix) {
             break;
@@ -312,9 +344,10 @@ pub(crate) fn scan(
         if expected.get(&key) != Some(&pk) {
             return Err(CoreError::Corrupt("index entry disagrees with row".into()));
         }
-        rows.push((pk, row));
+        visitor(pk, row)?;
+        }
     }
-    Ok(rows)
+    Ok(())
 }
 pub(crate) fn successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
     while let Some(last) = prefix.pop() {

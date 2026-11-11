@@ -37,6 +37,12 @@ pub(crate) trait RowSink {
         self.scan(table, visit)
     }
 
+    fn begin_conflict_pages(&mut self, _floor: u64) {}
+    fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[Value],
+        visit: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
+        self.lookup(table, columns, Some(values), true, visit)
+    }
+
     fn indexes(&self) -> Vec<secondary_index::Descriptor> {
         Vec::new()
     }
@@ -76,6 +82,9 @@ pub(crate) trait RowSink {
     ) -> Result<(), CoreError> {
         Ok(())
     }
+    /// Physical occupancy is checked before end-of-statement FK actions.
+    fn check_occupancy(&mut self, _table: &TableDef, _before: &DdlRows, _after: &DdlRows)
+        -> Result<(), CoreError> { Ok(()) }
     /// Publish the difference atomically; the caller owns a statement savepoint.
     fn apply(
         &mut self,
@@ -104,7 +113,7 @@ impl Relational {
         let prepared = &bound;
         if expected.is_none()
             && sink.streams_index_builds()
-            && matches!(&prepared.statement, Statement::InsertMulti(i) if i.append_only())
+            && matches!(&prepared.statement, Statement::InsertMulti(_))
             && paged_insert::eligible(self, prepared)
         {
             return paged_insert::execute(
@@ -221,6 +230,12 @@ impl Relational {
                     .cloned()
             })
             .flatten();
+        let conflict_rows = if sink.streams_index_builds() {
+            if let Statement::InsertMulti(insert) = &prepared.statement {
+                insert.witness_rows(self, params, &prepared.parameter_types, clock)
+                    .map_err(CoreError::Sql)?
+            } else { None }
+        } else { None };
         let mut names = if let Statement::TypeDdl(user_types::Ddl::Drop {
             names,
             cascade: true,
@@ -292,6 +307,8 @@ impl Relational {
                 if crate::cancellation::check().is_err() {
                     return Err(SqlError::Aborted);
                 }
+                let key = pk(table, &row.values)?;
+                if conflict_rows.is_some() && rows.contains_key(&key) { return Ok(()); }
                 // Only destination rows constrain its version allocator. A
                 // concurrent source writer may hold a newer reserved range.
                 if is_target {
@@ -299,14 +316,27 @@ impl Relational {
                         .next_version
                         .max(row.version.checked_add(1).ok_or(SqlError::Overflow)?);
                 }
-                let key = pk(table, &row.values)?;
                 retention.charge(searched::retained_row_bytes(&key, &row)?)?;
                 if rows.insert(key, row).is_some() {
                     return Err(SqlError::Duplicate);
                 }
                 Ok(())
             };
-            if let Some((columns, values)) = point {
+            if is_target && let Some(proposals) = &conflict_rows {
+                let keys = std::iter::once(table.primary_key.iter()
+                    .map(|i| table.columns[*i].id).collect::<Vec<_>>())
+                    .chain(sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique)
+                        .map(|d| d.columns)).collect::<Vec<_>>();
+                for proposal in proposals {
+                    for columns in &keys {
+                        let values = columns.iter().map(|id| proposal[table.columns.iter()
+                            .position(|c| c.id == *id).expect("index column")].clone()).collect::<Vec<_>>();
+                        if !values.contains(&Value::Null) {
+                            sink.conflict_lookup(table, columns, &values, &mut visit)?;
+                        }
+                    }
+                }
+            } else if let Some((columns, values)) = point {
                 sink.lookup(table, &columns, Some(&values), true, &mut visit)?;
             } else {
                 sink.scan(table, &mut visit)?;
@@ -401,6 +431,10 @@ impl Relational {
                 )
                 .map_err(CoreError::Sql)?;
             if writing {
+                if !append && let Some(table) = &table
+                    && matches!(prepared.v2_class(), V2Class::Dml) {
+                    sink.check_occupancy(table, &before.rows[&table.id], &self.rows[&table.id])?;
+                }
                 if append {
                     let table = table.as_ref().expect("append target");
                     let old = &before.rows[&table.id];
@@ -510,24 +544,8 @@ fn point_target(
     prepared: &Prepared,
     table: &TableDef,
     params: &[Value],
-    indexes: &[secondary_index::Descriptor],
+    _indexes: &[secondary_index::Descriptor],
 ) -> Option<(Vec<u64>, Vec<Value>)> {
-    // Re-keying or changing a UNIQUE key needs the original occupancy image
-    // for immediate error precedence before referential actions execute.
-    let sets = match &prepared.statement {
-        Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-        Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
-        _ => vec![],
-    };
-    if table.columns.iter().enumerate().any(|(offset, column)| {
-        sets.contains(&&column.name)
-            && (table.primary_key.contains(&offset)
-                || indexes
-                    .iter()
-                    .any(|d| d.table == table.id && d.unique && d.columns.contains(&column.id)))
-    }) {
-        return None;
-    }
     let predicates = match &prepared.statement {
         Statement::Update { predicates, .. }
         | Statement::UpdateExpressions { predicates, .. }
@@ -614,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn point_staging_requires_complete_conjunction_and_stable_keys() {
+    fn point_staging_requires_complete_conjunction_and_exact_key_types() {
         let mut image = Relational::default();
         let ddl = Prepared::parse(
             "CREATE TABLE t(a bigint,b bigint,v bigint,PRIMARY KEY(a,b))",
@@ -638,7 +656,7 @@ mod tests {
             ("UPDATE t SET v=3 WHERE a=1 AND b=2 AND v=4", true),
             ("DELETE FROM t WHERE a=1", false),
             ("DELETE FROM t WHERE a=1 OR b=2", false),
-            ("UPDATE t SET a=3 WHERE a=1 AND b=2", false),
+            ("UPDATE t SET a=3 WHERE a=1 AND b=2", true),
         ] {
             let p = Prepared::parse(sql, 1, image.epoch).unwrap();
             assert_eq!(

@@ -405,6 +405,44 @@ fn source_indexes(insert: &Insert, state: &Relational, table: &TableDef) -> R<Ve
     Ok(indexes)
 }
 impl Insert {
+    /// Pure, fully supplied proposals can identify physical conflict witnesses.
+    /// Defaults and identities stay on the original path; evaluating them twice
+    /// could consume a sequence or produce a different proposed key.
+    pub(super) fn witness_rows(
+        &self, state: &Relational, params: &[Value], declared: &[Option<DataType>],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> R<Option<Vec<Vec<Value>>>> {
+        let table = state.tables.get(&self.table).ok_or(SqlError::UnknownTable)?;
+        if self.rows.len() > 200 || !self.can_witness(state) { return Ok(None); }
+        let indexes = indexes(self, table)?;
+        admit_statement(self, params)?;
+        self.rows.iter().zip(&self.defaults).enumerate().map(|(i, (row, defaults))| {
+            normalize_row(state, table, self, &indexes, row, i, defaults, params,
+                declared, clock, self.source_types.as_deref())
+        }).collect::<R<Vec<_>>>().map(Some)
+    }
+
+    pub(super) fn can_witness(&self, state: &Relational) -> bool {
+        let Some(table) = state.tables.get(&self.table) else { return false; };
+        self.conflict.is_some() && self.source.is_none() && table.hidden_rowid().is_none()
+            && self.overriding.is_none() && self.casts.is_empty()
+            && !table.columns.iter().any(|c| state.column_identity(c.id).is_some())
+            && !self.defaults.iter().flatten().any(|d| *d)
+            && indexes(self, table).is_ok_and(|i| i.len() == table.columns.len())
+    }
+    pub(super) fn stable_referenced_keys(&self, state: &Relational, table: &TableDef) -> bool {
+        self.conflict.as_ref().and_then(|c| c.update.as_ref()).is_none_or(|u| {
+            u.sets.iter().all(|(name, _)| table.columns.iter().all(|c| {
+                name != &c.name || !state.ext.constraints.values().flatten().any(|constraint| {
+                    matches!(&constraint.kind, ConstraintKind::ForeignKey { ref_table, ref_columns, .. }
+                        if *ref_table == table.id && ref_columns.contains(&c.id))
+                })
+            }))
+        })
+    }
+    pub(super) fn updates_conflicts(&self) -> bool {
+        self.conflict.as_ref().is_some_and(|c| c.update.is_some())
+    }
     pub(super) fn append_only(&self) -> bool {
         self.conflict.is_none()
     }

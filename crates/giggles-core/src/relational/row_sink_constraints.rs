@@ -74,12 +74,18 @@ pub(super) fn hydrate(
                             .ok_or(CoreError::Sql(SqlError::UnknownColumn))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let rows = [seeds, &*before, &*staged]
-                    .into_iter()
-                    .filter_map(|s| s.rows.get(&source_id))
-                    .flat_map(|rows| rows.values())
-                    .cloned()
-                    .collect::<Vec<_>>();
+                // Only changed parent keys need incoming witnesses. Rows loaded
+                // merely to prove an outgoing FK must not expand into every sibling.
+                let rows = if parent {
+                    [seeds, &*before, &*staged].into_iter()
+                        .filter_map(|s| s.rows.get(&source_id))
+                        .flat_map(|rows| rows.values()).cloned().collect::<Vec<_>>()
+                } else {
+                    before.rows.get(&source_id).into_iter().flat_map(|rows| rows.iter())
+                        .filter(|(key, row)| staged.rows.get(&source_id).and_then(|rows| rows.get(*key))
+                            .is_none_or(|new| positions.iter().any(|i| row.values[*i] != new.values[*i])))
+                        .map(|(_, row)| row.clone()).collect()
+                };
                 let mut keys = BTreeSet::new();
                 for row in rows {
                     crate::cancellation::check()?;

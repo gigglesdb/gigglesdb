@@ -20,6 +20,11 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     {
         return false;
     }
+    if let Statement::InsertMulti(i) = &prepared.statement
+        && !i.append_only()
+        && (!i.can_witness(state) || !i.stable_referenced_keys(state, table)) {
+        return false;
+    }
     matches!(&prepared.statement, Statement::InsertMulti(i) if i.needs_pages()
         && i.source.as_ref().is_none_or(|q| q.pageable_insert()
             && q.read_tables().first().is_some_and(|name| state.tables.contains_key(name))
@@ -47,6 +52,7 @@ pub(super) fn execute(
     let mut after = None;
     let mut start = 0;
     let first_version = state.next_version;
+    if insert.updates_conflicts() { sink.begin_conflict_pages(first_version); }
     let table = state.tables[&insert.table].clone();
     let foreign_keys = state.ext.constraints.get(&table.id).into_iter().flatten()
         .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }));
@@ -74,6 +80,7 @@ pub(super) fn execute(
             start = end;
             (input, false)
         };
+
         let mut page = state.clone();
         // FK triggers run after all input has passed immediate uniqueness and
         // row checks, including proposals on later pages (PostgreSQL timing).

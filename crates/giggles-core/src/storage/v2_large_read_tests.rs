@@ -200,3 +200,60 @@ fn sql_unique_writer_waits_and_rejects_committed_occupant_at_scale() {
     worker.join().unwrap();
     assert!(values(&mut first, "SELECT id FROM users WHERE id=50001").is_empty());
 }
+
+#[test]
+fn physical_conflicts_and_fk_witnesses_at_app_scale() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users (id bigint PRIMARY KEY, email text UNIQUE)");
+    f.execute("CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users(id), status bigint)");
+    f.execute("CREATE INDEX by_user ON orders(user_id)");
+    seed(&f, "users", 50_000);
+    seed(&f, "orders", 200_000);
+    let mut s = f.admin().sql_session();
+    for (id, email, action, affected) in [
+        (0, "u0@test", "DO NOTHING", 0),
+        (50000, "new@test", "DO NOTHING", 1),
+        (0, "u0@test", "DO UPDATE SET email=excluded.email", 1),
+        (50001, "newer@test", "DO UPDATE SET email=excluded.email", 1),
+        (50002, "u1@test", "DO UPDATE SET email=excluded.email", 1),
+    ] {
+        assert_eq!(s.execute(&format!("INSERT INTO users VALUES ({id},'{email}') ON CONFLICT(email) {action}"),
+            &[], None).unwrap().affected, affected);
+    }
+    assert!(values(&mut s, "SELECT id FROM users WHERE id=50002").is_empty());
+    let batch = (0..2000).map(|n| format!("({n},'batch{n}@test')")).collect::<Vec<_>>().join(",");
+    assert_eq!(s.execute(&format!("INSERT INTO users VALUES {batch} ON CONFLICT(id) DO UPDATE SET email=excluded.email"),
+        &[], None).unwrap().affected, 2000);
+    assert_eq!(values(&mut s, "SELECT email FROM users WHERE id=1999"), vec![vec![Text("batch1999@test".into())]]);
+    // A conflict from an earlier page must retain the bounded planner's duplicate-target error.
+    let batch = (0..201).map(|n| format!("({},'changed{}@test')", n % 200, n % 200)).collect::<Vec<_>>().join(",");
+    assert_eq!(s.execute(&format!("INSERT INTO users VALUES {batch} ON CONFLICT(id) DO UPDATE SET email=excluded.email"),
+        &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+    assert_eq!(values(&mut s, "SELECT email FROM users WHERE id=0"), vec![vec![Text("batch0@test".into())]]);
+    assert_eq!(s.execute("INSERT INTO orders VALUES (200000,0,0)", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("INSERT INTO orders VALUES (200001,999999,0)", &[], None),
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert!(values(&mut s, "SELECT id FROM orders WHERE id=200001").is_empty());
+    assert_eq!(s.execute("UPDATE orders SET user_id=1 WHERE id=200000", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("UPDATE orders SET user_id=999999 WHERE id=200000", &[], None),
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert_eq!(values(&mut s, "SELECT user_id FROM orders WHERE id=200000"), vec![vec![Int(1)]]);
+    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None),
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert_eq!(values(&mut s, "SELECT id FROM users WHERE id=0"), vec![vec![Int(0)]]);
+    assert_eq!(s.execute("UPDATE users SET id=999999 WHERE id=0", &[], None),
+        Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert!(values(&mut s, "SELECT id FROM users WHERE id=999999").is_empty());
+    assert_eq!(s.execute("UPDATE users SET email='unique-change@test' WHERE id=49999", &[], None).unwrap().affected, 1);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM orders WHERE user_id>=0"), vec![vec![Int(200001)]]);
+    f.execute("CREATE TABLE restricted(id bigint PRIMARY KEY, user_id bigint REFERENCES users(id) ON DELETE RESTRICT)");
+    s.execute("INSERT INTO restricted VALUES (1,0)", &[], None).unwrap();
+    assert_eq!(s.execute("DELETE FROM users WHERE id=0", &[], None), Err(CoreError::Sql(SqlError::RestrictViolation)));
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO users VALUES (60000,'own@test')", &[], None).unwrap();
+    s.execute("INSERT INTO users VALUES (60001,'own@test') ON CONFLICT(email) DO NOTHING", &[], None).unwrap();
+    s.execute("INSERT INTO orders VALUES (200001,60000,0)", &[], None).unwrap();
+    assert!(values(&mut s, "SELECT id FROM users WHERE id=60001").is_empty());
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert!(values(&mut s, "SELECT id FROM orders WHERE id=200001").is_empty());
+}

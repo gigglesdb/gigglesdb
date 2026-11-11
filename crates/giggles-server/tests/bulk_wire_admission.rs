@@ -101,8 +101,7 @@ async fn bulk_case(rows: usize, boundaries: bool) {
                 assert_eq!(error.as_db_error().unwrap().code().code(), "42501", "{sql}");
             }
         }
-        // Admission now reaches core: conflict execution retains its 1,024-row
-        // bound (separate from the paged append-only VALUES path).
+        // Both initial inserts and conflicting updates page through core.
         client
             .batch_execute("CREATE TABLE bulk_upsert(id INTEGER PRIMARY KEY, v INTEGER)")
             .await
@@ -112,19 +111,12 @@ async fn bulk_case(rows: usize, boundaries: bool) {
             .collect::<Vec<_>>()
             .join(",");
         let upsert = format!(
-            "INSERT INTO bulk_upsert VALUES {pairs} ON CONFLICT(id) DO UPDATE SET v=excluded.v"
+            "INSERT INTO bulk_upsert VALUES {pairs} ON CONFLICT(id) DO UPDATE SET v=excluded.v+1"
         );
-        assert_eq!(
-            client
-                .execute(&upsert, &[])
-                .await
-                .unwrap_err()
-                .as_db_error()
-                .unwrap()
-                .code()
-                .code(),
-            "54000"
-        );
+        assert_eq!(client.execute(&upsert, &[]).await.unwrap(), rows as u64);
+        assert_eq!(client.execute(&upsert, &[]).await.unwrap(), rows as u64);
+        assert_eq!(client.query_one("SELECT v FROM bulk_upsert WHERE id=0", &[])
+            .await.unwrap().get::<_, i32>(0), 1);
         let limit = giggles_core::relational::V2_MAX_SQL;
         let mut oversized = "INSERT INTO bulk VALUES (999999)".to_owned();
         oversized.extend(std::iter::repeat_n(' ', limit + 1 - oversized.len()));
