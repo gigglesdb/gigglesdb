@@ -44,10 +44,9 @@ fn empty_description_xmin_descriptor_and_left_join_null() {
         ["objoid", "classoid", "objsubid", "description"]
     );
     assert!(r.rows.is_empty());
-    assert!(matches!(
-        plan("SELECT xmin FROM pg_shdescription"),
-        Err(Error::UnknownColumn)
-    ));
+    let r = run("SELECT xmin FROM pg_shdescription", &[]);
+    assert_eq!(r.fields[0].data_type, PgType::Xid);
+    assert!(r.rows.is_empty());
     assert!(
         run("SELECT age(xmin) FROM pg_description", &[])
             .rows

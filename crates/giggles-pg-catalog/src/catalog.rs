@@ -69,7 +69,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
     if let Some(fields) = information_schema::schema(name) {
         return Some(fields);
     }
-    Some(fields(match name {
+    let mut result = fields(match name {
         "pg_namespace" => &[
             ("oid", T::Oid),
             ("nspname", T::Name),
@@ -796,7 +796,14 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
         ],
 
         _ => return None,
-    }))
+    });
+    if tableoid(name).is_some() && !result.iter().any(|f| f.name == "xmin") {
+        result.push(Field {
+            name: "xmin".into(),
+            data_type: T::Xid,
+        });
+    }
+    Some(result)
 }
 pub(crate) fn known_names() -> &'static [&'static str] {
     &[
@@ -1325,15 +1332,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(oid),
                 s(name),
                 I(namespace),
-                s(
-                    if matches!(name, "pg_indexes" | "pg_locks" | "pg_stat_ssl") || info.is_some() {
-                        "v"
-                    } else {
-                        "r"
-                    },
-                ),
+                s(if tableoid(name).is_none() { "v" } else { "r" }),
                 I(10),
-                I(fs.len() as i64),
+                I(fs.iter().filter(|f| f.name != "xmin").count() as i64),
                 B(false),
                 s("p"),
                 B(false),
@@ -1350,14 +1351,19 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             "pg_type",
             composite_row(rowtype as u32, name, namespace, oid, 10),
         );
-        for (i, f) in fs.iter().enumerate() {
+        for (i, f) in fs
+            .iter()
+            .filter(|f| f.name != "xmin")
+            .chain(fs.iter().filter(|f| f.name == "xmin"))
+            .enumerate()
+        {
             add(
                 "pg_attribute",
                 vec![
                     I(oid),
                     s(&f.name),
                     I(f.data_type.oid() as i64),
-                    I(i as i64 + 1),
+                    I(if f.name == "xmin" { -2 } else { i as i64 + 1 }),
                     B(false),
                     I(-1),
                     I(type_len(f.data_type)),
@@ -1956,6 +1962,10 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             .position(|field| field.name == "xmin")
         {
             for row in &mut relation.rows {
+                // Newly synthesized system slots follow all physical fields.
+                if xmin == row.len() {
+                    row.push(N);
+                }
                 row[xmin] = I(i64::from(snapshot.generation as u32));
             }
         }
@@ -2432,5 +2442,74 @@ mod schema_tests {
             execute(&plan, &snapshot, &[]).unwrap().rows,
             vec![vec![B(true), B(false)]]
         );
+    }
+}
+
+#[cfg(test)]
+mod system_xmin_tests {
+    use super::*;
+
+    #[test]
+    fn every_catalog_base_table_plans_xmin_and_stamps_catalog_xid() {
+        let snapshot = CatalogSnapshot {
+            generation: 12345,
+            ..Default::default()
+        };
+        let relations = build(&snapshot).unwrap();
+        for name in known_names() {
+            let sql = format!("select xmin from pg_catalog.{name}");
+            if tableoid(name).is_some() {
+                let plan = crate::plan(&sql).unwrap().unwrap();
+                assert_eq!(
+                    crate::describe(&plan).unwrap()[0].data_type,
+                    PgType::Xid,
+                    "{name}"
+                );
+                let result = crate::execute(&plan, &snapshot, &[]).unwrap();
+                for row in result.rows {
+                    assert_eq!(row, vec![I(12345)], "{name}");
+                }
+                let star = crate::plan(&format!("select * from pg_catalog.{name}"))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    !crate::describe(&star)
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.name == "xmin"),
+                    "{name}"
+                );
+                let oid = I(i64::from(tableoid(name).unwrap()));
+                let attrs = &relations["pg_attribute"].rows;
+                assert!(
+                    attrs
+                        .iter()
+                        .any(|row| row[0] == oid && row[1] == s("xmin") && row[4] == I(-2)),
+                    "{name}"
+                );
+                let ordinary = attrs
+                    .iter()
+                    .filter(|row| row[0] == oid && matches!(row[4], I(n) if n > 0))
+                    .count();
+                let class = relations["pg_class"]
+                    .rows
+                    .iter()
+                    .find(|row| row[0] == oid)
+                    .unwrap();
+                assert_eq!(class[5], I(ordinary as i64), "{name}");
+                let fields = &relations[*name].fields;
+                assert_eq!(
+                    fields.iter().filter(|f| f.name == "xmin").count(),
+                    1,
+                    "{name}"
+                );
+            } else if relation_namespace(name) == "pg_catalog" {
+                assert_eq!(
+                    crate::plan(&sql).unwrap_err(),
+                    Error::UnknownColumn,
+                    "{name}"
+                );
+            }
+        }
     }
 }

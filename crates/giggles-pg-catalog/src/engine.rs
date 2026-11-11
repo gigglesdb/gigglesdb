@@ -19,6 +19,7 @@ pub struct Plan {
     parameters: usize,
     parameter_types: Vec<PgType>,
     projection_parameters: bool,
+    text_cast_parameters: Vec<bool>,
 }
 impl Plan {
     pub fn user_relations(&self) -> &BTreeMap<String, Vec<Field>> {
@@ -28,6 +29,14 @@ impl Plan {
     /// (including a derived query) contains a parameter expression.
     pub fn allows_numeric_input_override(&self) -> bool {
         !self.projection_parameters
+    }
+    /// True only when every occurrence of this parameter is the direct operand
+    /// of an explicit text/varchar cast. Its declared input cannot change output types.
+    pub fn allows_text_cast_input_override(&self, parameter: usize) -> bool {
+        self.text_cast_parameters
+            .get(parameter)
+            .copied()
+            .unwrap_or(false)
     }
     pub fn parameter_count(&self) -> usize {
         self.parameters
@@ -378,6 +387,57 @@ impl Scan {
         }
     }
 }
+// Count all occurrences, including repeated uses and nested queries, so an
+// uncast use of the same $n prevents widening that parameter everywhere.
+struct TextCastParameters(BTreeMap<usize, usize>, BTreeMap<usize, usize>);
+impl TextCastParameters {
+    fn flags(&self, parameters: usize) -> Vec<bool> {
+        (1..=parameters)
+            .map(|i| {
+                self.0
+                    .get(&i)
+                    .is_some_and(|count| self.1.get(&i) == Some(count))
+            })
+            .collect()
+    }
+}
+
+impl Visitor for TextCastParameters {
+    type Break = ();
+    fn pre_visit_expr(&mut self, e: &A) -> ControlFlow<()> {
+        fn parameter(e: &A) -> Option<usize> {
+            if let A::Value(a::Value::Placeholder(p)) = e {
+                p.strip_prefix('$')?.parse().ok()
+            } else {
+                None
+            }
+        }
+        if let Some(i) = parameter(e) {
+            *self.0.entry(i).or_default() += 1;
+        }
+        if let A::Cast {
+            expr,
+            data_type,
+            format: None,
+            kind,
+        } = e
+            && matches!(kind, a::CastKind::Cast | a::CastKind::DoubleColon)
+        {
+            let name = data_type.to_string().to_ascii_lowercase();
+            let name = name.strip_prefix("pg_catalog.").unwrap_or(&name);
+            let mut operand = expr.as_ref();
+            while let A::Nested(inner) = operand {
+                operand = inner;
+            }
+            if matches!(name, "text" | "varchar" | "character varying")
+                && let Some(i) = parameter(operand)
+            {
+                *self.1.entry(i).or_default() += 1;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
 struct ProjectionParameters(bool);
 impl Visitor for ProjectionParameters {
     type Break = ();
@@ -525,6 +585,9 @@ fn plan_inner(
     let mut plan = finish_plan(query, c.parameters, projection_parameters.0)?;
     if let Some(plan) = &mut plan {
         plan.user_relations = c.used_relations;
+        let mut uses = TextCastParameters(BTreeMap::new(), BTreeMap::new());
+        let _ = q.visit(&mut uses);
+        plan.text_cast_parameters = uses.flags(plan.parameters);
     }
     Ok(plan)
 }
@@ -549,6 +612,7 @@ fn finish_plan(
         query,
         parameters,
         parameter_types,
+        text_cast_parameters: vec![false; parameters],
     }))
 }
 pub fn describe(plan: &Plan) -> R<Vec<Field>> {
@@ -1475,13 +1539,15 @@ impl Compiler {
                 .or_else(|| self.user_relations.contains_key(name).then_some(0)),
             _ => None,
         };
+        let catalog_system_columns = matches!(&source,
+            Source::Catalog(name) if catalog::tableoid(name).is_some());
         let mut schema: Schema = fields
             .into_iter()
             .map(|field| Col {
                 qualifier: qualifier.clone(),
+                system: catalog_system_columns && field.name == "xmin",
                 field,
                 natural_hidden: false,
-                system: false,
                 scope_depth: 0,
             })
             .collect();

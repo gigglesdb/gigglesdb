@@ -92,6 +92,7 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
     let arms = split(tokens)?;
     let mut scan = Scan::new();
     let mut projections = ProjectionParameters(false);
+    let mut text_casts = TextCastParameters(BTreeMap::new(), BTreeMap::new());
     // The flat wrapper consumes one query and one source, like an operator.
     let mut compiler = Compiler {
         user_relations: BTreeMap::new(),
@@ -124,6 +125,7 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
             return Err(Error::Unsupported);
         }
         let _ = q.visit(&mut projections);
+        let _ = q.visit(&mut text_casts);
         // Classification of every arm precedes any successful plan/None return.
         // Keep the first compiler failure until combined routing is established.
         match compiler.query(q, &vec![]) {
@@ -176,7 +178,11 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
         group: vec![],
         aggregate: false,
     };
-    finish_plan(query, compiler.parameters, projections.0)
+    let mut plan = finish_plan(query, compiler.parameters, projections.0)?;
+    if let Some(plan) = &mut plan {
+        plan.text_cast_parameters = text_casts.flags(plan.parameters);
+    }
+    Ok(plan)
 }
 
 pub(super) fn validate_wrapper(q: &Query) -> R<()> {

@@ -1,0 +1,2 @@
+select oid
+from pg_catalog.pg_user_mapping

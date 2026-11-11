@@ -1,0 +1,1 @@
+select oid::bigint from pg_catalog.pg_tablespace

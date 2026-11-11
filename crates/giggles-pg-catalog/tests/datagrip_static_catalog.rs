@@ -49,7 +49,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("aggmtransspace", PgType::Int4),
             ("agginitval", PgType::Text),
             ("aggminitval", PgType::Text),
-            ("xmin", PgType::Xid),
             ("aggfnoid", PgType::Regproc),
             ("aggtransfn", PgType::Regproc),
             ("aggfinalfn", PgType::Regproc),
@@ -88,7 +87,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("amopopr", PgType::Oid),
             ("amopmethod", PgType::Oid),
             ("amopsortfamily", PgType::Oid),
-            ("xmin", PgType::Xid),
         ],
         "pg_amop"
     );
@@ -114,7 +112,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("amproclefttype", PgType::Oid),
             ("amprocrighttype", PgType::Oid),
             ("amprocnum", PgType::Int2),
-            ("xmin", PgType::Xid),
             ("amproc", PgType::Regproc),
         ],
         "pg_amproc"
@@ -146,7 +143,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("collcollate", PgType::Name),
             ("collctype", PgType::Name),
             ("collversion", PgType::Text),
-            ("xmin", PgType::Xid),
         ],
         "pg_collation"
     );
@@ -176,7 +172,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("opcfamily", PgType::Oid),
             ("opcintype", PgType::Oid),
             ("opckeytype", PgType::Oid),
-            ("xmin", PgType::Xid),
         ],
         "pg_opclass"
     );
@@ -209,7 +204,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("oprresult", PgType::Oid),
             ("oprcom", PgType::Oid),
             ("oprnegate", PgType::Oid),
-            ("xmin", PgType::Xid),
             ("oprcode", PgType::Regproc),
             ("oprrest", PgType::Regproc),
             ("oprjoin", PgType::Regproc),
@@ -238,7 +232,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("opfname", PgType::Name),
             ("opfnamespace", PgType::Oid),
             ("opfowner", PgType::Oid),
-            ("xmin", PgType::Xid),
         ],
         "pg_opfamily"
     );
@@ -265,7 +258,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("polcmd", PgType::Char),
             ("polpermissive", PgType::Bool),
             ("polroles", PgType::OidArray),
-            ("xmin", PgType::Xid),
             ("polqual", PgType::PgNodeTree),
             ("polwithcheck", PgType::PgNodeTree),
         ],
@@ -315,7 +307,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("probin", PgType::Text),
             ("proconfig", PgType::TextArray),
             ("proacl", PgType::AclItemArray),
-            ("xmin", PgType::Xid),
             ("prosupport", PgType::Regproc),
             ("proargdefaults", PgType::PgNodeTree),
             ("prosqlbody", PgType::PgNodeTree),
@@ -345,7 +336,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("ev_type", PgType::Char),
             ("ev_enabled", PgType::Char),
             ("is_instead", PgType::Bool),
-            ("xmin", PgType::Xid),
             ("ev_qual", PgType::PgNodeTree),
             ("ev_action", PgType::PgNodeTree),
         ],
@@ -376,7 +366,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("seqmin", PgType::Int8),
             ("seqcache", PgType::Int8),
             ("seqcycle", PgType::Bool),
-            ("xmin", PgType::Xid),
         ],
         "pg_sequence"
     );
@@ -415,7 +404,6 @@ fn static_catalog_descriptors_and_empty_rows() {
             ("tgargs", PgType::Bytea),
             ("tgoldtable", PgType::Name),
             ("tgnewtable", PgType::Name),
-            ("xmin", PgType::Xid),
             ("tgqual", PgType::PgNodeTree),
         ],
         "pg_trigger"
@@ -466,7 +454,11 @@ fn catalog_identity_authorized_facts_and_generation_xmin() {
             .is_empty()
     );
     // The finite PG18 lock view is now modeled; no transaction xids are assigned.
-    assert!(run("select * from pg_catalog.pg_locks", &[]).rows.is_empty());
+    assert!(
+        run("select * from pg_catalog.pg_locks", &[])
+            .rows
+            .is_empty()
+    );
 }
 #[test]
 fn exact_static_captured_query_subset() {

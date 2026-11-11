@@ -111,16 +111,16 @@ impl Fixture {
 // Translate JDBC markers only in SQL, preserving the '?' in captured -- comments.
 // The only marker shapes in this frozen capture are ::oid, ::varchar::xid and
 // bare schema-OID IN-list markers. Explicit OIDs match JDBC's parameter types.
-fn jdbc_sql(sql: &str) -> (String, Vec<u32>) {
+fn jdbc_sql(sql: &str, numeric_xid: bool) -> (String, Vec<u32>) {
     let mut translated = String::new();
     let mut oids = vec![];
-    for line in sql.lines() {
+    for line in sql.split_inclusive('\n') {
         let (code, comment) = line.split_once("--").unwrap_or((line, ""));
         for (at, ch) in code.char_indices() {
             if ch == '?' {
                 let suffix = &code[at + 1..];
                 oids.push(if suffix.starts_with("::varchar::xid") {
-                    1043
+                    if numeric_xid { 20 } else { 1043 }
                 } else {
                     assert!(suffix.starts_with("::oid") || suffix.trim_start().starts_with(')'));
                     26
@@ -134,9 +134,13 @@ fn jdbc_sql(sql: &str) -> (String, Vec<u32>) {
             translated.push_str("--");
             translated.push_str(comment);
         }
-        translated.push('\n');
     }
-    (translated.trim_end().to_owned(), oids)
+    let translated = if numeric_xid {
+        translated
+    } else {
+        translated.trim_end().to_owned()
+    };
+    (translated, oids)
 }
 
 #[derive(Default, Debug)]
@@ -191,7 +195,35 @@ async fn query(
         parse_oids("", sql, oids)
     };
     pg_send(stream, b'P', &prepared).await;
-    pg_send(stream, b'B', &bind("", "", &inputs, false)).await;
+    let binding = if oids.contains(&20) {
+        // PgPreparedStatement.setLong uses Oid.INT8 and ByteConverter.int8
+        // when binaryTransferSend(INT8) is enabled (the pgjdbc binary path).
+        let mut body = vec![0, 0]; // unnamed portal and statement
+        body.extend((oids.len() as u16).to_be_bytes());
+        for oid in oids {
+            body.extend(u16::from(*oid == 20).to_be_bytes());
+        }
+        body.extend((oids.len() as u16).to_be_bytes());
+        for (oid, value) in oids.iter().zip(&inputs) {
+            let bytes = if *oid == 20 {
+                value
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+                    .to_be_bytes()
+                    .to_vec()
+            } else {
+                value.unwrap().as_bytes().to_vec()
+            };
+            body.extend((bytes.len() as i32).to_be_bytes());
+            body.extend(bytes);
+        }
+        body.extend(0u16.to_be_bytes()); // text results
+        body
+    } else {
+        bind("", "", &inputs, false)
+    };
+    pg_send(stream, b'B', &binding).await;
     pg_send(stream, b'D', b"P\0").await;
     pg_send(stream, b'E', &execute("", 0)).await;
     let frames = pg_sync(stream).await;
@@ -265,6 +297,16 @@ async fn replay(engine: Engine) {
         BTreeSet::from(["1060084418", "1060084419", "1060084420"])
     );
     captures.extend(reconnect);
+    let reconnect2: Vec<Capture> =
+        serde_json::from_str(include_str!("fixtures/datagrip_reconnect2/manifest.json")).unwrap();
+    assert_eq!(reconnect2.len(), 192);
+    let reconnect2_sessions = reconnect2
+        .iter()
+        .map(|c| c.session.clone())
+        .collect::<BTreeSet<_>>();
+    captures.extend(reconnect2);
+    let reconnect2_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/datagrip_reconnect2");
     let reconnect_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/datagrip_reconnect");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/datagrip_session");
@@ -290,16 +332,48 @@ async fn replay(engine: Engine) {
                 refresh_xid = max_xid;
             }
         }
-        let capture_root = if matches!(session.as_str(), "1060084418" | "1060084419" | "1060084420")
-        {
+        if capture.statement == "94686000" {
+            // This recording starts from a fresh database and repeats the earlier
+            // CREATE TABLE. Restore that boundary state on the same running server.
+            let existing = query(
+                &mut stream,
+                capture,
+                "SELECT relname AS table_name FROM pg_catalog.pg_class WHERE relname='table_name'",
+                &[],
+                max_xid.unwrap(),
+            )
+            .await;
+            assert!(
+                existing
+                    .values("table_name")
+                    .any(|name| name == "table_name")
+            );
+            query(
+                &mut stream,
+                capture,
+                "DROP TABLE table_name",
+                &[],
+                max_xid.unwrap(),
+            )
+            .await;
+        }
+        // Qualified application wildcards belong to the other implementation worker.
+        if session == "1060084425" && capture.statement == "94686119" {
+            continue;
+        }
+        let numeric_xid = reconnect2_sessions.contains(&session);
+        let capture_root = if numeric_xid {
+            &reconnect2_root
+        } else if matches!(session.as_str(), "1060084418" | "1060084419" | "1060084420") {
             &reconnect_root
         } else {
             &root
         };
         let sql = std::fs::read_to_string(capture_root.join(&capture.file)).unwrap();
         assert!(!sql.contains('\r'), "LF fixture {}", capture.file);
-        let (sql, oids) = jdbc_sql(&sql);
-        // The server hashes the trimmed PostgreSQL SQL, after JDBC renumbering.
+        let (sql, oids) = jdbc_sql(&sql, numeric_xid);
+        // Captured query IDs hash the exact SQL after JDBC renumbering.
+        // The first recording was trimmed; reconnect2 retains trailing whitespace.
         let hash = hex::encode(Sha256::digest(sql.as_bytes()));
         if let Some(detail) = &capture.detail {
             let expected = detail.split("query_id=").nth(1).unwrap();
@@ -346,6 +420,18 @@ async fn replay(engine: Engine) {
             assert!(result.max_xid().unwrap() >= refresh_xid.unwrap());
             refreshed_tables.insert(session.clone());
         }
+        if matches!(capture.statement.as_str(), "94686104" | "94686174") {
+            assert!(
+                result.values("column_name").any(|name| name == "test"),
+                "{}: {result:?}",
+                capture.file
+            );
+            assert!(
+                !result
+                    .values("column_name")
+                    .any(|name| name == "giggles_rowid")
+            );
+        }
         if matches!(capture.statement.as_str(), "94685815" | "94685875") {
             assert!(sql.contains("pg_catalog.age("), "incremental columns query");
             assert!(
@@ -367,7 +453,15 @@ async fn replay(engine: Engine) {
             "1060084417",
             "1060084418",
             "1060084419",
-            "1060084420"
+            "1060084420",
+            "1060084421",
+            "1060084422",
+            "1060084423",
+            "1060084424",
+            "1060084425",
+            "1060084426",
+            "1060084423",
+            "1060084427"
         ]
     );
     for expected in QUERY_IDS {
@@ -402,7 +496,7 @@ async fn replay(engine: Engine) {
     );
     println!(
         "DataGrip {engine:?}: {} statements, zero ErrorResponses; initial xid {}, final xid {}; table_name/test found in refresh sessions; table_name visible after all reconnects",
-        captures.len(),
+        captures.len() - 1,
         initial_xid.unwrap(),
         max_xid.unwrap()
     );

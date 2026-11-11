@@ -436,7 +436,6 @@ fn standalone_relations_have_postgresql_18_column_order_and_types() {
                 ("attoptions", T::TextArray),
                 ("attfdwoptions", T::TextArray),
                 ("attmissingval", T::AnyArray),
-                ("xmin", T::Xid),
             ],
         ),
     ];
@@ -559,4 +558,49 @@ fn bigint_remainder_preserves_sign_nulls_and_zero_errors() {
             .unwrap();
         assert_eq!(execute(&p, &snapshot(42), &[]), Err(Error::DivisionByZero));
     }
+}
+
+#[test]
+fn text_cast_parameter_override_requires_every_use_to_be_explicit() {
+    for sql in [
+        "select pg_catalog.age($1::varchar::xid)",
+        "select oid from pg_class where age(xmin) <= age($1::text::xid)",
+        "select $1::text from pg_class",
+        "select ($1)::pg_catalog.varchar from pg_class",
+        "select $1::text, $1::varchar from pg_class",
+    ] {
+        let p = plan(sql).unwrap().unwrap();
+        assert!(p.allows_text_cast_input_override(0), "{sql}");
+        assert!(!p.allows_text_cast_input_override(1));
+        let r = execute(&p, &CatalogSnapshot::default(), &[Value::Int(123)]);
+        assert!(r.is_ok(), "{sql}: {r:?}");
+    }
+    for sql in [
+        "select $1 from pg_class",
+        "select $1::int from pg_class",
+        "select $1::text, $1 from pg_class",
+        "select $1::text from pg_class where oid=$1",
+        "select $1::text from (select $1 from pg_class) t",
+    ] {
+        let p = plan(sql).unwrap().unwrap();
+        assert!(!p.allows_text_cast_input_override(0), "{sql}");
+    }
+}
+
+#[test]
+fn text_cast_parameter_override_covers_the_flat_union_adapter() {
+    let filter = ["1=1"; 10].join(" AND ");
+    let arm = format!("SELECT $1::varchar FROM pg_database WHERE {filter}");
+    let mut arms = vec![arm; 16];
+    let p = plan(&arms.join(" UNION ALL ")).unwrap().unwrap();
+    assert!(p.allows_text_cast_input_override(0));
+    assert_eq!(
+        execute(&p, &Default::default(), &[Value::Int(123)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("123".into())]; 16]
+    );
+    arms[15] = format!("SELECT $1 FROM pg_database WHERE {filter}");
+    let p = plan(&arms.join(" UNION ALL ")).unwrap().unwrap();
+    assert!(!p.allows_text_cast_input_override(0));
 }

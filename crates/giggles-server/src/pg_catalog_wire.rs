@@ -49,11 +49,29 @@ pub(crate) fn snapshot(
     epoch: u64,
     tables: Vec<giggles_core::relational::TableDef>,
     indexes: Vec<giggles_core::IndexInfo>,
-    column_typmods: std::collections::BTreeMap<u64, i32>,
+    mut column_typmods: std::collections::BTreeMap<u64, i32>,
     types: giggles_core::relational::UserTypeCatalog,
 ) -> Result<giggles_pg_catalog::CatalogSnapshot> {
     use giggles_core::relational::DataType as C;
     use giggles_pg_catalog::ScalarType as P;
+    // Storage-only heap keys must disappear before deriving any catalog relation.
+    // Side maps and indexes use stable column IDs, so removing the marker here
+    // also keeps all user attribute positions contiguous.
+    let tables = tables
+        .into_iter()
+        .map(|mut table| {
+            if let Some(hidden) = table.hidden_rowid() {
+                table.columns.remove(hidden);
+                table.primary_key.clear();
+            }
+            table
+        })
+        .collect::<Vec<_>>();
+    let columns = tables
+        .iter()
+        .flat_map(|t| t.columns.iter().map(|c| c.id))
+        .collect::<std::collections::BTreeSet<_>>();
+    column_typmods.retain(|id, _| columns.contains(id));
     let visible: std::collections::BTreeSet<_> = tables.iter().map(|table| table.id).collect();
     let (roles, table_owners) = catalog_roles(session, &tables);
     let user_types = types
@@ -92,6 +110,7 @@ pub(crate) fn snapshot(
     let column_type_oids = types
         .column_types
         .iter()
+        .filter(|(id, _)| columns.contains(id))
         .map(|(id, ty)| {
             (
                 *id,
@@ -150,7 +169,10 @@ pub(crate) fn snapshot(
         column_typmods,
         indexes: indexes
             .into_iter()
-            .filter(|index| visible.contains(&index.table))
+            .filter(|index| {
+                visible.contains(&index.table)
+                    && index.columns.iter().all(|id| columns.contains(id))
+            })
             .map(|index| giggles_pg_catalog::IndexDef {
                 id: index.id,
                 table: index.table,
@@ -1009,6 +1031,138 @@ mod tests {
         assert!(read(&mut session).generation > committed);
         drop(session);
         drop(reopened);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn heap_storage_key_is_removed_before_catalog_derivation() {
+        use giggles_core::{Admin, Limits, roles::NewRole};
+        let path = crate::test_support::fixture_root().join(format!(
+            "catalog-heap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let admin = Admin::create(&path, Limits::default()).unwrap();
+        admin
+            .roles()
+            .create(NewRole {
+                name: "heap_owner".into(),
+                login: true,
+                superuser: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let service =
+            crate::Service::new(admin, vec![], crate::clock::Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.role_session("heap_owner").unwrap();
+        for sql in [
+            "CREATE TABLE heap_table (a VARCHAR(7), b NUMERIC(8,2))",
+            "CREATE TABLE pk_table (id BIGINT PRIMARY KEY, a VARCHAR(9))",
+        ] {
+            session
+                .execute_sql(sql, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        let (epoch, tables, mut indexes, mut typmods, mut types) =
+            session.catalog_snapshot_with_typmods().unwrap();
+        let heap = tables.iter().find(|t| t.name == "heap_table").unwrap();
+        let hidden = heap.columns[heap.hidden_rowid().unwrap()].id;
+        // Heap secondary-index execution is outside this adapter test. Supply
+        // stable-ID catalog descriptors to prove their attribute mapping survives.
+        indexes.push(giggles_core::IndexInfo {
+            id: 99,
+            table: heap.id,
+            name: "heap_b".into(),
+            columns: vec![heap.columns.iter().find(|c| c.name == "b").unwrap().id],
+            unique: false,
+        });
+        indexes.push(giggles_core::IndexInfo {
+            id: 100,
+            table: heap.id,
+            name: "hidden_storage_index".into(),
+            columns: vec![hidden],
+            unique: true,
+        });
+        // Even stale presentation metadata for the storage marker is removed.
+        typmods.insert(hidden, 123);
+        types.column_types.insert(hidden, 999);
+        let snapshot = snapshot(&session, epoch, tables, indexes, typmods, types).unwrap();
+        assert!(!snapshot.column_typmods.contains_key(&hidden));
+        assert!(!snapshot.column_type_oids.contains_key(&hidden));
+        let heap = snapshot
+            .tables
+            .iter()
+            .find(|t| t.name == "heap_table")
+            .unwrap();
+        assert!(heap.primary_key.is_empty());
+        assert_eq!(
+            heap.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let pk = snapshot
+            .tables
+            .iter()
+            .find(|t| t.name == "pk_table")
+            .unwrap();
+        assert_eq!(pk.primary_key, [0]);
+        let run = |sql: &str| {
+            let p = giggles_pg_catalog::plan(sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+                .unwrap();
+            execute(&p, &snapshot, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+                .rows
+        };
+        assert_eq!(
+            run(
+                "select a.attname,a.attnum,a.atttypmod from pg_attribute a join pg_class c on c.oid=a.attrelid where c.relname='heap_table' order by a.attnum"
+            ),
+            [
+                vec![Value::Text("a".into()), Value::Int(1), Value::Int(11)],
+                vec![Value::Text("b".into()), Value::Int(2), Value::Int(524294)],
+            ]
+        );
+        assert_eq!(
+            run(
+                "select column_name,ordinal_position from information_schema.columns where table_name='heap_table' order by ordinal_position"
+            ),
+            [
+                vec![Value::Text("a".into()), Value::Int(1)],
+                vec![Value::Text("b".into()), Value::Int(2)],
+            ]
+        );
+        assert!(run("select conname from pg_constraint where conrelid=(select oid from pg_class where relname='heap_table') and contype='p'").is_empty());
+        assert!(run("select indexrelid from pg_index where indrelid=(select oid from pg_class where relname='heap_table') and indisprimary").is_empty());
+        assert_eq!(
+            run(
+                "select indkey from pg_index where indrelid=(select oid from pg_class where relname='heap_table')"
+            ),
+            [vec![Value::Array(vec![Value::Int(2)])]]
+        );
+        assert_eq!(
+            run("select relnatts,relhasindex from pg_class where relname='heap_table'"),
+            [vec![Value::Int(2), Value::Bool(true)]]
+        );
+        assert_eq!(
+            run(
+                "select conname from pg_constraint where conrelid=(select oid from pg_class where relname='pk_table') and contype='p'"
+            ),
+            [vec![Value::Text("pk_table_pkey".into())]]
+        );
+        assert_eq!(
+            run(
+                "select indkey,indisprimary from pg_index where indrelid=(select oid from pg_class where relname='pk_table')"
+            ),
+            [vec![Value::Array(vec![Value::Int(1)]), Value::Bool(true)]]
+        );
+        drop(session);
+        drop(service);
         std::fs::remove_dir_all(path).unwrap();
     }
 

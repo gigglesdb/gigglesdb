@@ -149,7 +149,6 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
             "typinput",
             "typdelim",
             "typowner",
-            "xmin",
             "typndims",
             "typdefault",
             "typisdefined",
@@ -160,23 +159,23 @@ fn every_type_constructor_appends_null_acl_with_exact_descriptor() {
             "typstorage",
         ]
     );
-    assert_eq!(result.fields[20].data_type, PgType::AclItemArray);
-    assert_eq!(result.fields[20].data_type.oid(), 1034);
+    assert_eq!(result.fields[19].data_type, PgType::AclItemArray);
+    assert_eq!(result.fields[19].data_type.oid(), 1034);
     assert!(
         result
             .rows
             .iter()
-            .all(|r| r.len() == 24 && r[20] == Value::Null)
+            .all(|r| r.len() == 23 && r[19] == Value::Null)
     );
     // Scalar, array, nominal, nominal array, virtual composite and application
     // composite paths must all be represented with NULL, never invented grants.
     for oid in [20, 1016, 24, 1008, 194, 34015, 65567] {
         let rows: Vec<_> = result.rows.iter().filter(|row| row[0] == i(oid)).collect();
         assert_eq!(rows.len(), 1, "type {oid}");
-        assert_eq!(rows[0][20], Value::Null);
+        assert_eq!(rows[0][19], Value::Null);
     }
-    assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typacl'", &snapshot(), &[]).rows,vec![vec![i(1034),i(-1),i(21)]]);
-    assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typreceive'", &snapshot(), &[]).rows,vec![vec![i(26),i(4),i(22)]]);
+    assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typacl'", &snapshot(), &[]).rows,vec![vec![i(1034),i(-1),i(20)]]);
+    assert_eq!(run("select atttypid, attlen, attnum from pg_catalog.pg_attribute where attrelid=1247 and attname='typreceive'", &snapshot(), &[]).rows,vec![vec![i(26),i(4),i(21)]]);
     assert_eq!(run("select oid, typname, typtype, typcategory, typelem, typarray, typacl from pg_catalog.pg_type where oid in (24,194,1008,65567) order by oid", &snapshot(), &[]).rows,vec![
         vec![i(24),s("regproc"),s("b"),s("N"),i(0),i(1008),Value::Null],
         vec![i(194),s("pg_node_tree"),s("b"),s("Z"),i(0),i(0),Value::Null],

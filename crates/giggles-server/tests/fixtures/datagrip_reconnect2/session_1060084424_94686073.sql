@@ -1,0 +1,1 @@
+select oid from pg_catalog.pg_foreign_server

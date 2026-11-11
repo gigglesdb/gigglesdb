@@ -711,15 +711,23 @@ fn catalog_plan(
     }
 }
 
-/// A declared wire type may replace an inferred catalog input type only when no
-/// SELECT projection contains a parameter, and only within one family: the
-/// integer/oid family, or the string family (name, text, varchar). Drivers such
-/// as Npgsql bind text for `information_schema` identifier comparisons
-/// (`table_schema = $1`), which PostgreSQL resolves as a text comparison.
-fn catalog_input_override(plan: &giggles_pg_catalog::Plan, declared: u32, inferred: u32) -> bool {
-    plan.allows_numeric_input_override()
-        && ((matches!(declared, 20 | 21 | 23 | 26) && matches!(inferred, 20 | 21 | 23 | 26))
-            || (matches!(declared, 19 | 25 | 1043) && matches!(inferred, 19 | 25 | 1043)))
+/// Explicit text/varchar cast operands may use integer or string declarations:
+/// decode with the declared wire type, then the catalog applies PostgreSQL text
+/// output semantics. Every use of that parameter must have the explicit cast.
+/// Otherwise overrides require no projected parameters and stay within one
+/// family (integer/oid or name/text/varchar), as needed by Npgsql identifiers.
+fn catalog_input_override(
+    plan: &giggles_pg_catalog::Plan,
+    parameter: usize,
+    declared: u32,
+    inferred: u32,
+) -> bool {
+    (plan.allows_text_cast_input_override(parameter)
+        && matches!(declared, 20 | 21 | 23 | 25 | 1043)
+        && matches!(inferred, 25 | 1043))
+        || plan.allows_numeric_input_override()
+            && ((matches!(declared, 20 | 21 | 23 | 26) && matches!(inferred, 20 | 21 | 23 | 26))
+                || (matches!(declared, 19 | 25 | 1043) && matches!(inferred, 19 | 25 | 1043)))
 }
 
 fn sql_declared_type(ty: &DataType, declared: u32) -> Option<DataType> {
@@ -1245,9 +1253,15 @@ impl State {
                 // Retry only the catalog declaration mismatch that would otherwise be
                 // 0A000. Keep catalog validation and successful numeric overrides intact.
                 if let Plan::Catalog(plan, _, _) = &p {
-                    let mismatch = oids.iter().zip(&parameter_oids).any(|(o, inferred)| {
-                        *o != 0 && o != inferred && !catalog_input_override(plan, *o, *inferred)
-                    });
+                    let mismatch =
+                        oids.iter()
+                            .zip(&parameter_oids)
+                            .enumerate()
+                            .any(|(i, (o, inferred))| {
+                                *o != 0
+                                    && o != inferred
+                                    && !catalog_input_override(plan, i, *o, *inferred)
+                            });
                     if session.role.is_sql()
                         && mismatch
                         && oids.iter().all(|o| {
@@ -1287,7 +1301,7 @@ impl State {
                             // projected parameter's output type unchanged.
                             if o != parameter_oids[i] {
                                 let safe = matches!(&p, Plan::Catalog(plan, _, _)
-                                    if catalog_input_override(plan, o, parameter_oids[i]));
+                                    if catalog_input_override(plan, i, o, parameter_oids[i]));
                                 if !safe {
                                     return Err("0A000");
                                 }
@@ -2322,3 +2336,55 @@ mod logical_wire_tests {
 #[cfg(test)]
 #[path = "pgwire_user_types_tests.rs"]
 mod user_types_tests;
+
+#[cfg(test)]
+mod catalog_text_cast_input_tests {
+    use super::*;
+
+    #[test]
+    fn integer_wire_declarations_are_limited_to_explicit_text_cast_operands() {
+        let plan = giggles_pg_catalog::plan("select $1::varchar from pg_catalog.pg_database")
+            .unwrap()
+            .unwrap();
+        let inferred = plan.parameter_types()[0].oid();
+        for declared in [20, 21, 23, 25, 1043] {
+            assert!(catalog_input_override(&plan, 0, declared, inferred));
+            let ty = catalog_wire::parameter_type(declared).unwrap();
+            for format in [0, 1] {
+                let value = if matches!(declared, 20 | 21 | 23) {
+                    giggles_pg_catalog::Value::Int(-123)
+                } else {
+                    giggles_pg_catalog::Value::Text("-123".into())
+                };
+                let bytes = catalog_wire::encode(&value, ty, format).unwrap().unwrap();
+                let decoded = catalog_wire::decode(&bytes, ty, format).unwrap();
+                let result =
+                    giggles_pg_catalog::execute(&plan, &Default::default(), &[decoded]).unwrap();
+                assert_eq!(
+                    result.rows,
+                    [vec![giggles_pg_catalog::Value::Text("-123".into())]]
+                );
+            }
+        }
+        for declared in [16, 17, 19, 26, 28, 700, 701, 1700, 1007] {
+            assert!(
+                !catalog_input_override(&plan, 0, declared, inferred),
+                "{declared}"
+            );
+        }
+        for sql in [
+            "select $1 from pg_catalog.pg_database",
+            "select $1::varchar, $1 from pg_catalog.pg_database",
+            "select $1::varchar from pg_catalog.pg_database where oid=$1",
+            "select pg_catalog.age($1::xid)",
+        ] {
+            let plan = giggles_pg_catalog::plan(sql).unwrap().unwrap();
+            for declared in [20, 21, 23] {
+                assert!(
+                    !catalog_input_override(&plan, 0, declared, plan.parameter_types()[0].oid()),
+                    "{sql}: {declared}"
+                );
+            }
+        }
+    }
+}

@@ -240,7 +240,7 @@ fn range_and_enum_are_registered_with_postgres_catalog_identities() {
         ]
     );
     let attrs = run(
-        "SELECT c.relname,a.attname,a.atttypid,a.attnum FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relname IN ('pg_enum','pg_range') ORDER BY c.relname,a.attnum",
+        "SELECT c.relname,a.attname,a.atttypid,a.attnum FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relname IN ('pg_enum','pg_range') AND a.attnum>0 ORDER BY c.relname,a.attnum",
     );
     let expected = [
         ("pg_enum", "oid", 26, 1),

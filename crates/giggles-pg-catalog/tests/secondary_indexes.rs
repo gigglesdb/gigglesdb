@@ -537,7 +537,7 @@ fn index_view_preserves_g1a_type_receive_metadata() {
     );
     assert_eq!(
         run("SELECT attnum FROM pg_attribute WHERE attrelid=1247 AND attname='typreceive'").rows,
-        vec![vec![I(22)]]
+        vec![vec![I(21)]]
     );
     assert_eq!(
         run("SELECT relname,oid FROM pg_class WHERE relname IN ('pg_enum','pg_range') ORDER BY relname").rows,

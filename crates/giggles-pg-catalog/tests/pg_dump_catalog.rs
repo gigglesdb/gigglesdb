@@ -247,8 +247,7 @@ fn tableoid_is_hidden_from_stars_views_and_ordinary_attributes() {
             "extrelocatable",
             "extversion",
             "extconfig",
-            "extcondition",
-            "xmin"
+            "extcondition"
         ]
     );
     let comma = run("SELECT * FROM pg_namespace n, pg_extension x").unwrap();
