@@ -220,7 +220,7 @@ fn expression(tokens: Vec<Token>) -> R<Filter> {
 pub(in crate::relational) fn constraint_deparse(tokens: &[Token]) -> R<String> {
     deparse(&expression(tokens.to_vec())?)
 }
-fn query(table: &TableDef, expr: &str) -> R<Query> {
+fn query(table: &TableDef, key: &str, expr: &str) -> R<Query> {
     let expr = expr.strip_suffix(" NOT VALID").unwrap_or(expr);
     let expr = expr
         .strip_prefix("CHECK (")
@@ -250,7 +250,7 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
     Ok(Query {
         explain: false,
         sources: vec![Source {
-            name: table.name.clone(),
+            name: key.into(),
             alias: table.name.clone(),
         }],
         joins: vec![],
@@ -353,7 +353,11 @@ pub(in crate::relational) fn constraint_validate(
     table: &TableDef,
     expr: &str,
 ) -> R<()> {
-    let q = query(table, expr)?;
+    let q = query(
+        table,
+        &relation_key(state.table_schema(table.id), &table.name),
+        expr,
+    )?;
     cast_subset(q.filter.as_ref().ok_or(SqlError::Unsupported)?, table)?;
     let bound = q.bind(state, 0, &[])?;
     if !bound.filter.as_ref().is_some_and(immutable) {
@@ -367,7 +371,11 @@ pub(in crate::relational) fn constraint_check(
     expr: &str,
     row: &SqlRow,
 ) -> R<()> {
-    let q = query(table, expr)?;
+    let q = query(
+        table,
+        &relation_key(state.table_schema(table.id), &table.name),
+        expr,
+    )?;
     let bound = q.bind(state, 0, &[])?;
     let result = bound.filter.as_ref().ok_or(SqlError::Unsupported)?.eval(
         &Tuple {
@@ -503,7 +511,7 @@ mod pg186_deparse_tests {
             primary_key: vec![],
         };
         let canonical = constraint_deparse(&lex("coalesce(i > 0, false)").unwrap()).unwrap();
-        let stored = query(&table, &canonical).unwrap();
+        let stored = query(&table, &table.name, &canonical).unwrap();
         assert_eq!(deparse(stored.filter.as_ref().unwrap()).unwrap(), canonical);
 
         let original = expression(lex("\"coalesce\"(true, false)").unwrap()).unwrap();

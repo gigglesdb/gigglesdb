@@ -349,3 +349,6 @@ mod qualified_wildcard;
 
 #[path = "ctid.rs"]
 mod ctid;
+
+#[path = "check_schema.rs"]
+mod check_schema;
