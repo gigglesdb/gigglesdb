@@ -1,0 +1,20 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "matrix": "tsx src/cli.ts matrix",
+    "load": "tsx src/cli.ts load",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write src tsconfig.json package.json README.md",
+    "ops": "tsx src/cli.ts ops"
+  },
+  "dependencies": {
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "8.15.5",
+    "typescript": "5.9.3",
+    "tsx": "4.20.6",
+    "prettier": "3.6.2"
+  }
+}

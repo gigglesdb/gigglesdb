@@ -3,3 +3,4 @@
 **/target-*/
 **/artifacts/
 /composite-review.db/
+node_modules/
