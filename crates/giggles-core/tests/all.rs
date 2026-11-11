@@ -352,3 +352,6 @@ mod ctid;
 
 #[path = "check_schema.rs"]
 mod check_schema;
+
+#[path = "upsert_arbiter.rs"]
+mod upsert_arbiter;

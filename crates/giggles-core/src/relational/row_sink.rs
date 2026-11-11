@@ -273,6 +273,11 @@ impl Relational {
         } else { None };
         if conflict_rows.is_some() { normalized.unbound_statement = None; }
         let prepared = &normalized;
+        let arbiter = match &prepared.statement {
+            Statement::InsertMulti(insert) if conflict_rows.is_some() =>
+                insert.conflict_arbiter_columns(self, &sink.indexes()),
+            _ => None,
+        };
         let mut names = if let Statement::TypeDdl(user_types::Ddl::Drop {
             names,
             cascade: true,
@@ -370,7 +375,14 @@ impl Relational {
                         let values = columns.iter().map(|id| proposal[table.columns.iter()
                             .position(|c| c.id == *id).expect("index column")].clone()).collect::<Vec<_>>();
                         if !values.contains(&Value::Null) {
-                            sink.conflict_lookup(table, columns, &values, &mut visit)?;
+                            // Only the arbiter can affect the same row twice (21000).
+                            // Other unique keys retain ordinary uniqueness checks (23505).
+                            if arbiter.as_ref().is_some_and(|ids| ids.len() == columns.len()
+                                && columns.iter().all(|id| ids.contains(id))) {
+                                sink.conflict_lookup(table, columns, &values, &mut visit)?;
+                            } else {
+                                sink.lookup(table, columns, Some(&values), true, &mut visit)?;
+                            }
                         }
                     }
                 }

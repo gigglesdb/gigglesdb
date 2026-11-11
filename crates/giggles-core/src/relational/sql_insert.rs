@@ -458,6 +458,24 @@ impl Insert {
             }))
         })
     }
+    /// Probe classification only; the conflict planner still validates the target.
+    pub(super) fn conflict_arbiter_columns(&self, state: &Relational,
+        descriptors: &[secondary_index::Descriptor]) -> Option<BTreeSet<u64>> {
+        let conflict = self.conflict.as_ref()?;
+        conflict.update.as_ref()?;
+        let table = state.tables.get(&self.table)?;
+        if let Some(columns) = &conflict.columns {
+            return columns.iter().map(|name| col(table, name).ok()
+                .map(|index| table.columns[index].id)).collect();
+        }
+        let name = conflict.constraint.as_deref()?;
+        if let Some(descriptor) = descriptors.iter().find(|d| d.table == table.id
+            && d.unique && split_key(&d.name).1 == name) {
+            return Some(descriptor.columns.iter().copied().collect());
+        }
+        (state.primary_key_constraint_name(table).as_deref() == Some(name))
+            .then(|| table.primary_key.iter().map(|index| table.columns[*index].id).collect())
+    }
     pub(super) fn updates_conflicts(&self) -> bool {
         self.conflict.as_ref().is_some_and(|c| c.update.is_some())
     }
