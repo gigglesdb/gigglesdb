@@ -419,3 +419,123 @@ fn cascade_diamond_deduplicates_and_unindexed_fanout_pages() {
         assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM {table}")), vec![vec![Int(0)]]);
     }
 }
+
+#[test]
+fn x8b_set_null_5000_parents_own_writes_and_rollback() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE p(id bigint PRIMARY KEY, unused bigint)");
+    f.execute("CREATE TABLE c(id bigint PRIMARY KEY, p bigint REFERENCES p(id) ON DELETE SET NULL)");
+    f.execute("CREATE INDEX c_parent ON c(p)");
+    seed_cascade(&f, "p", 5000, |n| n);
+    seed_cascade(&f, "c", 20000, |n| n / 4);
+    let mut s = f.admin().sql_session();
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO c VALUES(20000,4999)", &[], None).unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(s.execute("DELETE FROM p", &[], None).unwrap().affected, 5000);
+    eprintln!("X8b 5000 parents x 4 children SET NULL: {:?}", start.elapsed());
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM c WHERE p IS NULL"), vec![vec![Int(20001)]]);
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM p"), vec![vec![Int(5000)]]);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM c WHERE p IS NOT NULL"), vec![vec![Int(20000)]]);
+}
+
+#[test]
+fn x8b_set_actions_large_fanout_delete_and_update() {
+    for action in ["SET NULL", "SET DEFAULT"] {
+        for mutation in ["DELETE FROM p WHERE id=0", "UPDATE p SET id=1 WHERE id=0"] {
+            let f = Fixture::new();
+            f.execute("CREATE TABLE p(id bigint PRIMARY KEY)");
+            f.execute("INSERT INTO p VALUES(-1),(0)");
+            f.execute(&format!("CREATE TABLE c(id bigint PRIMARY KEY, p bigint DEFAULT -1 REFERENCES p(id) ON DELETE {action} ON UPDATE {action})"));
+            f.execute("CREATE INDEX c_parent ON c(p)");
+            seed_cascade(&f, "c", 1500, |_| 0);
+            let mut s = f.admin().sql_session();
+            assert_eq!(s.execute(mutation, &[], None).unwrap().affected, 1);
+            let predicate = if action == "SET NULL" { "p IS NULL" } else { "p=-1" };
+            assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM c WHERE {predicate}")), vec![vec![Int(1500)]]);
+        }
+    }
+}
+
+#[test]
+fn x8b_update_cascade_two_levels_and_moving_cursor() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE p(id bigint PRIMARY KEY, unused bigint)");
+    f.execute("CREATE TABLE c(id bigint PRIMARY KEY REFERENCES p(id) ON UPDATE CASCADE, unused bigint)");
+    f.execute("CREATE TABLE leaf(id bigint PRIMARY KEY, p bigint REFERENCES c(id) ON UPDATE CASCADE)");
+    f.execute("CREATE INDEX leaf_parent ON leaf(p)");
+    seed_cascade(&f, "p", 1500, |n| n);
+    seed_cascade(&f, "c", 1500, |n| n);
+    seed_cascade(&f, "leaf", 4500, |n| n / 3);
+    let mut s = f.admin().sql_session();
+    assert_eq!(s.execute("UPDATE p SET id=id+10000 RETURNING id", &[], None).unwrap().affected, 1500);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM c WHERE id>=10000"), vec![vec![Int(1500)]]);
+    assert_eq!(buffered(&mut s, "SELECT count(*) FROM leaf WHERE p>=10000"), vec![vec![Int(4500)]]);
+    assert_eq!(s.execute("UPDATE p SET id=10001 WHERE id=10000", &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+}
+
+#[test]
+fn x8b_single_parent_update_cascade_large_two_level_fanout() {
+    let f = Fixture::new();
+    f.execute("CREATE TABLE p(id bigint PRIMARY KEY)");
+    f.execute("INSERT INTO p VALUES(0)");
+    f.execute("CREATE TABLE c(id bigint PRIMARY KEY, p bigint REFERENCES p(id) ON UPDATE CASCADE, UNIQUE(id,p))");
+    f.execute("CREATE INDEX c_parent ON c(p)");
+    f.execute("CREATE TABLE leaf(id bigint PRIMARY KEY, c bigint, p bigint, FOREIGN KEY(c,p) REFERENCES c(id,p) ON UPDATE CASCADE)");
+    f.execute("CREATE INDEX leaf_parent ON leaf(c,p)");
+    seed_cascade(&f, "c", 1500, |_| 0);
+    let mut s = f.admin().sql_session();
+    s.execute("INSERT INTO leaf SELECT id,id,0 FROM c", &[], None).unwrap();
+    assert_eq!(s.execute("UPDATE p SET id=1", &[], None).unwrap().affected, 1);
+    for table in ["c", "leaf"] {
+        assert_eq!(buffered(&mut s, &format!("SELECT count(*) FROM {table} WHERE p=1")), vec![vec![Int(1500)]]);
+    }
+}
+
+#[test]
+fn x8b_unchanged_default_and_deferred_autocommit_still_check_parent() {
+    for default in [0, 9999] {
+        let f = Fixture::new();
+        f.execute("CREATE TABLE p(id bigint PRIMARY KEY)");
+        f.execute("INSERT INTO p VALUES(0)");
+        f.execute(&format!("CREATE TABLE c(id bigint PRIMARY KEY, p bigint DEFAULT {default} REFERENCES p(id) ON DELETE SET DEFAULT DEFERRABLE INITIALLY DEFERRED)"));
+        f.execute("CREATE INDEX c_parent ON c(p)");
+        seed_cascade(&f, "c", 1500, |_| 0);
+        let mut s = f.admin().sql_session();
+        assert_eq!(s.execute("DELETE FROM p", &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+        assert_eq!(buffered(&mut s, "SELECT count(*) FROM c WHERE p=0"), vec![vec![Int(1500)]]);
+        s.execute("BEGIN", &[], None).unwrap();
+        let result = s.execute("DELETE FROM p", &[], None);
+        if default == 0 {
+            assert_eq!(result, Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+        } else {
+            assert_eq!(result.unwrap().affected, 1);
+        }
+        s.execute("ROLLBACK", &[], None).unwrap();
+    }
+}
+
+#[test]
+fn x8b_late_set_action_failure_rolls_back_all_pages() {
+    for (action, bad_type, error) in [
+        ("SET NULL", "bigint NOT NULL", SqlError::Null),
+        ("SET DEFAULT", "bigint DEFAULT 9999", SqlError::ForeignKeyViolation),
+    ] {
+        let f = Fixture::new();
+        f.execute("CREATE TABLE p(id bigint PRIMARY KEY)");
+        f.execute("INSERT INTO p VALUES(-1),(0)");
+        f.execute(&format!("CREATE TABLE c(id bigint PRIMARY KEY, p bigint DEFAULT -1 REFERENCES p(id) ON DELETE {action} ON UPDATE {action})"));
+        f.execute("CREATE INDEX c_parent ON c(p)");
+        seed_cascade(&f, "c", 1500, |_| 0);
+        f.execute(&format!("CREATE TABLE bad(id bigint PRIMARY KEY, p {bad_type} REFERENCES p(id) ON DELETE {action} ON UPDATE {action})"));
+        f.execute("INSERT INTO bad VALUES(1,0)");
+        let mut s = f.admin().sql_session();
+        for sql in ["DELETE FROM p WHERE id=0", "UPDATE p SET id=1 WHERE id=0"] {
+            assert_eq!(s.execute(sql, &[], None), Err(CoreError::Sql(error.clone())));
+            assert_eq!(buffered(&mut s, "SELECT count(*) FROM p WHERE id=0"), vec![vec![Int(1)]]);
+            assert_eq!(buffered(&mut s, "SELECT count(*) FROM c WHERE p=0"), vec![vec![Int(1500)]]);
+            assert_eq!(buffered(&mut s, "SELECT p FROM bad"), vec![vec![Int(0)]]);
+        }
+    }
+}

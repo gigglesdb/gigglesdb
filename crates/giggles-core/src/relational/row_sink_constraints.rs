@@ -230,7 +230,7 @@ pub(super) fn paged_pending(
                 while hydrate(&page.clone(), &state.ext.constraints, &mut before, &mut page,
                     sink, &mut retention, true)? > 0 {}
                 rebuild(&mut page, &sink.indexes())?;
-                page.set_constraints(&mut pending, names, false, || crate::cancellation::check().is_err())
+                page.validate_deferred(&mut pending, || crate::cancellation::check().is_err())
                     .map_err(CoreError::Sql)?;
             }
         }

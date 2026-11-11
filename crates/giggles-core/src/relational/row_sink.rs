@@ -158,7 +158,7 @@ impl Relational {
             );
         }
         if expected.is_none() && sink.streams_index_builds() && paged_dml::cascade_eligible(self, prepared) {
-            return paged_dml::delete_cascade(self, prepared, params, clock, sink, deferred);
+            return paged_dml::cascade(self, prepared, params, clock, sink, deferred, version_end);
         }
         let append = sink.streams_index_builds()
             && match &prepared.statement {
