@@ -2593,6 +2593,12 @@ impl Prepared {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
+        // C3 parses/binds EXISTS internally; public admission waits for C8.
+        if p.tokens.windows(3).any(|w| matches!(w,
+            [Token::Word(a), Token::Symbol('('), Token::Word(b)] if a == "exists" && b == "select")) {
+            query::admit_subquery_depth(&p.tokens)?;
+            return Err(SqlError::Unsupported);
+        }
         let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
             if user_types::CompositeSelect::claims(&p) {

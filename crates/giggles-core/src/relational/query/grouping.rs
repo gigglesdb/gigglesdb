@@ -136,7 +136,7 @@ fn canonical_filter(
     let scalar = |s| canonical(s, resolve, scope, tables);
     let filter = |f| canonical_filter(f, resolve, scope, tables);
     Ok(match f {
-        Filter::Clauses(_) => return Err(SqlError::Unsupported),
+        Filter::Clauses(_) | Filter::Exists { .. } => return Err(SqlError::Unsupported),
         Filter::InSubquery {
             value,
             query,
@@ -274,7 +274,7 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
     }
     fn filter(&mut self, f: &Filter) -> R<Filter> {
         Ok(match f {
-            Filter::Clauses(_) | Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
+            Filter::Clauses(_) | Filter::InSubquery { .. } | Filter::Exists { .. } => return Err(SqlError::Unsupported),
             Filter::Scalar(s) => Filter::Scalar(self.scalar(s)?),
             Filter::Compare(a, op, b) => {
                 Filter::Compare(self.scalar(a)?, op.clone(), self.scalar(b)?)

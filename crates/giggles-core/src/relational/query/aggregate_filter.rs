@@ -42,7 +42,7 @@ fn coerce_boolean_literals(filter: &mut Filter) {
             coerce_boolean_literals(a);
             coerce_boolean_literals(b);
         }
-        Filter::Clauses(_) | Filter::InSubquery { .. } => {
+        Filter::Clauses(_) | Filter::InSubquery { .. } | Filter::Exists { .. } => {
             unreachable!("FILTER cannot contain query clauses or subqueries")
         }
     }
@@ -110,7 +110,7 @@ fn encode(f: Filter) -> Scalar {
                 args,
             )
         }
-        Filter::Clauses(_) | Filter::InSubquery { .. } => {
+        Filter::Clauses(_) | Filter::InSubquery { .. } | Filter::Exists { .. } => {
             unreachable!("FILTER cannot contain query clauses or subqueries")
         }
     }
@@ -222,6 +222,7 @@ fn expand_filter_inner(
     }
     *work += 1;
     match f {
+        Filter::Exists { .. } => {}
         Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
             expand(s, replacements, depth + 1, work)?
         }
@@ -425,6 +426,7 @@ fn replace_filter_aggregates(
     tables: &[&TableDef],
 ) -> R<()> {
     match f {
+        Filter::Exists { .. } => {}
         Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
             replace_argument_aggregates(s, parameters, resolve, tables)?
         }
@@ -637,6 +639,7 @@ pub(super) fn validate_filter(
     tables: &[&TableDef],
 ) -> R<()> {
     match filter {
+        Filter::Exists { .. } => {}
         Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
             validate_scalar(s, parameters, resolve, tables)?
         }

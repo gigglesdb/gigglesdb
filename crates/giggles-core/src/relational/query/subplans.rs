@@ -289,4 +289,44 @@ mod tests {
         assert!(matches!(state.execute_with_cancel(&prepared, &[], None, || false), Err(SqlError::Unsupported)));
     }
 
+    #[test]
+    fn exists_parser_shapes_and_recursive_dependencies() {
+        for (term, negated) in [("EXISTS (SELECT NULL)", false), ("NOT EXISTS (SELECT NULL)", true)] {
+            let q = query(&format!("SELECT 1 WHERE {term}"));
+            assert!(matches!(q.where_filter(), Some(Filter::Exists { negated: n, .. }) if *n == negated));
+        }
+        let q = query("SELECT 1 WHERE NOT (EXISTS (SELECT NULL))");
+        assert!(matches!(q.where_filter(), Some(Filter::Not(f)) if matches!(f.as_ref(), Filter::Exists { negated: false, .. })));
+        let q = query("SELECT 1 WHERE false OR (EXISTS (SELECT NULL) AND NOT EXISTS (SELECT NULL))");
+        assert!(matches!(q.where_filter(), Some(Filter::Logic(_, false, _))));
+        let q = query("SELECT id FROM a WHERE EXISTS (SELECT abs(id) FROM b WHERE id IN (SELECT length(v) FROM c WHERE EXISTS (SELECT count(*) FROM d WHERE lower(v) = 'x'))) OR id IN (SELECT id FROM e WHERE NOT EXISTS (SELECT NULL FROM f WHERE nextval('seq') > 0))");
+        let deps = q.dependencies().unwrap();
+        assert_eq!(deps.relations, ["a", "b", "c", "d", "e", "f"].map(String::from).into());
+        assert_eq!(deps.routines, ["abs", "length", "count", "lower", "nextval"].map(String::from).into());
+        assert_eq!(q.sequence_dependencies(), vec![Some("seq".into())]);
+        assert_eq!(q.read_tables().into_iter().collect::<BTreeSet<_>>(), deps.relations);
+    }
+
+    #[test]
+    fn exists_binds_nullable_multi_column_children_and_lexical_outer_slots() {
+        let mut state = Relational::default();
+        for sql in ["CREATE TABLE a(id int PRIMARY KEY)", "CREATE TABLE b(id int PRIMARY KEY)"] {
+            let create = Prepared::parse(sql, 1, state.epoch).unwrap();
+            state.execute_with_cancel(&create, &[], None, || false).unwrap();
+        }
+        let q = query("SELECT id FROM a o WHERE EXISTS (SELECT NULL, abs(o.id) FROM b WHERE id = $1 AND NOT EXISTS (SELECT NULL WHERE o.id = $1))");
+        let bound = q.bind(&state, 1, &[]).unwrap();
+        assert_eq!(bound.parameters, vec![DataType::Integer]);
+        let child = &bound.subqueries.entries[0];
+        assert_eq!(child.mode, SubplanMode::Exists);
+        assert_eq!(child.query.columns.len(), 2);
+        assert_eq!(child.query.outer_slots[0].depth, 1);
+        let nested = &child.query.subqueries.entries[0];
+        assert_eq!(nested.mode, SubplanMode::Exists);
+        assert_eq!(nested.query.outer_slots[0].depth, 2);
+        assert_eq!(bound.dependencies().unwrap(), q.dependencies().unwrap());
+        let q = query("SELECT 1 WHERE EXISTS (SELECT NULL)");
+        q.bind(&state, 0, &[]).unwrap();
+    }
+
 }

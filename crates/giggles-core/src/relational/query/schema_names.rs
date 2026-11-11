@@ -113,6 +113,7 @@ impl Filter {
                 scalar(a, bind, state, path);
                 scalar(b, bind, state, path);
             }
+            Self::Exists { query, .. } => query.bind_schema_names(bind, state, path),
             Self::InSubquery { value, query, .. } => {
                 scalar(value, bind, state, path);
                 query.bind_schema_names(bind, state, path);

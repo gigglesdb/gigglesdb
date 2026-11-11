@@ -263,7 +263,7 @@ fn query(table: &TableDef, expr: &str) -> R<Query> {
 }
 pub(super) fn immutable(filter: &BoundFilter) -> bool {
     match filter {
-        BoundFilter::InSubquery { .. } => false,
+        BoundFilter::InSubquery { .. } | BoundFilter::Exists { .. } => false,
         BoundFilter::Scalar(s) | BoundFilter::Null(s, _) => s.constraint_immutable(),
         BoundFilter::Compare(a, _, b) => a.constraint_immutable() && b.constraint_immutable(),
         BoundFilter::Like {

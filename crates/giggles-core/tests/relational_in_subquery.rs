@@ -696,3 +696,25 @@ fn qualified_correlation_and_local_shadowing_errors() {
         E::UnknownColumn,
     );
 }
+
+#[test]
+fn exists_admission_remains_off_on_each_engine() {
+    for engine in [Engine::Legacy, #[cfg(feature = "engine-rocksdb")] Engine::V2] {
+        let path = std::env::temp_dir().join(format!("c3-exists-{}-{:?}", std::process::id(), engine));
+        let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+        let mut session = admin.sql_session();
+        for sql in ["SELECT 1 WHERE EXISTS (SELECT NULL)",
+            "SELECT 1 WHERE NOT EXISTS (SELECT NULL)",
+            "SELECT 1 WHERE false OR NOT (EXISTS (SELECT NULL))",
+            "SELECT 1 WHERE 1 IN (SELECT 1 WHERE EXISTS (SELECT NULL))"] {
+            assert_eq!(session.prepare(sql).err(), Some(CoreError::Sql(E::Unsupported)), "{sql}");
+            error(&mut session, sql, E::Unsupported);
+        }
+        let mut nested = "SELECT NULL".to_string();
+        for _ in 0..33 { nested = format!("SELECT 1 WHERE EXISTS ({nested})"); }
+        error(&mut session, &nested, E::Limit);
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}

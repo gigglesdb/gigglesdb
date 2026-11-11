@@ -3096,3 +3096,18 @@ async fn datagrip_ssl_probe_reports_tls_on_certificate_listener() {
     connection.await.unwrap();
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exists_admission_still_returns_feature_not_supported() {
+    let f = Fixture::new().await;
+    let (pg, conn) = f.pg(f.app.clone()).await;
+    for sql in ["SELECT 1 WHERE EXISTS (SELECT NULL)",
+        "SELECT id FROM app WHERE NOT EXISTS (SELECT NULL FROM app)",
+        "SELECT 1 WHERE false OR NOT (EXISTS (SELECT NULL))"] {
+        assert_eq!(code(pg.simple_query(sql).await.unwrap_err()), "0A000");
+        assert_eq!(code(pg.prepare(sql).await.unwrap_err()), "0A000");
+    }
+    drop(pg);
+    conn.await.unwrap();
+    f.stop().await;
+}

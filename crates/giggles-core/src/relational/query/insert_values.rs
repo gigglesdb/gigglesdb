@@ -321,7 +321,7 @@ impl InsertExpressions {
                             filter(a, map)?;
                             filter(b, map)
                         }
-                        Filter::InSubquery { .. } => Err(SqlError::Unsupported),
+                        Filter::InSubquery { .. } | Filter::Exists { .. } => Err(SqlError::Unsupported),
                         Filter::Clauses(_) => unreachable!("VALUES has no query clauses"),
                     }
                 }

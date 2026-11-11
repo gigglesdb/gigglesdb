@@ -197,6 +197,10 @@ enum Filter {
         query: Box<Query>,
         negated: bool,
     },
+    Exists {
+        query: Box<Query>,
+        negated: bool,
+    },
     Null(Scalar, bool),
     Is(Box<Filter>, Option<bool>, bool),
     Like {
@@ -219,6 +223,11 @@ enum BoundFilter {
         negated: bool,
         clock: Option<super::clock::ExecutionClock>,
     },
+    #[allow(dead_code)] // Execution belongs to C4; public admission remains off.
+    Exists {
+        query: usize,
+        negated: bool,
+    },
     Null(BoundScalar, bool),
     Is(Box<BoundFilter>, Option<bool>, bool),
     Like {
@@ -239,7 +248,7 @@ fn admit_expansion(lhs: &Scalar, copies: usize) -> R<()> {
     fn filter_cost(f: &Filter, nodes: &mut usize, bytes: &mut usize) -> R<()> {
         *nodes = nodes.checked_add(1).ok_or(SqlError::Limit)?;
         match f {
-            Filter::Clauses(_) | Filter::InSubquery { .. } => return Err(SqlError::Unsupported),
+            Filter::Clauses(_) | Filter::InSubquery { .. } | Filter::Exists { .. } => return Err(SqlError::Unsupported),
             Filter::Scalar(s) | Filter::Null(s, _) => cost(s, nodes, bytes)?,
             Filter::Compare(a, op, b) => {
                 *bytes = bytes.checked_add(op.len()).ok_or(SqlError::Limit)?;
@@ -340,11 +349,12 @@ fn subquery_end(tokens: &[Token], open: usize) -> R<usize> {
     }
     Err(SqlError::Syntax)
 }
-fn admit_subquery_forms(tokens: &[Token]) -> R<()> {
+fn admit_subquery_forms(tokens: &[Token], allow_exists: bool) -> R<()> {
     let mut at = 0;
     while at < tokens.len() {
         if is_subquery_open(tokens, at) {
-            if at == 0 || tokens.get(at - 1) != Some(&Token::Word("in".into())) {
+            if at == 0 || !(tokens.get(at - 1) == Some(&Token::Word("in".into()))
+                || allow_exists && tokens.get(at - 1) == Some(&Token::Word("exists".into()))) {
                 return Err(SqlError::Unsupported);
             }
             if at >= 2 && tokens[at - 2] == Token::Symbol(')') {
@@ -384,7 +394,7 @@ fn admit_subquery_forms(tokens: &[Token]) -> R<()> {
     }
     Ok(())
 }
-fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
+pub(super) fn admit_subquery_depth(tokens: &[Token]) -> R<()> {
     let mut stack = Vec::new();
     let mut nested = 0;
     for (at, token) in tokens.iter().enumerate() {
@@ -479,10 +489,11 @@ impl Filter {
     }
     fn visit_subqueries<'a>(
         &'a self,
-        visit: &mut impl FnMut(&'a Scalar, &'a Query) -> R<()>,
+        visit: &mut impl FnMut(Option<&'a Scalar>, &'a Query) -> R<()>,
     ) -> R<()> {
         match self {
-            Self::InSubquery { value, query, .. } => visit(value, query)?,
+            Self::InSubquery { value, query, .. } => visit(Some(value), query)?,
+            Self::Exists { query, .. } => visit(None, query)?,
             Self::Clauses(c) => {
                 if let Some(f) = &c.filter {
                     f.visit_subqueries(visit)?;
@@ -517,7 +528,7 @@ impl Filter {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
-            Self::InSubquery { .. } => Ok(()),
+            Self::InSubquery { .. } | Self::Exists { .. } => Ok(()),
             Self::Logic(a, _, b) => {
                 a.infer_outer(params, resolve, tables)?;
                 b.infer_outer(params, resolve, tables)
@@ -534,6 +545,7 @@ impl Filter {
         subqueries: &Subplans<'_>,
     ) -> R<()> {
         match self {
+            Self::Exists { .. } => Ok(()),
             Self::InSubquery { value, query, .. } => {
                 let bound = subqueries.get(query.as_ref() as *const Query as usize, SubplanMode::In)?;
                 let expected = if matches!(value, Scalar::Param(n) if params.get(n - 1).is_some_and(Option::is_some))
@@ -562,6 +574,14 @@ impl Filter {
         subqueries: &Subplans<'_>,
     ) -> R<BoundFilter> {
         Ok(match self {
+            Self::Exists { query, negated } => {
+                let key = query.as_ref() as *const Query as usize;
+                subqueries.get(key, SubplanMode::Exists)?;
+                BoundFilter::Exists {
+                    query: key,
+                    negated: *negated,
+                }
+            }
             Self::InSubquery {
                 value,
                 query,
@@ -627,6 +647,7 @@ impl Filter {
                     f.visit_scalars(visit)?;
                 }
             }
+            Self::Exists { .. } => {}
             Self::Scalar(s) | Self::Null(s, _) | Self::InSubquery { value: s, .. } => visit(s)?,
             Self::Compare(a, _, b) => {
                 visit(a)?;
@@ -696,6 +717,7 @@ impl Filter {
         *nodes += 1;
         match self {
             Self::Clauses(_) => Err(SqlError::Unsupported),
+            Self::Exists { .. } => Ok(()),
             Self::InSubquery { value, .. } => insert_values::shape(value, depth + 1, nodes),
             Self::Scalar(s) | Self::Null(s, _) => insert_values::shape(s, depth + 1, nodes),
             Self::Compare(a, _, b) => {
@@ -722,6 +744,20 @@ impl Filter {
             }
         }
     }
+    fn parse_child(p: &mut Parser) -> R<Box<Query>> {
+        let end = subquery_end(&p.tokens, p.at - 1)?;
+        let mut child = Parser {
+            tokens: p.tokens[p.at..end].to_vec(),
+            at: 0,
+            params: BTreeSet::new(),
+            relations: Vec::new(),
+        };
+        let query = Query::parse(&mut child)?;
+        p.params.extend(child.params);
+        p.relations.extend(child.relations);
+        p.at = end + 1;
+        Ok(Box::new(query))
+    }
     fn parse(p: &mut Parser, precedence: usize, depth: usize) -> R<Self> {
         Self::parse_context(p, precedence, depth, false)
     }
@@ -735,12 +771,21 @@ impl Filter {
             return Err(SqlError::Limit);
         }
         let mut f = if p.word("not") {
-            Self::Not(Box::new(Self::parse_context(
-                p,
-                3,
-                depth + 1,
-                aggregate_argument,
-            )?))
+            let direct = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "exists");
+            let term = Self::parse_context(p, 3, depth + 1, aggregate_argument)?;
+            match term {
+                Self::Exists { query, negated } if direct => Self::Exists {
+                    query,
+                    negated: !negated,
+                },
+                term => Self::Not(Box::new(term)),
+            }
+        } else if p.word("exists") {
+            p.punct('(')?;
+            Self::Exists {
+                query: Self::parse_child(p)?,
+                negated: false,
+            }
         } else {
             let parse_scalar = |p: &mut Parser, depth| {
                 if aggregate_argument {
@@ -779,20 +824,10 @@ impl Filter {
                     return Err(SqlError::Syntax);
                 }
                 if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "select") {
-                    let end = subquery_end(&p.tokens, p.at - 1)?;
-                    let mut child = Parser {
-                        tokens: p.tokens[p.at..end].to_vec(),
-                        at: 0,
-                        params: BTreeSet::new(),
-                        relations: Vec::new(),
-                    };
-                    let query = Query::parse(&mut child)?;
-                    p.params.extend(child.params);
-                    p.relations.extend(child.relations);
-                    p.at = end + 1;
+                    let query = Self::parse_child(p)?;
                     Self::InSubquery {
                         value: a,
-                        query: Box::new(query),
+                        query,
                         negated: not,
                     }
                 } else {
@@ -971,7 +1006,7 @@ impl Filter {
         tables: &[&TableDef],
     ) -> R<()> {
         match self {
-            Self::Clauses(_) | Self::InSubquery { .. } => Err(SqlError::Unsupported),
+            Self::Clauses(_) | Self::InSubquery { .. } | Self::Exists { .. } => Err(SqlError::Unsupported),
             Self::Scalar(a) => a.infer(Some(&DataType::Boolean), params, resolve, tables),
             Self::Null(a, _) => a.infer(None, params, resolve, tables),
             Self::Compare(a, _, b) => {
@@ -1055,7 +1090,7 @@ impl Filter {
     ) -> R<BoundFilter> {
         let bind = |a: &Scalar| a.bind(resolve, tables, params);
         Ok(match self {
-            Self::Clauses(_) | Self::InSubquery { .. } => return Err(SqlError::Unsupported),
+            Self::Clauses(_) | Self::InSubquery { .. } | Self::Exists { .. } => return Err(SqlError::Unsupported),
             Self::Scalar(a) => {
                 let a = if matches!(a, Scalar::Literal(Value::Null)) {
                     bind(&Scalar::Cast(Box::new(a.clone()), DataType::Boolean))?
@@ -1342,7 +1377,7 @@ impl BoundFilter {
             _ => Err(SqlError::Type),
         };
         match self {
-            Self::InSubquery { .. } => Ok(None),
+            Self::InSubquery { .. } | Self::Exists { .. } => Ok(None),
             Self::Scalar(a) => a.plan_constant(budget)?.map(boolean).transpose(),
             Self::Null(a, not) => Ok(a
                 .plan_constant(budget)?
@@ -1425,7 +1460,7 @@ impl BoundFilter {
     }
     fn eval(&self, row: &Tuple, params: &[Value], bytes: &mut usize) -> R<Option<bool>> {
         Ok(match self {
-            Self::InSubquery { .. } => return Err(SqlError::Unsupported),
+            Self::InSubquery { .. } | Self::Exists { .. } => return Err(SqlError::Unsupported),
             Self::Scalar(a) => match a.eval(row, params, bytes)? {
                 Value::Bool(b) => Some(b),
                 Value::Null => None,
@@ -1555,6 +1590,7 @@ fn filter_contains_aggregate(f: &Filter) -> bool {
                 || c.group.iter().any(grouping::contains_aggregate)
                 || c.having.as_ref().is_some_and(filter_contains_aggregate)
         }
+        Filter::Exists { .. } => false,
         Filter::Scalar(s) | Filter::Null(s, _) | Filter::InSubquery { value: s, .. } => {
             grouping::contains_aggregate(s)
         }
@@ -1767,7 +1803,8 @@ impl Query {
         let mut out = Subplans::default();
         if let Some(f) = self.where_filter() {
             f.visit_subqueries(&mut |value, q| {
-                if let [(Item::Scalar(Scalar::Param(n)), _)] = q.items.as_slice()
+                if let Some(value) = value
+                    && let [(Item::Scalar(Scalar::Param(n)), _)] = q.items.as_slice()
                     && parameters.get(n - 1).is_some_and(Option::is_none)
                 {
                     let ty = value.bind(resolve, tables, parameters).ok().map(|v| v.ty).unwrap_or(DataType::Text);
@@ -1787,10 +1824,11 @@ impl Query {
                     .collect();
                 let scopes: Vec<_> = std::iter::once(self.sources.as_slice()).chain(outer.iter().copied()).collect();
                 let bound = q.bind_seeded_inner(state, seed, false, &scopes)?;
-                if bound.columns.len() != 1 {
+                if value.is_some() && bound.columns.len() != 1 {
                     return Err(SqlError::Syntax);
                 }
-                if !matches!(value, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
+                if let Some(value) = value
+                    && !matches!(value, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
                     value.infer(Some(&bound.columns[0].data_type), parameters, resolve, tables)?;
                 }
                 for n in used {
@@ -1798,7 +1836,8 @@ impl Query {
                         *slot = Some(bound.parameters[n - 1].clone());
                     }
                 }
-                out.register(q as *const Query as usize, SubplanMode::In, bound)?;
+                let mode = if value.is_some() { SubplanMode::In } else { SubplanMode::Exists };
+                out.register(q as *const Query as usize, mode, bound)?;
                 Ok(())
             })?;
         }
@@ -1926,7 +1965,7 @@ impl Query {
     }
     pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
-        admit_subquery_forms(&p.tokens[p.at..])?;
+        admit_subquery_forms(&p.tokens[p.at..], false)?;
         let filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
         } else {
@@ -2052,7 +2091,7 @@ impl Query {
     }
     pub(super) fn parse(p: &mut Parser) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
-        admit_subquery_forms(&p.tokens[p.at..])?;
+        admit_subquery_forms(&p.tokens[p.at..], true)?;
         let explain = p.word("explain");
         p.need("select")?;
         let distinct = p.word("distinct");
@@ -2489,6 +2528,7 @@ impl Query {
                         && c.group.iter().all(scalar)
                         && c.having.as_ref().is_none_or(filter)
                 }
+                Filter::Exists { .. } => false,
                 Filter::InSubquery { value, query, .. } => scalar(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
@@ -2559,6 +2599,7 @@ impl Query {
                         && c.group.iter().all(scalar)
                         && c.having.as_ref().is_none_or(filter_ok)
                 }
+                Filter::Exists { .. } => false,
                 Filter::InSubquery { value, query, .. } => scalar(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),
@@ -2621,6 +2662,7 @@ impl Query {
                         filter(f, out);
                     }
                 }
+                Filter::Exists { query, .. } => out.extend(query.sequence_dependencies()),
                 Filter::InSubquery { value, query, .. } => {
                     value.sequence_dependencies(out);
                     out.extend(query.sequence_dependencies());
@@ -2675,6 +2717,7 @@ impl Query {
                         || c.group.iter().any(scalar_has_undefined_routine)
                         || c.having.as_ref().is_some_and(filter)
                 }
+                Filter::Exists { query, .. } => query.has_undefined_routine(),
                 Filter::InSubquery { value, query, .. } => {
                     scalar_has_undefined_routine(value) || query.has_undefined_routine()
                 }
@@ -2737,6 +2780,7 @@ impl Query {
                         && c.group.iter().all(operand)
                         && c.having.as_ref().is_none_or(filter)
                 }
+                Filter::Exists { .. } => false,
                 Filter::InSubquery { value, query, .. } => operand(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => operand(s),
                 Filter::Compare(a, _, b) => operand(a) && operand(b),
@@ -4746,6 +4790,7 @@ mod aggregate_tests;
 impl BoundFilter {
     fn attach_clock(&mut self, clock: Option<&super::clock::ExecutionClock>) {
         match self {
+            Self::Exists { .. } => {}
             Self::InSubquery {
                 value,
                 clock: saved,
