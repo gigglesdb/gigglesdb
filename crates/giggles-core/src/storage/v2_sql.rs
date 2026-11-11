@@ -1326,7 +1326,9 @@ impl relational::scan::RowSource for MutationRows<'_> {
 
 impl SqlRows<'_> {
     fn scan_index(&self, table: &TableDef) -> Option<IndexRange> {
-        let predicates = self.prepared.v2_index_predicates(self.params);
+        self.scan_index_predicates(table, &self.prepared.v2_index_predicates(self.params))
+    }
+    fn scan_index_predicates(&self, table: &TableDef, predicates: &[(String, String, relational::Value)]) -> Option<IndexRange> {
         (!self.writing)
             .then(|| {
                 self.parts.indexes.iter().find_map(|d| {

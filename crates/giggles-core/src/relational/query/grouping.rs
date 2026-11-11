@@ -740,6 +740,18 @@ pub(super) fn bind<'a>(
         .map(|f| f.bind_with_subqueries(&parameters, resolve, tables, &subqueries))
         .transpose()?;
     let joins = q.bind_joins(tables, &mut parameters, resolve)?;
+    let predicates = q.predicates.iter().filter_map(|(c, op, e)| {
+        let c = resolve(c, tables.len()).ok()?;
+        let ty = &tables[c.source].columns[c.column].data_type;
+        // Range selection is optional; the bound WHERE remains authoritative.
+        let safe = match e {
+            Expr::Literal(v) => check(v, &tables[c.source].columns[c.column]).is_ok()
+                && !comparison_requires_filter(v, ty).ok()?,
+            Expr::Param(n) => parameters.get(n - 1) == Some(&Some(ty.clone())),
+        };
+        (*ty != DataType::Bpchar && safe)
+            .then_some((c, op.as_str(), e))
+    }).collect();
     let parameters = parameters
         .into_iter()
         .map(|p| p.ok_or(SqlError::Parameters))
@@ -751,7 +763,7 @@ pub(super) fn bind<'a>(
         items: vec![],
         columns,
         parameters,
-        predicates: vec![],
+        predicates,
         filter,
         order: vec![],
         aggregate: true,
@@ -950,7 +962,12 @@ impl Grouping {
                     lo: std::ops::Bound::Unbounded,
                     hi: std::ops::Bound::Unbounded,
                 };
-                let input = source.scan(query.tables[0], &range, scan::Direction::Forward)?;
+                let input = if source.streams_reductions() {
+                    let (empty, bounds) = query.base_bounds(params)?;
+                    let range = if empty { scan::KeyRange { lo: std::ops::Bound::Excluded(vec![]), hi: std::ops::Bound::Excluded(vec![]) } }
+                        else { scan::KeyRange::from_bounds(bounds) };
+                    query.input_rows(source, params, &range, empty)?
+                } else { source.scan(query.tables[0], &range, scan::Direction::Forward)? };
                 for row in join_rows(query, source, input, params, &mut meter, &execution.visits, &outer, exists) {
                     accept(&row?)?;
                 }

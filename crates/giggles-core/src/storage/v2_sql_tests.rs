@@ -17,6 +17,8 @@ mod large_read;
 mod fk_prefix;
 #[path = "v2_reduction_tests.rs"]
 mod reduction;
+#[path = "v2_join_tests.rs"]
+mod indexed_join;
 
 struct Fixture {
     path: std::path::PathBuf,

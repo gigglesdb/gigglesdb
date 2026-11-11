@@ -1732,7 +1732,8 @@ impl Query {
         found
     }
     pub(super) fn streaming_reduction(&self) -> bool {
-        self.sources.len() == 1 && self.joins.is_empty()
+        if !self.joins.is_empty() { return true; }
+        self.sources.len() == 1
             && !self.distinct() && !self.has_in_subquery()
             && (!self.group().is_empty()
                 || self.items.iter().any(|(item, _)| match item {
@@ -3741,14 +3742,19 @@ fn join_rows<'a>(
                 let join = &query.joins[depth];
                 let table = query.tables[depth + 1];
                 let rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a> = if join.scan {
-                    source.scan(
+                    let keys = join.equalities.iter().filter(|_| source.streams_reductions()).filter(|(_, _, outer_ty, inner_ty)|
+                        functions::join_key_supported(outer_ty, inner_ty))
+                        .map(|(outer, inner, outer_ty, inner_ty)|
+                            Ok((inner.column, functions::join_key(row.get(*outer), outer_ty, inner_ty)?)))
+                        .collect::<R<Vec<_>>>()?;
+                    if let Some(rows) = source.join_probe(table, &keys)? { rows } else { source.scan(
                         table,
                         &scan::KeyRange {
                             lo: std::ops::Bound::Unbounded,
                             hi: std::ops::Bound::Unbounded,
                         },
                         scan::Direction::Forward,
-                    )?
+                    )? }
                 } else {
                     let candidate = match join.key(&row)? {
                         Some(key) => source.get(table, &encode_key(&key)?)?,
@@ -3967,6 +3973,14 @@ impl BoundQuery<'_> {
             other => other?,
         };
         Ok((empty_input, bounds))
+    }
+    fn input_rows<'s>(&'s self, source: &'s dyn scan::RowSource, params: &[Value],
+        range: &scan::KeyRange, empty: bool) -> R<scan::SourceRows<'s>> {
+        let predicates = self.predicates.iter().filter(|(c, _, _)| c.source == 0)
+            .map(|(c, op, e)| Ok((c.column, *op, e.value(params)?))).collect::<R<Vec<_>>>()?;
+        if !empty && let Some(rows) = source.index_input(self.tables[0], &predicates)? {
+            Ok(rows)
+        } else { source.scan(self.tables[0], range, scan::Direction::Forward) }
     }
     pub(super) fn cursor_direction(&self) -> Option<scan::Direction> {
         if self.tables.len() != 1
@@ -4502,7 +4516,7 @@ impl BoundQuery<'_> {
         } else {
             scan::KeyRange::from_bounds(bounds)
         };
-        let input = source.scan(self.tables[0], &range, scan::Direction::Forward)?;
+        let input = self.input_rows(source, params, &range, empty_input)?;
         let mut meter = if subquery || self.aggregate || !self.joins.is_empty() {
             scan::Meter::per_row(cancel)
         } else {

@@ -18,14 +18,20 @@ impl<'a> Source<'a> {
         *self.error.borrow_mut() = Some(error);
         SqlError::Unsupported
     }
+    #[cfg(test)]
+    fn observed(&self, table: &TableDef) {
+        AFTER_TABLE_SCAN.with_borrow_mut(|hook| {
+            if let Some(hook) = hook { hook(&table.name); }
+        });
+    }
 }
-impl RowSource for Source<'_> {
-    fn streams_reductions(&self) -> bool { true }
-    fn scan<'s>(
+impl Source<'_> {
+    fn pages<'s>(
         &'s self,
         table: &TableDef,
         range: &scan::KeyRange,
         dir: scan::Direction,
+        index: Option<IndexRange>,
     ) -> Result<scan::SourceRows<'s>, SqlError> {
         if range.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -35,29 +41,12 @@ impl RowSource for Source<'_> {
             heap: self.rows.borrow().parts.heap.contains(&table.id),
             columns_ext: BTreeMap::new(),
         };
-        let index = self.rows.borrow().scan_index(table);
-        let mut range = range.clone();
-        if range.lo == Bound::Unbounded && range.hi == Bound::Unbounded {
-            let rows = self.rows.borrow();
-            if table.primary_key.iter().all(|i| {
-                rows.parts
-                    .ext
-                    .columns
-                    .get(&table.columns[*i].id)
-                    .is_none_or(|c| c.type_id.is_none())
-            }) && let Some(primary) =
-                relational::row_sink::reduction_range(table, rows.prepared, rows.params)
-            {
-                range = primary;
-            }
-        }
-        if range.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-        let (mut lo, mut hi) = (range.lo, range.hi);
+        let (mut lo, mut hi) = (range.lo.clone(), range.hi.clone());
         let mut after = None;
         let mut page = VecDeque::new();
         let mut done = false;
+        #[cfg(test)]
+        let mut observed = false;
         Ok(Box::new(std::iter::from_fn(move || {
             if let Some(row) = page.pop_front() {
                 return Some(Ok(row));
@@ -128,12 +117,70 @@ impl RowSource for Source<'_> {
                 page.clear();
                 return Some(Err(self.error(error)));
             }
+            #[cfg(test)]
+            if !observed { observed = true; self.observed(&entry.def); }
             let row = page.pop_front();
             if row.is_none() {
                 done = true;
             }
             row.map(Ok)
         })))
+    }
+}
+impl RowSource for Source<'_> {
+    fn streams_reductions(&self) -> bool { true }
+    fn scan<'s>(&'s self, table: &TableDef, range: &scan::KeyRange, dir: scan::Direction)
+        -> Result<scan::SourceRows<'s>, SqlError> {
+        let rows = self.rows.borrow();
+        let index = rows.scan_index(table);
+        let mut range = range.clone();
+        if range.lo == Bound::Unbounded && range.hi == Bound::Unbounded
+            && table.primary_key.iter().all(|i| rows.parts.ext.columns
+                .get(&table.columns[*i].id).is_none_or(|c| c.type_id.is_none()))
+            && let Some(primary) = relational::row_sink::reduction_range(table, rows.prepared, rows.params) {
+            range = primary;
+        }
+        drop(rows);
+        self.pages(table, &range, dir, index)
+    }
+    fn index_input<'s>(&'s self, table: &TableDef, predicates: &[(usize, &str, relational::Value)])
+        -> Result<Option<scan::SourceRows<'s>>, SqlError> {
+        let predicates = predicates.iter().map(|(i, op, value)|
+            (table.columns[*i].name.clone(), (*op).to_owned(), value.clone())).collect::<Vec<_>>();
+        let index = self.rows.borrow().scan_index_predicates(table, &predicates);
+        index.map(|index| self.pages(table, &scan::KeyRange { lo: Bound::Unbounded, hi: Bound::Unbounded },
+            scan::Direction::Forward, Some(index))).transpose()
+    }
+    fn join_probe<'s>(&'s self, table: &TableDef, keys: &[(usize, Option<relational::Value>)])
+        -> Result<Option<scan::SourceRows<'s>>, SqlError> {
+        let rows = self.rows.borrow();
+        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<Vec<_>>();
+        let prefix = |ids: &[u64]| ids.iter().take_while(|id| keys.iter().any(|(i, _)|
+            table.columns[*i].id == **id && rows.parts.ext.columns.get(id).is_none_or(|c| c.type_id.is_none())))
+            .copied().collect::<Vec<_>>();
+        let mut ids = prefix(&primary);
+        let mut index = None;
+        for descriptor in rows.parts.indexes.iter().filter(|d| d.table == table.id) {
+            let candidate = prefix(&descriptor.columns);
+            if candidate.len() > ids.len() { ids = candidate; index = Some(descriptor.clone()); }
+        }
+        if ids.is_empty() { return Ok(None); }
+        let values = ids.iter().map(|id| keys.iter().find(|(i, _)| table.columns[*i].id == *id)
+            .unwrap().1.clone()).collect::<Option<Vec<_>>>();
+        drop(rows);
+        let Some(values) = values else { return Ok(Some(Box::new(std::iter::empty()))); };
+        // Combined outer keys can exceed one row's key budget; retain the scan fallback.
+        let range = if let Some(descriptor) = index.as_ref() {
+            let Ok(tuple) = codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])
+                else { return Ok(None); };
+            return self.pages(table, &scan::KeyRange { lo: Bound::Unbounded, hi: Bound::Unbounded },
+                scan::Direction::Forward, Some((descriptor.clone(), Bound::Included(tuple.clone()), Bound::Included(tuple)))).map(Some);
+        } else {
+            let Ok(prefix) = codec::pk_bytes(&values) else { return Ok(None); };
+            scan::KeyRange { lo: Bound::Included(prefix.clone()),
+                hi: engine::indexes::successor(prefix).map_or(Bound::Unbounded, Bound::Excluded) }
+        };
+        self.pages(table, &range, scan::Direction::Forward, None).map(Some)
     }
     fn get<'s>(
         &'s self,
@@ -161,6 +208,9 @@ impl RowSource for Source<'_> {
             .next()
             .transpose()
             .map_err(|e| self.error(e))?;
+        drop(rows);
+        #[cfg(test)]
+        self.observed(table);
         Ok(result.map(|(key, row)| scan::SourceRow {
             key: Cow::Owned(key),
             row: Cow::Owned(SqlRow {
