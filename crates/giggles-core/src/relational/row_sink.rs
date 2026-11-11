@@ -29,6 +29,15 @@ pub(crate) fn row_key(table: &TableDef, row: &SqlRow) -> R<Vec<u8>> {
 }
 
 pub(crate) trait RowSink {
+    fn mutation_keys(
+        &mut self,
+        _state: &Relational,
+        _prepared: &Prepared,
+        _params: &[Value],
+        _clock: Option<&clock::ExecutionClock>,
+    ) -> Result<BTreeSet<Vec<u8>>, CoreError> {
+        Err(CoreError::Sql(SqlError::Unsupported))
+    }
     /// FK witnesses need a fresh snapshot after acquiring their table locks.
     fn check_fk_snapshot(&self) -> Result<(), CoreError> {
         Ok(())
@@ -148,6 +157,14 @@ impl Relational {
             || crate::cancellation::check().is_err(), clock, Some(source), &mut Vec::new())
     }
 
+    pub(crate) fn mutation_keys(
+        &self, prepared: &Prepared, params: &[Value],
+        clock: Option<&clock::ExecutionClock>, source: &dyn scan::RowSource,
+    ) -> R<BTreeSet<Vec<u8>>> {
+        let parameters = searched::describe(prepared, self)?.parameters.into_iter().map(Some).collect();
+        searched::target(prepared).ok_or(SqlError::Unsupported)?
+            .bind_seeded(self, parameters)?.with_clock(clock).matching_keys(self, source, params)
+    }
     pub(crate) fn copy_input_page(
         &mut self,
         prepared: &Prepared,
@@ -261,7 +278,7 @@ impl Relational {
             };
         if expected.is_none() && sink.streams_index_builds() && paged_dml::eligible(self, prepared)
         {
-            return paged_dml::execute(self, prepared, params, clock, sink, version_end);
+            return paged_dml::execute(self, prepared, params, clock, sink, version_end, deferred);
         }
         let streamed_ddl = match &prepared.statement {
             Statement::DropIndex(_) | Statement::DropTable { .. } => true,

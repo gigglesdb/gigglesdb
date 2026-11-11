@@ -1742,6 +1742,10 @@ impl Query {
                 })
                 || (!self.order.is_empty() && self.limit.is_some()))
     }
+    pub(super) fn clear_mutation_filter(&mut self) {
+        self.filter = None;
+        self.predicates.clear();
+    }
     /// Only row-local SELECTs can be evaluated independently on source pages.
     pub(super) fn pageable_insert(&self) -> bool {
         self.sources.len() == 1
@@ -4186,6 +4190,31 @@ impl BoundQuery<'_> {
         retention: &mut scan::Retention,
         cancel: &mut impl FnMut() -> bool,
     ) -> R<Vec<(Vec<u8>, SqlRow)>> {
+        let mut rows = Vec::new();
+        self.matching_mutation(state, source, params, retention, cancel, false,
+            &mut |row| rows.push((row.key.into_owned(), row.row.into_owned())))?;
+        Ok(rows)
+    }
+    /// Freeze only target identities, never complete target/source row images.
+    pub(super) fn matching_keys(
+        &self,
+        state: &Relational,
+        source: &dyn scan::RowSource,
+        params: &[Value],
+    ) -> R<BTreeSet<Vec<u8>>> {
+        let mut retention = scan::Retention::new(scan::retention_limit());
+        let mut keys = BTreeSet::new();
+        self.matching_mutation(state, source, params, &mut retention,
+            &mut || crate::cancellation::check().is_err(), true,
+            &mut |row| { keys.insert(row.key.into_owned()); })?;
+        Ok(keys)
+    }
+    #[expect(clippy::too_many_arguments, reason = "shared mutation scan and retained representation")]
+    fn matching_mutation(
+        &self, state: &Relational, source: &dyn scan::RowSource, params: &[Value],
+        retention: &mut scan::Retention, cancel: &mut impl FnMut() -> bool, keys_only: bool,
+        retain: &mut impl FnMut(scan::SourceRow<'_>),
+    ) -> R<()> {
         let execution = Execution::new(cancel, &self.declared);
         execution.retention.borrow_mut().charge(retention.used())?;
         if !self.outer_slots.is_empty() {
@@ -4236,17 +4265,18 @@ impl BoundQuery<'_> {
             }
             Ok(Some(row))
         });
-        let mut rows = Vec::new();
-        for row in filtered {
+        for (count, row) in filtered.enumerate() {
             let row = row?;
-            if rows.len() >= scan::query_row_limit().min(super::MAX_ROWS) {
+            if !keys_only && count >= scan::query_row_limit().min(super::MAX_ROWS) {
                 return Err(SqlError::Limit);
             }
-            retention.charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
-            execution.retention.borrow_mut().charge(searched::retained_row_bytes(&row.key, &row.row)?)?;
-            rows.push((row.key.into_owned(), row.row.into_owned()));
+            let bytes = if keys_only { row.key.len() + 96 }
+                else { searched::retained_row_bytes(&row.key, &row.row)? };
+            retention.charge(bytes)?;
+            execution.retention.borrow_mut().charge(bytes)?;
+            retain(row);
         }
-        Ok(rows)
+        Ok(())
     }
     #[cfg(test)]
     pub(super) fn execute(

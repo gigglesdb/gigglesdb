@@ -737,6 +737,19 @@ struct SqlRows<'a> {
     params: &'a [relational::Value],
 }
 impl RowSink for SqlRows<'_> {
+    fn mutation_keys(
+        &mut self, state: &relational::Relational, prepared: &relational::Prepared,
+        params: &[relational::Value], clock: Option<&relational::clock::ExecutionClock>,
+    ) -> Result<BTreeSet<Vec<u8>>, CoreError> {
+        let source = MutationRows { db: self.db, txn: std::cell::RefCell::new(&mut *self.txn),
+            parts: self.parts, error: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            target: state.tables[prepared.table().expect("mutation target")].id,
+        };
+        let result = state.mutation_keys(prepared, params, clock, &source);
+        if let Some(error) = source.error.into_inner() { return Err(error); }
+        result.map_err(CoreError::Sql)
+    }
     fn check_fk_snapshot(&self) -> Result<(), CoreError> {
         if self.txn.isolation() != Isolation::ReadCommitted {
             return Err(CoreError::Sql(SqlError::Conflict));
@@ -1243,6 +1256,71 @@ impl RowSink for SqlRows<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Short transaction borrows permit nested physical scans with bounded pages.
+/// Every scan reads the same statement snapshot plus transaction own writes.
+struct MutationRows<'a> {
+    db: &'a v2::V2Db,
+    txn: std::cell::RefCell<&'a mut Transaction>,
+    parts: &'a CatalogParts,
+    error: std::cell::RefCell<Option<CoreError>>,
+    #[cfg(test)]
+    target: u64,
+}
+impl relational::scan::RowSource for MutationRows<'_> {
+    fn scan<'s>(&'s self, table: &TableDef, range: &relational::scan::KeyRange,
+        direction: relational::scan::Direction,
+    ) -> Result<relational::scan::SourceRows<'s>, SqlError> {
+        use std::borrow::Cow;
+        #[cfg(test)]
+        if table.id != self.target {
+            AFTER_TABLE_SCAN.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() { hook(&table.name); }
+            });
+        }
+        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new() };
+        let (mut lo, mut hi) = (range.lo.clone(), range.hi.clone());
+        let forward = direction == relational::scan::Direction::Forward;
+        let mut pending = Vec::new().into_iter();
+        let mut done = range.is_empty();
+        Ok(Box::new(std::iter::from_fn(move || loop {
+            if let Some((key, row)) = pending.next() {
+                return Some(Ok(relational::scan::SourceRow { key: Cow::Owned(key), row: Cow::Owned(row) }));
+            }
+            if done { return None; }
+            let page = (|| {
+                crate::cancellation::check()?;
+                self.db.rows.scan(&mut self.txn.borrow_mut(), &entry, lo.clone(), hi.clone(),
+                    if forward { engine::kv::Direction::Forward } else { engine::kv::Direction::Reverse }, Some(200))?
+                    .collect::<Result<Vec<_>, CoreError>>()
+            })();
+            match page {
+                Ok(rows) => {
+                    let Some((last, _)) = rows.last() else { done = true; continue; };
+                    if forward { lo = Bound::Excluded(last.clone()); } else { hi = Bound::Excluded(last.clone()); }
+                    let rows = rows.into_iter().map(|(_, row)| {
+                        let row = SqlRow { values: row.values, version: row.version };
+                        relational::row_sink::row_key(&entry.def, &row).map(|key| (key, row))
+                    }).collect::<Result<Vec<_>, _>>();
+                    match rows {
+                        Ok(rows) => pending = rows.into_iter(),
+                        Err(error) => { done = true; return Some(Err(error)); }
+                    }
+                }
+                Err(error) => {
+                    done = true;
+                    *self.error.borrow_mut() = Some(error);
+                    return Some(Err(SqlError::Unsupported));
+                }
+            }
+        })))
+    }
+    fn get<'s>(&'s self, table: &TableDef, key: &[u8]) -> Result<Option<relational::scan::SourceRow<'s>>, SqlError> {
+        self.scan(table, &relational::scan::KeyRange { lo: Bound::Included(key.to_vec()),
+            hi: Bound::Included(key.to_vec()) }, relational::scan::Direction::Forward)?.next().transpose()
     }
 }
 

@@ -11,22 +11,24 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
         Statement::Delete { .. } => vec![],
         _ => return false,
     };
-    // A stable primary key makes the forward cursor Halloween-safe. Subqueries
-    // need their complete statement snapshot, not a page-local relation image.
+    // A stable primary key makes the forward cursor Halloween-safe.
     if table
         .primary_key
         .iter()
         .any(|i| sets.contains(&&table.columns[*i].name))
-        || searched::target(prepared).is_some_and(query::Query::has_in_subquery)
     {
         return false;
     }
-    // Keep referential actions on the existing complete-image executor until
-    // their work queue and lookup hydration can also be paged atomically.
+    // Outgoing references can be checked after all pages. Incoming actions and
+    // self references retain their existing executors.
     !state.ext.constraints.iter().any(|(owner, constraints)| {
         constraints.iter().any(|constraint| {
-            matches!(constraint.kind, ConstraintKind::ForeignKey { ref_table, .. }
-                if *owner == table.id || ref_table == table.id)
+            let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } = &constraint.kind else { return false; };
+            let changed = |ids: &[u64]| ids.iter().any(|id| table.columns.iter()
+                .any(|column| column.id == *id && sets.contains(&&column.name)));
+            let deleting = matches!(prepared.statement, Statement::Delete { .. });
+            (*owner == table.id && !deleting && *ref_table == table.id && changed(columns))
+                || (*ref_table == table.id && (deleting || changed(ref_columns)))
         })
     })
 }
@@ -38,6 +40,7 @@ pub(super) fn execute(
     clock: Option<&clock::ExecutionClock>,
     sink: &mut impl RowSink,
     version_end: u64,
+    deferred: Option<&mut DeferralState>,
 ) -> Result<SqlResult, CoreError> {
     let table = state.tables[prepared.table().expect("mutation target")].clone();
     // Analyze even an empty table before opening the cursor. No writes escape
@@ -53,17 +56,32 @@ pub(super) fn execute(
             &mut Vec::new(),
         )
         .map_err(CoreError::Sql)?;
-    let descriptors = sink.indexes();
+    let (template, keys) = selection(state, prepared, params, clock, sink)?;
+    let unique = sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
+    let mut pending = deferred.as_deref().cloned().unwrap_or_default();
+    let mut immediate = DeferralState::default();
+    let mut checks = scan::Retention::new(scan::retention_limit());
     let mut output = scan::Retention::new(MAX_RESULT_BYTES);
-    sink.ddl_pages(&table, &table, true, &mut |rows| {
+    sink.ddl_pages(&table, &table, true, &mut |mut rows| {
+        let mut unchanged = DdlRows::new();
+        if let Some(keys) = &keys {
+            rows.retain(|key, row| {
+                if keys.contains(key) { true } else { unchanged.insert(key.clone(), row.clone()); false }
+            });
+        }
         let mut page = state.clone();
+        let before = rows.clone();
         page.rows.insert(table.id, rows);
-        page.secondary = page
-            .secondary_build_complete_engine(&descriptors, || crate::cancellation::check().is_err())
-            .map_err(CoreError::Sql)?;
+        for constraints in page.ext.constraints.values_mut() {
+            constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
+        }
+        // Retain only page-local UNIQUE witnesses for exact immediate error
+        // order. Non-unique entries are maintained solely by the physical sink.
+        page.secondary = page.secondary_build_complete_engine(&unique,
+            || crate::cancellation::check().is_err()).map_err(CoreError::Sql)?;
         let batch = page
             .execute_statement_inner(
-                prepared,
+                &template,
                 params,
                 None,
                 || crate::cancellation::check().is_err(),
@@ -83,15 +101,59 @@ pub(super) fn execute(
         }
         result.affected += batch.affected;
         result.rows.extend(batch.rows);
-        Ok(page.rows.remove(&table.id).unwrap_or_default())
+        for (key, new) in &page.rows[&table.id] {
+            for c in state.ext.constraints.get(&table.id).into_iter().flatten() {
+                let ConstraintKind::ForeignKey { columns, deferral, .. } = &c.kind else { continue; };
+                if !columns.iter().any(|id| {
+                    let i = table.columns.iter().position(|column| column.id == *id).unwrap();
+                    new.values[i] != before[key].values[i]
+                }) { continue; }
+                checks.charge(key.len() + 96).map_err(CoreError::Sql)?;
+                let deferred = *deferral != Deferral::NotDeferrable && pending.modes.get(&c.id)
+                    .copied().unwrap_or(*deferral == Deferral::DeferrableDeferred);
+                let target = if deferred { &mut pending } else { &mut immediate };
+                target.pending.entry((c.id, table.id)).or_default().insert(key.clone());
+            }
+        }
+        unchanged.extend(page.rows.remove(&table.id).unwrap_or_default());
+        Ok(unchanged)
     })?;
+    paged_pending(state, &mut immediate, &[], false, sink)?;
+    if deferred.is_none() { paged_pending(state, &mut pending, &[], false, sink)?; }
+    if let Some(deferred) = deferred { *deferred = pending; }
     Ok(result)
+}
+
+// Complete predicate evaluation precedes publication, including self-subqueries.
+type MutationSelection = (Prepared, Option<BTreeSet<Vec<u8>>>);
+fn selection(state: &Relational, prepared: &Prepared, params: &[Value],
+    clock: Option<&clock::ExecutionClock>, sink: &mut impl RowSink,
+) -> Result<MutationSelection, CoreError> {
+    let keys = searched::target(prepared).filter(|q| q.has_in_subquery())
+        .map(|_| sink.mutation_keys(state, prepared, params, clock)).transpose()?;
+    let mut template = prepared.clone();
+    if keys.is_some() {
+        template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?
+            .parameters.into_iter().map(Some).collect();
+        template.unbound_statement = None;
+        match &mut template.statement {
+            Statement::Update { predicates, search, .. }
+            | Statement::UpdateExpressions { predicates, search, .. }
+            | Statement::Delete { predicates, search, .. } => {
+                predicates.clear();
+                search.as_mut().expect("IN target").clear_mutation_filter();
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok((template, keys))
 }
 
 // Follow both delete and update edges; NO ACTION graphs retain the legacy fallback.
 pub(super) fn cascade_eligible(state: &Relational, prepared: &Prepared) -> bool {
-    if !matches!(prepared.statement, Statement::Delete { .. } | Statement::Update { .. } | Statement::UpdateExpressions { .. })
-        || searched::target(prepared).is_some_and(query::Query::has_in_subquery) {
+    if eligible(state, prepared)
+        || !matches!(prepared.statement, Statement::Delete { .. } | Statement::Update { .. } | Statement::UpdateExpressions { .. })
+    {
         return false;
     }
     let Some(target) = prepared.table().and_then(|name| state.tables.get(name)) else { return false; };
@@ -136,6 +198,8 @@ pub(super) fn cascade(
     let descriptors = sink.indexes();
     let mut result = state.execute_statement_inner(prepared, params, None,
         || crate::cancellation::check().is_err(), clock, None, &mut Vec::new()).map_err(CoreError::Sql)?;
+    let (template, keys) = selection(state, prepared, params, clock, sink)?;
+    let prepared = &template;
     let first_version = state.next_version;
     let mut work = ActionWork { queue: std::collections::VecDeque::new(),
         retention: scan::Retention::new(scan::retention_limit()), visited: BTreeSet::new(), pending, immediate: DeferralState::default() };
@@ -144,7 +208,7 @@ pub(super) fn cascade(
     while let Some((last, mut rows)) = sink.read_page(&table, after)? {
         after = Some(last);
         // Own writes can move a primary key ahead of the physical cursor.
-        rows.retain(|_, row| row.version < first_version);
+        rows.retain(|key, row| row.version < first_version && keys.as_ref().is_none_or(|keys| keys.contains(key)));
         let mut page = state.clone();
         page.rows.insert(table.id, rows.clone());
         for cs in page.ext.constraints.values_mut() {

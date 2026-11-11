@@ -166,6 +166,82 @@ fn count(f: &Fixture, name: &str) -> usize {
 }
 
 #[test]
+fn audit_indexed_updates_and_snapshot_in_subqueries() {
+    audit_updates(5_000, 20_000);
+}
+
+#[test]
+#[ignore = "full audit-scale paged mutation timing; run explicitly"]
+fn audit_indexed_updates_full_scale() {
+    audit_updates(50_000, 200_000);
+}
+
+fn audit_updates(users: i64, orders: i64) {
+    use relational::Value::Text;
+    let f = Fixture::new();
+    f.execute("CREATE TABLE users(id bigint PRIMARY KEY, email text UNIQUE)");
+    f.execute("CREATE TABLE orders(id bigint PRIMARY KEY, user_id bigint REFERENCES users(id), status text)");
+    f.execute("CREATE INDEX orders_user ON orders(user_id)");
+    f.execute("CREATE TABLE items(id bigint PRIMARY KEY, order_id bigint REFERENCES orders(id) ON DELETE CASCADE)");
+    f.execute("CREATE TABLE bare(id bigint PRIMARY KEY, v bigint)");
+    let parts = f.parts();
+    for (name, count) in [("users", users), ("orders", orders), ("bare", 4)] {
+        let entry = TableEntry { def: parts.tables[name].clone(), heap: false, columns_ext: BTreeMap::new() };
+        for start in (0..count).step_by(200) {
+            let mut txn = f.db().begin(Isolation::ReadCommitted);
+            for id in start..(start + 200).min(count) {
+                let values = match name {
+                    "users" => vec![Int(id), Text(format!("u{id}"))],
+                    "orders" => vec![Int(id), Int(id % users), Text("old".into())],
+                    _ => vec![Int(id), Int(0)],
+                };
+                f.db().rows.insert(&mut txn, &entry, values, None, &|| false).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+    }
+    f.execute("INSERT INTO items VALUES(1,7)");
+    f.execute("CREATE TABLE precedence(id bigint PRIMARY KEY, v bigint UNIQUE CHECK(v<10))");
+    f.execute("INSERT INTO precedence VALUES(0,1),(1,2),(2,9)");
+    assert_eq!(f.admin().sql_session().execute("UPDATE precedence SET v=v+1", &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+    let mut s = f.admin().sql_session();
+    let mut run = |sql: &str, affected| {
+        let start = std::time::Instant::now();
+        assert_eq!(s.execute(sql, &[], None).unwrap().affected, affected, "{sql}");
+        println!("audit users={users} orders={orders}: {sql}: {:?}", start.elapsed());
+    };
+    run(&format!("UPDATE orders SET status='x' WHERE id<{users}"), users as u64);
+    run(&format!("UPDATE orders SET user_id=7 WHERE id<{users}"), users as u64);
+    // Physical index entries include every moved row and exclude old owners.
+    let values = s.execute("SELECT id FROM orders WHERE user_id=0", &[], None).unwrap();
+    assert_eq!(values.rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+        vec![vec![Int(users)], vec![Int(users * 2)], vec![Int(users * 3)]]);
+    assert_eq!(s.execute("SELECT count(*) FROM orders WHERE user_id=7", &[], None).unwrap().rows[0].values, vec![Int(users + 3)]);
+    let started = std::time::Instant::now();
+    assert_eq!(s.execute("UPDATE orders SET status='y' WHERE id IN (SELECT id FROM orders WHERE user_id=7)", &[], None).unwrap().affected, (users + 3) as u64);
+    println!("audit self IN elapsed={:?}", started.elapsed());
+    let started = std::time::Instant::now();
+    assert_eq!(s.execute("UPDATE bare SET v=v+1 WHERE id IN (SELECT id FROM users WHERE id<3)", &[], None).unwrap().affected, 3);
+    println!("audit cross IN elapsed={:?}", started.elapsed());
+    assert_eq!(s.execute(&format!("UPDATE users SET email=CASE WHEN id={} THEN 'n0' ELSE 'n'||id::text END", users - 1), &[], None), Err(CoreError::Sql(SqlError::Duplicate)));
+    assert_eq!(s.execute("SELECT count(*) FROM users WHERE email LIKE 'u%'", &[], None).unwrap().rows[0].values, vec![Int(users)]);
+    assert_eq!(s.execute(&format!("UPDATE orders SET user_id=CASE WHEN id={} THEN {} ELSE 8 END WHERE id<{}", users - 1, users + 1, users), &[], None), Err(CoreError::Sql(SqlError::ForeignKeyViolation)));
+    assert_eq!(s.execute("SELECT count(*) FROM orders WHERE user_id=7", &[], None).unwrap().rows[0].values, vec![Int(users + 3)]);
+    s.execute("BEGIN", &[], None).unwrap();
+    s.execute("INSERT INTO users VALUES(-1,'own')", &[], None).unwrap();
+    s.execute("INSERT INTO bare VALUES(-1,0)", &[], None).unwrap();
+    assert_eq!(s.execute("UPDATE bare SET v=v+1 WHERE id IN (SELECT id FROM users WHERE email='own')", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("UPDATE orders SET user_id=9 WHERE id IN (SELECT id FROM orders WHERE user_id=7)", &[], None).unwrap().affected, (users + 3) as u64);
+    assert_eq!(s.execute("DELETE FROM bare WHERE id IN (SELECT id FROM users WHERE email='own')", &[], None).unwrap().affected, 1);
+    assert_eq!(s.execute("DELETE FROM orders WHERE id IN (SELECT id FROM orders WHERE user_id=9)", &[], None).unwrap().affected, (users + 6) as u64);
+    assert_eq!(s.execute("SELECT count(*) FROM items", &[], None).unwrap().rows[0].values, vec![Int(0)]);
+    s.execute("ROLLBACK", &[], None).unwrap();
+    assert_eq!(s.execute("SELECT count(*) FROM items", &[], None).unwrap().rows[0].values, vec![Int(1)]);
+    assert_eq!(s.execute("SELECT count(*) FROM orders WHERE user_id=7", &[], None).unwrap().rows[0].values, vec![Int(users + 3)]);
+    assert_eq!(s.execute("SELECT count(*) FROM users WHERE id=-1", &[], None).unwrap().rows[0].values, vec![Int(0)]);
+}
+
+#[test]
 fn insert_select_200_000_and_late_failure() {
     for index in [
         "",
