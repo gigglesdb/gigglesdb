@@ -18,10 +18,10 @@ pub(crate) mod sequences;
 mod upgrade;
 mod v2;
 pub use upgrade::{UpgradePoint, UpgradeReport};
+mod copy_input;
 #[cfg(feature = "engine-rocksdb")]
 mod v2_export;
 mod v2_sql;
-mod copy_input;
 use copy_input::CopyInput;
 pub use cursor::Cursor;
 pub use secondary_index_public::IndexInfo;
@@ -2028,6 +2028,18 @@ impl SqlSession {
         self.extra_float_digits = value;
     }
 
+    /// Tables cleared by TRUNCATE, including its transitive CASCADE closure.
+    pub fn truncate_tables(&self, p: &relational::Prepared) -> Result<Vec<String>, CoreError> {
+        let targets = |s: &State| {
+            p.bind_schemas(&s.sql)
+                .and_then(|p| p.truncate_authority_tables(&s.sql))
+                .map_err(CoreError::Sql)
+        };
+        match &self.staged {
+            Some(s) => targets(s),
+            None => self.inspect_metadata(targets),
+        }
+    }
     /// Report default and identity sequence dependencies without resolving names.
     pub fn implicit_sequence_dependencies(
         &self,
@@ -2900,7 +2912,7 @@ impl SqlSession {
         if p.domain != s.view.domain {
             return Err(CoreError::Sql(E::StaleSchema));
         }
-        if p.is_sequence_ddl() {
+        if p.is_sequence_ddl() || p.truncate_restarts_identity() {
             self.admin.inner.merge_live_sequences(&mut s)?;
         }
         sequences::merge(
@@ -2931,7 +2943,7 @@ impl SqlSession {
             ))
         });
         let clock = context.as_ref();
-        let sequence_before = if p.is_sequence_ddl() {
+        let sequence_before = if p.is_sequence_ddl() || p.truncate_restarts_identity() {
             Some(
                 s.sql
                     .catalog_ext()
@@ -3031,6 +3043,25 @@ impl SqlSession {
                     stamp: 0,
                 },
             );
+        }
+        if p.truncate_restarts_identity() {
+            for (&id, definition) in &s.sql.catalog_ext().sequences {
+                if s.seq
+                    .get(&id)
+                    .is_some_and(|counter| counter.incarnation != definition.incarnation)
+                {
+                    s.seq.insert(
+                        id,
+                        sequences::SeqCounter {
+                            incarnation: definition.incarnation,
+                            last_value: definition.start,
+                            is_called: false,
+                            log_hw: definition.start,
+                            stamp: 0,
+                        },
+                    );
+                }
+            }
         }
         // ALTER may narrow bounds while retaining the current position. A prior
         // recovery reservation is expendable; keep it inside the new bounds.

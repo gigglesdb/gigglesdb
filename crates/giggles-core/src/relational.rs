@@ -2,13 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
-mod ctid;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
 mod catalog_image_tests;
 #[cfg(test)]
 mod constraint_acceptance_tests;
 mod constraints;
+mod ctid;
 pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
 mod assign;
 pub(crate) mod clock;
@@ -925,6 +925,11 @@ enum Statement {
         cascade: bool,
         resolution_error: Option<SqlError>,
     },
+    Truncate {
+        names: Vec<String>,
+        restart: bool,
+        cascade: bool,
+    },
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     CreateIndex(sql_index::CreateIndex),
@@ -986,6 +991,7 @@ enum Statement {
 }
 mod schema_binding;
 pub(crate) mod schemas;
+mod truncate;
 #[doc(hidden)]
 pub use schema_binding::relation_key;
 pub(crate) use schema_binding::split_key;
@@ -1447,6 +1453,35 @@ impl Parser {
                     returning,
                 }
             }
+        } else if self.word("truncate") {
+            self.word("table");
+            let mut names = Vec::new();
+            loop {
+                self.word("only");
+                names.push(self.table_name()?);
+                self.sym('*');
+                if !self.sym(',') {
+                    break;
+                }
+            }
+            let restart = if self.word("restart") {
+                self.need("identity")?;
+                true
+            } else {
+                if self.word("continue") {
+                    self.need("identity")?;
+                }
+                false
+            };
+            let cascade = self.word("cascade");
+            if !cascade {
+                self.word("restrict");
+            }
+            Statement::Truncate {
+                names,
+                restart,
+                cascade,
+            }
         } else if self.word("delete") {
             self.need("from")?;
             let name = self.table_name()?;
@@ -1582,7 +1617,9 @@ impl Prepared {
             | Statement::Update { .. }
             | Statement::UpdateExpressions { .. }
             | Statement::Delete { .. } => V2Class::Dml,
-            Statement::Schema(_) | Statement::TypeDdl(_) => V2Class::Ddl,
+            Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) => {
+                V2Class::Ddl
+            }
             Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
             Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
@@ -1892,6 +1929,15 @@ impl Prepared {
         Ok(description)
     }
     fn describe_inner(&self, state: &Relational) -> R<Description> {
+        if matches!(self.statement, Statement::Truncate { .. }) {
+            self.truncate_authority_tables(state)?;
+            return Ok(Description {
+                parameters: vec![],
+                columns: vec![],
+                type_oids: vec![],
+                typmods: vec![],
+            });
+        }
         if self.epoch != state.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -2078,6 +2124,7 @@ impl Prepared {
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
+            Statement::Truncate { names, .. } => names.first().map(String::as_str),
             Statement::Query(q) => {
                 if q.is_table_free() {
                     None
@@ -2180,6 +2227,7 @@ impl Prepared {
             Statement::Select { .. } => "SELECT",
             Statement::Update { .. } | Statement::UpdateExpressions { .. } => "UPDATE",
             Statement::Delete { .. } => "DELETE",
+            Statement::Truncate { .. } => "TRUNCATE TABLE",
             Statement::Begin => "BEGIN",
             Statement::Commit => "COMMIT",
             Statement::Rollback | Statement::RollbackTo(_) => "ROLLBACK",
@@ -2504,8 +2552,10 @@ impl Prepared {
     /// Every identifier is checked conservatively, including nested statements.
     pub fn application_dml(sql: &str, catalog_identifier: impl Fn(&str) -> bool) -> bool {
         let mut tokens = Vec::new();
-        if lex_into(sql, &mut tokens, true).is_err() { return false }
-        matches!(tokens.first(), Some(Token::Word(w)) if matches!(w.as_str(), "insert" | "update" | "delete"))
+        if lex_into(sql, &mut tokens, true).is_err() {
+            return false;
+        }
+        matches!(tokens.first(), Some(Token::Word(w)) if matches!(w.as_str(), "insert" | "update" | "delete" | "truncate"))
             && !tokens.iter().any(|token| match token {
                 Token::Word(w) | Token::QuotedIdent(w) => catalog_identifier(w),
                 _ => false,
@@ -3294,6 +3344,26 @@ impl Relational {
             }
             Statement::Schema(ddl) => {
                 return self.schema_ddl(ddl, &prepared.schema_user);
+            }
+            Statement::Truncate { restart, .. } => {
+                if expected.is_some() {
+                    return Err(SqlError::Unsupported);
+                }
+                let names = prepared.truncate_tables(self)?;
+                for name in &names {
+                    if cancel() {
+                        return Err(SqlError::Aborted);
+                    }
+                    self.rows
+                        .get_mut(&self.tables[name].id)
+                        .ok_or(SqlError::UnknownTable)?
+                        .clear();
+                }
+                let descriptors = self.secondary_descriptors_engine().to_vec();
+                self.secondary = self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
+                if *restart {
+                    prepared.truncate_restart(self, &names)?;
+                }
             }
             Statement::Sequence(ddl) => {
                 if expected.is_some() {

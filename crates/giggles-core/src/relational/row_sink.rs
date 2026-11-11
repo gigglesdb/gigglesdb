@@ -38,14 +38,24 @@ pub(crate) trait RowSink {
     }
 
     /// One physical FK page, with an opaque resume key and transaction own writes.
-    fn child_page(&mut self, _table: &TableDef, _columns: &[u64], _values: &[Value],
-        _after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+    fn child_page(
+        &mut self,
+        _table: &TableDef,
+        _columns: &[u64],
+        _values: &[Value],
+        _after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
 
     fn begin_conflict_pages(&mut self, _floor: u64) {}
-    fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[Value],
-        visit: &mut dyn FnMut(SqlRow) -> R<()>) -> Result<(), CoreError> {
+    fn conflict_lookup(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: &[Value],
+        visit: &mut dyn FnMut(SqlRow) -> R<()>,
+    ) -> Result<(), CoreError> {
         self.lookup(table, columns, Some(values), true, visit)
     }
 
@@ -89,8 +99,14 @@ pub(crate) trait RowSink {
         Ok(())
     }
     /// Physical occupancy is checked before end-of-statement FK actions.
-    fn check_occupancy(&mut self, _table: &TableDef, _before: &DdlRows, _after: &DdlRows)
-        -> Result<(), CoreError> { Ok(()) }
+    fn check_occupancy(
+        &mut self,
+        _table: &TableDef,
+        _before: &DdlRows,
+        _after: &DdlRows,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
     /// Publish the difference atomically; the caller owns a statement savepoint.
     fn apply(
         &mut self,
@@ -101,16 +117,44 @@ pub(crate) trait RowSink {
 }
 
 impl Relational {
-    pub(crate) fn copy_input_page(&mut self, prepared: &Prepared, sink: &mut impl RowSink,
-        range: std::ops::Range<u64>, finish: bool, deferred: &mut DeferralState,
+    pub(crate) fn copy_input_page(
+        &mut self,
+        prepared: &Prepared,
+        sink: &mut impl RowSink,
+        range: std::ops::Range<u64>,
+        finish: bool,
+        deferred: &mut DeferralState,
         clock: Option<&clock::ExecutionClock>,
     ) -> Result<(), CoreError> {
-        let table = self.tables.get(prepared.table().ok_or(CoreError::Sql(SqlError::Unsupported))?)
-            .ok_or(CoreError::Sql(SqlError::UnknownTable))?.clone();
+        let table = self
+            .tables
+            .get(
+                prepared
+                    .table()
+                    .ok_or(CoreError::Sql(SqlError::Unsupported))?,
+            )
+            .ok_or(CoreError::Sql(SqlError::UnknownTable))?
+            .clone();
         if finish {
-            if !self.ext.constraints.get(&table.id).into_iter().flatten()
-                .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. })) { return Ok(()); }
-            paged_insert::validate_append(self, &table, range.start, range.end, sink, Some(deferred), clock)
+            if !self
+                .ext
+                .constraints
+                .get(&table.id)
+                .into_iter()
+                .flatten()
+                .any(|c| matches!(c.kind, ConstraintKind::ForeignKey { .. }))
+            {
+                return Ok(());
+            }
+            paged_insert::validate_append(
+                self,
+                &table,
+                range.start,
+                range.end,
+                sink,
+                Some(deferred),
+                clock,
+            )
         } else {
             for constraints in self.ext.constraints.values_mut() {
                 constraints.retain(|c| !matches!(c.kind, ConstraintKind::ForeignKey { .. }));
@@ -135,7 +179,25 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
-        if sink.streams_index_builds() && let Some((names, mode)) = prepared.set_constraints() {
+        if let Statement::Truncate { restart, .. } = &prepared.statement {
+            if !params.is_empty() || expected.is_some() {
+                return Err(CoreError::Sql(SqlError::Parameters));
+            }
+            let names = prepared.truncate_tables(self).map_err(CoreError::Sql)?;
+            for name in &names {
+                let table = self.tables[name].clone();
+                sink.ddl_pages(&table, &table, true, &mut |_| Ok(BTreeMap::new()))?;
+            }
+            if *restart {
+                prepared
+                    .truncate_restart(self, &names)
+                    .map_err(CoreError::Sql)?;
+            }
+            return Ok(SqlResult::default());
+        }
+        if sink.streams_index_builds()
+            && let Some((names, mode)) = prepared.set_constraints()
+        {
             let deferred = deferred.ok_or(CoreError::Sql(SqlError::NoActiveTransaction))?;
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));
@@ -267,11 +329,18 @@ impl Relational {
         let mut normalized = prepared.clone();
         let conflict_rows = if sink.streams_index_builds() {
             if let Statement::InsertMulti(insert) = &mut normalized.statement {
-                insert.witness_rows(self, params, &prepared.parameter_types, clock)
+                insert
+                    .witness_rows(self, params, &prepared.parameter_types, clock)
                     .map_err(CoreError::Sql)?
-            } else { None }
-        } else { None };
-        if conflict_rows.is_some() { normalized.unbound_statement = None; }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if conflict_rows.is_some() {
+            normalized.unbound_statement = None;
+        }
         let prepared = &normalized;
         let arbiter = match &prepared.statement {
             Statement::InsertMulti(insert) if conflict_rows.is_some() =>
@@ -316,8 +385,12 @@ impl Relational {
         {
             names.push(self.table_key(table));
         }
-        for (_, table_id) in deferred.as_ref().filter(|_| !sink.streams_index_builds())
-            .into_iter().flat_map(|d| d.pending.keys()) {
+        for (_, table_id) in deferred
+            .as_ref()
+            .filter(|_| !sink.streams_index_builds())
+            .into_iter()
+            .flat_map(|d| d.pending.keys())
+        {
             if let Some(table) = self.tables.values().find(|t| t.id == *table_id) {
                 let name = self.table_key(table);
                 if !names.contains(&name) {
@@ -351,7 +424,9 @@ impl Relational {
                     return Err(SqlError::Aborted);
                 }
                 let key = pk(table, &row.values)?;
-                if conflict_rows.is_some() && rows.contains_key(&key) { return Ok(()); }
+                if conflict_rows.is_some() && rows.contains_key(&key) {
+                    return Ok(());
+                }
                 // Only destination rows constrain its version allocator. A
                 // concurrent source writer may hold a newer reserved range.
                 if is_target {
@@ -366,14 +441,33 @@ impl Relational {
                 Ok(())
             };
             if is_target && let Some(proposals) = &conflict_rows {
-                let keys = std::iter::once(table.primary_key.iter()
-                    .map(|i| table.columns[*i].id).collect::<Vec<_>>())
-                    .chain(sink.indexes().into_iter().filter(|d| d.table == table.id && d.unique)
-                        .map(|d| d.columns)).collect::<Vec<_>>();
+                let keys = std::iter::once(
+                    table
+                        .primary_key
+                        .iter()
+                        .map(|i| table.columns[*i].id)
+                        .collect::<Vec<_>>(),
+                )
+                .chain(
+                    sink.indexes()
+                        .into_iter()
+                        .filter(|d| d.table == table.id && d.unique)
+                        .map(|d| d.columns),
+                )
+                .collect::<Vec<_>>();
                 for proposal in proposals {
                     for columns in &keys {
-                        let values = columns.iter().map(|id| proposal[table.columns.iter()
-                            .position(|c| c.id == *id).expect("index column")].clone()).collect::<Vec<_>>();
+                        let values = columns
+                            .iter()
+                            .map(|id| {
+                                proposal[table
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.id == *id)
+                                    .expect("index column")]
+                                .clone()
+                            })
+                            .collect::<Vec<_>>();
                         if !values.contains(&Value::Null) {
                             // Only the arbiter can affect the same row twice (21000).
                             // Other unique keys retain ordinary uniqueness checks (23505).
@@ -481,8 +575,10 @@ impl Relational {
                 )
                 .map_err(CoreError::Sql)?;
             if writing {
-                if !append && let Some(table) = &table
-                    && matches!(prepared.v2_class(), V2Class::Dml) {
+                if !append
+                    && let Some(table) = &table
+                    && matches!(prepared.v2_class(), V2Class::Dml)
+                {
                     sink.check_occupancy(table, &before.rows[&table.id], &self.rows[&table.id])?;
                 }
                 if append {

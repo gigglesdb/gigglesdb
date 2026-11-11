@@ -283,7 +283,7 @@ impl Parser {
             } else {
                 !matches!(
                     p.as_str(),
-                    "select" | "insert" | "update" | "delete" | "all"
+                    "select" | "insert" | "update" | "delete" | "truncate" | "all"
                 )
             }
         }) {
@@ -530,6 +530,7 @@ pub(crate) fn execute(
                 ("insert", TablePrivilege::Insert),
                 ("update", TablePrivilege::Update),
                 ("delete", TablePrivilege::Delete),
+                ("truncate", TablePrivilege::Delete),
             ]
             .into_iter()
             .filter(|(s, _)| all || privileges.iter().any(|p| p == s))

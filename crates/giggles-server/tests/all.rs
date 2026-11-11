@@ -138,15 +138,18 @@ mod per_schema_names;
 #[path = "streaming_cursor_network.rs"]
 mod streaming_cursor_network;
 
+#[path = "bulk_wire_admission.rs"]
+mod bulk_wire_admission;
 #[path = "v2_ddl_authority.rs"]
 mod v2_ddl_authority;
 #[path = "v2_uuid.rs"]
 mod v2_uuid;
-#[path = "bulk_wire_admission.rs"]
-mod bulk_wire_admission;
 
 #[path = "qualified_wildcard.rs"]
 mod qualified_wildcard;
 
 #[path = "ctid_wire.rs"]
 mod ctid_wire;
+
+#[path = "truncate_wire.rs"]
+mod truncate_wire;

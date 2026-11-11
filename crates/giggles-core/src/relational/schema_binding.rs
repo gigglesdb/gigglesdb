@@ -129,6 +129,7 @@ impl Prepared {
             }
         };
         match &mut bound.statement {
+            Statement::Truncate { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {
                 name, constraints, ..
             } => {

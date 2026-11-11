@@ -196,6 +196,7 @@ pub(super) fn read_only_check(
         "INSERT" => "cannot execute INSERT in a read-only transaction",
         "UPDATE" => "cannot execute UPDATE in a read-only transaction",
         "DELETE" => "cannot execute DELETE in a read-only transaction",
+        "TRUNCATE TABLE" => "cannot execute TRUNCATE in a read-only transaction",
         "CREATE TABLE" => "cannot execute CREATE TABLE in a read-only transaction",
         "CREATE TYPE" => "cannot execute CREATE TYPE in a read-only transaction",
         "CREATE DOMAIN" => "cannot execute CREATE DOMAIN in a read-only transaction",

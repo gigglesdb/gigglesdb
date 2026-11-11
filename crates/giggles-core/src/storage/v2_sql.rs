@@ -93,7 +93,11 @@ impl SqlSession {
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::{SqlError as E, V2Class};
-        if self.copy_input.as_ref().is_some_and(|input| !input.executing) {
+        if self
+            .copy_input
+            .as_ref()
+            .is_some_and(|input| !input.executing)
+        {
             self.abort();
             return Err(CoreError::Sql(E::Transaction));
         }
@@ -242,7 +246,9 @@ impl SqlSession {
                         Some(txn) => txn,
                         None => implicit.insert(db.begin(Isolation::ReadCommitted)),
                     };
-                    if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
+                    if !self.copy_input.as_ref().is_some_and(|input| input.started) {
+                        txn.begin_statement();
+                    }
                     let mark = txn.savepoint();
                     let result = (|| {
                         // DDL stages a catalog-wide image (including schema cascades and
@@ -260,7 +266,9 @@ impl SqlSession {
                                 &|| crate::cancellation::check().is_err(),
                             )?;
                             // Refresh AFTER waiting: DDL may have introduced an FK.
-                            if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
+                            if !self.copy_input.as_ref().is_some_and(|input| input.started) {
+                                txn.begin_statement();
+                            }
                         }
                         // Lock before choosing the statement snapshot/image. SQL mutations
                         // serialize per table; readers retain MVCC snapshot visibility.
@@ -285,6 +293,10 @@ impl SqlSession {
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
                         let target_name = bound.table().map(str::to_owned);
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
+                        let truncating = bound.command() == "TRUNCATE TABLE";
+                        if truncating {
+                            names.extend(bound.truncate_tables(&binding).map_err(CoreError::Sql)?);
+                        }
                         if let Some(name) = &target_name {
                             names.insert(name.clone());
                         }
@@ -320,7 +332,14 @@ impl SqlSession {
                         let mut locks = BTreeMap::new();
                         for name in &names {
                             if let Some(table) = parts.tables.get(name) {
-                                locks.insert(table.id, LockMode::AccessShare);
+                                locks.insert(
+                                    table.id,
+                                    if truncating {
+                                        LockMode::AccessExclusive
+                                    } else {
+                                        LockMode::AccessShare
+                                    },
+                                );
                             }
                         }
                         if writing {
@@ -369,7 +388,9 @@ impl SqlSession {
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.
-                        if !self.copy_input.as_ref().is_some_and(|input| input.started) { txn.begin_statement(); }
+                        if !self.copy_input.as_ref().is_some_and(|input| input.started) {
+                            txn.begin_statement();
+                        }
                         let old = db.catalog().parts(txn)?;
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
@@ -401,11 +422,17 @@ impl SqlSession {
                             floor..floor
                         };
                         let versions = if matches!(class, V2Class::Dml) {
-                            if let Some(range) = self.copy_input.as_ref().and_then(|input| input.versions.clone()) {
+                            if let Some(range) = self
+                                .copy_input
+                                .as_ref()
+                                .and_then(|input| input.versions.clone())
+                            {
                                 range
                             } else {
                                 let range = db.sequences.reserve_range(3, 0, 1_000_001)?;
-                                if let Some(input) = self.copy_input.as_mut() { input.versions = Some(range.clone()); }
+                                if let Some(input) = self.copy_input.as_mut() {
+                                    input.versions = Some(range.clone());
+                                }
                                 range
                             }
                         } else {
@@ -442,11 +469,25 @@ impl SqlSession {
                             }
                             input.table = Some(table.to_owned());
                             let floor = *input.floor.get_or_insert(versions.start);
-                            image.copy_input_page(&bound,
-                                &mut SqlRows { conflict_floor: None, db, txn, parts: &old,
-                                    writing, prepared: &bound, params }, floor..versions.start,
-                                input.finishing, &mut self.deferral, context.as_ref())?;
-                            if input.finishing { return Ok(Default::default()); }
+                            image.copy_input_page(
+                                &bound,
+                                &mut SqlRows {
+                                    conflict_floor: None,
+                                    db,
+                                    txn,
+                                    parts: &old,
+                                    writing,
+                                    prepared: &bound,
+                                    params,
+                                },
+                                floor..versions.start,
+                                input.finishing,
+                                &mut self.deferral,
+                                context.as_ref(),
+                            )?;
+                            if input.finishing {
+                                return Ok(Default::default());
+                            }
                         }
                         let result = image.execute_with_sink(
                             p,
@@ -473,13 +514,39 @@ impl SqlSession {
                             return Err(error);
                         }
                         let result = result?;
-                        if let Some(range) = self.copy_input.as_mut().and_then(|input| input.versions.as_mut()) {
+                        if let Some(range) = self
+                            .copy_input
+                            .as_mut()
+                            .and_then(|input| input.versions.as_mut())
+                        {
                             range.start = image.catalog_parts().3;
                         }
                         if !ddl {
                             return Ok(result);
                         }
                         let (tables, ext, next_id, _) = image.catalog_parts();
+                        if p.truncate_restarts_identity() {
+                            let mut values =
+                                self.sequence_values.lock().map_err(|_| CoreError::Fenced)?;
+                            for (&id, definition) in &ext.sequences {
+                                if let Some(before) = old.ext.sequences.get(&id)
+                                    && before.incarnation != definition.incarnation
+                                {
+                                    // The existing sequence key codec binds counters to an
+                                    // incarnation. Retire the old reservation in the same
+                                    // transaction so reopen never loads it against the new definition.
+                                    txn.delete_counter(engine::catalog_codec::counter_key(
+                                        id,
+                                        before.incarnation,
+                                    ))?;
+                                    if let Some(value) =
+                                        values.get(&(id, before.incarnation)).copied()
+                                    {
+                                        values.insert((id, definition.incarnation), value);
+                                    }
+                                }
+                            }
+                        }
                         if next_id > ids.end {
                             return Err(CoreError::Corrupt(
                                 "v2 DDL exceeded ID reservation".into(),
@@ -896,8 +963,13 @@ impl RowSink for SqlRows<'_> {
                 d,
                 Bound::Included(tuple.clone()),
                 Bound::Included(tuple),
-                &mut |_, row| visit(SqlRow { values: row.values, version: row.version })
-                    .map_err(CoreError::Sql),
+                &mut |_, row| {
+                    visit(SqlRow {
+                        values: row.values,
+                        version: row.version,
+                    })
+                    .map_err(CoreError::Sql)
+                },
             );
         } else if unique {
             return Err(CoreError::Sql(SqlError::InvalidForeignKey));
@@ -913,32 +985,74 @@ impl RowSink for SqlRows<'_> {
         }
         Ok(())
     }
-    fn child_page(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
-        after: Option<Vec<u8>>) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
-        let descriptor = self.parts.indexes.iter().find(|d| d.table == table.id
-            && d.columns.len() == columns.len() && d.columns.iter().all(|id| columns.contains(id)));
+    fn child_page(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: &[relational::Value],
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
+        let descriptor = self.parts.indexes.iter().find(|d| {
+            d.table == table.id
+                && d.columns.len() == columns.len()
+                && d.columns.iter().all(|id| columns.contains(id))
+        });
         if let Some(d) = descriptor {
-            let values = d.columns.iter().map(|id| values[columns.iter().position(|c| c == id).unwrap()].clone()).collect::<Vec<_>>();
-            let tuple = codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
-            let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id), columns_ext: BTreeMap::new() };
+            let values = d
+                .columns
+                .iter()
+                .map(|id| values[columns.iter().position(|c| c == id).unwrap()].clone())
+                .collect::<Vec<_>>();
+            let tuple =
+                codec::index_tuple_bytes(&values, &vec![codec::Direction::Asc; values.len()])?;
+            let entry = TableEntry {
+                def: table.clone(),
+                heap: self.parts.heap.contains(&table.id),
+                columns_ext: BTreeMap::new(),
+            };
             let mut rows = DdlRows::new();
-            let last = engine::indexes::visit_page(self.txn, &entry, d,
-                Bound::Included(tuple.clone()), Bound::Included(tuple), after, &mut |_, row| {
-                    let row = SqlRow { values: row.values, version: row.version };
-                    rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
+            let last = engine::indexes::visit_page(
+                self.txn,
+                &entry,
+                d,
+                Bound::Included(tuple.clone()),
+                Bound::Included(tuple),
+                after,
+                &mut |_, row| {
+                    let row = SqlRow {
+                        values: row.values,
+                        version: row.version,
+                    };
+                    rows.insert(
+                        relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?,
+                        row,
+                    );
                     Ok(())
-                })?;
+                },
+            )?;
             return Ok(last.map(|last| (last, rows)));
         }
-        let Some((last, mut rows)) = self.read_page(table, after)? else { return Ok(None); };
-        rows.retain(|_, row| columns.iter().zip(values).all(|(id, value)|
-            row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value));
+        let Some((last, mut rows)) = self.read_page(table, after)? else {
+            return Ok(None);
+        };
+        rows.retain(|_, row| {
+            columns.iter().zip(values).all(|(id, value)| {
+                row.values[table.columns.iter().position(|c| c.id == *id).unwrap()] == *value
+            })
+        });
         Ok(Some((last, rows)))
     }
 
-    fn begin_conflict_pages(&mut self, floor: u64) { self.conflict_floor = Some(floor); }
-    fn conflict_lookup(&mut self, table: &TableDef, columns: &[u64], values: &[relational::Value],
-        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>) -> Result<(), CoreError> {
+    fn begin_conflict_pages(&mut self, floor: u64) {
+        self.conflict_floor = Some(floor);
+    }
+    fn conflict_lookup(
+        &mut self,
+        table: &TableDef,
+        columns: &[u64],
+        values: &[relational::Value],
+        visit: &mut dyn FnMut(SqlRow) -> Result<(), SqlError>,
+    ) -> Result<(), CoreError> {
         let floor = self.conflict_floor;
         self.lookup(table, columns, Some(values), true, &mut |row| {
             if floor.is_some_and(|v| row.version >= v) { return Err(SqlError::CardinalityViolation); }
@@ -1036,7 +1150,11 @@ impl RowSink for SqlRows<'_> {
             return self.scan_all(&entry, visit);
         };
         engine::indexes::visit(self.txn, &entry, descriptor, lo, hi, &mut |_, row| {
-            visit(SqlRow { values: row.values, version: row.version }).map_err(CoreError::Sql)
+            visit(SqlRow {
+                values: row.values,
+                version: row.version,
+            })
+            .map_err(CoreError::Sql)
         })?;
         #[cfg(test)]
         USED_INDEX_SCAN.set(true);
@@ -1048,15 +1166,32 @@ impl RowSink for SqlRows<'_> {
         });
         Ok(())
     }
-    fn check_occupancy(&mut self, table: &TableDef, before: &BTreeMap<Vec<u8>, SqlRow>,
-        after: &BTreeMap<Vec<u8>, SqlRow>) -> Result<(), CoreError> {
+    fn check_occupancy(
+        &mut self,
+        table: &TableDef,
+        before: &BTreeMap<Vec<u8>, SqlRow>,
+        after: &BTreeMap<Vec<u8>, SqlRow>,
+    ) -> Result<(), CoreError> {
         for (key, row) in after {
-            if before.contains_key(key) { continue; }
+            if before.contains_key(key) {
+                continue;
+            }
             let mut physical = table.id.to_be_bytes().to_vec();
-            physical.extend(codec::pk_bytes(&table.primary_key.iter()
-                .map(|i| row.values[*i].clone()).collect::<Vec<_>>())?);
-            if self.txn.lock_for_write(Keyspace::Rows, &physical, None,
-                &|| crate::cancellation::check().is_err())?.current.is_some() {
+            physical.extend(codec::pk_bytes(
+                &table
+                    .primary_key
+                    .iter()
+                    .map(|i| row.values[*i].clone())
+                    .collect::<Vec<_>>(),
+            )?);
+            if self
+                .txn
+                .lock_for_write(Keyspace::Rows, &physical, None, &|| {
+                    crate::cancellation::check().is_err()
+                })?
+                .current
+                .is_some()
+            {
                 return Err(CoreError::Sql(SqlError::Duplicate));
             }
         }

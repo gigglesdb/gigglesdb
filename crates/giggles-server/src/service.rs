@@ -1236,7 +1236,7 @@ impl Session {
                         "SELECT" | "EXPLAIN" => Some(roles::TablePrivilege::Select),
                         "INSERT" => Some(roles::TablePrivilege::Insert),
                         "UPDATE" => Some(roles::TablePrivilege::Update),
-                        "DELETE" => Some(roles::TablePrivilege::Delete),
+                        "DELETE" | "TRUNCATE TABLE" => Some(roles::TablePrivilege::Delete),
                         _ => None,
                     };
                     self.table_privilege_allowed(table, name, privilege)?
@@ -1275,6 +1275,23 @@ impl Session {
         if !allowed {
             self.sql.abort();
             return Err(CoreError::Policy(Error::Scope));
+        }
+        if p.command() == "TRUNCATE TABLE" && !superuser {
+            for table in self.sql.truncate_tables(p)? {
+                let permitted = match &self.role {
+                    Role::Database { name } => self.table_privilege_allowed(
+                        &table,
+                        name,
+                        Some(roles::TablePrivilege::Delete),
+                    )?,
+                    Role::Application { tables, .. } => tables.contains(&table),
+                    _ => false,
+                };
+                if !permitted {
+                    self.sql.abort();
+                    return Err(CoreError::Policy(Error::Scope));
+                }
+            }
         }
         // Ordinary table/DDL authority precedes implicit default metadata:
         // denied sessions must not discover whether a target table exists.
@@ -1388,13 +1405,18 @@ impl Session {
             session.sql.normalize_copy_rows_at(prepared, rows, clock)
         })
     }
-    pub(crate) fn finish_copy_input(&mut self, authority: &Prepared, prepared: &Prepared,
+    pub(crate) fn finish_copy_input(
+        &mut self,
+        authority: &Prepared,
+        prepared: &Prepared,
         clock: &StatementClock,
     ) -> Result<SqlResult, CoreError> {
         self.authority_scope(|session| {
             session.authorize(authority)?;
             let result = session.sql.finish_copy_input_at(prepared, clock);
-            if !session.sql.in_transaction() { session.transaction_us = None; }
+            if !session.sql.in_transaction() {
+                session.transaction_us = None;
+            }
             result
         })
     }

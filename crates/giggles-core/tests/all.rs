@@ -36,8 +36,6 @@ mod e2_string_truncation_error;
 mod e2_varchar_char_oracle;
 #[path = "export.rs"]
 mod export;
-#[path = "upgrade.rs"]
-mod upgrade;
 #[path = "float_text_input.rs"]
 mod float_text_input;
 #[path = "heap_native_operations.rs"]
@@ -266,6 +264,8 @@ mod temporal_constructors;
 mod temporal_retained;
 #[path = "transactions.rs"]
 mod transactions;
+#[path = "upgrade.rs"]
+mod upgrade;
 #[path = "upsert.rs"]
 mod upsert;
 
@@ -318,10 +318,10 @@ mod user_schemas;
 #[path = "user_defined_types.rs"]
 mod user_defined_types;
 
-#[path = "per_schema_names.rs"]
-mod per_schema_names;
 #[path = "corruption_detection.rs"]
 mod corruption_detection;
+#[path = "per_schema_names.rs"]
+mod per_schema_names;
 
 #[path = "streaming_cursor.rs"]
 mod streaming_cursor;
@@ -355,3 +355,6 @@ mod check_schema;
 
 #[path = "upsert_arbiter.rs"]
 mod upsert_arbiter;
+
+#[path = "truncate.rs"]
+mod truncate;

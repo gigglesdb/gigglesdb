@@ -14,6 +14,12 @@ pub fn take_sql_error_message() -> Option<String> {
 pub fn take_sql_notices() -> Vec<(String, Option<String>)> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }
+pub(super) fn truncate_reference_error() {
+    SQL_ERROR_MESSAGE.with(|message| {
+        *message.borrow_mut() =
+            Some("cannot truncate a table referenced in a foreign key constraint".into())
+    });
+}
 pub(super) fn clear_sql_error_message() {
     take_sql_notices();
     take_sql_error_message();
