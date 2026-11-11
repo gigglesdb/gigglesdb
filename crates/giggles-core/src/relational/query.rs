@@ -1741,7 +1741,7 @@ impl Query {
                     Item::Scalar(s) => grouping::contains_aggregate(s),
                     _ => false,
                 })
-                || (!self.order.is_empty() && self.limit.is_some()))
+                || !self.order.is_empty())
     }
     pub(super) fn clear_mutation_filter(&mut self) {
         self.filter = None;
@@ -4675,21 +4675,35 @@ impl BoundQuery<'_> {
                         .iter()
                         .map(|(e, _, _)| e.eval(&row, params, &mut key_work))
                         .collect::<R<Vec<_>>>()?;
-                    Ok((row, keys))
+                    // Buffered table images visit primary keys in order. Preserve
+                    // that stable tie order even when a secondary index supplied input.
+                    let stable_key = (source.streams_reductions() && limit.is_none())
+                        .then(|| pk(self.tables[0], &row.values[0])).transpose()?;
+                    Ok((row, keys, stable_key))
                 });
                 let mut retention = RetentionScope::new(execution);
                 let sorted = scan::sort_bounded(
                     keyed,
                     page.keep(),
-                    |(row, keys)| {
-                        row.values
+                    |(row, keys, stable_key)| {
+                        let payload: usize = row.values
                             .iter()
                             .flatten()
                             .chain(keys)
                             .map(value_bytes)
-                            .sum()
+                            .sum();
+                        // Unbounded streamed sorts retain owned tuples rather than a
+                        // hydrated table image. Charge their allocation overhead too.
+                        let overhead = if source.streams_reductions() && limit.is_none() {
+                            std::mem::size_of::<(Tuple, Vec<Value>, Option<Vec<u8>>, usize, usize)>()
+                                + row.values.len() * std::mem::size_of::<Vec<Value>>()
+                                + (row.values.iter().map(Vec::len).sum::<usize>() + keys.len())
+                                    * std::mem::size_of::<Value>()
+                                + stable_key.as_ref().map_or(0, Vec::len)
+                        } else { 0 };
+                        payload + overhead
                     },
-                    |(_, a), (_, b)| {
+                    |(_, a, a_key), (_, b, b_key)| {
                         for ((_, desc, first), (a, b)) in self.order.iter().zip(a.iter().zip(b)) {
                             let ord = match (a, b) {
                                 (Value::Null, Value::Null) => Ordering::Equal,
@@ -4716,11 +4730,11 @@ impl BoundQuery<'_> {
                                 return ord;
                             }
                         }
-                        Ordering::Equal
+                        a_key.cmp(b_key)
                     },
                     &mut retention,
                 )?;
-                Box::new(sorted.into_iter().map(|(row, _)| Ok(row)))
+                Box::new(sorted.into_iter().map(|(row, _, _)| Ok(row)))
             };
             for row in page.apply(rows) {
                 let row = row?;

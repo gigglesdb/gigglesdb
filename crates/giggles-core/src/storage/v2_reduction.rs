@@ -3,6 +3,9 @@ use super::*;
 use relational::scan::{self, RowSource};
 use std::{borrow::Cow, cell::RefCell, collections::VecDeque};
 
+#[cfg(test)]
+thread_local! { pub(super) static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub(super) struct Source<'a> {
     rows: RefCell<SqlRows<'a>>,
     pub(super) error: RefCell<Option<CoreError>>,
@@ -59,6 +62,8 @@ impl Source<'_> {
                 let mut rows = self.rows.borrow_mut();
                 let mut retention = scan::Retention::new(scan::retention_limit());
                 let mut accept = |key: Vec<u8>, row: engine::rows::Row| {
+                    #[cfg(test)]
+                    SCANNED.update(|n| n + 1);
                     let row = SqlRow {
                         values: row.values,
                         version: row.version,

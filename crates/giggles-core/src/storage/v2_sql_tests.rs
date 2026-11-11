@@ -19,6 +19,8 @@ mod fk_prefix;
 mod reduction;
 #[path = "v2_join_tests.rs"]
 mod indexed_join;
+#[path = "v2_ordered_range_tests.rs"]
+mod ordered_range;
 
 struct Fixture {
     path: std::path::PathBuf,

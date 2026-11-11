@@ -1346,28 +1346,45 @@ impl SqlRows<'_> {
                     {
                         return None;
                     }
-                    predicates.iter().find_map(|(name, op, value)| {
+                    let (mut lower, mut upper) = (None, None);
+                    let mut usable = false;
+                    for (name, op, value) in predicates {
                         if *name != column.name
                             || *value == relational::Value::Null
                             || relational::check(value, column).is_err()
                         {
-                            return None;
+                            continue;
                         }
                         let tuple = codec::index_tuple_bytes(
                             std::slice::from_ref(value),
                             &[codec::Direction::Asc],
                         )
                         .ok()?;
+                        // Intersect mandatory AND predicates in half-open tuple
+                        // space so both sides of a narrow range reach the store.
                         let (lo, hi) = match op.as_str() {
-                            "=" => (Bound::Included(tuple.clone()), Bound::Included(tuple)),
-                            ">" => (Bound::Excluded(tuple), Bound::Unbounded),
-                            ">=" => (Bound::Included(tuple), Bound::Unbounded),
-                            "<" => (Bound::Unbounded, Bound::Excluded(tuple)),
-                            "<=" => (Bound::Unbounded, Bound::Included(tuple)),
-                            _ => return None,
+                            "=" => (Some(tuple.clone()), engine::indexes::successor(tuple)),
+                            ">" => (Some(engine::indexes::successor(tuple)?), None),
+                            ">=" => (Some(tuple), None),
+                            "<" => (None, Some(tuple)),
+                            "<=" => (None, engine::indexes::successor(tuple)),
+                            _ => continue,
                         };
-                        Some((d.clone(), lo, hi))
-                    })
+                        usable = true;
+                        if let Some(lo) = lo {
+                            lower = Some(lower.map_or(lo.clone(), |old: Vec<u8>| old.max(lo)));
+                        }
+                        if let Some(hi) = hi {
+                            upper = Some(upper.map_or(hi.clone(), |old: Vec<u8>| old.min(hi)));
+                        }
+                    }
+                    if let (Some(lo), Some(hi)) = (&lower, &upper)
+                        && lo > hi
+                    {
+                        lower = upper.clone();
+                    }
+                    usable.then(|| (d.clone(), lower.map_or(Bound::Unbounded, Bound::Included),
+                        upper.map_or(Bound::Unbounded, Bound::Excluded)))
                 })
             })
             .flatten()
