@@ -290,7 +290,6 @@ fn unsupported_subquery_positions_remain_unsupported() {
     fixture(s);
     for sql in [
         "SELECT (SELECT id FROM u) FROM t",
-        "SELECT id FROM t WHERE EXISTS (SELECT id FROM u)",
         "SELECT id FROM t WHERE id = ANY (SELECT id FROM u)",
         "SELECT id FROM t WHERE id = ALL (SELECT id FROM u)",
         "SELECT id FROM (SELECT id FROM t) a",
@@ -698,7 +697,7 @@ fn qualified_correlation_and_local_shadowing_errors() {
 }
 
 #[test]
-fn exists_admission_remains_off_on_each_engine() {
+fn exists_admission_and_nesting_limit_on_each_engine() {
     for engine in [Engine::Legacy, #[cfg(feature = "engine-rocksdb")] Engine::V2] {
         let path = std::env::temp_dir().join(format!("c3-exists-{}-{:?}", std::process::id(), engine));
         let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
@@ -707,8 +706,9 @@ fn exists_admission_remains_off_on_each_engine() {
             "SELECT 1 WHERE NOT EXISTS (SELECT NULL)",
             "SELECT 1 WHERE false OR NOT (EXISTS (SELECT NULL))",
             "SELECT 1 WHERE 1 IN (SELECT 1 WHERE EXISTS (SELECT NULL))"] {
-            assert_eq!(session.prepare(sql).err(), Some(CoreError::Sql(E::Unsupported)), "{sql}");
-            error(&mut session, sql, E::Unsupported);
+            let prepared = session.prepare(sql).unwrap();
+            session.describe(&prepared).unwrap();
+            run(&mut session, sql);
         }
         let mut nested = "SELECT NULL".to_string();
         for _ in 0..33 { nested = format!("SELECT 1 WHERE EXISTS ({nested})"); }

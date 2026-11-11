@@ -153,3 +153,6 @@ mod ctid_wire;
 
 #[path = "truncate_wire.rs"]
 mod truncate_wire;
+
+#[path = "exists_authority.rs"]
+mod exists_authority;

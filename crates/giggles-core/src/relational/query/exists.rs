@@ -219,7 +219,7 @@ mod tests {
             assert_eq!(q.bind(&state, 0, &[]).unwrap().execute(&state,
                 &scan::LegacyRows(&state), &[], &mut || false).unwrap().rows.len(), count, "{term}");
         }
-        assert!(Prepared::parse("SELECT 1 WHERE EXISTS(SELECT NULL)", 1, state.epoch).is_err());
+        assert!(Prepared::parse("SELECT 1 WHERE EXISTS(SELECT NULL)", 1, state.epoch).is_ok());
         for (negation, expected) in [("", vec![Value::Int(1), Value::Int(2)]),
             ("NOT ", vec![Value::Int(3), Value::Null])] {
             let q = query(&format!("SELECT id FROM o WHERE {negation}EXISTS(SELECT v FROM i WHERE k=o.id) ORDER BY id"));

@@ -358,3 +358,6 @@ mod upsert_arbiter;
 
 #[path = "truncate.rs"]
 mod truncate;
+
+#[path = "exists_public.rs"]
+mod exists_public;

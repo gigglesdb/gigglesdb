@@ -2161,6 +2161,27 @@ impl Prepared {
         }
     }
 
+    /// Complete syntactic reads, collected before gateway classification or binding.
+    pub fn authorization_tables(&self) -> R<Vec<String>> {
+        let query = match &self.statement {
+            Statement::Query(query) => Some(query),
+            Statement::InsertMulti(insert) => insert.source.as_deref(),
+            _ => searched::target(self).filter(|query| query.has_in_subquery()),
+        };
+        match query {
+            Some(query) => {
+                let mut tables = query.authorization_tables()?;
+                if searched::target(self).is_some() {
+                    // The target keeps its command privilege; child reads need SELECT.
+                    let children = query.subquery_tables();
+                    tables.retain(|table| children.contains(table));
+                }
+                Ok(tables)
+            }
+            None => Ok(self.read_tables()),
+        }
+    }
+
     pub fn is_ddl(&self) -> bool {
         matches!(
             self.statement,
@@ -2643,12 +2664,6 @@ impl Prepared {
             params: BTreeSet::new(),
             relations: Vec::new(),
         };
-        // C3 parses/binds EXISTS internally; public admission waits for C8.
-        if p.tokens.windows(3).any(|w| matches!(w,
-            [Token::Word(a), Token::Symbol('('), Token::Word(b)] if a == "exists" && b == "select")) {
-            query::admit_subquery_depth(&p.tokens)?;
-            return Err(SqlError::Unsupported);
-        }
         let statement = if matches!(p.tokens.first(), Some(Token::Word(word)) if word == "select" || word == "explain")
         {
             if user_types::CompositeSelect::claims(&p) {

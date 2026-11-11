@@ -79,7 +79,6 @@ pub(super) struct Dependencies {
 }
 impl Query {
     /// Syntactic dependencies, including unused child projections.
-    #[allow(dead_code)] // C8 will authorize this complete set before classification.
     pub(super) fn dependencies(&self) -> R<Dependencies> {
         let mut out = Dependencies::default();
         self.collect_dependencies(&mut out)?;

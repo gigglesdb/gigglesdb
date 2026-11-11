@@ -1773,6 +1773,9 @@ impl Query {
         }
         out
     }
+    pub(super) fn authorization_tables(&self) -> R<Vec<String>> {
+        Ok(self.dependencies()?.relations.into_iter().collect())
+    }
     pub(super) fn read_tables(&self) -> Vec<String> {
         let mut out = Vec::new();
         for name in self
@@ -1984,7 +1987,7 @@ impl Query {
     }
     pub(super) fn mutation_target(p: &mut Parser, table: &str) -> R<Self> {
         admit_subquery_depth(&p.tokens[p.at..])?;
-        admit_subquery_forms(&p.tokens[p.at..], false)?;
+        admit_subquery_forms(&p.tokens[p.at..], true)?;
         let filter = if p.word("where") {
             Some(Filter::parse(p, 0, 0)?)
         } else {
@@ -2384,7 +2387,7 @@ impl Query {
         Ok(joins)
     }
     /// Positive proof for the current bounded AST. Unknown calls keep a target.
-    /// No stored functions, subqueries or CTEs are admitted by this proof.
+    /// Child queries must independently satisfy the same positive proof.
     pub(super) fn is_table_free(&self) -> bool {
         fn scalar(s: &Scalar) -> bool {
             match s {
@@ -2547,7 +2550,7 @@ impl Query {
                         && c.group.iter().all(scalar)
                         && c.having.as_ref().is_none_or(filter)
                 }
-                Filter::Exists { .. } => false,
+                Filter::Exists { query, .. } => query.is_table_free(),
                 Filter::InSubquery { value, query, .. } => scalar(value) && query.is_table_free(),
                 Filter::Scalar(s) | Filter::Null(s, _) => scalar(s),
                 Filter::Compare(a, _, b) => scalar(a) && scalar(b),

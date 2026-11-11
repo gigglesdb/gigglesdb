@@ -3098,15 +3098,32 @@ async fn datagrip_ssl_probe_reports_tls_on_certificate_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exists_admission_still_returns_feature_not_supported() {
+async fn exists_admission_returns_results() {
     let f = Fixture::new().await;
     let (pg, conn) = f.pg(f.app.clone()).await;
-    for sql in ["SELECT 1 WHERE EXISTS (SELECT NULL)",
-        "SELECT id FROM app WHERE NOT EXISTS (SELECT NULL FROM app)",
-        "SELECT 1 WHERE false OR NOT (EXISTS (SELECT NULL))"] {
-        assert_eq!(code(pg.simple_query(sql).await.unwrap_err()), "0A000");
-        assert_eq!(code(pg.prepare(sql).await.unwrap_err()), "0A000");
+    pg.execute("INSERT INTO app(id) VALUES(1),(2)", &[]).await.unwrap();
+    for (sql, count) in [("SELECT 1 WHERE EXISTS (SELECT NULL)", 1),
+        ("SELECT id FROM app WHERE NOT EXISTS (SELECT NULL FROM app)", 0),
+        ("SELECT 1 WHERE false OR NOT (EXISTS (SELECT NULL))", 0),
+        ("SELECT id FROM app o WHERE EXISTS(SELECT 1/0 FROM app i WHERE i.id=o.id)", 2)] {
+        let messages = pg.simple_query(sql).await.unwrap();
+        assert_eq!(messages.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count(), count);
+        let statement = pg.prepare(sql).await.unwrap();
+        assert_eq!(pg.query(&statement, &[]).await.unwrap().len(), count);
     }
+    for sql in ["SELECT id FROM app WHERE EXISTS(SELECT missing FROM other)",
+        "SELECT id FROM app WHERE EXISTS(SELECT 1/0 FROM other)",
+        "SELECT id FROM app WHERE EXISTS(SELECT nosuchfn() FROM other)"] {
+        assert_eq!(code(pg.simple_query(sql).await.unwrap_err()), "42501");
+        assert_eq!(code(pg.prepare(sql).await.unwrap_err()), "42501");
+    }
+    for sql in ["SELECT id FROM app WHERE EXISTS(SELECT nosuchfn() FROM app)",
+        "SELECT id FROM app WHERE EXISTS(SELECT public.abs(-1) FROM app)"] {
+        assert_eq!(code(pg.simple_query(sql).await.unwrap_err()), "42883");
+        assert_eq!(code(pg.prepare(sql).await.unwrap_err()), "42883");
+    }
+    assert_eq!(pg.execute("UPDATE app SET body='x' WHERE EXISTS(SELECT NULL)", &[]).await.unwrap(), 2);
+    assert_eq!(pg.execute("DELETE FROM app WHERE NOT EXISTS(SELECT NULL LIMIT 0)", &[]).await.unwrap(), 2);
     drop(pg);
     conn.await.unwrap();
     f.stop().await;

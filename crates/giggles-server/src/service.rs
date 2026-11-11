@@ -1178,7 +1178,9 @@ impl Session {
         if p.sequence_only() {
             return Ok(());
         }
-        let read_tables = p.read_tables();
+        // E939: collect every child dependency before table-free/routine classification.
+        // Routine/sequence authority and classification keep their existing gates.
+        let read_tables = p.authorization_tables().map_err(CoreError::Sql)?;
         let joined_read = !read_tables.is_empty()
             && matches!(p.command(), "SELECT" | "EXPLAIN")
             && p.table() == Some("giggles_join");
