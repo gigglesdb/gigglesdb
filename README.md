@@ -7,6 +7,10 @@ It is under active development. The embedded SQL shell is usable today;
 distributed features have different implementation and verification limits.
 This is not a production-qualified release or a PostgreSQL-compatible replacement.
 
+R1 release notes cover the new v2 default, explicit legacy upgrades,
+compatibility results, and current operator limitations.
+Read [R1 release notes](docs/release-notes/R1.md) before upgrading.
+
 ## Build prerequisites and engines
 
 Install Rust/Cargo and libclang/LLVM (required by the default RocksDB build).
