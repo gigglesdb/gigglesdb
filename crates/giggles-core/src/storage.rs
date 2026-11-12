@@ -3185,6 +3185,12 @@ impl SqlSession {
         }
     }
 
+    /// A V2 transaction's own table tombstone, not an older snapshot's missing table.
+    pub fn table_dropped_in_transaction(&self, id: u64) -> bool {
+        self.v2_transaction.as_ref().is_some_and(|txn|
+            matches!(txn.catalog_own(&engine::catalog::table_key(id)), Some(None)))
+    }
+
     /// Resolve a staged table name to its durable owner key by stable table id.
     pub fn table_authority_name(&self, name: &str) -> Result<String, CoreError> {
         // V2 reconciles authority keys inside each DDL statement, so staged

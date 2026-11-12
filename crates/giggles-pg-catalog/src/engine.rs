@@ -2,6 +2,7 @@ use crate::{catalog, *};
 mod flat_union;
 mod join_selection;
 mod regtype;
+mod subscripts;
 use a::{BinaryOperator as Op, Expr as A};
 use sqlparser::ast::{Visit, Visitor};
 use sqlparser::{
@@ -325,7 +326,7 @@ impl Visitor for Scan {
         if is_catalog {
             self.catalog = true;
             self.explicit_catalog = true;
-        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="unnest" || n=="pg_available_extension_versions" || n=="pg_options_to_table" || self.ctes.contains(n))
+        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="generate_subscripts" || n=="unnest" || n=="pg_available_extension_versions" || n=="pg_options_to_table" || self.ctes.contains(n))
         {
             self.user = true
         }
@@ -1070,7 +1071,7 @@ impl Compiler {
                 // correlation remains unsupported until Series is a lateral
                 // operator with the corresponding work/materialization rules.
                 let (rhs, rs) = self
-                    .table(&j.relation, if series { outer } else { &lateral_schema })
+                    .table(&j.relation, if series || matches!(j.relation, a::TableFactor::Derived { .. }) { outer } else { &lateral_schema })
                     .map_err(|error| {
                         if series && error == Error::UnknownColumn {
                             Error::Unsupported
@@ -1107,6 +1108,7 @@ impl Compiler {
                             col.field.name.clear();
                             col.natural_hidden = true;
                         }
+                        append_outer(&mut on_schema, outer)?;
                         self.expr(e, &on_schema).map_err(|error| {
                             if operand_start != 0 && error == Error::UnknownColumn {
                                 Error::Unsupported
@@ -1406,7 +1408,11 @@ impl Compiler {
                     _ => return Err(Error::Unsupported),
                 };
                 let mut on = match constraint {
-                    a::JoinConstraint::On(e) => self.expr(e, &schema)?,
+                    a::JoinConstraint::On(e) => {
+                        let mut on_schema = schema.clone();
+                        append_outer(&mut on_schema, outer)?;
+                        self.expr(e, &on_schema)?
+                    }
                     a::JoinConstraint::None => truth(),
                     _ => return Err(Error::Unsupported),
                 };
@@ -1546,6 +1552,17 @@ impl Compiler {
                             alias,
                             n,
                         )
+                    } else if n == "generate_subscripts" && args.settings.is_none() {
+                        let e = subscripts::compile(self.args(&args.args, outer)?)?;
+                        (
+                            Source::Unnest(e, false),
+                            vec![Field {
+                                name: alias.as_ref().map_or(n.clone(), |a| ident(&a.name)),
+                                data_type: PgType::Int4,
+                            }],
+                            alias,
+                            n,
+                        )
                     } else if n == "unnest" && args.args.len() == 1 && args.settings.is_none() {
                         let mut es = self.args(&args.args, outer)?;
                         let e = es.remove(0);
@@ -1626,7 +1643,9 @@ impl Compiler {
                 subquery,
                 alias,
             } => {
-                let q = self.query(subquery, &vec![])?;
+                // A non-lateral derived table sees enclosing queries, but not
+                // sibling FROM inputs of its own query.
+                let q = self.query(subquery, outer)?;
                 let fs = q.fields.clone();
                 (
                     Source::Derived(std::sync::Arc::new(q)),
@@ -2032,17 +2051,14 @@ impl Compiler {
                                 .to_ascii_lowercase()
                                 .strip_prefix("pg_catalog.")
                                 .unwrap_or(&registered.to_string().to_ascii_lowercase()),
-                            "regtype" | "regprocedure" | "regoperator"
+                            "regtype" | "regclass" | "regprocedure" | "regoperator"
                         )
                     {
-                        if registered
-                            .to_string()
-                            .to_ascii_lowercase()
-                            .ends_with("regtype")
-                        {
+                        let registered = registered.to_string().to_ascii_lowercase();
+                        if registered.ends_with("regtype") || registered.ends_with("regclass") {
                             let value = self.expr(inner, schema)?;
                             return Ok(E {
-                                kind: K::Call("_regtype_display".into(), vec![value]),
+                                kind: K::Call(if registered.ends_with("regclass") { "_regclass_display" } else { "_regtype_display" }.into(), vec![value]),
                                 ty: PgType::Text,
                             });
                         }
@@ -3326,7 +3342,7 @@ impl Runtime<'_> {
                 }
                 Ok(rows)
             }
-            Source::Derived(q) => self.query(q, &[]),
+            Source::Derived(q) => self.query(q, outer),
             Source::Cte(q) => self.query(
                 q,
                 outer
@@ -3471,13 +3487,17 @@ impl Runtime<'_> {
                     for r in candidates {
                         self.charge(1)?;
                         // Candidate is admitted before cloning; it is released before the next candidate.
-                        let size = l.iter().chain(r).map(Value::bytes).sum::<usize>();
+                        let size = l.iter().chain(r).chain(outer).map(Value::bytes).sum::<usize>();
                         if size > MAX_BYTES {
                             return Err(Error::Limit);
                         }
                         let mut row = l.clone();
                         row.extend(r.iter().cloned());
-                        if boolean(self.eval(on, &row, None, 0, &[], None)?)? == Some(true) {
+                        let width = row.len();
+                        row.extend_from_slice(outer);
+                        let keep = boolean(self.eval(on, &row, None, 0, &[], None)?)? == Some(true);
+                        row.truncate(width);
+                        if keep {
                             matched = true;
                             admit(&out, &row, &mut bytes)?;
                             out.push(row)
@@ -4180,6 +4200,21 @@ impl Runtime<'_> {
     fn call(&mut self, n: &str, v: Vec<Value>, remaining: Option<usize>) -> R<Value> {
         use Value::{Bool as B, Int as I, Null as N, Text as S};
         self.charge(v.iter().map(Value::bytes).sum::<usize>() / 64 + 1)?;
+        if matches!(n, "_array_subscripts" | "_vector_subscripts") {
+            return subscripts::evaluate(self, n, v, remaining);
+        }
+        if n == "_regclass_display" {
+            if v[0] == N { return Ok(N); }
+            self.charge(self.catalogs["pg_class"].rows.len() + self.catalogs["pg_namespace"].rows.len())?;
+            let Some(relation) = self.catalogs["pg_class"].rows.iter().find(|r| r[0] == v[0]) else {
+                return Ok(S(integer(v[0].clone())?.to_string()));
+            };
+            let name = catalog::quote_identifier(&text(relation[1].clone())?);
+            let namespace = self.catalogs["pg_namespace"].rows.iter().find(|r| r[0] == relation[2]).ok_or(Error::Type)?;
+            let schema = catalog::quote_identifier(&text(namespace[1].clone())?);
+            let visible = self.call("pg_table_is_visible", vec![v[0].clone()], remaining)? == B(true);
+            return Ok(S(if visible { name } else { format!("{schema}.{name}") }));
+        }
         if matches!(n, "like" | "ilike") {
             self.charge(v[0].bytes() + v[1].bytes().saturating_mul(64))?;
         }

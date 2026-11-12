@@ -717,6 +717,7 @@ impl Session {
             let schemas = session.sql.schema_metadata()?;
             let visible = catalog
                 .into_iter()
+                .filter(|table| !session.sql.table_dropped_in_transaction(table.id))
                 .filter(|table| {
                     tables.as_ref().is_none_or(|tables| {
                         tables.contains(&relational::relation_key(
@@ -2442,6 +2443,28 @@ mod lifecycle_tests {
             owner.catalog_snapshot(),
             Err(CoreError::Sql(relational::SqlError::Aborted))
         ));
+    }
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn catalog_snapshot_excludes_own_drop_and_restores_it_at_savepoint() {
+        let path = crate::test_support::fixture_root().join(format!("catalog-own-drop-{}", std::process::id()));
+        let admin = Admin::create_engine(&path, Limits::default(), giggles_core::Engine::V2).unwrap();
+        admin.roles().create(roles::NewRole { name: "owner".into(), login: true, superuser: true, ..roles::NewRole::default() }).unwrap();
+        let service = Service::new(admin, vec![], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.role_session("owner").unwrap();
+        session.execute_sql("CREATE TABLE gone (id INT PRIMARY KEY)", &[]).unwrap();
+        session.execute_sql("CREATE INDEX gone_idx ON gone(id)", &[]).unwrap();
+        for finish in ["ROLLBACK", "COMMIT"] {
+            session.execute_sql("BEGIN", &[]).unwrap();
+            session.execute_sql("SAVEPOINT keep", &[]).unwrap();
+            session.execute_sql("DROP TABLE gone", &[]).unwrap();
+            let (_, tables, indexes) = session.catalog_snapshot().unwrap();
+            assert!(tables.is_empty() && indexes.is_empty());
+            session.execute_sql("ROLLBACK TO keep", &[]).unwrap();
+            assert_eq!(session.catalog_snapshot().unwrap().1.len(), 1);
+            for sql in ["DROP TABLE gone", finish] { session.execute_sql(sql, &[]).unwrap(); }
+        }
+        assert!(session.catalog_snapshot().unwrap().1.is_empty());
     }
     #[test]
     fn metadata_snapshot_filters_real_definitions_without_reading_or_mutating_rows() {
