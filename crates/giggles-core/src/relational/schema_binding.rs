@@ -129,6 +129,12 @@ impl Prepared {
             }
         };
         match &mut bound.statement {
+            Statement::View(ddl) => {
+                if let Some(query) = &mut ddl.query {
+                    ddl.names[0] = create(&ddl.names[0])?;
+                    query.bind_schema_names(&read, state, &self.search_path);
+                } else { ddl.names.iter_mut().for_each(read); }
+            }
             Statement::Comment(comment) => read(&mut comment.table),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {

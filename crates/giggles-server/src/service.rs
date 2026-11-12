@@ -1239,7 +1239,7 @@ impl Session {
                 }
                 owns_all
             } else if p.is_ddl() {
-                let schema = if p.command() == "CREATE TABLE" {
+                let schema = if matches!(p.command(), "CREATE TABLE" | "CREATE VIEW") {
                     self.sql.creation_schema(p)?
                 } else {
                     self.sql.relation_schema(p.table().unwrap_or(""))?

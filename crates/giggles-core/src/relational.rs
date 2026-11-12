@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
 mod comments;
+mod views;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
 mod catalog_image_tests;
@@ -425,6 +426,7 @@ pub(crate) struct Relational {
     next_id: u64,
     next_version: u64,
     pub tables: BTreeMap<String, TableDef>,
+    pub(crate) view_names: BTreeMap<String, u64>, // Runtime-only; absent from namespace-5.
     rows: BTreeMap<u64, BTreeMap<Vec<u8>, SqlRow>>,
     ext: CatalogExt,
     secondary: secondary_index::Sidecar,
@@ -438,6 +440,7 @@ impl Default for Relational {
             next_id: 1,
             next_version: 1,
             tables: BTreeMap::new(),
+            view_names: BTreeMap::new(),
             rows: BTreeMap::new(),
             ext: CatalogExt::default(),
             secondary: secondary_index::Sidecar::default(),
@@ -952,6 +955,7 @@ enum Statement {
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
     Comment(comments::Comment),
+    View(views::Ddl),
     CreateIndex(sql_index::CreateIndex),
     DropIndex(sql_index::DropIndex),
     InsertMulti(Box<sql_insert::Insert>),
@@ -1194,6 +1198,9 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if views::claims(&self.tokens) {
+            return views::parse(self).map(Statement::View);
+        }
         if self.word("comment") {
             return comments::parse(self).map(Statement::Comment);
         }
@@ -1702,7 +1709,7 @@ impl Prepared {
             Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) => {
                 V2Class::Ddl
             }
-            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) => V2Class::Ddl,
+            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) | Statement::View(_) => V2Class::Ddl,
             Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
@@ -2207,6 +2214,7 @@ impl Prepared {
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
+            Statement::View(ddl) => ddl.names.first().map(String::as_str),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.first().map(String::as_str),
             Statement::Query(q) => {
                 if q.is_table_free() {
@@ -2234,6 +2242,7 @@ impl Prepared {
     /// Mutation targets are included only when an IN subquery reads them.
     pub fn read_tables(&self) -> Vec<String> {
         match &self.statement {
+            Statement::View(ddl) => ddl.query.as_ref().map_or_else(Vec::new, query::Query::read_tables),
             Statement::Query(query) => query.read_tables(),
             Statement::InsertMulti(insert) => insert
                 .source
@@ -2247,6 +2256,7 @@ impl Prepared {
     /// Complete syntactic reads, collected before gateway classification or binding.
     pub fn authorization_tables(&self) -> R<Vec<String>> {
         let query = match &self.statement {
+            Statement::View(ddl) => ddl.query.as_ref(),
             Statement::Query(query) => Some(query),
             Statement::InsertMulti(insert) => insert.source.as_deref(),
             _ => searched::target(self).filter(|query| query.has_in_subquery()),
@@ -2276,14 +2286,15 @@ impl Prepared {
                 | Statement::DropIndex(_)
                 | Statement::AlterTable(_)
                 | Statement::Comment(_)
+                | Statement::View(_)
                 | Statement::DropTable { .. }
         )
     }
     pub fn drop_tables(&self) -> &[String] {
-        match &self.statement { Statement::DropTable { names, .. } => names, _ => &[] }
+        match &self.statement { Statement::DropTable { names, .. } => names, Statement::View(ddl) if ddl.query.is_none() => &ddl.names, _ => &[] }
     }
     pub fn is_drop_table(&self) -> bool {
-        matches!(self.statement, Statement::DropTable { .. })
+        matches!(self.statement, Statement::DropTable { .. }) || matches!(&self.statement, Statement::View(ddl) if ddl.query.is_none())
     }
     pub fn is_alter_table(&self) -> bool {
         matches!(self.statement, Statement::AlterTable(_))
@@ -2327,6 +2338,7 @@ impl Prepared {
             Statement::SetConstraints(..) => "SET CONSTRAINTS",
             Statement::AlterTable(_) => "ALTER TABLE",
             Statement::Comment(_) => "COMMENT",
+            Statement::View(ref ddl) => if ddl.query.is_some() { "CREATE VIEW" } else { "DROP VIEW" },
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
@@ -3491,7 +3503,7 @@ impl Relational {
                 }
                 alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
             }
-            Statement::Comment(_) => return Err(SqlError::Unsupported), // v2 bridge only
+            Statement::Comment(_) | Statement::View(_) => return Err(SqlError::Unsupported), // v2 bridge only
             Statement::DropTable {
                 names,
                 optional,

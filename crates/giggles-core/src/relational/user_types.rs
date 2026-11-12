@@ -17,6 +17,9 @@ pub(super) fn invalid_type_modifier_error() {
 pub fn take_sql_notices() -> Vec<(String, Option<String>)> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }
+pub(super) fn view_missing_notice(name: &str) {
+    SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None)));
+}
 pub(super) fn truncate_reference_error() {
     SQL_ERROR_MESSAGE.with(|message| {
         *message.borrow_mut() =

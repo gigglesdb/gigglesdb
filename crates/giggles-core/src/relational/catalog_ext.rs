@@ -918,6 +918,7 @@ impl Relational {
     }
     pub(crate) fn relation_name_taken(&self, name: &str) -> bool {
         self.tables.contains_key(name)
+            || self.view_names.contains_key(name)
             || self.secondary.descriptors().iter().any(|d| d.name == name)
             || self.sequence_by_name(name).is_some()
     }

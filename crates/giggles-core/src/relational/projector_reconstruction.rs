@@ -353,6 +353,7 @@ impl ScratchRelation {
             tables: BTreeMap::from([(table.name.clone(), table.clone())]),
             rows: BTreeMap::from([(table.id, copied_rows)]),
             secondary: Default::default(),
+            view_names: BTreeMap::new(),
         };
         // No indexes were reconstructed, so validate's ambient index-only branch
         // is unreachable. Reuse all existing schema/row/key/ID/version semantics.

@@ -329,6 +329,9 @@ impl SqlSession {
                         }
                         let mut locks = BTreeMap::new();
                         for name in &names {
+                            if let Some(id) = binding.view_names.get(name) {
+                                locks.insert(*id, if ddl && target_name.as_ref() == Some(name) { LockMode::AccessExclusive } else { LockMode::AccessShare });
+                            }
                             if let Some(table) = parts.tables.get(name) {
                                 locks.insert(
                                     table.id,
@@ -361,6 +364,10 @@ impl SqlSession {
                             .map(|(name, table)| (table.id, name))
                             .collect::<BTreeMap<_, _>>();
                         for (id, mode) in locks {
+                            if !table_names.contains_key(&id) {
+                                txn.acquire_lock(engine::locks::LockKey::Table(id), mode, None, &|| crate::cancellation::check().is_err())?;
+                                continue;
+                            }
                             db.catalog()
                                 .resolve(txn, table_names[&id], mode, None, &|| {
                                     crate::cancellation::check().is_err()
@@ -518,7 +525,8 @@ impl SqlSession {
                             if let Some(error) = context.as_ref().and_then(|c| c.take_error()) { return Err(error); }
                             return result.map_err(CoreError::Sql);
                         }
-                        let result = if bound.command() == "COMMENT" { Ok(Default::default()) } else { image.execute_with_sink(
+                        bound.check_view_drop(&image).map_err(CoreError::Sql)?;
+                        let result = if matches!(bound.command(), "COMMENT" | "CREATE VIEW" | "DROP VIEW") { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,
                             expected_version,
@@ -606,6 +614,7 @@ impl SqlSession {
                             indexes,
                         };
                         bound.apply_comment(&new.tables, &mut new.comments).map_err(CoreError::Sql)?;
+                        bound.apply_view(&image, &mut new, ids.start).map_err(CoreError::Sql)?;
                         txn.reclaim_after_commit |=
                             old.tables
                                 .values()

@@ -169,3 +169,5 @@ mod prepared_cap_network;
 mod derived_authority;
 #[path = "comment_presentation.rs"]
 mod comment_presentation;
+#[path = "view_ddl.rs"]
+mod view_ddl;

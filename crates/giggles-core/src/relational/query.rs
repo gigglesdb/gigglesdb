@@ -1727,6 +1727,32 @@ fn integer_width(ty: &DataType) -> bool {
 }
 
 impl Query {
+    pub(super) fn view_projection(&self, state: &Relational) -> R<Vec<ColumnDef>> {
+        if self.sources.len() != 1 || !self.joins.is_empty() || !self.predicates.is_empty()
+            || self.where_filter().is_some() || !self.order.is_empty() || self.limit.is_some()
+            || self.distinct() || !self.group().is_empty() || self.having().is_some()
+            || self.offset().is_some() || self.derived().is_some()
+            || self.items.iter().any(|(i, _)| !matches!(i, Item::Star | Item::QualifiedStar { .. } | Item::Scalar(Scalar::Column(_))))
+        { return Err(SqlError::Unsupported); }
+        let mut query = self.clone();
+        // Duplicate output names belong to CREATE VIEW's final-name check.
+        for (i, (item, alias)) in query.items.iter_mut().enumerate() {
+            if matches!(item, Item::Scalar(_)) { *alias = Some(format!("view_output_{i}")); }
+        }
+        let mut columns = query.bind(state, 0, &[])?.columns;
+        let mut offset = 0;
+        for (item, alias) in &self.items {
+            let count = if matches!(item, Item::Star | Item::QualifiedStar { .. }) {
+                state.tables[&self.sources[0].name].logical_columns().count()
+            } else { 1 };
+            for column in &mut columns[offset..offset + count] {
+                let original = state.tables[&self.sources[0].name].logical_columns().find(|c| c.id == column.id).ok_or(SqlError::UnknownColumn)?;
+                column.name = alias.as_ref().unwrap_or(&original.name).clone();
+            }
+            offset += count;
+        }
+        Ok(columns)
+    }
     /// Resolve wildcard scope after schema binding; aliases hide base names.
     fn star_sources(&self, item: &Item) -> R<Vec<usize>> {
         let Item::QualifiedStar { schema, relation } = item else {

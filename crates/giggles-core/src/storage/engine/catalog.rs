@@ -178,6 +178,10 @@ impl CatalogSnapshot {
             u64::MAX,
         )?;
         image.catalog_indexes(&self.parts.indexes)?;
+        for (id, view) in &self.parts.sql_views {
+            let name = catalog_codec::sql_views::relation_name(view, &self.parts.ext.schemas).map_err(|_| SqlError::InvalidSchema)?;
+            image.view_names.insert(name, *id);
+        }
         let image = Arc::new(image);
         let _ = self.image.set(image.clone());
         Ok(image)

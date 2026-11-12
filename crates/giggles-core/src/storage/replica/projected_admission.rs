@@ -1420,7 +1420,7 @@ impl AdmittedProjectedSource<'_> {
         Ok(self.state)
     }
 }
-// Schema maps enlarge the inline state by 48 bytes; empty maps allocate nothing.
+// Schema maps and runtime view names enlarge inline state; empty maps allocate nothing.
 // The restricted legacy source still rejects extensions, so heap bounds are unchanged.
 fn layouts() -> Result<(), Failure> {
     use std::mem::{align_of, size_of};
@@ -1434,7 +1434,7 @@ fn layouts() -> Result<(), Failure> {
         size_of::<TableDef>(),
         size_of::<SqlRow>(),
         size_of::<relational::Relational>(),
-    ] != [40, 40, 80, 32, 312]
+    ] != [40, 40, 80, 32, 336]
         || [
             align_of::<Value>(),
             align_of::<ColumnDef>(),
@@ -1447,7 +1447,7 @@ fn layouts() -> Result<(), Failure> {
             size_of::<Vec<u8>>(),
             size_of::<BTreeMap<u64, u64>>(),
         ] != [24; 3]
-        || size_of::<State>() != 656
+        || size_of::<State>() != 672
         || size_of::<bincode::ErrorKind>() > 32
     {
         return Err(Failure::Unsupported);
@@ -1613,9 +1613,9 @@ mod tests {
             ],
             [8; 4]
         );
-        assert_eq!(size_of::<relational::Relational>(), 312);
+        assert_eq!(size_of::<relational::Relational>(), 336);
         assert_eq!(size_of::<Metadata>(), 80);
-        assert_eq!(size_of::<State>(), 656);
+        assert_eq!(size_of::<State>(), 672);
         assert_eq!(size_of::<DataType>(), 1);
         layouts().unwrap();
         println!(

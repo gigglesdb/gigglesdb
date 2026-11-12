@@ -319,6 +319,10 @@ fn authority_objects(parts: &CatalogParts) -> BTreeMap<String, u64> {
                 .iter()
                 .map(|(id, def)| (def.name.clone(), *id)),
         )
+        .chain(parts.sql_views.iter().map(|(id, v)| {
+            let schema = parts.ext.schemas.iter().find(|(_, s)| s.id == v.schema).map_or("public", |(n, _)| n.as_str());
+            (crate::relational::relation_key(schema, &v.name), *id)
+        }))
         .collect()
 }
 
@@ -347,7 +351,7 @@ pub(crate) fn assign_created(
         let mut after = before.clone();
         // Tables precede their dependent sequences when inheriting authority.
         for (name, id) in &created {
-            if new.tables.values().any(|def| def.id == *id) {
+            if new.tables.values().any(|def| def.id == *id) || new.sql_views.contains_key(id) {
                 after
                     .0
                     .insert(super::key(b"owner/", name), owner.as_bytes().to_vec());

@@ -1177,7 +1177,7 @@ impl Relational {
 // never silently dropped from an indexed state, including direct encode calls.
 impl Serialize for Relational {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.has_secondary_indexes_engine() {
+        if self.has_secondary_indexes_engine() || !self.view_names.is_empty() {
             return Err(serde::ser::Error::custom(
                 "runtime secondary indexes require explicit persistence handoff",
             ));
@@ -1246,6 +1246,7 @@ impl<'de> Deserialize<'de> for Relational {
                     rows: field!("rows"),
                     ext: CatalogExt::default(),
                     secondary: Sidecar::default(),
+                    view_names: BTreeMap::new(),
                 };
                 if format == 2 {
                     value.ext = field!("ext");
