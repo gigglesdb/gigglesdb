@@ -1,5 +1,68 @@
 use giggles_pg_catalog::*;
 
+#[test]
+fn jdbc_trim_bitwise_and_pgadmin_text_array_casts() {
+    let snapshot = CatalogSnapshot::default();
+    let result = run("SELECT trim(both 'xy' from 'xyabcxy'),trim(leading 'é' from 'ééabé'),trim(trailing 'xy' from 'xyabxy'),trim(' abc '),trim(both '' from ' abc '),trim(NULL::text),5::smallint & 3::smallint,-1::bigint & 3::integer,NULL::smallint & 1::smallint,concat(NULL::text,'ab',NULL::text,'cd'),concat(NULL::text,NULL::text),(CASE WHEN true THEN ARRAY['ASC','NULLS LAST'] ELSE ARRAY['DESC','NULLS FIRST'] END)::text[] FROM pg_namespace WHERE oid=11", &snapshot);
+    assert_eq!(result.fields[6].data_type, PgType::Int2);
+    assert_eq!(result.fields[7].data_type, PgType::Int8);
+    assert_eq!(result.fields[11].data_type, PgType::TextArray);
+    assert_eq!(result.rows, vec![vec![Value::Text("abc".into()),Value::Text("abé".into()),Value::Text("xyab".into()),Value::Text("abc".into()),Value::Text(" abc ".into()),Value::Null,Value::Int(1),Value::Int(3),Value::Null,Value::Text("abcd".into()),Value::Text(String::new()),Value::Array(vec![Value::Text("ASC".into()),Value::Text("NULLS LAST".into())])]]);
+    assert!(plan("SELECT true & false FROM pg_namespace").is_err());
+    let expensive = plan(&format!("SELECT trim(both '{}' from '{}') FROM pg_namespace WHERE oid=11", "x".repeat(1500), "x".repeat(1500))).unwrap().unwrap();
+    assert!(matches!(execute(&expensive, &snapshot, &[]), Err(Error::Limit)));
+}
+
+#[test]
+fn pg18_catalog_star_order_matches_reflected_attributes() {
+    let snapshot = CatalogSnapshot::default();
+    for (name, names) in [
+        ("pg_class", "oid,relname,relnamespace,reltype,reloftype,relowner,relam,relfilenode,reltablespace,relpages,reltuples,relallvisible,relallfrozen,reltoastrelid,relhasindex,relisshared,relpersistence,relkind,relnatts,relchecks,relhasrules,relhastriggers,relhassubclass,relrowsecurity,relforcerowsecurity,relispopulated,relreplident,relispartition,relrewrite,relfrozenxid,relminmxid,relacl,reloptions,relpartbound"),
+        ("pg_index", "indexrelid,indrelid,indnatts,indnkeyatts,indisunique,indnullsnotdistinct,indisprimary,indisexclusion,indimmediate,indisclustered,indisvalid,indcheckxmin,indisready,indislive,indisreplident,indkey,indcollation,indclass,indoption,indexprs,indpred"),
+    ] {
+        let result = run(&format!("SELECT c.* FROM {name} c"), &snapshot);
+        assert_eq!(result.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(","), names);
+        let reflected = run(&format!("SELECT a.attname,a.atttypid FROM pg_attribute a WHERE a.attrelid='{name}'::regclass AND a.attnum>0 ORDER BY a.attnum"), &snapshot);
+        assert_eq!(reflected.rows, result.fields.iter().map(|f| vec![Value::Text(f.name.clone()),Value::Int(i64::from(f.data_type.oid()))]).collect::<Vec<_>>());
+    }
+    assert_eq!(run("SELECT relkind,relfilenode,relrewrite,relisshared,relhassubclass,relpartbound FROM pg_class WHERE relname='pg_class'", &snapshot).rows,
+        vec![vec![Value::Text("r".into()),Value::Int(0),Value::Int(0),Value::Bool(false),Value::Bool(false),Value::Null]]);
+}
+
+#[test]
+fn pgadmin_nested_joins_and_projected_distinct_on() {
+    let snapshot = CatalogSnapshot::default();
+    assert_eq!(run("SELECT n.nspname,c.relname FROM pg_namespace n LEFT JOIN (pg_class c JOIN pg_namespace ns ON ns.oid=c.relnamespace AND c.relname='pg_class') ON c.relnamespace=n.oid WHERE n.oid=11", &snapshot).rows,
+        vec![vec![Value::Text("pg_catalog".into()),Value::Text("pg_class".into())]]);
+    assert_eq!(run("SELECT n.nspname,c.relname FROM pg_namespace n LEFT JOIN (pg_class c JOIN pg_namespace ns ON ns.oid=c.relnamespace AND c.relname='absent') ON c.relnamespace=n.oid WHERE n.oid=11", &snapshot).rows,
+        vec![vec![Value::Text("pg_catalog".into()),Value::Null]]);
+    assert_eq!(run("SELECT DISTINCT ON(n.oid) n.oid,c.relname FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.oid=11 AND c.relname IN ('pg_class','pg_namespace') ORDER BY n.oid,c.relname DESC LIMIT 1", &snapshot).rows,
+        vec![vec![Value::Int(11),Value::Text("pg_namespace".into())]]);
+    assert_eq!(run("SELECT DISTINCT ON(k) k,v FROM (SELECT 1 AS k,'a' AS v FROM pg_namespace WHERE oid=11 UNION ALL SELECT 1,'b' UNION ALL SELECT 2,'c') s ORDER BY k,v DESC", &snapshot).rows,
+        vec![vec![Value::Int(1),Value::Text("b".into())],vec![Value::Int(2),Value::Text("c".into())]]);
+    assert_eq!(run("SELECT EXISTS(SELECT DISTINCT ON(n.oid) n.oid FROM pg_namespace n)", &snapshot).rows,
+        vec![vec![Value::Bool(true)]]);
+    assert_eq!(plan("SELECT DISTINCT ON(oid) oid,nspname FROM pg_namespace ORDER BY nspname").unwrap_err(),Error::Unsupported);
+    assert_eq!(plan("SELECT DISTINCT ON(2) 2,oid FROM pg_namespace").unwrap_err(),Error::Unsupported);
+    assert_eq!(plan("SELECT DISTINCT ON((oid)) nspname AS oid,oid AS nspname FROM pg_namespace").unwrap_err(),Error::Unsupported);
+}
+
+#[test]
+fn jdbc_imported_keys_joins_stay_within_execution_budget() {
+    let mut s = CatalogSnapshot::default();
+    s.schemas.insert("gui_sales".into(), (70000, 10));
+    for (id, name, columns) in [(10, "parent", vec!["id"]), (20, "child", vec!["id", "parent_id"])] {
+        s.tables.push(TableDef { id, name: name.into(), primary_key: vec![0], columns: columns.iter().enumerate().map(|(i,n)| ColumnDef {
+            id: id + i as u64, name: (*n).into(), data_type: ScalarType::Integer, not_null: i == 0,
+        }).collect() });
+        s.table_schemas.insert(id, "gui_sales".into());
+    }
+    s.constraints.push(ConstraintDef { id: 31, table: 20, name: "child_parent_id_fkey".into(), kind: 'f', columns: vec![21],
+        foreign_table: 10, foreign_columns: vec![10], update: 'a', delete: 'a', validated: true, ..Default::default() });
+    let sql = "SELECT pkn.nspname,pkc.relname,pka.attname,fkn.nspname,fkc.relname,fka.attname,pos.n,con.conname,pkic.relname FROM pg_namespace pkn,pg_class pkc,pg_attribute pka,pg_namespace fkn,pg_class fkc,pg_attribute fka,pg_constraint con,generate_series(1,32) pos(n),pg_class pkic WHERE pkn.oid=pkc.relnamespace AND pkc.oid=pka.attrelid AND pka.attnum=con.confkey[pos.n] AND con.confrelid=pkc.oid AND fkn.oid=fkc.relnamespace AND fkc.oid=fka.attrelid AND fka.attnum=con.conkey[pos.n] AND con.conrelid=fkc.oid AND con.contype='f' AND (pkic.relkind='i' OR pkic.relkind='I') AND pkic.oid=con.conindid AND fkn.nspname='gui_sales' AND fkc.relname='child' ORDER BY pkn.nspname,pkc.relname,con.conname,pos.n";
+    assert_eq!(run(sql, &s).rows, vec![vec![Value::Text("gui_sales".into()),Value::Text("parent".into()),Value::Text("id".into()),Value::Text("gui_sales".into()),Value::Text("child".into()),Value::Text("parent_id".into()),Value::Int(1),Value::Text("child_parent_id_fkey".into()),Value::Text("parent_pkey".into())]]);
+}
+
 fn run(sql: &str, snapshot: &CatalogSnapshot) -> ResultSet {
     execute(&plan(sql).unwrap().expect("catalog"), snapshot, &[]).unwrap()
 }

@@ -47,13 +47,11 @@ fn zero_limit_never_returns_a_row_even_for_identity_or_derived_sources() {
 }
 
 #[test]
-fn unsupported_distinct_on_is_not_silently_treated_as_full_row_distinct() {
-    assert!(matches!(
-        plan(
-            "SELECT DISTINCT ON (relkind) relkind, relname FROM pg_catalog.pg_class ORDER BY relkind, relname"
-        ),
-        Err(Error::Unsupported)
-    ));
+fn distinct_on_is_not_silently_treated_as_full_row_distinct() {
+    use giggles_pg_catalog::Value;
+    let p = plan("SELECT DISTINCT ON (relkind) relkind, relname FROM pg_catalog.pg_class WHERE relname IN ('pg_class','pg_namespace') ORDER BY relkind, relname").unwrap().unwrap();
+    assert_eq!(execute(&p, &CatalogSnapshot::default(), &[]).unwrap().rows,
+        vec![vec![Value::Text("r".into()), Value::Text("pg_class".into())]]);
 }
 
 #[test]

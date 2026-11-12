@@ -69,6 +69,48 @@ pub fn table_oid(id: u64) -> R<u32> {
     })
 }
 pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
+    let mut fields = storage_schema(name)?;
+    let order = physical_order(name);
+    if !order.is_empty() {
+        for (name, data_type) in [
+            ("relfilenode", PgType::Oid), ("relrewrite", PgType::Oid),
+            ("relisshared", PgType::Bool), ("relhassubclass", PgType::Bool),
+        ] {
+            if order.contains(&name) { fields.push(Field { name: name.into(), data_type }); }
+        }
+        fields.sort_by_key(|f| order.iter().position(|n| *n == f.name).unwrap_or(order.len()));
+        for f in &mut fields {
+            if matches!(f.name.as_str(), "relpartbound" | "indexprs" | "indpred") {
+                f.data_type = PgType::PgNodeTree;
+            }
+        }
+    }
+    Some(fields)
+}
+// The builders retain their private slot layout; public rows and reflected
+// attributes use PostgreSQL 18's physical order, including SELECT *.
+fn physical_order(name: &str) -> &'static [&'static str] {
+    match name {
+        "pg_class" => &[
+            "oid", "relname", "relnamespace", "reltype", "reloftype", "relowner", "relam",
+            "relfilenode", "reltablespace", "relpages", "reltuples", "relallvisible",
+            "relallfrozen", "reltoastrelid", "relhasindex", "relisshared", "relpersistence",
+            "relkind", "relnatts", "relchecks", "relhasrules", "relhastriggers", "relhassubclass",
+            "relrowsecurity", "relforcerowsecurity", "relispopulated", "relreplident",
+            "relispartition", "relrewrite", "relfrozenxid", "relminmxid", "relacl", "reloptions",
+            "relpartbound",
+        ],
+        "pg_index" => &[
+            "indexrelid", "indrelid", "indnatts", "indnkeyatts", "indisunique",
+            "indnullsnotdistinct", "indisprimary", "indisexclusion", "indimmediate",
+            "indisclustered", "indisvalid", "indcheckxmin", "indisready", "indislive",
+            "indisreplident", "indkey", "indcollation", "indclass", "indoption", "indexprs",
+            "indpred",
+        ],
+        _ => &[],
+    }
+}
+fn storage_schema(name: &str) -> Option<Vec<Field>> {
     if let Some(fields) = information_schema::schema(name) {
         return Some(fields);
     }
@@ -1209,7 +1251,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             (
                 (*n).into(),
                 Relation {
-                    fields: schema(n).unwrap(),
+                    fields: storage_schema(n).unwrap(),
                     rows: vec![],
                 },
             )
@@ -2063,7 +2105,20 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
     }
     information_schema::populate(snapshot, &key_names, &mut all)?;
+    // pg_tables reads pg_class in its private builder layout, so it runs
+    // before pg_class/pg_index are presented in PG18 column order.
     pg_tables::populate(snapshot, &mut all);
+    for name in ["pg_class", "pg_index"] {
+        let relation = all.get_mut(name).unwrap();
+        let fields = schema(name).unwrap();
+        for row in &mut relation.rows {
+            *row = fields.iter().map(|f| {
+                relation.fields.iter().position(|old| old.name == f.name)
+                    .map_or_else(|| if f.data_type == PgType::Bool { B(false) } else { I(0) }, |i| row[i].clone())
+            }).collect();
+        }
+        relation.fields = fields;
+    }
     let total: usize = all
         .values()
         .flat_map(|r| &r.rows)
@@ -2599,7 +2654,7 @@ mod system_xmin_tests {
                     .iter()
                     .find(|row| row[0] == oid)
                     .unwrap();
-                assert_eq!(class[5], I(ordinary as i64), "{name}");
+                assert_eq!(class[18], I(ordinary as i64), "{name}");
                 let fields = &relations[*name].fields;
                 assert_eq!(
                     fields.iter().filter(|f| f.name == "xmin").count(),

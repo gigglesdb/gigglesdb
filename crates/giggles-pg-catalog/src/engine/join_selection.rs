@@ -99,13 +99,16 @@ fn push_terms(source: &mut Source, filter: &mut E, width: usize, parameters: &[P
     if matches!(source, Source::Catalog(_)) {
         return;
     }
+    let keys_safe = left_eligible(filter, width, parameters);
     let mut terms = vec![];
     conjuncts(std::mem::replace(filter, truth()), &mut terms);
     *filter = conjunction(
         terms
             .into_iter()
             .filter(|term| {
-                !left_eligible(term, width, parameters) || !push_one(source, term, width)
+                !left_eligible(term, width, parameters)
+                    || !(push_one(source, term, width)
+                        || keys_safe && push_join_key(source, term, width, parameters))
             })
             .collect(),
     );
@@ -357,6 +360,7 @@ fn place_source(source: &mut Source, filter: &mut E, width: usize, parameters: &
 
 fn left_eligible(e: &E, width: usize, parameters: &[PgType]) -> bool {
     match &e.kind {
+        K::Index(_, _) => catalog_array_index(e, width),
         K::Literal(_) => true,
         K::Column(i) => *i < width,
         K::Param(i) => parameters.get(*i) == Some(&e.ty),
@@ -438,8 +442,17 @@ fn operand(e: &E, width: usize, parameters: &[PgType]) -> bool {
             // A later use can promote the global parameter type. Keep the old
             // placement if this leaf would still cast to a different type.
             K::Param(i) => parameters.get(*i) == Some(&e.ty),
-            _ => false,
+            _ => catalog_array_index(e, width),
         }
+}
+
+// Direct typed array/ordinal slots are total, including NULL and out-of-range
+// subscripts. Name subscripts, casts and computed indices remain barriers.
+fn catalog_array_index(e: &E, width: usize) -> bool {
+    matches!(&e.kind, K::Index(a, i)
+        if matches!(a.ty, PgType::Int2Array | PgType::OidArray | PgType::Int2Vector | PgType::OidVector)
+            && matches!(a.kind, K::Column(n) if n < width)
+            && i.ty == PgType::Int4 && matches!(i.kind, K::Column(n) if n < width))
 }
 
 fn eligible(e: &E, width: usize, parameters: &[PgType]) -> bool {

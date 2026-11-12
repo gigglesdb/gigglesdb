@@ -175,6 +175,7 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
         order: vec![],
         limit: MAX_ROWS,
         distinct: false,
+        distinct_on: vec![],
         expand: None,
         group: vec![],
         aggregate: false,
@@ -192,6 +193,7 @@ pub(super) fn validate_wrapper(q: &Query) -> R<()> {
         || !q.group.is_empty()
         || q.expand.is_some()
         || q.distinct
+        || !q.distinct_on.is_empty()
         || q.aggregate
         || q.limit != MAX_ROWS
         || q.source_width != q.fields.len()
