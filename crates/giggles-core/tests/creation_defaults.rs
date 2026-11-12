@@ -45,7 +45,41 @@ fn creation_defaults_and_explicit_engines() {
         assert_eq!(admin.snapshot().is_err(), v2);
         assert_eq!(path.join("data.redb").exists(), !v2);
         assert_eq!(reply["data"]["engine"], if v2 { "v2" } else { "redb" });
+        let (domain, last_time, next_approval, origin) = admin.authority_metadata().unwrap();
+        let mut expected = json!({"version":1,"code":0,"data":{
+            "domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,
+            "origin":origin.map(|v|v.to_string()),"write_format":3,"durability":"immediate","engine":"redb"
+        }});
+        if v2 {
+            expected["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("write_format");
+            expected["data"]["engine"] = json!("v2");
+            expected["data"]["durability"] = json!("sync");
+        }
+        let metadata = giggles_core::local::admin(&admin, br#"{"command":"metadata"}"#);
+        assert_eq!(
+            serde_json::to_vec(&metadata).unwrap(),
+            format!(r#"{{"version":1,"code":0,"data":{}}}"#, expected["data"]).as_bytes()
+        );
+        let export = root.join(format!("{name}.gdexp"));
+        if v2 {
+            admin.export(&export).unwrap();
+            assert_eq!(&std::fs::read(&export).unwrap()[..8], b"GDEXP002");
+        }
         drop(admin);
+        if v2 {
+            let restored = root.join(format!("{name}-restored"));
+            let output = cli(&["restore", export.to_str().unwrap()], &restored);
+            assert!(output.status.success(), "{output:?}");
+            let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(reply["code"], 0);
+            assert_eq!(reply["data"]["engine"], "v2");
+            assert_eq!(reply["data"]["durability"], "sync");
+            assert!(reply["data"].get("write_format").is_none());
+            assert_eq!(reply["data"]["origin"], domain.to_string());
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -1190,6 +1190,12 @@ impl Admin {
         self.inner.db(KERNEL_RECORDS)?;
         self.inner.inspect(|s| Ok(s.view.clone()))
     }
+    pub(crate) fn engine(&self) -> Engine {
+        match &self.inner.backend {
+            Backend::Legacy(_) => Engine::Legacy,
+            Backend::V2(_) => Engine::V2,
+        }
+    }
     pub fn authority_metadata(&self) -> Result<(u128, u64, u64, Option<u128>), CoreError> {
         // V2 has a durable SQL authority domain, but no native approval clock/ledger.
         if let Backend::V2(db) = &self.inner.backend {

@@ -309,9 +309,18 @@ pub fn admin(a: &Admin, input: &[u8]) -> Reply {
         AdminCommand::RevokeApproval { approval } => result(a.revoke_approval(approval)),
         AdminCommand::Export { path } => result(a.export(path)),
         AdminCommand::Metadata => match a.authority_metadata() {
-            Ok((domain, last_time, next_approval, origin)) => Reply::ok(
-                json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"write_format":3,"durability":"immediate","engine":"redb"}),
-            ),
+            Ok((domain, last_time, next_approval, origin)) => {
+                let mut data = json!({"domain":domain.to_string(),"last_time":last_time,"next_approval":next_approval,"origin":origin.map(|v|v.to_string()),"write_format":3,"durability":"immediate","engine":"redb"});
+                if a.engine() == Engine::V2 {
+                    // V2 uses family/subversion metadata, not a legacy write format.
+                    data.as_object_mut()
+                        .expect("metadata object")
+                        .remove("write_format");
+                    data["engine"] = json!("v2");
+                    data["durability"] = json!("sync");
+                }
+                Reply::ok(data)
+            }
             Err(e) => failure(e),
         },
         AdminCommand::Inspect => match a.snapshot() {
