@@ -235,15 +235,15 @@ of the reverse-apply intent, before any reverse transaction may commit. A deadli
 abort before that point keeps `rolling-back` until destination restoration is
 checkpointed; only then does it return to `rollback-window`. Eligibility loss
 blocks new transfer and restoration intents, retaining the fences for recovery.
-Transfer adapters remain unavailable. A single disabled driver-availability
-constant gates eligible requests before journal admission: exit 2,
-`rollback_driver_unavailable`, with reverse capture left running and lifecycle
-unchanged. Admission must remain disabled until both deadline restoration before
-reverse apply and completion after reverse apply are implemented and tested.
-Previously admitted journals route restart/takeover to the rollback recovery path
-before probes or finalize; they retain `rolling-back` and the source fence with
-exit 5. Deadlines are not automatically aborted without a destination-restoration
-adapter; operator recovery is required for those historical journals.
+The post-activation owner admits eligible requests and drives the shared rollback
+steps under exclusive migration authority. It retains live reverse capture on a
+dedicated thread, publishing the exact durable stop receipt before reverse apply.
+Native destination fence receipts and the original source snapshot reconstruct
+adapters on retry; restart/takeover resumes the journaled step without extending
+the deadline. Before reverse-apply intent, a deadline restores the destination
+and restarts capture before returning to `rollback-window`. After that intent,
+rollback completes or retains fences for operator action. Infrastructure faults
+retry; an operator-action result is durably latched for the admitted request.
 
 Each hook has `name`, `phase`, positive `timeout_seconds`, `command` and
 `secret_env`. `command` is an executable/argument array. `secret_env` keys name
@@ -276,7 +276,7 @@ Init uses the first 24 hex characters of the definition digest as migration ID.
 | `status <id> [--watch]` | Wired observer; watch is flushed NDJSON. |
 | `verify <id> [--tables ...]` | Wired active-owner request; exit 6 with no owner. |
 | `cutover <id> --deadline <dur>` | Wired active-owner request to `request_cutover`; exits 0 completed, 2 not ready or deadline, 3 invalid, 5 uncertain or breach, 6 no owner or infrastructure, 8 lost ownership. |
-| `rollback <id> [--deadline <dur>]` | Generation-scoped owner request (default: configured downtime budget). Exits 3 for wrong state/ineligible/invalid deadline, 6 for no owner/infrastructure, 8 for stale generation. Eligible requests are refused before admission with exit 2 (`rollback_driver_unavailable`); lifecycle, journal and reverse capture remain unchanged. Previously admitted journals fail closed with exit 5; restart/takeover retains their admission, deadline and source fence. The shared step driver and request-scoped durable journal bridge are implemented and tested with in-memory reverse buffers. The reverse capture has a manifest-durable exact-marker stop/restart primitive, and status exposes the journaled rollback step and outcome. The live worker adapter implements exact-marker receipt publication and deadline restart from its retained durable LSN; recovery restores the stopped latch without starting destination replication. Owner execution wiring and qualification remain pending; admission stays disabled. |
+| `rollback <id> [--deadline <dur>]` | Generation-scoped owner request (default: configured downtime budget). Exits 0 after source activation, 2 after a pre-PONR deadline restores destination and capture, 3 for invalid state/eligibility/deadline, 5 for uncertainty or operator action, 6 for no owner/infrastructure, and 8 for lost ownership/stale generation. Admission is enabled. Status exposes the durable step, intent, fixed deadline and outcome; restart/takeover resumes before probes or finalize. |
 | `finalize <id> [--drop-objects]` | Active-owner request from rollback-window, or destination-active after eligibility ended. Stops reverse capture; explicit `--drop-objects` removes installed objects on both endpoints. Exits 0 completed, 3 invalid, 6 no owner/infrastructure, 8 lost ownership. |
 | `abort <id>` | Wired coordinator-only; exit 9 if journal history records any external effect; no database restoration. |
 | `report <id>` | Wired safe trust/status reporting. |

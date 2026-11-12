@@ -191,10 +191,10 @@ impl engine::ChunkDatabase for Chunks {
         self.pg.read(plan, chunk).await
     }
 }
-struct Connect {
-    config: tls::Config,
-    connection: Connection,
-    drivers: Vec<Driver>,
+pub(super) struct Connect {
+    pub(super) config: tls::Config,
+    pub(super) connection: Connection,
+    pub(super) drivers: Vec<Driver>,
 }
 #[async_trait::async_trait]
 impl Connector for Connect {

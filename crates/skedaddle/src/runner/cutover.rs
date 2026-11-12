@@ -224,6 +224,14 @@ fn replay(state: &Materialized) -> coordinator::Result<Option<Saved>> {
         .transpose()
 }
 
+/// Original authenticated snapshots; rollback must never snapshot fenced source grants.
+pub(super) fn rollback_fences(
+    state: &Materialized,
+) -> coordinator::Result<(fence::Fence, activate::Config)> {
+    let saved = replay(state)?.ok_or_else(invalid)?;
+    Ok((saved.source, saved.destination.config))
+}
+
 pub(super) fn rollback_drain(state: &Materialized) -> coordinator::Result<u64> {
     replay(state)?
         .and_then(|s| s.source.drain_lsn)

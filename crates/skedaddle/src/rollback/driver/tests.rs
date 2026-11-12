@@ -46,10 +46,10 @@ impl BufferStore for Memory {
         unreachable!()
     }
 }
-struct Order;
+struct Order(String);
 impl PositionOrder for Order {
     fn domain(&self) -> &str {
-        "m_rev"
+        &self.0
     }
     fn compare(&self, a: &[u8], b: &[u8]) -> std::result::Result<Ordering, EventError> {
         Ok(a.cmp(b))
@@ -127,13 +127,13 @@ fn replay_txns(id: &str, txns: Vec<AssembledTxn>) -> Replay {
     );
     Replay {
         store,
-        order: Arc::new(Order),
+        order: Arc::new(Order(stream)),
         required_next_mseq: 1,
         tables: vec![],
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Effects {
     destination_fenced: bool,
     source_active: bool,
@@ -481,5 +481,81 @@ fn lost_ownership_has_no_effects_and_next_owner_resumes() {
         f.log.state.owner = "next".into();
         f.finish();
         f.assert_complete();
+    }
+}
+
+struct OwnerCapture {
+    endpoint: Endpoint,
+    runtime: crate::engine::Runtime,
+    digest: [u8; 32],
+}
+impl destination::Capture for OwnerCapture {
+    fn captured(&mut self, marker: &cutover::Marker) -> cutover::Result<Option<cutover::Marker>> {
+        self.endpoint.captured(marker)
+    }
+    fn stop_at(&mut self, marker: &cutover::Marker) -> cutover::Result<()> {
+        super::bridge(self.runtime.commit(Transition::Rollback {
+            record: Box::new(Record::CaptureStopped {
+                boundary: crate::pg::reverse::StopBoundary {
+                    marker: marker.clone(),
+                    durable_lsn: 30,
+                    next_mseq: 1,
+                    digest: self.digest,
+                },
+            }),
+        }))?;
+        self.endpoint.stop_at(marker)
+    }
+    fn restart(&mut self, key: &Key) -> cutover::Result<()> {
+        self.endpoint.restart(key)
+    }
+}
+
+/// Fake endpoints and real buffers, run through the actual owner journal bridge.
+#[derive(Clone, Default)]
+pub(crate) struct OwnerModel {
+    effects: Arc<Mutex<Effects>>,
+    rows: Arc<Mutex<Vec<u64>>>,
+}
+impl OwnerModel {
+    pub(crate) fn assert_complete(&self) {
+        let e = self.effects.lock().unwrap();
+        assert!(e.destination_fenced && e.source_active && e.stopped);
+        assert_eq!(*self.rows.lock().unwrap(), vec![10, 20, 30]);
+    }
+    pub(crate) fn assert_aborted(&self) {
+        let e = self.effects.lock().unwrap();
+        assert!(!e.destination_fenced && !e.source_active && !e.stopped);
+        assert!(self.rows.lock().unwrap().is_empty());
+    }
+    pub(crate) async fn tick(
+        &self,
+        runtime: crate::engine::Runtime,
+        id: String,
+    ) -> cutover::Result<Outcome> {
+        let model = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let state=rt.block_on(runtime.state());
+            let cp=state.rollback.as_ref().unwrap();
+            let key=Key {migration:id.clone(),cutover:cp.request.clone(),epoch:state.epoch as i64,coordinator:state.owner.clone()};
+            let mut transactions=vec![txn(10,false),txn(20,false),txn(30,true),txn(40,false)];
+            transactions[2].events[0].after.as_mut().unwrap().get_mut("control").unwrap().bytes=Some(serde_json::to_vec(&serde_json::json!({"message_lsn":25,"content":cutover::Marker {cutover:cp.request.clone(),epoch:1,lsn:25}.payload().as_bytes()})).unwrap());
+            for txn in &mut transactions {
+                txn.commit_position=Position::new(format!("{id}_rev"),txn.commit_position.bytes().to_vec());
+                for event in &mut txn.events {event.position=txn.commit_position.clone();}
+                *txn=AssembledTxn::new(txn.source.clone(),txn.txn.clone(),txn.commit_position.clone(),txn.commit_time,txn.events.clone()).unwrap();
+            }
+            let replay=replay_txns(&id,transactions);
+            let manifest=rt.block_on(replay.store.get(&manifest_key("reverse-runner-v1",&id,&format!("{id}_rev"),0))).unwrap().unwrap();
+            let digest=ManifestEntry::from_canonical_json(&manifest).unwrap().digest().unwrap();
+            let e=Rc::new(RefCell::new(model.effects.lock().unwrap().clone()));
+            e.borrow_mut().guarded=true;
+            let mut log=RuntimeJournal::new(&runtime,Default::default())?;
+            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let result=execute_next(&key,now,&mut runtime.cutover_authority(),&rt,&mut Components {destination:&mut Endpoint(e.clone()),capture:&mut OwnerCapture {endpoint:Endpoint(e.clone()),runtime:runtime.clone(),digest},pre_hook:&mut Endpoint(e.clone()),replay:&replay,target:&mut Target(model.rows.clone()),verification:&mut Endpoint(e.clone()),source:&mut Endpoint(e.clone()),post_hook:&mut Endpoint(e.clone()),journal:&mut log});
+            *model.effects.lock().unwrap()=e.borrow().clone();
+            result
+        }).await.unwrap()
     }
 }

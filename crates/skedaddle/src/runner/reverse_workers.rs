@@ -76,6 +76,7 @@ fn buffer_error(error: crate::buffer::writer::Error) -> Failure {
 }
 
 pub(super) struct Workers {
+    pub(super) tables: Vec<catalog::TableCatalog>,
     capture: reverse::Capture<Resolver>,
     destination: Option<ReplicationConnection>,
     destination_config: crate::pg::replication::ConnectionConfig,
@@ -325,7 +326,7 @@ impl Workers {
             identity,
             checkpoint.durable_lsn,
             writer,
-            Resolver(tables),
+            Resolver(tables.clone()),
             SchemaVersions::new(id.into(), 0, []).map_err(|_| invalid())?,
             eligibility.clone(),
         )
@@ -389,6 +390,7 @@ impl Workers {
         .map_err(capture_error)?;
         let (send, paused) = watch::channel(false);
         Ok(Box::new(Self {
+            tables,
             capture,
             destination: Some(connection),
             destination_config,

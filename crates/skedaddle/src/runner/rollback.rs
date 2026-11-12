@@ -1,7 +1,6 @@
-//! Rollback request boundary. No observer acquires database authority.
-//! Only the acquired post-activation owner handles requests. Admission stays
-//! disabled until the complete transfer and deadline-restoration driver is qualified.
-//! Previously admitted journals retain their source fence for explicit recovery.
+//! Owner-only rollback admission, resumable execution and outcome mapping.
+//! Observers use the generation-scoped request transport and never acquire authority.
+mod live;
 use super::verification::VerifyResponse;
 use crate::{
     coordinator::{self, Materialized, State, Transition, rollback::Record},
@@ -12,7 +11,8 @@ use std::{path::Path, time::Duration};
 
 // Enable only with both deadline restoration before reverse apply and completion
 // after reverse apply implemented and tested. Never admit into a partial driver.
-const ROLLBACK_DRIVER_AVAILABLE: bool = false;
+const ROLLBACK_DRIVER_AVAILABLE: bool = true;
+const OPERATOR: &str = "runner-rollback-operator-v1";
 
 fn refused(kind: &str, exit_code: u8) -> VerifyResponse {
     VerifyResponse {
@@ -81,28 +81,97 @@ pub(super) async fn admit(
     Ok(None)
 }
 
-/// Recovery enters here before health probes, finalize or reverse-worker startup.
-/// No checkpoint or effect intent may be fabricated when an adapter is missing.
-/// Keep the admitted identity and deadline intact for the real transfer driver.
-pub(super) async fn run(runtime: &Runtime) -> coordinator::Result<VerifyResponse> {
+/// A single owner slice; None keeps the request pending while status remains live.
+pub(super) trait OwnerDriver {
+    #[cfg(test)]
+    fn simulated_healthy(&self) -> bool {
+        false
+    }
+    async fn slice(
+        &mut self,
+        runtime: &Runtime,
+        root: &Path,
+        id: &str,
+        context: Option<&(coordinator::journal::Journal, crate::MigrationDefinition)>,
+    ) -> coordinator::Result<crate::cutover::Result<crate::rollback::driver::Outcome>>;
+}
+#[derive(Default)]
+pub(super) struct Live(live::Thread);
+impl OwnerDriver for Live {
+    async fn slice(
+        &mut self,
+        runtime: &Runtime,
+        root: &Path,
+        id: &str,
+        context: Option<&(coordinator::journal::Journal, crate::MigrationDefinition)>,
+    ) -> coordinator::Result<crate::cutover::Result<crate::rollback::driver::Outcome>> {
+        let Some((journal, definition)) = context else {
+            return Ok(Err(crate::cutover::Error::Invalid(
+                "rollback endpoints unavailable",
+            )));
+        };
+        self.0.slice(runtime, id, journal, definition, root).await
+    }
+}
+pub(super) async fn run_with_driver(
+    runtime: &Runtime,
+    root: &Path,
+    id: &str,
+    context: Option<&(coordinator::journal::Journal, crate::MigrationDefinition)>,
+    driver: &mut impl OwnerDriver,
+    workers: &mut Option<Box<super::reverse_workers::Workers>>,
+) -> coordinator::Result<Option<VerifyResponse>> {
     runtime.refresh_owner().await?;
     let state = runtime.state().await;
     if state.lifecycle.state != State::RollingBack || state.rollback.is_none() {
         return Err(coordinator::Error::RecoveryRequired(
-            "rollback admission evidence unavailable; operator action required".into(),
+            "rollback admission evidence unavailable".into(),
         ));
     }
-    let mut response = refused(
-        if state.rollback_eligibility_ended.is_some() {
-            "rollback_operator_action_required"
-        } else {
-            "rollback_driver_unavailable"
-        },
-        5,
-    );
-    response.data["admitted"] = json!(true);
-    response.data["final_state"] = json!(State::RollingBack);
-    Ok(response)
+    if state.rollback_eligibility_ended.is_some()
+        || state.progress.get(OPERATOR).is_some_and(|(_, request)| {
+            state
+                .rollback
+                .as_ref()
+                .is_some_and(|cp| &cp.request == request)
+        })
+    {
+        return Ok(Some(refused("rollback_operator_action_required", 5)));
+    }
+    // Workers contain thread-local capture state. Retire sockets before the
+    // blocking slice opens a fresh adapter from the retained durable boundary.
+    *workers = None;
+    let result = driver.slice(runtime, root, id, context).await?;
+    match result {
+        Ok(crate::rollback::driver::Outcome::Progress) | Err(crate::cutover::Error::Pending) => {
+            runtime.refresh_owner().await?;
+            Ok(None)
+        }
+        Ok(outcome) => {
+            let state = runtime.state().await;
+            Ok(Some(VerifyResponse {
+                exit_code: outcome.exit_code().expect("terminal outcome"),
+                data: json!({"complete":outcome==crate::rollback::driver::Outcome::Complete,"admitted":true,"final_state":state.lifecycle.state,"rollback":status(&state)}),
+            }))
+        }
+        Err(crate::cutover::Error::LostOwnership) => Err(coordinator::Error::LostOwnership),
+        Err(crate::cutover::Error::Component(_) | crate::cutover::Error::Journal(_)) => {
+            Err(coordinator::Error::RecoveryRequired(
+                "rollback infrastructure unavailable; retrying durable admission".into(),
+            ))
+        }
+        Err(_) => {
+            runtime.refresh_owner().await?;
+            runtime
+                .marker(
+                    OPERATOR,
+                    "operator-action-required".into(),
+                    state.rollback.as_ref().expect("admitted").request.clone(),
+                )
+                .await?;
+            Ok(Some(refused("rollback_operator_action_required", 5)))
+        }
+    }
 }
 
 /// Observer-only view of authenticated rollback progress. A terminal outcome
@@ -114,7 +183,14 @@ pub fn status(state: &Materialized) -> serde_json::Value {
     let outcome = match (state.lifecycle.state, checkpoint.next) {
         (State::SourceActiveAfterRollback, coordinator::rollback::Step::Complete) => "completed",
         (State::RollbackWindow, coordinator::rollback::Step::Aborted) => "deadline-aborted",
-        _ if state.rollback_eligibility_ended.is_some() => "operator-action-required",
+        _ if state.rollback_eligibility_ended.is_some()
+            || state
+                .progress
+                .get(OPERATOR)
+                .is_some_and(|(_, request)| request == &checkpoint.request) =>
+        {
+            "operator-action-required"
+        }
         _ => "in-progress",
     };
     json!({"request":checkpoint.request,"step":checkpoint.next,
@@ -163,12 +239,7 @@ mod tests {
             let before = serde_json::to_vec(&state).unwrap();
             let response = admission(&state, Some(30_000));
             if lifecycle == State::RollbackWindow {
-                let response = response.unwrap();
-                assert_eq!(response.exit_code, 2);
-                assert_eq!(
-                    response.data["error"]["kind"],
-                    "rollback_driver_unavailable"
-                );
+                assert!(response.is_none());
             } else {
                 assert_eq!(response.unwrap().exit_code, 3);
             }
