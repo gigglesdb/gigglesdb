@@ -30,7 +30,14 @@ mod transaction;
 use transaction::{admin_command, execute_mode, parse_control, read_only_check};
 
 type R<T> = Result<T, &'static str>;
-const MAX_OBJECTS: usize = 32;
+const MAX_NAMED_STATEMENTS: usize = 1024;
+const MAX_NAMED_PORTALS: usize = 1024;
+const MAX_CURSORS: usize = 1024;
+// Every legal statement must fit, with headroom for another maximum-size statement.
+const MAX_NAMED_STATEMENT_BYTES: usize = {
+    let headroom = 2 * giggles_core::relational::MAX_STATEMENT_SQL;
+    if headroom > 16 * 1024 * 1024 { headroom } else { 16 * 1024 * 1024 }
+};
 pub async fn ssl_request<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> io::Result<()> {
     timeout(IO_TIMEOUT, async {
         let mut b = [0; 8];
@@ -816,6 +823,7 @@ enum Plan {
 }
 #[derive(Clone)]
 struct Statement {
+    sql_bytes: usize,
     p: Plan,
     d: Description,
     parameter_oids: Vec<u32>,
@@ -905,6 +913,7 @@ struct State {
     implicit: bool,
     settings: crate::pg_settings::SessionSettings,
     statements: BTreeMap<String, Statement>,
+    named_statement_bytes: usize,
     portals: BTreeMap<String, Portal>,
     cursors: cursor::Cursors,
     drain: bool,
@@ -1125,7 +1134,11 @@ impl State {
                 if !name.is_empty() && self.statements.contains_key(&name) {
                     return Err("42P05");
                 }
-                if !self.statements.contains_key(&name) && self.statements.len() >= MAX_OBJECTS {
+                if !name.is_empty()
+                    && (self.statements.keys().filter(|name| !name.is_empty()).count()
+                        >= MAX_NAMED_STATEMENTS
+                        || self.named_statement_bytes.checked_add(sql.len()).ok_or("54000")? > MAX_NAMED_STATEMENT_BYTES)
+                {
                     return Err("54000");
                 }
                 if !is_copy_sql(&sql) {
@@ -1340,9 +1353,13 @@ impl State {
                         parameter_oids[i] = o;
                     }
                 }
+                if !name.is_empty() {
+                    self.named_statement_bytes += sql.len();
+                }
                 self.statements.insert(
                     name,
                     Statement {
+                        sql_bytes: sql.len(),
                         p,
                         d,
                         parameter_oids,
@@ -1413,7 +1430,7 @@ impl State {
                 if !name.is_empty() && self.portals.contains_key(&name) {
                     return Err("42P03");
                 }
-                if !self.portals.contains_key(&name) && self.portals.len() >= MAX_OBJECTS {
+                if !name.is_empty() && !self.portals.contains_key(&name) && self.portals.keys().filter(|name| !name.is_empty()).count() >= MAX_NAMED_PORTALS {
                     return Err("54000");
                 }
                 parameter_bytes = parameter_bytes
@@ -1846,7 +1863,12 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
-                        self.statements.remove(&name);
+                        if let Some(statement) = self.statements.remove(&name)
+                            && !name.is_empty()
+                        {
+                            self.named_statement_bytes -= statement.sql_bytes;
+                        }
+                        debug_assert_eq!(self.named_statement_bytes, self.statements.iter().filter(|(name, _)| !name.is_empty()).map(|(_, statement)| statement.sql_bytes).sum::<usize>());
                     }
                     b'P' => {
                         self.portals.remove(&name);
@@ -1959,6 +1981,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         implicit: false,
         settings: crate::pg_settings::SessionSettings::default(),
         statements: BTreeMap::new(),
+        named_statement_bytes: 0,
         portals: BTreeMap::new(),
         cursors: cursor::Cursors::default(),
         drain: false,

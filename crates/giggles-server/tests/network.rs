@@ -1987,7 +1987,7 @@ async fn portal_suspension_transaction_cleanup_and_object_limits() {
     while pg_read(&mut s).await.0 != b'Z' {}
     pg_send(&mut s, b'E', &execute("page", 0)).await;
     assert!(has_code(&pg_sync(&mut s).await, "34000"));
-    for i in 0..31 {
+    for i in 0..1023 {
         pg_send(
             &mut s,
             b'P',

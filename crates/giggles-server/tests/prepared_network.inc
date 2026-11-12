@@ -267,7 +267,7 @@ async fn prepared_task_statement_and_portal_caps_do_not_execute_or_advance_clock
     let mut s = raw_task(&f).await;
     let before = f.admin.snapshot().unwrap();
     let clock = f.admin.authority_metadata().unwrap();
-    for i in 0..32 {
+    for i in 0..1024 /* per-connection named object cap */ {
         pg_send(&mut s, b'P', &parse(&format!("r{i}"), KEY)).await;
         assert_eq!(pg_sync(&mut s).await[0].0, b'1');
     }
@@ -275,7 +275,7 @@ async fn prepared_task_statement_and_portal_caps_do_not_execute_or_advance_clock
     assert!(has_code(&pg_sync(&mut s).await, "54000"));
     pg_send(&mut s, b'P', &parse("r0", KEY)).await;
     assert!(has_code(&pg_sync(&mut s).await, "42P05"));
-    for i in 0..32 {
+    for i in 0..1024 /* per-connection named object cap */ {
         pg_send(&mut s, b'B', &key_bind(&format!("p{i}"), "r0", 5000 + i, 0)).await;
         pg_send(&mut s, b'H', &[]).await;
         assert_eq!(pg_read(&mut s).await.0, b'2');

@@ -159,3 +159,6 @@ mod truncate_wire;
 
 #[path = "exists_authority.rs"]
 mod exists_authority;
+
+#[path = "prepared_cap_network.rs"]
+mod prepared_cap_network;

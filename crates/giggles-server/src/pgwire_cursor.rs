@@ -254,7 +254,7 @@ impl Cursors {
                 if self.0.contains_key(name) {
                     return Err("42P03");
                 }
-                if self.0.len() >= MAX_OBJECTS {
+                if self.0.len() >= MAX_CURSORS {
                     return Err("54000");
                 }
                 let p = match prepared {
