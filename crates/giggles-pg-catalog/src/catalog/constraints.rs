@@ -16,7 +16,7 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
         let table = snapshot.tables.iter().find(|t| t.id == c.table).ok_or(Error::InvalidSnapshot)?;
         let oid = i64::from(table_oid(c.id)?);
         let rel = i64::from(table_oid(c.table)?);
-        if c.name.is_empty() || c.name.len() > 63 || !matches!(c.kind, 'c' | 'f')
+        if c.name.is_empty() || c.name.len() > 63 || !matches!(c.kind, 'c' | 'f' | 'u')
             || c.expression.as_ref().is_some_and(|e| e.len() > 65536)
             || c.deferred && !c.deferrable || c.columns.len() > 64 { return Err(Error::InvalidSnapshot); }
         let keys = key(table, &c.columns)?;
@@ -33,6 +33,11 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
                 return Err(Error::InvalidSnapshot);
             }
             (i64::from(table_oid(parent.id)?), Value::Array(key(parent, &c.foreign_columns)?), i64::from(index))
+        } else if c.kind == 'u' {
+            let index = snapshot.indexes.iter().find(|i| i.id == c.index && i.table == c.table
+                && i.unique && i.columns == c.columns).ok_or(Error::InvalidSnapshot)?;
+            if keys.is_empty() || c.deferrable || c.deferred || !c.validated { return Err(Error::InvalidSnapshot); }
+            (0, N, i64::from(table_oid(index.id)?))
         } else {
             if c.expression.is_none() { return Err(Error::InvalidSnapshot); }
             (0, N, 0)
@@ -42,7 +47,10 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
             B(c.deferrable), B(c.deferred), B(c.validated), N, I(0),
             s(if c.kind == 'f' { match c.update {'a'=>"a",'r'=>"r",'c'=>"c",'n'=>"n",_=>"d"} } else { " " }),
             s(if c.kind == 'f' { match c.delete {'a'=>"a",'r'=>"r",'c'=>"c",'n'=>"n",_=>"d"} } else { " " }),
-            s(if c.kind == 'f' { "s" } else { " " }), B(c.kind == 'f'), c.expression.as_ref().map_or(N, |e| s(e)), N]);
+            s(if c.kind == 'f' { "s" } else { " " }), B(matches!(c.kind, 'f' | 'u')), c.expression.as_ref().map_or(N, |e| s(e)), N]);
+        if c.kind == 'u' {
+            all.get_mut("pg_depend").unwrap().rows.push(vec![I(1259), I(index), I(0), I(2606), I(oid), I(0), s("i")]);
+        }
         if keys.is_empty() { depend(all, 2606, oid, rel, I(0), "a"); }
         for k in keys { depend(all, 2606, oid, rel, k.clone(), "a");
             if c.kind == 'c' { depend(all, 2606, oid, rel, k, "n"); }
@@ -67,7 +75,8 @@ pub(super) fn populate(snapshot: &CatalogSnapshot, all: &mut BTreeMap<String, Re
             }
         }
     }
-    for index in snapshot.indexes.iter().filter(|i| snapshot.tables.iter().any(|t| t.id == i.table)) {
+    for index in snapshot.indexes.iter().filter(|i| snapshot.tables.iter().any(|t| t.id == i.table)
+        && !snapshot.constraints.iter().any(|c| c.kind == 'u' && c.index == i.id)) {
         for k in key(snapshot.tables.iter().find(|t| t.id == index.table).ok_or(Error::InvalidSnapshot)?, &index.columns)? {
             depend(all, 1259, i64::from(table_oid(index.id)?), i64::from(table_oid(index.table)?), k, "a");
         }
@@ -94,6 +103,8 @@ pub(crate) fn definition(snapshot: &CatalogSnapshot, oid: i64, pretty: bool) -> 
         let expr = c.expression.as_ref()?;
         let expr = if pretty { expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expr) } else { expr };
         format!("CHECK ({expr})")
+    } else if c.kind == 'u' {
+        format!("UNIQUE ({})", names(c.table, &c.columns)?)
     } else {
         let parent = snapshot.tables.iter().find(|t| t.id == c.foreign_table)?;
         let schema = snapshot.table_schema(parent.id).0;

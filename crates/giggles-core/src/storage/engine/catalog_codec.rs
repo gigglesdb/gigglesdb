@@ -328,6 +328,7 @@ pub(crate) enum ConstraintKindDto {
         deferral: DeferralDto,
     },
     PrimaryKey,
+    Unique { columns: Vec<u64>, index: u64 },
 }
 impl From<Deferral> for DeferralDto {
     fn from(v: Deferral) -> Self {
@@ -371,6 +372,7 @@ impl From<ConstraintKind> for ConstraintKindDto {
                 deferral: deferral.into(),
             },
             ConstraintKind::PrimaryKey => Self::PrimaryKey,
+            ConstraintKind::Unique { columns, index } => Self::Unique { columns, index },
         }
     }
 }
@@ -397,6 +399,7 @@ impl TryFrom<ConstraintKindDto> for ConstraintKind {
                 deferral: deferral.into(),
             },
             ConstraintKindDto::PrimaryKey => Self::PrimaryKey,
+            ConstraintKindDto::Unique { columns, index } => Self::Unique { columns, index },
         })
     }
 }
@@ -652,10 +655,21 @@ fn validate_definition(def: &TableDef) -> Result<(), CoreError> {
         .map_err(|_| corrupt("invalid catalog table definition"))
 }
 pub(crate) fn encode_constraint(v: &Constraint, _table: &str) -> Result<Vec<u8>, CoreError> {
-    encode_version(1, &ConstraintDto::from(v.clone()))
+    encode_version(if matches!(v.kind, ConstraintKind::Unique { .. }) { 2 } else { 1 }, &ConstraintDto::from(v.clone()))
 }
 pub(crate) fn decode_constraint(v: &[u8], table: &TableDef) -> Result<Constraint, CoreError> {
-    let dto: ConstraintDto = decode_version(1, v)?;
+    let version = *v.first().ok_or_else(|| corrupt("missing constraint version"))?;
+    if !matches!(version, 1 | 2) { return Err(corrupt("unsupported constraint version")); }
+    let dto: ConstraintDto = decode_version(version, v)?;
+    if (version == 2) != matches!(dto.kind, ConstraintKindDto::Unique { .. }) {
+        return Err(corrupt("noncanonical constraint version"));
+    }
+    if let ConstraintKindDto::Unique { columns, index } = &dto.kind
+        && (*index == 0 || columns.is_empty() || columns.len() > MAX_COLUMNS
+            || columns.iter().collect::<BTreeSet<_>>().len() != columns.len()
+            || columns.iter().any(|id| !table.columns.iter().any(|c| c.id == *id))) {
+        return Err(corrupt("invalid unique constraint"));
+    }
     if dto
         .name
         .as_ref()

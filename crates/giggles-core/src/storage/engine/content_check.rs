@@ -49,7 +49,10 @@ pub(crate) fn required_bits_for_catalog_value(
             }
             Ok(required)
         }
-        CatalogKind::Constraint | CatalogKind::Sequence | CatalogKind::Type => Ok(64),
+        CatalogKind::Constraint => Ok(64 | if value.first() == Some(&2) {
+            super::meta::UNIQUE_CONSTRAINT_IDENTITY | super::meta::SECONDARY_INDEXES
+        } else { 0 }),
+        CatalogKind::Sequence | CatalogKind::Type => Ok(64),
         // validate_meta treats a live kind-7 marker without bit 9 as Corrupt,
         // so the commit guard must refuse it too (DD-0068 X1).
         CatalogKind::RoleBootstrap => Ok(512),

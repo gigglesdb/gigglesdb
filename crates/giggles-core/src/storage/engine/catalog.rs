@@ -129,6 +129,7 @@ impl CatalogView {
         if !parts.ext.types.is_empty() {
             parts.ext.ext_version = 6;
         }
+        parts.ext.ext_version = parts.ext.wire_version();
         parts
     }
 }
@@ -439,6 +440,9 @@ impl Catalog {
             deadline,
             cancel,
         )?;
+        for (key, value) in &new_records {
+            txn.require_features(super::content_check::required_bits_for_catalog_value(key, value).map_err(|e| corrupt(&e.to_string()))?);
+        }
         self.lock_and_write(txn, &old_records, &new_records, deadline, cancel)?;
         if !new.indexes.is_empty() {
             txn.require_features(super::meta::SECONDARY_INDEXES);
@@ -1052,6 +1056,7 @@ fn finish_view(
     {
         return Err(corrupt("constraint table absent"));
     }
+    relational::catalog_ext::validate_unique_indexes(view.constraints.iter().flat_map(|(t, cs)| cs.values().map(move |c| (*t, c))), view.indexes.values()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     view.names = names;
     if !view.schemas.is_empty()
         || !view.types.is_empty()
@@ -1107,6 +1112,7 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     Ok(result)
 }
 pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     object_ids(parts)?;
     let mut records = BTreeMap::new();
     let mut names = BTreeSet::new();

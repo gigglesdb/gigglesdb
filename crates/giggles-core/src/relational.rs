@@ -3516,6 +3516,10 @@ impl Relational {
                     .find(|d| d.name == index.name)
                     .cloned();
                 if let Some(descriptor) = descriptor {
+                    if self.ext.constraints.values().flatten().any(|c|
+                        matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {
+                        return Err(SqlError::DependentObjects);
+                    }
                     let descriptors = self
                         .secondary_descriptors_engine()
                         .iter()

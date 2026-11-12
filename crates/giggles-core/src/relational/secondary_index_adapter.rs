@@ -977,6 +977,10 @@ impl Relational {
         let staged = pending
             .validate_complete(&snap.rows(&tuples), &CatalogView(self), &mut cancel)
             .map_err(error)?;
+        super::catalog_ext::validate_unique_indexes(
+            self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
+            staged.descriptors().iter(),
+        )?;
         tick(&mut cancel)?;
         self.secondary = staged;
         Ok(())
@@ -993,6 +997,7 @@ impl Relational {
         if !self.has_secondary_indexes_engine() {
             return Err(SqlError::Unsupported);
         }
+        self.validate_unique_indexes()?;
         self.secondary_validate_engine(&mut cancel)?;
         let payload = si::codec::encode(&self.secondary, &mut cancel).map_err(error)?;
         tick(&mut cancel)?;

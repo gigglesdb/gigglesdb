@@ -162,7 +162,7 @@ pub(crate) fn snapshot(
                 id: c.id, table: c.table, name: c.name, kind: c.kind, columns: c.columns,
                 foreign_table: c.foreign_table, foreign_columns: c.foreign_columns,
                 update: c.update, delete: c.delete, deferrable: c.deferrable, deferred: c.deferred,
-                validated: c.validated, expression: c.expression,
+                validated: c.validated, expression: c.expression, index: c.index,
             }).collect(),
         generation,
         backend_pid: session.backend_pid,

@@ -668,3 +668,16 @@ fn schema_and_type_wire_extensions_are_append_only() {
         assert_corrupt(classify_catalog_key(&name_key(name)));
     }
 }
+
+#[test]
+fn unique_constraint_record_v2_roundtrip_old_record_and_unknown_version() {
+    let c = Constraint { id: 4, name: "uq".into(), kind: ConstraintKind::Unique { columns: vec![2], index: 3 } };
+    let bytes = encode_constraint(&c, "t").unwrap(); assert_eq!(bytes[0], 2);
+    assert_eq!(bytes, hex("020000000000000004010000000000000002757100000003000000000000000100000000000000020000000000000003"));
+    assert_eq!(decode_constraint(&bytes, &table().def).unwrap(), c);
+    assert!(matches!(decode_constraint(&hex(PK), &table().def).unwrap().kind, ConstraintKind::PrimaryKey));
+    assert_corrupt(decode_version::<ConstraintDto>(1, &bytes)); // older reader refuses at version
+    for version in [0, 1, 3, 255] {
+        let mut bad = bytes.clone(); bad[0] = version; assert_corrupt(decode_constraint(&bad, &table().def));
+    }
+}

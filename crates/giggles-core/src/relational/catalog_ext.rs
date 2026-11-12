@@ -135,6 +135,11 @@ pub(crate) enum ConstraintKind {
         deferral: Deferral,
     },
     PrimaryKey,
+    Unique {
+        #[serde(deserialize_with = "ids")]
+        columns: Vec<u64>,
+        index: u64,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum Deferral {
@@ -203,8 +208,9 @@ impl From<ConstraintV1> for Constraint {
         }
     }
 }
-impl From<&Constraint> for ConstraintV1 {
-    fn from(c: &Constraint) -> Self {
+impl TryFrom<&Constraint> for ConstraintV1 {
+    type Error = &'static str;
+    fn try_from(c: &Constraint) -> Result<Self, Self::Error> {
         let kind = match &c.kind {
             ConstraintKind::Check { expr, not_valid } => ConstraintKindV1::Check {
                 expr: expr.clone(),
@@ -227,20 +233,38 @@ impl From<&Constraint> for ConstraintV1 {
                 not_valid: *not_valid,
             },
             ConstraintKind::PrimaryKey => ConstraintKindV1::PrimaryKey,
+            ConstraintKind::Unique { .. } => return Err("UNIQUE requires catalog extension v7"),
         };
-        Self {
+        Ok(Self {
             id: c.id,
             name: c.name.clone(),
             kind,
+        })
+    }
+}
+pub(crate) fn validate_unique_indexes<'a>(
+    constraints: impl Iterator<Item = (u64, &'a Constraint)>,
+    indexes: impl Iterator<Item = &'a super::secondary_index::Descriptor>,
+) -> R<()> {
+    let indexes: BTreeMap<_, _> = indexes.map(|d| (d.id, d)).collect();
+    for (table, constraint) in constraints {
+        if let ConstraintKind::Unique { columns, index } = &constraint.kind {
+            let d = indexes.get(index).ok_or(SqlError::Type)?;
+            if d.table != table || !d.unique || d.columns != *columns {
+                return Err(SqlError::Type);
+            }
         }
     }
+    Ok(())
 }
 impl CatalogExt {
     fn has_text_kind(&self) -> bool {
         self.columns.values().any(|c| c.text_kind.is_some())
     }
-    fn wire_version(&self) -> u32 {
-        if !self.types.is_empty() || self.columns.values().any(|c| c.type_id.is_some()) {
+    pub(crate) fn wire_version(&self) -> u32 {
+        if self.constraints.values().flatten().any(|c| matches!(c.kind, ConstraintKind::Unique { .. })) {
+            7
+        } else if !self.types.is_empty() || self.columns.values().any(|c| c.type_id.is_some()) {
             6
         } else if !self.schemas.is_empty() || !self.table_schemas.is_empty() {
             5
@@ -263,12 +287,12 @@ impl Serialize for CatalogExt {
         use serde::ser::SerializeTuple;
         let version = self.wire_version();
         let mut out = serializer.serialize_tuple(match version {
-            5 | 6 => 8,
+            5..=7 => 8,
             4 => 6,
             _ => 5,
         })?;
         out.serialize_element(&version)?;
-        if version == 6 {
+        if version >= 6 {
             out.serialize_element(&self.columns)?;
         } else if matches!(version, 3..=5) {
             let columns: BTreeMap<_, _> = self
@@ -308,8 +332,8 @@ impl Serialize for CatalogExt {
             let legacy: BTreeMap<_, Vec<_>> = self
                 .constraints
                 .iter()
-                .map(|(id, cs)| (*id, cs.iter().map(ConstraintV1::from).collect()))
-                .collect();
+                .map(|(id, cs)| Ok((*id, cs.iter().map(ConstraintV1::try_from).collect::<Result<Vec<_>, _>>()?)))
+                .collect::<Result<_, &'static str>>().map_err(serde::ser::Error::custom)?;
             out.serialize_element(&legacy)?;
         } else {
             out.serialize_element(&self.constraints)?;
@@ -428,10 +452,10 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     };
                 }
                 let ext_version = next!(u32);
-                if !matches!(ext_version, 1..=6) {
+                if !matches!(ext_version, 1..=7) {
                     return Err(de::Error::custom(UNSUPPORTED_CATALOG_EXT));
                 }
-                let columns = if ext_version == 6 {
+                let columns = if ext_version >= 6 {
                     next!(Columns).0
                 } else if matches!(ext_version, 3..=5) {
                     #[derive(Deserialize)]
@@ -467,7 +491,7 @@ impl<'de> Deserialize<'de> for CatalogExt {
                     columns,
                     constraints,
                     sequences: next!(Sequences).0,
-                    types: if ext_version == 6 {
+                    types: if ext_version >= 6 {
                         next!(Types).0
                     } else {
                         #[derive(Deserialize)]
@@ -971,6 +995,12 @@ impl Relational {
         ext.constraints.retain(|_, v| !v.is_empty());
         ext.ext_version = ext.wire_version();
     }
+    pub(crate) fn validate_unique_indexes(&self) -> R<()> {
+        validate_unique_indexes(
+            self.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))),
+            self.secondary.descriptors().iter(),
+        )
+    }
     pub(crate) fn validate_ext(&self) -> R<()> {
         self.validate_ext_candidate(&self.ext, self.next_id, None)
     }
@@ -980,7 +1010,7 @@ impl Relational {
         next_id: u64,
         excluded_table: Option<u64>,
     ) -> R<()> {
-        if !matches!(ext.ext_version, 1..=6) {
+        if !matches!(ext.ext_version, 1..=7) {
             return Err(SqlError::Unsupported);
         }
         self.validate_schemas(ext, next_id, excluded_table)?;
@@ -1154,6 +1184,14 @@ impl Relational {
                             {
                                 return Err(SqlError::Type);
                             }
+                        }
+                    }
+                    ConstraintKind::Unique { columns: cols, index } => {
+                        if *index == 0 || *index >= next_id || *index == c.id
+                            || cols.is_empty() || cols.len() > MAX_COLUMNS
+                            || cols.iter().collect::<BTreeSet<_>>().len() != cols.len()
+                            || cols.iter().any(|id| !local.columns.iter().any(|c| c.id == *id)) {
+                            return Err(SqlError::Type);
                         }
                     }
                     ConstraintKind::PrimaryKey => {}

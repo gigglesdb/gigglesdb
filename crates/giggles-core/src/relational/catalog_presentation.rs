@@ -5,7 +5,7 @@ pub struct CatalogConstraint {
     pub id: u64, pub table: u64, pub name: String, pub kind: char,
     pub columns: Vec<u64>, pub foreign_table: u64, pub foreign_columns: Vec<u64>,
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
-    pub validated: bool, pub expression: Option<String>,
+    pub validated: bool, pub expression: Option<String>, pub index: u64,
 }
 #[derive(Clone, Debug, Default)]
 pub struct CatalogPresentation {
@@ -38,6 +38,9 @@ impl Relational {
                     validated: true, ..Default::default() };
                 match &c.kind {
                     ConstraintKind::PrimaryKey => continue,
+                    ConstraintKind::Unique { columns, index } => {
+                        info.kind = 'u'; info.columns = columns.clone(); info.index = *index;
+                    }
                     ConstraintKind::Check { expr, not_valid } => {
                         info.kind = 'c'; info.validated = !not_valid;
                         let expr = expr.strip_suffix(" NOT VALID").unwrap_or(expr);

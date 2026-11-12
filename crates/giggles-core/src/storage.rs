@@ -275,6 +275,7 @@ fn key(ns: u8, nums: &[u64]) -> Vec<u8> {
     k
 }
 fn records(s: &State) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    s.sql.validate_unique_indexes().map_err(secondary_index::sql_error)?;
     let format = state_format(s)?;
     let mut out = BTreeMap::new();
     let bits = feature_envelope::feature_bits_present(s)?;
@@ -506,6 +507,7 @@ fn from_records_mode(
             .secondary_restore_engine(pending, &mut *cancel)
             .map_err(|error| secondary_index::sql_error_with_cancel(error, cancel))?;
     }
+    s.sql.validate_unique_indexes().map_err(|e| CoreError::Corrupt(format!("relational invariant: {e:?}")))?;
     if let Some(bits) = bits
         && feature_envelope::feature_bits_present(&s)? != bits
     {

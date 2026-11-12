@@ -1232,3 +1232,38 @@ fn qualified_table_without_its_schema_is_corrupt() {
         Err(CoreError::Corrupt(_))
     ));
 }
+
+#[test]
+fn forged_unique_index_references_fail_save_and_load() {
+    use crate::relational::{Relational, Prepared, catalog_ext::ConstraintKind};
+    let mut sql = Relational::default();
+    for text in ["CREATE TABLE u(a text,b text,CONSTRAINT uq UNIQUE(b,a))",
+        "CREATE TABLE v(a text,CONSTRAINT other_table UNIQUE(a))",
+        "CREATE INDEX nonunique ON u(b,a)", "CREATE UNIQUE INDEX wrongcols ON u(a)",
+        "CREATE UNIQUE INDEX wrongorder ON u(a,b)"] {
+        let p = Prepared::parse(text, 1, sql.epoch).unwrap();
+        sql.execute(&p, &[], None).unwrap();
+    }
+    let (tables, ext, _, _) = sql.catalog_parts();
+    let parts = CatalogParts { tables, ext, heap: BTreeSet::new(), indexes: sql.secondary_descriptors_engine().to_vec() };
+    let valid = parts_records(&parts).unwrap();
+    for name in ["missing", "nonunique", "other_table", "wrongcols", "wrongorder"] {
+        let mut bad = parts.clone();
+        let id = bad.indexes.iter().find(|d| d.name == name).map_or(999, |d| d.id);
+        let table = bad.tables["u"].id;
+        let c = &mut bad.ext.constraints.get_mut(&table).unwrap()[0];
+        let ConstraintKind::Unique { index, .. } = &mut c.kind else { panic!() };
+        *index = id;
+        let c = c.clone();
+        assert!(matches!(parts_records(&bad), Err(CoreError::Corrupt(_))), "{name}");
+        let mut records = valid.clone();
+        records.insert(catalog_codec::constraint_key(table, c.id), catalog_codec::encode_constraint(&c, "u").unwrap());
+        let mem = MemKv::new();
+        let mut batch = WriteBatch::default();
+        for (key, value) in records {
+            batch.put(Keyspace::Catalog, super::super::codec::user_key_seek_at(&key, Ts(1)), mvcc::encode_live(&value));
+        }
+        mem.write(batch, Durability::Sync).unwrap();
+        assert!(matches!(load_view(&Kv::new(Arc::new(mem)), Ts(1)), Err(CoreError::Corrupt(_))), "{name}");
+    }
+}

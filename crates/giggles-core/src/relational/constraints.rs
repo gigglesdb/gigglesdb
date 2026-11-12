@@ -257,7 +257,12 @@ pub(super) fn install_unique(
         return Err(SqlError::DuplicateObject);
     }
     let epoch = state.epoch;
-    state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, &mut *cancel)?;
+    let index = state.create_secondary_index_populated_engine(table, epoch, &name, &ids, true, &mut *cancel)?;
+    let id = allocate(&mut state.next_id)?;
+    state.ext.constraints.entry(table.id).or_default().push(Constraint {
+        id, name, kind: ConstraintKind::Unique { columns: ids, index },
+    });
+    Relational::normalize_ext(&mut state.ext);
     // The surrounding CREATE/ALTER owns the single schema epoch advance.
     state.epoch = epoch;
     Ok(())
@@ -439,7 +444,7 @@ fn validate_kind(
         match kind {
             ConstraintKind::Check { expr, .. } => query::constraint_check(state, table, expr, row)?,
             ConstraintKind::ForeignKey { .. } => fk_row(state, table, row, kind)?,
-            ConstraintKind::PrimaryKey => (),
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique { .. } => (),
         }
     }
     Ok(())
@@ -486,6 +491,18 @@ pub(super) fn drop_named(
         && constraint_primary_key::primary_key_name(state, table).as_deref() == Some(name)
     {
         return Err(SqlError::Unsupported);
+    }
+    if let Some(Constraint { kind: ConstraintKind::Unique { index, .. }, .. }) =
+        state.table_constraints(table.id).iter().find(|c| c.name == name) {
+        let index = *index;
+        let columns = &state.secondary_descriptors_engine().iter().find(|d| d.id == index).ok_or(SqlError::Type)?.columns;
+        if state.ext.constraints.values().flatten().any(|c| matches!(&c.kind,
+            ConstraintKind::ForeignKey { ref_table, ref_columns, .. } if *ref_table == table.id && ref_columns.len() == columns.len() && ref_columns.iter().all(|id| columns.contains(id)))) {
+            return Err(SqlError::DependentObjects);
+        }
+        let descriptors = state.secondary_descriptors_engine().iter()
+            .filter(|d| d.id != index).cloned().collect::<Vec<_>>();
+        state.secondary = state.secondary_build_complete_engine(&descriptors, &mut || false)?;
     }
     let cs = state.ext.constraints.entry(table.id).or_default();
     if let Some(at) = cs.iter().position(|c| c.name == name) {
@@ -538,7 +555,9 @@ pub(super) fn enforce_with_rows<'a>(
     clock: Option<&clock::ExecutionClock>,
     mut load: Option<&mut LoadRows<'_>>,
 ) -> R<std::borrow::Cow<'a, Relational>> {
-    if state.ext.constraints.is_empty() {
+    // UNIQUE is enforced by its index; it must not activate row-event checks.
+    if !state.ext.constraints.values().flatten().any(|c| matches!(c.kind,
+        ConstraintKind::Check { .. } | ConstraintKind::ForeignKey { .. })) {
         return Ok(before);
     }
     if let Some(load) = load.as_mut() {

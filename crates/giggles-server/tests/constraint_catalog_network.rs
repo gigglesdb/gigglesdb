@@ -29,7 +29,13 @@ async fn stored_constraint_metadata_reaches_simple_and_extended_wire() {
     }
     let fk: String = client.query_one("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype='f'",&[]).await.unwrap().get(0);
     assert_eq!(fk,"FOREIGN KEY (parent_id) REFERENCES gui_sales.parent(id)");
-    assert_eq!(client.query_one("SELECT count(*) FROM pg_constraint WHERE contype='u'",&[]).await.unwrap().get::<_,i64>(0),0);
+    assert_eq!(client.query_one("SELECT count(*) FROM pg_constraint WHERE contype='u'",&[]).await.unwrap().get::<_,i64>(0),2);
+    let uq: String = client.query_one("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='child_label_key'",&[]).await.unwrap().get(0);
+    assert_eq!(uq, "UNIQUE (label)");
+    client.simple_query("CREATE TABLE gui_sales.uq_drop (label text CONSTRAINT owned UNIQUE)").await.unwrap();
+    let error = client.simple_query("DROP INDEX gui_sales.owned").await.unwrap_err();
+    assert_eq!(error.code().unwrap().code(), "2BP01");
+    client.simple_query("ALTER TABLE gui_sales.uq_drop DROP CONSTRAINT owned").await.unwrap();
     client.simple_query("CREATE TABLE gui_sales.actions (x integer REFERENCES gui_sales.parent(id) ON DELETE SET NULL ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED)").await.unwrap();
     let action: String = client.query_one("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='actions_x_fkey'",&[]).await.unwrap().get(0);
     assert_eq!(action,"FOREIGN KEY (x) REFERENCES gui_sales.parent(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED");

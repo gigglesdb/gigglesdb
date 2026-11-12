@@ -82,13 +82,13 @@ pub struct IndexDef {
     pub columns: Vec<u64>,
     pub unique: bool,
 }
-/// Read-only CHECK/FK metadata, using stable core IDs and PostgreSQL action codes.
+/// Read-only CHECK/FK/UNIQUE metadata, using stable core IDs and PostgreSQL action codes.
 #[derive(Debug, Clone, Default)]
 pub struct ConstraintDef {
     pub id: u64, pub table: u64, pub name: String, pub kind: char,
     pub columns: Vec<u64>, pub foreign_table: u64, pub foreign_columns: Vec<u64>,
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
-    pub validated: bool, pub expression: Option<String>,
+    pub validated: bool, pub expression: Option<String>, pub index: u64,
 }
 /// Presentation metadata only; these flags do not implement role privileges or policies.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -34,3 +34,27 @@ fn pg18_check_fk_defaults_identity_and_dependencies() {
     assert_eq!(run(&s, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype='f'"),
         vec![vec![S("FOREIGN KEY (parent_id) REFERENCES gui_sales.parent(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED".into())]]);
 }
+
+#[test]
+fn pg18_unique_origin_rows_dependencies_definition_and_information_schema() {
+    use Value::{Text as S, Int as I, Bool as B};
+    let mut s = CatalogSnapshot::default();
+    s.tables.push(TableDef { id: 10, name: "t".into(), primary_key: vec![], columns: vec![ColumnDef {
+        id: 11, name: "label".into(), data_type: ScalarType::Text, not_null: false }] });
+    for (id, name) in [(20, "uq"), (21, "plain")] {
+        s.indexes.push(IndexDef { id, table: 10, name: name.into(), columns: vec![11], unique: true });
+    }
+    s.constraints.push(ConstraintDef { id: 30, table: 10, name: "uq".into(), kind: 'u', columns: vec![11],
+        index: 20, validated: true, ..Default::default() });
+    assert_eq!(run(&s, "SELECT conname,contype,conkey,conindid,condeferrable,condeferred,convalidated,confrelid,confkey,pg_get_constraintdef(oid) FROM pg_constraint WHERE contype='u'"),
+        vec![vec![S("uq".into()),S("u".into()),Value::Array(vec![I(1)]),I(65616),B(false),B(false),B(true),I(0),Value::Null,S("UNIQUE (label)".into())]]);
+    assert_eq!(run(&s, "SELECT classid,objid,refclassid,refobjid,deptype FROM pg_depend WHERE objid=65616"),
+        vec![vec![I(1259),I(65616),I(2606),I(65656),S("i".into())]]);
+    assert_eq!(run(&s, "SELECT constraint_name,constraint_type,is_deferrable,initially_deferred,enforced,nulls_distinct FROM information_schema.table_constraints WHERE constraint_type='UNIQUE'"),
+        vec![vec![S("uq".into()),S("UNIQUE".into()),S("NO".into()),S("NO".into()),S("YES".into()),S("YES".into())]]);
+    assert_eq!(run(&s, "SELECT constraint_name,column_name,ordinal_position,position_in_unique_constraint FROM information_schema.key_column_usage WHERE constraint_name='uq'"),
+        vec![vec![S("uq".into()),S("label".into()),I(1),Value::Null]]);
+    assert_eq!(run(&s, "SELECT connoinherit,conparentid,conperiod,conenforced,conislocal,coninhcount FROM pg_constraint WHERE contype='u'"),
+        vec![vec![B(true),I(0),B(false),B(true),B(true),I(0)]]);
+    assert_eq!(run(&s, "SELECT count(*) FROM pg_index WHERE indisunique"), vec![vec![I(2)]]);
+}

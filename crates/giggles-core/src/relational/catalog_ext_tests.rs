@@ -52,7 +52,7 @@ fn constraint_extension_frozen_v1_and_canonical_v2_goldens() {
             .contains("noncanonical")
     );
     let mut unknown = bytes(V1);
-    unknown[..4].copy_from_slice(&7u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&8u32.to_be_bytes());
     assert!(
         codec()
             .deserialize::<CatalogExt>(&unknown)
@@ -568,4 +568,69 @@ fn catalog_ext_v5_preserves_the_complete_v4_prefix() {
     Relational::normalize_ext(&mut ext);
     assert_eq!(ext.ext_version, 4);
     assert_eq!(codec().serialize(&ext).unwrap(), v4);
+}
+
+#[test]
+fn unique_origin_v7_roundtrip_and_old_index_has_no_origin() {
+    let mut s = Relational::default();
+    let exec = |s: &mut Relational, sql| {
+        let p = Prepared::parse(sql, 1, s.epoch).unwrap(); s.execute(&p, &[], None)
+    };
+    exec(&mut s, "CREATE TABLE u (label text CONSTRAINT uq UNIQUE)").unwrap();
+    exec(&mut s, "CREATE UNIQUE INDEX plain ON u(label)").unwrap();
+    exec(&mut s, "CREATE TABLE multi (a text, b text, CONSTRAINT ordered UNIQUE(b,a))").unwrap();
+    let multi = s.catalog_presentation().unwrap().constraints.into_iter().find(|c| c.name == "ordered").unwrap();
+    assert_eq!(multi.columns, vec![s.tables["multi"].columns[1].id, s.tables["multi"].columns[0].id]);
+    exec(&mut s, "ALTER TABLE multi DROP COLUMN a").unwrap();
+    assert!(!s.secondary_descriptors_engine().iter().any(|d| d.name == "ordered"));
+    exec(&mut s, "DROP TABLE multi").unwrap();
+    assert_eq!(s.ext.ext_version, 7);
+    let ext = codec().serialize(&s.ext).unwrap();
+    assert_eq!(codec().deserialize::<CatalogExt>(&ext).unwrap(), s.ext);
+    let (base, indexes) = s.secondary_persistence_engine(|| false).unwrap();
+    let mut restored: Relational = bincode::deserialize(&base).unwrap();
+    restored.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
+    assert_eq!(restored, s);
+    let u = s.catalog_presentation().unwrap().constraints.into_iter().find(|c| c.kind == 'u').unwrap();
+    assert_eq!(u.name, "uq"); assert_ne!(u.index, u.id);
+    assert_eq!(exec(&mut s, "DROP INDEX uq"), Err(SqlError::DependentObjects));
+    exec(&mut s, "CREATE TABLE child (label text REFERENCES u(label))").unwrap();
+    assert_eq!(exec(&mut s, "ALTER TABLE u DROP CONSTRAINT uq"), Err(SqlError::DependentObjects));
+    exec(&mut s, "DROP TABLE child").unwrap();
+    exec(&mut s, "ALTER TABLE u DROP CONSTRAINT uq").unwrap();
+    assert_eq!(s.secondary_descriptors_engine().len(), 1);
+    exec(&mut s, "ALTER TABLE u ADD CONSTRAINT again UNIQUE (label)").unwrap();
+    exec(&mut s, "ALTER TABLE u DROP COLUMN label").unwrap_err(); // last logical column
+    // Simulate a pre-v7 image: descriptors retain uniqueness, but origin is unknown.
+    s.ext.constraints.clear(); Relational::normalize_ext(&mut s.ext);
+    let (base, indexes) = s.secondary_persistence_engine(|| false).unwrap();
+    let mut old: Relational = bincode::deserialize(&base).unwrap();
+    old.secondary_restore_engine(secondary_index::codec::decode_pending(&indexes, || false).unwrap(), || false).unwrap();
+    assert!(old.catalog_presentation().unwrap().constraints.is_empty());
+    let mut unknown = ext; unknown[..4].copy_from_slice(&8u32.to_be_bytes());
+    assert!(codec().deserialize::<CatalogExt>(&unknown).unwrap_err().to_string().contains(catalog_ext::UNSUPPORTED_CATALOG_EXT));
+}
+
+#[test]
+fn forged_unique_index_references_fail_legacy_restore_and_save() {
+    let mut s = Relational::default();
+    for text in ["CREATE TABLE u(a text,b text,CONSTRAINT uq UNIQUE(b,a))",
+        "CREATE TABLE v(a text,CONSTRAINT other_table UNIQUE(a))",
+        "CREATE INDEX nonunique ON u(b,a)", "CREATE UNIQUE INDEX wrongcols ON u(a)",
+        "CREATE UNIQUE INDEX wrongorder ON u(a,b)"] {
+        let p = Prepared::parse(text, 1, s.epoch).unwrap(); s.execute(&p, &[], None).unwrap();
+    }
+    let (base, payload) = s.secondary_persistence_engine(|| false).unwrap();
+    for name in ["missing", "nonunique", "other_table", "wrongcols", "wrongorder"] {
+        let mut bad = s.clone();
+        let id = s.secondary_descriptors_engine().iter().find(|d| d.name == name).map_or(999, |d| d.id);
+        let ConstraintKind::Unique { index, .. } = &mut bad.ext.constraints.get_mut(&s.tables["u"].id).unwrap()[0].kind else { panic!() };
+        *index = id;
+        assert_eq!(bad.secondary_persistence_engine(|| false), Err(SqlError::Type), "{name}");
+        let mut restored: Relational = bincode::deserialize(&base).unwrap();
+        restored.ext = bad.ext;
+        let before = restored.clone();
+        assert_eq!(restored.secondary_restore_engine(secondary_index::codec::decode_pending(&payload, || false).unwrap(), || false), Err(SqlError::Type), "{name}");
+        assert_eq!(restored, before);
+    }
 }

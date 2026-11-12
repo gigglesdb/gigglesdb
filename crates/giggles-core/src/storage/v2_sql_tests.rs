@@ -1605,3 +1605,28 @@ fn copy_input_snapshot_savepoint_drop_and_forward_fk() {
     observer.feed_copy_input_at(&p, vec![vec![V::Int(2), V::Null]], &clock).unwrap();
     assert_eq!(observer.finish_copy_input_at(&p, &clock).unwrap().affected, 2);
 }
+
+#[test]
+fn unique_constraint_origin_survives_v2_reopen_and_owned_index_drop() {
+    let mut f = Fixture::new();
+    f.execute("CREATE TABLE uq_origin (label text)");
+    f.execute("CREATE UNIQUE INDEX plain ON uq_origin(label)");
+    f.reopen(); // old record versions, with no origin metadata
+    assert!(f.admin().catalog_presentation().unwrap().constraints.is_empty());
+    assert_eq!(f.parts().ext.ext_version, 1);
+    f.execute("ALTER TABLE uq_origin ADD CONSTRAINT uq UNIQUE(label)");
+    let bit = engine::meta::UNIQUE_CONSTRAINT_IDENTITY;
+    let bits = u64::from_be_bytes(f.db().kv.get(Keyspace::Meta, b"features").unwrap().unwrap().try_into().unwrap());
+    assert_ne!(bits & bit, 0);
+    assert!(engine::content_check::check(f.db().kv.as_ref(), bits & !bit).is_err());
+    f.reopen();
+    assert_eq!(f.parts().ext.ext_version, 7);
+    let metadata = f.admin().catalog_presentation().unwrap();
+    let unique: Vec<_> = metadata.constraints.iter().filter(|c| c.kind == 'u').collect();
+    assert_eq!(unique.len(), 1); assert_eq!(unique[0].name, "uq");
+    assert!(f.parts().indexes.iter().any(|d| d.id == unique[0].index && d.unique));
+    f.execute("ALTER TABLE uq_origin DROP CONSTRAINT uq");
+    f.reopen();
+    assert!(f.admin().catalog_presentation().unwrap().constraints.is_empty());
+    assert_eq!(f.parts().indexes.len(), 1);
+}

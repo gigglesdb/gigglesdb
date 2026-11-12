@@ -238,6 +238,17 @@ pub(super) fn populate(
             }
         }
     }
+    for c in snapshot.constraints.iter().filter(|c| c.kind == 'u') {
+        let table = snapshot.tables.iter().find(|t| t.id == c.table).ok_or(Error::InvalidSnapshot)?;
+        let schema = snapshot.table_schema(c.table).0;
+        generated.get_mut("table_constraints").unwrap().push(vec![s(&snapshot.database), s(schema), s(&c.name),
+            s(&snapshot.database), s(schema), s(&table.name), s("UNIQUE"), s("NO"), s("NO"), s("YES"), s("YES")]);
+        for (position, id) in c.columns.iter().enumerate() {
+            let col = table.columns.iter().find(|col| col.id == *id).ok_or(Error::InvalidSnapshot)?;
+            generated.get_mut("key_column_usage").unwrap().push(vec![s(&snapshot.database), s(schema), s(&c.name),
+                s(&snapshot.database), s(schema), s(&table.name), s(&col.name), I(position as i64 + 1), N]);
+        }
+    }
     for (name, rows) in generated {
         all.get_mut(name).unwrap().rows = rows;
     }

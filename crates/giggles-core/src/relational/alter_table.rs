@@ -365,6 +365,9 @@ pub(super) fn execute(
                 }
                 let id = table.columns[at].id;
                 if candidate.ext.constraints.values().flatten().any(|constraint| matches!(&constraint.kind, ConstraintKind::ForeignKey { columns, ref_table, ref_columns, .. } if columns.contains(&id) || (*ref_table == table.id && ref_columns.contains(&id)))) { return Err(SqlError::Unsupported); }
+                if let Some(cs) = candidate.ext.constraints.get_mut(&table.id) {
+                    cs.retain(|c| !matches!(&c.kind, ConstraintKind::Unique { columns, .. } if columns.contains(&id)));
+                }
                 let descriptors = candidate
                     .secondary_descriptors_engine()
                     .iter()
