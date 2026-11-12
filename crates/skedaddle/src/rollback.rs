@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod apply;
 pub mod destination;
+pub mod driver;
 pub mod finalize;
 pub mod source;
 pub use finalize::{Finalize, FinalizeRecord, FinalizeStep, Inventory, Object, ObjectKind, Side};

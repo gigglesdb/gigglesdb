@@ -1363,4 +1363,76 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+    #[test]
+    fn rollback_runtime_journal_callbacks_work_inside_async_apply_and_recover() {
+        use crate::coordinator::rollback::{Record, Step};
+        use crate::rollback::{apply::Journal as _, driver::RuntimeJournal};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (journal, _) = executor.block_on(activated());
+        let root = task_root();
+        let local = executor
+            .block_on(Local::recover(root.join("rollback-bridge"), &journal))
+            .unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "bridge-owner").unwrap();
+        executor.block_on(coordinator.acquire()).unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let runtime = engine.runtime();
+        executor.block_on(admit(&runtime, true)).unwrap();
+        // Exercise authenticated recovery of an admission; the CLI gate stays off.
+        executor
+            .block_on(runtime.commit(Transition::Rollback {
+                record: Box::new(Record::Admit {
+                    request: "bridge-request".into(),
+                    deadline_at_ms: u64::MAX,
+                }),
+            }))
+            .unwrap();
+        let mut adapter = RuntimeJournal::new(&runtime, Default::default()).unwrap();
+        executor.block_on(async {
+            crate::rollback::destination::Journal::publish(
+                &mut adapter,
+                Record::Intent {
+                    step: Step::PreHook,
+                },
+            )
+            .unwrap();
+            crate::rollback::destination::Journal::native(
+                &mut adapter,
+                &crate::cutover::Record::Drain(Default::default()),
+            )
+            .unwrap();
+            crate::rollback::destination::Journal::publish(
+                &mut adapter,
+                Record::Checkpoint {
+                    step: Step::PreHook,
+                    final_marker: None,
+                },
+            )
+            .unwrap();
+            adapter
+                .save("bridge-request", Default::default(), true)
+                .unwrap();
+        });
+        let recovered = RuntimeJournal::new(&runtime, Default::default()).unwrap();
+        assert_eq!(
+            crate::rollback::destination::Journal::state(&recovered)
+                .rollback
+                .as_ref()
+                .unwrap()
+                .next,
+            Step::FenceDestination
+        );
+        assert_eq!(recovered.destination_records().unwrap().len(), 1);
+        assert!(recovered.progress("bridge-request").unwrap().1);
+        assert!(recovered.progress("other-request").is_err());
+        drop(adapter);
+        drop(recovered);
+        drop(runtime);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
