@@ -561,3 +561,23 @@ cells are NOT RUN. Full command output and server logs remain in the evidence
 directory. No product files are changed, and the temporary psql container is
 removed on completion. The script does not build binaries or run upgrades on
 operator data.
+
+## v2 real-process crash qualification
+
+Build `giggles-server` in `crates/giggles-server` and `giggles` in
+`crates/giggles-core`, both with default features and the same external target
+directory. With Docker and `postgres:18.6` available, run:
+
+```powershell
+python -I compat/v2_qualification.py --server-bin J:/gigglesdb-work/p1-pc/target/debug/giggles-server.exe
+```
+
+The default run uses seed 5412, 30 four-connection crash iterations, three DDL
+crashes, and 5,000,000 rows with a PK and two secondary indexes, followed by v2
+export/restore verification. `--seed`, `--iterations`, `--rows`, `--batch` and
+`--work` configure the run; work must remain beneath `J:/gigglesdb-work`.
+Each unique evidence directory contains `report.md`, server/client logs and
+transaction intent/COMMIT acknowledgement journals. Failures stop immediately
+with a nonzero exit and retain data for reproduction; successful large-load
+and restored data are removed. The script abruptly kills its servers and
+removes its temporary psql container before exiting. No product files change.
