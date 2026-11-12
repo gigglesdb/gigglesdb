@@ -533,6 +533,116 @@ fn reset_receipts(m: &Shared) {
     m.synced = false;
 }
 
+// Each journal callback is a crash boundary, including the checkpoint after effects.
+#[test]
+fn finalize_crash_at_every_journal_boundary_recovers_and_never_drops_before_intent() {
+    use rollback::{FinalizeRecord, FinalizeStep};
+    #[derive(Default)]
+    struct Evidence {
+        intent: bool,
+        drops: Inventory,
+        objects: Inventory,
+    }
+    struct Catalog(Rc<RefCell<Evidence>>, Side);
+    impl fence::Connection for Catalog {
+        fn query(&mut self, sql: &str, _: Duration) -> Result<fence::Rows, String> {
+            let mut e = self.0.borrow_mut();
+            assert!(e.intent, "catalog access before durable intent");
+            let column = |kind| match kind {
+                ObjectKind::Slot => "slot_name",
+                ObjectKind::Publication => "pubname",
+                ObjectKind::EventTrigger => "evtname",
+                ObjectKind::ReplicationOrigin => "roname",
+                ObjectKind::Schema => "nspname",
+            };
+            if sql.contains("DROP ")
+                || sql.contains("pg_drop_replication_slot(slot_name)")
+                || sql.contains("pg_replication_origin_drop(roname)")
+            {
+                let objects: Vec<_> = e
+                    .objects
+                    .iter()
+                    .filter(|o| {
+                        o.side == self.1
+                            && (sql.contains(&format!("\"{}\"", o.name))
+                                || sql.contains(&format!("E'{}'", o.name)))
+                    })
+                    .cloned()
+                    .collect();
+                // Kind is disambiguated by SQL as all fixture kinds use one name.
+                for object in objects {
+                    let matches = match object.kind {
+                        ObjectKind::Slot => sql.contains("pg_drop_replication_slot"),
+                        ObjectKind::Publication => sql.contains("DROP PUBLICATION"),
+                        ObjectKind::EventTrigger => sql.contains("DROP EVENT TRIGGER"),
+                        ObjectKind::ReplicationOrigin => sql.contains("pg_replication_origin_drop"),
+                        ObjectKind::Schema => sql.contains("DROP SCHEMA"),
+                    };
+                    if matches {
+                        assert!(e.drops.contains(&object), "drop before journal intent");
+                        e.objects.remove(&object);
+                    }
+                }
+                return Ok(vec![]);
+            }
+            Ok(e.objects
+                .iter()
+                .filter(|o| {
+                    o.side == self.1
+                        && sql.starts_with(&format!("SELECT {}::text", column(o.kind)))
+                        && sql.contains(&format!("E'{}'", o.name))
+                })
+                .map(|o| vec![o.name.clone()])
+                .collect())
+        }
+    }
+    for crash in 0..18 {
+        let evidence = Rc::new(RefCell::new(Evidence {
+            objects: manifest(),
+            ..Default::default()
+        }));
+        let initial = Finalize::new(key("faults"), true, manifest()).unwrap();
+        let mut state = initial.clone();
+        let mut durable = initial;
+        let mut calls = 0;
+        let mut faulted = false;
+        while state.next != FinalizeStep::Complete {
+            let result = state.execute_next(
+                &mut Guard,
+                &mut Catalog(evidence.clone(), Side::Source),
+                &mut Catalog(evidence.clone(), Side::Destination),
+                &mut |_| {
+                    assert!(evidence.borrow().intent);
+                    Ok(())
+                },
+                &mut |record| {
+                    let fail = calls == crash && !faulted;
+                    calls += 1;
+                    if fail {
+                        faulted = true;
+                        return Err("injected crash".into());
+                    }
+                    match record {
+                        FinalizeRecord::Intent(_) => evidence.borrow_mut().intent = true,
+                        FinalizeRecord::Drop(object) => {
+                            evidence.borrow_mut().drops.insert(object.clone());
+                        }
+                        FinalizeRecord::Checkpoint(saved) => durable = saved.clone(),
+                    }
+                    Ok(())
+                },
+            );
+            if result.is_err() {
+                assert!(faulted);
+                state = serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+            }
+        }
+        assert!(faulted, "boundary {crash} was not exercised");
+        assert!(state.leftovers().unwrap().is_empty());
+        assert!(evidence.borrow().objects.is_empty());
+    }
+}
+
 // These tests deliberately use two disposable databases, never Docker directly.
 // The fixture consumes real pgoutput INSERT/message frames for its single table;
 // it is not the general reverse capture/applier qualification (P11a owns that).

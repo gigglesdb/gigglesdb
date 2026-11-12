@@ -184,9 +184,10 @@ fn initialized_status_report_assessment_and_not_wired_commands() {
     assert_eq!(invoke(&r, &["report", &id]).0, 0);
     assert_eq!(invoke(&r, &["assess", &id]).0, 2);
     assert_eq!(invoke(&r, &["assess", &id, "--sample", "10"]).0, 9);
-    for command in ["start", "resume", "rollback", "finalize"] {
+    for command in ["start", "resume", "rollback"] {
         assert_eq!(invoke(&r, &[command, &id]).0, 9);
     }
+    assert_eq!(invoke(&r, &["finalize", &id]).0, 3);
     let (code, verification) = invoke(&r, &["verify", &id]);
     assert_eq!(code, 6, "{verification}");
     assert_eq!(verification["outcome"], "infrastructure");
@@ -312,7 +313,7 @@ fn definition_override_and_operational_options() {
         }
         assert_eq!(invoke(&r, &args).0, 3, "{deadline:?}");
     }
-    assert_eq!(invoke(&r, &["finalize", &id, "--drop-objects"]).0, 9);
+    assert_eq!(invoke(&r, &["finalize", &id, "--drop-objects"]).0, 3);
     for id in ["C:bad", "bad:name", "../bad", "bad?name"] {
         assert_eq!(invoke(&r, &["status", id]).0, 3);
     }

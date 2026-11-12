@@ -558,7 +558,7 @@ impl Service {
 
 /// Dedicated synchronous administrative transports; the blocking driver owns
 /// their runtime. Reverse setup can move them to its joined bridge thread.
-struct Pg {
+pub(super) struct Pg {
     rt: Arc<tokio::runtime::Runtime>,
     session: Session,
     config: tls::Config,
@@ -566,7 +566,7 @@ struct Pg {
     healthy: bool,
 }
 impl Pg {
-    fn open(
+    pub(super) fn open(
         rt: Arc<tokio::runtime::Runtime>,
         config: &tls::Config,
         connection: &Connection,

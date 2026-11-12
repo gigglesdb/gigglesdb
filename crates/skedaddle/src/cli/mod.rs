@@ -734,23 +734,27 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
         }
         Command::Rollback { .. } => Err(unwired("rollback")),
         Command::Finalize { drop_objects, .. } => {
-            if *drop_objects
-                || !matches!(
-                    state.lifecycle.state,
-                    State::DestinationActive | State::RollbackWindow
-                )
-            {
-                return Err(unwired("finalize"));
+            if !crate::runner::finalize_allowed(&state) {
+                return Err(fail(
+                    Outcome::InvalidInput,
+                    "Invalid finalize state",
+                    "Finalize requires a rollback window or ended eligibility.",
+                    "Inspect migration status.",
+                ));
             }
-            let response = crate::runner::request_finalize(root, id).await;
+            let response = crate::runner::request_finalize_objects(root, id, *drop_objects).await;
             if response.exit_code == 0 {
                 Ok((Outcome::Success, response.data))
             } else {
                 let mut error = fail(
-                    Outcome::Blocked,
+                    match response.exit_code {
+                        3 => Outcome::InvalidInput,
+                        8 => Outcome::NonOwner,
+                        _ => Outcome::Infrastructure,
+                    },
                     "Finalization could not reach the active owner",
-                    "No lifecycle change was authorized.",
-                    "Resume the post-activation owner and retry.",
+                    "Inspect durable progress; an admitted cleanup retries under the owner.",
+                    "Resume the post-activation owner and inspect status.",
                 );
                 error.2 = response.data;
                 Err(error)

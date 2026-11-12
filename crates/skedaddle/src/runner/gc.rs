@@ -13,6 +13,8 @@ use std::{
 struct Request {
     generation: String,
     request: String,
+    #[serde(default)]
+    drop_objects: bool,
 }
 fn failed(kind: &str, exit_code: u8) -> VerifyResponse {
     VerifyResponse {
@@ -26,6 +28,15 @@ pub async fn request_gc(root: &Path, id: &str) -> VerifyResponse {
 }
 
 pub(super) async fn request(root: &Path, id: &str, action: &str) -> VerifyResponse {
+    request_options(root, id, action, false).await
+}
+
+pub(super) async fn request_options(
+    root: &Path,
+    id: &str,
+    action: &str,
+    drop_objects: bool,
+) -> VerifyResponse {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -41,6 +52,7 @@ pub(super) async fn request(root: &Path, id: &str, action: &str) -> VerifyRespon
         Err(_) => return failed("infrastructure", 6),
     };
     let request = Request {
+        drop_objects,
         generation: generation.clone(),
         request: uuid::Uuid::new_v4().to_string(),
     };

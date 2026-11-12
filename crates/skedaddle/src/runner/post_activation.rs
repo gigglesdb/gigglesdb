@@ -22,11 +22,17 @@ pub async fn request_finalize(root: &Path, id: &str) -> VerifyResponse {
     super::gc::request(root, id, "finalize").await
 }
 
+pub async fn request_finalize_objects(root: &Path, id: &str, drop_objects: bool) -> VerifyResponse {
+    super::gc::request_options(root, id, "finalize", drop_objects).await
+}
+
 #[derive(Deserialize)]
 struct Request {
     generation: String,
     #[serde(alias = "run")]
     request: String,
+    #[serde(default)]
+    drop_objects: bool,
 }
 
 pub(super) async fn resume(
@@ -96,6 +102,28 @@ async fn serve(
             return Err(coordinator::Error::Rejected(
                 "post-activation owner cannot run forward work".into(),
             ));
+        }
+        if *pause.borrow() || owner.requested()? {
+            break;
+        }
+        if let Some((saved, _)) = state.progress.get(super::finalize::REQUEST) {
+            let drop_objects = serde_json::from_str::<bool>(saved)?;
+            workers = None; // These workers own sockets directly, with no spawned capture task.
+            match super::finalize::run(&runtime, id, drop_objects, context.as_ref().map(|(_, d)| d))
+                .await
+            {
+                Ok(()) => {
+                    finalize(&runtime).await?;
+                    continue;
+                }
+                Err(coordinator::Error::LostOwnership | coordinator::Error::Observer) => {
+                    return Err(coordinator::Error::LostOwnership);
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
         }
         if state.rollback_eligibility_ended.is_none() && tokio::time::Instant::now() >= retry_at {
             let result = if let Some((journal, definition)) = &context {
@@ -215,10 +243,59 @@ async fn serve(
                     data: json!({"error":{"kind":"invalid_request"}}),
                 }
             } else if action == "finalize" {
-                finalize(&runtime).await?;
-                VerifyResponse {
-                    exit_code: 0,
-                    data: json!({"final_state":State::Finalized}),
+                let state = runtime.state().await;
+                if !super::finalize::allowed(&state) {
+                    VerifyResponse {
+                        exit_code: 3,
+                        data: json!({"error":{"kind":"invalid_state"}}),
+                    }
+                } else {
+                    // Durable admission disables capture restart and health probes on recovery.
+                    if let Err(error) = runtime
+                        .marker(
+                            super::finalize::REQUEST,
+                            serde_json::to_string(&request.drop_objects)?,
+                            "intent".into(),
+                        )
+                        .await
+                    {
+                        respond_failure(&path, &error)?;
+                        return Err(error);
+                    }
+                    workers = None;
+                    match super::finalize::run(
+                        &runtime,
+                        id,
+                        request.drop_objects,
+                        context.as_ref().map(|(_, d)| d),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Err(error) = finalize(&runtime).await {
+                                respond_failure(&path, &error)?;
+                                return Err(error);
+                            }
+                            VerifyResponse {
+                                exit_code: 0,
+                                data: json!({"final_state":State::Finalized}),
+                            }
+                        }
+                        Err(coordinator::Error::LostOwnership | coordinator::Error::Observer) => {
+                            write_json(
+                                &path.with_extension("response"),
+                                &VerifyResponse {
+                                    exit_code: 8,
+                                    data: json!({"error":{"kind":"lost_ownership"}}),
+                                },
+                            )?;
+                            return Err(coordinator::Error::LostOwnership);
+                        }
+                        Err(_) => VerifyResponse {
+                            exit_code: 6,
+                            data: json!({"error":{"kind":"infrastructure","retrying":true}}),
+                        },
+                    }
                 }
             } else {
                 // Forward verification and forward GC have no reverse authority.
@@ -277,6 +354,24 @@ async fn serve(
     })
 }
 
+fn respond_failure(path: &Path, error: &coordinator::Error) -> coordinator::Result<()> {
+    let (exit_code, kind) = if matches!(
+        error,
+        coordinator::Error::LostOwnership | coordinator::Error::Observer
+    ) {
+        (8, "lost_ownership")
+    } else {
+        (6, "infrastructure")
+    };
+    write_json(
+        &path.with_extension("response"),
+        &VerifyResponse {
+            exit_code,
+            data: json!({"error":{"kind":kind}}),
+        },
+    )
+}
+
 pub(super) async fn end_workers(
     runtime: &crate::engine::Runtime,
     reason: EligibilityEnd,
@@ -290,6 +385,11 @@ pub(super) async fn end_workers(
 }
 
 async fn finalize(runtime: &crate::engine::Runtime) -> coordinator::Result<()> {
+    if !super::finalize::allowed(&runtime.state().await) {
+        return Err(coordinator::Error::Rejected(
+            "finalize requires rollback window or ended eligibility".into(),
+        ));
+    }
     if runtime.state().await.rollback_eligibility_ended.is_none() {
         runtime
             .commit(Transition::RollbackEligibilityEnded {
@@ -938,7 +1038,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eligible_but_unhealthy_owner_can_finalize_with_specific_reason() {
+    async fn eligible_but_unhealthy_destination_active_refuses_finalize() {
         let (journal, _) = activated().await;
         let root = task_root();
         let local = Local::recover(root.join("finalize"), &journal)
@@ -948,13 +1048,46 @@ mod tests {
         coordinator.acquire().await.unwrap();
         let engine = Engine::new(coordinator, journal.clone());
         admit(&engine.runtime(), false).await.unwrap();
-        finalize(&engine.runtime()).await.unwrap();
+        assert!(finalize(&engine.runtime()).await.is_err());
         let state = journal.load(true).await.unwrap();
-        assert_eq!(state.lifecycle.state, State::Finalized);
+        assert_eq!(state.lifecycle.state, State::DestinationActive);
+        assert_eq!(state.rollback_eligibility_ended, None);
+    }
+
+    #[tokio::test]
+    async fn admitted_finalize_resumes_before_probes_and_records_intent_before_lifecycle() {
+        let (journal, _) = activated().await;
+        let root = task_root();
+        let local = Local::recover(root.join("resume-finalize"), &journal)
+            .await
+            .unwrap();
+        let mut coordinator = Coordinator::observer(journal.clone(), local, "finalizer").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let runtime = engine.runtime();
+        admit(&runtime, true).await.unwrap();
+        runtime
+            .marker(
+                super::super::finalize::REQUEST,
+                "false".into(),
+                "intent".into(),
+            )
+            .await
+            .unwrap();
+        let admitted = journal.load(true).await.unwrap();
+        assert_eq!(admitted.lifecycle.state, State::RollbackWindow);
+        assert!(admitted.rollback_eligibility_ended.is_none());
+        let (_pause, receive) = watch::channel(false);
+        let reached = serve(runtime, &root, "migration", receive, None)
+            .await
+            .unwrap();
+        assert_eq!(reached.state, State::Finalized);
+        let done = journal.load(true).await.unwrap();
         assert_eq!(
-            state.rollback_eligibility_ended,
+            done.rollback_eligibility_ended,
             Some(EligibilityEnd::OperatorFinalized)
         );
+        assert!(done.applied_seq > admitted.applied_seq);
     }
 
     #[tokio::test]
