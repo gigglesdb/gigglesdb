@@ -184,8 +184,12 @@ fn initialized_status_report_assessment_and_not_wired_commands() {
     assert_eq!(invoke(&r, &["report", &id]).0, 0);
     assert_eq!(invoke(&r, &["assess", &id]).0, 2);
     assert_eq!(invoke(&r, &["assess", &id, "--sample", "10"]).0, 9);
-    for command in ["start", "resume", "rollback"] {
+    for command in ["start", "resume"] {
         assert_eq!(invoke(&r, &[command, &id]).0, 9);
+    }
+    assert_eq!(invoke(&r, &["rollback", &id]).0, 3);
+    for deadline in ["0s", "soon", "5d", "-1s"] {
+        assert_eq!(invoke(&r, &["rollback", &id, "--deadline", deadline]).0, 3);
     }
     assert_eq!(invoke(&r, &["finalize", &id]).0, 3);
     let (code, verification) = invoke(&r, &["verify", &id]);

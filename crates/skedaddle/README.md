@@ -227,6 +227,17 @@ parameters or fragments. Definitions alone do not qualify remote runner assembly
 
 ### Hooks and rollback
 
+The rollback journal contract (`coordinator::rollback`) records admission and
+`rolling-back` atomically, then requires a current-epoch intent before each step
+checkpoint. It retains the request identity, absolute deadline and final marker
+behind coordinator metadata. Its conservative point of no return is publication
+of the reverse-apply intent, before any reverse transaction may commit. A deadline
+abort before that point keeps `rolling-back` until destination restoration is
+checkpointed; only then does it return to `rollback-window`. Eligibility loss
+blocks new transfer and restoration intents, retaining the fences for recovery.
+This contract is not yet connected to the owner's transfer driver; eligible CLI
+requests continue to fail closed without admission or endpoint effects.
+
 Each hook has `name`, `phase`, positive `timeout_seconds`, `command` and
 `secret_env`. `command` is an executable/argument array. `secret_env` keys name
 the supplied environment variables; its values are references. Do not embed
@@ -258,7 +269,7 @@ Init uses the first 24 hex characters of the definition digest as migration ID.
 | `status <id> [--watch]` | Wired observer; watch is flushed NDJSON. |
 | `verify <id> [--tables ...]` | Wired active-owner request; exit 6 with no owner. |
 | `cutover <id> --deadline <dur>` | Wired active-owner request to `request_cutover`; exits 0 completed, 2 not ready or deadline, 3 invalid, 5 uncertain or breach, 6 no owner or infrastructure, 8 lost ownership. |
-| `rollback <id>` | Requires the rollback-window owner (not yet available): exit 9. |
+| `rollback <id> [--deadline <dur>]` | Generation-scoped owner request (default: configured downtime budget). Exits 3 for wrong state/ineligible/invalid deadline, 6 for no owner/infrastructure, 8 for stale generation. Eligible requests currently fail closed with exit 2 (`rollback_driver_unavailable`); no fence or lifecycle change is performed until the reverse transfer driver is connected. |
 | `finalize <id> [--drop-objects]` | Active-owner request from rollback-window, or destination-active after eligibility ended. Stops reverse capture; explicit `--drop-objects` removes installed objects on both endpoints. Exits 0 completed, 3 invalid, 6 no owner/infrastructure, 8 lost ownership. |
 | `abort <id>` | Wired coordinator-only; exit 9 if journal history records any external effect; no database restoration. |
 | `report <id>` | Wired safe trust/status reporting. |

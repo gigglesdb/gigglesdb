@@ -393,6 +393,7 @@ impl Journal {
                         | super::State::Finalized
                 }
             } | Transition::RollbackEligibilityEnded { .. }
+                | Transition::Rollback { .. }
                 | Transition::ReverseSetup { .. }
                 | Transition::ReverseConsistentPoint { .. }
                 | Transition::VerificationInvalidated { .. }

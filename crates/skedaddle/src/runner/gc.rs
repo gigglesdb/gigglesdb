@@ -15,11 +15,13 @@ struct Request {
     request: String,
     #[serde(default)]
     drop_objects: bool,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
 }
 fn failed(kind: &str, exit_code: u8) -> VerifyResponse {
     VerifyResponse {
         exit_code,
-        data: json!({"error":{"kind":kind,"message":"Owner buffer GC request could not complete safely; inspect owner status."}}),
+        data: json!({"error":{"kind":kind,"message":"Owner request could not complete safely; inspect owner status."}}),
     }
 }
 /// This observer never acquires migration authority or opens the buffer store.
@@ -37,6 +39,16 @@ pub(super) async fn request_options(
     action: &str,
     drop_objects: bool,
 ) -> VerifyResponse {
+    request_with_deadline(root, id, action, drop_objects, None).await
+}
+
+pub(super) async fn request_with_deadline(
+    root: &Path,
+    id: &str,
+    action: &str,
+    drop_objects: bool,
+    deadline_ms: Option<u64>,
+) -> VerifyResponse {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -52,6 +64,7 @@ pub(super) async fn request_options(
         Err(_) => return failed("infrastructure", 6),
     };
     let request = Request {
+        deadline_ms,
         drop_objects,
         generation: generation.clone(),
         request: uuid::Uuid::new_v4().to_string(),

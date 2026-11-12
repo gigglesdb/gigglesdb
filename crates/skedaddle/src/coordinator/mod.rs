@@ -14,6 +14,7 @@ pub mod journal;
 pub mod local;
 pub mod readiness;
 pub mod reverse;
+pub mod rollback;
 mod scratch;
 pub mod verification;
 
@@ -515,6 +516,9 @@ pub enum Transition {
     RollbackEligibilityEnded {
         reason: reverse::EligibilityEnd,
     },
+    Rollback {
+        record: Box<rollback::Record>,
+    },
     ReverseSetup {
         record: Box<reverse::SetupRecord>,
     },
@@ -572,6 +576,8 @@ pub struct Materialized {
 /// Cold metadata shares one allocation while retaining the checkpoint wire shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<rollback::Checkpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback_eligibility_ended: Option<reverse::EligibilityEnd>,
     #[serde(
@@ -663,6 +669,9 @@ impl Materialized {
                     Transition::RollbackEligibilityEnded { reason } => {
                         reverse::end_eligibility(self, reason)?;
                     }
+                    Transition::Rollback { record } => {
+                        rollback::apply(self, record, entry.seq, entry.at)?;
+                    }
                     Transition::ReverseSetup { record } => {
                         reverse::apply_setup(self, record, entry.seq)?;
                     }
@@ -673,6 +682,11 @@ impl Materialized {
                         reverse::apply_recovered(self, receipt)?;
                     }
                     Transition::Lifecycle { event } => {
+                        if self.rollback.is_some() && self.lifecycle.state == State::RollingBack {
+                            return Err(Error::Rejected(
+                                "rollback lifecycle requires its typed journal checkpoint".into(),
+                            ));
+                        }
                         reverse::guard_lifecycle(self, event)?;
                         if matches!(
                             event,

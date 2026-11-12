@@ -33,6 +33,8 @@ struct Request {
     request: String,
     #[serde(default)]
     drop_objects: bool,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
 }
 
 pub(super) async fn resume(
@@ -219,6 +221,8 @@ async fn serve(
             }
             let action = if name.starts_with("finalize-") {
                 "finalize"
+            } else if name.starts_with("rollback-") {
+                "rollback"
             } else if name.starts_with("verify-") {
                 "verify"
             } else if name.starts_with("gc-") {
@@ -242,6 +246,8 @@ async fn serve(
                     exit_code: 3,
                     data: json!({"error":{"kind":"invalid_request"}}),
                 }
+            } else if action == "rollback" {
+                super::rollback::admission(&runtime.state().await, request.deadline_ms)
             } else if action == "finalize" {
                 let state = runtime.state().await;
                 if !super::finalize::allowed(&state) {
@@ -1088,6 +1094,67 @@ mod tests {
             Some(EligibilityEnd::OperatorFinalized)
         );
         assert!(done.applied_seq > admitted.applied_seq);
+    }
+
+    #[tokio::test]
+    async fn rollback_requests_reject_stale_generation_and_ineligible_window() {
+        let (journal, _) = activated().await;
+        let root = task_root();
+        let local = Local::recover(root.join("rollback-request"), &journal)
+            .await
+            .unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "rollback-owner").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let runtime = engine.runtime();
+        admit(&runtime, true).await.unwrap();
+        end_workers(&runtime, EligibilityEnd::SourceFenceBreach)
+            .await
+            .unwrap();
+        let before = journal.load(true).await.unwrap().applied_seq;
+        let (pause, receive) = watch::channel(false);
+        let owner = serve(runtime.clone(), &root, "migration", receive, None);
+        let requests = async {
+            let control = root.join("migration.control");
+            let generation = loop {
+                if let Some(value) = active(&control).unwrap() {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let stale = uuid::Uuid::new_v4().to_string();
+            for (generation, expected, kind) in [
+                (stale, 8, "stale_generation"),
+                (generation, 3, "rollback_ineligible"),
+            ] {
+                let request = uuid::Uuid::new_v4().to_string();
+                let path = control.join(format!("rollback-{generation}-{request}.request"));
+                write_json(
+                    &path,
+                    &json!({"generation":generation,"request":request,"deadline_ms":30_000}),
+                )
+                .unwrap();
+                let response = loop {
+                    if let Ok(bytes) = std::fs::read(path.with_extension("response")) {
+                        break serde_json::from_slice::<VerifyResponse>(&bytes).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(response.exit_code, expected);
+                assert_eq!(response.data["error"]["kind"], kind);
+            }
+            assert_eq!(journal.load(true).await.unwrap().applied_seq, before);
+            pause.send(true).unwrap();
+        };
+        let (reached, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(owner, requests)
+        })
+        .await
+        .unwrap();
+        assert_eq!(reached.unwrap().state, State::RollbackWindow);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

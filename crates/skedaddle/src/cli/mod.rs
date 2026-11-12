@@ -166,6 +166,8 @@ enum Command {
     },
     Rollback {
         id: String,
+        #[arg(long)]
+        deadline: Option<String>,
     },
     Finalize {
         id: String,
@@ -427,7 +429,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
         | Command::Status { id, .. }
         | Command::Verify { id, .. }
         | Command::Cutover { id, .. }
-        | Command::Rollback { id }
+        | Command::Rollback { id, .. }
         | Command::Finalize { id, .. }
         | Command::Abort { id }
         | Command::Report { id } => id,
@@ -456,6 +458,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             | Command::Pause { .. }
             | Command::Verify { .. }
             | Command::Cutover { .. }
+            | Command::Rollback { .. }
             | Command::Finalize { .. }
             | Command::Buffer { .. }
     ) {
@@ -732,7 +735,42 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
                 })?;
             cutover_result(response)
         }
-        Command::Rollback { .. } => Err(unwired("rollback")),
+        Command::Rollback { deadline, .. } => {
+            let configured_deadline = format!("{}s", def.budgets.max_downtime_seconds);
+            let deadline =
+                cutover_deadline(Some(deadline.as_deref().unwrap_or(&configured_deadline)))?;
+            if state.lifecycle.state != State::RollbackWindow
+                || state.rollback_eligibility_ended.is_some()
+            {
+                return Err(fail(
+                    Outcome::InvalidInput,
+                    "Invalid rollback state",
+                    "Rollback requires an eligible rollback window.",
+                    "Inspect migration status.",
+                ));
+            }
+            let response = crate::runner::request_rollback(root, id, deadline).await;
+            let outcome = match response.exit_code {
+                0 => Outcome::Success,
+                2 => Outcome::Blocked,
+                3 => Outcome::InvalidInput,
+                5 => Outcome::RecoveryRequired,
+                8 => Outcome::NonOwner,
+                _ => Outcome::Infrastructure,
+            };
+            if response.exit_code == 0 {
+                Ok((outcome, response.data))
+            } else {
+                let mut error = fail(
+                    outcome,
+                    "Rollback request could not complete",
+                    "Inspect data.error.kind for the owner decision.",
+                    "Inspect migration status before retrying.",
+                );
+                error.2 = response.data;
+                Err(error)
+            }
+        }
         Command::Finalize { drop_objects, .. } => {
             if !crate::runner::finalize_allowed(&state) {
                 return Err(fail(
@@ -790,8 +828,8 @@ fn cutover_deadline(raw: Option<&str>) -> Result<Duration> {
     let invalid = || {
         fail(
             Outcome::InvalidInput,
-            "cutover requires a positive --deadline",
-            "Cutover must be bounded by an explicit deadline before fencing writes.",
+            "Transfer requires a positive --deadline",
+            "A transfer must be bounded by a positive deadline before fencing writes.",
             "Pass --deadline <n>[ms|s|m|h], for example --deadline 30s.",
         )
     };
@@ -891,7 +929,7 @@ fn contextualize(cli: &Cli, mut failure: Failure) -> Failure {
                 | Command::Status { id, .. }
                 | Command::Verify { id, .. }
                 | Command::Cutover { id, .. }
-                | Command::Rollback { id }
+                | Command::Rollback { id, .. }
                 | Command::Finalize { id, .. }
                 | Command::Abort { id }
                 | Command::Report { id }

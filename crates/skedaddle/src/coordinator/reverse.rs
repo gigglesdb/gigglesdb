@@ -504,8 +504,9 @@ pub(super) fn end_eligibility(state: &mut Materialized, reason: &EligibilityEnd)
     if !matches!(
         state.lifecycle.state,
         State::DestinationActive | State::RollbackWindow
-    ) {
-        return Err(Error::Rejected("eligibility can end only after destination activation and before rollback/finalization".into()));
+    ) && !(state.lifecycle.state == State::RollingBack && state.rollback.is_some())
+    {
+        return Err(Error::Rejected("eligibility can end only after destination activation or during journaled rollback, before finalization".into()));
     }
     if state.rollback_eligibility_ended.is_some() {
         return Err(Error::Rejected("rollback eligibility already ended".into()));
