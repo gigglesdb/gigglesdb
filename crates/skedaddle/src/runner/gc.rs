@@ -22,6 +22,10 @@ fn failed(kind: &str, exit_code: u8) -> VerifyResponse {
 }
 /// This observer never acquires migration authority or opens the buffer store.
 pub async fn request_gc(root: &Path, id: &str) -> VerifyResponse {
+    request(root, id, "gc").await
+}
+
+pub(super) async fn request(root: &Path, id: &str, action: &str) -> VerifyResponse {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -40,7 +44,7 @@ pub async fn request_gc(root: &Path, id: &str) -> VerifyResponse {
         generation: generation.clone(),
         request: uuid::Uuid::new_v4().to_string(),
     };
-    let path = control.join(format!("gc-{generation}-{}.request", request.request));
+    let path = control.join(format!("{action}-{generation}-{}.request", request.request));
     if write_json(&path, &request).is_err() {
         return failed("infrastructure", 6);
     }

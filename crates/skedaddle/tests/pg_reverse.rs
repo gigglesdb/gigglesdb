@@ -130,20 +130,16 @@ fn ddl_record(tag: &str) -> ddl::DdlRecord {
 
 #[test]
 fn unsupported_ddl_new_types_and_extensions_end_eligibility_without_rows() {
-    for (tag, kind) in [
-        ("DROP TABLE", 0),
-        ("CREATE TYPE", 1),
-        ("CREATE EXTENSION", 2),
+    for tag in [
+        "DROP TABLE",
+        "CREATE TYPE",
+        "CREATE EXTENSION",
+        "ALTER TABLE",
     ] {
         let e = Eligibility::new(|_| Ok(()));
         let mut schemas = ddl::SchemaVersions::new("p11a".into(), 0, []).unwrap();
         assert!(e.check_ddl(&mut schemas, &[ddl_record(tag)]).is_err());
-        assert!(matches!(
-            (kind, e.first_violation()),
-            (0, Some(Violation::UnsupportedDdl { .. }))
-                | (1, Some(Violation::NewType { .. }))
-                | (2, Some(Violation::Extension { .. }))
-        ));
+        assert_eq!(e.first_violation(), Some(Violation::DestinationDdl));
         assert!(e.check_ddl(&mut schemas, &[]).is_err());
     }
 }
@@ -227,7 +223,7 @@ fn ddl_batch_retains_the_first_violation_in_statement_order() {
     assert!(e.check_ddl(&mut schemas, &[first, later]).is_err());
     assert!(matches!(
         e.first_violation(),
-        Some(Violation::UnsupportedDdl { .. })
+        Some(Violation::DestinationDdl)
     ));
 }
 
@@ -987,4 +983,31 @@ async fn tls_connect(
     assert!(transport.encrypted());
     assert!(transport.warnings.is_empty());
     Ok((client, driver))
+}
+
+#[test]
+fn live_post_activation_health_is_read_only_and_detects_missing_publication() {
+    let _guard = REAL_PG.lock().unwrap();
+    let Some(mut fixture) = Fixture::gated("post_activation_health") else {
+        return;
+    };
+    let ready = fixture.setup();
+    let barrier = ready.slot().consistent_point + 1;
+    let sql = fixture.config.health_sql(&ready, barrier).unwrap();
+    assert_eq!(
+        fixture
+            .destination
+            .sql(&format!("SELECT result::text FROM ({sql}) q(result)"))[0][0],
+        "true"
+    );
+    fixture.destination.sql(&format!(
+        "DROP PUBLICATION {}",
+        fixture.config.publication()
+    ));
+    assert_eq!(
+        fixture
+            .destination
+            .sql(&format!("SELECT result::text FROM ({sql}) q(result)"))[0][0],
+        "false"
+    );
 }

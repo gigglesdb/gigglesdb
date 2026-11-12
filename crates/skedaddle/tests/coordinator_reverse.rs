@@ -323,9 +323,10 @@ async fn epoch_namespace_owner_fence_and_nonpredating_proofs_are_refused() {
 async fn nonjournaled_metadata_cannot_publish_a_checkpoint_or_mint_a_token() {
     let (journal, mut state, binding) = fenced().await;
     let proof = setup_records(&journal, &mut state, &binding).await;
+    let proof_seq = state.applied_seq;
     let reverse = state.verification.reverse.as_mut().unwrap();
     reverse.proof = Some(Box::new(proof));
-    reverse.proof_seq = state.applied_seq;
+    reverse.proof_seq = proof_seq;
     assert!(journal.checkpoint(&state).await.is_err());
     assert!(matches!(
         journal.authenticated_reverse().await,
@@ -396,4 +397,173 @@ async fn checkpoint_cannot_replace_missing_raw_setup_proof() {
             .await
             .is_err()
     );
+}
+
+async fn activated() -> (Journal, Materialized) {
+    let (journal, mut state, binding) = fenced().await;
+    let proof = setup_records(&journal, &mut state, &binding).await;
+    append(
+        &journal,
+        &mut state,
+        Transition::ReverseConsistentPoint {
+            proof: Box::new(proof),
+        },
+    )
+    .await;
+    append(
+        &journal,
+        &mut state,
+        Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::DestinationActive,
+            },
+        },
+    )
+    .await;
+    (journal, state)
+}
+
+async fn rejects(journal: &Journal, state: &Materialized, transition: Transition) {
+    let entry = Entry::new(state, transition, "owner").unwrap();
+    assert!(journal.put(&entry).await.is_err());
+    let mut projected = state.clone();
+    assert!(projected.apply(&entry).is_err());
+    assert_eq!(&projected, state);
+}
+
+#[tokio::test]
+async fn destination_active_finalizes_only_after_durable_eligibility_end() {
+    let (journal, mut state) = activated().await;
+    let finalize = Transition::Lifecycle {
+        event: Event::Advance {
+            to: State::Finalized,
+        },
+    };
+    rejects(&journal, &state, finalize.clone()).await;
+    let reason = coordinator::reverse::EligibilityEnd::Domain {
+        violation: pg::Violation::Extension {
+            name: "new extension".into(),
+        },
+    };
+    append(
+        &journal,
+        &mut state,
+        Transition::RollbackEligibilityEnded {
+            reason: reason.clone(),
+        },
+    )
+    .await;
+    journal.checkpoint(&state).await.unwrap();
+    let recovered = journal.load(false).await.unwrap();
+    assert_eq!(recovered.rollback_eligibility_ended, Some(reason));
+    append(&journal, &mut state, finalize).await;
+    assert_eq!(
+        journal.load(true).await.unwrap().lifecycle.state,
+        State::Finalized
+    );
+}
+
+#[tokio::test]
+async fn eligibility_end_is_at_most_once_and_closes_window_admission() {
+    let (journal, mut state) = activated().await;
+    append(
+        &journal,
+        &mut state,
+        Transition::RollbackEligibilityEnded {
+            reason: coordinator::reverse::EligibilityEnd::SourceFenceBreach,
+        },
+    )
+    .await;
+    rejects(
+        &journal,
+        &state,
+        Transition::RollbackEligibilityEnded {
+            reason: coordinator::reverse::EligibilityEnd::Domain {
+                violation: pg::Violation::IrreversibleMapping,
+            },
+        },
+    )
+    .await;
+    rejects(
+        &journal,
+        &state,
+        Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::RollbackWindow,
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        journal
+            .load(false)
+            .await
+            .unwrap()
+            .rollback_eligibility_ended,
+        Some(coordinator::reverse::EligibilityEnd::SourceFenceBreach)
+    );
+}
+
+#[tokio::test]
+async fn window_eligibility_end_refuses_rollback_and_allows_finalization() {
+    let (journal, mut state) = activated().await;
+    append(
+        &journal,
+        &mut state,
+        Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::RollbackWindow,
+            },
+        },
+    )
+    .await;
+    append(
+        &journal,
+        &mut state,
+        Transition::RollbackEligibilityEnded {
+            reason: coordinator::reverse::EligibilityEnd::SourceFenceBreach,
+        },
+    )
+    .await;
+    rejects(
+        &journal,
+        &state,
+        Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::RollingBack,
+            },
+        },
+    )
+    .await;
+    append(
+        &journal,
+        &mut state,
+        Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::Finalized,
+            },
+        },
+    )
+    .await;
+    rejects(
+        &journal,
+        &state,
+        Transition::RollbackEligibilityEnded {
+            reason: coordinator::reverse::EligibilityEnd::SourceFenceBreach,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn eligibility_end_is_rejected_before_activation() {
+    let (journal, state, _) = fenced().await;
+    rejects(
+        &journal,
+        &state,
+        Transition::RollbackEligibilityEnded {
+            reason: coordinator::reverse::EligibilityEnd::SourceFenceBreach,
+        },
+    )
+    .await;
 }

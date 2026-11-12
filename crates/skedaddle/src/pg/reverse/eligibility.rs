@@ -13,11 +13,26 @@ use crate::{
 /// Stable, typed journal/status reasons. Values themselves are never recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Violation {
-    Value { reason: MappingFailure },
-    UnsupportedDdl { reason: String },
-    NewType { relation: String, column: String },
-    Extension { name: String },
+    Value {
+        reason: MappingFailure,
+    },
+    UnsupportedDdl {
+        reason: String,
+    },
+    NewType {
+        relation: String,
+        column: String,
+    },
+    Extension {
+        name: String,
+    },
     IrreversibleMapping,
+    #[serde(rename = "destination-ddl")]
+    DestinationDdl,
+    #[serde(rename = "destination-catalog-drift")]
+    DestinationCatalogDrift,
+    #[serde(rename = "activation-baseline-unavailable")]
+    ActivationBaselineUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,36 +136,12 @@ impl Eligibility {
     /// fail independently of whether a subsequent row happens to use them.
     pub fn check_ddl(
         &self,
-        schemas: &mut crate::pg::ddl::SchemaVersions,
+        _schemas: &mut crate::pg::ddl::SchemaVersions,
         records: &[crate::pg::ddl::DdlRecord],
     ) -> Result<(), MappingError> {
         self.ensure()?;
-        if let crate::pg::ddl::Classification::SafeBoundaryStop(stop) =
-            schemas.classify_transaction(records)
-        {
-            let record = records.iter().find(|r| r.version == stop.schema_version);
-            let violation = match record {
-                Some(r)
-                    if r.tag.contains("EXTENSION")
-                        || r.commands
-                            .iter()
-                            .any(|c| c.in_extension || c.object_type == "extension") =>
-                {
-                    Violation::Extension {
-                        name: "destination extension DDL".into(),
-                    }
-                }
-                Some(r) if r.tag.contains("TYPE") || r.tag.contains("DOMAIN") => {
-                    Violation::NewType {
-                        relation: "destination type DDL".into(),
-                        column: String::new(),
-                    }
-                }
-                _ => Violation::UnsupportedDdl {
-                    reason: stop.reason,
-                },
-            };
-            self.end(violation)?;
+        if !records.is_empty() {
+            self.end(Violation::DestinationDdl)?;
             return self.ensure();
         }
         Ok(())

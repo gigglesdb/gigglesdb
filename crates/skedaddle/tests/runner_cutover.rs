@@ -611,6 +611,17 @@ async fn pg_full_cutover_under_concurrent_writes_reports_timings_and_pause() {
                 .any(|s| s.step == skedaddle::cutover::Step::Activate)
         );
         assert!(write_pause_ms <= 120_000);
+        assert!(
+            owner.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "post-activation owner exited"
+        );
+        let finalized = tokio::time::timeout(
+            Duration::from_secs(10),
+            skedaddle::runner::request_finalize(&fixture.root, &fixture.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(finalized.exit_code, 0, "{finalized:?}");
         owner.join().await;
         let terminal = request_cutover(&fixture.root, &fixture.id, Duration::from_secs(60))
             .await

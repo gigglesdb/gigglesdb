@@ -188,6 +188,43 @@ impl Config {
         fence::detect_breach(txn, drain, order, &self.origin(), window)
     }
 
+    /// Read-only post-activation admission check. Never recreate a lost slot or
+    /// rerun fenced setup after application access has been restored.
+    pub fn health_sql(&self, readiness: &Readiness, activation_lsn: u64) -> Result<String> {
+        readiness.check_activation(self, activation_lsn)?;
+        let slot = literal(&self.slot());
+        let publication = literal(&self.publication());
+        let tables = self
+            .tables
+            .iter()
+            .map(|(s, t)| {
+                Ok(format!(
+                    "{}::regclass::oid",
+                    literal(&format!("{}.{}", ident(s)?, ident(t)?))
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",");
+        Ok(format!(
+            "SELECT (EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name={slot} AND plugin='pgoutput' AND slot_type='logical' AND database=current_database() AND NOT temporary AND NOT active AND wal_status IN ('reserved','extended') AND restart_lsn <= '{}'::pg_lsn AND confirmed_flush_lsn >= '{}'::pg_lsn) AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname={publication} AND NOT puballtables AND pubinsert AND pubupdate AND pubdelete AND pubtruncate AND NOT pubviaroot) AND NOT EXISTS (SELECT 1 FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication}) AND (prqual IS NOT NULL OR prattrs IS NOT NULL)) AND NOT EXISTS (SELECT 1 FROM pg_publication_namespace WHERE pnpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) AND (SELECT array_agg(prrelid ORDER BY prrelid) FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) = (SELECT array_agg(x ORDER BY x) FROM unnest(ARRAY[{tables}]) x) AND ({}))",
+            format_args!(
+                "{:X}/{:X}",
+                readiness.slot.consistent_point >> 32,
+                readiness.slot.consistent_point as u32
+            ),
+            format_args!(
+                "{:X}/{:X}",
+                readiness.slot.consistent_point >> 32,
+                readiness.slot.consistent_point as u32
+            ),
+            self.trigger
+                .verify
+                .trim()
+                .trim_end_matches(';')
+                .trim_start_matches("SELECT ")
+        ))
+    }
+
     fn publication_sql(&self) -> Result<String> {
         let names = self
             .tables

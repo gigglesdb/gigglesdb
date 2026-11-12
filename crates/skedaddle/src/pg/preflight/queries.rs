@@ -270,6 +270,12 @@ pub(super) async fn collect(
 
         for (check, sql) in [
             (
+                Check::SchemaDescriptor,
+                format!(
+                    "SELECT c.oid::bigint AS oid, (SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,a.atttypid,a.atttypmod,a.attcollation,a.attnotnull,a.attidentity,a.attgenerated,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns, (SELECT jsonb_agg(jsonb_build_array(conname,contype,convalidated,pg_get_constraintdef(oid)) ORDER BY conname) FROM pg_constraint WHERE conrelid=c.oid) AS constraints, (SELECT jsonb_agg(jsonb_build_array(indexrelid,indisvalid,indisready,pg_get_indexdef(indexrelid)) ORDER BY indexrelid) FROM pg_index WHERE indrelid=c.oid) AS indexes FROM pg_class c WHERE c.oid IN ({oid})"
+                ),
+            ),
+            (
                 Check::ColumnTypes,
                 format!(
                     "SELECT a.attname AS column,t.oid::bigint AS oid,tn.nspname AS schema,t.typname AS name,t.typtype::text AS kind,t.typbasetype::bigint AS base_oid,t.typelem::bigint AS element_oid,a.atttypmod AS typmod,format_type(a.atttypid,a.atttypmod) AS formatted,a.attnotnull AS not_null,a.atthasdef AS has_default,(a.attgenerated<>'') AS generated,(a.attidentity<>'') AS identity FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace WHERE a.attrelid IN ({oid}) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"

@@ -583,7 +583,7 @@ fn reverse_setup_refreshes_snapshot_on_partial_failure_and_returns_real_proof() 
                     &mut destination_fence,
                 )?;
                 let state = runtime.snapshot();
-                assert!(state.verification.reverse.unwrap().proof.is_some());
+                assert!(state.verification.reverse.as_ref().unwrap().proof.is_some());
                 assert_eq!(
                     runtime.snapshot(),
                     async_runtime.block_on(f.journal.load(true)).unwrap()

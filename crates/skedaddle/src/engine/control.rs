@@ -46,7 +46,7 @@ impl PauseControl {
             Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
-    pub(super) fn activate(&self) -> Result<Owner> {
+    pub(crate) fn activate(&self) -> Result<Owner> {
         let gate = self.open("control.lock")?;
         gate.lock()?;
         let lock = self.open("owner.lock")?;
@@ -63,22 +63,22 @@ impl PauseControl {
         })
     }
 }
-pub(super) struct Owner {
+pub(crate) struct Owner {
     token: uuid::Uuid,
     control: PauseControl,
     request: PathBuf,
     lock: Option<File>,
 }
 impl Owner {
-    pub(super) fn generation(&self) -> uuid::Uuid {
+    pub(crate) fn generation(&self) -> uuid::Uuid {
         self.token
     }
-    pub(super) fn requested(&self) -> Result<bool> {
+    pub(crate) fn requested(&self) -> Result<bool> {
         Ok(self.request.try_exists()?)
     }
     /// Freeze the last accepted request while still holding the owner lock.
     /// A later request observes no owner and cannot alter this stop decision.
-    pub(super) fn retire(&mut self) -> Result<bool> {
+    pub(crate) fn retire(&mut self) -> Result<bool> {
         if self.lock.is_none() {
             return Ok(false);
         }

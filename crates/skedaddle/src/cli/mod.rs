@@ -456,6 +456,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             | Command::Pause { .. }
             | Command::Verify { .. }
             | Command::Cutover { .. }
+            | Command::Finalize { .. }
             | Command::Buffer { .. }
     ) {
         None
@@ -496,7 +497,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             }
             Ok((
                 Outcome::Success,
-                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state)}),
+                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":{"capture_healthy":state.rollback_eligibility_ended.is_none() && state.progress.get("reverse-capture-health").is_some_and(|(health,_)| health == "healthy"),"capture_status":state.progress.get("reverse-capture-health").map(|(health,_)| health),"lag_bytes":null,"eligible":state.rollback_eligibility_ended.is_none(),"eligibility_ended":state.rollback_eligibility_ended}}),
             ))
         }
         Command::Assess { sample, .. } => {
@@ -732,7 +733,29 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             cutover_result(response)
         }
         Command::Rollback { .. } => Err(unwired("rollback")),
-        Command::Finalize { .. } => Err(unwired("finalize")),
+        Command::Finalize { drop_objects, .. } => {
+            if *drop_objects
+                || !matches!(
+                    state.lifecycle.state,
+                    State::DestinationActive | State::RollbackWindow
+                )
+            {
+                return Err(unwired("finalize"));
+            }
+            let response = crate::runner::request_finalize(root, id).await;
+            if response.exit_code == 0 {
+                Ok((Outcome::Success, response.data))
+            } else {
+                let mut error = fail(
+                    Outcome::Blocked,
+                    "Finalization could not reach the active owner",
+                    "No lifecycle change was authorized.",
+                    "Resume the post-activation owner and retry.",
+                );
+                error.2 = response.data;
+                Err(error)
+            }
+        }
         Command::Buffer { .. } => {
             let response = crate::runner::request_gc(root, id).await;
             let outcome = match response.exit_code {

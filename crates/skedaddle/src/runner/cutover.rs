@@ -159,6 +159,9 @@ pub async fn request_cutover(
     {
         return Ok(failed(CutoverErrorKind::InvalidRequest));
     }
+    if let Some(outcome) = terminal(root, id).await.ok().flatten() {
+        return Ok(outcome);
+    }
     let control = root.join(format!("{id}.control"));
     let Some(generation) = active(&control).map_err(|_| infrastructure())? else {
         return Ok(terminal(root, id)
@@ -226,7 +229,10 @@ pub(super) fn terminal_outcome(
 ) -> coordinator::Result<Option<CutoverOutcome>> {
     if !matches!(
         state.lifecycle.state,
-        Lifecycle::DestinationActive | Lifecycle::AbortedToSource
+        Lifecycle::DestinationActive
+            | Lifecycle::RollbackWindow
+            | Lifecycle::Finalized
+            | Lifecycle::AbortedToSource
     ) {
         return Ok(None);
     }
@@ -235,7 +241,7 @@ pub(super) fn terminal_outcome(
     let valid = match (&outcome, state.lifecycle.state, saved.state.next) {
         (
             CutoverOutcome::Completed { cutover_id, .. },
-            Lifecycle::DestinationActive,
+            Lifecycle::DestinationActive | Lifecycle::RollbackWindow | Lifecycle::Finalized,
             driver::Step::Complete,
         )
         | (
@@ -960,6 +966,29 @@ impl driver::Reverse for Reverse<'_, '_> {
             &mut self.old_source,
             &mut target.state,
         )?;
+        // Setup installs the reverse objects first; qualify and retain the exact
+        // catalog pair while both application endpoints remain fenced.
+        let rt = self.destination.rt.clone();
+        rt.block_on(async {
+            let objects = selection::catalog_objects(&self.task.definition.selected_objects);
+            let source = preflight::collect(&mut self.old_source.session.client, &objects)
+                .await
+                .map_err(component)?;
+            let destination = preflight::collect(&mut self.destination.session.client, &objects)
+                .await
+                .map_err(component)?;
+            let selections: Vec<_> = self
+                .task
+                .tables
+                .iter()
+                .map(|t| t.selection.clone())
+                .collect();
+            catalog::build(&source, &destination, &selections, 0, true).map_err(component)?;
+            super::activation_baseline::Baseline::new(&self.task.journal, source, destination)
+                .persist(&self.task.journal, &self.task.runtime)
+                .await
+                .map_err(component)
+        })?;
         target.state.attach_reverse_proof(proof);
         Ok(())
     }

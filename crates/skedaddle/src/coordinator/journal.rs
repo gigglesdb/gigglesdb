@@ -388,8 +388,12 @@ impl Journal {
             Transition::Lifecycle {
                 event: super::Event::Advance {
                     to: super::State::DestinationActive
+                        | super::State::RollbackWindow
+                        | super::State::RollingBack
+                        | super::State::Finalized
                 }
-            } | Transition::ReverseSetup { .. }
+            } | Transition::RollbackEligibilityEnded { .. }
+                | Transition::ReverseSetup { .. }
                 | Transition::ReverseConsistentPoint { .. }
                 | Transition::VerificationInvalidated { .. }
                 | Transition::VerificationCompleted { .. }

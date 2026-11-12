@@ -486,3 +486,53 @@ impl Coordinator {
         runtime.block_on(self.journal.authenticated_reverse())
     }
 }
+
+/// Permanent rollback disqualification. These reasons contain no row values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum EligibilityEnd {
+    /// Explicit operator finalization ends any remaining rollback opportunity.
+    OperatorFinalized,
+    Domain {
+        violation: pg::Violation,
+    },
+    /// A source fence breach is also a critical operator alert.
+    SourceFenceBreach,
+}
+
+pub(super) fn end_eligibility(state: &mut Materialized, reason: &EligibilityEnd) -> Result<()> {
+    if !matches!(
+        state.lifecycle.state,
+        State::DestinationActive | State::RollbackWindow
+    ) {
+        return Err(Error::Rejected("eligibility can end only after destination activation and before rollback/finalization".into()));
+    }
+    if state.rollback_eligibility_ended.is_some() {
+        return Err(Error::Rejected("rollback eligibility already ended".into()));
+    }
+    state.rollback_eligibility_ended = Some(reason.clone());
+    Ok(())
+}
+
+pub(super) fn guard_lifecycle(state: &Materialized, event: &super::Event) -> Result<()> {
+    let super::Event::Advance { to } = event else {
+        return Ok(());
+    };
+    if state.lifecycle.state == State::DestinationActive
+        && *to == State::Finalized
+        && state.rollback_eligibility_ended.is_none()
+    {
+        return Err(Error::Rejected(
+            "destination-active finalization requires journaled rollback eligibility ending reason"
+                .into(),
+        ));
+    }
+    if matches!(to, State::RollbackWindow | State::RollingBack)
+        && state.rollback_eligibility_ended.is_some()
+    {
+        return Err(Error::Rejected(
+            "rollback eligibility permanently ended".into(),
+        ));
+    }
+    Ok(())
+}

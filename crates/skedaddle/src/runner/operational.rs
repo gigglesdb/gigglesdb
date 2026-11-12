@@ -300,12 +300,18 @@ pub async fn run(
     // Terminal replay is authenticated before connections or copy workers start.
     if resume {
         let terminal = open_journal(root, id).await?.load(true).await?;
-        if super::cutover::terminal_outcome(&terminal)?.is_some() {
+        if terminal.lifecycle.state.is_terminal() {
             return Ok(Reached {
                 state: terminal.lifecycle.state,
                 blockers: vec![],
                 target_reached: false,
             });
+        }
+    }
+    if resume {
+        let state = open_journal(root, id).await?.load(true).await?;
+        if super::post_activation::owns(state.lifecycle.state) {
+            return super::post_activation::resume(root, id, definition, pause).await;
         }
     }
     let prepared = Box::pin(prepare(definition))
@@ -772,6 +778,9 @@ pub async fn run(
     verification.publish_terminal_readiness().await?;
     applier.destination.close().await.map_err(recovery)?;
     let final_state = engine.runtime().state().await.lifecycle.state;
+    if result.is_ok() && super::post_activation::owns(final_state) {
+        return super::post_activation::resume(root, id, definition, pause).await;
+    }
     result
         .map(|mut reached| {
             reached.state = final_state;

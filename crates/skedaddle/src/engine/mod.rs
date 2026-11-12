@@ -173,6 +173,15 @@ impl Runtime {
         result?;
         Ok(())
     }
+    pub(crate) async fn refresh_owner(&self) -> Result<()> {
+        let mut coordinator = self.0.lock().await;
+        coordinator.refresh().await?;
+        *self.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+        if !coordinator.is_owner() {
+            return Err(coordinator::Error::LostOwnership);
+        }
+        Ok(())
+    }
     pub async fn marker(&self, stream: &str, marker: String, position: String) -> Result<()> {
         self.commit(Transition::Progress {
             stream: stream.into(),

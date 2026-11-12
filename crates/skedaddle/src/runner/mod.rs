@@ -3,9 +3,12 @@
 mod cutover;
 mod gc;
 pub use gc::request_gc;
+mod activation_baseline;
 mod destination_readiness;
 mod fence_readiness;
 mod operational;
+mod post_activation;
+pub use post_activation::request_finalize;
 mod readiness;
 mod reverse_capabilities;
 mod selection;

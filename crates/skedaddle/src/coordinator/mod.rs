@@ -157,7 +157,7 @@ impl State {
             VerifiedReady => &[SourceFenced, CatchingUp],
             SourceFenced => &[FinalBoundaryApplied, AbortedToSource],
             FinalBoundaryApplied => &[DestinationActive, AbortedToSource],
-            DestinationActive => &[RollbackWindow],
+            DestinationActive => &[RollbackWindow, Finalized],
             RollbackWindow => &[RollingBack, Finalized],
             RollingBack => &[SourceActiveAfterRollback],
             Finalized
@@ -512,6 +512,9 @@ pub enum Transition {
     VerificationInvalidated {
         invalidation: verification::Invalidation,
     },
+    RollbackEligibilityEnded {
+        reason: reverse::EligibilityEnd,
+    },
     ReverseSetup {
         record: Box<reverse::SetupRecord>,
     },
@@ -560,13 +563,36 @@ pub struct Materialized {
     /// Active original/current intents and the latest replay anchor, never history.
     pub audit: BTreeMap<u64, journal::Entry>,
     pub intent_roots: BTreeMap<u64, u64>,
+    #[serde(flatten)]
+    pub metadata: Box<MaterializedMetadata>,
+    pub verifier_ranges: BTreeMap<String, VerifierRange>,
+    pub verifier_exceptions: BTreeMap<String, VerifierException>,
+}
+
+/// Cold metadata shares one allocation while retaining the checkpoint wire shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_eligibility_ended: Option<reverse::EligibilityEnd>,
     #[serde(
         default,
         skip_serializing_if = "verification::VerificationState::is_empty"
     )]
-    pub verification: Box<verification::VerificationState>,
-    pub verifier_ranges: BTreeMap<String, VerifierRange>,
-    pub verifier_exceptions: BTreeMap<String, VerifierException>,
+    pub verification: verification::VerificationState,
+}
+
+impl std::ops::Deref for Materialized {
+    type Target = MaterializedMetadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl std::ops::DerefMut for Materialized {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
 }
 
 impl Materialized {
@@ -634,6 +660,9 @@ impl Materialized {
                         self.definition = Some((**definition).clone());
                         self.lifecycle.since_seq = entry.seq;
                     }
+                    Transition::RollbackEligibilityEnded { reason } => {
+                        reverse::end_eligibility(self, reason)?;
+                    }
                     Transition::ReverseSetup { record } => {
                         reverse::apply_setup(self, record, entry.seq)?;
                     }
@@ -644,6 +673,7 @@ impl Materialized {
                         reverse::apply_recovered(self, receipt)?;
                     }
                     Transition::Lifecycle { event } => {
+                        reverse::guard_lifecycle(self, event)?;
                         if matches!(
                             event,
                             Event::Advance {
@@ -835,4 +865,38 @@ pub enum CrashSeam {
     AfterJournalPut,
     AfterLocalApply,
     AfterEffect,
+}
+
+#[cfg(test)]
+mod metadata_layout_tests {
+    use super::*;
+
+    #[test]
+    fn boxed_metadata_preserves_checkpoint_fields_and_strict_decoding() {
+        let state = Materialized::default();
+        let legacy = serde_json::to_value(&state).unwrap();
+        assert!(legacy.get("verification").is_none());
+        assert!(legacy.get("rollback_eligibility_ended").is_none());
+        assert_eq!(
+            serde_json::from_value::<Materialized>(legacy.clone()).unwrap(),
+            state
+        );
+
+        let mut wire = legacy;
+        wire["rollback_eligibility_ended"] = serde_json::json!({"kind": "source-fence-breach"});
+        wire["verification"] = serde_json::json!({
+            "report": null, "invalidated": false, "generation": 7, "runs": {},
+            "reverse": {"binding": null, "slot": null, "readiness": null,
+                        "proof": null, "ready_seq": 0, "proof_seq": 0}
+        });
+        let decoded: Materialized = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            decoded.rollback_eligibility_ended,
+            Some(reverse::EligibilityEnd::SourceFenceBreach)
+        );
+        assert_eq!(decoded.verification.generation, 7);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+        wire["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Materialized>(wire).is_err());
+    }
 }

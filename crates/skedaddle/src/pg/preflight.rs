@@ -9,6 +9,7 @@ mod queries;
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_postgres::{Client, IsolationLevel, Transaction};
 
@@ -72,7 +73,7 @@ impl Default for Options {
 
 /// Exact executed SQL and complete JSON result rows, or a redacted SQLSTATE.
 /// Query failures block instead of disappearing from the report.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Observation {
     pub check: Check,
     pub object: Option<ObjectSelector>,
@@ -81,12 +82,12 @@ pub struct Observation {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub observations: Vec<Observation>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Check {
     Version,
     WalLevel,
@@ -118,11 +119,13 @@ pub enum Check {
     LongTransactions,
     RestartLocks,
     SelectedObject,
+    SchemaDescriptor,
 }
 
 impl Check {
     pub fn id(self) -> &'static str {
         match self {
+            Self::SchemaDescriptor => "schema_descriptor",
             Self::Version => "version",
             Self::WalLevel => "wal_level",
             Self::SlotHeadroom => "slot_headroom",
@@ -158,6 +161,9 @@ impl Check {
 
     fn remediation(self) -> &'static str {
         match self {
+            Self::SchemaDescriptor => {
+                "Restore catalog visibility and recollect the selected table schema."
+            }
             Self::Version => "Use PostgreSQL 16, 17 or 18; qualify newer majors before migration.",
             Self::WalLevel => {
                 "Use the writable primary; set wal_level=logical and restart PostgreSQL before starting capture."
@@ -396,6 +402,7 @@ fn classify_rows<F: Fn(&ColumnType) -> bool>(
         }
     };
     match observation.check {
+        Check::SchemaDescriptor => verdict(!rows.is_empty()),
         Check::Version => {
             if (16..=18).contains(&major) {
                 Supported

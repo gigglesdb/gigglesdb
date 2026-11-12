@@ -703,7 +703,7 @@ fn reference_advance_edges(state: State) -> &'static [State] {
         VerifiedReady => &[SourceFenced],
         SourceFenced => &[FinalBoundaryApplied, AbortedToSource],
         FinalBoundaryApplied => &[DestinationActive, AbortedToSource],
-        DestinationActive => &[RollbackWindow],
+        DestinationActive => &[RollbackWindow, Finalized],
         RollbackWindow => &[RollingBack, Finalized],
         RollingBack => &[SourceActiveAfterRollback],
         Finalized
@@ -893,7 +893,7 @@ fn reference_edges(state: State) -> &'static [State] {
         VerifiedReady => &[SourceFenced, CatchingUp],
         SourceFenced => &[FinalBoundaryApplied, AbortedToSource],
         FinalBoundaryApplied => &[DestinationActive, AbortedToSource],
-        DestinationActive => &[RollbackWindow],
+        DestinationActive => &[RollbackWindow, Finalized],
         RollbackWindow => &[RollingBack, Finalized],
         RollingBack => &[SourceActiveAfterRollback],
         Finalized
