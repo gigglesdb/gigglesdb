@@ -229,7 +229,7 @@ fn datagrip_list_schemas() {
             i(2200),
             i(0),
             s("public"),
-            Value::Null,
+            s("standard public schema"),
             s("pg_database_owner")
         ]
     );

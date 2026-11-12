@@ -3,6 +3,7 @@ use super::{Result, SessionSettings, database};
 
 #[derive(Clone)]
 pub(crate) enum Function {
+    Inventory(giggles_pg_catalog::ResultSet),
     Advisory { name: String, key: (bool, i64), column: String },
     Set {
         name: String,
@@ -21,6 +22,7 @@ pub(crate) enum Function {
 impl Function {
     pub fn column(&self) -> &str {
         match self {
+            Self::Inventory(_) => "setting",
             Self::Set { column, .. } | Self::Current { column, .. } | Self::Advisory { column, .. } => column,
         }
     }
@@ -47,6 +49,7 @@ impl Function {
     /// the wire dispatcher restores it at that transaction's end, without WARNING.
     pub fn evaluate(&self, settings: &mut SessionSettings) -> Result<Option<String>> {
         match self {
+            Self::Inventory(_) => unreachable!("settings inventory"),
             Self::Advisory { .. } => unreachable!("wire session function"),
             Self::Set {
                 name, value, local, ..
@@ -76,6 +79,7 @@ enum Token {
     Comma,
     Equals,
     Number(i64),
+    Cast,
 }
 fn lex(sql: &str) -> Option<Vec<Token>> {
     let mut chars = sql
@@ -91,6 +95,7 @@ fn lex(sql: &str) -> Option<Vec<Token>> {
             continue;
         }
         tokens.push(match c {
+            ':' if chars.next()? == ':' => Token::Cast,
             '(' => Token::Left,
             ')' => Token::Right,
             '.' => Token::Dot,
@@ -170,6 +175,72 @@ impl Parser {
             _ => None,
         }
     }
+}
+// Read-only compatibility defaults, not evidence of an autovacuum worker.
+// Keep the finite inventory explicit; unknown settings have no row.
+fn inventory(tokens: Vec<Token>) -> Option<Function> {
+    use giggles_pg_catalog::{Field, PgType, ResultSet, Value};
+    let mut p = Parser { tokens, at: 0 };
+    p.token(Token::Word("select".into()))?;
+    let names = ["name","setting","unit","min_val","max_val","vartype","context","source","boot_val","reset_val","pending_restart"];
+    let mut columns = Vec::new();
+    loop {
+        let name = p.word()?;
+        let index = names.iter().position(|n| *n == name)?;
+        let numeric = if p.tokens.get(p.at) == Some(&Token::Cast) {
+            p.at += 1;
+            if p.word()? != "numeric" || !matches!(index, 1 | 3 | 4 | 8 | 9) { return None; }
+            true
+        } else { false };
+        let alias = if p.tokens.get(p.at) == Some(&Token::Word("as".into())) { p.at += 1; p.word()? } else { name };
+        columns.push((index,numeric,alias));
+        if columns.len() > 128 { return None; }
+        if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
+        p.at += 1;
+    }
+    p.token(Token::Word("from".into()))?;
+    let mut relation = p.word()?;
+    if relation == "pg_catalog" { p.token(Token::Dot)?; relation = p.word()?; }
+    if relation == "pg_show_all_settings" { p.token(Token::Left)?; p.token(Token::Right)?; }
+    else if relation != "pg_settings" { return None; }
+    p.token(Token::Word("where".into()))?;
+    p.token(Token::Word("name".into()))?;
+    p.token(Token::Word("in".into()))?;
+    p.token(Token::Left)?;
+    let mut filter = Vec::new();
+    loop {
+        filter.push(p.text()?);
+        if filter.len() > 256 { return None; }
+        if p.tokens.get(p.at) != Some(&Token::Comma) { break; }
+        p.at += 1;
+    }
+    p.token(Token::Right)?;
+    if p.at != p.tokens.len() {
+        for word in ["order","by","name"] { p.token(Token::Word(word.into()))?; }
+    }
+    if p.at != p.tokens.len() { return None; }
+    let mut rows = Vec::new();
+    for (name,value,unit,min,max,kind,context) in [
+        ("autovacuum_analyze_scale_factor","0.1",None,"0","100","real","sighup"),
+        ("autovacuum_analyze_threshold","50",None,"0","2147483647","integer","sighup"),
+        ("autovacuum_freeze_max_age","200000000",None,"100000","2000000000","integer","postmaster"),
+        ("autovacuum_vacuum_cost_delay","2",Some("ms"),"-1","100","real","sighup"),
+        ("autovacuum_vacuum_cost_limit","-1",None,"-1","10000","integer","sighup"),
+        ("autovacuum_vacuum_scale_factor","0.2",None,"0","100","real","sighup"),
+        ("autovacuum_vacuum_threshold","50",None,"0","2147483647","integer","sighup"),
+        ("vacuum_freeze_min_age","50000000",None,"0","1000000000","integer","user"),
+        ("vacuum_freeze_table_age","150000000",None,"0","2000000000","integer","user"),
+    ] {
+        if !filter.iter().any(|n| n == name) { continue; }
+        let values = [Some(name),Some(value),unit,Some(min),Some(max),Some(kind),Some(context),Some("default"),Some(value),Some(value),None];
+        rows.push(columns.iter().map(|(i,numeric,_)| {
+            if *i == 10 { Value::Bool(false) }
+            else if *numeric { Value::Numeric(giggles_pg_types::Numeric::parse(values[*i].unwrap()).expect("numeric defaults")) }
+            else { values[*i].map(|s| Value::Text(s.into())).unwrap_or(Value::Null) }
+        }).collect());
+    }
+    let fields = columns.into_iter().map(|(i,numeric,name)| Field { name, data_type: if numeric { PgType::Numeric } else if i == 10 { PgType::Bool } else { PgType::Text } }).collect();
+    Some(Function::Inventory(ResultSet { fields, rows }))
 }
 fn parse(sql: &str) -> Option<Function> {
     let mut p = Parser {
@@ -271,6 +342,7 @@ fn parse(sql: &str) -> Option<Function> {
         p.at += 1;
         match &mut call {
             Function::Set { column: c, .. } | Function::Current { column: c, .. } | Function::Advisory { column: c, .. } => *c = column,
+            Function::Inventory(_) => unreachable!("separate inventory grammar"),
         }
     }
     if from_settings || p.tokens.get(p.at) == Some(&Token::Word("from".into())) {
@@ -312,6 +384,7 @@ fn parse(sql: &str) -> Option<Function> {
     (p.at == p.tokens.len()).then_some(call)
 }
 pub(crate) fn parse_function(sql: &str) -> Result<Option<Function>> {
+    if sql.len() <= 65536 && let Some(call) = lex(sql).and_then(inventory) { return Ok(Some(call)); }
     let Some(call) = parse(sql) else {
         return Ok(None);
     };
@@ -343,6 +416,17 @@ mod tests {
         let call = parse_function("SELECT set_config(name,'hex',false) FROM pg_show_all_settings() WHERE name='BYTEA_OUTPUT'").unwrap().unwrap();
         assert!(!call.has_row(&settings));
         assert!(parse_function("SELECT set_config('bytea_output','hex',false) FROM pg_show_all_settings() WHERE name='other'").unwrap().is_none());
+    }
+
+    #[test]
+    fn numeric_inventory_defaults_are_bounded_and_case_sensitive() {
+        let names = "'autovacuum_analyze_scale_factor','autovacuum_analyze_threshold','autovacuum_freeze_max_age','autovacuum_vacuum_cost_delay','autovacuum_vacuum_cost_limit','autovacuum_vacuum_scale_factor','autovacuum_vacuum_threshold','vacuum_freeze_min_age','vacuum_freeze_table_age'";
+        let sql = format!("SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ({names}) ORDER BY name");
+        let Function::Inventory(result) = parse_function(&sql).unwrap().unwrap() else { panic!("inventory") };
+        let expected = ["0.1","50","200000000","2","-1","0.2","50","50000000","150000000"];
+        assert_eq!(result.rows.iter().map(|r| r[1].clone()).collect::<Vec<_>>(), expected.into_iter().map(|s| giggles_pg_catalog::Value::Numeric(giggles_pg_types::Numeric::parse(s).unwrap())).collect::<Vec<_>>());
+        assert!(parse_function(&(sql.clone() + "; DELETE FROM x")).unwrap().is_none());
+        assert!(parse_function(&sql.replace("ORDER BY name", "ORDER BY setting")).unwrap().is_none());
     }
 
     #[test]

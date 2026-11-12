@@ -11,7 +11,7 @@ fn run(sql: &str, params: &[Value]) -> ResultSet {
 #[test]
 fn empty_description_xmin_descriptor_and_left_join_null() {
     let r = run(
-        "SELECT objoid,classoid,objsubid,description,xmin FROM pg_description",
+        "SELECT objoid,classoid,objsubid,description,xmin FROM pg_description WHERE objoid<>2200",
         &[],
     );
     assert_eq!(
@@ -48,7 +48,7 @@ fn empty_description_xmin_descriptor_and_left_join_null() {
     assert_eq!(r.fields[0].data_type, PgType::Xid);
     assert!(r.rows.is_empty());
     assert!(
-        run("SELECT age(xmin) FROM pg_description", &[])
+        run("SELECT age(xmin) FROM pg_description WHERE objoid<>2200", &[])
             .rows
             .is_empty()
     );

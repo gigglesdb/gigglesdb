@@ -205,7 +205,7 @@ fn qualified_wildcard_excludes_system_columns_and_preserves_duplicates() {
         result
             .rows
             .iter()
-            .all(|r| r[0] == r[1] && r[5] == Value::Null)
+            .all(|r| r[0] == r[1] && r[5] == if r[0] == Value::Int(2200) { Value::Text("standard public schema".into()) } else { Value::Null })
     );
     assert_eq!(
         plan("SELECT missing.* FROM pg_namespace n").unwrap_err(),
@@ -406,4 +406,23 @@ fn catalog_index_definition_uses_identity_and_search_path() {
             );
         }
     }
+}
+
+#[test]
+fn pg18_gui_description_casts_and_physical_statistics() {
+    let s = CatalogSnapshot::default();
+    assert_eq!(run("SELECT objoid,classoid,objsubid,description FROM pg_description WHERE objoid=2200", &s).rows,
+        vec![vec![Value::Int(2200),Value::Int(2615),Value::Int(0),Value::Text("standard public schema".into())]]);
+    let casts = run("SELECT oid,castsource,casttarget,castfunc,castcontext,castmethod FROM pg_cast ORDER BY oid", &s);
+    let expected = [(10010,23,20,481,"i","f"),(10011,23,21,314,"a","f"),(10012,23,700,318,"i","f"),(10013,23,701,316,"i","f"),(10014,23,1700,1740,"i","f"),(10034,23,16,2557,"e","f"),(10039,23,26,0,"i","b"),(10046,23,24,0,"i","b"),(10125,25,1042,0,"i","b"),(10126,25,1043,0,"i","b"),(10137,25,18,944,"a","f"),(10140,25,19,407,"i","f"),(10144,23,17,6368,"e","f"),(10150,23,18,78,"e","f")];
+    assert_eq!(casts.rows, expected.into_iter().map(|(o,s,t,f,c,m)| vec![Value::Int(o),Value::Int(s),Value::Int(t),Value::Int(f),Value::Text(c.into()),Value::Text(m.into())]).collect::<Vec<_>>());
+    assert_eq!(casts.fields.iter().map(|f| f.data_type).collect::<Vec<_>>(), vec![PgType::Oid,PgType::Oid,PgType::Oid,PgType::Oid,PgType::Char,PgType::Char]);
+    assert_eq!(run("SELECT DISTINCT castsource FROM pg_cast WHERE castcontext IN ('i','a') ORDER BY castsource", &s).rows, vec![vec![Value::Int(23)],vec![Value::Int(25)]]);
+    for function in ["pg_relation_size","pg_total_relation_size","pg_table_size","pg_indexes_size","pg_stat_get_numscans"] {
+        let result = run(&format!("SELECT {function}(c.oid),{function}(0::oid),{function}(NULL::oid) FROM pg_class c WHERE c.relname='pg_class'"), &s);
+        assert!(result.fields.iter().all(|f| f.data_type == PgType::Int8));
+        assert_eq!(result.rows, vec![vec![Value::Int(0),if function == "pg_stat_get_numscans" { Value::Int(0) } else { Value::Null },Value::Null]]);
+    }
+    assert_eq!(run("SELECT pg_relation_size(oid,'fsm') FROM pg_class WHERE relname='pg_class'", &s).rows, vec![vec![Value::Int(0)]]);
+    assert!(execute(&plan("SELECT pg_relation_size(oid,'invalid') FROM pg_class").unwrap().unwrap(), &s, &[]).is_err());
 }

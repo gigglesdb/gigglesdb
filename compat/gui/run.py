@@ -101,6 +101,14 @@ def main():
         sides = {side:jdbc(side,setup+[ids]) for side in ports}
         for q in setup: add('setup',q['id'],sides['pg'][q['id']],sides['giggles'][q['id']],q['sql'])
         oids = {side:sides[side]['ids'].get('rows',[[None,None,None]])[0] for side in ports}
+        objects = dict(id='objects',sql="SELECT n.nspname,c.relname,c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('gui_sales','gui_aux')")
+        inventories = {side:jdbc(side,[objects])['objects'] for side in ports}
+        if any(v.get('status') != 'OK' for v in inventories.values()):
+            raise RuntimeError('object identity inventory failed')
+        identities = {side:{tuple(row[:2]):row[2] for row in v['rows']} for side,v in inventories.items()}
+        mapping = {oid:identities['giggles'][key] for key,oid in identities['pg'].items() if key in identities['giggles']}
+        mapping.update({a:b for a,b in zip(oids['pg'],oids['giggles']) if a and b and int(a)>10000})
+        write(run/'oid-mapping.json',dict(inventories=inventories,mapping=mapping))
         if args.tool in ('all','dbeaver'):
             queries = json.loads((HERE/'queries.json').read_text())
             queries += [dict(id='metadata_'+name,sql='META:'+name) for name in ('schemas','tables','columns','indexes','pk','fk')]
@@ -163,8 +171,7 @@ def main():
             write(run/'pgadmin-oracle-queries.json',replay)
             adapted=[]
             for q in replay:
-                mapping={a:b for a,b in zip(oids['pg'],oids['giggles']) if a and b and int(a)>10000}
-                sql=re.sub(r'\b\d+\b',lambda m:str(mapping.get(m[0],m[0])),q['sql'])
+                sql=re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|\b(\d+)\b",lambda m:str(mapping.get(m[1],m[0])) if m[1] else m[0],q['sql'])
                 if oids['pg'][0] and oids['giggles'][0]:
                     sql=re.sub(r'(\b(?:oid|datid|datoid)\s*=\s*)'+oids['pg'][0]+r'\b',lambda m:m[1]+oids['giggles'][0],sql)
                 adapted.append(dict(q,sql=sql))

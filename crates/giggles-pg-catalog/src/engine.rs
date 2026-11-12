@@ -2918,6 +2918,11 @@ fn check_expr(e: &mut E) -> R<()> {
                     array_element(args[0].ty)?;
                 }
             }
+            "pg_relation_size" | "pg_total_relation_size" | "pg_table_size" | "pg_indexes_size"
+            | "pg_stat_get_numscans" => {
+                expect(&mut args[0], PgType::Oid)?;
+                if args.len() == 2 { expect(&mut args[1], PgType::Text)?; }
+            }
             "pg_relation_is_publishable" | "pg_get_statisticsobjdef_columns" => {
                 expect(&mut args[0], PgType::Oid)?
             }
@@ -2992,6 +2997,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
             0,
         ) => PgType::Name,
         ("to_regtype", 1) => PgType::Oid,
+        ("pg_relation_size", 1 | 2) | ("pg_total_relation_size" | "pg_table_size" | "pg_indexes_size" | "pg_stat_get_numscans", 1) => PgType::Int8,
         ("pg_backend_pid", 0) => PgType::Int4,
         ("txid_current", 0) => PgType::Int8,
         ("age", 1) if a[0].ty == PgType::Xid => PgType::Int4,
@@ -4754,6 +4760,12 @@ impl Runtime<'_> {
                     S(expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expr).into())
                 } else { v[0].clone() }
             },
+            "pg_relation_size" | "pg_total_relation_size" | "pg_table_size" | "pg_indexes_size" | "pg_stat_get_numscans" => {
+                if n == "pg_relation_size" && v.get(1).is_some_and(|f| !matches!(f, S(s) if matches!(s.as_str(), "main" | "fsm" | "vm" | "init"))) { return Err(Error::Unsupported); }
+                // No PostgreSQL heap/index files or scan counters are maintained.
+                // Zero measures those surfaces, not the shared engine's disk use.
+                if n == "pg_stat_get_numscans" || self.catalogs["pg_class"].rows.iter().any(|r| r[0] == v[0]) { I(0) } else { N }
+            }
             "obj_description" | "col_description" => N,
             "shobj_description" => {
                 let class = catalog::relation_oid(&text(v[1].clone())?)

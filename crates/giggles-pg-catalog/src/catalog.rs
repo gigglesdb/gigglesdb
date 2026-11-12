@@ -1276,6 +1276,20 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     let mut add = |name: &str, row: Vec<Value>| {
         all.get_mut(name).unwrap().rows.push(row);
     };
+    add("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
+    // PG18.6 casts from the integer/text GUI edit-type inventories. Both ends
+    // are supported built-in scalar/catalog types; this is not a routine registry.
+    for (oid, source, target, function, context, method) in [
+        (10010,23,20,481,"i","f"), (10011,23,21,314,"a","f"),
+        (10012,23,700,318,"i","f"), (10013,23,701,316,"i","f"),
+        (10014,23,1700,1740,"i","f"), (10034,23,16,2557,"e","f"),
+        (10039,23,26,0,"i","b"), (10046,23,24,0,"i","b"),
+        (10125,25,1042,0,"i","b"), (10126,25,1043,0,"i","b"),
+        (10137,25,18,944,"a","f"), (10140,25,19,407,"i","f"),
+        (10144,23,17,6368,"e","f"), (10150,23,18,78,"e","f"),
+    ] {
+        add("pg_cast", vec![I(oid),I(source),I(target),I(function),s(context),s(method),N]);
+    }
     // Only this freshly authorized connection is visible. TLS details beyond
     // the handshake status are not retained by the hosting session.
     add(

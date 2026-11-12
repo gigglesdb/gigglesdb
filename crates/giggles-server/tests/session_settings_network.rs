@@ -820,3 +820,19 @@ async fn advisory_warning_and_disconnected_waiter_release_locks() {
     }).await.unwrap();
     drop(b); f.stop().await;
 }
+
+#[tokio::test]
+async fn pgadmin_numeric_settings_inventory_shapes() {
+    let fixture = Fixture::new().await;
+    let client = fixture.client().await;
+    let sql = "SELECT name,setting::numeric AS setting,min_val,max_val,unit,vartype,context,source,boot_val,reset_val,pending_restart FROM pg_catalog.pg_show_all_settings() WHERE name IN ('autovacuum_vacuum_cost_delay','autovacuum_vacuum_threshold','missing') ORDER BY name";
+    let messages = client.simple_query(sql).await.unwrap();
+    let rows: Vec<_> = messages.iter().filter_map(|m| if let SimpleQueryMessage::Row(r) = m { Some((0..r.len()).map(|i| r.get(i)).collect::<Vec<_>>()) } else { None }).collect();
+    assert_eq!(rows, vec![vec![Some("autovacuum_vacuum_cost_delay"),Some("2"),Some("-1"),Some("100"),Some("ms"),Some("real"),Some("sighup"),Some("default"),Some("2"),Some("2"),Some("f")],vec![Some("autovacuum_vacuum_threshold"),Some("50"),Some("0"),Some("2147483647"),None,Some("integer"),Some("sighup"),Some("default"),Some("50"),Some("50"),Some("f")]]);
+    let statement = client.prepare(sql).await.unwrap();
+    assert_eq!(statement.columns().iter().map(|c| c.type_().oid()).collect::<Vec<_>>(), vec![25,1700,25,25,25,25,25,25,25,25,16]);
+    assert_eq!(client.query(&statement, &[]).await.unwrap().len(), 2);
+    assert!(client.simple_query("SELECT name,setting::numeric AS setting FROM pg_show_all_settings() WHERE name IN ('AUTOVACUUM_VACUUM_THRESHOLD') ORDER BY name").await.unwrap().iter().all(|m| !matches!(m, SimpleQueryMessage::Row(_))));
+    drop(client);
+    fixture.stop().await;
+}
