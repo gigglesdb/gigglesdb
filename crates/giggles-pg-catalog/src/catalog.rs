@@ -254,6 +254,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("datctype", T::Text),
             ("datlocale", T::Text),
             ("daticurules", T::Text),
+            ("dattablespace", T::Oid),
         ],
         "pg_user" | "pg_shadow" => &[
             ("usename", T::Name),
@@ -384,6 +385,14 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("client_serial", T::Numeric),
             ("issuer_dn", T::Text),
         ],
+        "pg_stat_gssapi" => &[
+            ("pid", T::Int4),
+            ("gss_authenticated", T::Bool),
+            ("principal", T::Text),
+            ("encrypted", T::Bool),
+            ("credentials_delegated", T::Bool),
+        ],
+        "pg_replication_slots" => &[("slot_name", T::Name)],
         "pg_user_mappings" => &[
             ("umid", T::Oid),
             ("srvid", T::Oid),
@@ -840,6 +849,8 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_user_mapping",
         "pg_locks",
         "pg_stat_ssl",
+        "pg_stat_gssapi",
+        "pg_replication_slots",
         "pg_am",
         "pg_extension",
         "pg_depend",
@@ -895,6 +906,8 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
                 | "pg_user_mappings"
                 | "pg_locks"
                 | "pg_stat_ssl"
+                | "pg_stat_gssapi"
+                | "pg_replication_slots"
         )
     {
         None
@@ -936,6 +949,8 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         // Stable virtual view identities, not persisted PostgreSQL catalog OIDs.
         "pg_locks" => 12050,
         "pg_stat_ssl" => 12051,
+        "pg_stat_gssapi" => 12257,
+        "pg_replication_slots" => 12261,
         "pg_am" => 2601,
         "pg_extension" => 3079,
         "pg_depend" => 2608,
@@ -1225,6 +1240,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             N,
         ],
     );
+    add(
+        "pg_stat_gssapi",
+        vec![
+            I(i64::from(snapshot.backend_pid)),
+            B(false),
+            N,
+            B(false),
+            B(false),
+        ],
+    );
     for (id, name, owner) in [
         (11, "pg_catalog", 10),
         (2200, "public", 6171),
@@ -1243,6 +1268,20 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             N,
         ],
     );
+    for (oid, name) in [(1663, "pg_default"), (1664, "pg_global")] {
+        add("pg_tablespace", vec![I(oid), s(name), I(10), N, N, N]);
+    }
+    if snapshot.database == "postgres" {
+        add(
+            "pg_shdescription",
+            vec![
+                I(16384),
+                I(1262),
+                I(0),
+                s("default administrative connection database"),
+            ],
+        );
+    }
     add("pg_am", vec![I(2), s("heap"), I(3), s("t"), N]);
     add("pg_am", vec![I(403), s("btree"), I(330), s("i"), N]);
     // Snapshot flags and predefined identities are presentation metadata, not
@@ -1951,7 +1990,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         row.extend([I(0), B(false), B(true), B(true), I(0)]);
     }
     for row in &mut all.get_mut("pg_database").unwrap().rows {
-        row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N]);
+        row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N, I(1663)]);
     }
     // No per-object MVCC tuple exists. Reporting the current durable generation
     // for every xmin makes DataGrip conservatively refresh every catalog object.

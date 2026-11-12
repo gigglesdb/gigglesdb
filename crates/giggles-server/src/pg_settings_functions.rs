@@ -246,14 +246,40 @@ fn parse(sql: &str) -> Option<Function> {
             Function::Set { column: c, .. } | Function::Current { column: c, .. } => *c = column,
         }
     }
-    if from_settings {
-        for word in ["from", "pg_settings", "where", "name"] {
-            p.token(Token::Word(word.into()))?;
+    if from_settings || p.tokens.get(p.at) == Some(&Token::Word("from".into())) {
+        p.token(Token::Word("from".into()))?;
+        let mut relation = p.word()?;
+        if relation == "pg_catalog" {
+            p.token(Token::Dot)?;
+            relation = p.word()?;
         }
+        match relation.as_str() {
+            "pg_settings" => {}
+            "pg_show_all_settings" => {
+                p.token(Token::Left)?;
+                p.token(Token::Right)?;
+            }
+            _ => return None,
+        }
+        p.token(Token::Word("where".into()))?;
+        p.token(Token::Word("name".into()))?;
         p.token(Token::Equals)?;
         let filter = p.text()?;
-        if let Function::Set { name, .. } = &mut call {
+        if let Function::Set {
+            name,
+            from_settings: source,
+            ..
+        } = &mut call
+        {
+            // Literal arguments need not equal the source row's name. Leave
+            // those forms to general SQL rather than silently changing them.
+            if !from_settings && *name != filter {
+                return None;
+            }
             *name = filter;
+            *source = true;
+        } else {
+            return None;
         }
     }
     (p.at == p.tokens.len()).then_some(call)
@@ -266,4 +292,45 @@ pub(crate) fn parse_function(sql: &str) -> Result<Option<Function>> {
         return Err("42601");
     }
     Ok(Some(call))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pgadmin_settings_source_and_case_sensitive_filter() {
+        let mut settings = SessionSettings::default();
+        for source in [
+            "pg_show_all_settings()",
+            "pg_catalog.pg_show_all_settings()",
+            "pg_settings",
+        ] {
+            let sql = format!(
+                "SELECT set_config('bytea_output','hex',false) FROM {source} WHERE name = 'bytea_output'"
+            );
+            let call = parse_function(&sql).unwrap().unwrap();
+            assert!(call.has_row(&settings));
+            assert_eq!(call.evaluate(&mut settings), Ok(Some("hex".into())));
+        }
+        let call = parse_function("SELECT set_config(name,'hex',false) FROM pg_show_all_settings() WHERE name='BYTEA_OUTPUT'").unwrap().unwrap();
+        assert!(!call.has_row(&settings));
+        assert!(parse_function("SELECT set_config('bytea_output','hex',false) FROM pg_show_all_settings() WHERE name='other'").unwrap().is_none());
+    }
+
+    #[test]
+    fn jdbc_max_index_keys_is_read_only() {
+        let mut settings = SessionSettings::default();
+        let call = parse_function(
+            "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(call.has_row(&settings));
+        assert_eq!(call.evaluate(&mut settings), Ok(Some("32".into())));
+        assert_eq!(
+            database::function_assignment("max_index_keys", "32", false).err(),
+            Some("22023")
+        );
+    }
 }

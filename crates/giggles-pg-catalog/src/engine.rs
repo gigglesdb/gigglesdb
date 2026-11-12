@@ -109,6 +109,7 @@ enum Source {
     Empty,
     Catalog(String),
     Derived(std::sync::Arc<Query>),
+    Cte(std::sync::Arc<Query>),
     Union(Box<Query>, Box<Query>, bool),
     FlatUnion(Vec<Query>),
     Series(E, E),
@@ -129,6 +130,7 @@ struct Query {
     distinct: bool,
     expand: Option<E>,
     source_width: usize,
+    outer_width: usize,
     group: Vec<E>,
     aggregate: bool,
 }
@@ -685,8 +687,8 @@ fn definitely_empty(q: &Query) -> bool {
         match s {
             Source::Empty => true,
             // No stored views/rules exist in this catalog model.
-            Source::Catalog(n) => n == "pg_rewrite",
-            Source::Derived(q) => definitely_empty(q),
+            Source::Catalog(n) => matches!(n.as_str(), "pg_rewrite" | "pg_auth_members"),
+            Source::Derived(q) | Source::Cte(q) => definitely_empty(q),
             Source::Filtered(s, _) => source(s),
             Source::Join(l, r, _, left, _, _) => source(l) || !*left && source(r),
             Source::Union(l, r, _) => definitely_empty(l) && definitely_empty(r),
@@ -724,8 +726,8 @@ impl Compiler {
                     return Err(Error::Unsupported);
                 }
                 let compiled = if with.recursive {
-                    // Only eliminate recursion proven empty by absent catalog
-                    // features (e.g. pg_dump's materialized-view dependencies).
+                    // Only eliminate recursive steps proven empty by absent catalog
+                    // features (views/rules and role memberships).
                     // A potentially productive recursion remains unsupported.
                     let a::SetExpr::SetOperation {
                         op: a::SetOperator::Union,
@@ -745,15 +747,14 @@ impl Compiler {
                     }
                     let mut branch = cte.query.clone();
                     branch.body = left.clone();
-                    let mut seed = self.query(&branch, &vec![])?;
-                    if !definitely_empty(&seed) {
-                        return Err(Error::Unsupported);
+                    let mut seed = self.query(&branch, outer)?;
+                    if definitely_empty(&seed) {
+                        seed.source = Source::Empty;
                     }
-                    seed.source = Source::Empty;
                     self.ctes
                         .insert(name.clone(), std::sync::Arc::new(seed.clone()));
                     branch.body = right.clone();
-                    let step = self.query(&branch, &vec![])?;
+                    let step = self.query(&branch, outer)?;
                     if !definitely_empty(&step) {
                         return Err(Error::Unsupported);
                     }
@@ -863,6 +864,7 @@ impl Compiler {
                 filter: truth(),
                 projection,
                 source_width: fields.len(),
+                outer_width: outer.len(),
                 fields,
                 order,
                 limit,
@@ -1183,6 +1185,25 @@ impl Compiler {
                         projection.push(column(i, c.field.data_type))
                     }
                 }
+                a::SelectItem::QualifiedWildcard(name, opts)
+                    if *opts == a::WildcardAdditionalOptions::default() =>
+                {
+                    let parts = object(name);
+                    let [qualifier] = parts.as_slice() else {
+                        return Err(Error::Unsupported);
+                    };
+                    let mut found = false;
+                    for (i, c) in schema[..source_width].iter().enumerate() {
+                        if c.qualifier == *qualifier && !c.system {
+                            found = true;
+                            fields.push(c.field.clone());
+                            projection.push(column(i, c.field.data_type));
+                        }
+                    }
+                    if !found {
+                        return Err(Error::UnknownColumn);
+                    }
+                }
                 _ => return Err(Error::Unsupported),
             }
         }
@@ -1266,6 +1287,7 @@ impl Compiler {
             distinct: s.distinct.is_some(),
             expand,
             source_width,
+            outer_width: outer.len(),
             group,
             aggregate,
         })
@@ -1457,7 +1479,7 @@ impl Compiler {
                     if p.len() == 1 && self.ctes.contains_key(&n) {
                         let q = self.ctes[&n].clone();
                         let fields = q.fields.clone();
-                        (Source::Derived(q), fields, alias, n)
+                        (Source::Cte(q), fields, alias, n)
                     } else if let Some(fields) = self.user_relations.get(&user_key) {
                         self.used_relations.insert(user_key.clone(), fields.clone());
                         (Source::Catalog(user_key), fields.clone(), alias, n)
@@ -2755,9 +2777,10 @@ fn check_expr(e: &mut E) -> R<()> {
             "pg_get_userbyid" | "pg_table_is_visible" | "pg_type_is_visible" => {
                 expect(&mut args[0], PgType::Oid)?
             }
-            "has_table_privilege" | "has_type_privilege" | "has_schema_privilege" => {
-                expect(&mut args[1], PgType::Text)?
-            }
+            "has_table_privilege"
+            | "has_type_privilege"
+            | "has_schema_privilege"
+            | "has_database_privilege" => expect(&mut args[1], PgType::Text)?,
             "nullif" => {
                 let t = common_type(args.iter())?;
                 for x in args {
@@ -2791,7 +2814,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("age", 1) if a[0].ty == PgType::Xid => PgType::Int4,
         ("greatest", n) if n > 0 => common_type(a.iter())?,
         ("version", 0) => PgType::Text,
-        ("pg_is_in_recovery", 0) => PgType::Bool,
+        ("pg_is_in_recovery" | "pg_is_wal_replay_paused", 0) => PgType::Bool,
         ("current_schemas", 1) => PgType::NameArray,
         ("acldefault", 2) => PgType::AclItemArray,
         ("array_remove", 2) => a[0].ty,
@@ -2819,7 +2842,13 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         }
         ("nullif", 2) => a[0].ty,
         ("coalesce", n) if n > 0 => a[0].ty,
-        ("has_table_privilege" | "has_schema_privilege" | "has_type_privilege", 2)
+        (
+            "has_table_privilege"
+            | "has_schema_privilege"
+            | "has_type_privilege"
+            | "has_database_privilege",
+            2,
+        )
         | ("pg_table_is_visible" | "pg_type_is_visible", 1) => PgType::Bool,
         _ => return Err(Error::Unsupported),
     })
@@ -2930,7 +2959,7 @@ fn collect_parameters(q: &Query, types: &mut [Option<PgType>]) -> R<()> {
                 source(input, types)?;
                 expr(filter, types, None)?;
             }
-            Source::Derived(q) => collect_parameters(q, types)?,
+            Source::Derived(q) | Source::Cte(q) => collect_parameters(q, types)?,
             Source::FlatUnion(arms) => {
                 for arm in arms {
                     collect_parameters(arm, types)?;
@@ -3070,6 +3099,12 @@ impl Runtime<'_> {
                 Ok(rows)
             }
             Source::Derived(q) => self.query(q, &[]),
+            Source::Cte(q) => self.query(
+                q,
+                outer
+                    .get(outer.len().checked_sub(q.outer_width).ok_or(Error::Type)?..)
+                    .ok_or(Error::Type)?,
+            ),
             Source::FlatUnion(arms) => flat_union::execute(self, arms, outer),
             Source::Union(l, r, distinct) => {
                 let mut out = self.query(l, outer)?;
@@ -4187,7 +4222,14 @@ impl Runtime<'_> {
                 // Always quoting is valid identifier SQL and avoids a keyword list.
                 S(format!("\"{}\"", name.replace('"', "\"\"")))
             }
-            "pg_tablespace_location" | "pg_get_partkeydef" => N,
+            "pg_tablespace_location" => {
+                if matches!(v[0], I(1663 | 1664)) {
+                    S(String::new())
+                } else {
+                    N
+                }
+            }
+            "pg_get_partkeydef" => N,
             "_partition_ancestors" => Value::Array(vec![]),
             "_regnamespace" => self.catalogs["pg_namespace"]
                 .rows
@@ -4330,6 +4372,28 @@ impl Runtime<'_> {
                     v[1].clone(),
                     &self.catalogs["pg_type"].rows,
                 )?)
+            }
+            "has_database_privilege" => {
+                let requested = text(v[1].clone())?.to_ascii_uppercase();
+                let privileges = requested.split(',').map(str::trim).collect::<Vec<_>>();
+                if privileges
+                    .iter()
+                    .any(|p| !["CREATE", "CONNECT", "TEMP", "TEMPORARY"].contains(p))
+                {
+                    return Err(Error::Unsupported);
+                }
+                let database = self.catalogs["pg_database"]
+                    .rows
+                    .iter()
+                    .find(|r| r[0] == v[0] || r[1] == v[0]);
+                match database {
+                    None => N,
+                    Some(database) => B(privileges.iter().any(|p| *p != "CREATE")
+                        || self.snapshot.roles.iter().any(|r| {
+                            r.name == self.snapshot.user
+                                && (r.superuser || I(i64::from(r.oid)) == database[2])
+                        })),
+                }
             }
             "has_table_privilege" | "has_schema_privilege" | "has_type_privilege" => {
                 let requested = text(v[1].clone())?;

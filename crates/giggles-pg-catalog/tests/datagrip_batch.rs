@@ -51,7 +51,8 @@ fn captured_expanded_global_discovery() {
         let r = run(sql, &[]);
         let expected = match i + 1 {
             2 => 17,
-            5 => 1,
+            4 => 2, // Built-in pg_default and pg_global tablespaces.
+            5 => 3, // Two tablespaces plus the snapshot database.
             11 => 3,
             _ => 0,
         };

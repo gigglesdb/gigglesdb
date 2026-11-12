@@ -32,7 +32,9 @@ pub(super) fn place(query: &mut Query, parameters: &[PgType]) {
 // predicates above them never cross projection, window, grouping, or LIMIT.
 fn place_inputs(source: &mut Source, width: usize, parameters: &[PgType]) {
     match source {
-        Source::Derived(query) => place(std::sync::Arc::make_mut(query), parameters),
+        Source::Derived(query) | Source::Cte(query) => {
+            place(std::sync::Arc::make_mut(query), parameters)
+        }
         Source::Union(l, r, _) => {
             place(l, parameters);
             place(r, parameters);

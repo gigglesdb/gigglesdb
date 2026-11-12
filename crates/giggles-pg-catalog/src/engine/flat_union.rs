@@ -162,6 +162,7 @@ pub(super) fn plan(tokens: Vec<Token>, gateway: bool) -> R<Option<Plan>> {
         return Err(Error::Type);
     }
     let query = Query {
+        outer_width: 0,
         projection: fields
             .iter()
             .enumerate()
@@ -194,6 +195,7 @@ pub(super) fn validate_wrapper(q: &Query) -> R<()> {
         || q.aggregate
         || q.limit != MAX_ROWS
         || q.source_width != q.fields.len()
+        || q.outer_width != 0
         || q.projection.len() != q.fields.len()
         || q.projection
             .iter()

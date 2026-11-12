@@ -105,3 +105,5 @@ mod datagrip_refresh;
 
 #[path = "orm_regtype.rs"]
 mod orm_regtype;
+#[path = "gui_browse.rs"]
+mod gui_browse;
