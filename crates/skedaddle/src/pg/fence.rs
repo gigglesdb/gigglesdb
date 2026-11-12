@@ -731,7 +731,7 @@ pub fn restoration_sql(
     Ok(sql)
 }
 
-fn read_catalog(
+pub(crate) fn read_catalog(
     connection: &mut impl Connection,
     tables: &[Table],
     timeout: Duration,

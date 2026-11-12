@@ -656,10 +656,16 @@ mod real_pg {
         let source = std::env::var("SKEDADDLE_ROLLBACK_PG_SOURCE_URL").ok();
         let destination = std::env::var("SKEDADDLE_ROLLBACK_PG_DESTINATION_URL").ok();
         match (source, destination) {
-            (Some(s), Some(d)) if !s.is_empty() && !d.is_empty() => Some((s, d)),
+            (Some(s), Some(d))
+                if !s.is_empty()
+                    && !d.is_empty()
+                    && std::env::var_os("SKEDADDLE_TEST_CONFIG").is_some() =>
+            {
+                Some((s, d))
+            }
             _ => {
                 // Bypass libtest capture so the skip is visible without --nocapture.
-                std::io::stderr().write_all(format!("SKIP {test}: set SKEDADDLE_ROLLBACK_PG_SOURCE_URL and SKEDADDLE_ROLLBACK_PG_DESTINATION_URL to two disposable PostgreSQL 16+ databases (superuser, wal_level=logical). Docker runs belong to the coordinator.\n").as_bytes()).expect("write loud skip");
+                std::io::stderr().write_all(format!("SKIP {test}: set SKEDADDLE_ROLLBACK_PG_SOURCE_URL and SKEDADDLE_ROLLBACK_PG_DESTINATION_URL plus SKEDADDLE_TEST_CONFIG to two disposable PostgreSQL 16+ databases (superuser, wal_level=logical). Docker runs belong to the coordinator.\n").as_bytes()).expect("write loud skip");
                 None
             }
         }
@@ -1312,7 +1318,48 @@ mod real_pg {
             return;
         };
         let _guard = SERIAL.lock().unwrap();
-        Fixture::new(&s, &d).run(None);
+        let mut fixture = Fixture::new(&s, &d);
+        fixture.run(None);
+        // Exercise the new final-step PG adapter with the authenticated ORIGINAL
+        // source snapshot; never replace it with the currently fenced catalog.
+        use rollback::source::{Effects, Journal};
+        struct Native(Vec<fence::Intent>);
+        impl Journal for Native {
+            fn state(&self) -> skedaddle::coordinator::Materialized {
+                Default::default()
+            }
+            fn publish(
+                &mut self,
+                _: skedaddle::coordinator::rollback::Record,
+            ) -> rollback::apply::Result<()> {
+                unreachable!()
+            }
+            fn native(&mut self, i: &fence::Intent) -> Result<(), String> {
+                self.0.push(i.clone());
+                Ok(())
+            }
+        }
+        let mut log = Native(vec![]);
+        let mut adapter = rollback::source::Pg {
+            source: fixture.source.clone(),
+            destination: fixture.destination.clone(),
+            original: fixture.source_fence.clone(),
+            scope: activate::SequenceScope {
+                tables: fixture.source_fence.config.tables.clone(),
+                sequences: vec![],
+            },
+            timeout: Duration::from_secs(30),
+        };
+        adapter.refence(&mut log).unwrap();
+        adapter.restore(&mut log).unwrap();
+        assert!(matches!(log.0.last(), Some(fence::Intent::Unfence(_))));
+        assert_eq!(
+            fixture.destination.sql(&format!(
+                "SELECT rolcanlogin::text FROM pg_roles WHERE rolname={}",
+                lit(&fixture.destination_role)
+            ))[0][0],
+            "false"
+        );
     }
     #[test]
     fn crash_during_rollback_recovers() {

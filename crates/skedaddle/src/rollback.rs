@@ -25,7 +25,10 @@
 use crate::{cutover, pg::reverse::Eligibility};
 use serde::{Deserialize, Serialize};
 
+pub mod apply;
+pub mod destination;
 pub mod finalize;
+pub mod source;
 pub use finalize::{Finalize, FinalizeRecord, FinalizeStep, Inventory, Object, ObjectKind, Side};
 
 pub type Journal<'a> = dyn FnMut(&Record) -> Result<(), String> + 'a;
