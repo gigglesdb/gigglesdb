@@ -115,7 +115,17 @@ pub(super) fn stage_pending(
     pending: &sequences::Pending,
 ) -> Result<(), CoreError> {
     let parts = db.catalog().parts(txn)?;
-    for (id, counter) in pending.lock().map_err(|_| CoreError::Fenced)?.iter() {
+    let mut pending = pending.lock().map_err(|_| CoreError::Fenced)?;
+    // A savepoint rollback can discard a RESTART's private definition. Exclude
+    // its counter from both durable staging and the caller's live publication.
+    pending.retain(|id, counter| {
+        parts
+            .ext
+            .sequences
+            .get(id)
+            .is_some_and(|def| def.incarnation == counter.incarnation)
+    });
+    for (id, counter) in pending.iter() {
         if let Some(def) = parts.ext.sequences.get(id)
             && def.incarnation == counter.incarnation
         {
@@ -131,3 +141,7 @@ pub(super) fn stage_pending(
 #[cfg(test)]
 #[path = "v2_sequence_reservation_tests.rs"]
 mod reservation_tests;
+
+#[cfg(test)]
+#[path = "v2_sequence_restart_tests.rs"]
+mod restart_tests;

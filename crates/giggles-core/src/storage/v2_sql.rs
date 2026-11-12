@@ -537,8 +537,11 @@ impl SqlSession {
                         if !ddl {
                             return Ok(result);
                         }
+                        // RESTART WITH does not change the recorded START. Carry its
+                        // seed separately, using the bound name and post-DDL START.
+                        let restart_seed = bound.sequence_restart_seed(&image);
                         let (tables, ext, next_id, _) = image.catalog_parts();
-                        if p.truncate_restarts_identity() {
+                        if p.truncate_restarts_identity() || restart_seed.is_some() {
                             let mut values =
                                 self.sequence_values.lock().map_err(|_| CoreError::Fenced)?;
                             for (&id, definition) in &ext.sequences {
@@ -589,6 +592,29 @@ impl SqlSession {
                             crate::cancellation::check().is_err()
                         })?;
                         roles::engine::assign_created(txn, &old, &new, self.ddl_owner.as_deref())?;
+                        if let Some((id, value)) = restart_seed {
+                            let definition = &new.ext.sequences[&id];
+                            let counter = sequences::SeqCounter {
+                                incarnation: definition.incarnation,
+                                last_value: value,
+                                is_called: false,
+                                log_hw: value,
+                                stamp: 0,
+                            };
+                            if self.transaction_id.is_some() {
+                                // Keep just the final incarnation until COMMIT: repeated
+                                // RESTARTs must not stage counters for superseded definitions.
+                                self.pending_sequences
+                                    .lock()
+                                    .map_err(|_| CoreError::Fenced)?
+                                    .insert(id, counter);
+                            } else {
+                                txn.put_counter(
+                                    engine::catalog_codec::counter_key(id, definition.incarnation),
+                                    engine::catalog_codec::encode_counter(&counter, definition)?,
+                                )?;
+                            }
+                        }
                         Ok(result)
                     })();
                     if result.is_err() {
