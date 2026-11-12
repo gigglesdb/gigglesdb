@@ -77,7 +77,8 @@ fn buffer_error(error: crate::buffer::writer::Error) -> Failure {
 
 pub(super) struct Workers {
     capture: reverse::Capture<Resolver>,
-    destination: ReplicationConnection,
+    destination: Option<ReplicationConnection>,
+    destination_config: crate::pg::replication::ConnectionConfig,
     source: ReplicationConnection,
     eligibility: Eligibility,
     checkpoint: Checkpoint,
@@ -86,6 +87,9 @@ pub(super) struct Workers {
     tip: u64,
     paused: watch::Receiver<bool>,
     _pause: watch::Sender<bool>,
+    runtime: Runtime,
+    executor: tokio::runtime::Handle,
+    publication: String,
 }
 #[derive(Default)]
 struct BreachMonitor {
@@ -143,11 +147,14 @@ impl Workers {
         id: &str,
     ) -> Result<Box<Self>, Failure> {
         let state = runtime.state().await;
-        if state.lifecycle.state != coordinator::State::RollbackWindow
-            || state.rollback_eligibility_ended.is_some()
+        if !matches!(
+            state.lifecycle.state,
+            coordinator::State::RollbackWindow | coordinator::State::RollingBack
+        ) || state.rollback_eligibility_ended.is_some()
         {
             return Err(invalid());
         }
+        let stopped = recovery_boundary(&state)?;
         let proof = state
             .verification
             .reverse
@@ -293,6 +300,13 @@ impl Workers {
                 return Err(invalid());
             }
         }
+        if let Some(boundary) = stopped {
+            boundary.validate(&recovered).map_err(capture_error)?;
+            if checkpoint.durable_lsn > boundary.durable_lsn {
+                return Err(invalid());
+            }
+            checkpoint.durable_lsn = boundary.durable_lsn;
+        }
         if let Some(last) = recovered.last_position {
             checkpoint.durable_lsn = checkpoint.durable_lsn.max(u64::from_be_bytes(
                 last.bytes().try_into().map_err(|_| invalid())?,
@@ -328,14 +342,18 @@ impl Workers {
             .await
             .map_err(capture_error)?;
         checkpoint.durable_lsn = capture.durable_lsn();
-        connection
-            .start(
-                &checkpoint.slot,
-                checkpoint.durable_lsn,
-                &[reverse.publication()],
-            )
-            .await
-            .map_err(|e| capture_error(e.into()))?;
+        if let Some(boundary) = stopped {
+            capture.restore_stop(boundary).map_err(capture_error)?;
+        } else {
+            connection
+                .start(
+                    &checkpoint.slot,
+                    checkpoint.durable_lsn,
+                    &[reverse.publication()],
+                )
+                .await
+                .map_err(|e| capture_error(e.into()))?;
+        }
         let source_config =
             config(&definition.source, &mut redactor).map_err(|_| Failure::Retry)?;
         let mut source_checkpoint = state
@@ -372,7 +390,8 @@ impl Workers {
         let (send, paused) = watch::channel(false);
         Ok(Box::new(Self {
             capture,
-            destination: connection,
+            destination: Some(connection),
+            destination_config,
             source,
             eligibility,
             checkpoint,
@@ -386,12 +405,15 @@ impl Workers {
             tip: 0,
             paused,
             _pause: send,
+            runtime: runtime.clone(),
+            executor: tokio::runtime::Handle::current(),
+            publication: reverse.publication(),
         }))
     }
     pub(super) async fn step(&mut self) -> Result<bool, Failure> {
         let mut sink = |_: source::Watermark| Ok(());
         let mut destination = TipTransport {
-            inner: &mut self.destination,
+            inner: self.destination.as_mut().ok_or(Failure::Retry)?,
             tip: &mut self.tip,
         };
         tokio::select! {
@@ -412,6 +434,34 @@ impl Workers {
         Ok(false)
     }
     pub(super) async fn status(&mut self, runtime: &Runtime) -> coordinator::Result<()> {
+        if let Some(boundary) = self
+            .capture
+            .stop_boundary()
+            .map_err(|_| coordinator::Error::Rejected("reverse stop boundary unavailable".into()))?
+        {
+            let state = runtime.state().await;
+            match state
+                .rollback
+                .as_ref()
+                .and_then(|cp| cp.capture_boundary.as_ref())
+            {
+                Some(saved) if saved == &boundary => {}
+                Some(_) => {
+                    return Err(coordinator::Error::Rejected(
+                        "reverse stop receipt differs".into(),
+                    ));
+                }
+                None => {
+                    runtime
+                        .commit(coordinator::Transition::Rollback {
+                            record: Box::new(coordinator::rollback::Record::CaptureStopped {
+                                boundary,
+                            }),
+                        })
+                        .await?
+                }
+            }
+        }
         self.checkpoint.durable_lsn = self.capture.durable_lsn();
         let writer = self.capture.writer().checkpoint().map_err(|_| {
             coordinator::Error::Rejected("reverse writer checkpoint unavailable".into())
@@ -438,9 +488,162 @@ impl Workers {
             .marker(
                 "reverse-capture-health",
                 "healthy".into(),
-                "streaming".into(),
+                if self.capture.stopped_at().is_some() {
+                    "stopped-at-marker"
+                } else {
+                    "streaming"
+                }
+                .into(),
             )
             .await
+    }
+}
+
+/// A receipt suppresses destination replication on takeover. Before the stop,
+/// recovery may continue capture; after FinalMarker it must never guess a tip.
+fn recovery_boundary(state: &Materialized) -> Result<Option<&reverse::StopBoundary>, Failure> {
+    use coordinator::rollback::Step;
+    if state.lifecycle.state != coordinator::State::RollingBack {
+        return Ok(None);
+    }
+    let cp = state.rollback.as_ref().ok_or_else(invalid)?;
+    if let Some(boundary) = &cp.capture_boundary {
+        return Ok(Some(boundary));
+    }
+    if matches!(
+        cp.next,
+        Step::PreHook
+            | Step::FenceDestination
+            | Step::Drain
+            | Step::FinalMarker
+            | Step::RestoreDestination
+    ) && !cp.point_of_no_return
+    {
+        Ok(None)
+    } else {
+        Err(invalid())
+    }
+}
+
+fn driver_failure(failure: Failure) -> crate::cutover::Error {
+    match failure {
+        Failure::Retry => crate::cutover::Error::Component("reverse capture unavailable".into()),
+        Failure::End(_) => crate::cutover::Error::Invalid("reverse capture evidence differs"),
+    }
+}
+fn driver_journal(error: coordinator::Error) -> crate::cutover::Error {
+    match error {
+        coordinator::Error::LostOwnership | coordinator::Error::Observer => {
+            crate::cutover::Error::LostOwnership
+        }
+        coordinator::Error::Rejected(_) | coordinator::Error::RecoveryRequired(_) => {
+            crate::cutover::Error::Invalid("reverse capture journal differs")
+        }
+        _ => crate::cutover::Error::Component("reverse capture journal unavailable".into()),
+    }
+}
+
+/// The synchronous driver calls this adapter on its blocking thread, retaining
+/// exclusive authority throughout. Each poll is bounded so the owner can serve
+/// status and check its deadline between driver slices.
+impl crate::rollback::destination::Capture for Workers {
+    fn captured(
+        &mut self,
+        marker: &crate::cutover::Marker,
+    ) -> crate::cutover::Result<Option<crate::cutover::Marker>> {
+        let executor = self.executor.clone();
+        executor.block_on(async {
+            self.runtime.refresh_owner().await.map_err(driver_journal)?;
+            self.capture
+                .stop_at(marker)
+                .map_err(capture_error)
+                .map_err(driver_failure)?;
+            if self.capture.stopped_at().is_none()
+                && let Ok(Err(failure)) =
+                    tokio::time::timeout(Duration::from_millis(25), self.step()).await
+            {
+                if let Failure::End(reason) = &failure {
+                    self.runtime
+                        .commit(coordinator::Transition::RollbackEligibilityEnded {
+                            reason: reason.clone(),
+                        })
+                        .await
+                        .map_err(driver_journal)?;
+                }
+                return Err(driver_failure(failure));
+            }
+            let runtime = self.runtime.clone();
+            // Publication is outside the cancellable read: never detach or
+            // cancel an ambiguous durable receipt.
+            self.status(&runtime).await.map_err(driver_journal)?;
+            Ok(self.capture.stopped_at().cloned())
+        })
+    }
+    fn stop_at(&mut self, marker: &crate::cutover::Marker) -> crate::cutover::Result<()> {
+        if self.capture.stopped_at() != Some(marker) {
+            return Err(crate::cutover::Error::Pending);
+        }
+        let executor = self.executor.clone();
+        executor.block_on(async {
+            self.runtime.refresh_owner().await.map_err(driver_journal)?;
+            let runtime = self.runtime.clone();
+            self.status(&runtime).await.map_err(driver_journal)?;
+            let state = runtime.state().await;
+            if state
+                .rollback
+                .as_ref()
+                .and_then(|cp| cp.capture_boundary.as_ref())
+                .map(|b| &b.marker)
+                != Some(marker)
+            {
+                return Err(crate::cutover::Error::Invalid(
+                    "durable capture receipt missing",
+                ));
+            }
+            Ok(())
+        })
+    }
+    fn restart(&mut self, key: &crate::cutover::Key) -> crate::cutover::Result<()> {
+        let executor = self.executor.clone();
+        executor.block_on(async {
+            self.runtime.refresh_owner().await.map_err(driver_journal)?;
+            let state = self.runtime.state().await;
+            if key.epoch <= 0 || state.epoch != key.epoch as u64 || state.owner != key.coordinator {
+                return Err(crate::cutover::Error::LostOwnership);
+            }
+            let cp = state
+                .rollback
+                .as_ref()
+                .ok_or(crate::cutover::Error::Invalid("rollback admission missing"))?;
+            if cp.request != key.cutover
+                || cp.point_of_no_return
+                || cp.next != coordinator::rollback::Step::RestoreDestination
+                || state.rollback_eligibility_ended.is_some()
+            {
+                return Err(crate::cutover::Error::Invalid(
+                    "capture restart not authorized",
+                ));
+            }
+            if self.capture.stopped_at().is_some() {
+                // Drop CopyBoth before reconnecting: the slot permits one reader.
+                self.checkpoint.durable_lsn = self.capture.durable_lsn();
+                self.destination = None;
+                self.destination = Some(
+                    source::reconnect(
+                        &self.destination_config,
+                        &self.checkpoint,
+                        std::slice::from_ref(&self.publication),
+                    )
+                    .await
+                    .map_err(|e| driver_failure(capture_error(e)))?,
+                );
+            }
+            // Clear an armed marker too: the deadline may expire before its
+            // transaction arrives, and normal capture must not stop later.
+            self.capture.restart();
+            let runtime = self.runtime.clone();
+            self.status(&runtime).await.map_err(driver_journal)
+        })
     }
 }
 
@@ -477,6 +680,81 @@ mod tests {
         event::{AssembledTxn, Position, TxnId},
         pg::pgoutput::{Begin, Commit},
     };
+    #[test]
+    fn recovery_requires_a_receipt_after_final_marker_but_not_before() {
+        use coordinator::{
+            State,
+            rollback::{Checkpoint, Step},
+        };
+        let mut state = Materialized::default();
+        state.lifecycle.state = State::RollingBack;
+        state.rollback = Some(Checkpoint {
+            request: "request".into(),
+            deadline_at_ms: 100,
+            next: Step::PreHook,
+            intent: None,
+            final_marker: None,
+            capture_boundary: None,
+            point_of_no_return: false,
+        });
+        for step in [
+            Step::PreHook,
+            Step::FenceDestination,
+            Step::Drain,
+            Step::FinalMarker,
+            Step::RestoreDestination,
+        ] {
+            state.rollback.as_mut().unwrap().next = step;
+            assert!(matches!(recovery_boundary(&state), Ok(None)), "{step:?}");
+        }
+        for step in [
+            Step::ReverseApply,
+            Step::Verify,
+            Step::Sequences,
+            Step::RestoreSource,
+            Step::PostHook,
+        ] {
+            state.rollback.as_mut().unwrap().next = step;
+            assert!(recovery_boundary(&state).is_err(), "{step:?}");
+        }
+        let boundary = reverse::StopBoundary {
+            marker: crate::cutover::Marker {
+                cutover: "request".into(),
+                epoch: 1,
+                lsn: 10,
+            },
+            durable_lsn: 11,
+            next_mseq: 1,
+            digest: [7; 32],
+        };
+        state.rollback.as_mut().unwrap().capture_boundary = Some(boundary.clone());
+        assert_eq!(recovery_boundary(&state).ok().flatten(), Some(&boundary));
+        state.rollback = None;
+        assert!(recovery_boundary(&state).is_err());
+    }
+
+    #[test]
+    fn capture_adapter_preserves_lost_ownership_and_retries_infrastructure() {
+        use crate::cutover::Error;
+        assert!(matches!(
+            driver_journal(coordinator::Error::LostOwnership),
+            Error::LostOwnership
+        ));
+        assert!(matches!(
+            driver_journal(coordinator::Error::Observer),
+            Error::LostOwnership
+        ));
+        assert!(matches!(
+            driver_journal(coordinator::Error::UnknownOutcome("lost reply".into())),
+            Error::Component(_)
+        ));
+        assert!(matches!(
+            driver_failure(Failure::Retry),
+            Error::Component(_)
+        ));
+        assert!(matches!(driver_failure(invalid()), Error::Invalid(_)));
+    }
+
     fn root() -> PathBuf {
         let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
             .join(format!("reverse-worker-{}", uuid::Uuid::new_v4()));
@@ -797,6 +1075,57 @@ mod tests {
             .collect()
     }
     #[tokio::test]
+    async fn deadline_restart_clears_an_armed_stop_before_marker_arrives() {
+        let root = root();
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        let store =
+            Arc::new(ObjectBufferStore::local(root.join("store"), Duration::from_secs(5)).unwrap());
+        let config =
+            reverse::Config::new("m", 180000, vec![("public".into(), "rows".into())]).unwrap();
+        let mut capture = reverse::Capture::new(
+            &config,
+            identity(),
+            1,
+            writer(&root, store.clone(), PREFIX).await,
+            Resolver(vec![]),
+            SchemaVersions::new("m".into(), 0, []).unwrap(),
+            Eligibility::new(|_| Ok(())),
+        )
+        .unwrap();
+        let marker = crate::cutover::Marker {
+            cutover: "request".into(),
+            epoch: 1,
+            lsn: 100,
+        };
+        let later = crate::cutover::Marker {
+            lsn: 200,
+            ..marker.clone()
+        };
+        capture.stop_at(&marker).unwrap();
+        // Deadline compensation before the final transaction is observed.
+        capture.restart();
+        let mut frames = Frames(
+            marker_frames(&marker)
+                .into_iter()
+                .chain(marker_frames(&later))
+                .collect(),
+        );
+        let (_send, mut paused) = watch::channel(false);
+        for _ in 0..6 {
+            capture
+                .step(&mut frames, &mut |_: source::Watermark| Ok(()), &mut paused)
+                .await
+                .unwrap();
+        }
+        assert!(frames.0.is_empty());
+        assert!(capture.stopped_at().is_none());
+        assert!(capture.stop_boundary().unwrap().is_none());
+        drop(capture);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn exact_marker_stop_is_durable_idempotent_and_restart_keeps_following_wal() {
         let root = root();
         std::fs::create_dir_all(root.join("store")).unwrap();
@@ -875,6 +1204,50 @@ mod tests {
         }
         assert_eq!(frames.0.len(), 3);
         assert!(capture.stop_at(&later).is_err());
+        let boundary = capture.stop_boundary().unwrap().unwrap();
+        let durable_lsn = capture.durable_lsn();
+        drop(capture);
+        let mut capture = reverse::Capture::new(
+            &config,
+            identity(),
+            durable_lsn,
+            writer(&root, store.clone(), PREFIX).await,
+            Resolver(vec![]),
+            SchemaVersions::new("m".into(), 0, []).unwrap(),
+            Eligibility::new(|_| Ok(())),
+        )
+        .unwrap();
+        let boundary: reverse::StopBoundary =
+            serde_json::from_slice(&serde_json::to_vec(&boundary).unwrap()).unwrap();
+        for bad in [
+            reverse::StopBoundary {
+                next_mseq: boundary.next_mseq + 1,
+                ..boundary.clone()
+            },
+            reverse::StopBoundary {
+                digest: [7; 32],
+                ..boundary.clone()
+            },
+            reverse::StopBoundary {
+                durable_lsn: durable_lsn + 1,
+                ..boundary.clone()
+            },
+        ] {
+            assert!(capture.restore_stop(&bad).is_err());
+            assert!(capture.stopped_at().is_none());
+        }
+        capture.restore_stop(&boundary).unwrap();
+        capture.restore_stop(&boundary).unwrap();
+        assert_eq!(capture.stopped_at(), Some(&marker));
+        capture
+            .step(
+                &mut frames,
+                &mut |_: source::Watermark| panic!("recovered stop read"),
+                &mut paused,
+            )
+            .await
+            .unwrap();
+        assert_eq!(frames.0.len(), 3);
         capture.restart();
         assert_eq!(capture.writer().checkpoint().unwrap(), saved);
         assert!(capture.stop_at(&marker).is_err()); // passed LSN is not proof
@@ -887,6 +1260,11 @@ mod tests {
         }
         assert_eq!(capture.stopped_at(), Some(&later));
         assert_eq!(capture.writer().checkpoint().unwrap().next_mseq, 2);
+        assert!(
+            boundary
+                .validate(&capture.writer().checkpoint().unwrap())
+                .is_err()
+        );
         drop(capture);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();

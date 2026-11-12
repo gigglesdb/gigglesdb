@@ -139,6 +139,7 @@ mod tests {
             next: Step::ReverseApply,
             intent: None,
             final_marker: Some(50),
+            capture_boundary: None,
             point_of_no_return: true,
         });
         state.lifecycle.state = State::RollingBack;

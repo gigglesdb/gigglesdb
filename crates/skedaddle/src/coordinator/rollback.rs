@@ -55,6 +55,8 @@ pub struct Checkpoint {
     pub next: Step,
     pub intent: Option<Intent>,
     pub final_marker: Option<u64>,
+    #[serde(default)]
+    pub capture_boundary: Option<crate::pg::reverse::StopBoundary>,
     /// Conservative point of no return: publication of ReverseApply intent,
     /// before any source transaction can commit. Remains true after recovery.
     pub point_of_no_return: bool,
@@ -73,6 +75,9 @@ pub enum Record {
     Checkpoint {
         step: Step,
         final_marker: Option<u64>,
+    },
+    CaptureStopped {
+        boundary: crate::pg::reverse::StopBoundary,
     },
     /// Must be followed by RestoreDestination intent and its completion.
     /// The lifecycle remains RollingBack until restoration is acknowledged.
@@ -112,6 +117,7 @@ pub(super) fn apply(state: &mut Materialized, record: &Record, seq: u64, at: u64
             next: Step::PreHook,
             intent: None,
             final_marker: None,
+            capture_boundary: None,
             point_of_no_return: false,
         });
         state.lifecycle.state = State::RollingBack;
@@ -158,6 +164,14 @@ pub(super) fn apply(state: &mut Materialized, record: &Record, seq: u64, at: u64
             {
                 return Err(rejected());
             }
+            if *step == Step::FinalMarker
+                && cp
+                    .capture_boundary
+                    .as_ref()
+                    .is_some_and(|b| Some(b.marker.lsn) != *final_marker)
+            {
+                return Err(rejected());
+            }
             cp.next = step.next().ok_or_else(rejected)?;
             cp.intent = None;
             if let Some(marker) = final_marker {
@@ -177,6 +191,27 @@ pub(super) fn apply(state: &mut Materialized, record: &Record, seq: u64, at: u64
                 };
                 state.lifecycle.since_seq = seq;
             }
+        }
+        Record::CaptureStopped { boundary } => {
+            let intent = cp.intent.as_ref().ok_or_else(rejected)?;
+            if cp.next != Step::FinalMarker
+                || intent.step != Step::FinalMarker
+                || intent.epoch != epoch
+                || intent.seq >= seq
+                || boundary.marker.cutover != cp.request
+                || boundary.marker.epoch <= 0
+                || boundary.marker.epoch as u64 > epoch
+                || boundary.marker.lsn == 0
+                || boundary.durable_lsn <= boundary.marker.lsn
+                || boundary.next_mseq == 0
+                || cp
+                    .capture_boundary
+                    .as_ref()
+                    .is_some_and(|old| old != boundary)
+            {
+                return Err(rejected());
+            }
+            cp.capture_boundary = Some(boundary.clone());
         }
         Record::DeadlineAbort => {
             if ineligible
@@ -235,6 +270,110 @@ mod tests {
             step,
             final_marker: (step == Step::FinalMarker).then_some(42),
         }
+    }
+
+    #[test]
+    fn capture_boundary_survives_takeover_and_rejects_substitution() {
+        let mut state = window();
+        admit(&mut state);
+        let boundary = crate::pg::reverse::StopBoundary {
+            marker: crate::cutover::Marker {
+                cutover: "rollback-1".into(),
+                epoch: 1,
+                lsn: 42,
+            },
+            durable_lsn: 53,
+            next_mseq: 1,
+            digest: [9; 32],
+        };
+        assert!(
+            record(
+                &mut state,
+                Record::CaptureStopped {
+                    boundary: boundary.clone()
+                }
+            )
+            .is_err()
+        );
+        for step in [Step::PreHook, Step::FenceDestination, Step::Drain] {
+            record(&mut state, Record::Intent { step }).unwrap();
+            record(&mut state, checkpoint(step)).unwrap();
+        }
+        record(
+            &mut state,
+            Record::Intent {
+                step: Step::FinalMarker,
+            },
+        )
+        .unwrap();
+        record(
+            &mut state,
+            Record::CaptureStopped {
+                boundary: boundary.clone(),
+            },
+        )
+        .unwrap();
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let takeover = Entry::new(
+            &state,
+            Transition::AcquireOwnership { epoch: 2 },
+            "new-owner",
+        )
+        .unwrap();
+        state.apply(&takeover).unwrap();
+        assert_eq!(
+            state.rollback.as_ref().unwrap().capture_boundary,
+            Some(boundary.clone())
+        );
+        assert!(
+            record(
+                &mut state,
+                Record::CaptureStopped {
+                    boundary: boundary.clone()
+                }
+            )
+            .is_err()
+        );
+        record(
+            &mut state,
+            Record::Intent {
+                step: Step::FinalMarker,
+            },
+        )
+        .unwrap();
+        record(
+            &mut state,
+            Record::CaptureStopped {
+                boundary: boundary.clone(),
+            },
+        )
+        .unwrap();
+        assert!(
+            record(
+                &mut state,
+                Record::CaptureStopped {
+                    boundary: crate::pg::reverse::StopBoundary {
+                        digest: [8; 32],
+                        ..boundary
+                    }
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            record(
+                &mut state,
+                Record::Checkpoint {
+                    step: Step::FinalMarker,
+                    final_marker: Some(43)
+                }
+            )
+            .is_err()
+        );
+        record(&mut state, checkpoint(Step::FinalMarker)).unwrap();
+        state.rollback.as_mut().unwrap().deadline_at_ms = 1;
+        record(&mut state, Record::DeadlineAbort).unwrap();
+        assert!(state.rollback.as_ref().unwrap().capture_boundary.is_some());
     }
 
     #[test]

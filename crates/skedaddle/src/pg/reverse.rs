@@ -437,6 +437,42 @@ fn parse_cell(rows: &fence::Rows, row: usize, column: usize) -> Result<u64> {
     fence::parse_lsn(s).map_err(|_| Error::SlotChanged)
 }
 
+/// Journal-authenticated exact stop receipt. Manifest identity is checked again
+/// before recovery can suppress capture or authorize deadline restoration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopBoundary {
+    pub marker: crate::cutover::Marker,
+    pub durable_lsn: u64,
+    pub next_mseq: u64,
+    pub digest: [u8; 32],
+}
+impl StopBoundary {
+    pub fn validate(
+        &self,
+        checkpoint: &crate::buffer::writer::WriterCheckpoint,
+    ) -> source::Result<()> {
+        if self.marker.cutover.is_empty()
+            || self.marker.epoch <= 0
+            || self.marker.lsn == 0
+            || self.durable_lsn <= self.marker.lsn
+            || self.next_mseq == 0
+            || checkpoint.next_mseq != self.next_mseq
+            || checkpoint.prev_digest != self.digest
+            || !checkpoint
+                .last_position
+                .as_ref()
+                .and_then(|p| <[u8; 8]>::try_from(p.bytes()).ok().map(u64::from_be_bytes))
+                .is_some_and(|commit| commit >= self.marker.lsn && commit < self.durable_lsn)
+        {
+            return Err(source::Error::RecoveryRequired(
+                "reverse durable stop boundary differs",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Adds eligibility observation to source::Capture; the wire decoder, buffer
 /// durability and DDL classification remain the original implementation.
 pub struct Capture<R> {
@@ -500,6 +536,36 @@ impl<R: source::TypeResolver> Capture<R> {
     /// Present only after the exact marker transaction is manifest durable.
     pub fn stopped_at(&self) -> Option<&crate::cutover::Marker> {
         self.stop.as_ref().filter(|_| self.stopped)
+    }
+    /// Snapshot only after the exact marker transaction is manifest durable.
+    pub fn stop_boundary(&self) -> source::Result<Option<StopBoundary>> {
+        let Some(marker) = self.stopped_at() else {
+            return Ok(None);
+        };
+        let checkpoint = self.writer().checkpoint()?;
+        let boundary = StopBoundary {
+            marker: marker.clone(),
+            durable_lsn: self.durable_lsn(),
+            next_mseq: checkpoint.next_mseq,
+            digest: checkpoint.prev_digest,
+        };
+        boundary.validate(&checkpoint)?;
+        Ok(Some(boundary))
+    }
+    /// The caller must obtain this receipt from the authenticated journal.
+    /// Recovery never reads a new frame before checking the complete manifest tip.
+    pub fn restore_stop(&mut self, boundary: &StopBoundary) -> source::Result<()> {
+        boundary.validate(&self.writer().checkpoint()?)?;
+        if self.durable_lsn() != boundary.durable_lsn
+            || self.stop.as_ref().is_some_and(|m| m != &boundary.marker)
+        {
+            return Err(source::Error::RecoveryRequired(
+                "reverse stop recovery differs",
+            ));
+        }
+        self.stop = Some(boundary.marker.clone());
+        self.stopped = true;
+        Ok(())
     }
     /// Deadline compensation resumes at the retained durable boundary. No WAL
     /// or writer state is reset; the next read acknowledges only durable WAL.
