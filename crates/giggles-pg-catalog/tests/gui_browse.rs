@@ -5,6 +5,124 @@ fn run(sql: &str, snapshot: &CatalogSnapshot) -> ResultSet {
 }
 
 #[test]
+fn django_descriptions_and_search_path_visibility() {
+    let mut snapshot = CatalogSnapshot::default();
+    snapshot.schemas.insert("gui_sales".into(), (70000, 10));
+    snapshot.schemas.insert("gui_aux".into(), (70001, 10));
+    for (id, schema) in [(10, "gui_sales"), (20, "gui_aux")] {
+        snapshot.tables.push(TableDef {
+            id,
+            name: "parent".into(),
+            primary_key: vec![0],
+            columns: vec![ColumnDef {
+                id,
+                name: "id".into(),
+                data_type: ScalarType::Integer,
+                not_null: true,
+            }],
+        });
+        snapshot.table_schemas.insert(id, schema.into());
+    }
+    let sql = "SELECT n.nspname,pg_catalog.pg_table_is_visible(c.oid),obj_description(c.oid),obj_description(c.oid,'pg_class'),col_description(c.oid,1),shobj_description(c.oid,'pg_class') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='parent' ORDER BY n.nspname";
+    for (path, expected) in [
+        (vec!["gui_sales", "gui_aux"], [false, true]),
+        (vec!["gui_aux", "gui_sales"], [true, false]),
+        (vec!["public"], [false, false]),
+    ] {
+        snapshot.search_path = path.into_iter().map(str::to_owned).collect();
+        let rows = run(sql, &snapshot).rows;
+        assert_eq!(rows.len(), 2);
+        for (row, visible) in rows.iter().zip(expected) {
+            assert_eq!(row[1], Value::Bool(visible));
+            assert_eq!(&row[2..], vec![Value::Null; 4]);
+        }
+    }
+    snapshot.search_path = vec!["gui_sales".into()];
+    assert_eq!(run("SELECT c.relname,pg_get_constraintdef(con.oid) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_depend d ON d.classid=c.tableoid AND d.objid=c.oid AND d.refclassid='pg_constraint'::regclass AND d.deptype='i' JOIN pg_constraint con ON con.tableoid=d.refclassid AND con.oid=d.refobjid WHERE pg_table_is_visible(c.oid)", &snapshot).rows,
+        vec![vec![Value::Text("parent_pkey".into()), Value::Text("PRIMARY KEY (id)".into())]]);
+    assert_eq!(run("SELECT c.relname, CASE WHEN c.relispartition THEN 'p' WHEN c.relkind IN ('m','v') THEN 'v' ELSE 't' END, obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('f','m','p','r','v') AND n.nspname NOT IN ('pg_catalog','pg_toast') AND pg_catalog.pg_table_is_visible(c.oid)", &snapshot).rows,
+        vec![vec![Value::Text("parent".into()), Value::Text("t".into()), Value::Null]]);
+    assert_eq!(run("SELECT pg_table_is_visible(0::oid),pg_table_is_visible(NULL::oid),obj_description(0::oid),obj_description(NULL::oid,'pg_class'),col_description(0::oid,1),shobj_description(0::oid,'pg_database')", &snapshot).rows,
+        vec![vec![Value::Null; 6]]);
+    assert_eq!(
+        run(
+            "SELECT pg_table_is_visible('pg_class'::regclass)",
+            &snapshot
+        )
+        .rows,
+        vec![vec![Value::Bool(true)]]
+    );
+    snapshot.database = "postgres".into();
+    assert_eq!(
+        run(
+            "SELECT shobj_description(oid,'pg_database') FROM pg_database",
+            &snapshot
+        )
+        .rows,
+        vec![vec![Value::Text(
+            "default administrative connection database".into()
+        )]]
+    );
+}
+
+#[test]
+fn catalog_target_srfs_zip_and_preserve_element_types() {
+    let snapshot = CatalogSnapshot::default();
+    let result = run(
+        "SELECT unnest(ARRAY[2::int2,3::int2]),unnest(ARRAY[7,8,9]),unnest(ARRAY['a']) FROM pg_namespace WHERE oid=11",
+        &snapshot,
+    );
+    assert_eq!(
+        result
+            .fields
+            .iter()
+            .map(|f| f.data_type)
+            .collect::<Vec<_>>(),
+        vec![PgType::Int2, PgType::Int4, PgType::Text]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int(2), Value::Int(7), Value::Text("a".into())],
+            vec![Value::Int(3), Value::Int(8), Value::Null],
+            vec![Value::Null, Value::Int(9), Value::Null]
+        ]
+    );
+    assert_eq!(run("SELECT unnest(ARRAY(SELECT generate_series(1,3))),unnest(ARRAY[4,5]) FROM pg_namespace WHERE oid=11", &snapshot).rows,
+        vec![vec![Value::Int(1),Value::Int(4)],vec![Value::Int(2),Value::Int(5)],vec![Value::Int(3),Value::Null]]);
+    assert!(
+        run(
+            "SELECT unnest(NULL::int4[]) FROM pg_namespace WHERE oid=11",
+            &snapshot
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(run("SELECT (information_schema._pg_expandarray(ARRAY[NULL::int2])).n,unnest(ARRAY[4,5]) FROM pg_namespace WHERE oid=11", &snapshot).rows,
+        vec![vec![Value::Int(1),Value::Int(4)],vec![Value::Null,Value::Int(5)]]);
+}
+
+#[test]
+fn gui_substring_numeric_and_regex_forms() {
+    let result = run(
+        "SELECT substring('abc',2),substring('abc',0,2),substring('abc',-2,4),substring('éclair',2,3),substring('fillfactor=70' FROM 'fillfactor=([0-9]*)'),substring('abc' FROM 'z'),substring(NULL::text,1) FROM pg_namespace WHERE oid=11",
+        &CatalogSnapshot::default(),
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Text("bc".into()),
+            Value::Text("a".into()),
+            Value::Text("a".into()),
+            Value::Text("cla".into()),
+            Value::Text("70".into()),
+            Value::Null,
+            Value::Null
+        ]]
+    );
+}
+
+#[test]
 fn qualified_wildcard_excludes_system_columns_and_preserves_duplicates() {
     let snapshot = CatalogSnapshot::default();
     let result = run(

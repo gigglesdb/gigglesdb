@@ -83,14 +83,12 @@ fn length_dimensions_empty_null_and_vectors() {
 }
 
 #[test]
-fn srf_contexts_and_multiple_distinct_expansions_stay_closed() {
+fn nested_and_non_projection_srf_contexts_stay_closed() {
     for sql in [
-        "SELECT unnest(ARRAY[1])",
         "SELECT unnest(ARRAY[1::oid],ARRAY[2::oid])",
         "SELECT 1 WHERE unnest(ARRAY[1::oid])=1",
         "SELECT 1 ORDER BY unnest(ARRAY[1::oid])",
         "SELECT array_length(ARRAY[unnest(ARRAY[1::oid])],1)",
-        "SELECT unnest(ARRAY[1::oid]),unnest(ARRAY[2::oid])",
         "SELECT unnest(ARRAY[1::oid])+1",
     ] {
         assert!(plan(sql).is_err(), "{sql}");

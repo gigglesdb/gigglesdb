@@ -1691,6 +1691,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     N,
                 ],
             );
+            // A primary-key index is internally owned by its constraint (PG18).
+            add(
+                "pg_depend",
+                vec![I(1259), I(oid + 1), I(0), I(2606), I(oid + 2), I(0), s("i")],
+            );
         }
         let mut indexes = visible_indexes
             .iter()

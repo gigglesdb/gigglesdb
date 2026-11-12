@@ -22,7 +22,7 @@ pub(super) fn place(query: &mut Query, parameters: &[PgType]) {
         .chain(std::iter::once(&mut query.filter))
         .chain(query.group.iter_mut())
         .chain(query.order.iter_mut().map(|o| &mut o.e))
-        .chain(query.expand.iter_mut())
+        .chain(query.expand.iter_mut().flatten())
     {
         nested_queries(expression, parameters);
     }
