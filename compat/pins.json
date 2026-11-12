@@ -2,5 +2,7 @@
   "postgres": {"image": "postgres:18.6", "digest": "sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42", "initdb_args": "--locale=C.UTF-8 --encoding=UTF8", "tz": "UTC"},
   "clients": {"psql": {"image": "postgres:18.6", "digest": "sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42"}},
   "orm_python": {"image": "python:3.13-slim", "digest": "sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90"},
+  "orm_ruby": {"image": "ruby:4.0-slim", "digest": "sha256:243a066707bcb16e214840d374ae01a886a7fba374bde795834efee4a752b479"},
+  "orm_node": {"image": "node:26-bookworm-slim", "digest": "sha256:18a166e2d50578afe933434857ed2d9059bd1aa398a223e9c89eb4302354f079"},
   "pgadmin": {"image": "dpage/pgadmin4:9.10", "digest": "sha256:8c128407f45f1c582eda69e71da1a393237388469052e3cc1e6ae4a475e12b70"}
 }
