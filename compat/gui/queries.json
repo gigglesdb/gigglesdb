@@ -1,0 +1,42 @@
+[
+  {
+    "id": "schemas",
+    "sql": "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n\nLEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass\n ORDER BY nspname",
+    "bind": "",
+    "source": "PostgreDatabase.java:1332-1355",
+    "url": "https://github.com/dbeaver/dbeaver/blob/24.3.0/plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreDatabase.java",
+    "source_sha256": "0efa419aef42a395481bb95cc5ade260ffe5d958bd9f50a33e0c7cf5b5ac76bb"
+  },
+  {
+    "id": "tables",
+    "sql": "SELECT c.oid,c.*,d.description,pg_catalog.pg_get_expr(c.relpartbound, c.oid) as partition_expr,  pg_catalog.pg_get_partkeydef(c.oid) as partition_key \nFROM pg_catalog.pg_class c\nLEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_class'::regclass\nWHERE c.relnamespace=? AND c.relkind not in ('i','I','c')",
+    "bind": "schema",
+    "source": "PostgreSchema.java:853-860",
+    "url": "https://github.com/dbeaver/dbeaver/blob/24.3.0/plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreSchema.java",
+    "source_sha256": "479d50dd3c033bb7146b8b994d9de68b306b863b786e9cf85e8a368997940ad5"
+  },
+  {
+    "id": "columns",
+    "sql": "SELECT c.relname,a.*,pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as def_value,dsc.description,dep.objid\nFROM pg_catalog.pg_attribute a\nINNER JOIN pg_catalog.pg_class c ON (a.attrelid=c.oid)\nLEFT OUTER JOIN pg_catalog.pg_attrdef ad ON (a.attrelid=ad.adrelid AND a.attnum = ad.adnum)\nLEFT OUTER JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid)\nLEFT OUTER JOIN pg_depend dep on dep.refobjid = a.attrelid AND dep.deptype = 'i' and dep.refobjsubid = a.attnum and dep.classid = dep.refclassid\nWHERE NOT a.attisdropped AND c.relkind not in ('i','I','c') AND c.oid=?\nORDER BY a.attnum",
+    "bind": "table",
+    "source": "PostgreSchema.java:891-902; PostgreSQL supportsSequences=true",
+    "url": "https://github.com/dbeaver/dbeaver/blob/24.3.0/plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreSchema.java",
+    "source_sha256": "479d50dd3c033bb7146b8b994d9de68b306b863b786e9cf85e8a368997940ad5"
+  },
+  {
+    "id": "constraints",
+    "sql": "SELECT c.oid,c.*,t.relname as tabrelname,rt.relnamespace as refnamespace,d.description, case when c.contype='c' then \"substring\"(pg_get_constraintdef(c.oid), 7) else null end consrc_copy\nFROM pg_catalog.pg_constraint c\nINNER JOIN pg_catalog.pg_class t ON t.oid=c.conrelid\nLEFT OUTER JOIN pg_catalog.pg_class rt ON rt.oid=c.confrelid\nLEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_constraint'::regclass\nWHERE c.conrelid=?\nORDER BY c.oid",
+    "bind": "table",
+    "source": "PostgreSchema.java:940-953; supportsPGConstraintExpressionColumn=true",
+    "url": "https://github.com/dbeaver/dbeaver/blob/24.3.0/plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreSchema.java",
+    "source_sha256": "479d50dd3c033bb7146b8b994d9de68b306b863b786e9cf85e8a368997940ad5"
+  },
+  {
+    "id": "indexes",
+    "sql": "SELECT i.*,i.indkey as keys,c.relname,c.relnamespace,c.relam,c.reltablespace,tc.relname as tabrelname,dsc.description,pg_catalog.pg_get_expr(i.indpred, i.indrelid) as pred_expr,pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true) as expr,pg_catalog.pg_relation_size(i.indexrelid) as index_rel_size,pg_catalog.pg_stat_get_numscans(i.indexrelid) as index_num_scans\nFROM pg_catalog.pg_index i\nINNER JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid\nINNER JOIN pg_catalog.pg_class tc ON tc.oid=i.indrelid\nLEFT OUTER JOIN pg_catalog.pg_description dsc ON i.indexrelid=dsc.objoid\nWHERE  i.indrelid=? ORDER BY c.relname",
+    "bind": "table",
+    "source": "PostgreSchema.java:1097-1118; supportsExprIndex/supportsRelationSizeCalc=true",
+    "url": "https://github.com/dbeaver/dbeaver/blob/24.3.0/plugins/org.jkiss.dbeaver.ext.postgresql/src/org/jkiss/dbeaver/ext/postgresql/model/PostgreSchema.java",
+    "source_sha256": "479d50dd3c033bb7146b8b994d9de68b306b863b786e9cf85e8a368997940ad5"
+  }
+]
