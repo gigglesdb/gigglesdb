@@ -74,10 +74,6 @@ fn pk_mutations_match_scan_and_legacy_constraints_returning_and_indexes() {
             let result = s.execute_prepared(&p,&params,None).map(values);
             let expected_error = match sql {
                 "UPDATE t SET n=n+1 WHERE id=$1" => Some(SqlError::Type),
-                "UPDATE t SET n=n+1 WHERE id=$1 RETURNING id"
-                    | "UPDATE t SET n=n+1 WHERE id=NULL RETURNING id"
-                    | "DELETE FROM t WHERE id=$1 RETURNING id"
-                    | "DELETE FROM t WHERE id=NULL RETURNING id" => Some(SqlError::Null),
                 "UPDATE t SET n=-1 WHERE id=1" => Some(SqlError::CheckViolation),
                 "UPDATE t SET email='two' WHERE id=1" => Some(SqlError::Duplicate),
                 "UPDATE t SET email='two' WHERE id=1 RETURNING 1/(n-10)" => Some(SqlError::DivisionByZero),
@@ -88,6 +84,13 @@ fn pk_mutations_match_scan_and_legacy_constraints_returning_and_indexes() {
             match expected_error {
                 Some(error) => assert_eq!(result, Err(CoreError::Sql(error)), "{sql}"),
                 None => assert!(result.is_ok(), "{sql}: {result:?}"),
+            }
+            // PG18: a NULL equality operand is unknown, so it selects no rows.
+            if matches!(sql, "UPDATE t SET n=n+1 WHERE id=$1 RETURNING id"
+                | "UPDATE t SET n=n+1 WHERE id=NULL RETURNING id"
+                | "DELETE FROM t WHERE id=$1 RETURNING id"
+                | "DELETE FROM t WHERE id=NULL RETURNING id") {
+                assert_eq!(result, Ok((0, vec![])), "{sql}");
             }
             let contents = if result.is_ok() {
                 let rows = contents(s,"t");
@@ -156,9 +159,10 @@ fn pk_mutation_reads_only_target_keys_on_5000_rows() {
     assert_eq!(MUTATION_POINT_READS.get(),3);
     assert_eq!(MUTATION_ROWS_READ.get(),2);
     reset_reads();
-    assert_eq!(s.execute_prepared(&p,&[Null],None),Err(CoreError::Sql(SqlError::Null)));
+    // PG18: NULL selects no rows; the conservative path reads existing pages.
+    assert_eq!(values(s.execute_prepared(&p,&[Null],None).unwrap()),(0,vec![]));
     assert_eq!(MUTATION_POINT_READS.get(),0);
-    assert_eq!(MUTATION_ROWS_READ.get(),0);
+    assert_eq!(MUTATION_ROWS_READ.get(),4998);
     reset_reads();
     assert!(s.execute_prepared(&p,&[Text("wrong".into())],None).is_err());
     assert_eq!(MUTATION_POINT_READS.get(),0);

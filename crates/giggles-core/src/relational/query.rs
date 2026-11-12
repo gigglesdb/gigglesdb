@@ -3116,8 +3116,8 @@ impl Query {
             || table.hidden_rowid().is_some() || table.primary_key.is_empty()
             || table.columns.iter().any(|c| state.column_type(c.id).is_some()) { return None; }
         let filter = self.filter.as_ref()?;
-        // Preserve the existing NULL-key error route, even when another AND
-        // conjunct could supply a non-NULL candidate for the same key column.
+        // Leave NULL-key comparisons to the full WHERE evaluator, even when
+        // another AND conjunct supplies a non-NULL candidate for the same key.
         fn null_key(f: &Filter, table: &TableDef, params: &[Value]) -> bool {
             match f {
                 Filter::Logic(a, _, b) => null_key(a, table, params) || null_key(b, table, params),

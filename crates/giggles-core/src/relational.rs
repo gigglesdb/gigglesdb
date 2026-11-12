@@ -2862,6 +2862,12 @@ fn bounds(t: &TableDef, preds: &[Predicate], params: &[Value]) -> R<Bounds> {
             // A clock-dependent literal is compared in the full filter.
             v = typed.ok_or(SqlError::Unbounded)?;
         }
+        // NULL is a comparison operand, not a stored key value. Let the full
+        // WHERE evaluator apply SQL's unknown result instead of the column's
+        // NOT NULL constraint (or encoding NULL as an ordinary point key).
+        if v == Value::Null {
+            return Err(SqlError::Unbounded);
+        }
         if let Value::Int(n) = &v
             && match t.columns[i].data_type {
                 DataType::SmallInt => i16::try_from(*n).is_err(),
