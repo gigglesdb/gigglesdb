@@ -47,6 +47,14 @@ core CLI); neither binary upgrades on open. V2 supports SQL and catalog roles;
 native task operations, receipts, and export still return an unsupported-feature
 error.
 
+V2 supports transactional `COMMENT ON TABLE [schema.]t IS 'text'` and
+`COMMENT ON COLUMN [schema.]t.c IS 'text'`, with table-owner authorization.
+`NULL` and empty strings remove comments. Text is limited to 65,536 UTF-8 bytes;
+larger comments return `54000` (`program_limit_exceeded`). PostgreSQL 18.6
+accepts larger comments. Legacy databases and other object kinds return `0A000`.
+Stored comments are not yet exposed through `pg_description`, `obj_description`
+or `col_description`.
+
 To reset the owner password offline, stop the server first, then run:
 
 ```powershell

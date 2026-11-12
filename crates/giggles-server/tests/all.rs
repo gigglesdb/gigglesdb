@@ -1,5 +1,7 @@
 // Each file keeps its own support modules, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "comments_network.rs"]
+mod comments_network;
 #[path = "constraint_catalog_network.rs"]
 mod constraint_catalog_network;
 

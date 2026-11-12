@@ -698,6 +698,7 @@ impl Catalog {
         let old = self.parts(txn)?;
         let mut new = old.clone();
         new.tables.remove(name);
+        new.comments.retain(|(table, _), _| *table != entry.def.id);
         new.heap.remove(&entry.def.id);
         new.indexes.retain(|d| d.table != entry.def.id);
         for column in &entry.def.columns {
@@ -777,6 +778,18 @@ impl Catalog {
         let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
         cache.ensure_live()?;
         let latest = &cache.versions.last().unwrap().1;
+        // A DROP may have waited behind COMMENT without a table-record change.
+        // A newly committed comment absent from its tombstones makes it stale.
+        for (key, value) in txn.catalog_writes() {
+            if key.first() == Some(&1) && value.is_none() {
+                let id = decode_id(&key[1..9]).map_err(commit_error)?;
+                for &(table, column) in latest.comments.keys().filter(|(table, _)| *table == id) {
+                    if !matches!(txn.catalog_own(&catalog_codec::comment_key(table, column)), Some(None)) {
+                        return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                    }
+                }
+            }
+        }
         // Reject limit/corruption before committing anything durably.
         overlay_view(latest, txn.catalog_writes()).map_err(commit_error)?;
         txn.commit_then(|ts| {

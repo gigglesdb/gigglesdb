@@ -129,6 +129,7 @@ impl Prepared {
             }
         };
         match &mut bound.statement {
+            Statement::Comment(comment) => read(&mut comment.table),
             Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {
                 name, constraints, ..

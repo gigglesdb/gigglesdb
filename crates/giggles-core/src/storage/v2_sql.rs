@@ -12,6 +12,9 @@ use std::{collections::BTreeSet, ops::Bound};
 mod sql_sequences;
 #[path = "v2_reduction.rs"]
 mod reduction;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_sql_comment_tests.rs"]
+mod comment_tests;
 
 impl SqlSession {
     pub(super) fn prepare_v2(
@@ -511,7 +514,7 @@ impl SqlSession {
                             if let Some(error) = context.as_ref().and_then(|c| c.take_error()) { return Err(error); }
                             return result.map_err(CoreError::Sql);
                         }
-                        let result = image.execute_with_sink(
+                        let result = if bound.command() == "COMMENT" { Ok(Default::default()) } else { image.execute_with_sink(
                             p,
                             params,
                             expected_version,
@@ -531,7 +534,7 @@ impl SqlSession {
                             } else {
                                 None
                             },
-                        );
+                        ) };
                         if let Some(error) = context.as_ref().and_then(|clock| clock.take_error()) {
                             return Err(error);
                         }
@@ -584,7 +587,7 @@ impl SqlSession {
                             .map(|def| def.id)
                             .collect();
                         let indexes = image.secondary_descriptors_engine().to_vec();
-                        let new = CatalogParts {
+                        let mut new = CatalogParts {
                             comments: old.comments.iter()
                                 .filter(|((relation, column), _)| {
                                     tables.values().any(|table| table.id == *relation
@@ -597,6 +600,7 @@ impl SqlSession {
                             ext,
                             indexes,
                         };
+                        bound.apply_comment(&new.tables, &mut new.comments).map_err(CoreError::Sql)?;
                         txn.reclaim_after_commit |=
                             old.tables
                                 .values()

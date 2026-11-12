@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
+mod comments;
 #[cfg(test)]
 #[path = "relational/catalog_image_tests.rs"]
 mod catalog_image_tests;
@@ -950,6 +951,7 @@ enum Statement {
     },
     SetConstraints(Vec<String>, bool),
     AlterTable(alter_table::AlterTable),
+    Comment(comments::Comment),
     CreateIndex(sql_index::CreateIndex),
     DropIndex(sql_index::DropIndex),
     InsertMulti(Box<sql_insert::Insert>),
@@ -1192,6 +1194,9 @@ impl Parser {
         Ok(out)
     }
     fn parse(&mut self) -> R<Statement> {
+        if self.word("comment") {
+            return comments::parse(self).map(Statement::Comment);
+        }
         if schemas::claims(&self.tokens) {
             return schemas::parse(self).map(Statement::Schema);
         }
@@ -1697,7 +1702,7 @@ impl Prepared {
             Statement::Truncate { .. } | Statement::Schema(_) | Statement::TypeDdl(_) => {
                 V2Class::Ddl
             }
-            Statement::Sequence(_) | Statement::DropTable { .. } => V2Class::Ddl,
+            Statement::Sequence(_) | Statement::DropTable { .. } | Statement::Comment(_) => V2Class::Ddl,
             Statement::Create { .. } => V2Class::Ddl,
             Statement::CreateIndex(_) | Statement::DropIndex(_) => V2Class::Ddl,
             Statement::AlterTable(alter) => {
@@ -2212,6 +2217,7 @@ impl Prepared {
             }
             Statement::InsertExpressions(values) => Some(&values.name),
             Statement::AlterTable(alter) => Some(&alter.table),
+            Statement::Comment(comment) => Some(&comment.table),
             Statement::CreateIndex(index) => Some(&index.table),
             Statement::DropIndex(index) => index.table.as_deref(),
             Statement::InsertMulti(insert) => Some(&insert.table),
@@ -2269,6 +2275,7 @@ impl Prepared {
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
                 | Statement::AlterTable(_)
+                | Statement::Comment(_)
                 | Statement::DropTable { .. }
         )
     }
@@ -2319,6 +2326,7 @@ impl Prepared {
             Statement::DropTable { .. } => "DROP TABLE",
             Statement::SetConstraints(..) => "SET CONSTRAINTS",
             Statement::AlterTable(_) => "ALTER TABLE",
+            Statement::Comment(_) => "COMMENT",
             Statement::Create { .. } => "CREATE TABLE",
             Statement::CreateIndex(_) => "CREATE INDEX",
             Statement::DropIndex(_) => "DROP INDEX",
@@ -3483,6 +3491,7 @@ impl Relational {
                 }
                 alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
             }
+            Statement::Comment(_) => return Err(SqlError::Unsupported), // v2 bridge only
             Statement::DropTable {
                 names,
                 optional,

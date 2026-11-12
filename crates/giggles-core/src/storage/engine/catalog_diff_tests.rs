@@ -15,6 +15,8 @@ use std::{ops::Range, time::Duration};
 
 #[path = "catalog_comment_tests.rs"]
 mod comment_tests;
+#[path = "catalog_comment_ddl_tests.rs"]
+mod comment_ddl_tests;
 
 fn setup() -> (Arc<MemKv>, Arc<Sequencer>, Arc<LockManager>, Catalog) {
     let mem = Arc::new(MemKv::new());

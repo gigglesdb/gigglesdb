@@ -855,6 +855,11 @@ impl Session {
                 return Err(CoreError::Sql(relational::SqlError::Unsupported));
             }
             session.reconcile_sequence_owners()?;
+            let comment_target = Prepared::comment_table_target(sql).map_err(|error| {
+                session.sql.abort();
+                parse_error(session, CoreError::Sql(error))
+            })?;
+            if let Some(table) = comment_target { session.authorize_alter_table(&table)?; }
             // Parse the complete ALTER before checking authority, but do not bind
             // its table, columns, or defaults until ownership has been checked.
             let alter_target = Prepared::alter_table_target(sql).map_err(|error| {
@@ -1222,7 +1227,7 @@ impl Session {
             if role.superuser {
                 superuser = true;
                 true
-            } else if p.is_alter_table()
+            } else if p.command() == "COMMENT" || p.is_alter_table()
                 || p.is_drop_table()
                 || (p.command() == "DROP INDEX" && p.table().is_some())
             {
