@@ -112,3 +112,6 @@ mod gui_browse;
 
 #[path = "temporal_column_precision.rs"]
 mod temporal_column_precision;
+
+#[path = "rails_columns.rs"]
+mod rails_columns;

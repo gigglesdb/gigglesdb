@@ -221,21 +221,14 @@ fn exercise(engine: Engine) {
         s.execute("SELECT t.* AS renamed FROM table_name t", &[], None),
         s.execute("SELECT * AS renamed FROM table_name t", &[], None),
     );
-    // Core currently rejects CTEs and derived FROM tables for plain stars too.
-    for (plain, qualified) in [
-        (
-            "SELECT * FROM (SELECT test FROM table_name) q",
-            "SELECT q.* FROM (SELECT test FROM table_name) q",
-        ),
-        (
-            "WITH q AS (SELECT test FROM table_name) SELECT * FROM q",
-            "WITH q AS (SELECT test FROM table_name) SELECT q.* FROM q",
-        ),
-    ] {
-        let expected = s.execute(plain, &[], None);
-        assert!(expected.is_err());
-        assert_eq!(s.execute(qualified, &[], None), expected);
-    }
+    assert_eq!(
+        query(&mut s, "SELECT q.* FROM (SELECT test FROM table_name) q ORDER BY test", &["test"]),
+        query(&mut s, "SELECT * FROM (SELECT test FROM table_name) q ORDER BY test", &["test"]),
+    );
+    // CTEs remain outside the supported query profile.
+    let expected = s.execute("WITH q AS (SELECT test FROM table_name) SELECT * FROM q", &[], None);
+    assert!(expected.is_err());
+    assert_eq!(s.execute("WITH q AS (SELECT test FROM table_name) SELECT q.* FROM q", &[], None), expected);
     drop(s);
     drop(admin);
     if path.is_dir() {

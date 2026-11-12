@@ -1108,6 +1108,11 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
             .unwrap().rows[0].values,
         vec![relational::Value::Int(1)],
     );
+    assert_eq!(
+        parity(&mut a, &mut b, "SELECT id FROM (SELECT id FROM a) q", &[])
+            .unwrap().rows[0].values,
+        vec![relational::Value::Int(1)],
+    );
     for sql in [
         "SELECT id FROM a UNION SELECT id FROM b",
         "SELECT id FROM a UNION ALL SELECT id FROM b",
@@ -1118,7 +1123,6 @@ fn legacy_unsupported_read_forms_keep_exact_errors() {
         "SELECT a.id,b.id FROM a FULL OUTER JOIN b ON a.id=b.id",
         "SELECT (SELECT id FROM b) FROM a",
         "SELECT id FROM a WHERE id=(SELECT id FROM b)",
-        "SELECT id FROM (SELECT id FROM a) q",
         "INSERT INTO b SELECT id FROM a UNION SELECT id FROM b",
     ] {
         parity(&mut a, &mut b, sql, &[]).unwrap_err();

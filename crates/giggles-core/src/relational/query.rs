@@ -10,6 +10,7 @@ mod grouping;
 mod insert_values;
 mod schema_names;
 mod subplans;
+mod derived;
 mod outer;
 mod exists;
 use subplans::{SubplanMode, Subplans};
@@ -188,6 +189,7 @@ struct QueryClauses {
     page_casts: [Option<DataType>; 2],
     // Explicit aliases hide schema-qualified relation names, even `FROM t AS t`.
     aliased_sources: Vec<usize>,
+    derived: Option<Box<Query>>,
 }
 #[derive(Debug, Clone)]
 enum Filter {
@@ -356,7 +358,8 @@ fn admit_subquery_forms(tokens: &[Token], allow_exists: bool) -> R<()> {
     while at < tokens.len() {
         if is_subquery_open(tokens, at) {
             if at == 0 || !(tokens.get(at - 1) == Some(&Token::Word("in".into()))
-                || allow_exists && tokens.get(at - 1) == Some(&Token::Word("exists".into()))) {
+                || allow_exists && tokens.get(at - 1) == Some(&Token::Word("exists".into()))
+                || tokens.get(at - 1) == Some(&Token::Word("from".into()))) {
                 return Err(SqlError::Unsupported);
             }
             if at >= 2 && tokens[at - 2] == Token::Symbol(')') {
@@ -755,6 +758,7 @@ impl Filter {
             relations: Vec::new(),
         };
         let query = Query::parse(&mut child)?;
+        if query.derived().is_some() { return Err(SqlError::Unsupported); }
         p.params.extend(child.params);
         p.relations.extend(child.relations);
         p.at = end + 1;
@@ -1754,6 +1758,7 @@ impl Query {
     }
 
     fn walk_scalars(&self, visit: &mut impl FnMut(&Scalar) -> R<()>) -> R<()> {
+        if let Some(q) = self.derived() { q.walk_scalars(visit)?; }
         for (item, _) in &self.items {
             match item {
                 Item::Scalar(s) | Item::Aggregate(_, Some(s)) => walk_scalar(s, visit)?,
@@ -1802,7 +1807,7 @@ impl Query {
         if let Some(filter) = self.where_filter() {
             let _ = filter.visit_subqueries(&mut |value, _| { exists |= value.is_none(); Ok(()) });
         }
-        if exists { return true; }
+        if exists || self.derived().is_some() { return true; }
         if !self.joins.is_empty() { return true; }
         self.sources.len() == 1
             && !self.distinct() && !self.has_in_subquery()
@@ -1829,6 +1834,7 @@ impl Query {
             && self.group().is_empty()
             && self.clauses().is_none_or(|c| c.having.is_none())
             && !self.has_in_subquery()
+            && self.derived().is_none()
             && self.items.iter().all(|(item, _)| match item {
                 Item::Aggregate(..) => false,
                 Item::Scalar(s) => !grouping::contains_aggregate(s),
@@ -1837,6 +1843,7 @@ impl Query {
     }
     pub(super) fn subquery_tables(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(q) = self.derived() { out.extend(q.read_tables()); }
         if let Some(f) = &self.filter {
             let _ = f.visit_subqueries(&mut |_, q| {
                 for name in q.read_tables() {
@@ -1878,6 +1885,7 @@ impl Query {
         out
     }
     fn limit_parameters(&self, out: &mut BTreeSet<usize>) {
+        if let Some(q) = self.derived() { q.limit_parameters(out); }
         for e in self.limit.iter().chain(self.offset()) {
             if let Expr::Param(n) = e {
                 out.insert(*n);
@@ -1899,6 +1907,14 @@ impl Query {
         tables: &[&TableDef],
     ) -> R<Subplans<'a>> {
         let mut out = Subplans::default();
+        if let Some(q) = self.derived() {
+            let used = q.used_parameters();
+            let seed = parameters.iter().enumerate().map(|(i, p)|
+                p.clone().or_else(|| (!used.contains(&(i + 1))).then_some(DataType::Text))).collect();
+            let bound = q.bind_seeded_inner(state, seed, false, &[])?;
+            for n in used { parameters[n - 1] = Some(bound.parameters[n - 1].clone()); }
+            out.register(q as *const Query as usize, SubplanMode::Scalar, bound)?;
+        }
         if let Some(f) = self.where_filter() {
             f.visit_subqueries(&mut |value, q| {
                 if let Some(value) = value
@@ -2292,8 +2308,13 @@ impl Query {
         let mut items = Self::parse_items(p)?;
         let mut sources = vec![];
         let mut aliased_sources = vec![];
+        let mut derived = None;
         if p.word("from") {
-            let (source, aliased) = p.source()?;
+            let (source, aliased) = if is_subquery_open(&p.tokens, p.at) {
+                let (source, child) = derived::parse(p, &mut items)?;
+                derived = Some(child);
+                (source, true)
+            } else { p.source()? };
             if aliased {
                 aliased_sources.push(0);
             }
@@ -2324,6 +2345,7 @@ impl Query {
             let on = Filter::parse(p, 0, 0)?;
             joins.push(Join { left, on });
         }
+        if derived.is_some() && !joins.is_empty() { return Err(SqlError::Unsupported); }
         // Only schema-qualified wildcards need explicit-alias metadata.
         if !items.iter().any(|(item, _)| {
             matches!(
@@ -2470,6 +2492,10 @@ impl Query {
         if p.at != p.tokens.len() {
             return Err(SqlError::Unsupported);
         }
+        if derived.is_some() {
+            predicates.clear();
+            if let Some(f) = &filter { f.visit_subqueries(&mut |_, _| Err(SqlError::Unsupported))?; }
+        }
         Ok(Self {
             explain,
             sources,
@@ -2482,6 +2508,7 @@ impl Query {
                 && offset.is_none()
                 && limit_cast.is_none()
                 && aliased_sources.is_empty()
+                && derived.is_none()
             {
                 filter
             } else {
@@ -2493,6 +2520,7 @@ impl Query {
                     offset,
                     page_casts: [limit_cast, offset_cast],
                     aliased_sources,
+                    derived,
                 })))
             },
             order,
@@ -2884,7 +2912,7 @@ impl Query {
                 }
             }
         }
-        let mut out = Vec::new();
+        let mut out = self.derived().map_or_else(Vec::new, Query::sequence_dependencies);
         for join in &self.joins {
             filter(&join.on, &mut out);
         }
@@ -3466,7 +3494,8 @@ impl Query {
         }
         let outer_slots = RefCell::new(Vec::new());
         let resolve = |c: &ColumnRef, scope: usize| {
-            outer::resolve(self, outer, &tables, c, scope, &outer_slots)
+            let mapped = derived::column(self, c)?;
+            outer::resolve(self, outer, &tables, mapped.as_ref().unwrap_or(c), scope, &outer_slots)
         };
         if self.has_in_subquery()
             && let Some(f) = self.where_filter()
@@ -3735,8 +3764,10 @@ impl Query {
                     }
                     let e = e.bind(&resolve, &tables, &parameters)?;
                     let (source_column, d) = if let Item::Scalar(Scalar::Column(c)) = item {
+                        let name = c.name.clone();
                         let c = resolve(c, tables.len())?;
                         let mut d = tables[c.source].columns[c.column].clone();
+                        if self.derived().is_some() { d.name = name; }
                         if c.source > 0 && self.joins.get(c.source - 1).is_some_and(|j| j.left) {
                             d.not_null = false;
                         }
@@ -4300,6 +4331,7 @@ impl BoundQuery<'_> {
             || self.query.distinct()
             || self.query.explain
             || self.query.has_in_subquery()
+            || self.query.derived().is_some()
         {
             return None;
         }
@@ -4648,6 +4680,8 @@ impl BoundQuery<'_> {
         subquery: bool,
         insert_source: bool,
     ) -> R<SqlResult> {
+        let materialized = self.materialize_derived(state, source, params, declared, execution)?;
+        let source: &dyn scan::RowSource = materialized.as_ref().map_or(source, |rows| rows);
         if !self.outer_slots.is_empty() {
             return Err(SqlError::Unsupported); // C4 supplies outer tuples.
         }

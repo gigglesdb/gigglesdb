@@ -7,6 +7,8 @@ impl Query {
         state: &Relational,
         path: &[String],
     ) {
+        if let Some(Filter::Clauses(c)) = &mut self.filter
+            && let Some(q) = &mut c.derived { q.bind_schema_names(bind, state, path); }
         for source in &mut self.sources {
             bind(&mut source.name);
         }

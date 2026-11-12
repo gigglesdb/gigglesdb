@@ -292,7 +292,6 @@ fn unsupported_subquery_positions_remain_unsupported() {
         "SELECT (SELECT id FROM u) FROM t",
         "SELECT id FROM t WHERE id = ANY (SELECT id FROM u)",
         "SELECT id FROM t WHERE id = ALL (SELECT id FROM u)",
-        "SELECT id FROM (SELECT id FROM t) a",
         "SELECT id,id IN (SELECT id FROM u) AS m FROM t ORDER BY id",
         "SELECT (id IN (SELECT n FROM u)) IS NULL AS unk,id FROM t ORDER BY id",
         "SELECT NULL::int IN (SELECT id FROM u WHERE false)",

@@ -178,7 +178,7 @@ pub fn catalog_identifier(name: &str) -> bool {
 fn unqualified_catalog(name: &str) -> bool {
     catalog::relation_namespace(name) == "pg_catalog" && catalog::schema(name).is_some()
 }
-fn regclass_oid(value: &str) -> R<u32> {
+fn regclass_oid(value: &str, snapshot: &CatalogSnapshot) -> R<u32> {
     if let Ok(oid) = value.parse::<u32>() {
         return Ok(oid);
     }
@@ -201,12 +201,22 @@ fn regclass_oid(value: &str) -> R<u32> {
         return Err(Error::Unsupported);
     }
     let parts = object(&name);
-    let name = match parts.as_slice() {
-        [name] if unqualified_catalog(name) => name,
-        [schema, name] if schema == catalog::relation_namespace(name) => name,
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name),
+        [schema, name] => (Some(schema.as_str()), name),
         _ => return Err(Error::Unsupported),
     };
-    catalog::relation_oid(name).ok_or(Error::Unsupported)
+    let mut path = snapshot.search_path.clone();
+    if !path.iter().any(|s| s == "pg_catalog") { path.insert(0, "pg_catalog".into()); }
+    for namespace in schema.map(|s| vec![s.to_owned()]).unwrap_or(path) {
+        if namespace == catalog::relation_namespace(name)
+            && let Some(oid) = catalog::relation_oid(name) { return Ok(oid); }
+        if let Some(table) = snapshot.tables.iter().find(|t|
+            t.name == *name && snapshot.table_schema(t.id).0 == namespace) {
+            return catalog::table_oid(table.id);
+        }
+    }
+    Err(Error::Unsupported)
 }
 fn function(n: &a::ObjectName) -> R<String> {
     let p = object(n);
@@ -2895,7 +2905,7 @@ fn check_expr(e: &mut E) -> R<()> {
                 }
             }
             "to_regtype" | "_regtype" => expect(&mut args[0], PgType::Text)?,
-            "array_remove" => {
+            "array_remove" | "array_position" => {
                 let element = array_element(args[0].ty)?;
                 expect(&mut args[1], element)?;
             }
@@ -3036,6 +3046,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("current_schemas", 1) => PgType::NameArray,
         ("acldefault", 2) => PgType::AclItemArray,
         ("array_remove", 2) => a[0].ty,
+        ("array_position", 2) => PgType::Int4,
         ("replace" | "translate", 3)
         | ("substring", 2 | 3)
         | ("pg_get_expr", 2 | 3)
@@ -3736,7 +3747,7 @@ impl Runtime<'_> {
             K::IntegerOid(e, source) => integer_oid(ev(e)?, *source)?,
             K::Regclass(e) => match ev(e)? {
                 N => N,
-                S(s) => I(regclass_oid(&s)? as i64),
+                S(s) => I(regclass_oid(&s, self.snapshot)? as i64),
                 I(i) => I(i),
                 _ => return Err(Error::Type),
             },
@@ -3893,7 +3904,7 @@ impl Runtime<'_> {
                 } else {
                     self.call(n, values, remaining)?
                 };
-                if matches!(n.as_str(), "array_upper" | "array_lower")
+                if matches!(n.as_str(), "array_upper" | "array_lower" | "array_position")
                     && matches!(args[0].ty, PgType::Int2Vector | PgType::OidVector)
                 {
                     match value {
@@ -4209,6 +4220,7 @@ impl Runtime<'_> {
             && !(n == "array_to_string" && v[0] != N && v[1] != N)
             && n != "_string_agg"
             && n != "array_remove"
+            && n != "array_position"
         {
             return Ok(N);
         }
@@ -4543,6 +4555,15 @@ impl Runtime<'_> {
                     I(i32::try_from(a.len()).map_err(|_| Error::Limit)? as i64)
                 }
                 (Value::Array(_), I(_)) => N,
+                _ => return Err(Error::Type),
+            },
+            "array_position" => match &v[0] {
+                N => N,
+                Value::Array(a) => {
+                    self.charge(a.len())?;
+                    if a.iter().any(|v| matches!(v, Value::Array(_))) { return Err(Error::Unsupported); }
+                    a.iter().position(|x| x == &v[1]).map_or(N, |i| I(i as i64 + 1))
+                }
                 _ => return Err(Error::Type),
             },
             "cardinality" => match &v[0] {

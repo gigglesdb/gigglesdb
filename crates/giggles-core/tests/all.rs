@@ -382,3 +382,6 @@ mod null_key_predicate;
 
 #[path = "temporal_column_precision.rs"]
 mod temporal_column_precision;
+
+#[path = "derived_orm.rs"]
+mod derived_orm;

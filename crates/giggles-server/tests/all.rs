@@ -162,3 +162,6 @@ mod exists_authority;
 
 #[path = "prepared_cap_network.rs"]
 mod prepared_cap_network;
+
+#[path = "derived_authority.rs"]
+mod derived_authority;
