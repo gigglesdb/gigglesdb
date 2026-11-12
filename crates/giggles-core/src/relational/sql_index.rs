@@ -10,6 +10,15 @@ pub(super) struct CreateIndex {
     pub if_not_exists: bool,
 }
 
+fn opclass_name(p: &mut Parser) -> R<String> {
+    let Some(Token::Word(name) | Token::QuotedIdent(name)) = p.tokens.get(p.at) else {
+        return Err(SqlError::Syntax);
+    };
+    let name = ident::truncate(name, 63).to_owned();
+    p.at += 1;
+    Ok(name)
+}
+
 pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
     p.need("create")?;
     let unique = p.word("unique");
@@ -49,6 +58,27 @@ pub(super) fn parse(p: &mut Parser) -> R<CreateIndex> {
             return Err(SqlError::Unsupported);
         }
         columns.push(p.name()?);
+        if matches!(p.tokens.get(p.at), Some(Token::QuotedIdent(_)))
+            || matches!(p.tokens.get(p.at), Some(Token::Word(w)) if !["asc", "desc", "nulls", "collate"].contains(&w.as_str()))
+        {
+            let mut opclass = opclass_name(p)?;
+            if p.sym('.') {
+                let schema = opclass;
+                opclass = opclass_name(p)?;
+                if schema != "pg_catalog" { return Err(SqlError::UndefinedObject); }
+            }
+            // Syntax-only compatibility: descriptors and indclass retain the default.
+            if ![
+                "text_pattern_ops", "varchar_pattern_ops", "bpchar_pattern_ops",
+                "array_ops", "bit_ops", "bool_ops", "bpchar_ops", "bytea_ops", "char_ops",
+                "date_ops", "enum_ops", "float4_ops", "float8_ops", "inet_ops", "int2_ops",
+                "int4_ops", "int8_ops", "interval_ops", "jsonb_ops", "macaddr8_ops", "macaddr_ops",
+                "money_ops", "multirange_ops", "name_ops", "numeric_ops", "oid_ops", "oidvector_ops",
+                "pg_lsn_ops", "range_ops", "record_ops", "text_ops", "tid_ops", "time_ops",
+                "timestamp_ops", "timestamptz_ops", "timetz_ops", "tsquery_ops", "tsvector_ops",
+                "uuid_ops", "varbit_ops", "varchar_ops", "xid8_ops",
+            ].contains(&opclass.as_str()) { return Err(SqlError::UndefinedObject); }
+        }
         p.word("asc");
         if p.word("nulls") {
             if p.word("first") {

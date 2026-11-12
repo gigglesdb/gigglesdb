@@ -85,23 +85,27 @@ fn prepared_ddl_ownership_commits_and_rolls_back_without_deadlock() {
             roles
                 .grant_table("created", "owner", &[TablePrivilege::Select])
                 .unwrap();
-            // Wire DROP currently uses an administrative route that forbids
-            // explicit blocks; exercise transactional DROP through Service.
-            let mut dropper = service.role_session("owner").unwrap();
-            dropper.execute_sql("BEGIN", &[]).unwrap();
-            dropper.execute_sql("DROP TABLE created", &[]).unwrap();
-            assert_eq!(
-                roles.table_owner("created").unwrap().as_deref(),
-                Some("owner")
-            );
-            dropper.execute_sql("ROLLBACK", &[]).unwrap();
-            assert!(admin.sql_session().relation_exists("created").unwrap());
-            assert!(
-                roles
-                    .table_privileges("created", "owner")
-                    .unwrap()
-                    .contains(&TablePrivilege::Select)
-            );
+            for simple in [false, true] {
+                client.execute("BEGIN", &[]).await.unwrap();
+                client.execute("SAVEPOINT keep", &[]).await.unwrap();
+                if simple { client.simple_query("DROP TABLE created").await.unwrap(); }
+                else { client.execute("DROP TABLE created", &[]).await.unwrap(); }
+                assert_eq!(roles.table_owner("created").unwrap().as_deref(), Some("owner"));
+                client.execute("ROLLBACK TO keep", &[]).await.unwrap();
+                assert_eq!(client.query("SELECT id FROM created", &[]).await.unwrap().len(), 1);
+                client.execute("DROP TABLE created", &[]).await.unwrap();
+                client.execute("ROLLBACK", &[]).await.unwrap();
+                assert_eq!(client.query("SELECT id FROM created", &[]).await.unwrap().len(), 1);
+                assert!(roles.table_privileges("created", "owner").unwrap().contains(&TablePrivilege::Select));
+            }
+            client.execute("CREATE INDEX created_ix ON created (id)", &[]).await.unwrap();
+            client.execute("BEGIN", &[]).await.unwrap();
+            client.execute("SAVEPOINT keep", &[]).await.unwrap();
+            client.execute("DROP INDEX created_ix", &[]).await.unwrap();
+            client.execute("ROLLBACK TO keep", &[]).await.unwrap();
+            client.execute("DROP INDEX created_ix", &[]).await.unwrap();
+            client.execute("ROLLBACK", &[]).await.unwrap();
+            assert!(admin.secondary_index_catalog().unwrap().1.iter().any(|ix| ix.name == "created_ix"));
             client.execute("BEGIN", &[]).await.unwrap();
             client
                 .execute("CREATE TABLE discarded (id BIGINT PRIMARY KEY)", &[])
@@ -117,7 +121,6 @@ fn prepared_ddl_ownership_commits_and_rolls_back_without_deadlock() {
                     .unwrap()
                     .is_empty()
             );
-            drop(dropper);
             pg.shutdown().await.unwrap();
         });
         runtime.shutdown_timeout(Duration::from_secs(1));

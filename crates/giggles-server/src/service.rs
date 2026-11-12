@@ -565,6 +565,19 @@ impl Session {
             return Err("42501");
         };
         self.check_binding().map_err(|error| sqlstate(&error))?;
+        if let crate::auth::statements::AdminStatement::DropTable(optional, names) = stmt
+            && names.len() == 1
+            && self.in_transaction()
+            && self.sql.set_ddl_owner(Some(name))
+        {
+            let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+            let target = if let Some((schema, table)) = names[0].split_once('\0') {
+                format!("{}.{}", quote(schema), quote(table))
+            } else { quote(&names[0]) };
+            let sql = format!("DROP TABLE {}{target}", if *optional { "IF EXISTS " } else { "" });
+            self.execute_sql(&sql, &[]).map_err(|e| sqlstate(&e))?;
+            return Ok("DROP TABLE");
+        }
         if self.in_transaction() {
             return Err("25001");
         }

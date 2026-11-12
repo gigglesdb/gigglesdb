@@ -185,6 +185,7 @@ struct QueryClauses {
     group: Vec<Scalar>,
     having: Option<Filter>,
     offset: Option<Expr>,
+    page_casts: [Option<DataType>; 2],
     // Explicit aliases hide schema-qualified relation names, even `FROM t AS t`.
     aliased_sources: Vec<usize>,
 }
@@ -1900,6 +1901,36 @@ impl Query {
     fn offset(&self) -> Option<&Expr> {
         self.clauses().and_then(|c| c.offset.as_ref())
     }
+    fn parse_page(p: &mut Parser) -> R<(Expr, Option<DataType>)> {
+        let start = p.at;
+        if let Ok(value) = p.expr()
+            && p.tokens.get(p.at) != Some(&Token::Symbol(':'))
+        {
+            return Ok((value, None));
+        }
+        p.at = start;
+        let value = Scalar::parse_expr(p, 0, false)?;
+        match value {
+            Scalar::Param(n) => Ok((Expr::Param(n), None)),
+            Scalar::Literal(v) => Ok((Expr::Literal(v), None)),
+            Scalar::Cast(value, ty) if integer_type(&ty) || ty == DataType::Numeric => {
+                let Scalar::Param(n) = *value else { return Err(SqlError::Unsupported) };
+                Ok((Expr::Param(n), Some(ty)))
+            }
+            _ => Err(SqlError::Unsupported),
+        }
+    }
+    fn page_cast(&self, limit: bool) -> Option<&DataType> {
+        self.clauses().and_then(|c| c.page_casts[usize::from(!limit)].as_ref())
+    }
+    fn page_value(&self, expr: &Expr, params: &[Value], limit: bool) -> R<Value> {
+        let value = expr.value(params)?;
+        if let Some(ty) = self.page_cast(limit) {
+            let value = functions::cast_value(value, ty, &mut 0)?;
+            return functions::cast_value(value, &DataType::BigInt, &mut 0);
+        }
+        Ok(value)
+    }
     fn parse_items(p: &mut Parser) -> R<Vec<(Item, Option<String>)>> {
         let mut items = Vec::new();
         loop {
@@ -2124,6 +2155,7 @@ impl Query {
             // Infer independently of SET to retain undeclared column conflicts.
             // Plain comparisons preserve explicit declarations, including widths.
             let mut inferred = vec![None; parameters.len()];
+            inferred[..declared.len()].clone_from_slice(declared);
             let inference = filter.infer_mutation(&mut inferred, declared, &resolve, &[table]);
             for (parameter, inferred) in parameters.iter_mut().zip(inferred) {
                 if let Some(inferred) = inferred {
@@ -2315,18 +2347,20 @@ impl Query {
         }
         let limit = if p.word("limit") {
             Some(if p.word("all") {
-                Expr::Literal(Value::Null)
+                (Expr::Literal(Value::Null), None)
             } else {
-                p.expr()?
+                Self::parse_page(p)?
             })
         } else {
             None
         };
         let offset = if p.word("offset") {
-            Some(p.expr()?)
+            Some(Self::parse_page(p)?)
         } else {
             None
         };
+        let (limit, limit_cast) = limit.map_or((None, None), |(e, t)| (Some(e), t));
+        let (offset, offset_cast) = offset.map_or((None, None), |(e, t)| (Some(e), t));
         if !aggregate_filters.is_empty() {
             for (item, _) in &mut items {
                 match item {
@@ -2381,6 +2415,7 @@ impl Query {
                 && group.is_empty()
                 && having.is_none()
                 && offset.is_none()
+                && limit_cast.is_none()
                 && aliased_sources.is_empty()
             {
                 filter
@@ -2391,6 +2426,7 @@ impl Query {
                     group,
                     having,
                     offset,
+                    page_casts: [limit_cast, offset_cast],
                     aliased_sources,
                 })))
             },
@@ -3195,6 +3231,11 @@ impl Query {
         if parameters.len() > MAX_PARAMS {
             return Err(SqlError::Limit);
         }
+        for (expr, limit) in self.limit.iter().map(|e| (e, true)).chain(self.offset().map(|e| (e, false))) {
+            if let (Expr::Param(n), Some(ty)) = (expr, self.page_cast(limit)) {
+                parameters.get_mut(n - 1).ok_or(SqlError::Parameters)?.get_or_insert_with(|| ty.clone());
+            }
+        }
         let declared_bytea_projection = parameters.contains(&Some(DataType::Bytes))
             && !self.explain
             && self.sources.is_empty()
@@ -3430,7 +3471,8 @@ impl Query {
                 predicates.push((c, op.as_str(), e));
             }
         }
-        for e in self.limit.iter().chain(self.offset()) {
+        for (e, limit) in self.limit.iter().map(|e| (e, true)).chain(self.offset().map(|e| (e, false))) {
+            if self.page_cast(limit).is_some() { continue; }
             // LIMIT accepts the integer widths by implicit widening. Keep an
             // input type already fixed by the SELECT list.
             if let Expr::Param(n) = e {
@@ -4123,7 +4165,7 @@ impl BoundQuery<'_> {
         }
         if !progress.initialized {
             let number = |expr: Option<&Expr>, default, numeric: bool| -> R<Option<u64>> {
-                let mut value = expr.map(|e| e.value(params)).transpose()?;
+                let mut value = expr.map(|e| self.query.page_value(e, params, numeric)).transpose()?;
                 if numeric
                     && let Some(Expr::Param(n)) = expr
                     && self.declared.get(n - 1) == Some(&Some(DataType::Numeric))
@@ -4441,7 +4483,7 @@ impl BoundQuery<'_> {
             return grouping.execute(self, state, source, params, execution, false);
         }
         let offset = match self.query.offset() {
-            Some(e) => match e.value(params)? {
+            Some(e) => match self.query.page_value(e, params, false)? {
                 Value::Int(n) if n >= 0 => n as u64,
                 Value::Int(_) => return Err(SqlError::InvalidRowCountInResultOffsetClause),
                 Value::Null => 0,
@@ -4451,7 +4493,7 @@ impl BoundQuery<'_> {
         };
         let limit = match &self.query.limit {
             Some(e) => {
-                let value = e.value(params)?;
+                let value = self.query.page_value(e, params, true)?;
                 let value = if matches!(e, Expr::Param(n)
                     if declared.get(n - 1) == Some(&Some(DataType::Numeric)))
                 {

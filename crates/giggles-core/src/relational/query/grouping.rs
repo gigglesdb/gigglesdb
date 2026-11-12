@@ -813,10 +813,11 @@ impl Ord for Key {
 fn retained(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(value_bytes).sum::<usize>()
 }
-fn page_expr(expr: Option<&Expr>, params: &[Value]) -> R<Option<u64>> {
-    match expr.map(|e| e.value(params)).transpose()? {
+fn page_expr(query: &Query, expr: Option<&Expr>, params: &[Value], limit: bool) -> R<Option<u64>> {
+    match expr.map(|e| query.page_value(e, params, limit)).transpose()? {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Int(n)) if n >= 0 => Ok(Some(n as u64)),
+        Some(Value::Int(_)) => Err(if limit { SqlError::InvalidRowCountInLimitClause } else { SqlError::InvalidRowCountInResultOffsetClause }),
         _ => Err(SqlError::Limit),
     }
 }
@@ -845,8 +846,8 @@ impl Grouping {
         let mut cancel_impl = || execution.cancelled();
         let cancel = &mut cancel_impl;
         let page = scan::Page {
-            offset: page_expr(query.query.offset(), params)?.unwrap_or(0),
-            limit: page_expr(query.query.limit.as_ref(), params)?,
+            offset: page_expr(query.query, query.query.offset(), params, false)?.unwrap_or(0),
+            limit: page_expr(query.query, query.query.limit.as_ref(), params, true)?,
         };
         if query.query.explain {
             return Ok(SqlResult {

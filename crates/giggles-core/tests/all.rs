@@ -370,3 +370,6 @@ mod bare_alias;
 
 #[path = "orm_identity_metadata.rs"]
 mod orm_identity_metadata;
+
+#[path = "orm_casts.rs"]
+mod orm_casts;

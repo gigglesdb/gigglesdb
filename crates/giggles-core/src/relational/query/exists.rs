@@ -115,7 +115,7 @@ impl BoundQuery<'_> {
     ) -> R<bool> {
         if execution.cancelled() { return Err(SqlError::Aborted); }
         let number = |e: Option<&Expr>, default, limit| -> R<Option<u64>> {
-            let mut value = e.map(|e| e.value(params)).transpose()?;
+            let mut value = e.map(|e| self.query.page_value(e, params, limit)).transpose()?;
             if limit && matches!(e, Some(Expr::Param(n)) if execution.declared.get(n-1) == Some(&Some(DataType::Numeric))) {
                 value = value.map(|v| assignment::convert(v, &DataType::Numeric, &DataType::BigInt, None)).transpose()?;
             }
