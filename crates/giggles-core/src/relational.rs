@@ -15,6 +15,7 @@ pub(crate) mod clock;
 mod constraint_lookup;
 mod constraint_primary_key;
 mod ddl_type;
+pub use ddl_type::take_sql_warnings;
 mod user_types;
 pub use user_types::{
     TypeDef, UserTypeCatalog, take_sql_error_message, take_sql_notices, type_oid,
@@ -579,6 +580,12 @@ pub(crate) fn coerce_to_column(rel: &Relational, column: &ColumnDef, value: Valu
     Ok(value)
 }
 fn coerce_base_to_column(rel: &Relational, column: &ColumnDef, value: Value) -> R<Value> {
+    if matches!(
+        column.data_type,
+        DataType::Time | DataType::TimeTz | DataType::Timestamp | DataType::TimestampTz
+    ) {
+        return defaults::apply_typmod(value, rel.column_typmod(column.id));
+    }
     if column.data_type.is_extended_text() {
         return logical_types::coerce(value, &column.data_type);
     }
@@ -1604,6 +1611,7 @@ pub struct Prepared {
     relations: Vec<schemas::Reference>,
     search_path: Vec<String>,
     schema_user: String,
+    warnings: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Awaiting v2 dispatch integration.
@@ -1739,6 +1747,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             unbound_statement: None,
+            warnings: vec![],
         }
     }
     pub(crate) fn create_engine(
@@ -2383,6 +2392,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             unbound_statement: None,
+            warnings: vec![],
             statement: Statement::Select {
                 name: scan.table,
                 projection: scan.projection,
@@ -2729,6 +2739,7 @@ impl Prepared {
     }
     pub(crate) fn parse(sql: &str, domain: u128, epoch: u64) -> R<Self> {
         assert_sql_frontend_allowed();
+        take_sql_warnings();
         let mut p = Parser {
             tokens: lex(sql)?,
             at: 0,
@@ -2783,6 +2794,7 @@ impl Prepared {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             unbound_statement: None,
+            warnings: take_sql_warnings(),
         })
     }
     /// Transaction-local name, normalized using PostgreSQL identifier rules.
@@ -3269,6 +3281,7 @@ impl Relational {
         let prepared = &bound;
         prepared.validate_schemas(self)?;
         user_types::clear_sql_error_message();
+        ddl_type::publish(&prepared.warnings);
         if prepared.epoch != self.epoch {
             return Err(SqlError::StaleSchema);
         }
@@ -3380,6 +3393,7 @@ impl Relational {
                 search_path: vec!["public".into()],
                 schema_user: "giggles".into(),
                 unbound_statement: None,
+                warnings: vec![],
                 statement: Statement::Insert {
                     name: values.name.clone(),
                     columns: values.columns.clone(),

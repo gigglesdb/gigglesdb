@@ -379,3 +379,6 @@ mod orm_rows;
 
 #[path = "null_key_predicate.rs"]
 mod null_key_predicate;
+
+#[path = "temporal_column_precision.rs"]
+mod temporal_column_precision;

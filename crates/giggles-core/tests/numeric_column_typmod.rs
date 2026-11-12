@@ -162,13 +162,7 @@ fn numeric_modifier_variants_and_invalid_declarations() {
             SqlError::Syntax,
         );
     }
-    for ty in ["time(2)", "timestamp(2)", "integer(2)"] {
-        fails(
-            &mut s,
-            &format!("CREATE TABLE invalid (v {ty})"),
-            SqlError::Syntax,
-        );
-    }
+    fails(&mut s, "CREATE TABLE invalid (v integer(2))", SqlError::Syntax);
 }
 
 #[test]

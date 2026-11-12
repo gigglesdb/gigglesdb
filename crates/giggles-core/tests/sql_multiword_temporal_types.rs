@@ -1,5 +1,5 @@
 //! PG 18.6 spelling oracle: e1-sql/evidence/oracle-pg186-multiword-temporal-types.txt.
-//! CREATE precision and array support deliberately follow the existing aliases.
+//! CREATE precision matches PG18.6; temporal arrays remain unsupported.
 mod common;
 
 use giggles_core::{
@@ -81,12 +81,6 @@ fn all_seven_oracle_forms_follow_create_alias_policy_independently() {
         let short = Database::new();
         let result = long.run(&format!("CREATE TABLE t (v {spelling})"));
         let alias_result = short.run(&format!("CREATE TABLE t (v {alias})"));
-        if precision {
-            assert_eq!(result, Err(CoreError::Sql(SqlError::Syntax)), "{spelling}");
-            assert_eq!(alias_result, result, "{alias}");
-            assert!(long.admin().catalog().unwrap().1.is_empty());
-            continue;
-        }
         result.unwrap();
         alias_result.unwrap();
         let catalog = long.admin().catalog().unwrap();
@@ -99,6 +93,14 @@ fn all_seven_oracle_forms_follow_create_alias_policy_independently() {
             long.admin().catalog_typmods().unwrap(),
             short.admin().catalog_typmods().unwrap()
         );
+        if precision {
+            let expected = if data_type == DataType::Time { 2 } else { 3 };
+            assert_eq!(
+                long.admin().catalog_typmods().unwrap().1.values().copied().collect::<Vec<_>>(),
+                vec![expected],
+                "{spelling}"
+            );
+        }
         // Same-name, same-id catalog definitions survive the persisted boundary.
         let restored_long = long.restore();
         let restored_short = short.restore();

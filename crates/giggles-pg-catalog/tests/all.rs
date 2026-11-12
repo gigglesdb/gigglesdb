@@ -109,3 +109,6 @@ mod datagrip_refresh;
 mod orm_regtype;
 #[path = "gui_browse.rs"]
 mod gui_browse;
+
+#[path = "temporal_column_precision.rs"]
+mod temporal_column_precision;

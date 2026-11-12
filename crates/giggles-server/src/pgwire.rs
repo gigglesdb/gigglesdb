@@ -139,6 +139,7 @@ impl Diagnostic {
             &result,
             Err(CoreError::Sql(
                 giggles_core::relational::SqlError::CheckViolation
+                    | giggles_core::relational::SqlError::InvalidParameterValue
                     | giggles_core::relational::SqlError::Null
                     | giggles_core::relational::SqlError::Unsupported
             ))
@@ -658,6 +659,18 @@ fn rows(
     Ok(())
 }
 fn complete(command: &str, r: &SqlResult, out: &mut Vec<u8>) -> R<()> {
+    for message in giggles_core::relational::take_sql_warnings() {
+        let mut body = vec![];
+        for (field, value) in [
+            (b'S', "WARNING"), (b'V', "WARNING"),
+            (b'C', "22023"), (b'M', message.as_str()),
+        ] {
+            body.push(field);
+            z(value, &mut body);
+        }
+        body.push(0);
+        frame(b'N', &body, out)?;
+    }
     for (message, detail) in giggles_core::relational::take_sql_notices() {
         let mut body = vec![];
         for (field, value) in [

@@ -11,6 +11,9 @@ thread_local! {
 pub fn take_sql_error_message() -> Option<String> {
     SQL_ERROR_MESSAGE.with(|message| message.borrow_mut().take())
 }
+pub(super) fn invalid_type_modifier_error() {
+    SQL_ERROR_MESSAGE.with(|message| *message.borrow_mut() = Some("invalid type modifier".into()));
+}
 pub fn take_sql_notices() -> Vec<(String, Option<String>)> {
     SQL_NOTICES.with(|notices| std::mem::take(&mut *notices.borrow_mut()))
 }

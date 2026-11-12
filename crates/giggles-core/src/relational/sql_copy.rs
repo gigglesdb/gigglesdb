@@ -320,6 +320,7 @@ impl Copy {
             search_path: vec!["public".into()],
             schema_user: "giggles".into(),
             unbound_statement: None,
+            warnings: vec![],
             statement: Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
                 format!(
                     "{}\0{}",

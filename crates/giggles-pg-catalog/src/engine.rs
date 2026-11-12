@@ -4981,10 +4981,15 @@ fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
                 .map_or_else(|| "numeric".into(), |modifier| format!("numeric{modifier}")),
             _ => "numeric".into(),
         },
-        1083 => "time without time zone".into(),
-        1266 => "time with time zone".into(),
-        1114 => "timestamp without time zone".into(),
-        1184 => "timestamp with time zone".into(),
+        1083 | 1266 | 1114 | 1184 => {
+            let base = if matches!(oid, 1114 | 1184) { "timestamp" } else { "time" };
+            let zone = if matches!(oid, 1266 | 1184) { "with" } else { "without" };
+            let precision = match typmod {
+                Value::Int(n) if n >= 0 => format!("({n})"),
+                _ => String::new(),
+            };
+            format!("{base}{precision} {zone} time zone")
+        }
         18 => "\"char\"".into(),
         _ => {
             let name = text(r[1].clone())?;

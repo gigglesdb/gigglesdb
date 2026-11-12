@@ -1,5 +1,15 @@
 //! DDL type spellings and modifiers. Expression casts retain their own grammar.
 use super::*;
+thread_local! {
+    static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Consume temporal precision warnings after execution on this thread.
+pub fn take_sql_warnings() -> Vec<String> {
+    WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
+}
+pub(super) fn publish(warnings: &[String]) {
+    WARNINGS.with(|pending| *pending.borrow_mut() = warnings.to_vec());
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Site {
@@ -75,18 +85,27 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
     }
     let temporal_suffix = matches!(word.as_str(), "time" | "timestamp");
     let character = matches!(data_type, DataType::Varchar | DataType::Bpchar);
-    // CREATE accepts character and numeric modifiers.
+    let temporal = matches!(
+        data_type,
+        DataType::Time | DataType::TimeTz | DataType::Timestamp | DataType::TimestampTz
+    );
+    let mut requested_precision = None;
+    // CREATE accepts character, numeric and temporal modifiers.
     if matches!(site, Site::Create)
         && !character
         && data_type != DataType::Numeric
+        && !temporal
         && p.tokens.get(p.at) == Some(&Token::Symbol('('))
     {
         return Err(SqlError::Syntax);
     }
     let mut semantic_error = None;
-    let mut typmod = if (matches!(site, Site::Alter) || character || data_type == DataType::Numeric)
-        && p.sym('(')
-    {
+    let accepts_modifier =
+        matches!(site, Site::Alter) || character || data_type == DataType::Numeric || temporal;
+    let mut typmod = if accepts_modifier && p.sym('(') {
+        if temporal_suffix && matches!(p.tokens.get(p.at), Some(Token::Op(op)) if op == "-" || op == "+") {
+            return Err(SqlError::Syntax);
+        }
         let first = if data_type == DataType::Numeric {
             numeric_integer(p)?
         } else {
@@ -120,6 +139,21 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
                     0
                 }
             }
+        } else if temporal {
+            if !temporal_suffix && p.sym(',') {
+                numeric_integer(p)?;
+                while p.sym(',') {
+                    numeric_integer(p)?;
+                }
+                p.punct(')')?;
+                user_types::invalid_type_modifier_error();
+                return Err(SqlError::InvalidParameterValue);
+            }
+            if first < 0 {
+                semantic_error = Some(SqlError::InvalidParameterValue);
+            }
+            requested_precision = Some(first);
+            first.min(6)
         } else {
             first
         };
@@ -201,6 +235,19 @@ pub(super) fn parse(p: &mut Parser, site: Site) -> R<Parsed> {
             DataType::Text => DataType::TextArray,
             _ => return Err(SqlError::Unsupported),
         };
+    }
+    if let Some(precision) = requested_precision.filter(|p| *p > 6) {
+        let (base, zone) = match data_type {
+            DataType::Timestamp => ("TIMESTAMP", ""),
+            DataType::TimestampTz => ("TIMESTAMP", " WITH TIME ZONE"),
+            DataType::Time => ("TIME", ""),
+            _ => ("TIME", " WITH TIME ZONE"),
+        };
+        WARNINGS.with(|warnings| {
+            warnings.borrow_mut().push(format!(
+                "{base}({precision}){zone} precision reduced to maximum allowed, 6"
+            ))
+        });
     }
     Ok(Parsed {
         data_type,

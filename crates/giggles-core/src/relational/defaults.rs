@@ -1234,7 +1234,7 @@ pub(super) fn evaluate(
     let value = coerce_to_column(state, column, value)?;
     apply_typmod(value, state.column_typmod(column.id))
 }
-fn apply_typmod(value: Value, modifier: i32) -> R<Value> {
+pub(super) fn apply_typmod(value: Value, modifier: i32) -> R<Value> {
     if modifier == -1 {
         return Ok(value);
     }
