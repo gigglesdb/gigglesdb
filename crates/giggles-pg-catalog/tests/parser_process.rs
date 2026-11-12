@@ -23,6 +23,11 @@ fn parser_budget_child() {
     for sql in cases {
         assert_eq!(plan(&sql).unwrap_err(), Error::Limit);
     }
+    // Wide output siblings must not hide a deep expression in another item.
+    let wide = vec!["1+1 AS x"; 127].join(",");
+    for tail in [vec!["1"; 300].join("+"), format!("{}true", "NOT ".repeat(40)), format!("(1){}", ".x".repeat(300))] {
+        assert_eq!(plan(&format!("SELECT {wide},{tail} FROM pg_class")).unwrap_err(), Error::Limit);
+    }
     // Exercise trees immediately below and above the constructor budget too;
     // the smaller AST must remain safe to visit and destroy after rejection.
     for n in [32, 64, 128, 248, 255, 256, 257] {

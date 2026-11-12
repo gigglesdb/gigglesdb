@@ -18,6 +18,7 @@ fn pg18_catalog_star_order_matches_reflected_attributes() {
     let snapshot = CatalogSnapshot::default();
     for (name, names) in [
         ("pg_class", "oid,relname,relnamespace,reltype,reloftype,relowner,relam,relfilenode,reltablespace,relpages,reltuples,relallvisible,relallfrozen,reltoastrelid,relhasindex,relisshared,relpersistence,relkind,relnatts,relchecks,relhasrules,relhastriggers,relhassubclass,relrowsecurity,relforcerowsecurity,relispopulated,relreplident,relispartition,relrewrite,relfrozenxid,relminmxid,relacl,reloptions,relpartbound"),
+        ("pg_constraint", "oid,conname,connamespace,contype,condeferrable,condeferred,conenforced,convalidated,conrelid,contypid,conindid,conparentid,confrelid,confupdtype,confdeltype,confmatchtype,conislocal,coninhcount,connoinherit,conperiod,conkey,confkey,conpfeqop,conppeqop,conffeqop,confdelsetcols,conexclop,conbin"),
         ("pg_index", "indexrelid,indrelid,indnatts,indnkeyatts,indisunique,indnullsnotdistinct,indisprimary,indisexclusion,indimmediate,indisclustered,indisvalid,indcheckxmin,indisready,indislive,indisreplident,indkey,indcollation,indclass,indoption,indexprs,indpred"),
     ] {
         let result = run(&format!("SELECT c.* FROM {name} c"), &snapshot);
@@ -414,7 +415,9 @@ fn pg18_gui_description_casts_and_physical_statistics() {
     assert_eq!(run("SELECT objoid,classoid,objsubid,description FROM pg_description WHERE objoid=2200", &s).rows,
         vec![vec![Value::Int(2200),Value::Int(2615),Value::Int(0),Value::Text("standard public schema".into())]]);
     let casts = run("SELECT oid,castsource,casttarget,castfunc,castcontext,castmethod FROM pg_cast ORDER BY oid", &s);
-    let expected = [(10010,23,20,481,"i","f"),(10011,23,21,314,"a","f"),(10012,23,700,318,"i","f"),(10013,23,701,316,"i","f"),(10014,23,1700,1740,"i","f"),(10034,23,16,2557,"e","f"),(10039,23,26,0,"i","b"),(10046,23,24,0,"i","b"),(10125,25,1042,0,"i","b"),(10126,25,1043,0,"i","b"),(10137,25,18,944,"a","f"),(10140,25,19,407,"i","f"),(10144,23,17,6368,"e","f"),(10150,23,18,78,"e","f")];
+    let mut expected = vec![(10010,23,20,481,"i","f"),(10011,23,21,314,"a","f"),(10012,23,700,318,"i","f"),(10013,23,701,316,"i","f"),(10014,23,1700,1740,"i","f"),(10034,23,16,2557,"e","f"),(10039,23,26,0,"i","b"),(10046,23,24,0,"i","b"),(10125,25,1042,0,"i","b"),(10126,25,1043,0,"i","b"),(10137,25,18,944,"a","f"),(10140,25,19,407,"i","f"),(10144,23,17,6368,"e","f"),(10150,23,18,78,"e","f")];
+    expected.extend([(10032,23,790,3811,"a","f"),(10055,23,2202,0,"i","b"),(10062,23,2203,0,"i","b"),(10071,23,2204,0,"i","b"),(10078,23,2205,0,"i","b"),(10085,23,4191,0,"i","b"),(10092,23,2206,0,"i","b"),(10099,23,3734,0,"i","b"),(10106,23,3769,0,"i","b"),(10109,25,2205,1079,"i","f"),(10115,23,4096,0,"i","b"),(10122,23,4089,0,"i","b")]);
+    expected.sort_by_key(|row| row.0);
     assert_eq!(casts.rows, expected.into_iter().map(|(o,s,t,f,c,m)| vec![Value::Int(o),Value::Int(s),Value::Int(t),Value::Int(f),Value::Text(c.into()),Value::Text(m.into())]).collect::<Vec<_>>());
     assert_eq!(casts.fields.iter().map(|f| f.data_type).collect::<Vec<_>>(), vec![PgType::Oid,PgType::Oid,PgType::Oid,PgType::Oid,PgType::Char,PgType::Char]);
     assert_eq!(run("SELECT DISTINCT castsource FROM pg_cast WHERE castcontext IN ('i','a') ORDER BY castsource", &s).rows, vec![vec![Value::Int(23)],vec![Value::Int(25)]]);
@@ -425,4 +428,33 @@ fn pg18_gui_description_casts_and_physical_statistics() {
     }
     assert_eq!(run("SELECT pg_relation_size(oid,'fsm') FROM pg_class WHERE relname='pg_class'", &s).rows, vec![vec![Value::Int(0)]]);
     assert!(execute(&plan("SELECT pg_relation_size(oid,'invalid') FROM pg_class").unwrap().unwrap(), &s, &[]).is_err());
+}
+
+#[test]
+fn cte_group_aliases_use_input_precedence_and_reject_ambiguity() {
+    let snapshot = CatalogSnapshot::default();
+    assert_eq!(run("WITH inh AS (SELECT attname AS name,concat(n.nspname,'.',p.relname) AS inheritedfrom FROM pg_attribute a JOIN pg_inherits i ON i.inhparent=a.attrelid JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace n ON n.oid=p.relnamespace GROUP BY attname,inheritedfrom ORDER BY inheritedfrom) SELECT * FROM inh", &snapshot).rows, Vec::<Vec<Value>>::new());
+    assert_eq!(run("SELECT nspname AS oid,count(*) FROM pg_namespace WHERE oid=11 GROUP BY oid,nspname", &snapshot).rows, vec![vec![Value::Text("pg_catalog".into()),Value::Int(1)]]);
+    assert_eq!(plan("SELECT oid AS x,nspname AS x FROM pg_namespace GROUP BY x").unwrap_err(), Error::AmbiguousColumn);
+    assert_eq!(plan("SELECT count(*) AS x FROM pg_namespace GROUP BY x").unwrap_err(), Error::Unsupported);
+    assert_eq!(run("SELECT ('2.5'::real)::bigint,('3.5'::real)::bigint,('-2.5'::real)::bigint FROM pg_namespace WHERE oid=11", &snapshot).rows, vec![vec![Value::Int(2),Value::Int(4),Value::Int(-2)]]);
+}
+
+#[test]
+fn pg18_constraint_descriptor_types_and_duplicate_oid() {
+    let result = run("SELECT c.oid,c.* FROM pg_constraint c", &CatalogSnapshot::default());
+    assert_eq!(result.fields.iter().map(|f| f.data_type.oid()).collect::<Vec<_>>(),
+        vec![26,26,19,26,18,16,16,16,16,26,26,26,26,26,18,18,18,16,21,16,16,1005,1005,1028,1028,1028,1005,1028,194]);
+}
+
+#[test]
+fn pgadmin_edit_type_inventory_matches_pg18() {
+    let snapshot = CatalogSnapshot::default();
+    for (source, names) in [(23,"bigint,double precision,information_schema.cardinal_number,money,numeric,oid,real,regclass,regcollation,regconfig,regdictionary,regnamespace,regoper,regoperator,regproc,regprocedure,regrole,regtype,smallint"),(25,"\"char\",character,character varying,name,regclass")] {
+        let rows = run(&format!("SELECT format_type(t.oid,NULL) AS name FROM pg_type t JOIN pg_cast c ON c.casttarget=t.oid WHERE c.castsource={source} AND c.castcontext IN ('i','a') UNION SELECT format_type(oid,NULL) FROM pg_type WHERE typbasetype={source} ORDER BY name"), &snapshot).rows;
+        assert_eq!(rows, names.split(',').map(|name| vec![Value::Text(name.into())]).collect::<Vec<_>>());
+    }
+    let result = run("SELECT 4096*1024 FROM pg_namespace WHERE oid=11", &snapshot);
+    assert_eq!(result.fields[0].data_type, PgType::Int4);
+    assert_eq!(result.rows, vec![vec![Value::Int(4194304)]]);
 }

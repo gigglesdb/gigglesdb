@@ -3,6 +3,8 @@ mod flat_union;
 mod join_selection;
 mod regtype;
 mod subscripts;
+#[cfg(test)]
+mod gui_properties;
 use a::{BinaryOperator as Op, Expr as A};
 use sqlparser::ast::{Visit, Visitor};
 use sqlparser::{
@@ -264,6 +266,12 @@ fn column(i: usize, ty: PgType) -> E {
     }
 }
 fn binary(l: E, op: Op, r: E) -> E {
+    // Fold safe int4 literal products without widening their PostgreSQL type.
+    if op == Op::Multiply && l.ty == PgType::Int4 && r.ty == PgType::Int4
+        && let (K::Literal(Value::Int(a)), K::Literal(Value::Int(b))) = (&l.kind, &r.kind)
+        && let Some(n) = a.checked_mul(*b).filter(|n| i32::try_from(*n).is_ok()) {
+        return literal(Value::Int(n), PgType::Int4);
+    }
     let ty = if matches!(
         op,
         Op::Plus | Op::Minus | Op::Multiply | Op::Divide | Op::Modulo
@@ -544,6 +552,36 @@ fn constructor(token: &Token) -> bool {
     !leaf
 }
 
+// A flat SELECT list has sibling expressions, not a left-deep AST. Keep the
+// existing constructor bound on each item and on the remaining query, rather
+// than charging unrelated output expressions against the same depth guard.
+fn bounded_projection(tokens: &[Token]) -> bool {
+    let mut depth = 0i32;
+    let mut count = 0;
+    let mut projections = BTreeMap::new();
+    let mut not_run = 0;
+    for token in tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF)) {
+        if matches!(token, Token::Word(w) if matches!(w.keyword, Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT)) { return false; }
+        if matches!(token, Token::Word(w) if w.keyword == Keyword::SELECT) {
+            projections.insert(depth, count);
+        }
+        if *token == Token::Comma && let Some(base) = projections.get(&depth) { count = *base; }
+        if matches!(token, Token::Word(w) if w.keyword == Keyword::FROM) {
+            projections.remove(&depth);
+        }
+        match token {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => { projections.remove(&depth); depth -= 1; }
+            _ => {}
+        }
+        if matches!(token, Token::Word(w) if w.keyword == Keyword::NOT) { not_run += 1; } else { not_run = 0; }
+        if depth < 0 || not_run > 16 { return false; }
+        count += usize::from(constructor(token));
+        if count > 256 { return false; }
+    }
+    depth == 0
+}
+
 fn plan_inner(
     sql: &str,
     gateway: bool,
@@ -574,7 +612,7 @@ fn plan_inner(
             return Err(Error::Limit);
         }
     }
-    if constructors > 256 {
+    if constructors > 256 && !bounded_projection(&tokens) {
         return flat_union::plan(tokens, gateway);
     }
     // sqlparser 0.53 cannot parse OPERATOR(pg_catalog.=) ANY (...).
@@ -1228,7 +1266,19 @@ impl Compiler {
         };
         let group = group
             .iter()
-            .map(|e| self.expr(e, &schema))
+            .map(|e| self.expr(e, &schema).or_else(|error| {
+                if error != Error::UnknownColumn { return Err(error); }
+                let A::Identifier(name) = e else { return Err(error); };
+                let aliases = s.projection.iter().filter_map(|p| match p {
+                    a::SelectItem::ExprWithAlias { expr, alias } if ident(alias) == ident(name) => Some(expr),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                match aliases.as_slice() {
+                    [expr] => self.expr(expr, &schema),
+                    [] => Err(error),
+                    _ => Err(Error::AmbiguousColumn),
+                }
+            }))
             .collect::<R<Vec<_>>>()?;
         for e in &group {
             no_set_or_window(e)?;
@@ -1512,6 +1562,19 @@ impl Compiler {
                             alias,
                             n,
                         )
+                    } else if n == "pg_show_all_settings" && args.args.is_empty() && args.settings.is_none() {
+                        let sql = "SELECT 'default_table_access_method'::text AS name, 'heap'::text AS setting,
+                            NULL::text AS unit, 'Client Connection Defaults / Statement Behavior'::text AS category,
+                            'Sets the default table access method for new tables.'::text AS short_desc, NULL::text AS extra_desc,
+                            'user'::text AS context, 'string'::text AS vartype, 'default'::text AS source,
+                            NULL::text AS min_val, NULL::text AS max_val, NULL::text[] AS enumvals,
+                            'heap'::text AS boot_val, 'heap'::text AS reset_val, NULL::text AS sourcefile,
+                            NULL::integer AS sourceline, false AS pending_restart";
+                        let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|_| Error::Syntax)?;
+                        let a::Statement::Query(q) = statements.remove(0) else { unreachable!() };
+                        let query = self.query(&q, &vec![])?;
+                        let fields = query.fields.clone();
+                        (Source::Derived(std::sync::Arc::new(query)), fields, alias, n)
                     } else if n == "pg_get_sequence_data"
                         && args.args.len() == 1
                         && args.settings.is_none()
@@ -4717,14 +4780,14 @@ impl Runtime<'_> {
                     .find(|r| {
                         r[0] == I(oid) && matches!(&r[3], S(kind) if kind == "p" || kind == "n")
                     })
-                    .and_then(|constraint| match &constraint[6] {
+                    .and_then(|constraint| match &constraint[20] {
                         Value::Array(keys) => keys
                             .iter()
                             .map(|key| {
                                 self.catalogs["pg_attribute"]
                                     .rows
                                     .iter()
-                                    .find(|r| r[0] == constraint[4] && r[4] == *key)
+                                    .find(|r| r[0] == constraint[8] && r[4] == *key)
                                     .and_then(|r| match &r[1] {
                                         S(name) => Some(catalog::quote_identifier(name)),
                                         _ => None,
@@ -4849,7 +4912,7 @@ impl Runtime<'_> {
             .ok_or(Error::Type)?
             .to_string()),
             "pg_get_expr" => {
-                let known = [("pg_attrdef", 3, 1), ("pg_constraint", 18, 4)].iter().any(|(name, expr, rel)|
+                let known = [("pg_attrdef", 3, 1), ("pg_constraint", 27, 8)].iter().any(|(name, expr, rel)|
                     self.catalogs[*name].rows.iter().any(|r| r[*expr] == v[0] && r[*rel] == v[1]));
                 if !known { return Err(Error::Unsupported); }
                 if v.get(2) == Some(&B(true)) && let S(expr) = &v[0] {
@@ -5034,6 +5097,7 @@ fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
                 (1043, Some(n)) => format!("character varying({n})"),
                 (1043, None) => "character varying".into(),
                 (_, Some(n)) => format!("character({n})"),
+                (_, None) if typmod == Value::Null => "character".into(),
                 (_, None) => "bpchar".into(),
             }
         }
@@ -5059,6 +5123,7 @@ fn format_type(oid: i64, typmod: Value, rows: &[Vec<Value>]) -> R<String> {
             };
             format!("{base}{precision} {zone} time zone")
         }
+        13307 => "information_schema.cardinal_number".into(),
         18 => "\"char\"".into(),
         _ => {
             let name = text(r[1].clone())?;
@@ -5090,6 +5155,11 @@ fn integer_oid(v: Value, source: PgType) -> R<Value> {
         _ => return Err(Error::Type),
     };
     Ok(Value::Int(i64::from(u32::from_ne_bytes(i.to_ne_bytes()))))
+}
+fn float_integer(value: f64) -> R<i64> {
+    let rounded = value.round_ties_even();
+    if !(-9223372036854775808.0..9223372036854775808.0).contains(&rounded) { return Err(Error::Type); }
+    Ok(rounded as i64)
 }
 fn cast(v: Value, t: PgType) -> R<Value> {
     if v == Value::Null {
@@ -5174,6 +5244,8 @@ fn cast(v: Value, t: PgType) -> R<Value> {
             let i = match v {
                 I(i) => i,
                 S(s) => s.parse().map_err(|_| Error::Type)?,
+                Value::Float4(f) => float_integer(f64::from(f.value()))?,
+                Value::Float8(f) => float_integer(f.value())?,
                 _ => return Err(Error::Type),
             };
             if match t {

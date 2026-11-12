@@ -80,7 +80,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
         }
         fields.sort_by_key(|f| order.iter().position(|n| *n == f.name).unwrap_or(order.len()));
         for f in &mut fields {
-            if matches!(f.name.as_str(), "relpartbound" | "indexprs" | "indpred") {
+            if matches!(f.name.as_str(), "relpartbound" | "indexprs" | "indpred" | "conbin") {
                 f.data_type = PgType::PgNodeTree;
             }
         }
@@ -99,6 +99,13 @@ fn physical_order(name: &str) -> &'static [&'static str] {
             "relrowsecurity", "relforcerowsecurity", "relispopulated", "relreplident",
             "relispartition", "relrewrite", "relfrozenxid", "relminmxid", "relacl", "reloptions",
             "relpartbound",
+        ],
+        "pg_constraint" => &[
+            "oid", "conname", "connamespace", "contype", "condeferrable", "condeferred",
+            "conenforced", "convalidated", "conrelid", "contypid", "conindid", "conparentid",
+            "confrelid", "confupdtype", "confdeltype", "confmatchtype", "conislocal", "coninhcount",
+            "connoinherit", "conperiod", "conkey", "confkey", "conpfeqop", "conppeqop", "conffeqop",
+            "confdelsetcols", "conexclop", "conbin",
         ],
         "pg_index" => &[
             "indexrelid", "indrelid", "indnatts", "indnkeyatts", "indisunique",
@@ -267,6 +274,10 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("conenforced", T::Bool),
             ("conislocal", T::Bool),
             ("coninhcount", T::Int2),
+            ("conpfeqop", T::OidArray),
+            ("conppeqop", T::OidArray),
+            ("conffeqop", T::OidArray),
+            ("confdelsetcols", T::Int2Array),
         ],
         "pg_description" => &[
             ("objoid", T::Oid),
@@ -1289,12 +1300,16 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
     }
     // PG18.6 casts from the integer/text GUI edit-type inventories. Both ends
-    // are supported built-in scalar/catalog types; this is not a routine registry.
+    // are reflected built-in scalar/catalog types; this is not a routine registry.
     for (oid, source, target, function, context, method) in [
         (10010,23,20,481,"i","f"), (10011,23,21,314,"a","f"),
         (10012,23,700,318,"i","f"), (10013,23,701,316,"i","f"),
-        (10014,23,1700,1740,"i","f"), (10034,23,16,2557,"e","f"),
+        (10014,23,1700,1740,"i","f"), (10032,23,790,3811,"a","f"), (10034,23,16,2557,"e","f"),
         (10039,23,26,0,"i","b"), (10046,23,24,0,"i","b"),
+        (10055,23,2202,0,"i","b"), (10062,23,2203,0,"i","b"), (10071,23,2204,0,"i","b"),
+        (10078,23,2205,0,"i","b"), (10085,23,4191,0,"i","b"), (10092,23,2206,0,"i","b"),
+        (10099,23,3734,0,"i","b"), (10106,23,3769,0,"i","b"), (10109,25,2205,1079,"i","f"),
+        (10115,23,4096,0,"i","b"), (10122,23,4089,0,"i","b"),
         (10125,25,1042,0,"i","b"), (10126,25,1043,0,"i","b"),
         (10137,25,18,944,"a","f"), (10140,25,19,407,"i","f"),
         (10144,23,17,6368,"e","f"), (10150,23,18,78,"e","f"),
@@ -1581,6 +1596,25 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             ],
         );
     }
+    // PG18.6 metadata-only targets used by pgAdmin's integer/text edit list.
+    for (oid, name, len, array, input, receive) in [
+        (790,"money",8,791,886,2492), (2202,"regprocedure",4,2207,2212,2446),
+        (2203,"regoper",4,2208,2214,2448), (2204,"regoperator",4,2209,2216,2450),
+        (2205,"regclass",4,2210,2218,2452), (2206,"regtype",4,2211,2220,2454),
+        (3734,"regconfig",4,3735,3736,3738), (3769,"regdictionary",4,3770,3771,3773),
+        (4089,"regnamespace",4,4090,4084,4087), (4096,"regrole",4,4097,4098,4094),
+        (4191,"regcollation",4,4192,4193,4196),
+    ] {
+        let mut row = type_row(oid, name, len, 0, array, false);
+        row[5] = s("N"); row[12] = I(input); row[21] = I(receive);
+        add("pg_type", row);
+        add("pg_type", type_row(array, &format!("_{name}"), -1, oid, 0, true));
+    }
+    let mut cardinal = type_row(13307, "cardinal_number", 4, 0, 13306, false);
+    cardinal[2] = I(13293); cardinal[4] = s("d"); cardinal[5] = s("N"); cardinal[7] = I(23);
+    cardinal[12] = I(2597); cardinal[21] = I(2598); add("pg_type", cardinal);
+    let mut array = type_row(13306, "_cardinal_number", -1, 13307, 0, true);
+    array[2] = I(13293); add("pg_type", array);
     // Nominal descriptors needed by NULL-only catalog fields, not new SQL types.
     for (oid, name, len, kind, category, elem, array, input, receive) in [
         (2277, "anyarray", -1, "p", "P", 0, 0, 2296, 2502),
@@ -2106,8 +2140,25 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
     }
     constraints::populate(snapshot, &mut all, &mut used_oids, &mut next_oid)?;
+    let foreign = snapshot.constraints.iter().filter(|c| c.kind == 'f')
+        .map(|c| Ok((I(i64::from(table_oid(c.id)?)), c))).collect::<R<BTreeMap<_, _>>>()?;
     for row in &mut all.get_mut("pg_constraint").unwrap().rows {
-        row.extend([I(0), B(false), B(true), B(true), I(0)]);
+        row.extend([I(0), B(false), B(true), B(true), I(0), N, N, N, N]);
+        if let Some(c) = foreign.get(&row[0]) {
+            let operators = c.foreign_columns.iter().map(|id| {
+                let ty = snapshot.tables.iter().find(|t| t.id == c.foreign_table).unwrap().columns.iter().find(|col| col.id == *id).unwrap().data_type;
+                I(match ty {
+                    ScalarType::Boolean => 91, ScalarType::SmallInt => 94, ScalarType::Integer => 96,
+                    ScalarType::BigInt => 410, ScalarType::Text | ScalarType::Varchar => 98,
+                    ScalarType::Bpchar => 1054, ScalarType::Uuid => 2972, ScalarType::Jsonb => 3240,
+                    ScalarType::Bytes => 1955, ScalarType::Numeric => 1752, ScalarType::Real => 620,
+                    ScalarType::DoublePrecision => 670, ScalarType::Date => 1093, ScalarType::Time => 1108,
+                    ScalarType::TimeTz => 1550, ScalarType::Timestamp => 2060, ScalarType::TimestampTz => 1320,
+                    ScalarType::Interval => 1330, ScalarType::IntArray | ScalarType::BigIntArray | ScalarType::TextArray => 1070,
+                })
+            }).collect::<Vec<_>>();
+            for slot in &mut row[25..28] { *slot = Value::Array(operators.clone()); }
+        }
     }
     for row in &mut all.get_mut("pg_database").unwrap().rows {
         row.extend([I(6), s("c"), s("C.UTF-8"), s("C.UTF-8"), N, N, I(1663)]);
@@ -2133,7 +2184,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     // pg_tables reads pg_class in its private builder layout, so it runs
     // before pg_class/pg_index are presented in PG18 column order.
     pg_tables::populate(snapshot, &mut all);
-    for name in ["pg_class", "pg_index"] {
+    for name in ["pg_class", "pg_index", "pg_constraint"] {
         let relation = all.get_mut(name).unwrap();
         let fields = schema(name).unwrap();
         for row in &mut relation.rows {

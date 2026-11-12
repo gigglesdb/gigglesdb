@@ -154,7 +154,7 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
             .count(),
         30
     );
-    let expected: BTreeSet<Vec<Value>> = EXPECTED_TYPES
+    let mut expected: BTreeSet<Vec<Value>> = EXPECTED_TYPES
         .lines()
         .skip(1)
         .filter(|l| !l.is_empty())
@@ -177,12 +177,18 @@ fn verbatim_npgsql_9_0_4_startup_batch() {
         .collect();
     // E2a′: + bpchar, varchar, _bpchar, _varchar (ranks from the PG18.6 batch output).
     assert_eq!(expected.len(), 61);
-    assert_eq!(types.rows.len(), 61);
+    for (oid, name, array) in [(790,"money",791),(2202,"regprocedure",2207),(2203,"regoper",2208),(2204,"regoperator",2209),(2205,"regclass",2210),(2206,"regtype",2211),(3734,"regconfig",3735),(3769,"regdictionary",3770),(4089,"regnamespace",4090),(4096,"regrole",4097),(4191,"regcollation",4192)] {
+        expected.insert(vec![s("pg_catalog"),Value::Int(oid),s(name),s("b"),Value::Bool(false),Value::Null]);
+        expected.insert(vec![s("pg_catalog"),Value::Int(array),s(&format!("_{name}")),s("b"),Value::Bool(false),Value::Null]);
+    }
+    expected.insert(vec![s("information_schema"),Value::Int(13307),s("cardinal_number"),s("d"),Value::Bool(false),Value::Int(23)]);
+    expected.insert(vec![s("information_schema"),Value::Int(13306),s("_cardinal_number"),s("b"),Value::Bool(false),Value::Null]);
+    assert_eq!(types.rows.len(), 85);
     assert_eq!(
         types.rows.iter().cloned().collect::<BTreeSet<_>>(),
         expected
     );
-    assert!(types.rows.iter().all(|row| row[3] == s("b")));
+    assert!(types.rows.iter().all(|row| row[3] == s("b") || row[3] == s("d")));
     let composites = run(statements[2]);
     assert_eq!(
         fields(&composites),

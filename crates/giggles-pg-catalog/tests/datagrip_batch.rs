@@ -54,7 +54,7 @@ fn captured_expanded_global_discovery() {
             4 => 2, // Built-in pg_default and pg_global tablespaces.
             5 => 3, // Two tablespaces plus the snapshot database.
             11 => 3,
-            12 => 14, // PG18.6 casts from the supported integer/text GUI inventory.
+            12 => 26, // PG18.6 casts from the reflected integer/text GUI inventory.
             _ => 0,
         };
         assert_eq!(r.rows.len(), expected, "case {}", i + 1);

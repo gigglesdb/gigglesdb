@@ -35,5 +35,13 @@ async fn comment_ownership_precedes_semantics_on_simple_and_extended_wire() {
         drop(client); connection.await.unwrap().unwrap();
     }
     running.shutdown().await.unwrap(); drop(service);
-    std::fs::remove_dir_all(path).unwrap();
+    // Accepted connection tasks can finish releasing their Windows handles
+    // just after listener shutdown, as in bulk_wire_admission's fixture.
+    for attempt in 0..20 {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => break,
+            Err(error) if attempt == 19 => panic!("cleanup: {error}"),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    }
 }

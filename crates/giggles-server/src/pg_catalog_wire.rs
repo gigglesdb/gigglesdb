@@ -709,7 +709,7 @@ fn encode_with_extra(
                 v.to_be_bytes().to_vec()
             }
         }
-        (Value::Text(v), PgType::Text | PgType::Varchar | PgType::Name | PgType::Char) => {
+        (Value::Text(v), PgType::Text | PgType::Varchar | PgType::Name | PgType::Char | PgType::PgNodeTree) => {
             if v.contains('\0')
                 || (ty == PgType::Char && v.len() > 1)
                 || (ty == PgType::Name && v.len() > 63)
@@ -1425,11 +1425,12 @@ mod tests {
                 assert_eq!(encode(&Value::Null, ty, format), Ok(None));
                 for v in [
                     Value::Int(0),
-                    Value::Text(String::new()),
                     Value::Bytes(vec![]),
                 ] {
                     assert_eq!(encode(&v, ty, format), Err("42804"));
                 }
+                assert_eq!(encode(&Value::Text(String::new()), ty, format),
+                    if ty == PgType::PgNodeTree { Ok(Some(vec![])) } else { Err("42804") });
                 assert_eq!(decode(&[], ty, format), Err("0A000"));
                 assert_eq!(decode(&[0, 0, 0, 0], ty, format), Err("0A000"));
             }
@@ -1442,4 +1443,24 @@ mod tests {
             Ok(Some(7u32.to_be_bytes().to_vec()))
         );
     }
+    #[test]
+    fn dbeaver_constraint_star_encodes_nonnull_node_tree() {
+        use giggles_pg_catalog::{CatalogSnapshot, ColumnDef, ConstraintDef, ScalarType, TableDef};
+        let snapshot = CatalogSnapshot {
+            tables: vec![TableDef { id: 1, name: "child".into(), columns: vec![ColumnDef { id: 1, name: "id".into(), data_type: ScalarType::Integer, not_null: false }], primary_key: vec![] }],
+            constraints: vec![ConstraintDef { id: 10, table: 1, name: "child_check".into(), kind: 'c', columns: vec![1], expression: Some("(id >= 0)".into()), validated: true, ..Default::default() }],
+            ..Default::default()
+        };
+        let sql = "SELECT c.oid,c.*,t.relname as tabrelname,rt.relnamespace as refnamespace,d.description,case when c.contype='c' then substring(pg_get_constraintdef(c.oid),7) else null end consrc_copy FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid LEFT JOIN pg_class rt ON rt.oid=c.confrelid LEFT JOIN pg_description d ON d.objoid=c.oid AND d.objsubid=0 AND d.classoid='pg_constraint'::regclass WHERE c.conrelid=65540 ORDER BY c.oid";
+        let plan = giggles_pg_catalog::plan(sql).unwrap().unwrap();
+        let result = giggles_pg_catalog::execute(&plan, &snapshot, &[]).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.fields[28].data_type, PgType::PgNodeTree);
+        assert!(retained_bytes(&result).unwrap() > 0);
+        for format in [0, 1] {
+            assert_eq!(encode(&result.rows[0][28], PgType::PgNodeTree, format), Ok(Some(b"(id >= 0)".to_vec())));
+            assert_eq!(encode(&Value::Text("bad\0tree".into()), PgType::PgNodeTree, format), Err("22021"));
+        }
+    }
+
 }

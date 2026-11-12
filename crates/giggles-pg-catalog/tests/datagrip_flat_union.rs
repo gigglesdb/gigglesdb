@@ -255,7 +255,7 @@ fn aggregate_compile_budgets() {
     assert_eq!(r.rows, vec![vec![Value::Int(2); 127]]);
     assert_eq!(
         plan(&(single.clone() + " WHERE 1")).unwrap_err(),
-        Error::Limit
+        Error::Type // Independent projections fit; WHERE still requires boolean.
     );
     assert_eq!(
         run(&(single.clone() + " UNION ALL " + &single), &[]).rows,
