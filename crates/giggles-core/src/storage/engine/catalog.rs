@@ -611,6 +611,14 @@ impl Catalog {
     /// Retain the transaction (and therefore its locks) through cache publication.
     pub(crate) fn commit_ddl(&self, txn: Transaction) -> Result<Ts, TxnError> {
         self.check()?;
+        // Data-only and read-only commits cannot change any cached catalog
+        // version. Do not rebuild or republish an identical view, and do not
+        // hold the publication mutex while waiting for their durable commit.
+        // DDL still holds it across sequencer success and publication below:
+        // a reader at the newly visible timestamp must never use the old view.
+        if txn.catalog_writes().next().is_none() {
+            return txn.commit_then(|_| Ok(()));
+        }
         let mut cache = self.cache.lock().map_err(|_| TxnError::Misuse)?;
         cache.ensure_live()?;
         let latest = &cache.versions.last().unwrap().1;
@@ -1124,3 +1132,7 @@ mod tests;
 #[cfg(test)]
 #[path = "catalog_diff_tests.rs"]
 mod diff_tests;
+
+#[cfg(test)]
+#[path = "catalog_commit_fast_tests.rs"]
+mod commit_fast_tests;
