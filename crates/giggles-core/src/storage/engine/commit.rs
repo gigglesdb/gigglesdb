@@ -46,6 +46,7 @@ impl Clock for ManualClock {
 pub(crate) struct SequencerConfig {
     /// Maximum additional requests gathered after the first; zero means singleton.
     pub(crate) group_max: usize,
+    /// Zero or sub-millisecond waits only drain requests already queued.
     pub(crate) group_wait: Duration,
     pub(crate) recent_log_bytes: usize,
     pub(crate) write_set_bytes: usize,
@@ -54,7 +55,7 @@ impl Default for SequencerConfig {
     fn default() -> Self {
         Self {
             group_max: 64,
-            group_wait: Duration::from_micros(200),
+            group_wait: Duration::ZERO,
             recent_log_bytes: 256 * 1024 * 1024,
             write_set_bytes: 256 * 1024 * 1024,
         }
@@ -336,6 +337,48 @@ impl Drop for Sequencer {
     }
 }
 
+fn gather(
+    first: Pending,
+    receiver: &mpsc::Receiver<Message>,
+    config: &SequencerConfig,
+) -> (Vec<Pending>, Option<Message>, bool) {
+    let mut group = vec![first];
+    // Windows timed receives can round a sub-millisecond wait up to a roughly
+    // 15 ms timer tick. Drain without waiting by default, and only opt into a
+    // timed gather for windows of at least 1 ms, including the remaining time.
+    const MIN_TIMED_WAIT: Duration = Duration::from_millis(1);
+    let deadline = (config.group_wait >= MIN_TIMED_WAIT).then(|| {
+        Instant::now()
+            .checked_add(config.group_wait)
+            .unwrap_or_else(Instant::now)
+    });
+    while group.len() - 1 < config.group_max {
+        let message = match receiver.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                let Some(deadline) = deadline else {
+                    break;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining < MIN_TIMED_WAIT {
+                    break;
+                }
+                match receiver.recv_timeout(remaining) {
+                    Ok(message) => message,
+                    Err(_) => break,
+                }
+            }
+        };
+        match message {
+            Message::Commit(pending) => group.push(pending),
+            counter @ Message::Counter { .. } => return (group, Some(counter), false),
+            Message::Shutdown => return (group, None, true),
+        }
+    }
+    (group, None, false)
+}
+
 fn run(
     receiver: mpsc::Receiver<Message>,
     kv: Arc<Kv>,
@@ -369,25 +412,8 @@ fn run(
             }
             Message::Shutdown => break,
         };
-        let mut group = vec![first];
-        let deadline = Instant::now()
-            .checked_add(config.group_wait)
-            .unwrap_or_else(Instant::now);
-        let mut shutdown = false;
-        while group.len() - 1 < config.group_max && Instant::now() < deadline {
-            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Message::Commit(p)) => group.push(p),
-                Ok(counter @ Message::Counter { .. }) => {
-                    deferred = Some(counter);
-                    break;
-                }
-                Ok(Message::Shutdown) => {
-                    shutdown = true;
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
+        let (group, next, shutdown) = gather(first, &receiver, &config);
+        deferred = next;
         if shutdown || fenced || kv.is_fenced() {
             for p in group {
                 let _ = p.reply.send(Err(TxnError::Fenced));
@@ -657,3 +683,7 @@ impl Sequencer {
 #[cfg(test)]
 #[path = "commit_guard_tests.rs"]
 mod guard_tests;
+
+#[cfg(test)]
+#[path = "commit_batch_tests.rs"]
+mod batch_tests;
