@@ -6,6 +6,7 @@
 //! administrative changes must be excluded while the guard/fences are held.
 
 use super::*;
+use crate::coordinator::reverse::{ActivationReceipt, DestinationIdentity};
 use crate::pg::{activate, fence};
 use std::{collections::BTreeSet, time::Duration};
 
@@ -47,8 +48,48 @@ fn timeout(ms: u64) -> Duration {
 fn query(c: &mut impl fence::Connection, sql: &str, ms: u64) -> Result<fence::Rows> {
     c.query(sql, timeout(ms)).map_err(component)
 }
-fn timestamp(rows: &fence::Rows) -> Result<u64> {
-    cell(rows, 0)?.parse().map_err(component)
+/// Map a database receipt only when its persisted identity matches this cutover.
+/// Empty identity fields represent NULL/missing legacy columns and fail closed.
+pub fn activation_receipt_row(
+    rows: &fence::Rows,
+    key: &Key,
+    destination: &DestinationIdentity,
+) -> Result<ActivationReceipt> {
+    if rows.len() != 1 {
+        return Err(Error::ActivationReceiptMismatch);
+    }
+    if cell(rows, 0)? == key.migration && cell(rows, 1)? != key.cutover {
+        return Err(Error::UseRollback);
+    }
+    if (4..7).any(|column| cell(rows, column).map_or(true, str::is_empty)) {
+        return Err(Error::LegacyActivationReceipt);
+    }
+    let receipt = ActivationReceipt {
+        migration: cell(rows, 0)?.into(),
+        cutover: cell(rows, 1)?.into(),
+        fence_epoch: cell(rows, 2)?
+            .parse()
+            .map_err(|_| Error::ActivationReceiptMismatch)?,
+        activated_at_ms: cell(rows, 3)?
+            .parse()
+            .map_err(|_| Error::ActivationReceiptMismatch)?,
+        fence_owner: cell(rows, 4)?.into(),
+        destination: DestinationIdentity {
+            system_identifier: cell(rows, 5)?.into(),
+            database: cell(rows, 6)?.into(),
+        },
+    };
+    if receipt.migration != key.migration
+        || receipt.cutover != key.cutover
+        || receipt.destination != *destination
+        || receipt.fence_epoch == 0
+        || receipt.activated_at_ms == 0
+        || receipt.fence_epoch > key.epoch as u64
+        || (receipt.fence_epoch == key.epoch as u64 && receipt.fence_owner != key.coordinator)
+    {
+        return Err(Error::ActivationReceiptMismatch);
+    }
+    Ok(receipt)
 }
 
 pub struct Source<C, H> {
@@ -191,7 +232,7 @@ impl<C: fence::Connection> Target<C> {
             query(
                 &mut self.connection,
                 &format!(
-                    "{origin}CREATE SCHEMA IF NOT EXISTS _skedaddle; CREATE TABLE IF NOT EXISTS _skedaddle.cutover_activation(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,activated_ms bigint NOT NULL); COMMIT;"
+                    "{origin}CREATE SCHEMA IF NOT EXISTS _skedaddle; CREATE TABLE IF NOT EXISTS _skedaddle.cutover_activation(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,activated_ms bigint NOT NULL); ALTER TABLE _skedaddle.cutover_activation ADD COLUMN IF NOT EXISTS fence_owner text, ADD COLUMN IF NOT EXISTS destination_system_identifier text, ADD COLUMN IF NOT EXISTS destination_database text; COMMIT;"
                 ),
                 ms,
             )?;
@@ -201,6 +242,26 @@ impl<C: fence::Connection> Target<C> {
             let _ = query(&mut self.connection, "ROLLBACK", ms);
         }
         result
+    }
+    /// Read the durable row without deriving missing legacy identities from live state.
+    pub fn activation_receipt(&mut self, key: &Key) -> Result<Option<ActivationReceipt>> {
+        let rows = query(
+            &mut self.connection,
+            &format!(
+                "SELECT migration,cutover,epoch::text,activated_ms::text,COALESCE(to_jsonb(a)->>'fence_owner',''),COALESCE(to_jsonb(a)->>'destination_system_identifier',''),COALESCE(to_jsonb(a)->>'destination_database','') FROM _skedaddle.cutover_activation a WHERE migration={}",
+                literal(&key.migration)
+            ),
+            self.state.config.timeout_ms,
+        )?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let (destination, _) = crate::coordinator::reverse::destination_barrier(
+            &mut self.connection,
+            timeout(self.state.config.timeout_ms),
+        )
+        .map_err(component)?;
+        activation_receipt_row(&rows, key, &destination).map(Some)
     }
     fn native_next(&mut self, journal: &mut Journal<'_>) -> Result<()> {
         self.state
@@ -220,6 +281,7 @@ impl<C: fence::Connection> Target<C> {
 struct ActivationConnection<'a, C> {
     connection: &'a mut C,
     key: &'a Key,
+    destination: &'a DestinationIdentity,
 }
 impl<C: fence::Connection> fence::Connection for ActivationConnection<'_, C> {
     fn query(&mut self, sql: &str, timeout: Duration) -> std::result::Result<fence::Rows, String> {
@@ -230,31 +292,20 @@ impl<C: fence::Connection> fence::Connection for ActivationConnection<'_, C> {
             .strip_suffix("COMMIT;")
             .ok_or("activation must be a transaction")?;
         let guarded = format!(
-            "{body} INSERT INTO _skedaddle.cutover_activation VALUES({},{},{},floor(extract(epoch FROM clock_timestamp())*1000)::bigint); COMMIT;",
+            "{body} INSERT INTO _skedaddle.cutover_activation(migration,cutover,epoch,activated_ms,fence_owner,destination_system_identifier,destination_database) VALUES({},{},{},floor(extract(epoch FROM clock_timestamp())*1000)::bigint,{},{},{}); COMMIT;",
             literal(&self.key.migration),
             literal(&self.key.cutover),
-            self.key.epoch
+            self.key.epoch,
+            literal(&self.key.coordinator),
+            literal(&self.destination.system_identifier),
+            literal(&self.destination.database)
         );
         self.connection.query(&guarded, timeout)
     }
 }
 impl<C: fence::Connection> Destination for Target<C> {
     fn activated(&mut self, key: &Key) -> Result<Option<u64>> {
-        let rows = query(
-            &mut self.connection,
-            &format!(
-                "SELECT activated_ms::text,cutover FROM _skedaddle.cutover_activation WHERE migration={}",
-                literal(&key.migration)
-            ),
-            self.state.config.timeout_ms,
-        )?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        if cell(&rows, 1)? != key.cutover {
-            return Err(Error::UseRollback);
-        }
-        Ok(Some(timestamp(&rows)?))
+        Ok(self.activation_receipt(key)?.map(|r| r.activated_at_ms))
     }
     fn prove_fenced(&mut self, _key: &Key, journal: &mut Journal<'_>) -> Result<()> {
         // CheckActivation is still fenced; Restore is ambiguous and must first
@@ -345,6 +396,7 @@ impl<C: fence::Connection> Destination for Target<C> {
                 let mut connection = ActivationConnection {
                     connection: &mut self.connection,
                     key,
+                    destination: &identity,
                 };
                 self.state
                     .execute_next(&mut connection, &mut |i| {
@@ -400,6 +452,68 @@ impl<S: fence::Connection, D: fence::Connection> Sequences for SequenceSync<S, D
 mod tests {
     use super::*;
 
+    #[test]
+    fn receipt_mapping_rejects_legacy_and_mismatched_rows() {
+        let key = Key {
+            migration: "m".into(),
+            cutover: "c".into(),
+            epoch: 2,
+            coordinator: "new".into(),
+        };
+        let destination = DestinationIdentity {
+            system_identifier: "123".into(),
+            database: "db".into(),
+        };
+        let rows = vec![
+            vec!["m", "c", "1", "42", "old", "123", "db"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        ];
+        let receipt = activation_receipt_row(&rows, &key, &destination).unwrap();
+        assert_eq!(receipt.fence_owner, "old");
+        assert_eq!(receipt.fence_epoch, 1);
+        assert_eq!(receipt.activated_at_ms, 42);
+        assert_eq!(receipt.destination, destination);
+        for column in 4..7 {
+            let mut legacy = rows.clone();
+            legacy[0][column].clear();
+            assert_eq!(
+                activation_receipt_row(&legacy, &key, &destination),
+                Err(Error::LegacyActivationReceipt)
+            );
+        }
+        for column in 0..7 {
+            let mut wrong = rows.clone();
+            wrong[0][column] = "wrong".into();
+            if column == 4 {
+                continue;
+            } // Old owner is authenticated against the retained proof by the journal.
+            assert_eq!(
+                activation_receipt_row(&wrong, &key, &destination),
+                Err(if column == 1 {
+                    Error::UseRollback
+                } else {
+                    Error::ActivationReceiptMismatch
+                })
+            );
+        }
+        let mut other_cutover_legacy = rows.clone();
+        other_cutover_legacy[0][1] = "other".into();
+        other_cutover_legacy[0].truncate(4);
+        assert_eq!(
+            activation_receipt_row(&other_cutover_legacy, &key, &destination),
+            Err(Error::UseRollback)
+        );
+        let mut same_epoch = rows.clone();
+        same_epoch[0][2] = "2".into();
+        assert_eq!(
+            activation_receipt_row(&same_epoch, &key, &destination),
+            Err(Error::ActivationReceiptMismatch)
+        );
+        same_epoch[0][4] = "new".into();
+        assert!(activation_receipt_row(&same_epoch, &key, &destination).is_ok());
+    }
     #[test]
     fn final_marker_sql_uses_exact_capture_prefix() {
         let key = Key {
@@ -515,6 +629,10 @@ mod administrative_tests {
         let mut connection = ActivationConnection {
             connection: &mut recording,
             key: &key,
+            destination: &DestinationIdentity {
+                system_identifier: "123".into(),
+                database: "db".into(),
+            },
         };
         let origin =
             crate::pg::ddl::administrative_origin(&mut connection, Duration::from_secs(1)).unwrap();
@@ -528,6 +646,11 @@ mod administrative_tests {
         assert!(!recording.sql[0].contains("INSERT"));
         assert!(recording.sql[1].contains("admin_origin = 'd9'"));
         assert!(recording.sql[1].contains("INSERT INTO _skedaddle.cutover_activation"));
+        assert!(
+            recording.sql[1]
+                .contains("fence_owner,destination_system_identifier,destination_database")
+        );
+        assert!(recording.sql[1].contains("E'owner',E'123',E'db'"));
         assert!(recording.sql[1].ends_with("COMMIT;"));
     }
 }

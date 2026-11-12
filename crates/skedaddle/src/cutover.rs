@@ -176,11 +176,15 @@ pub enum Error {
     FenceBreached(String),
     /// Activation may already have committed even when its reply was lost.
     UseRollback,
+    /// Legacy receipt lacks authenticated owner/destination; operator action required.
+    LegacyActivationReceipt,
+    ActivationReceiptMismatch,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReverseProof(error) => error.fmt(f),
+            Self::LegacyActivationReceipt => f.write_str("legacy activation receipt: operator action required; inspect destination activation before recovery"),
             _ => write!(f, "cutover: {self:?}"),
         }
     }

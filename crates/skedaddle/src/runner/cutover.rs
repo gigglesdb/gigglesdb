@@ -984,6 +984,16 @@ impl Task {
                     driver::Error::UseRollback => CutoverErrorKind::ActivationUncertain,
                     _ => CutoverErrorKind::Driver,
                 });
+                if matches!(error, driver::Error::LegacyActivationReceipt)
+                    && let CutoverOutcome::Failed {
+                        error: detail,
+                        next_step,
+                        ..
+                    } = &mut outcome
+                {
+                    detail.message = error.to_string();
+                    *next_step = "Operator action required: inspect the legacy destination activation receipt; automatic takeover recovery is disabled.".into();
+                }
                 if let CutoverOutcome::Failed {
                     cutover_id,
                     step_timings_ms,
@@ -1467,6 +1477,27 @@ impl Task {
                 advance(&self.runtime, &rt, Lifecycle::AbortedToSource)?;
             }
         } else if lifecycle == Lifecycle::FinalBoundaryApplied {
+            let receipt = target
+                .borrow_mut()
+                .activation_receipt(&state.key)?
+                .ok_or(driver::Error::Invalid("activation receipt missing"))?;
+            let current = rt.block_on(self.runtime.state());
+            if receipt.fence_epoch != current.epoch || receipt.fence_owner != current.owner {
+                match current
+                    .verification
+                    .reverse
+                    .as_ref()
+                    .and_then(|r| r.recovered.as_ref())
+                {
+                    Some(recorded) if recorded == &receipt => {}
+                    Some(_) => return Err(driver::Error::ActivationReceiptMismatch),
+                    None => rt
+                        .block_on(self.runtime.commit(Transition::RecoveredActivation {
+                            receipt: Box::new(receipt),
+                        }))
+                        .map_err(component)?,
+                }
+            }
             advance(&self.runtime, &rt, Lifecycle::DestinationActive)?;
         }
         Ok(outcome)

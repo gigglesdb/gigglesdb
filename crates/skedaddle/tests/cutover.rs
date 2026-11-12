@@ -695,8 +695,20 @@ fn measured_interruption_reported() {
         }
     }
     assert_eq!(state.next, Step::Complete);
+    let receipt = f.target.activation_receipt(&f.key).unwrap().unwrap();
+    assert_eq!(receipt.migration, f.key.migration);
+    assert_eq!(receipt.cutover, f.key.cutover);
+    assert_eq!(receipt.fence_epoch, f.key.epoch as u64);
+    assert_eq!(receipt.fence_owner, f.key.coordinator);
+    let identity = f
+        .target
+        .connection
+        .sql("SELECT system_identifier::text,current_database() FROM pg_control_system()");
+    assert_eq!(receipt.destination.system_identifier, identity[0][0]);
+    assert_eq!(receipt.destination.database, identity[0][1]);
     let report = audit.borrow().clone().unwrap();
     assert_eq!(&report, state.audit.as_ref().unwrap());
+    assert_eq!(receipt.activated_at_ms, report.activated_at_ms);
     assert_eq!(
         report.write_pause_ms,
         report.activated_at_ms - report.fence_start_ms

@@ -190,12 +190,68 @@ fn mismatch(result: c::Result<()>) -> bool {
 
 #[test]
 fn crash_after_activation_receipt_new_owner_publishes_destination_active() {
+    // Fake only the PG transport: the row survives a crash before journal publication.
+    struct Activated;
+    impl fence::Connection for Activated {
+        fn query(&mut self, sql: &str, _: std::time::Duration) -> Result<fence::Rows, String> {
+            if sql.starts_with("SELECT migration,cutover") {
+                Ok(vec![
+                    vec![
+                        "migration",
+                        "cutover-1",
+                        "1",
+                        "42",
+                        "owner-1",
+                        "123",
+                        "destination",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ])
+            } else if sql.contains("pg_control_system()") {
+                Ok(vec![vec![
+                    "123".into(),
+                    "destination".into(),
+                    "0/100".into(),
+                ]])
+            } else {
+                panic!("unexpected recovery effect: {sql}");
+            }
+        }
+    }
     let mut state = promoted();
+    let mut target = skedaddle::cutover::pg::Target {
+        connection: Activated,
+        state: (*state
+            .verification
+            .reverse
+            .as_ref()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .binding
+            .fence)
+            .clone(),
+        acknowledged_triggers: BTreeSet::new(),
+    };
+    let durable = target
+        .activation_receipt(&skedaddle::cutover::Key {
+            migration: "migration".into(),
+            cutover: "cutover-1".into(),
+            epoch: 2,
+            coordinator: "owner-2".into(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable, receipt());
+    assert!(try_apply(&mut state, "owner-2", terminal()).is_err());
     append(
         &mut state,
         "owner-2",
         Transition::RecoveredActivation {
-            receipt: Box::new(receipt()),
+            receipt: Box::new(durable),
         },
     );
     append(&mut state, "owner-2", terminal());

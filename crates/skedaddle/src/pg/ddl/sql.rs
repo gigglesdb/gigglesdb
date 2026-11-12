@@ -98,6 +98,7 @@ CREATE SCHEMA IF NOT EXISTS _skedaddle;
 CREATE TABLE IF NOT EXISTS _skedaddle.fence_state(epoch bigint PRIMARY KEY,state text NOT NULL);
 CREATE TABLE IF NOT EXISTS _skedaddle.cutover_marker(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,lsn pg_lsn NOT NULL);
 CREATE TABLE IF NOT EXISTS _skedaddle.cutover_activation(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,activated_ms bigint NOT NULL);
+ALTER TABLE _skedaddle.cutover_activation ADD COLUMN IF NOT EXISTS fence_owner text, ADD COLUMN IF NOT EXISTS destination_system_identifier text, ADD COLUMN IF NOT EXISTS destination_database text;
 CREATE TABLE IF NOT EXISTS _skedaddle.authority(migration text PRIMARY KEY,epoch bigint NOT NULL);
 CREATE TABLE IF NOT EXISTS _skedaddle.effects(migration text NOT NULL,epoch bigint NOT NULL,seq bigint NOT NULL,payload text NOT NULL,PRIMARY KEY(migration,epoch,seq));
 REVOKE CREATE ON SCHEMA _skedaddle FROM PUBLIC;
