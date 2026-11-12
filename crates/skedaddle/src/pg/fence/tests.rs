@@ -334,3 +334,85 @@ fn migration_binding_survives_resume_and_rejects_namespace_changes() {
         Err(FenceError::Invalid(_))
     ));
 }
+
+#[test]
+fn saved_fence_sql_keys_both_migration_and_epoch() {
+    struct Keyed {
+        rows: std::collections::BTreeMap<String, String>,
+        migration: String,
+        epoch: i64,
+        encoded: String,
+    }
+    impl Connection for Keyed {
+        fn query(&mut self, sql: &str, _: Duration) -> Result<Rows, String> {
+            if sql == FENCE_METADATA_SQL {
+                return Ok(vec![vec!["t".into()]]);
+            }
+            let key = literal(&self.migration);
+            if sql
+                == format!(
+                    "SELECT state FROM _skedaddle.fence_state WHERE migration={key} AND epoch={}",
+                    self.epoch
+                )
+            {
+                return Ok(self
+                    .rows
+                    .get(&self.migration)
+                    .map(|s| vec![vec![s.clone()]])
+                    .unwrap_or_default());
+            }
+            assert_eq!(
+                sql,
+                format!(
+                    "INSERT INTO _skedaddle.fence_state(migration,epoch,state) VALUES({key},{},{}) ON CONFLICT(migration,epoch) DO NOTHING",
+                    self.epoch,
+                    literal(&self.encoded)
+                )
+            );
+            self.rows
+                .entry(self.migration.clone())
+                .or_insert(self.encoded.clone());
+            Ok(vec![])
+        }
+    }
+    let (mut first, catalog) = fixture();
+    first.saved = Some(SavedState {
+        catalog,
+        authority: None,
+    });
+    first.migration = "first'quoted".into();
+    let mut second = first.clone();
+    second.migration = "second".into();
+    let mut db = Keyed {
+        rows: Default::default(),
+        migration: String::new(),
+        epoch: first.config.epoch,
+        encoded: String::new(),
+    };
+    for fence in [&mut first, &mut second] {
+        db.migration = fence.migration.clone();
+        db.encoded = serde_json::to_string(fence).unwrap();
+        fence
+            .save(&mut db, &mut |_| Ok(()), Duration::from_secs(1))
+            .unwrap();
+    }
+    assert_eq!(db.rows.len(), 2);
+    db.migration = first.migration.clone();
+    db.encoded = serde_json::to_string(&first).unwrap();
+    first.saved = None;
+    first
+        .save(&mut db, &mut |_| Ok(()), Duration::from_secs(1))
+        .unwrap();
+    assert!(first.saved.is_some());
+    // Even a corrupt row under the right key cannot import another migration.
+    db.rows.insert(
+        first.migration.clone(),
+        serde_json::to_string(&second).unwrap(),
+    );
+    assert!(matches!(
+        first.save(&mut db, &mut |_| Ok(()), Duration::from_secs(1)),
+        Err(FenceError::Invalid(_))
+    ));
+    let ddl = crate::pg::ddl::TriggerSql::new("fence_key", 180000).unwrap();
+    assert!(ddl.install.contains("fence_state(migration text NOT NULL,epoch bigint NOT NULL,state text NOT NULL,PRIMARY KEY(migration,epoch))"));
+}

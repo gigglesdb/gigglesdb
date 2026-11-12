@@ -103,6 +103,15 @@ pub struct Local {
     path: PathBuf,
 }
 
+// Keep filesystem work, including core's durable projection I/O, off runtime workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
+
 impl Local {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -178,30 +187,36 @@ impl Local {
     ) -> Result<Self> {
         let verified = journal.load(true).await?;
         let path = path.as_ref().to_path_buf();
-        super::scratch::check(&path)?;
-        let admin = Admin::open(&path, Limits::default())?;
-        let probe = Self {
-            admin,
-            state: Box::default(),
-            path: path.clone(),
-        };
-        probe.validate_schema()?;
-        let anchor = probe.read_collection("journal_applied", 1)?;
-        let seq = match anchor.as_slice() {
-            [SqlRow { values, .. }] => match values.as_slice() {
-                [V::Int(0), V::Int(seq), V::Text(_)] if *seq >= 0 => *seq as u64,
-                _ => return Err(Error::RecoveryRequired("invalid local anchor".into())),
-            },
-            _ => return Err(Error::RecoveryRequired("invalid local anchor count".into())),
-        };
-        drop(probe);
+        let probe_path = path.clone();
+        let seq = blocking(move || {
+            let path = probe_path;
+            super::scratch::check(&path)?;
+            let admin = Admin::open(&path, Limits::default())?;
+            let probe = Self {
+                admin,
+                state: Box::default(),
+                path: path.clone(),
+            };
+            probe.validate_schema()?;
+            let anchor = probe.read_collection("journal_applied", 1)?;
+            let seq = match anchor.as_slice() {
+                [SqlRow { values, .. }] => match values.as_slice() {
+                    [V::Int(0), V::Int(seq), V::Text(_)] if *seq >= 0 => *seq as u64,
+                    _ => return Err(Error::RecoveryRequired("invalid local anchor".into())),
+                },
+                _ => return Err(Error::RecoveryRequired("invalid local anchor count".into())),
+            };
+            drop(probe);
+            Ok(seq)
+        })
+        .await?;
         if seq > verified.applied_seq {
             return Err(Error::RecoveryRequired(
                 "local store is ahead of journal".into(),
             ));
         }
         if seq == verified.applied_seq {
-            return Self::open(path, &verified);
+            return blocking(move || Self::open(path, &verified)).await;
         }
         let mut prefix = Materialized::default();
         while prefix.applied_seq < seq {
@@ -212,7 +227,7 @@ impl Local {
                 journal.apply_entry(&mut prefix, &entry).await?;
             }
         }
-        let mut local = Self::open(path, &prefix)?;
+        let mut local = blocking(move || Self::open(path, &prefix)).await?;
         local.sync_verified(&verified, journal).await?;
         Ok(local)
     }
@@ -415,7 +430,22 @@ impl Local {
                 "local replay anchor differs from journal".into(),
             ));
         }
-        self.replace_state(state.clone(), true)
+        self.replace_state_async(state.clone()).await
+    }
+
+    async fn replace_state_async(&mut self, next: Materialized) -> Result<()> {
+        let mut local = Self {
+            admin: self.admin.clone(),
+            state: self.state.clone(),
+            path: self.path.clone(),
+        };
+        let state = blocking(move || {
+            local.replace_state(next, true)?;
+            Ok(local.state)
+        })
+        .await?;
+        self.state = state;
+        Ok(())
     }
 
     pub async fn replay_journal(&mut self, journal: &super::journal::Journal) -> Result<()> {
@@ -440,7 +470,7 @@ impl Local {
             for entry in page {
                 let mut next = (*self.state).clone();
                 journal.apply_entry(&mut next, &entry).await?;
-                self.replace_state(next, true)?;
+                self.replace_state_async(next).await?;
             }
         }
         if *self.state != verified {
@@ -769,15 +799,21 @@ impl Local {
     /// archive and staging files before publishing the checkpoint.
     pub async fn checkpoint(&self, journal: &super::journal::Journal) -> Result<()> {
         use base64::Engine;
-        let archive = super::scratch::with_archive(&self.path, |scratch, export| {
-            use std::io::Read;
-            self.admin.export(export)?;
-            let mut bytes = Vec::new();
-            scratch
-                .open_file("archive.export")?
-                .read_to_end(&mut bytes)?;
-            Ok(bytes)
-        })?;
+        let path = self.path.clone();
+        let admin = self.admin.clone();
+        let archive = blocking(move || {
+            let archive = super::scratch::with_archive(&path, |scratch, export| {
+                use std::io::Read;
+                admin.export(export)?;
+                let mut bytes = Vec::new();
+                scratch
+                    .open_file("archive.export")?
+                    .read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })?;
+            Ok(archive)
+        })
+        .await?;
         journal
             .checkpoint_archive(
                 &self.state,
@@ -796,49 +832,52 @@ impl Local {
         use std::io::Write;
         let path = path.as_ref().to_path_buf();
         let recovery = journal.recover(true).await?;
-        super::scratch::check(&path)?;
-        if let Some(cp) = &recovery.checkpoint
-            && let Some(encoded) = &cp.local_archive
-        {
-            let archive = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|e| {
-                    Error::RecoveryRequired(format!("invalid local checkpoint encoding: {e}"))
-                })?;
-            let admin = super::scratch::with_archive(&path, |scratch, export| {
-                let mut file = scratch.create_file("archive.export")?;
-                file.write_all(&archive)?;
-                file.sync_all()?;
-                drop(file);
-                Admin::restore(export, &path, Limits::default()).map_err(|e| {
-                    Error::RecoveryRequired(format!(
-                        "local checkpoint archive rejected by core: {e}"
-                    ))
-                })
-            })?;
-            let mut local = Self {
-                admin,
-                state: Box::new(cp.state.clone()),
-                path,
-            };
-            local.validate_schema()?;
-            // The checkpoint digest covers the complete exported state;
-            // do not re-scan its historical audit rows during bounded recovery.
-            local.validate_rows(false)?;
-            let rows = local.read_collection("journal_applied", 128)?;
-            if rows.len() != 1
-                || rows[0].values != [V::Int(0), num(cp.seq)?, text(&cp.journal_digest)]
+        blocking(move || {
+            super::scratch::check(&path)?;
+            if let Some(cp) = &recovery.checkpoint
+                && let Some(encoded) = &cp.local_archive
             {
-                return Err(Error::RecoveryRequired(
-                    "local archive anchor differs from checkpoint".into(),
-                ));
+                let archive = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|e| {
+                        Error::RecoveryRequired(format!("invalid local checkpoint encoding: {e}"))
+                    })?;
+                let admin = super::scratch::with_archive(&path, |scratch, export| {
+                    let mut file = scratch.create_file("archive.export")?;
+                    file.write_all(&archive)?;
+                    file.sync_all()?;
+                    drop(file);
+                    Admin::restore(export, &path, Limits::default()).map_err(|e| {
+                        Error::RecoveryRequired(format!(
+                            "local checkpoint archive rejected by core: {e}"
+                        ))
+                    })
+                })?;
+                let mut local = Self {
+                    admin,
+                    state: Box::new(cp.state.clone()),
+                    path,
+                };
+                local.validate_schema()?;
+                // The checkpoint digest covers the complete exported state;
+                // do not re-scan its historical audit rows during bounded recovery.
+                local.validate_rows(false)?;
+                let rows = local.read_collection("journal_applied", 128)?;
+                if rows.len() != 1
+                    || rows[0].values != [V::Int(0), num(cp.seq)?, text(&cp.journal_digest)]
+                {
+                    return Err(Error::RecoveryRequired(
+                        "local archive anchor differs from checkpoint".into(),
+                    ));
+                }
+                if *local.state != recovery.state {
+                    local.replace_state(recovery.state, true)?;
+                }
+                return Ok(local);
             }
-            if *local.state != recovery.state {
-                local.replace_state(recovery.state, true)?;
-            }
-            return Ok(local);
-        }
-        Self::rebuild(path, &recovery.state)
+            Self::rebuild(path, &recovery.state)
+        })
+        .await
     }
 }
 

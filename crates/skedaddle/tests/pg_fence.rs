@@ -295,8 +295,8 @@ impl Drop for Fixture {
             .unwrap_or_default();
         let saved_state = if self.fence.saved.is_some() {
             format!(
-                "DELETE FROM _skedaddle.fence_state WHERE epoch={}; DELETE FROM _skedaddle.authority WHERE migration='{}';",
-                self.fence.config.epoch, self.schema
+                "DELETE FROM _skedaddle.fence_state WHERE epoch={} AND migration='{}'; DELETE FROM _skedaddle.authority WHERE migration='{}';",
+                self.fence.config.epoch, self.schema, self.schema
             )
         } else {
             String::new()
@@ -650,4 +650,35 @@ async fn tls_connect(
     assert!(transport.encrypted());
     assert!(transport.warnings.is_empty());
     Ok((client, driver))
+}
+
+#[test]
+fn same_epoch_migrations_preserve_independent_saved_state() {
+    let _serial = SERIAL.lock().unwrap();
+    let Some(mut first) = Fixture::new("same_epoch_migrations") else {
+        return;
+    };
+    let Some(mut second) = Fixture::new("same_epoch_migrations") else {
+        return;
+    };
+    second.fence.config.epoch = first.fence.config.epoch;
+    first.through(Step::NoLogin);
+    second.through(Step::NoLogin);
+    let first_saved = first.fence.saved.clone();
+    let second_saved = second.fence.saved.clone();
+    assert_ne!(first_saved, second_saved);
+    for fixture in [&mut first, &mut second] {
+        fixture.fence.saved = None;
+        fixture.fence.next = Step::Save;
+        fixture.step().unwrap();
+    }
+    assert_eq!(first.fence.saved, first_saved);
+    assert_eq!(second.fence.saved, second_saved);
+    let rows = first.db.sql(&format!("SELECT migration FROM _skedaddle.fence_state WHERE epoch={} AND migration IN ('{}','{}') ORDER BY migration", first.fence.config.epoch, first.schema, second.schema));
+    assert_eq!(rows.len(), 2);
+    drop(second);
+    first.fence.saved = None;
+    first.fence.next = Step::Save;
+    first.step().unwrap();
+    assert_eq!(first.fence.saved, first_saved);
 }

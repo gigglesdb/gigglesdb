@@ -303,7 +303,7 @@ impl Drop for Fixture {
                 .connection
                 .sql(&format!("SELECT pg_drop_replication_slot({})", lit(slot)));
         }
-        self.source.connection.sql(&format!("DROP SCHEMA {} CASCADE; DROP ROLE {}; DELETE FROM _skedaddle.cutover_marker WHERE migration={}; DELETE FROM _skedaddle.fence_state WHERE epoch={}; DELETE FROM _skedaddle.authority WHERE migration={} AND epoch={};", self.schema, self.source_role, lit(&self.key.migration), self.epoch, lit(&self.key.migration), self.epoch));
+        self.source.connection.sql(&format!("DROP SCHEMA {} CASCADE; DROP ROLE {}; DELETE FROM _skedaddle.cutover_marker WHERE migration={}; DELETE FROM _skedaddle.fence_state WHERE migration={} AND epoch={}; DELETE FROM _skedaddle.authority WHERE migration={} AND epoch={};", self.schema, self.source_role, lit(&self.key.migration), lit(&self.key.migration), self.epoch, lit(&self.key.migration), self.epoch));
         self.target.connection.sql(&format!("DROP SCHEMA {} CASCADE; DROP ROLE {}; DELETE FROM _skedaddle.cutover_activation WHERE migration={};", self.schema, self.destination_role, lit(&self.key.migration)));
     }
 }

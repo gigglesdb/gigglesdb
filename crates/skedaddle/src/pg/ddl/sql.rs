@@ -95,7 +95,7 @@ END
 DO $check$ BEGIN IF current_setting('server_version_num')::int / 10000 <> {major} THEN RAISE EXCEPTION 'Skedaddle PG major mismatch'; END IF; END $check$;
 DROP EVENT TRIGGER IF EXISTS {name};
 CREATE SCHEMA IF NOT EXISTS _skedaddle;
-CREATE TABLE IF NOT EXISTS _skedaddle.fence_state(epoch bigint PRIMARY KEY,state text NOT NULL);
+CREATE TABLE IF NOT EXISTS _skedaddle.fence_state(migration text NOT NULL,epoch bigint NOT NULL,state text NOT NULL,PRIMARY KEY(migration,epoch));
 CREATE TABLE IF NOT EXISTS _skedaddle.cutover_marker(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,lsn pg_lsn NOT NULL);
 CREATE TABLE IF NOT EXISTS _skedaddle.cutover_activation(migration text PRIMARY KEY,cutover text NOT NULL,epoch bigint NOT NULL,activated_ms bigint NOT NULL);
 ALTER TABLE _skedaddle.cutover_activation ADD COLUMN IF NOT EXISTS fence_owner text, ADD COLUMN IF NOT EXISTS destination_system_identifier text, ADD COLUMN IF NOT EXISTS destination_database text;

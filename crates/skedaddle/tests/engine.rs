@@ -1198,7 +1198,7 @@ async fn copy_table(
         }
         if matches!(final_marker, Some(MarkerEmitter::Native | MarkerEmitter::NativeRestart)) {
             cleanup_source.execute("DELETE FROM _skedaddle.cutover_marker WHERE migration=$1", &[&id]).await?;
-            cleanup_source.execute("DELETE FROM _skedaddle.fence_state WHERE state::jsonb->>'migration'=$1", &[&id]).await?;
+            cleanup_source.execute("DELETE FROM _skedaddle.fence_state WHERE migration=$1", &[&id]).await?;
             cleanup_source.execute("DELETE FROM _skedaddle.authority WHERE migration=$1", &[&id]).await?;
         }
         cleanup_source.query_one("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name=$1",&[&slot]).await.ok();

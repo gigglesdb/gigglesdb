@@ -504,14 +504,12 @@ impl Fixture {
             .await
             .unwrap()
             .get(0);
-        // Remove only this fixture's migration-scoped control rows. fence_state
-        // is keyed by epoch alone, so match its stored migration rather than
-        // deleting every row for an epoch another migration may still own.
+        // Remove only this fixture's migration-scoped control rows.
         let migration = format!("'{}'", self.id.replace('\'', "''"));
         let metadata = format!(
             "DO $cleanup$ BEGIN \
              IF to_regclass('_skedaddle.fence_state') IS NOT NULL THEN \
-             DELETE FROM _skedaddle.fence_state WHERE state::jsonb->>'migration'={migration}; END IF; \
+             DELETE FROM _skedaddle.fence_state WHERE migration={migration}; END IF; \
              IF to_regclass('_skedaddle.cutover_marker') IS NOT NULL THEN \
              DELETE FROM _skedaddle.cutover_marker WHERE migration={migration}; END IF; \
              IF to_regclass('_skedaddle.cutover_activation') IS NOT NULL THEN \

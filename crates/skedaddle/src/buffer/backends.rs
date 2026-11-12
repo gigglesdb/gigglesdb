@@ -577,15 +577,53 @@ impl BufferStore for ObjectBufferStore {
             Backend::S3(store) => store,
             Backend::Gcs(store) => &store.adapter,
             Backend::Local(local) => {
-                let _guards = match local.parents(Some(&path), false) {
-                    Ok(guards) => guards,
-                    Err(Error::LocalParentMissing) => return Ok(None),
-                    Err(e) => return Err(e),
+                let local = local.clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    let guards = match local.parents(Some(&path), false) {
+                        Ok(guards) => guards,
+                        Err(Error::LocalParentMissing) => return Ok(None),
+                        Err(e) => return Err(e),
+                    };
+                    Ok(local
+                        .check_leaf(&path)?
+                        .map(|file| (guards, local.reader(file))))
+                })
+                .await
+                .map_err(|_| Error::LocalIo)??;
+                let Some(mut opened) = opened else {
+                    return Ok(None);
                 };
-                return match local.check_leaf(&path)? {
-                    Some(file) => copy_digest_at(&mut local.reader(file), output, key).map(Some),
-                    None => Ok(None),
-                };
+                let mut hashed = Sha256::new();
+                let mut bytes = 0_u64;
+                loop {
+                    let read_key = key.to_owned();
+                    let (next, chunk) = tokio::task::spawn_blocking(move || {
+                        let mut chunk = vec![0; STREAM_BUFFER];
+                        let read = opened
+                            .1
+                            .read(&mut chunk)
+                            .map_err(|e| local_error("read-stream", &read_key, e))?;
+                        chunk.truncate(read);
+                        Ok::<_, Error>((opened, chunk))
+                    })
+                    .await
+                    .map_err(|_| Error::LocalIo)??;
+                    opened = next;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    output
+                        .write_all(&chunk)
+                        .map_err(|e| local_error("write-stream", key, e))?;
+                    hashed.update(&chunk);
+                    bytes = bytes
+                        .checked_add(chunk.len() as u64)
+                        .ok_or(Error::LocalIo)?;
+                }
+                return Ok(Some(ObjectDigest {
+                    bytes,
+                    sha256: hashed.finalize().into(),
+                }));
             }
         };
         let meta = match store.head(&path).await {

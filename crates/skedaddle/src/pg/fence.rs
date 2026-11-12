@@ -461,7 +461,8 @@ impl Fence {
         let stored = query(
             connection,
             &format!(
-                "SELECT state FROM _skedaddle.fence_state WHERE epoch={}",
+                "SELECT state FROM _skedaddle.fence_state WHERE migration={} AND epoch={}",
+                literal(&self.migration),
                 self.config.epoch
             ),
             timeout,
@@ -511,7 +512,8 @@ impl Fence {
         query(
             connection,
             &format!(
-                "INSERT INTO _skedaddle.fence_state(epoch,state) VALUES({},{}) ON CONFLICT(epoch) DO NOTHING",
+                "INSERT INTO _skedaddle.fence_state(migration,epoch,state) VALUES({},{},{}) ON CONFLICT(migration,epoch) DO NOTHING",
+                literal(&self.migration),
                 self.config.epoch,
                 literal(&encoded)
             ),
@@ -521,7 +523,8 @@ impl Fence {
         let rows = query(
             connection,
             &format!(
-                "SELECT state FROM _skedaddle.fence_state WHERE epoch={}",
+                "SELECT state FROM _skedaddle.fence_state WHERE migration={} AND epoch={}",
+                literal(&self.migration),
                 self.config.epoch
             ),
             timeout,
