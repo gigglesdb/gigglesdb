@@ -235,8 +235,15 @@ of the reverse-apply intent, before any reverse transaction may commit. A deadli
 abort before that point keeps `rolling-back` until destination restoration is
 checkpointed; only then does it return to `rollback-window`. Eligibility loss
 blocks new transfer and restoration intents, retaining the fences for recovery.
-This contract is not yet connected to the owner's transfer driver; eligible CLI
-requests continue to fail closed without admission or endpoint effects.
+Transfer adapters remain unavailable. A single disabled driver-availability
+constant gates eligible requests before journal admission: exit 2,
+`rollback_driver_unavailable`, with reverse capture left running and lifecycle
+unchanged. Admission must remain disabled until both deadline restoration before
+reverse apply and completion after reverse apply are implemented and tested.
+Previously admitted journals route restart/takeover to the rollback recovery path
+before probes or finalize; they retain `rolling-back` and the source fence with
+exit 5. Deadlines are not automatically aborted without a destination-restoration
+adapter; operator recovery is required for those historical journals.
 
 Each hook has `name`, `phase`, positive `timeout_seconds`, `command` and
 `secret_env`. `command` is an executable/argument array. `secret_env` keys name
@@ -269,7 +276,7 @@ Init uses the first 24 hex characters of the definition digest as migration ID.
 | `status <id> [--watch]` | Wired observer; watch is flushed NDJSON. |
 | `verify <id> [--tables ...]` | Wired active-owner request; exit 6 with no owner. |
 | `cutover <id> --deadline <dur>` | Wired active-owner request to `request_cutover`; exits 0 completed, 2 not ready or deadline, 3 invalid, 5 uncertain or breach, 6 no owner or infrastructure, 8 lost ownership. |
-| `rollback <id> [--deadline <dur>]` | Generation-scoped owner request (default: configured downtime budget). Exits 3 for wrong state/ineligible/invalid deadline, 6 for no owner/infrastructure, 8 for stale generation. Eligible requests currently fail closed with exit 2 (`rollback_driver_unavailable`); no fence or lifecycle change is performed until the reverse transfer driver is connected. |
+| `rollback <id> [--deadline <dur>]` | Generation-scoped owner request (default: configured downtime budget). Exits 3 for wrong state/ineligible/invalid deadline, 6 for no owner/infrastructure, 8 for stale generation. Eligible requests are refused before admission with exit 2 (`rollback_driver_unavailable`); lifecycle, journal and reverse capture remain unchanged. Previously admitted journals fail closed with exit 5; restart/takeover retains their admission, deadline and source fence. Transfer adapters are pending. |
 | `finalize <id> [--drop-objects]` | Active-owner request from rollback-window, or destination-active after eligibility ended. Stops reverse capture; explicit `--drop-objects` removes installed objects on both endpoints. Exits 0 completed, 3 invalid, 6 no owner/infrastructure, 8 lost ownership. |
 | `abort <id>` | Wired coordinator-only; exit 9 if journal history records any external effect; no database restoration. |
 | `report <id>` | Wired safe trust/status reporting. |

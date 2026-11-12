@@ -15,7 +15,10 @@ use std::{collections::BTreeSet, path::Path};
 use tokio::sync::watch;
 
 pub(super) fn owns(state: State) -> bool {
-    matches!(state, State::DestinationActive | State::RollbackWindow)
+    matches!(
+        state,
+        State::DestinationActive | State::RollbackWindow | State::RollingBack
+    )
 }
 
 pub async fn request_finalize(root: &Path, id: &str) -> VerifyResponse {
@@ -108,7 +111,18 @@ async fn serve(
         if *pause.borrow() || owner.requested()? {
             break;
         }
-        if let Some((saved, _)) = state.progress.get(super::finalize::REQUEST) {
+        if state.lifecycle.state == State::RollingBack {
+            // Retire directly owned sockets before rollback owns reverse capture.
+            // Recovery never falls through into probes, finalize or forward work.
+            workers = None;
+            if tokio::time::Instant::now() >= retry_at {
+                super::rollback::run(&runtime).await?;
+                retry_at = tokio::time::Instant::now() + Duration::from_secs(1);
+            }
+        }
+        if state.lifecycle.state != State::RollingBack
+            && let Some((saved, _)) = state.progress.get(super::finalize::REQUEST)
+        {
             let drop_objects = serde_json::from_str::<bool>(saved)?;
             workers = None; // These workers own sockets directly, with no spawned capture task.
             match super::finalize::run(&runtime, id, drop_objects, context.as_ref().map(|(_, d)| d))
@@ -127,7 +141,10 @@ async fn serve(
                 }
             }
         }
-        if state.rollback_eligibility_ended.is_none() && tokio::time::Instant::now() >= retry_at {
+        if state.lifecycle.state != State::RollingBack
+            && state.rollback_eligibility_ended.is_none()
+            && tokio::time::Instant::now() >= retry_at
+        {
             let result = if let Some((journal, definition)) = &context {
                 tokio::time::timeout(
                     Duration::from_secs(10),
@@ -247,7 +264,18 @@ async fn serve(
                     data: json!({"error":{"kind":"invalid_request"}}),
                 }
             } else if action == "rollback" {
-                super::rollback::admission(&runtime.state().await, request.deadline_ms)
+                match super::rollback::admit(&runtime, &request.request, request.deadline_ms).await
+                {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        workers = None;
+                        super::rollback::run(&runtime).await?
+                    }
+                    Err(error) => {
+                        respond_failure(&path, &error)?;
+                        return Err(error);
+                    }
+                }
             } else if action == "finalize" {
                 let state = runtime.state().await;
                 if !super::finalize::allowed(&state) {
@@ -1153,6 +1181,123 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reached.unwrap().state, State::RollbackWindow);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn eligible_rollback_is_refused_before_journal_admission() {
+        let (journal, _) = activated().await;
+        let root = task_root();
+        let local = Local::recover(root.join("rollback-request-refuse"), &journal)
+            .await
+            .unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "rollback-request-owner").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let runtime = engine.runtime();
+        admit(&runtime, true).await.unwrap();
+        let before = journal.load(true).await.unwrap();
+        for request in ["first-request", "retry-request"] {
+            let response = super::super::rollback::admit(&runtime, request, Some(30_000))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.exit_code, 2);
+            assert_eq!(
+                response.data["error"]["kind"],
+                "rollback_driver_unavailable"
+            );
+            let after = journal.load(true).await.unwrap();
+            assert_eq!(after.lifecycle.state, State::RollbackWindow);
+            assert!(after.rollback.is_none());
+            assert!(after.rollback_eligibility_ended.is_none());
+            assert_eq!(after.applied_seq, before.applied_seq);
+            assert_eq!(
+                serde_json::to_vec(&after).unwrap(),
+                serde_json::to_vec(&before).unwrap()
+            );
+        }
+        drop(runtime);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_rollback_survives_takeover_without_probes_or_finalize() {
+        let (journal, _) = activated().await;
+        let root = task_root();
+        let local = Local::recover(root.join("rollback-admit"), &journal)
+            .await
+            .unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "rollback-first").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let runtime = engine.runtime();
+        admit(&runtime, true).await.unwrap();
+        // Simulate a journal admitted by the previous implementation. New requests
+        // cannot reach this state while the transfer driver is unavailable.
+        runtime
+            .commit(Transition::Rollback {
+                record: Box::new(coordinator::rollback::Record::Admit {
+                    request: "rollback-request".into(),
+                    deadline_at_ms: u64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis(),
+                    )
+                    .unwrap()
+                        + 30_000,
+                }),
+            })
+            .await
+            .unwrap();
+        let admitted = journal.load(true).await.unwrap();
+        assert_eq!(admitted.lifecycle.state, State::RollingBack);
+        let checkpoint = admitted.rollback.clone().unwrap();
+        assert_eq!(checkpoint.request, "rollback-request");
+        assert!(checkpoint.intent.is_none());
+        assert_eq!(
+            super::super::rollback::run(&runtime)
+                .await
+                .unwrap()
+                .exit_code,
+            5
+        );
+        assert_eq!(
+            journal.load(true).await.unwrap().applied_seq,
+            admitted.applied_seq
+        );
+        drop(runtime);
+        drop(engine);
+        let local = Local::recover(root.join("rollback-takeover"), &journal)
+            .await
+            .unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "rollback-second").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        let recovered = journal.load(true).await.unwrap();
+        assert!(recovered.epoch > admitted.epoch);
+        assert_eq!(recovered.rollback.as_ref(), Some(&checkpoint));
+        let (pause, receive) = watch::channel(false);
+        let owner = serve(engine.runtime(), &root, "migration", receive, None);
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pause.send(true).unwrap();
+        };
+        let (reached, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(owner, stop) })
+                .await
+                .unwrap();
+        assert_eq!(reached.unwrap().state, State::RollingBack);
+        let after = journal.load(true).await.unwrap();
+        assert_eq!(after.applied_seq, recovered.applied_seq);
+        assert!(after.rollback_eligibility_ended.is_none());
+        assert_eq!(after.rollback.as_ref(), Some(&checkpoint));
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }

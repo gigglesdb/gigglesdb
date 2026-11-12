@@ -1,5 +1,5 @@
 //! Durable rollback protocol. This is a journal contract, not an effect driver.
-//! Admission is deliberately not wired into the owner until all adapters exist.
+//! Owner admission is atomic; unavailable effect adapters must retain this state.
 use super::{Error, Materialized, Result, State};
 use serde::{Deserialize, Serialize};
 
