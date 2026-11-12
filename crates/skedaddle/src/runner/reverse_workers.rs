@@ -761,6 +761,196 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
+    struct Frames(std::collections::VecDeque<Vec<u8>>);
+    impl source::Transport for Frames {
+        async fn next(&mut self, _: u64) -> source::Result<Vec<u8>> {
+            Ok(self
+                .0
+                .pop_front()
+                .expect("capture read beyond stop boundary"))
+        }
+    }
+    fn marker_frames(marker: &crate::cutover::Marker) -> Vec<Vec<u8>> {
+        let mut begin = vec![b'B'];
+        begin.extend((marker.lsn + 10).to_be_bytes());
+        begin.extend(0i64.to_be_bytes());
+        begin.extend(1u32.to_be_bytes());
+        let mut message = vec![b'M', 1];
+        message.extend(marker.lsn.to_be_bytes());
+        message.extend(crate::pg::chunk::MESSAGE_PREFIX.as_bytes());
+        message.push(0);
+        let payload = marker.payload();
+        message.extend((payload.len() as u32).to_be_bytes());
+        message.extend(payload.as_bytes());
+        let mut commit = vec![b'C', 0];
+        commit.extend((marker.lsn + 10).to_be_bytes());
+        commit.extend((marker.lsn + 11).to_be_bytes());
+        commit.extend(0i64.to_be_bytes());
+        [begin, message, commit]
+            .into_iter()
+            .map(|message| {
+                let mut frame = vec![b'w'];
+                frame.extend([0; 24]);
+                frame.extend(message);
+                frame
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn exact_marker_stop_is_durable_idempotent_and_restart_keeps_following_wal() {
+        let root = root();
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        let store =
+            Arc::new(ObjectBufferStore::local(root.join("store"), Duration::from_secs(5)).unwrap());
+        let config =
+            reverse::Config::new("m", 180000, vec![("public".into(), "rows".into())]).unwrap();
+        let mut capture = reverse::Capture::new(
+            &config,
+            identity(),
+            1,
+            writer(&root, store.clone(), PREFIX).await,
+            Resolver(vec![]),
+            SchemaVersions::new("m".into(), 0, []).unwrap(),
+            Eligibility::new(|_| Ok(())),
+        )
+        .unwrap();
+        let marker = crate::cutover::Marker {
+            cutover: "request".into(),
+            epoch: 1,
+            lsn: 100,
+        };
+        let later = crate::cutover::Marker {
+            lsn: 200,
+            ..marker.clone()
+        };
+        let mut frames = Frames(
+            marker_frames(&marker)
+                .into_iter()
+                .chain(marker_frames(&later))
+                .collect(),
+        );
+        let (_send, mut paused) = watch::channel(false);
+        let mut seen = Vec::new();
+        capture.stop_at(&marker).unwrap();
+        for _ in 0..2 {
+            capture
+                .step(
+                    &mut frames,
+                    &mut |w| {
+                        seen.push(w);
+                        Ok(())
+                    },
+                    &mut paused,
+                )
+                .await
+                .unwrap();
+            assert!(capture.stopped_at().is_none());
+            assert_eq!(capture.writer().checkpoint().unwrap().next_mseq, 0);
+        }
+        capture
+            .step(
+                &mut frames,
+                &mut |w| {
+                    seen.push(w);
+                    Ok(())
+                },
+                &mut paused,
+            )
+            .await
+            .unwrap();
+        assert_eq!(capture.stopped_at(), Some(&marker));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(capture.writer().checkpoint().unwrap().next_mseq, 1);
+        let saved = capture.writer().checkpoint().unwrap();
+        for _ in 0..3 {
+            capture.stop_at(&marker).unwrap();
+            capture
+                .step(
+                    &mut frames,
+                    &mut |_: source::Watermark| panic!("duplicate callback"),
+                    &mut paused,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(frames.0.len(), 3);
+        assert!(capture.stop_at(&later).is_err());
+        capture.restart();
+        assert_eq!(capture.writer().checkpoint().unwrap(), saved);
+        assert!(capture.stop_at(&marker).is_err()); // passed LSN is not proof
+        capture.stop_at(&later).unwrap();
+        for _ in 0..3 {
+            capture
+                .step(&mut frames, &mut |_: source::Watermark| Ok(()), &mut paused)
+                .await
+                .unwrap();
+        }
+        assert_eq!(capture.stopped_at(), Some(&later));
+        assert_eq!(capture.writer().checkpoint().unwrap().next_mseq, 2);
+        drop(capture);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn marker_identity_mismatch_never_authorizes_stop() {
+        for (epoch, lsn) in [(2, 100), (1, 101)] {
+            let root = root();
+            std::fs::create_dir_all(root.join("store")).unwrap();
+            let store = Arc::new(
+                ObjectBufferStore::local(root.join("store"), Duration::from_secs(5)).unwrap(),
+            );
+            let config =
+                reverse::Config::new("m", 180000, vec![("public".into(), "rows".into())]).unwrap();
+            let mut capture = reverse::Capture::new(
+                &config,
+                identity(),
+                1,
+                writer(&root, store.clone(), PREFIX).await,
+                Resolver(vec![]),
+                SchemaVersions::new("m".into(), 0, []).unwrap(),
+                Eligibility::new(|_| Ok(())),
+            )
+            .unwrap();
+            let marker = crate::cutover::Marker {
+                cutover: "request".into(),
+                epoch: 1,
+                lsn: 100,
+            };
+            capture.stop_at(&marker).unwrap();
+            let mut frames = Frames(
+                marker_frames(&crate::cutover::Marker {
+                    epoch,
+                    lsn,
+                    ..marker
+                })
+                .into(),
+            );
+            let (_send, mut paused) = watch::channel(false);
+            let mut sink = |_: source::Watermark| Ok(());
+            for _ in 0..2 {
+                capture
+                    .step(&mut frames, &mut sink, &mut paused)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                capture
+                    .step(&mut frames, &mut sink, &mut paused)
+                    .await
+                    .is_err()
+            );
+            assert!(capture.stopped_at().is_none());
+            assert!(
+                capture
+                    .step(&mut frames, &mut sink, &mut paused)
+                    .await
+                    .is_err()
+            );
+            drop(capture);
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
     #[test]
     fn breach_reason_replays_as_critical_alert() {
         let state = Materialized {

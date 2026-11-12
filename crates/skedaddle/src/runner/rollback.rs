@@ -105,11 +105,55 @@ pub(super) async fn run(runtime: &Runtime) -> coordinator::Result<VerifyResponse
     Ok(response)
 }
 
+/// Observer-only view of authenticated rollback progress. A terminal outcome
+/// requires both the terminal checkpoint and its matching lifecycle state.
+pub fn status(state: &Materialized) -> serde_json::Value {
+    let Some(checkpoint) = &state.rollback else {
+        return serde_json::Value::Null;
+    };
+    let outcome = match (state.lifecycle.state, checkpoint.next) {
+        (State::SourceActiveAfterRollback, coordinator::rollback::Step::Complete) => "completed",
+        (State::RollbackWindow, coordinator::rollback::Step::Aborted) => "deadline-aborted",
+        _ if state.rollback_eligibility_ended.is_some() => "operator-action-required",
+        _ => "in-progress",
+    };
+    json!({"request":checkpoint.request,"step":checkpoint.next,
+        "intent":checkpoint.intent,"deadline_at_ms":checkpoint.deadline_at_ms,
+        "point_of_no_return":checkpoint.point_of_no_return,
+        "final_marker":checkpoint.final_marker,"outcome":outcome})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coordinator::reverse::EligibilityEnd;
 
+    #[test]
+    fn status_requires_matching_checkpoint_and_lifecycle_for_terminal_outcome() {
+        use coordinator::rollback::{Checkpoint, Step};
+        let mut state = Materialized::default();
+        assert!(status(&state).is_null());
+        state.rollback = Some(Checkpoint {
+            request: "request".into(),
+            deadline_at_ms: 100,
+            next: Step::ReverseApply,
+            intent: None,
+            final_marker: Some(50),
+            point_of_no_return: true,
+        });
+        state.lifecycle.state = State::RollingBack;
+        assert_eq!(status(&state)["step"], "reverse-apply");
+        assert_eq!(status(&state)["outcome"], "in-progress");
+        state.rollback.as_mut().unwrap().next = Step::Complete;
+        assert_eq!(status(&state)["outcome"], "in-progress");
+        state.lifecycle.state = State::SourceActiveAfterRollback;
+        assert_eq!(status(&state)["outcome"], "completed");
+        state.rollback.as_mut().unwrap().next = Step::Aborted;
+        state.lifecycle.state = State::RollingBack;
+        assert_eq!(status(&state)["outcome"], "in-progress");
+        state.lifecycle.state = State::RollbackWindow;
+        assert_eq!(status(&state)["outcome"], "deadline-aborted");
+    }
     #[test]
     fn refuses_every_non_window_state_without_mutating_materialized_state() {
         let mut state = Materialized::default();

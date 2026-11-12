@@ -14,7 +14,7 @@ mod reverse_workers;
 mod rollback;
 pub use post_activation::{request_finalize, request_finalize_objects};
 pub use reverse_workers::status as reverse_status;
-pub use rollback::request_rollback;
+pub use rollback::{request_rollback, status as rollback_status};
 mod readiness;
 mod reverse_capabilities;
 mod selection;

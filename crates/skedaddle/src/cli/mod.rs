@@ -500,7 +500,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             }
             Ok((
                 Outcome::Success,
-                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state)}),
+                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state),"rollback":crate::runner::rollback_status(&state)}),
             ))
         }
         Command::Assess { sample, .. } => {

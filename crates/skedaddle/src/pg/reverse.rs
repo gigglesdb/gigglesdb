@@ -444,6 +444,8 @@ pub struct Capture<R> {
     eligibility: Eligibility,
     schemas: ddl::SchemaVersions,
     installation: String,
+    stop: Option<crate::cutover::Marker>,
+    stopped: bool,
 }
 impl<R: source::TypeResolver> Capture<R> {
     #[allow(clippy::too_many_arguments)]
@@ -472,7 +474,38 @@ impl<R: source::TypeResolver> Capture<R> {
             eligibility,
             schemas: eligibility_schemas,
             installation: config.installation.clone(),
+            stop: None,
+            stopped: false,
         })
+    }
+    /// Arm before reading the marker transaction. An already passed boundary
+    /// requires authenticated buffer recovery; WAL progress alone is no proof.
+    pub fn stop_at(&mut self, marker: &crate::cutover::Marker) -> source::Result<()> {
+        if self.stop.as_ref() == Some(marker) {
+            return Ok(());
+        }
+        if self.stop.is_some()
+            || marker.cutover.is_empty()
+            || marker.epoch <= 0
+            || marker.lsn == 0
+            || self.durable_lsn() >= marker.lsn
+        {
+            return Err(source::Error::RecoveryRequired(
+                "reverse stop boundary differs or passed",
+            ));
+        }
+        self.stop = Some(marker.clone());
+        Ok(())
+    }
+    /// Present only after the exact marker transaction is manifest durable.
+    pub fn stopped_at(&self) -> Option<&crate::cutover::Marker> {
+        self.stop.as_ref().filter(|_| self.stopped)
+    }
+    /// Deadline compensation resumes at the retained durable boundary. No WAL
+    /// or writer state is reset; the next read acknowledges only durable WAL.
+    pub fn restart(&mut self) {
+        self.stop = None;
+        self.stopped = false;
     }
     pub fn durable_lsn(&self) -> u64 {
         self.inner.durable_lsn()
@@ -494,13 +527,29 @@ impl<R: source::TypeResolver> Capture<R> {
         paused: &mut tokio::sync::watch::Receiver<bool>,
     ) -> source::Result<source::Step> {
         self.eligibility.ensure().map_err(source::Error::Mapping)?;
+        if self.stopped {
+            return Ok(source::Step::Durable {
+                end_lsn: self.durable_lsn(),
+                stop: None,
+            });
+        }
         let mut checked = CheckedTransport {
             inner: transport,
             eligibility: &self.eligibility,
             schemas: &mut self.schemas,
             installation: &self.installation,
         };
-        let result = self.inner.step(&mut checked, sink, paused).await;
+        let mut boundary = StopSink {
+            sink,
+            target: self.stop.as_ref(),
+            reached: false,
+        };
+        let result = self.inner.step(&mut checked, &mut boundary, paused).await;
+        // Set the latch only after the source step (including all callbacks)
+        // succeeds. Capture poisons itself on callback errors.
+        if result.is_ok() && boundary.reached {
+            self.stopped = true;
+        }
         match &result {
             Ok(source::Step::Durable {
                 stop: Some(stop), ..
@@ -526,6 +575,54 @@ impl<R: source::TypeResolver> Capture<R> {
             _ => {}
         }
         result
+    }
+}
+
+/// Runs inside source::Capture's manifest-durable callback, never on wire receipt.
+struct StopSink<'a, S> {
+    sink: &'a mut S,
+    target: Option<&'a crate::cutover::Marker>,
+    reached: bool,
+}
+impl<S: source::WatermarkSink> source::WatermarkSink for StopSink<'_, S> {
+    fn committed(&mut self, transaction: &crate::event::AssembledTxn) -> source::Result<()> {
+        if let Some(target) = self.target {
+            let commit =
+                u64::from_be_bytes(transaction.commit_position.bytes().try_into().map_err(
+                    |_| source::Error::RecoveryRequired("reverse commit position invalid"),
+                )?);
+            if commit >= target.lsn
+                && !transaction.events.iter().any(|event| {
+                    matches!(
+                        crate::engine::classify_captured_control(event),
+                        Ok(crate::engine::CapturedControl::Final(ref marker)) if marker == target
+                    )
+                })
+            {
+                return Err(source::Error::RecoveryRequired(
+                    "reverse final marker missing at boundary",
+                ));
+            }
+        }
+        self.sink.committed(transaction)
+    }
+    fn watermark(&mut self, watermark: source::Watermark) -> source::Result<()> {
+        if let Some(target) = self.target
+            && watermark.message_lsn == target.lsn
+        {
+            if !watermark.transactional
+                || !matches!(
+                    crate::engine::decode_marker_payload(&watermark.content, watermark.message_lsn),
+                    Ok(crate::engine::CapturedControl::Final(ref marker)) if marker == target
+                )
+            {
+                return Err(source::Error::RecoveryRequired(
+                    "reverse final marker identity differs",
+                ));
+            }
+            self.reached = true;
+        }
+        self.sink.watermark(watermark)
     }
 }
 
