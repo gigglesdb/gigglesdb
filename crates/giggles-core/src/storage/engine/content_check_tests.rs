@@ -149,7 +149,7 @@ fn counter_requires_bit_and_live_matching_sequence() {
         1,
         Some(catalog_codec::encode_sequence(&sequence(8)).unwrap()),
     );
-    corrupt_check(&kv, 320);
+    assert_eq!(check(&kv, 320).unwrap(), vec![catalog_codec::counter_key(3, 7)]);
     catalog(
         &kv,
         catalog_codec::sequence_key(3),

@@ -107,6 +107,7 @@ fn export_inner(
         })
         .transpose()?
         .unwrap_or(Ts(0));
+    let checked = engine::meta::open_checks(read.as_ref()).map_err(v2::format_error)?;
     after_snapshot(ts);
     let stage = staging(path)?;
     let mut file = OpenOptions::new()
@@ -149,7 +150,9 @@ fn export_inner(
         Direction::Forward,
     )? {
         let (key, value) = item?;
-        write_record(&mut file, &mut hash, 4, &key, &value)?;
+        if !checked.stale_counters.contains(&key) {
+            write_record(&mut file, &mut hash, 4, &key, &value)?;
+        }
     }
     let digest: [u8; 32] = hash.finalize().into();
     file.write_all(&digest).map_err(io)?;

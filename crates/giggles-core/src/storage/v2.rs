@@ -69,6 +69,13 @@ impl V2Db {
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
         let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
+        if !meta.stale_counters.is_empty() {
+            let mut batch = engine::kv::WriteBatch::default();
+            for key in &meta.stale_counters {
+                batch.delete(engine::kv::Keyspace::Seq, key.clone());
+            }
+            kv.write(batch, engine::kv::Durability::Sync)?;
+        }
         let sequencer = engine::commit::Sequencer::open(
             kv.clone(),
             Arc::new(engine::commit::SystemClock),

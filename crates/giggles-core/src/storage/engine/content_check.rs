@@ -77,7 +77,8 @@ pub(crate) fn required_bits_for_catalog_value(
     }
 }
 
-pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
+pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, FormatError> {
+    let mut stale = Vec::new();
     let mut previous = None;
     let mut tables = BTreeMap::new();
     let mut sequences = BTreeMap::new();
@@ -178,12 +179,16 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<(), FormatError> {
         let definition = sequences
             .get(&id)
             .ok_or_else(|| corrupt("counter sequence is absent"))?;
+        if u128::from_be_bytes(key[9..25].try_into().unwrap()) != definition.incarnation {
+            stale.push(key);
+            continue;
+        }
         catalog_codec::decode_counter(&key, &value, definition).map_err(corrupt)?;
     }
     if required & !features != 0 {
         return Err(corrupt("content requires unset format feature"));
     }
-    Ok(())
+    Ok(stale)
 }
 
 #[cfg(test)]

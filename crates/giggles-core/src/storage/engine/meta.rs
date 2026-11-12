@@ -142,6 +142,7 @@ pub(crate) fn classify_dir(dir: &Path) -> Result<DirClass, FormatError> {
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MetaInfo {
+    pub(crate) stale_counters: Vec<Vec<u8>>,
     pub(crate) family: u32,
     pub(crate) subversion: u32,
     pub(crate) features: u64,
@@ -243,6 +244,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
         return Err(corrupt("role bootstrap feature/catalog mismatch"));
     }
     Ok(MetaInfo {
+        stale_counters: Vec::new(),
         family,
         subversion,
         features,
@@ -265,8 +267,8 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     Ok(())
 }
 pub(crate) fn open_checks(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
-    let info = validate_meta(kv)?;
-    super::content_check::check(kv, info.features)?;
+    let mut info = validate_meta(kv)?;
+    info.stale_counters = super::content_check::check(kv, info.features)?;
     Ok(info)
 }
 pub(crate) fn put_features(batch: &mut WriteBatch, bits: u64) -> Result<(), FormatError> {

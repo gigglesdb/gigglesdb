@@ -300,29 +300,78 @@ fn identity_column_restart_syntax_is_currently_rejected_without_mutation() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-fn old_orphan_counter_remains_a_validation_error_pending_pre_release() {
-    let mut f = Fixture::new(Engine::V2);
-    let mut s = f.session();
-    run(&mut s, "CREATE SEQUENCE ids");
-    scalar(&mut s, "SELECT nextval('ids')");
-    {
-        let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
-            unreachable!()
-        };
-        let mut txn = db.begin(Isolation::ReadCommitted);
-        let parts = db.catalog().parts(&mut txn).unwrap();
-        let (&id, def) = parts.ext.sequences.iter().next().unwrap();
-        let key = engine::catalog_codec::counter_key(id, def.incarnation);
-        let bytes = db.kv.get(Keyspace::Seq, &key).unwrap().unwrap();
-        run(&mut s, "ALTER SEQUENCE ids RESTART WITH 10");
-        // Recreate exactly the old writer's orphan: a valid old reservation
-        // beside a replacement definition. Do not relax the on-disk validator.
-        let mut batch = engine::kv::WriteBatch::default();
-        batch.put(Keyspace::Seq, key, bytes);
-        db.kv.write(batch, engine::kv::Durability::Sync).unwrap();
+fn old_orphan_counter_is_retired_on_open() {
+    for matching in [false, true] {
+        let mut f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE ids");
+        scalar(&mut s, "SELECT nextval('ids')");
+        let stale;
+        {
+            let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else {
+                unreachable!()
+            };
+            let mut txn = db.begin(Isolation::ReadCommitted);
+            let parts = db.catalog().parts(&mut txn).unwrap();
+            let (&id, def) = parts.ext.sequences.iter().next().unwrap();
+            stale = engine::catalog_codec::counter_key(id, def.incarnation);
+            let bytes = db.kv.get(Keyspace::Seq, &stale).unwrap().unwrap();
+            run(&mut s, "ALTER SEQUENCE ids RESTART WITH 10");
+            if !matching {
+                let mut txn = db.begin(Isolation::ReadCommitted);
+                let parts = db.catalog().parts(&mut txn).unwrap();
+                let def = &parts.ext.sequences[&id];
+                let mut batch = engine::kv::WriteBatch::default();
+                batch.delete(Keyspace::Seq, engine::catalog_codec::counter_key(id, def.incarnation));
+                db.kv.write(batch, engine::kv::Durability::Sync).unwrap();
+            }
+            let mut batch = engine::kv::WriteBatch::default();
+            batch.put(Keyspace::Seq, stale.clone(), bytes);
+            db.kv.write(batch, engine::kv::Durability::Sync).unwrap();
+            assert_eq!(engine::meta::open_checks(db.kv.as_ref()).unwrap().stale_counters, vec![stale.clone()]);
+        }
+        // Export the still-unrepaired physical state, then validate its import.
+        let backup = f.path.with_extension("export");
+        let restored = f.path.with_extension("restored");
+        f.admin.as_ref().unwrap().export(&backup).unwrap();
+        let copy = Admin::restore(&backup, &restored, Limits::default()).unwrap();
+        let mut copy_session = copy.sql_session();
+        assert_eq!(scalar(&mut copy_session, "SELECT nextval('ids')"), if matching { 10 } else { 1 });
+        drop(copy_session);
+        drop(copy);
+        std::fs::remove_dir_all(restored).unwrap();
+        std::fs::remove_file(backup).unwrap();
+        drop(s);
+        f.reopen();
+        let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+        assert!(db.kv.get(Keyspace::Seq, &stale).unwrap().is_none());
+        assert!(engine::meta::open_checks(db.kv.as_ref()).unwrap().stale_counters.is_empty());
+        let mut s = f.session();
+        assert_eq!(scalar(&mut s, "SELECT nextval('ids')"), if matching { 10 } else { 1 });
+        drop(s);
+        f.reopen();
     }
-    drop(s);
-    f.admin.take();
-    assert!(matches!(Admin::open(&f.path, Limits::default()),
-        Err(CoreError::Corrupt(message)) if message.contains("sequence counter invariant")));
+}
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn invalid_live_or_missing_sequence_counter_stays_corrupt() {
+    for missing_definition in [false, true] {
+        let mut f = Fixture::new(Engine::V2);
+        let mut s = f.session();
+        run(&mut s, "CREATE SEQUENCE ids");
+        scalar(&mut s, "SELECT nextval('ids')");
+        {
+            let Backend::V2(db) = &f.admin.as_ref().unwrap().inner.backend else { unreachable!() };
+            let mut txn = db.begin(Isolation::ReadCommitted);
+            let parts = db.catalog().parts(&mut txn).unwrap();
+            let (&id, def) = parts.ext.sequences.iter().next().unwrap();
+            let key = engine::catalog_codec::counter_key(if missing_definition { id + 999 } else { id }, def.incarnation);
+            let mut batch = engine::kv::WriteBatch::default();
+            batch.put(Keyspace::Seq, key, vec![0; 24]);
+            db.kv.write(batch, engine::kv::Durability::Sync).unwrap();
+        }
+        drop(s);
+        f.admin.take();
+        assert!(matches!(Admin::open(&f.path, Limits::default()), Err(CoreError::Corrupt(_))));
+    }
 }
