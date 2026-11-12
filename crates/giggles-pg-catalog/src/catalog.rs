@@ -1454,6 +1454,8 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         (18, "char", 1, 1002),
         (19, "name", 64, 1003),
         (26, "oid", 4, 1028),
+        (27, "tid", 6, 1010),
+        (29, "cid", 4, 1012),
         (28, "xid", 4, 1011),
         (1033, "aclitem", 16, 1034),
     ] {
@@ -1555,6 +1557,38 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             "pg_type",
             composite_row((oid + 3) as u32, &t.name, namespace, oid, owner),
         );
+        // Heap system attributes exist in pg_attribute but are excluded by
+        // clients that explicitly request attnum > 0.
+        for (attnum, name, ty, len) in [
+            (-6, "tableoid", 26, 4),
+            (-5, "cmax", 29, 4),
+            (-4, "xmax", 28, 4),
+            (-3, "cmin", 29, 4),
+            (-2, "xmin", 28, 4),
+            (-1, "ctid", 27, 6),
+        ] {
+            add(
+                "pg_attribute",
+                vec![
+                    I(oid),
+                    s(name),
+                    I(ty),
+                    I(attnum),
+                    B(true),
+                    I(-1),
+                    I(len),
+                    B(false),
+                    s(""),
+                    s(""),
+                    B(false),
+                    I(0),
+                    N,
+                    I(0),
+                    B(true),
+                    N,
+                ],
+            );
+        }
         for (i, c) in t.columns.iter().enumerate() {
             let (ty, _, len, _) = scalar(c.data_type);
             add(
@@ -1913,6 +1947,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                     | 24
                     | 26
                     | 28
+                    | 29
                     | 700
                     | 701
                     | 1082
@@ -2062,7 +2097,7 @@ fn type_layout(oid: i64) -> (&'static str, &'static str) {
     };
     let align = match oid {
         16 | 18 | 19 => "c",
-        21 => "s",
+        21 | 27 => "s",
         20 | 701 | 1016 | 1034 | 1083 | 1183 | 1114 | 1115 | 1184 | 1185 | 1186 | 1187 | 1266
         | 1270 | 2249 | 2277 | 3220 | 3221 => "d",
         n if n >= 32768 => "d",
@@ -2119,7 +2154,7 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
             "D"
         } else if oid == 1186 {
             "T"
-        } else if matches!(oid, 17 | 28 | 1033 | 2950 | 3802) {
+        } else if matches!(oid, 17 | 27 | 28 | 29 | 1033 | 2950 | 3802) {
             "U"
         } else if oid == 18 {
             "Z"
@@ -2134,7 +2169,15 @@ fn type_row(oid: u32, name: &str, len: i64, elem: u32, array: u32, is_array: boo
         I(0),
         I(if oid == 19 { 18 } else { elem as i64 }),
         I(array as i64),
-        I(if is_array { 750 } else { 0 }),
+        I(if is_array {
+            750
+        } else {
+            match oid {
+                27 => 48,
+                29 => 52,
+                _ => 0,
+            }
+        }),
         s(","),
         I(10),
         N,
@@ -2163,7 +2206,9 @@ fn type_receive(oid: u32, is_array: bool) -> i64 {
         24 => 2444,
         25 => 2414,
         26 => 2418,
+        27 => 2438,
         28 => 2440,
+        29 => 2442,
         30 => 2420,
         194 => 197,
         700 => 2424,

@@ -121,7 +121,7 @@ fn exact_full_acl_has_real_ordered_authorized_oids_and_null_acl() {
             Value::Bool(true)
         ]]
     );
-    assert_eq!(run("select atttypid, attnotnull from pg_catalog.pg_attribute where attrelid=65564 order by attnum", &snapshot(), &[]).rows, vec![vec![i(20),Value::Bool(true)],vec![i(25),Value::Bool(false)]]);
+    assert_eq!(run("select atttypid, attnotnull from pg_catalog.pg_attribute where attrelid=65564 AND attnum>0 order by attnum", &snapshot(), &[]).rows, vec![vec![i(20),Value::Bool(true)],vec![i(25),Value::Bool(false)]]);
 }
 
 #[test]

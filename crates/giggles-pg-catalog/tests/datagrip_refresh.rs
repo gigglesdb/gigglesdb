@@ -256,7 +256,7 @@ fn xid_casts_nulls_wrapping_and_parameter_descriptors() {
 #[test]
 fn every_exposed_catalog_xmin_uses_the_same_current_generation() {
     let snapshot = snapshot((1 << 32) + 42);
-    let p = plan("select c.relname from pg_class c join pg_attribute a on c.oid=a.attrelid where a.attname='xmin'").unwrap().unwrap();
+    let p = plan("select c.relname from pg_class c join pg_attribute a on c.oid=a.attrelid where a.attname='xmin' AND c.relnamespace=11").unwrap().unwrap();
     let relations = execute(&p, &snapshot, &[]).unwrap();
     assert!(!relations.rows.is_empty());
     for row in relations.rows {

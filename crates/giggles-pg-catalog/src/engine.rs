@@ -2243,6 +2243,16 @@ impl Compiler {
                             return Err(Error::Type);
                         }
                         (K::Expand(Box::new(args[0].clone())), PgType::Record)
+                    } else if n == "aclexplode" && args.len() == 1 {
+                        expect(&mut args[0], PgType::AclItemArray)?;
+                        no_set_or_window(&args[0])?;
+                        (
+                            K::Unnest(Box::new(E {
+                                kind: K::Call("_aclexplode".into(), args),
+                                ty: PgType::AnyArray,
+                            })),
+                            PgType::Record,
+                        )
                     } else if n == "generate_series" && args.len() == 2 {
                         for arg in &mut args {
                             expect(arg, PgType::Int4)?;
@@ -2337,6 +2347,10 @@ impl Compiler {
                 let (i, t) = match ident(key).as_str() {
                     "x" => (0, PgType::Int2),
                     "n" => (1, PgType::Int4),
+                    "grantor" => (0, PgType::Oid),
+                    "grantee" => (1, PgType::Oid),
+                    "privilege_type" => (2, PgType::Text),
+                    "is_grantable" => (3, PgType::Bool),
                     _ => return Err(Error::UnknownColumn),
                 };
                 (K::Member(Box::new(e), i), t)
@@ -2688,7 +2702,11 @@ fn check_expr(e: &mut E) -> R<()> {
             }
         }
         K::Unnest(x) => {
-            e.ty = array_element(x.ty)?;
+            e.ty = if matches!(&x.kind, K::Call(n, _) if n == "_aclexplode") {
+                PgType::Record
+            } else {
+                array_element(x.ty)?
+            };
         }
         K::Array(es) => {
             if !es.is_empty() {
@@ -2730,6 +2748,7 @@ fn check_expr(e: &mut E) -> R<()> {
                 let element = array_element(args[0].ty)?;
                 expect(&mut args[1], element)?;
             }
+            "_aclexplode" => expect(&mut args[0], PgType::AclItemArray)?,
             "acldefault" => {
                 expect(&mut args[0], PgType::Char)?;
                 coerce(&mut args[1], PgType::Oid)?;
@@ -4006,6 +4025,9 @@ impl Runtime<'_> {
                 return Ok(N);
             }
         }
+        if n == "_aclexplode" && v[0] == N {
+            return Ok(Value::Array(vec![]));
+        }
         if v.contains(&N)
             && !(n == "format_type" && v[0] != N)
             && !(n == "array_to_string" && v[0] != N && v[1] != N)
@@ -4095,6 +4117,72 @@ impl Runtime<'_> {
                 }
                 _ => return Err(Error::Type),
             },
+            "_aclexplode" => {
+                let Value::Array(items) = &v[0] else {
+                    return Err(Error::Type);
+                };
+                let roles = &self.catalogs["pg_authid"].rows;
+                let mut result = vec![];
+                for item in items {
+                    let S(item) = item else {
+                        return Err(Error::Type);
+                    };
+                    self.charge(item.len() + roles.len())?;
+                    // Match encoded role names, so quoted '=', '/' and doubled
+                    // quotes in identifiers cannot be mistaken for separators.
+                    let (grantor, acl) = roles
+                        .iter()
+                        .find_map(|role| {
+                            let S(name) = &role[1] else { return None };
+                            item.strip_suffix(&format!("/{}", acl_role_name(name)))
+                                .map(|acl| (role[0].clone(), acl))
+                        })
+                        .ok_or(Error::Unsupported)?;
+                    let (grantee, privileges) = if let Some(acl) = acl.strip_prefix('=') {
+                        (I(0), acl)
+                    } else {
+                        roles
+                            .iter()
+                            .find_map(|role| {
+                                let S(name) = &role[1] else { return None };
+                                acl.strip_prefix(&format!("{}=", acl_role_name(name)))
+                                    .map(|privileges| (role[0].clone(), privileges))
+                            })
+                            .ok_or(Error::Unsupported)?
+                    };
+                    let mut chars = privileges.chars().peekable();
+                    while let Some(privilege) = chars.next() {
+                        let name = match privilege {
+                            'a' => "INSERT",
+                            'r' => "SELECT",
+                            'w' => "UPDATE",
+                            'd' => "DELETE",
+                            'D' => "TRUNCATE",
+                            'x' => "REFERENCES",
+                            't' => "TRIGGER",
+                            'm' => "MAINTAIN",
+                            'X' => "EXECUTE",
+                            'U' => "USAGE",
+                            'C' => "CREATE",
+                            'c' => "CONNECT",
+                            'T' => "TEMPORARY",
+                            _ => return Err(Error::Unsupported),
+                        };
+                        let grantable = chars.next_if_eq(&'*').is_some();
+                        self.charge(1)?;
+                        if result.len() >= MAX_ROWS {
+                            return Err(Error::Limit);
+                        }
+                        result.push(Value::Record(vec![
+                            grantor.clone(),
+                            grantee.clone(),
+                            S(name.into()),
+                            B(grantable),
+                        ]));
+                    }
+                }
+                Value::Array(result)
+            }
             "acldefault" => {
                 // Defaults describe the object owner's initial rights, independently
                 // of actual catalog ACLs (which this snapshot does not model).
@@ -4406,17 +4494,37 @@ impl Runtime<'_> {
                     integer(v[1].clone())?
                 };
                 if column == 0 {
-                    let name = self.catalogs["pg_class"]
+                    let relation = self.catalogs["pg_index"]
+                        .rows
+                        .iter()
+                        .find(|r| r[0] == I(oid))
+                        .map(|r| r[1].clone());
+                    let visible = if v.len() == 3 && v[2] == B(true) {
+                        self.call(
+                            "pg_table_is_visible",
+                            vec![relation.unwrap_or(N)],
+                            remaining,
+                        )? == B(true)
+                    } else {
+                        false
+                    };
+                    let identity = self.catalogs["pg_class"]
                         .rows
                         .iter()
                         .find(|r| r[0] == I(oid) && r[3] == S("i".into()))
-                        .map(|r| &r[1]);
+                        .and_then(|r| {
+                            self.catalogs["pg_namespace"]
+                                .rows
+                                .iter()
+                                .find(|ns| ns[0] == r[2])
+                                .map(|ns| (&r[1], &ns[1]))
+                        });
                     self.catalogs["pg_indexes"]
                         .rows
                         .iter()
-                        .find(|r| Some(&r[2]) == name)
+                        .find(|r| Some((&r[2], &r[0])) == identity)
                         .map(|r| match &r[4] {
-                            S(definition) if v.len() == 3 && v[2] == B(true) => {
+                            S(definition) if visible => {
                                 let index_name = match &r[2] {
                                     S(name) => catalog::quote_identifier(name),
                                     _ => return N,
@@ -4432,7 +4540,11 @@ impl Runtime<'_> {
                                 S(format!(
                                     "{}{}",
                                     &definition[..offset],
-                                    &definition[offset + "public.".len()..]
+                                    &definition[offset
+                                        + text(r[0].clone())
+                                            .map(|schema| catalog::quote_identifier(&schema).len()
+                                                + 1)
+                                            .unwrap_or(0)..]
                                 ))
                             }
                             value => value.clone(),

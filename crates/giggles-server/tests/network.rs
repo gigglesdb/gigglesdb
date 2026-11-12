@@ -2597,7 +2597,7 @@ async fn catalog_driver_identity_typed_metadata_and_hidden_relations() {
     assert_eq!(tables.len(), 1);
     assert_eq!(tables[0].get::<_, String>(1), "app");
     let oid: u32 = tables[0].get(0);
-    let statement = pg.prepare("SELECT attname, attnum, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE attrelid=$1 ORDER BY attnum").await.unwrap();
+    let statement = pg.prepare("SELECT attname, attnum, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE attrelid=$1 AND attnum>0 ORDER BY attnum").await.unwrap();
     assert_eq!(statement.params(), &[tokio_postgres::types::Type::OID]);
     let columns = pg.query(&statement, &[&oid]).await.unwrap();
     assert_eq!(columns.len(), 6);
@@ -2967,7 +2967,7 @@ async fn catalog_multiple_granted_tables_composite_key_order_and_empty_visible_s
     );
     let key = pg.query_one("SELECT conkey FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class t ON t.oid=c.conrelid WHERE t.relname='composite' AND c.contype='p'", &[]).await.unwrap();
     assert_eq!(key.get::<_, Vec<i16>>(0), [2, 1]);
-    let attrs = pg.query("SELECT attname, attnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid WHERE t.relname='composite' ORDER BY attnum", &[]).await.unwrap();
+    let attrs = pg.query("SELECT attname, attnotnull FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class t ON t.oid=a.attrelid WHERE t.relname='composite' AND attnum>0 ORDER BY attnum", &[]).await.unwrap();
     assert_eq!(attrs.len(), 3);
     assert!(attrs[0].get::<_, bool>(1));
     assert!(attrs[1].get::<_, bool>(1));

@@ -1121,7 +1121,7 @@ mod tests {
         };
         assert_eq!(
             run(
-                "select a.attname,a.attnum,a.atttypmod from pg_attribute a join pg_class c on c.oid=a.attrelid where c.relname='heap_table' order by a.attnum"
+                "select a.attname,a.attnum,a.atttypmod from pg_attribute a join pg_class c on c.oid=a.attrelid where c.relname='heap_table' AND a.attnum>0 order by a.attnum"
             ),
             [
                 vec![Value::Text("a".into()), Value::Int(1), Value::Int(11)],

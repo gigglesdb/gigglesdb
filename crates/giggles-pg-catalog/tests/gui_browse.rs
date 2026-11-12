@@ -195,3 +195,152 @@ fn pgadmin_role_recursion_stops_at_absent_memberships() {
     );
     assert!(plan("WITH RECURSIVE cte AS (SELECT oid FROM pg_roles UNION ALL SELECT oid FROM cte) SELECT * FROM cte").is_err());
 }
+
+#[test]
+fn gui_acl_records_and_heap_system_attributes() {
+    let mut snapshot = CatalogSnapshot::default();
+    snapshot.tables.push(TableDef {
+        id: 10,
+        name: "child".into(),
+        primary_key: vec![0],
+        columns: vec![ColumnDef {
+            id: 10,
+            name: "id".into(),
+            data_type: ScalarType::Integer,
+            not_null: true,
+        }],
+    });
+    for column in ["relacl", "attacl"] {
+        let relation = if column == "relacl" {
+            "pg_class"
+        } else {
+            "pg_attribute"
+        };
+        let result = run(
+            &format!(
+                "SELECT (d).grantor,(d).grantee,(d).privilege_type,(d).is_grantable FROM (SELECT aclexplode({column}) d FROM {relation}) a"
+            ),
+            &snapshot,
+        );
+        assert!(result.rows.is_empty());
+        assert_eq!(
+            result
+                .fields
+                .iter()
+                .map(|f| f.data_type)
+                .collect::<Vec<_>>(),
+            vec![PgType::Oid, PgType::Oid, PgType::Text, PgType::Bool]
+        );
+    }
+    snapshot.roles[0].name = "a/=\"b".into();
+    let result = run(
+        "SELECT (d).grantor,(d).grantee,(d).privilege_type,(d).is_grantable FROM (SELECT aclexplode(acldefault('r',10)) d FROM pg_namespace WHERE oid=11) a",
+        &snapshot,
+    );
+    assert_eq!(
+        result.rows,
+        [
+            "INSERT",
+            "SELECT",
+            "UPDATE",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+            "MAINTAIN"
+        ]
+        .into_iter()
+        .map(|p| vec![
+            Value::Int(10),
+            Value::Int(10),
+            Value::Text(p.into()),
+            Value::Bool(false)
+        ])
+        .collect::<Vec<_>>()
+    );
+    let result = run(
+        "SELECT attname,attnum,atttypid,attlen,attnotnull,attbyval,attalign,attstorage,attislocal,attstattarget FROM pg_attribute WHERE attrelid=65576 AND attnum<0 ORDER BY attnum",
+        &snapshot,
+    );
+    let expected = [
+        (-6, "tableoid", 26, 4, true, "i"),
+        (-5, "cmax", 29, 4, true, "i"),
+        (-4, "xmax", 28, 4, true, "i"),
+        (-3, "cmin", 29, 4, true, "i"),
+        (-2, "xmin", 28, 4, true, "i"),
+        (-1, "ctid", 27, 6, false, "s"),
+    ];
+    assert_eq!(
+        result.rows,
+        expected
+            .into_iter()
+            .map(|(n, name, ty, len, byval, align)| vec![
+                Value::Text(name.into()),
+                Value::Int(n),
+                Value::Int(ty),
+                Value::Int(len),
+                Value::Bool(true),
+                Value::Bool(byval),
+                Value::Text(align.into()),
+                Value::Text("p".into()),
+                Value::Bool(true),
+                Value::Null
+            ])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn catalog_index_definition_uses_identity_and_search_path() {
+    let mut snapshot = CatalogSnapshot::default();
+    for (id, schema, column) in [(10, "gui_sales", "amount"), (20, "gui_aux", "id")] {
+        snapshot
+            .schemas
+            .insert(schema.into(), (70000 + id as u32, 10));
+        snapshot.table_schemas.insert(id, schema.into());
+        snapshot.tables.push(TableDef {
+            id,
+            name: "child".into(),
+            primary_key: vec![],
+            columns: vec![ColumnDef {
+                id,
+                name: column.into(),
+                data_type: ScalarType::Integer,
+                not_null: false,
+            }],
+        });
+        snapshot.indexes.push(IndexDef {
+            id: id + 100,
+            table: id,
+            name: "child_idx".into(),
+            columns: vec![id],
+            unique: false,
+        });
+    }
+    let sql = "SELECT pg_get_indexdef(c.oid,0,true),pg_get_indexdef(c.oid,0,false),pg_get_indexdef(c.oid,1,true) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='child_idx' ORDER BY n.nspname";
+    for path in ["public", "gui_sales", "gui_aux"] {
+        snapshot.search_path = vec![path.into()];
+        let result = run(sql, &snapshot);
+        for (row, (schema, column)) in result
+            .rows
+            .iter()
+            .zip([("gui_aux", "id"), ("gui_sales", "amount")])
+        {
+            let qualified =
+                format!("CREATE INDEX child_idx ON {schema}.child USING btree ({column})");
+            let pretty = if path == schema {
+                format!("CREATE INDEX child_idx ON child USING btree ({column})")
+            } else {
+                qualified.clone()
+            };
+            assert_eq!(
+                row,
+                &vec![
+                    Value::Text(pretty),
+                    Value::Text(qualified),
+                    Value::Text(column.into())
+                ]
+            );
+        }
+    }
+}

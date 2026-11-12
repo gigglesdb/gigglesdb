@@ -256,7 +256,7 @@ fn derived_window_filter_does_not_change_row_numbers() {
     let result = run("SELECT attname,attnum FROM (SELECT a.attname,row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum FROM pg_attribute a JOIN pg_class c ON a.attrelid=c.oid WHERE c.relname='r0d_jdbc_items') q WHERE attname='name'", &fixture_snapshot(1), &[]).unwrap();
     assert_eq!(
         result.rows,
-        vec![vec![Value::Text("name".into()), Value::Int(2)]]
+        vec![vec![Value::Text("name".into()), Value::Int(8)]]
     );
 }
 

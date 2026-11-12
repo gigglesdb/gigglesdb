@@ -449,7 +449,7 @@ fn pg18_6_secondary_catalog_capture_matches() {
         (
             "attribute",
             "SELECT c.relname,a.attname,a.attnum,a.attnotnull FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relnamespace=2200 AND c.relname IN ('t','t_pkey','t_email_key','t_ab_idx') ORDER BY c.relname,a.attnum;",
-            "relname,attname,attnum,attnotnull\nt,id,1,t\nt,email,2,f\nt,a,3,f\nt,b,4,f\nt_ab_idx,a,1,f\nt_ab_idx,b,2,f\nt_email_key,email,1,f\nt_pkey,id,1,f\n",
+            "relname,attname,attnum,attnotnull\nt,tableoid,-6,t\nt,cmax,-5,t\nt,xmax,-4,t\nt,cmin,-3,t\nt,xmin,-2,t\nt,ctid,-1,t\nt,id,1,t\nt,email,2,f\nt,a,3,f\nt,b,4,f\nt_ab_idx,a,1,f\nt_ab_idx,b,2,f\nt_email_key,email,1,f\nt_pkey,id,1,f\n",
         ),
         (
             "am",

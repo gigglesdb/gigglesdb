@@ -696,7 +696,7 @@ fn postgres18_collation_and_replica_identity_catalog_values() {
     );
     assert_eq!(
         run(
-            "SELECT a.attname,a.attcollation FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='r0g_t' ORDER BY a.attnum"
+            "SELECT a.attname,a.attcollation FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname='r0g_t' AND a.attnum>0 ORDER BY a.attnum"
         ),
         vec![
             vec![Value::Text("id".into()), Value::Int(0)],
