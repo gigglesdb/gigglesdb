@@ -1,4 +1,5 @@
 mod information_schema;
+mod pg_tables;
 mod constraints;
 pub(crate) use constraints::definition;
 use crate::*;
@@ -190,6 +191,7 @@ pub(crate) fn schema(name: &str) -> Option<Vec<Field>> {
             ("indcheckxmin", T::Bool),
             ("indnullsnotdistinct", T::Bool),
         ],
+        "pg_tables" => return Some(pg_tables::schema()),
         "pg_indexes" => &[
             ("schemaname", T::Name),
             ("tablename", T::Name),
@@ -829,6 +831,7 @@ pub(crate) fn known_names() -> &'static [&'static str] {
         "pg_type",
         "pg_index",
         "pg_indexes",
+        "pg_tables",
         "pg_constraint",
         "pg_description",
         "pg_shdescription",
@@ -898,7 +901,7 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
     if relation_namespace(name) != "pg_catalog"
         || matches!(
             name,
-            "pg_indexes"
+            "pg_indexes" | "pg_tables"
                 | "pg_seclabels"
                 | "pg_user"
                 | "pg_roles"
@@ -928,6 +931,7 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_attribute" => 1249,
         "pg_index" => 2610,
         "pg_indexes" => 12006,
+        "pg_tables" => 12033,
         "pg_constraint" => 2606,
         "pg_description" => 2609,
         "pg_attrdef" => 2604,
@@ -2059,6 +2063,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         }
     }
     information_schema::populate(snapshot, &key_names, &mut all)?;
+    pg_tables::populate(snapshot, &mut all);
     let total: usize = all
         .values()
         .flat_map(|r| &r.rows)

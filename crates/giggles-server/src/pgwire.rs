@@ -288,7 +288,7 @@ pub fn row_description(d: &Description, formats: &[u16], out: &mut Vec<u8>) -> R
                 .unwrap_or_else(|| oid(&c.data_type))
                 .to_be_bytes(),
         );
-        b.extend(size(&c.data_type).to_be_bytes());
+        b.extend(if d.type_oids.get(i) == Some(&2278) { 4i16 } else { size(&c.data_type) }.to_be_bytes());
         b.extend(d.typmods.get(i).copied().unwrap_or(-1).to_be_bytes());
         b.extend(format_at(formats, i).to_be_bytes());
     }
@@ -912,6 +912,11 @@ struct State {
     copy_completion: Vec<u8>,
     copy_active: Option<crate::cancel::Active>,
 }
+fn statement_deadline(settings: &crate::pg_settings::Settings) {
+    if settings.statement_timeout > 0 && let Some(context) = giggles_core::Cancellation::current() {
+        context.deadline(std::time::Instant::now() + std::time::Duration::from_millis(settings.statement_timeout));
+    }
+}
 fn begin_implicit(
     session: &mut Session,
     implicit: &mut bool,
@@ -996,6 +1001,7 @@ fn execute_control(
     }
     *implicit = false;
     settings.transaction(was, session.in_transaction(), actual);
+    if !session.in_transaction() { session.service.advisory.release(session.backend_pid, true); }
     settings_status(&before, settings, session, out)?;
     Ok(actual)
 }
@@ -1013,8 +1019,10 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        if tag == b'E' { statement_deadline(&self.settings.current); }
         let result = self.handle_inner(tag, b, session, out, received);
         if !session.in_transaction() {
+            if !self.implicit { session.service.advisory.release(session.backend_pid, true); }
             self.cursors
                 .transaction_end(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
         }
@@ -1064,7 +1072,7 @@ impl State {
                         self.cursors.transaction_end("ROLLBACK");
                         self.settings.transaction(true, false, "ROLLBACK");
                     } else {
-                        let commit = session.execute_sql("COMMIT", &[]);
+                        let commit = if session.in_transaction() { session.execute_sql("COMMIT", &[]) } else { Ok(SqlResult::default()) };
                         if let Err(error) = commit {
                             session.sql.rollback();
                             self.cursors.transaction_end("ROLLBACK");
@@ -1969,10 +1977,11 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
     session.set_search_path(&state.settings.current.search_path);
     session.set_extra_float_digits(state.settings.current.extra_float_digits);
     let mut admin_sync = false;
+    let mut pending_tag = None;
     loop {
         // Idle connections hold a bounded admission slot, not an active frame.
         // Once a frame starts, its remaining header and body have a deadline.
-        let tag = match s.read_u8().await {
+        let tag = match if let Some(tag) = pending_tag.take() { Ok(tag) } else { s.read_u8().await } {
             Ok(tag) => tag,
             Err(_) => return Ok(()),
         };
@@ -2066,6 +2075,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let (output, mut chunks) = tokio::sync::mpsc::channel(2);
         state.output = Some(output);
+        let connection_closed = session.connection_closed.clone();
         let work = blocking.run_admitted(permit, move || {
             let mut out = Vec::new();
             let keep = match active.context.scope(|| {
@@ -2123,6 +2133,7 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             };
+            if !session.in_transaction() && !state.implicit { session.service.advisory.release(session.backend_pid, true); }
             if state.copy_receiving() {
                 state.copy_active = Some(active);
             } else {
@@ -2139,6 +2150,11 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
                     None => break work.await?,
                 },
                 result = &mut work => break result?,
+                next = s.read_u8(), if pending_tag.is_none() => match next {
+                    Ok(b'X') => { connection_closed.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+                    Ok(tag) => pending_tag = Some(tag),
+                    Err(_) => { connection_closed.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+                },
             }
         };
         while let Some(chunk) = chunks.recv().await {

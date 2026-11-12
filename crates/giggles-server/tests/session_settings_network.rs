@@ -418,7 +418,7 @@ async fn common_gucs_simple_and_extended_and_invalid_values() {
         "SET standard_conforming_strings=off",
         "SET IntervalStyle=invalid",
         "SET bytea_output=escape",
-        "SET statement_timeout=1",
+        "SET statement_timeout=-1",
         "SET lock_timeout=1",
         "SET idle_in_transaction_session_timeout=1",
     ] {
@@ -718,4 +718,105 @@ async fn orm_interval_output_and_readonly_presets() {
     }
     drop(c);
     f.stop().await;
+}
+
+#[tokio::test]
+async fn advisory_locks_reentry_block_cancel_and_transaction_release() {
+    use std::time::Duration;
+    let fixture = Fixture::new().await;
+    let a = fixture.client().await;
+    let b = fixture.client().await;
+    let boolean = |row: tokio_postgres::Row| row.get::<_, bool>(0);
+    let lock = a.prepare("SELECT pg_advisory_lock(72707369)").await.unwrap();
+    assert_eq!(lock.columns()[0].type_().oid(), 2278);
+    a.query_one(&lock, &[]).await.unwrap();
+    a.simple_query("SELECT pg_catalog.pg_advisory_lock(72707369)").await.unwrap();
+    assert!(!boolean(b.query_one("SELECT pg_try_advisory_lock(72707369)", &[]).await.unwrap()));
+    // The int,int key space is distinct from the bigint key space.
+    assert!(boolean(b.query_one("SELECT pg_try_advisory_lock(0,72707369)", &[]).await.unwrap()));
+    assert!(boolean(a.query_one("SELECT pg_advisory_unlock(72707369)", &[]).await.unwrap()));
+    {
+    let wait = b.simple_query("SELECT pg_advisory_lock(72707369)");
+    tokio::pin!(wait);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut wait).await.is_err());
+    assert!(boolean(a.query_one("SELECT pg_advisory_unlock(72707369)", &[]).await.unwrap()));
+    tokio::time::timeout(Duration::from_secs(2), &mut wait).await.unwrap().unwrap();
+    }
+    assert!(!boolean(a.query_one("SELECT pg_advisory_unlock(72707369)", &[]).await.unwrap()));
+    a.simple_query("SET statement_timeout='30ms'").await.unwrap();
+    assert_eq!(code(a.simple_query("SELECT pg_advisory_lock(72707369)").await.unwrap_err()), "57014");
+    assert_eq!(values(&a.simple_query("SHOW statement_timeout").await.unwrap()), ["30ms"]);
+    a.simple_query("BEGIN; SET LOCAL statement_timeout=0; COMMIT").await.unwrap();
+    assert_eq!(values(&a.simple_query("SHOW statement_timeout").await.unwrap()), ["30ms"]);
+    a.simple_query("RESET statement_timeout").await.unwrap();
+    {
+    let wait = a.simple_query("SELECT pg_advisory_lock(72707369)");
+    tokio::pin!(wait);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut wait).await.is_err());
+    a.cancel_token().cancel_query(NoTls).await.unwrap();
+    assert_eq!(code(wait.await.unwrap_err()), "57014");
+    }
+    b.simple_query("SELECT pg_advisory_unlock_all()").await.unwrap();
+    for end in ["COMMIT", "ROLLBACK"] {
+        a.simple_query("BEGIN; SELECT pg_advisory_xact_lock(-8,9); SELECT pg_advisory_unlock_all()").await.unwrap();
+        assert!(!boolean(b.query_one("SELECT pg_try_advisory_xact_lock(-8,9)", &[]).await.unwrap()));
+        assert!(!boolean(a.query_one("SELECT pg_advisory_unlock(-8,9)", &[]).await.unwrap()));
+        a.simple_query(end).await.unwrap();
+        assert!(boolean(b.query_one("SELECT pg_try_advisory_xact_lock(-8,9)", &[]).await.unwrap()));
+    }
+    a.simple_query("SELECT pg_advisory_lock(91)").await.unwrap();
+    b.simple_query("SELECT pg_advisory_lock(92)").await.unwrap();
+    {
+    let wait = a.simple_query("SELECT pg_advisory_lock(92)");
+    tokio::pin!(wait);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut wait).await.is_err());
+    assert_eq!(code(b.simple_query("SELECT pg_advisory_lock(91)").await.unwrap_err()), "40P01");
+    b.simple_query("SELECT pg_advisory_unlock_all()").await.unwrap();
+    wait.await.unwrap();
+    }
+    // FIFO waiters cannot be bypassed by a later request.
+    let c = fixture.client().await;
+    a.simple_query("SELECT pg_advisory_lock(93)").await.unwrap();
+    {
+        let first = b.simple_query("SELECT pg_advisory_lock(93)"); tokio::pin!(first);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut first).await.is_err());
+        let second = c.simple_query("SELECT pg_advisory_lock(93)"); tokio::pin!(second);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second).await.is_err());
+        a.simple_query("SELECT pg_advisory_unlock(93)").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut first).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second).await.is_err());
+        b.simple_query("SELECT pg_advisory_unlock(93)").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut second).await.unwrap().unwrap();
+    }
+    drop(c);
+    // Connection teardown releases every session acquisition.
+    drop(a);
+    tokio::time::timeout(Duration::from_secs(2), b.simple_query("SELECT pg_advisory_lock(91)")).await.unwrap().unwrap();
+    drop(b);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn advisory_warning_and_disconnected_waiter_release_locks() {
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let b = f.client().await;
+    b.simple_query("SELECT pg_advisory_lock(101)").await.unwrap();
+    let mut stream = TcpStream::connect(f.pg.address).await.unwrap();
+    let body = b"\0\x03\0\0user\0owner\0database\0postgres\0\0";
+    stream.write_u32((body.len() + 4) as u32).await.unwrap(); stream.write_all(body).await.unwrap();
+    wire_cycle(&mut stream).await;
+    let messages = wire_query(&mut stream, "SELECT pg_advisory_unlock(101)").await;
+    assert_eq!(tags(&messages), b"NTDCZ");
+    assert!(messages[0].1.split(|b| *b == 0).any(|v| v == b"C01000"));
+    wire_query(&mut stream, "SELECT pg_advisory_lock(102)").await;
+    let mut body = Vec::new(); giggles_server::pgwire::z("SELECT pg_advisory_lock(101)", &mut body);
+    let mut packet = Vec::new(); giggles_server::pgwire::frame(b'Q', &body, &mut packet).unwrap();
+    stream.write_all(&packet).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(50), stream.read_u8()).await.is_err());
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !b.query_one("SELECT pg_try_advisory_lock(102)", &[]).await.unwrap().get::<_, bool>(0) { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    drop(b); f.stop().await;
 }

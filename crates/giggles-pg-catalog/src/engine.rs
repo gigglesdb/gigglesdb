@@ -2709,6 +2709,7 @@ fn check_expr(e: &mut E) -> R<()> {
             }
         }
         K::Any(l, _, r) => {
+            if unknown(r) && r.ty.array_element().is_none() { expect(r, array_type(l.ty)?)?; }
             let ty = array_element(r.ty)?;
             expect(l, ty)?;
         }
@@ -4847,6 +4848,10 @@ fn cast(v: Value, t: PgType) -> R<Value> {
     }
     use Value::{Bool as B, Int as I, Text as S};
     match t {
+        PgType::NameArray | PgType::TextArray => match v {
+            Value::Array(values) => values.into_iter().map(|v| cast(v, array_element(t)?)).collect::<R<Vec<_>>>().map(Value::Array),
+            _ => Err(Error::Type),
+        },
         PgType::OidArray | PgType::Int2Array | PgType::Int4Array | PgType::Int8Array => match v {
             Value::Array(_) => Err(Error::Unsupported),
             S(s) => {

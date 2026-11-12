@@ -248,7 +248,9 @@ impl State {
         session.set_time_zone(&self.settings.current.timezone);
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
+        super::statement_deadline(&self.settings.current);
         let result = self.simple_statement_inner(sql, session, out, received, implicit);
+        if !session.in_transaction() && !*implicit { session.service.advisory.release(session.backend_pid, true); }
         session.set_time_zone(&self.settings.current.timezone);
         session.set_search_path(&self.settings.current.search_path);
         session.set_extra_float_digits(self.settings.current.extra_float_digits);

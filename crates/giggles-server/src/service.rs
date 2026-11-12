@@ -196,6 +196,7 @@ pub fn sqlstate(e: &CoreError) -> &'static str {
     }
 }
 pub struct Service {
+    pub(crate) advisory: crate::advisory::Locks,
     pub(crate) blocking: crate::blocking::Blocking,
     pub(crate) cancellations: crate::cancel::Registry,
     task_gate: std::sync::Mutex<()>,
@@ -236,6 +237,7 @@ impl Service {
             })
             .collect();
         Ok(Arc::new(Self {
+            advisory: crate::advisory::Locks::default(),
             blocking: crate::blocking::Blocking::new(),
             cancellations: crate::cancel::Registry::default(),
             task_gate: std::sync::Mutex::new(()),
@@ -356,6 +358,7 @@ impl Service {
         Ok(Session {
             surface: Surface::Native,
             backend_pid: 0,
+            connection_closed: Default::default(),
             backend_ssl: false,
             service: self.clone(),
             fingerprint: format!("pgrole:{}", role.name),
@@ -386,6 +389,7 @@ impl Service {
         Ok(Session {
             surface: Surface::Native,
             backend_pid: 0,
+            connection_closed: Default::default(),
             backend_ssl: false,
             service: self.clone(),
             role,
@@ -415,6 +419,7 @@ pub(crate) enum Surface {
 pub struct Session {
     pub(crate) surface: Surface,
     pub(crate) backend_pid: i32,
+    pub(crate) connection_closed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) backend_ssl: bool,
     pub(crate) service: Arc<Service>,
     pub(crate) role: Role,
@@ -427,6 +432,9 @@ pub struct Session {
     zone: Option<SessionZone>,
     transaction_us: Option<i64>,
     sequence_owner_candidates: BTreeSet<String>,
+}
+impl Drop for Session {
+    fn drop(&mut self) { self.service.advisory.release(self.backend_pid, false); }
 }
 impl Session {
     pub(crate) fn zone(&self) -> Option<SessionZone> {
@@ -549,6 +557,7 @@ impl Session {
     }
 
     pub fn abort(&mut self) {
+        self.service.advisory.release(self.backend_pid, true);
         self.sql.abort();
     }
     pub fn in_transaction(&self) -> bool {

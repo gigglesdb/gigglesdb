@@ -97,3 +97,24 @@ fn prisma_schema_exists_and_immutable_presets() {
     }
     assert!(plan_gateway("SELECT current_setting('search_path') FROM pg_namespace").is_err());
 }
+
+#[test]
+fn prisma_pg_tables_matches_authorized_table_inventory() {
+    let mut snapshot = CatalogSnapshot::default();
+    snapshot.tables.push(TableDef { id: 1, name: "users".into(), columns: vec![ColumnDef { id: 1, name: "id".into(), data_type: ScalarType::Integer, not_null: false }], primary_key: vec![] });
+    let p = plan("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users','orders','_prisma_migrations')").unwrap().unwrap();
+    assert_eq!(execute(&p, &snapshot, &[]).unwrap().rows, vec![vec![Value::Text("users".into())]]);
+    let p = plan("SELECT schemaname, tablename, tableowner, tablespace, hasindexes, hasrules, hastriggers, rowsecurity FROM pg_catalog.pg_tables WHERE tablename IN ('pg_class','pg_tables','users') ORDER BY tablename").unwrap().unwrap();
+    assert!(describe(&p).unwrap().iter().take(4).all(|f| f.data_type == PgType::Name));
+    let rows = execute(&p, &snapshot, &[]).unwrap().rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(&rows[0][3..], &[Value::Null, Value::Bool(true), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
+    assert_eq!(&rows[1][3..], &[Value::Null, Value::Bool(false), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
+}
+
+#[test]
+fn prisma_namespace_any_infers_name_array() {
+    let p = plan("SELECT tbl.relname AS table_name, namespace.nspname AS table_namespace FROM pg_class AS tbl INNER JOIN pg_namespace AS namespace ON namespace.oid = tbl.relnamespace WHERE tbl.relkind = 'r' AND namespace.nspname = ANY ($1)").unwrap().unwrap();
+    assert_eq!(p.parameter_types(), &[PgType::NameArray]);
+    assert!(execute(&p, &CatalogSnapshot::default(), &[Value::Array(vec![Value::Text("public".into())])]).unwrap().rows.is_empty());
+}

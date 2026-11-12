@@ -361,8 +361,8 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         Show::XmlOption if matches!(lower.as_str(), "content" | "document") => Ok(lower),
         Show::DefaultTablespace if value.is_empty() => Ok(value),
         Show::DefaultTableAccessMethod if lower == "heap" => Ok(lower),
+        Show::StatementTimeout => statement_timeout_ms(&lower).map(|n| n.to_string()),
         Show::TransactionTimeout
-        | Show::StatementTimeout
         | Show::LockTimeout
         | Show::IdleInTransactionSessionTimeout => {
             if value.parse::<u64>() == Ok(0) {
@@ -373,6 +373,11 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
         }
         _ => Err("22023"),
     }
+}
+pub(crate) fn statement_timeout_ms(value: &str) -> Result<u64> {
+            let (number, unit) = value.trim().find(|c: char| !c.is_ascii_digit()).map_or((value.trim(), ""), |at| value.trim().split_at(at));
+            let factor = match unit.trim() { "" | "ms" => 1, "s" => 1000, "min" => 60000, "h" => 3600000, "d" => 86400000, _ => return Err("22023") };
+            number.parse::<u64>().ok().and_then(|n| n.checked_mul(factor)).filter(|n| *n <= i32::MAX as u64).ok_or("22023")
 }
 fn search_path(values: Vec<Token>) -> Result<String> {
     // A string literal can contain an entire identifier list, including quotes.

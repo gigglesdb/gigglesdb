@@ -3,6 +3,7 @@ use super::{Result, SessionSettings, database};
 
 #[derive(Clone)]
 pub(crate) enum Function {
+    Advisory { name: String, key: (bool, i64), column: String },
     Set {
         name: String,
         value: String,
@@ -20,7 +21,7 @@ pub(crate) enum Function {
 impl Function {
     pub fn column(&self) -> &str {
         match self {
-            Self::Set { column, .. } | Self::Current { column, .. } => column,
+            Self::Set { column, .. } | Self::Current { column, .. } | Self::Advisory { column, .. } => column,
         }
     }
     /// pg_settings.name comparisons are case-sensitive; absent rows never run set_config.
@@ -46,6 +47,7 @@ impl Function {
     /// the wire dispatcher restores it at that transaction's end, without WARNING.
     pub fn evaluate(&self, settings: &mut SessionSettings) -> Result<Option<String>> {
         match self {
+            Self::Advisory { .. } => unreachable!("wire session function"),
             Self::Set {
                 name, value, local, ..
             } => {
@@ -73,6 +75,7 @@ enum Token {
     Dot,
     Comma,
     Equals,
+    Number(i64),
 }
 fn lex(sql: &str) -> Option<Vec<Token>> {
     let mut chars = sql
@@ -113,6 +116,11 @@ fn lex(sql: &str) -> Option<Vec<Token>> {
                 } else {
                     Token::Ident(value)
                 }
+            }
+            c if c.is_ascii_digit() || matches!(c, '-' | '+') => {
+                let mut value = String::from(c);
+                while chars.peek().is_some_and(char::is_ascii_digit) { value.push(chars.next()?); }
+                Token::Number(value.parse().ok()?)
             }
             c if c.is_alphabetic() || c == '_' => {
                 let mut word = String::from(c);
@@ -196,6 +204,25 @@ fn parse(sql: &str) -> Option<Function> {
             column: "setting".into(),
         });
     }
+    if matches!(function.as_str(), "pg_advisory_lock" | "pg_try_advisory_lock" | "pg_advisory_unlock" | "pg_advisory_unlock_all" | "pg_advisory_xact_lock" | "pg_try_advisory_xact_lock") {
+        p.token(Token::Left)?;
+        let mut key = (false, 0);
+        if function != "pg_advisory_unlock_all" {
+            let Token::Number(first) = *p.tokens.get(p.at)? else { return None; }; p.at += 1;
+            key.1 = first;
+            if p.tokens.get(p.at) == Some(&Token::Comma) {
+                p.at += 1;
+                let Token::Number(second) = *p.tokens.get(p.at)? else { return None; }; p.at += 1;
+                key = (true, (i64::from(i32::try_from(first).ok()?) << 32) | i64::from(i32::try_from(second).ok()? as u32));
+            }
+        }
+        p.token(Token::Right)?;
+        let column = if p.tokens.get(p.at) == Some(&Token::Word("as".into())) {
+            p.at += 1;
+            let column = match p.tokens.get(p.at)? { Token::Word(s) | Token::Ident(s) => s.clone(), _ => return None }; p.at += 1; column
+        } else { function.clone() };
+        return (p.at == p.tokens.len()).then_some(Function::Advisory { name: function, key, column });
+    }
     if !matches!(function.as_str(), "set_config" | "current_setting") {
         return None;
     }
@@ -243,7 +270,7 @@ fn parse(sql: &str) -> Option<Function> {
         };
         p.at += 1;
         match &mut call {
-            Function::Set { column: c, .. } | Function::Current { column: c, .. } => *c = column,
+            Function::Set { column: c, .. } | Function::Current { column: c, .. } | Function::Advisory { column: c, .. } => *c = column,
         }
     }
     if from_settings || p.tokens.get(p.at) == Some(&Token::Word("from".into())) {
