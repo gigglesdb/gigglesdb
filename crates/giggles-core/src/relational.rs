@@ -1004,6 +1004,61 @@ struct Parser {
     relations: Vec<schemas::Reference>,
 }
 impl Parser {
+    // Normalize mutation target aliases before any expression binder sees them.
+    fn mutation_alias(&mut self, table: &str, update: bool) -> R<()> {
+        let table = table.rsplit('\0').next().unwrap_or(table);
+        let explicit = self.word("as");
+        let alias = if explicit {
+            Some(self.name()?)
+        } else {
+            match self.tokens.get(self.at) {
+                Some(Token::QuotedIdent(_)) => Some(self.name()?),
+                Some(Token::Word(w)) if !["set", "where", "returning"].contains(&w.as_str()) => {
+                    Some(self.name()?)
+                }
+                _ => None,
+            }
+        };
+        let Some(alias) = alias else {
+            return Ok(());
+        };
+        fn ident(t: &Token) -> Option<&str> {
+            match t {
+                Token::Word(w) | Token::QuotedIdent(w) => Some(w.as_str()),
+                _ => None,
+            }
+        }
+        // Conservatively reject shadowing subqueries rather than changing their scope.
+        for i in self.at..self.tokens.len().saturating_sub(1) {
+            if !matches!(&self.tokens[i], Token::Word(w) if w == "from" || w == "join") {
+                continue;
+            }
+            let mut end = i + 2;
+            while self.tokens.get(end) == Some(&Token::Symbol('.')) {
+                end += 2;
+            }
+            if matches!(self.tokens.get(end), Some(Token::Word(w)) if w == "as") {
+                end += 1;
+            }
+            if ident(&self.tokens[i + 1]) == Some(alias.as_str())
+                || self.tokens.get(end).and_then(ident) == Some(alias.as_str())
+            {
+                return Err(SqlError::Unsupported);
+            }
+        }
+        let start = self.at + usize::from(update);
+        for i in (start..self.tokens.len().saturating_sub(2)).rev() {
+            if self.tokens[i + 1] != Token::Symbol('.') || ident(&self.tokens[i + 2]).is_none() {
+                continue;
+            }
+            if ident(&self.tokens[i]) == Some(alias.as_str()) {
+                self.tokens[i] = Token::QuotedIdent(table.into());
+            } else if alias != table && ident(&self.tokens[i]) == Some(table) {
+                return Err(SqlError::UnknownTable);
+            }
+        }
+        Ok(())
+    }
     fn word(&mut self, s: &str) -> bool {
         if self.tokens.get(self.at) == Some(&Token::Word(s.into())) {
             self.at += 1;
@@ -1408,7 +1463,10 @@ impl Parser {
                 returning,
             }
         } else if self.word("update") {
+            self.word("only");
             let name = self.table_name()?;
+            self.sym('*');
+            self.mutation_alias(&name, true)?;
             self.need("set")?;
             let mut sets = vec![];
             loop {
@@ -1485,6 +1543,7 @@ impl Parser {
         } else if self.word("delete") {
             self.need("from")?;
             let name = self.table_name()?;
+            self.mutation_alias(&name, false)?;
             let (predicates, search) = searched::parse_target(self, &name)?;
             let returning = Returning::parse(self, &name)?;
             Statement::Delete {

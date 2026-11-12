@@ -1959,7 +1959,61 @@ impl Query {
                 p.at = item_start;
                 item = Item::Scalar(Scalar::parse_expr(p, 0, true)?);
             }
-            let alias = if p.word("as") { Some(p.name()?) } else { None };
+            // PostgreSQL 18 src/include/parser/kwlist.h: AS_LABEL requires AS.
+            let bare_label = match p.tokens.get(p.at) {
+                Some(Token::QuotedIdent(_)) => true,
+                Some(Token::Word(word)) => ![
+                    "array",
+                    "as",
+                    "char",
+                    "character",
+                    "create",
+                    "day",
+                    "except",
+                    "fetch",
+                    "filter",
+                    "for",
+                    "from",
+                    "grant",
+                    "group",
+                    "having",
+                    "hour",
+                    "intersect",
+                    "into",
+                    "isnull",
+                    "limit",
+                    "minute",
+                    "month",
+                    "notnull",
+                    "offset",
+                    "on",
+                    "order",
+                    "over",
+                    "overlaps",
+                    "precision",
+                    "returning",
+                    "second",
+                    "to",
+                    "union",
+                    "varying",
+                    "where",
+                    "window",
+                    "with",
+                    "within",
+                    "without",
+                    "year",
+                ]
+                .contains(&word.as_str()),
+                _ => false,
+            };
+            if matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "year") {
+                return Err(SqlError::Syntax);
+            }
+            let alias = if p.word("as") || bare_label {
+                Some(p.name()?)
+            } else {
+                None
+            };
             items.push((item, alias));
             if items.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit);
@@ -2088,6 +2142,12 @@ impl Query {
             filter.infer(parameters, &resolve, &[table])?;
         }
         Ok(())
+    }
+    pub(super) fn normalize_assignment_alias(mut self) -> Self {
+        for source in &mut self.sources {
+            source.alias = split_key(&source.name).1.into();
+        }
+        self
     }
     pub(super) fn returning(p: &mut Parser, table: &str) -> R<Self> {
         if p.tokens[p.at..].windows(2).any(

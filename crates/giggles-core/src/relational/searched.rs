@@ -249,7 +249,16 @@ pub(super) fn describe(prepared: &Prepared, state: &Relational) -> R<Description
                     assign::Value::Default => {}
                     assign::Value::Plain(value) => infer(value, ty, &mut parameters)?,
                     assign::Value::Scalar(value) => {
-                        value.infer_assignment(table, ty, &mut parameters)?;
+                        value.infer_assignment(
+                            &{
+                                let mut target = table.clone();
+                                target.name =
+                                    table.name.rsplit('\0').next().unwrap_or(&table.name).into();
+                                target
+                            },
+                            ty,
+                            &mut parameters,
+                        )?;
                     }
                 }
             }

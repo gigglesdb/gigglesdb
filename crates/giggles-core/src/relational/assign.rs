@@ -23,7 +23,7 @@ impl Value {
         }
         p.at = start;
         p.params = parameters;
-        query::Query::assignment(p, table).map(|value| Self::Scalar(Box::new(value)))
+        query::Query::assignment(p, table).map(|value| Self::Scalar(Box::new(value.normalize_assignment_alias())))
     }
 }
 
@@ -161,7 +161,15 @@ pub(super) fn describe(
             Value::Plain(value) => {
                 infer_mutation_parameter(value, target, &mut parameters, declared, true)?
             }
-            Value::Scalar(value) => value.infer_assignment(table, target, &mut parameters)?,
+            Value::Scalar(value) => value.infer_assignment(
+                &{
+                    let mut target = table.clone();
+                    target.name = table.name.rsplit('\0').next().unwrap_or(&table.name).into();
+                    target
+                },
+                target,
+                &mut parameters,
+            )?,
         }
     }
     for predicate in predicates {

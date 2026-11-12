@@ -364,3 +364,6 @@ mod exists_public;
 
 #[path = "exists_probe.rs"]
 mod exists_probe;
+
+#[path = "bare_alias.rs"]
+mod bare_alias;
