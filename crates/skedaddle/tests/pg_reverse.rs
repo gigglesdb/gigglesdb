@@ -1011,3 +1011,163 @@ fn live_post_activation_health_is_read_only_and_detects_missing_publication() {
         "false"
     );
 }
+
+#[test]
+fn live_reverse_capture_buffers_and_resumes_the_durable_manifest() {
+    use skedaddle::{
+        buffer::{
+            backends::ObjectBufferStore,
+            reader::{BufferReader, ReaderConfig},
+            writer::{BufferWriter, WriterConfig},
+        },
+        event::{EventError, PositionOrder, SourceIdentity},
+        mapping::PgType,
+    };
+    let _guard = REAL_PG.lock().unwrap();
+    let Some(mut f) = Fixture::gated("live_reverse_capture_buffers_and_resumes") else {
+        return;
+    };
+    let ready = f.setup();
+    // Activation restores access with a tagged administrative GRANT. It must
+    // preserve eligibility and the classifier version before application DML.
+    f.destination.sql(&format!("BEGIN; SET LOCAL skedaddle.admin_origin = '{}'; GRANT SELECT ON {}.rows TO {}_app; COMMIT;", f.id, f.id, f.id));
+    f.destination
+        .sql(&format!("INSERT INTO {}.rows VALUES(1,true)", f.id));
+    let messages = f.changes("none");
+    struct Order(String);
+    impl PositionOrder for Order {
+        fn domain(&self) -> &str {
+            &self.0
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering, EventError> {
+            Ok(a.cmp(b))
+        }
+    }
+    struct Transport(std::collections::VecDeque<Vec<u8>>);
+    impl source::Transport for Transport {
+        async fn next(&mut self, _: u64) -> source::Result<Vec<u8>> {
+            Ok(self.0.pop_front().expect("finite PG fixture stream"))
+        }
+    }
+    let root =
+        std::path::PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").expect("task test root"))
+            .join(format!("reverse-live-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("store")).unwrap();
+    let store =
+        Arc::new(ObjectBufferStore::local(root.join("store"), Duration::from_secs(5)).unwrap());
+    let config = WriterConfig {
+        prefix: "reverse-runner-v1".into(),
+        migration_id: f.id.clone(),
+        stream: f.config.stream(),
+        epoch: 1,
+        segment_bytes: 1000000,
+        segment_transactions: 100,
+        segment_age: Duration::from_secs(1),
+        max_transaction_bytes: 1000000,
+    };
+    let order = Arc::new(Order(f.config.stream()));
+    let runtime = f.destination.runtime.clone();
+    std::fs::create_dir_all(root.join("scratch")).unwrap();
+    runtime.block_on(async {
+        let (send, _) = std::sync::mpsc::channel();
+        let writer = BufferWriter::open_from_checkpoint(
+            store.clone(),
+            config.clone(),
+            Default::default(),
+            order.clone(),
+            send,
+            root.join("scratch"),
+        )
+        .await
+        .unwrap();
+        let identity = SourceIdentity {
+            engine: "postgres".into(),
+            system_id: "live-fixture".into(),
+            lineage: "1".into(),
+            db_name: "destination".into(),
+            slot: f.config.slot(),
+        };
+        let resolver = |_: &skedaddle::pg::pgoutput::Relation<'_>,
+                        c: &skedaddle::pg::pgoutput::RelationColumn<'_>|
+         -> source::Result<ColumnMapping> {
+            Ok(ColumnMapping::identity(match c.type_oid {
+                23 => PgType::Int4,
+                16 => PgType::Bool,
+                _ => panic!("unexpected PG fixture type"),
+            }))
+        };
+        let eligibility = Eligibility::new(|_| Ok(()));
+        let mut capture = skedaddle::pg::reverse::Capture::new(
+            &f.config,
+            identity,
+            ready.slot().consistent_point,
+            writer,
+            resolver,
+            ddl::SchemaVersions::new(f.id.clone(), 0, []).unwrap(),
+            eligibility.clone(),
+        )
+        .unwrap();
+        let mut transport = Transport(
+            messages
+                .into_iter()
+                .map(|m| {
+                    let mut bytes = vec![b'w'];
+                    bytes.extend_from_slice(&[0; 24]);
+                    bytes.extend(m);
+                    bytes
+                })
+                .collect(),
+        );
+        let (_send, mut pause) = tokio::sync::watch::channel(false);
+        let mut sink = |_: source::Watermark| Ok(());
+        let mut durable = false;
+        while !transport.0.is_empty() {
+            durable |= matches!(
+                capture
+                    .step(&mut transport, &mut sink, &mut pause)
+                    .await
+                    .unwrap(),
+                source::Step::Durable { .. }
+            );
+        }
+        assert!(durable);
+        assert!(eligibility.eligible());
+        let saved = capture.writer().checkpoint().unwrap();
+        drop(capture);
+        let (send, _) = std::sync::mpsc::channel();
+        let resumed = BufferWriter::open_from_checkpoint(
+            store.clone(),
+            config.clone(),
+            Default::default(),
+            order.clone(),
+            send,
+            root.join("scratch"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.checkpoint().unwrap(), saved);
+        let mut reader = BufferReader::new(
+            store.clone(),
+            ReaderConfig {
+                prefix: config.prefix,
+                migration_id: config.migration_id,
+                stream: config.stream,
+                limits: Default::default(),
+                required_next_mseq: saved.next_mseq,
+            },
+            Default::default(),
+            order,
+        )
+        .unwrap();
+        let mut insert = false;
+        while let Some(txn) = reader.next_txn().await.unwrap() {
+            insert |= txn
+                .events
+                .iter()
+                .any(|e| e.kind == skedaddle::event::EventKind::Insert);
+        }
+        assert!(insert);
+    });
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}

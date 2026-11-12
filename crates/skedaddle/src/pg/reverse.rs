@@ -191,7 +191,28 @@ impl Config {
     /// Read-only post-activation admission check. Never recreate a lost slot or
     /// rerun fenced setup after application access has been restored.
     pub fn health_sql(&self, readiness: &Readiness, activation_lsn: u64) -> Result<String> {
+        self.capture_health_sql(
+            readiness,
+            activation_lsn,
+            readiness.slot.consistent_point,
+            false,
+        )
+    }
+    /// A running capture may release WAL before its current durable boundary.
+    /// The original consistent point remains the activation proof, not a
+    /// perpetual retention requirement after acknowledgements begin.
+    pub fn capture_health_sql(
+        &self,
+        readiness: &Readiness,
+        activation_lsn: u64,
+        durable_lsn: u64,
+        streaming: bool,
+    ) -> Result<String> {
         readiness.check_activation(self, activation_lsn)?;
+        if durable_lsn < readiness.slot.consistent_point {
+            return Err(Error::Invalid("reverse capture cursor precedes slot"));
+        }
+        let active = if streaming { "active" } else { "NOT active" };
         let slot = literal(&self.slot());
         let publication = literal(&self.publication());
         let tables = self
@@ -206,12 +227,8 @@ impl Config {
             .collect::<Result<Vec<_>>>()?
             .join(",");
         Ok(format!(
-            "SELECT (EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name={slot} AND plugin='pgoutput' AND slot_type='logical' AND database=current_database() AND NOT temporary AND NOT active AND wal_status IN ('reserved','extended') AND restart_lsn <= '{}'::pg_lsn AND confirmed_flush_lsn >= '{}'::pg_lsn) AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname={publication} AND NOT puballtables AND pubinsert AND pubupdate AND pubdelete AND pubtruncate AND NOT pubviaroot) AND NOT EXISTS (SELECT 1 FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication}) AND (prqual IS NOT NULL OR prattrs IS NOT NULL)) AND NOT EXISTS (SELECT 1 FROM pg_publication_namespace WHERE pnpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) AND (SELECT array_agg(prrelid ORDER BY prrelid) FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) = (SELECT array_agg(x ORDER BY x) FROM unnest(ARRAY[{tables}]) x) AND ({}))",
-            format_args!(
-                "{:X}/{:X}",
-                readiness.slot.consistent_point >> 32,
-                readiness.slot.consistent_point as u32
-            ),
+            "SELECT (EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name={slot} AND plugin='pgoutput' AND slot_type='logical' AND database=current_database() AND NOT temporary AND {active} AND wal_status IN ('reserved','extended') AND restart_lsn <= '{}'::pg_lsn AND confirmed_flush_lsn >= '{}'::pg_lsn) AND EXISTS (SELECT 1 FROM pg_publication WHERE pubname={publication} AND NOT puballtables AND pubinsert AND pubupdate AND pubdelete AND pubtruncate AND NOT pubviaroot) AND NOT EXISTS (SELECT 1 FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication}) AND (prqual IS NOT NULL OR prattrs IS NOT NULL)) AND NOT EXISTS (SELECT 1 FROM pg_publication_namespace WHERE pnpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) AND (SELECT array_agg(prrelid ORDER BY prrelid) FROM pg_publication_rel WHERE prpubid=(SELECT oid FROM pg_publication WHERE pubname={publication})) = (SELECT array_agg(x ORDER BY x) FROM unnest(ARRAY[{tables}]) x) AND ({}))",
+            format_args!("{:X}/{:X}", durable_lsn >> 32, durable_lsn as u32),
             format_args!(
                 "{:X}/{:X}",
                 readiness.slot.consistent_point >> 32,
@@ -448,7 +465,7 @@ impl<R: source::TypeResolver> Capture<R> {
             ReverseResolver::new(resolver, eligibility.clone()),
             config.installation.clone(),
             schemas,
-            format!("skedaddle_{}_rev_watermark", config.installation),
+            super::chunk::MESSAGE_PREFIX.into(),
         )?;
         Ok(Self {
             inner,
@@ -462,6 +479,13 @@ impl<R: source::TypeResolver> Capture<R> {
     }
     pub fn writer(&self) -> &BufferWriter {
         self.inner.writer()
+    }
+    /// Restore the existing capture's authenticated classifier/durable boundary.
+    pub async fn restore_schema(
+        &mut self,
+        binding: source::SchemaJournalBinding,
+    ) -> source::Result<()> {
+        self.inner.restore_schema(binding).await
     }
     pub async fn step(
         &mut self,
@@ -526,9 +550,11 @@ impl<T: source::Transport> source::Transport for CheckedTransport<'_, T> {
             } = &message
             {
                 let record = ddl::decode(&message, self.installation)?;
-                self.eligibility
-                    .check_ddl(self.schemas, &[record])
-                    .map_err(source::Error::Mapping)?;
+                if !ddl::accepted_tool_internal(&record, self.installation) {
+                    self.eligibility
+                        .check_ddl(self.schemas, &[record])
+                        .map_err(source::Error::Mapping)?;
+                }
             }
         }
         Ok(payload)

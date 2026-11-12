@@ -58,13 +58,13 @@ pub(super) async fn resume(
     ));
     coordinator.acquire().await?;
     let engine = Engine::new(coordinator, journal.clone());
-    serve(
+    Box::pin(serve(
         engine.runtime(),
         root,
         id,
         pause,
         Some((journal, definition.clone())),
-    )
+    ))
     .await
     .map_err(RunError::Engine)
 }
@@ -82,6 +82,10 @@ async fn serve(
     let mut handled = BTreeSet::new();
     let mut retry_at = tokio::time::Instant::now();
     let mut backoff = Duration::from_secs(1);
+    let mut workers: Option<Box<super::reverse_workers::Workers>> = None;
+    let mut worker_retry = tokio::time::Instant::now();
+    let mut worker_backoff = Duration::from_secs(1);
+    let mut status_at = tokio::time::Instant::now();
     loop {
         runtime.refresh_owner().await?;
         let state = runtime.state().await;
@@ -97,7 +101,7 @@ async fn serve(
             let result = if let Some((journal, definition)) = &context {
                 tokio::time::timeout(
                     Duration::from_secs(10),
-                    probe(&runtime, journal, definition),
+                    probe(&runtime, journal, definition, workers.is_some()),
                 )
                 .await
                 .unwrap_or(Err(()))
@@ -113,7 +117,9 @@ async fn serve(
                         .await?;
                 }
                 Ok(None) => {
-                    admit(&runtime, true).await?;
+                    if runtime.state().await.lifecycle.state == State::DestinationActive {
+                        admit(&runtime, true).await?;
+                    }
                     backoff = Duration::from_secs(1);
                 }
                 Err(_) => {
@@ -128,6 +134,49 @@ async fn serve(
                 }
             }
             retry_at = tokio::time::Instant::now() + backoff;
+        }
+        let current = runtime.state().await;
+        if current.rollback_eligibility_ended.is_some() {
+            workers = None;
+        } else if current.lifecycle.state == State::RollbackWindow
+            && workers.is_none()
+            && tokio::time::Instant::now() >= worker_retry
+            && let Some((journal, definition)) = &context
+        {
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                Box::pin(super::reverse_workers::Workers::open(
+                    &runtime, journal, definition, root, id,
+                )),
+            )
+            .await
+            .unwrap_or(Err(super::reverse_workers::Failure::Retry));
+            match result {
+                Ok(value) => {
+                    workers = Some(value);
+                    worker_backoff = Duration::from_secs(1);
+                }
+                Err(super::reverse_workers::Failure::End(reason)) => {
+                    end_workers(&runtime, reason).await?;
+                }
+                Err(super::reverse_workers::Failure::Retry) => {
+                    runtime
+                        .marker(
+                            "reverse-capture-health",
+                            "unhealthy".into(),
+                            "retrying".into(),
+                        )
+                        .await?;
+                    worker_retry = tokio::time::Instant::now() + worker_backoff;
+                    worker_backoff = (worker_backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+        if let Some(worker) = &mut workers
+            && tokio::time::Instant::now() >= status_at
+        {
+            worker.status(&runtime).await?;
+            status_at = tokio::time::Instant::now() + Duration::from_secs(1);
         }
         if active(&control)?.as_deref() != Some(&generation) {
             return Err(coordinator::Error::LostOwnership);
@@ -190,6 +239,32 @@ async fn serve(
             break;
         }
         tokio::select! {
+            result = async {
+                match &mut workers {
+                    Some(worker) => Box::pin(worker.step()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok(durable) => {
+                        if durable && let Some(worker) = &mut workers {
+                            // Outside the cancellable worker future: checkpoint
+                            // publication must finish before the next WAL ack.
+                            worker.status(&runtime).await?;
+                        }
+                    }
+                    Err(super::reverse_workers::Failure::End(reason)) => {
+                        end_workers(&runtime, reason).await?;
+                        workers = None;
+                    }
+                    Err(super::reverse_workers::Failure::Retry) => {
+                        workers = None;
+                        runtime.marker("reverse-capture-health", "unhealthy".into(), "retrying".into()).await?;
+                        worker_retry = tokio::time::Instant::now() + worker_backoff;
+                        worker_backoff = (worker_backoff * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
             _ = tokio::time::sleep(Duration::from_millis(25)) => {},
             changed = pause.changed() => if changed.is_err() { break; },
         }
@@ -200,6 +275,18 @@ async fn serve(
         blockers: vec![],
         target_reached: false,
     })
+}
+
+pub(super) async fn end_workers(
+    runtime: &crate::engine::Runtime,
+    reason: EligibilityEnd,
+) -> coordinator::Result<()> {
+    if runtime.state().await.rollback_eligibility_ended.is_none() {
+        runtime
+            .commit(Transition::RollbackEligibilityEnded { reason })
+            .await?;
+    }
+    Ok(())
 }
 
 async fn finalize(runtime: &crate::engine::Runtime) -> coordinator::Result<()> {
@@ -255,6 +342,7 @@ async fn probe(
     runtime: &crate::engine::Runtime,
     journal: &coordinator::journal::Journal,
     definition: &MigrationDefinition,
+    streaming: bool,
 ) -> Result<Option<Violation>, ()> {
     let baseline = match super::activation_baseline::load(journal).await {
         Ok(Some(value)) => value,
@@ -311,8 +399,20 @@ async fn probe(
             .collect(),
     )
     .map_err(|_| ())?;
+    let durable_lsn = state
+        .progress
+        .get("reverse-slot-v1")
+        .map(|(saved, _)| crate::engine::decode_source_checkpoint(saved).map(|c| c.durable_lsn))
+        .transpose()
+        .map_err(|_| ())?
+        .unwrap_or(proof.slot.consistent_point);
     let sql = reverse
-        .health_sql(&proof.readiness, proof.activation_lsn)
+        .capture_health_sql(
+            &proof.readiness,
+            proof.activation_lsn,
+            durable_lsn,
+            streaming,
+        )
         .map_err(|_| ())?;
     if !destination
         .client
@@ -772,6 +872,34 @@ mod tests {
             baseline_failure(LoadError::Invalid),
             Ok(Some(Violation::DestinationCatalogDrift))
         );
+    }
+
+    #[tokio::test]
+    async fn source_breach_is_journaled_once_and_replayed_as_a_critical_alert() {
+        let (journal, _) = activated().await;
+        let root = task_root();
+        let local = Local::recover(root.join("breach"), &journal).await.unwrap();
+        let mut coordinator =
+            Coordinator::observer(journal.clone(), local, "breach-owner").unwrap();
+        coordinator.acquire().await.unwrap();
+        let engine = Engine::new(coordinator, journal.clone());
+        admit(&engine.runtime(), true).await.unwrap();
+        end_workers(&engine.runtime(), EligibilityEnd::SourceFenceBreach)
+            .await
+            .unwrap();
+        let seq = journal.load(true).await.unwrap().applied_seq;
+        end_workers(&engine.runtime(), EligibilityEnd::SourceFenceBreach)
+            .await
+            .unwrap();
+        let state = journal.load(true).await.unwrap();
+        assert_eq!(state.applied_seq, seq);
+        assert_eq!(state.lifecycle.state, State::RollbackWindow);
+        let status = super::super::reverse_workers::status(&state);
+        assert_eq!(status["critical_alert"], "source-fence-breach");
+        assert_eq!(status["eligible"], false);
+        finalize(&engine.runtime()).await.unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ fn recovery(_: impl std::fmt::Display) -> coordinator::Error {
         "Runner adapter operation failed; preserve state and inspect endpoint prerequisites".into(),
     )
 }
-struct Order(String);
+pub(super) struct Order(pub String);
 impl PositionOrder for Order {
     fn domain(&self) -> &str {
         &self.0
@@ -107,7 +107,7 @@ fn reader_config(id: &str) -> ReaderConfig {
 fn order(id: &str) -> Arc<dyn PositionOrder + Send + Sync> {
     Arc::new(Order(format!("skedaddle-postgres:{id}")))
 }
-fn buffer(
+pub(super) fn buffer(
     definition: &MigrationDefinition,
     create: bool,
 ) -> coordinator::Result<Arc<ObjectBufferStore>> {
@@ -151,7 +151,7 @@ pub async fn open_journal(root: &Path, id: &str) -> coordinator::Result<Journal>
     Ok(raw)
 }
 
-struct Resolver(Vec<catalog::TableCatalog>);
+pub(super) struct Resolver(pub Vec<catalog::TableCatalog>);
 impl Resolver {
     fn table(&self, relation: &Relation<'_>) -> source::Result<&catalog::TableCatalog> {
         self.0
@@ -311,7 +311,7 @@ pub async fn run(
     if resume {
         let state = open_journal(root, id).await?.load(true).await?;
         if super::post_activation::owns(state.lifecycle.state) {
-            return super::post_activation::resume(root, id, definition, pause).await;
+            return Box::pin(super::post_activation::resume(root, id, definition, pause)).await;
         }
     }
     let prepared = Box::pin(prepare(definition))
@@ -779,7 +779,7 @@ pub async fn run(
     applier.destination.close().await.map_err(recovery)?;
     let final_state = engine.runtime().state().await.lifecycle.state;
     if result.is_ok() && super::post_activation::owns(final_state) {
-        return super::post_activation::resume(root, id, definition, pause).await;
+        return Box::pin(super::post_activation::resume(root, id, definition, pause)).await;
     }
     result
         .map(|mut reached| {

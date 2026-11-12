@@ -224,6 +224,13 @@ fn replay(state: &Materialized) -> coordinator::Result<Option<Saved>> {
         .transpose()
 }
 
+pub(super) fn rollback_drain(state: &Materialized) -> coordinator::Result<u64> {
+    replay(state)?
+        .and_then(|s| s.source.drain_lsn)
+        .filter(|lsn| *lsn != 0)
+        .ok_or_else(invalid)
+}
+
 pub(super) fn terminal_outcome(
     state: &Materialized,
 ) -> coordinator::Result<Option<CutoverOutcome>> {
@@ -368,6 +375,15 @@ impl<C: Capture> Capture for Observed<C> {
                 self.monitor.written.fetch_max(lsn, Ordering::SeqCst);
             }
             self.monitor.captured.fetch_max(lsn, Ordering::SeqCst);
+        }
+        if let Some(lsn) = batch.durable_lsn {
+            self.runtime
+                .marker(
+                    "source-capture-durable-v1",
+                    lsn.to_string(),
+                    "breach-monitor-checked".into(),
+                )
+                .await?;
         }
         Ok(batch)
     }

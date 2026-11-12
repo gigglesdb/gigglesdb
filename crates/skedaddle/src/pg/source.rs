@@ -351,7 +351,9 @@ impl<R: TypeResolver> Capture<R> {
         self.schemas = schemas;
         self.mapper
             .set_mapped_versions(self.schemas.mapped_versions());
-        self.durable_lsn = lsn;
+        // A separately journaled transaction end may be later than the
+        // manifest COMMIT position. Preserve it to avoid regressing slot acks.
+        self.durable_lsn = self.durable_lsn.max(lsn);
         self.restored_unknown = unknown;
         journal.ready = true;
         Ok(())

@@ -497,7 +497,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             }
             Ok((
                 Outcome::Success,
-                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":{"capture_healthy":state.rollback_eligibility_ended.is_none() && state.progress.get("reverse-capture-health").is_some_and(|(health,_)| health == "healthy"),"capture_status":state.progress.get("reverse-capture-health").map(|(health,_)| health),"lag_bytes":null,"eligible":state.rollback_eligibility_ended.is_none(),"eligibility_ended":state.rollback_eligibility_ended}}),
+                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state)}),
             ))
         }
         Command::Assess { sample, .. } => {

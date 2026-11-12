@@ -33,6 +33,8 @@ pub enum Violation {
     DestinationCatalogDrift,
     #[serde(rename = "activation-baseline-unavailable")]
     ActivationBaselineUnavailable,
+    #[serde(rename = "reverse-capture-unverifiable")]
+    ReverseCaptureUnverifiable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +206,13 @@ impl<R> ReverseResolver<R> {
     }
 }
 impl<R: TypeResolver> TypeResolver for ReverseResolver<R> {
+    fn included_columns(
+        &mut self,
+        relation: &Relation<'_>,
+    ) -> source::Result<Option<std::collections::BTreeSet<String>>> {
+        self.eligibility.ensure().map_err(source::Error::Mapping)?;
+        self.resolver.included_columns(relation)
+    }
     fn resolve(
         &mut self,
         relation: &Relation<'_>,
