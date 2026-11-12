@@ -36,6 +36,7 @@ pub(crate) enum TxnError {
     Misuse,
     /// A counter reservation targeted a sequence that was dropped or recreated.
     SequenceGone,
+    DependentObjects,
     Kv(KvError),
     Codec(CodecError),
 }
@@ -49,6 +50,7 @@ impl TxnError {
             Self::LockLimit | Self::WriteSetLimit => "53200",
             Self::CommitAmbiguous => "08007",
             Self::SequenceGone => "42P01",
+            Self::DependentObjects => "2BP01",
             Self::Fenced | Self::Misuse => "XX000",
             Self::Kv(_) | Self::Codec(_) => "XX000",
         }
@@ -91,6 +93,7 @@ impl From<TxnError> for crate::CoreError {
             TxnError::CommitAmbiguous => Self::Storage("engine commit outcome unknown".into()),
             TxnError::Misuse => Self::Corrupt("engine transaction misuse".into()),
             // The sequence relation no longer exists (42P01, as on legacy).
+            TxnError::DependentObjects => Self::Sql(crate::relational::SqlError::DependentObjects),
             TxnError::SequenceGone => Self::Sql(crate::relational::SqlError::UnknownTable),
         }
     }

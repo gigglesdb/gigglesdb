@@ -153,12 +153,12 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x3FFF | RELATION_COMMENTS
+        0xFFFF
     );
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
     }
-    assert_eq!(FEATURE_TABLE[14].0, RELATION_COMMENTS);
+    assert_eq!(FEATURE_TABLE[14].0, SQL_VIEWS);
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -177,7 +177,7 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in (14..64).filter(|i| *i != 15) {
+    for i in 16..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -300,9 +300,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 14, FormatError::Unsupported("feature bits".into())),
+        (1 << 16, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 14) | 0xC00,
+            (1 << 16) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),

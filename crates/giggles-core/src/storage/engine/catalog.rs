@@ -56,6 +56,7 @@ impl From<SqlError> for CatalogError {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogView {
+    pub(crate) sql_views: BTreeMap<u64, catalog_codec::sql_views::SqlViewDef>,
     pub(crate) comments: BTreeMap<(u64, u64), String>,
     pub(crate) by_name: BTreeMap<String, Arc<TableEntry>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
@@ -69,6 +70,7 @@ pub(crate) struct CatalogView {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogParts {
+    pub(crate) sql_views: BTreeMap<u64, catalog_codec::sql_views::SqlViewDef>,
     pub(crate) comments: BTreeMap<(u64, u64), String>,
     pub(crate) tables: BTreeMap<String, TableDef>,
     pub(crate) heap: BTreeSet<u64>,
@@ -78,6 +80,7 @@ pub(crate) struct CatalogParts {
 impl CatalogView {
     pub(crate) fn parts(&self) -> CatalogParts {
         let mut parts = CatalogParts {
+            sql_views: self.sql_views.clone(),
             comments: self.comments.clone(),
             ..CatalogParts::default()
         };
@@ -212,6 +215,7 @@ impl CatalogSnapshot {
                         std::iter::once(table.id)
                             .chain(table.columns.iter().map(|column| column.id))
                     })
+                    .chain(self.parts.sql_views.iter().flat_map(|(id, v)| std::iter::once(*id).chain(v.columns.iter().map(|c| c.id))))
                     .chain(self.parts.indexes.iter().map(|index| index.id))
                     .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
                     .chain(self.parts.ext.sequences.keys().copied())
@@ -503,7 +507,7 @@ impl Catalog {
         let mut tables = BTreeSet::new();
         for key in changes.keys() {
             match key[0] {
-                1 | 4 | 18 => {
+                1 | 4 | 17 | 18 => {
                     tables.insert(decode_id(&key[1..9]).map_err(commit_error)?);
                 }
                 16 => {
@@ -781,10 +785,23 @@ impl Catalog {
         // A DROP may have waited behind COMMENT without a table-record change.
         // A newly committed comment absent from its tombstones makes it stale.
         for (key, value) in txn.catalog_writes() {
-            if key.first() == Some(&1) && value.is_none() {
+            if key.first() == Some(&18) && value.is_some() {
                 let id = decode_id(&key[1..9]).map_err(commit_error)?;
+                let column = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                if txn.catalog_own(&table_key(id)).is_none() && txn.catalog_own(&catalog_codec::sql_views::view_key(id)).is_none()
+                    && catalog_codec::validate_comments(&BTreeMap::from([((id, column), String::new())]), latest.by_id.values().map(|e| &e.def), &latest.sql_views).is_err() {
+                    return Err(TxnError::Serialization(SerializationReason::WriteConflict));
+                }
+            }
+            if matches!(key.first(), Some(1 | 17)) {
+                let id = decode_id(&key[1..9]).map_err(commit_error)?;
+                let retained: BTreeSet<_> = match (key[0], value) {
+                    (_, None) => BTreeSet::new(),
+                    (17, Some(v)) => catalog_codec::sql_views::decode_view(v).map_err(commit_error)?.columns.iter().map(|c| c.id).chain([0]).collect(),
+                    (_, Some(v)) => decode_entry(v).map_err(commit_error)?.def.columns.iter().map(|c| c.id).chain([0]).collect(),
+                };
                 for &(table, column) in latest.comments.keys().filter(|(table, _)| *table == id) {
-                    if !matches!(txn.catalog_own(&catalog_codec::comment_key(table, column)), Some(None)) {
+                    if !retained.contains(&column) && !matches!(txn.catalog_own(&catalog_codec::comment_key(table, column)), Some(None)) {
                         return Err(TxnError::Serialization(SerializationReason::WriteConflict));
                     }
                 }
@@ -878,7 +895,13 @@ fn load_view(kv: &Kv, snapshot: Ts) -> Result<CatalogView, CoreError> {
         let (key, value) = record.map_err(CoreError::from)?;
         apply_record(&mut view, &mut names, &key, Some(&value))?;
     }
-    finish_view(view, names)
+    finish_view(view, names).map_err(loaded_catalog_error)
+}
+fn loaded_catalog_error(e: CoreError) -> CoreError {
+    match e {
+        CoreError::Limit => e,
+        e => corrupt(&format!("invalid catalog: {e:?}")),
+    }
 }
 fn overlay_view<'a>(
     base: &CatalogView,
@@ -904,6 +927,14 @@ fn apply_record(
     value: Option<&[u8]>,
 ) -> Result<(), CoreError> {
     match catalog_codec::classify_catalog_key(key)? {
+        CatalogKind::SqlView => {
+            let id = decode_id(&key[1..])?;
+            if let Some(value) = value {
+                view.sql_views.insert(id, catalog_codec::sql_views::decode_view(value)?);
+            } else {
+                view.sql_views.remove(&id);
+            }
+        }
         CatalogKind::RelationComment => {
             let owner = (
                 decode_id(&key[1..9])?,
@@ -1023,7 +1054,12 @@ fn finish_view(
     names: BTreeMap<String, u64>,
 ) -> Result<CatalogView, CoreError> {
     view.by_name.clear();
-    catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def))?;
+    catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def), &view.sql_views)?;
+    if !view.sql_views.is_empty() {
+        let parts = view.parts();
+        catalog_codec::sql_views::validate_catalog(&parts)?;
+        object_ids(&parts)?;
+    }
     let mut expected = BTreeMap::new();
     for entry in view.by_id.values_mut() {
         let entry = Arc::make_mut(entry);
@@ -1057,6 +1093,12 @@ fn finish_view(
         }
         view.by_name
             .insert(entry.def.name.clone(), Arc::new(entry.clone()));
+    }
+    for (id, def) in &view.sql_views {
+        let name = catalog_codec::sql_views::relation_name(def, &view.schemas)?;
+        if expected.insert(name, *id).is_some() {
+            return Err(corrupt("duplicate catalog relation name"));
+        }
     }
     for descriptor in view.indexes.values() {
         let table = view
@@ -1113,6 +1155,10 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
             insert(column.id, (2, table.id))?;
         }
     }
+    for (id, view) in &parts.sql_views {
+        insert(*id, (17, 0))?;
+        for column in &view.columns { insert(column.id, (2, *id))?; }
+    }
     for (table, cs) in &parts.ext.constraints {
         for c in cs {
             insert(c.id, (4, *table))?;
@@ -1142,7 +1188,8 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     Ok(result)
 }
 pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
-    catalog_codec::validate_comments(&parts.comments, parts.tables.values())?;
+    catalog_codec::validate_comments(&parts.comments, parts.tables.values(), &parts.sql_views)?;
+    catalog_codec::sql_views::validate_catalog(parts)?;
     relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     object_ids(parts)?;
     let mut records = BTreeMap::new();
@@ -1153,6 +1200,12 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
         );
     }
     let mut names = BTreeSet::new();
+    for (id, view) in &parts.sql_views {
+        let name = catalog_codec::sql_views::relation_name(view, &parts.ext.schemas)?;
+        if !names.insert(name.clone()) { return Err(CoreError::Sql(SqlError::Duplicate)); }
+        records.insert(name_key(&name), id.to_be_bytes().to_vec());
+        records.insert(catalog_codec::sql_views::view_key(*id), catalog_codec::sql_views::encode_view(view)?);
+    }
     let mut columns = BTreeSet::new();
     let mut table_ids = BTreeSet::new();
     for (name, def) in &parts.tables {
@@ -1161,9 +1214,10 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
             .table_schemas
             .get(&def.id)
             .map_or("public", String::as_str);
-        if *name != relational::relation_key(schema, &def.name) || !names.insert(name.clone()) {
+        if *name != relational::relation_key(schema, &def.name) {
             return Err(corrupt("catalog table name mismatch"));
         }
+        if !names.insert(name.clone()) { return Err(CoreError::Sql(SqlError::Duplicate)); }
         table_ids.insert(def.id);
         let ext = def
             .columns
@@ -1210,7 +1264,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
             .ok_or_else(|| corrupt("index table absent"))?;
         super::indexes::validate_descriptor(descriptor, table)?;
         if !names.insert(descriptor.name.clone()) {
-            return Err(corrupt("duplicate catalog relation name"));
+            return Err(CoreError::Sql(SqlError::Duplicate));
         }
         records.insert(
             super::indexes::descriptor_key(descriptor.id),
@@ -1223,7 +1277,7 @@ pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Ve
     }
     for (id, def) in &parts.ext.sequences {
         if !names.insert(def.name.clone()) {
-            return Err(corrupt("duplicate catalog relation name"));
+            return Err(CoreError::Sql(SqlError::Duplicate));
         }
         let value = catalog_codec::encode_sequence(def)?;
         catalog_codec::decode_sequence(&value)?;
@@ -1307,6 +1361,8 @@ fn corrupt(message: &str) -> CoreError {
 }
 fn commit_error(error: CoreError) -> TxnError {
     match error {
+        CoreError::Sql(SqlError::InvalidSchema) => TxnError::Serialization(SerializationReason::WriteConflict),
+        CoreError::Sql(SqlError::DependentObjects) => TxnError::DependentObjects,
         CoreError::Limit => TxnError::WriteSetLimit,
         CoreError::Fenced => TxnError::Fenced,
         CoreError::Storage(message) => TxnError::Kv(KvError::Io(message)),

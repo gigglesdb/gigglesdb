@@ -13,6 +13,8 @@ use crate::relational::{
 };
 use std::{ops::Range, time::Duration};
 
+#[path = "catalog_sql_view_tests.rs"]
+mod sql_view_tests;
 #[path = "catalog_comment_tests.rs"]
 mod comment_tests;
 #[path = "catalog_comment_ddl_tests.rs"]
@@ -49,7 +51,7 @@ fn empty() -> CatalogParts {
         heap: BTreeSet::new(),
         indexes: Vec::new(),
         ext: CatalogExt::default(),
-        comments: BTreeMap::new(),
+        sql_views: BTreeMap::new(), comments: BTreeMap::new(),
     }
 }
 fn serial_parts(ids: &Range<u64>) -> CatalogParts {

@@ -35,6 +35,21 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn drop_schema_with_persisted_view_reports_dependency() {
+    use engine::catalog_codec::sql_views::{SqlViewColumn, SqlViewDef};
+    let f = Fixture::new(); let mut sql = f.admin().sql_session();
+    sql.execute("CREATE SCHEMA s", &[], None).unwrap();
+    let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    let old = db.catalog().parts(&mut tx).unwrap(); let mut new = old.clone();
+    let ids = db.catalog().reserve_ids(2).unwrap();
+    new.sql_views.insert(ids.start, SqlViewDef { schema: old.ext.schemas["s"].id, name: "v".into(),
+        columns: vec![SqlViewColumn { id: ids.start+1, name: "c".into(), storage_type: crate::relational::DataType::BigInt, pg_type_oid: 20, typmod: -1 }],
+        select: "SELECT 1".into(), dependencies: vec![] });
+    db.catalog().apply_diff(&mut tx, &old, &new, &ids, None, &|| false).unwrap(); db.catalog().commit_ddl(tx).unwrap();
+    assert_eq!(sql.execute("DROP SCHEMA s", &[], None).unwrap_err(), CoreError::Sql(crate::relational::SqlError::DependentObjects));
+}
+
+#[test]
 fn borrowed_metadata_preserves_statement_epochs_and_matches_owned_images() {
     let f = Fixture::new();
     let admin = f.admin();

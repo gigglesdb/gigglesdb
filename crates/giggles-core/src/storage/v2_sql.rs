@@ -434,6 +434,10 @@ impl SqlSession {
                         }
                         let catalog = db.catalog().snapshot(txn)?;
                         let old = &catalog.parts;
+                        if p.schema_ddl().is_some_and(|(name, _, create)| !create && old.sql_views.values().any(|v|
+                            if v.schema == 0 { name == "public" } else { old.ext.schemas.get(name).is_some_and(|s| s.id == v.schema) })) {
+                            return Err(CoreError::Sql(E::DependentObjects));
+                        }
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
                             db.reserve_sql_ids(txn, 3 * relational::MAX_COLUMNS as u64 + 64)?
@@ -588,9 +592,10 @@ impl SqlSession {
                             .collect();
                         let indexes = image.secondary_descriptors_engine().to_vec();
                         let mut new = CatalogParts {
+                            sql_views: old.sql_views.clone(),
                             comments: old.comments.iter()
                                 .filter(|((relation, column), _)| {
-                                    tables.values().any(|table| table.id == *relation
+                                    old.sql_views.get(relation).is_some_and(|v| *column == 0 || v.columns.iter().any(|c| c.id == *column)) || tables.values().any(|table| table.id == *relation
                                         && (*column == 0 || table.columns.iter().any(|c| c.id == *column)))
                                 })
                                 .map(|(owner, text)| (*owner, text.clone()))

@@ -1,4 +1,6 @@
 //! Frozen v2 catalog wire types. Field and variant order are persisted format.
+#[path = "catalog_view_codec.rs"]
+pub(crate) mod sql_views;
 use super::catalog::TableEntry;
 use crate::{
     CoreError,
@@ -760,6 +762,7 @@ pub(crate) enum CatalogKind {
     Schema,
     TypeDefinition,
     Index,
+    SqlView,
     RelationComment,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
@@ -782,6 +785,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
         Some(16) if key.len() == 9 => CatalogKind::Index,
+        Some(17) if key.len() == 9 && key[1..9] != [0; 8] => CatalogKind::SqlView,
         Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,
         Some(4) if key.len() == 17 => CatalogKind::Constraint,
         Some(5) if key.len() == 9 => CatalogKind::Sequence,
@@ -825,16 +829,16 @@ pub(crate) fn decode_comment(value: &[u8]) -> Result<String, CoreError> {
 pub(crate) fn validate_comments<'a>(
     comments: &BTreeMap<(u64, u64), String>,
     tables: impl Iterator<Item = &'a TableDef>,
+    views: &BTreeMap<u64, sql_views::SqlViewDef>,
 ) -> Result<(), CoreError> {
     if comments.is_empty() {
         return Ok(());
     }
     let tables: BTreeMap<_, _> = tables.map(|table| (table.id, table)).collect();
     for &(relation, column) in comments.keys() {
-        let table = tables
-            .get(&relation)
-            .ok_or_else(|| corrupt("comment relation absent"))?;
-        if relation == 0 || (column != 0 && !table.columns.iter().any(|c| c.id == column)) {
+        let valid = tables.get(&relation).is_some_and(|t| column == 0 || t.columns.iter().any(|c| c.id == column))
+            || views.get(&relation).is_some_and(|v| column == 0 || v.columns.iter().any(|c| c.id == column));
+        if relation == 0 || !valid {
             return Err(corrupt("comment column absent"));
         }
     }

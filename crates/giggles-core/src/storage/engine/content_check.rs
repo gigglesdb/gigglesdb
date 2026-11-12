@@ -23,6 +23,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first() == Some(&16) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SECONDARY_INDEXES)
+    } else if key.first() == Some(&17) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::SQL_VIEWS)
     } else if key.first() == Some(&18) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::RELATION_COMMENTS)
@@ -63,6 +66,10 @@ pub(crate) fn required_bits_for_catalog_value(
             super::indexes::decode_descriptor(value).map_err(corrupt)?;
             Ok(super::meta::SECONDARY_INDEXES)
         }
+        CatalogKind::SqlView => {
+            catalog_codec::sql_views::decode_view(value).map_err(corrupt)?;
+            Ok(super::meta::SQL_VIEWS)
+        }
         CatalogKind::RelationComment => {
             catalog_codec::decode_comment(value).map_err(corrupt)?;
             Ok(super::meta::RELATION_COMMENTS)
@@ -94,6 +101,8 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut sequences = BTreeMap::new();
     let mut constraints = Vec::new();
     let mut comments = BTreeMap::new();
+    let mut views = BTreeMap::new();
+    let mut schemas = BTreeMap::new();
     let mut required = 0;
     for item in kv
         .range(
@@ -120,6 +129,9 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         };
         required |= required_bits_for_catalog_value(user, value)?;
         match kind {
+            CatalogKind::SqlView => {
+                views.insert(u64::from_be_bytes(user[1..9].try_into().unwrap()), catalog_codec::sql_views::decode_view(value).map_err(corrupt)?);
+            }
             CatalogKind::RelationComment => {
                 comments.insert(
                     (
@@ -162,7 +174,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
                 super::indexes::decode_descriptor(value).map_err(corrupt)?;
             }
             CatalogKind::Schema => {
-                catalog_codec::decode_schema(value).map_err(corrupt)?;
+                schemas.insert(String::from_utf8(user[1..user.len()-1].to_vec()).map_err(corrupt)?, catalog_codec::decode_schema(value).map_err(corrupt)?);
             }
             // The role-bootstrap gate and its existing opaque payload fixture
             // are owned by validate_meta.
@@ -181,7 +193,11 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             .ok_or_else(|| corrupt("constraint table is absent"))?;
         catalog_codec::decode_constraint(&value, table).map_err(corrupt)?;
     }
-    catalog_codec::validate_comments(&comments, tables.values()).map_err(corrupt)?;
+    catalog_codec::validate_comments(&comments, tables.values(), &views).map_err(corrupt)?;
+    let mut parts = super::catalog::CatalogParts { sql_views: views, ..Default::default() };
+    parts.tables = tables.into_iter().map(|(id, t)| (id.to_string(), t)).collect();
+    parts.ext.schemas = schemas;
+    catalog_codec::sql_views::validate_catalog(&parts).map_err(corrupt)?;
     for item in kv
         .range(
             Keyspace::Seq,

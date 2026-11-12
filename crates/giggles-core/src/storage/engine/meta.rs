@@ -13,8 +13,9 @@ pub(crate) const SECONDARY_INDEXES: u64 = 1 << 2;
 pub(crate) const TEXT_BACKED_COLUMN_TYPES: u64 = 1 << 10;
 pub(crate) const SCHEMAS_AND_USER_TYPES: u64 = 1 << 12;
 pub(crate) const UNIQUE_CONSTRAINT_IDENTITY: u64 = 1 << 13;
+pub(crate) const SQL_VIEWS: u64 = 1 << 14;
 pub(crate) const RELATION_COMMENTS: u64 = 1 << 15;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 15] = [
+pub(crate) const FEATURE_TABLE: [(u64, &str); 16] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -29,6 +30,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 15] = [
     (2048, "role_catalog"),
     (SCHEMAS_AND_USER_TYPES, "schemas_and_user_types"),
     (UNIQUE_CONSTRAINT_IDENTITY, "unique_constraint_identity"),
+    (SQL_VIEWS, "sql_views"),
     (RELATION_COMMENTS, "relation_comments"),
 ];
 const MARKER: &str = "GIGGLES_FORMAT";
@@ -259,7 +261,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     })
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    check_features_allowed(bits, 0x3FFF | RELATION_COMMENTS)
+    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS)
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {
