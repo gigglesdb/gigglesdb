@@ -314,6 +314,7 @@ fn parts(s: &State) -> engine::catalog::CatalogParts {
         ext,
         heap,
         indexes: s.sql.secondary_descriptors_engine().to_vec(),
+        comments: BTreeMap::new(),
     }
 }
 

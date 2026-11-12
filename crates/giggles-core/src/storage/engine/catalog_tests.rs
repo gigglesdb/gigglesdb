@@ -1245,7 +1245,7 @@ fn forged_unique_index_references_fail_save_and_load() {
         sql.execute(&p, &[], None).unwrap();
     }
     let (tables, ext, _, _) = sql.catalog_parts();
-    let parts = CatalogParts { tables, ext, heap: BTreeSet::new(), indexes: sql.secondary_descriptors_engine().to_vec() };
+    let parts = CatalogParts { tables, ext, heap: BTreeSet::new(), indexes: sql.secondary_descriptors_engine().to_vec(), comments: BTreeMap::new() };
     let valid = parts_records(&parts).unwrap();
     for name in ["missing", "nonunique", "other_table", "wrongcols", "wrongorder"] {
         let mut bad = parts.clone();

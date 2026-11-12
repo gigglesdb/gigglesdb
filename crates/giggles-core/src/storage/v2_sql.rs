@@ -585,6 +585,13 @@ impl SqlSession {
                             .collect();
                         let indexes = image.secondary_descriptors_engine().to_vec();
                         let new = CatalogParts {
+                            comments: old.comments.iter()
+                                .filter(|((relation, column), _)| {
+                                    tables.values().any(|table| table.id == *relation
+                                        && (*column == 0 || table.columns.iter().any(|c| c.id == *column)))
+                                })
+                                .map(|(owner, text)| (*owner, text.clone()))
+                                .collect(),
                             tables,
                             heap,
                             ext,

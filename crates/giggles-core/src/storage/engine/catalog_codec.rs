@@ -760,6 +760,7 @@ pub(crate) enum CatalogKind {
     Schema,
     TypeDefinition,
     Index,
+    RelationComment,
 }
 pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError> {
     Ok(match key.first() {
@@ -781,6 +782,7 @@ pub(crate) fn classify_catalog_key(key: &[u8]) -> Result<CatalogKind, CoreError>
         }
         Some(15) if key.len() == 9 => CatalogKind::TypeDefinition,
         Some(16) if key.len() == 9 => CatalogKind::Index,
+        Some(18) if key.len() == 17 && key[1..9] != [0; 8] => CatalogKind::RelationComment,
         Some(4) if key.len() == 17 => CatalogKind::Constraint,
         Some(5) if key.len() == 9 => CatalogKind::Sequence,
         Some(6) if key.len() == 9 => CatalogKind::Type,
@@ -794,6 +796,49 @@ fn object_key(kind: u8, id: u64) -> Vec<u8> {
     let mut key = vec![kind];
     key.extend(id.to_be_bytes());
     key
+}
+pub(crate) fn comment_key(relation: u64, column: u64) -> Vec<u8> {
+    let mut key = object_key(18, relation);
+    key.extend(column.to_be_bytes());
+    key
+}
+/// Version 1: version byte, u32 BE UTF-8 byte length, then text (at most 64 KiB).
+pub(crate) fn encode_comment(text: &str) -> Result<Vec<u8>, CoreError> {
+    if text.len() > 65536 {
+        return Err(corrupt("relation comment length limit"));
+    }
+    let mut value = vec![1];
+    value.extend((text.len() as u32).to_be_bytes());
+    value.extend(text.as_bytes());
+    Ok(value)
+}
+pub(crate) fn decode_comment(value: &[u8]) -> Result<String, CoreError> {
+    if value.first() != Some(&1) || value.len() < 5 {
+        return Err(corrupt("unsupported or truncated relation comment"));
+    }
+    let len = u32::from_be_bytes(value[1..5].try_into().unwrap()) as usize;
+    if len > 65536 || value.len() - 5 != len {
+        return Err(corrupt("invalid relation comment length"));
+    }
+    String::from_utf8(value[5..].to_vec()).map_err(|_| corrupt("invalid comment UTF-8"))
+}
+pub(crate) fn validate_comments<'a>(
+    comments: &BTreeMap<(u64, u64), String>,
+    tables: impl Iterator<Item = &'a TableDef>,
+) -> Result<(), CoreError> {
+    if comments.is_empty() {
+        return Ok(());
+    }
+    let tables: BTreeMap<_, _> = tables.map(|table| (table.id, table)).collect();
+    for &(relation, column) in comments.keys() {
+        let table = tables
+            .get(&relation)
+            .ok_or_else(|| corrupt("comment relation absent"))?;
+        if relation == 0 || (column != 0 && !table.columns.iter().any(|c| c.id == column)) {
+            return Err(corrupt("comment column absent"));
+        }
+    }
+    Ok(())
 }
 pub(crate) fn table_key(id: u64) -> Vec<u8> {
     object_key(1, id)

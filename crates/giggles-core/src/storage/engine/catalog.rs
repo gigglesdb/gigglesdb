@@ -56,6 +56,7 @@ impl From<SqlError> for CatalogError {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogView {
+    pub(crate) comments: BTreeMap<(u64, u64), String>,
     pub(crate) by_name: BTreeMap<String, Arc<TableEntry>>,
     pub(crate) by_id: BTreeMap<u64, Arc<TableEntry>>,
     pub(crate) names: BTreeMap<String, u64>,
@@ -68,6 +69,7 @@ pub(crate) struct CatalogView {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CatalogParts {
+    pub(crate) comments: BTreeMap<(u64, u64), String>,
     pub(crate) tables: BTreeMap<String, TableDef>,
     pub(crate) heap: BTreeSet<u64>,
     pub(crate) indexes: Vec<relational::secondary_index::Descriptor>,
@@ -75,7 +77,10 @@ pub(crate) struct CatalogParts {
 }
 impl CatalogView {
     pub(crate) fn parts(&self) -> CatalogParts {
-        let mut parts = CatalogParts::default();
+        let mut parts = CatalogParts {
+            comments: self.comments.clone(),
+            ..CatalogParts::default()
+        };
         for entry in self.by_id.values() {
             let mut def = entry.def.clone();
             let (schema, bare) = relational::split_key(&entry.def.name);
@@ -498,7 +503,7 @@ impl Catalog {
         let mut tables = BTreeSet::new();
         for key in changes.keys() {
             match key[0] {
-                1 | 4 => {
+                1 | 4 | 18 => {
                     tables.insert(decode_id(&key[1..9]).map_err(commit_error)?);
                 }
                 16 => {
@@ -886,6 +891,17 @@ fn apply_record(
     value: Option<&[u8]>,
 ) -> Result<(), CoreError> {
     match catalog_codec::classify_catalog_key(key)? {
+        CatalogKind::RelationComment => {
+            let owner = (
+                decode_id(&key[1..9])?,
+                u64::from_be_bytes(key[9..17].try_into().unwrap()),
+            );
+            if let Some(value) = value {
+                view.comments.insert(owner, catalog_codec::decode_comment(value)?);
+            } else {
+                view.comments.remove(&owner);
+            }
+        }
         CatalogKind::Table => {
             let id = decode_id(&key[1..])?;
             if let Some(value) = value {
@@ -994,6 +1010,7 @@ fn finish_view(
     names: BTreeMap<String, u64>,
 ) -> Result<CatalogView, CoreError> {
     view.by_name.clear();
+    catalog_codec::validate_comments(&view.comments, view.by_id.values().map(|entry| &entry.def))?;
     let mut expected = BTreeMap::new();
     for entry in view.by_id.values_mut() {
         let entry = Arc::make_mut(entry);
@@ -1112,9 +1129,16 @@ fn object_ids(parts: &CatalogParts) -> Result<BTreeMap<u64, (u8, u64)>, CoreErro
     Ok(result)
 }
 pub(crate) fn parts_records(parts: &CatalogParts) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, CoreError> {
+    catalog_codec::validate_comments(&parts.comments, parts.tables.values())?;
     relational::catalog_ext::validate_unique_indexes(parts.ext.constraints.iter().flat_map(|(t, cs)| cs.iter().map(move |c| (*t, c))), parts.indexes.iter()).map_err(|_| corrupt("invalid UNIQUE backing index"))?;
     object_ids(parts)?;
     let mut records = BTreeMap::new();
+    for (&(relation, column), text) in &parts.comments {
+        records.insert(
+            catalog_codec::comment_key(relation, column),
+            catalog_codec::encode_comment(text)?,
+        );
+    }
     let mut names = BTreeSet::new();
     let mut columns = BTreeSet::new();
     let mut table_ids = BTreeSet::new();

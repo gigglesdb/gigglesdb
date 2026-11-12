@@ -153,11 +153,12 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x3FFF
+        0x3FFF | RELATION_COMMENTS
     );
-    for (i, (bit, _)) in FEATURE_TABLE.iter().enumerate() {
+    for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
     }
+    assert_eq!(FEATURE_TABLE[14].0, RELATION_COMMENTS);
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -176,7 +177,7 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 14..64 {
+    for i in (14..64).filter(|i| *i != 15) {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),

@@ -23,6 +23,9 @@ pub(crate) fn required_bits_for_catalog_key(key: &[u8]) -> Result<u64, FormatErr
     } else if key.first() == Some(&16) {
         catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
         Ok(super::meta::SECONDARY_INDEXES)
+    } else if key.first() == Some(&18) {
+        catalog_codec::classify_catalog_key(key).map_err(corrupt)?;
+        Ok(super::meta::RELATION_COMMENTS)
     } else {
         Ok(0)
     }
@@ -60,6 +63,10 @@ pub(crate) fn required_bits_for_catalog_value(
             super::indexes::decode_descriptor(value).map_err(corrupt)?;
             Ok(super::meta::SECONDARY_INDEXES)
         }
+        CatalogKind::RelationComment => {
+            catalog_codec::decode_comment(value).map_err(corrupt)?;
+            Ok(super::meta::RELATION_COMMENTS)
+        }
         CatalogKind::Name => Ok(if key[1..key.len() - 1].contains(&0) {
             super::meta::SCHEMAS_AND_USER_TYPES
         } else {
@@ -86,6 +93,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
     let mut tables = BTreeMap::new();
     let mut sequences = BTreeMap::new();
     let mut constraints = Vec::new();
+    let mut comments = BTreeMap::new();
     let mut required = 0;
     for item in kv
         .range(
@@ -112,6 +120,15 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
         };
         required |= required_bits_for_catalog_value(user, value)?;
         match kind {
+            CatalogKind::RelationComment => {
+                comments.insert(
+                    (
+                        u64::from_be_bytes(user[1..9].try_into().unwrap()),
+                        u64::from_be_bytes(user[9..17].try_into().unwrap()),
+                    ),
+                    catalog_codec::decode_comment(value).map_err(corrupt)?,
+                );
+            }
             CatalogKind::Table => {
                 let (entry, _) = catalog_codec::decode_table(value).map_err(corrupt)?;
                 tables.insert(
@@ -164,6 +181,7 @@ pub(crate) fn check(kv: &dyn KvRead, features: u64) -> Result<Vec<Vec<u8>>, Form
             .ok_or_else(|| corrupt("constraint table is absent"))?;
         catalog_codec::decode_constraint(&value, table).map_err(corrupt)?;
     }
+    catalog_codec::validate_comments(&comments, tables.values()).map_err(corrupt)?;
     for item in kv
         .range(
             Keyspace::Seq,

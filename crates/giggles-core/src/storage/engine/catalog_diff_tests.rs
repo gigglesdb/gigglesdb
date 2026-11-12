@@ -13,6 +13,9 @@ use crate::relational::{
 };
 use std::{ops::Range, time::Duration};
 
+#[path = "catalog_comment_tests.rs"]
+mod comment_tests;
+
 fn setup() -> (Arc<MemKv>, Arc<Sequencer>, Arc<LockManager>, Catalog) {
     let mem = Arc::new(MemKv::new());
     let kv = Arc::new(Kv::new(mem.clone()));
@@ -44,6 +47,7 @@ fn empty() -> CatalogParts {
         heap: BTreeSet::new(),
         indexes: Vec::new(),
         ext: CatalogExt::default(),
+        comments: BTreeMap::new(),
     }
 }
 fn serial_parts(ids: &Range<u64>) -> CatalogParts {
