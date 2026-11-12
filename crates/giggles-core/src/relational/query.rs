@@ -3033,6 +3033,139 @@ impl Query {
             })
             .collect()
     }
+    /// Finite candidate tuples only; the publisher still evaluates the full WHERE.
+    /// None preserves the paged scan for unsupported coercions or unbounded keys.
+    pub(super) fn mutation_primary_keys(
+        &self, state: &Relational, table: &TableDef, params: &[Value],
+    ) -> Option<Vec<Vec<Value>>> {
+        // Keep one candidate page within the existing 200-row staging budgets.
+        const MAX_KEYS: usize = 200;
+        fn supported(ty: &DataType) -> bool {
+            matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
+                | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
+                | DataType::Numeric | DataType::Real | DataType::DoublePrecision)
+        }
+        fn value(s: &Scalar, column: &ColumnDef, params: &[Value]) -> Option<Value> {
+            if !supported(&column.data_type) { return None; }
+            let v = match s {
+                Scalar::Literal(v) => match unknown_comparison_literal(v, &column.data_type).ok()? {
+                    Some(v) => v?,
+                    None => v.clone(),
+                },
+                Scalar::Param(n) => params.get(n.checked_sub(1)?)?.clone(),
+                _ => return None,
+            };
+            if v == Value::Null { return None; }
+            if check(&v, column).is_err()
+                || comparison_requires_filter(&v, &column.data_type).ok()? { return None; }
+            Some(v)
+        }
+        // Skipping a noncandidate must not skip an error/volatile expression that
+        // the old scan would evaluate before a later key test. Restrict residuals
+        // to total, exact comparisons and NULL/boolean tests over simple columns.
+        fn total(f: &Filter, table: &TableDef, params: &[Value]) -> bool {
+            let column = |s: &Scalar| match s {
+                Scalar::Column(c) => table.columns.iter().find(|d| d.name == c.name),
+                _ => None,
+            };
+            match f {
+                Filter::Logic(a, _, b) => total(a, table, params) && total(b, table, params),
+                Filter::Not(a) | Filter::Is(a, _, _) => total(a, table, params),
+                Filter::Compare(a, _, b) => {
+                    if let Some(c) = column(a) {
+                        if let Some(d) = column(b) {
+                            supported(&c.data_type) && c.data_type == d.data_type
+                        } else { value(b, c, params).is_some() }
+                    } else if let Some(c) = column(b) { value(a, c, params).is_some() }
+                    else { false }
+                }
+                Filter::Null(s, _) => matches!(s, Scalar::Column(_) | Scalar::Literal(_)),
+                Filter::Scalar(Scalar::Literal(Value::Bool(_) | Value::Null)) => true,
+                Filter::Scalar(s) => column(s).is_some_and(|c| c.data_type == DataType::Boolean),
+                _ => false,
+            }
+        }
+        fn domain(f: &Filter, column: &ColumnDef, params: &[Value]) -> Option<BTreeMap<Vec<u8>, Value>> {
+            match f {
+                Filter::Compare(a, op, b) if op == "=" => {
+                    let s = match (a, b) {
+                        (Scalar::Column(c), s) | (s, Scalar::Column(c)) if c.name == column.name => s,
+                        _ => return None,
+                    };
+                    let v = value(s, column, params)?;
+                    Some(BTreeMap::from([(encode_key(std::slice::from_ref(&v)).ok()?, v)]))
+                }
+                Filter::Logic(a, and, b) => {
+                    let (a, b) = (domain(a, column, params), domain(b, column, params));
+                    if *and {
+                        // Either mandatory conjunct supplies a sound superset.
+                        match (a, b) {
+                            (Some(a), Some(b)) => Some(if a.len() <= b.len() { a } else { b }),
+                            (a, b) => a.or(b),
+                        }
+                    } else {
+                        let mut out = a?;
+                        out.extend(b?);
+                        (out.len() <= MAX_KEYS).then_some(out)
+                    }
+                }
+                _ => None,
+            }
+        }
+        if self.sources.len() != 1 || !self.joins.is_empty() || self.has_in_subquery()
+            || table.hidden_rowid().is_some() || table.primary_key.is_empty()
+            || table.columns.iter().any(|c| state.column_type(c.id).is_some()) { return None; }
+        let filter = self.filter.as_ref()?;
+        // Preserve the existing NULL-key error route, even when another AND
+        // conjunct could supply a non-NULL candidate for the same key column.
+        fn null_key(f: &Filter, table: &TableDef, params: &[Value]) -> bool {
+            match f {
+                Filter::Logic(a, _, b) => null_key(a, table, params) || null_key(b, table, params),
+                Filter::Not(a) | Filter::Is(a, _, _) => null_key(a, table, params),
+                Filter::Compare(a, _, b) => {
+                    let null = |s: &Scalar| match s {
+                        Scalar::Literal(Value::Null) => true,
+                        Scalar::Param(n) => n.checked_sub(1).and_then(|i| params.get(i)) == Some(&Value::Null),
+                        _ => false,
+                    };
+                    let key = |s: &Scalar| matches!(s, Scalar::Column(c)
+                        if table.primary_key.iter().any(|i| table.columns[*i].name == c.name));
+                    key(a) && null(b) || key(b) && null(a)
+                }
+                _ => false,
+            }
+        }
+        if null_key(filter, table, params) { return None; }
+        // A complete existing point bound already skips all noncandidate rows,
+        // so arbitrary residuals retain their current evaluation domain there.
+        let exact_bounds = table.primary_key.iter().all(|i| {
+            let predicates = self.predicates.iter()
+                .filter(|(c, _, _)| c.name == table.columns[*i].name).collect::<Vec<_>>();
+            let [(.., op, expr)] = predicates.as_slice() else { return false; };
+            let scalar = match expr {
+                Expr::Literal(v) => Scalar::Literal(v.clone()),
+                Expr::Param(n) => Scalar::Param(*n),
+            };
+            *op == "=" && value(&scalar, &table.columns[*i], params).is_some()
+        });
+        if !exact_bounds && !total(filter, table, params) { return None; }
+        let mut tuples = BTreeMap::from([(Vec::new(), Vec::new())]);
+        for offset in &table.primary_key {
+            let values = domain(filter, &table.columns[*offset], params)?;
+            if tuples.len().checked_mul(values.len())? > MAX_KEYS { return None; }
+            let mut next = BTreeMap::new();
+            for prefix in tuples.into_values() {
+                for v in values.values() {
+                    let mut tuple = prefix.clone();
+                    tuple.push(v.clone());
+                    next.insert(encode_key(&tuple).ok()?, tuple);
+                }
+            }
+            tuples = next;
+        }
+        Some(tuples.into_values().collect())
+    }
+
     pub(super) fn target(&self) -> &str {
         if !self.sources.is_empty() && self.sources.iter().all(|s| s.name == self.sources[0].name) {
             &self.sources[0].name
@@ -5908,5 +6041,69 @@ mod integer_bound_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mutation_primary_key_tests {
+    use super::*;
+    fn image(ddl: &str) -> Relational {
+        let mut state = Relational::default();
+        let p = Prepared::parse(ddl, 1, state.epoch).unwrap();
+        state.execute(&p, &[], None).unwrap();
+        state
+    }
+    fn keys(state: &Relational, sql: &str, params: &[Value]) -> Option<Vec<Vec<Value>>> {
+        let p = Prepared::parse(sql, 1, state.epoch).unwrap();
+        searched::target(&p).unwrap().mutation_primary_keys(state, &state.tables["t"], params)
+    }
+    #[test]
+    fn equalities_membership_residuals_and_safe_fallbacks() {
+        use Value::{Int, Null};
+        let state = image("CREATE TABLE t(id bigint PRIMARY KEY,v bigint)");
+        for (sql, params, expected) in [
+            ("DELETE FROM t WHERE id=2", vec![], Some(vec![vec![Int(2)]])),
+            ("UPDATE t SET v=v+1 WHERE id=$1", vec![Int(3)], Some(vec![vec![Int(3)]])),
+            ("DELETE FROM t WHERE 2=id", vec![], Some(vec![vec![Int(2)]])),
+            ("DELETE FROM t WHERE id IN(3,1,3,$1) AND v>0", vec![Int(2)], Some(vec![vec![Int(1)],vec![Int(2)],vec![Int(3)]])),
+            ("DELETE FROM t WHERE id IN(1,NULL)", vec![], None),
+            ("DELETE FROM t WHERE id=1 AND id IN(1,NULL)", vec![], None),
+            ("DELETE FROM t WHERE id=NULL", vec![], None),
+            ("DELETE FROM t WHERE id=$1", vec![Null], None),
+            ("DELETE FROM t WHERE id='2'", vec![], Some(vec![vec![Int(2)]])),
+            ("DELETE FROM t WHERE id=$1", vec![Value::Text("bad".into())], None),
+            ("DELETE FROM t WHERE id>2", vec![], None),
+            ("DELETE FROM t WHERE id=1 OR v=2", vec![], None),
+            // With no original point bound, skipping rows must not hide errors.
+            ("DELETE FROM t WHERE 1/v>0 AND id IN(1,2)", vec![], None),
+            ("DELETE FROM t WHERE $1 IS NULL AND id IN(1,2)", vec![Null], None),
+            ("DELETE FROM t WHERE id=1 AND 1/v>0", vec![], Some(vec![vec![Int(1)]])),
+            ("DELETE FROM t WHERE id IN(SELECT v FROM t)", vec![], None),
+        ] {
+            assert_eq!(keys(&state,sql,&params),expected,"{sql}");
+        }
+        let state = image("CREATE TABLE t(id uuid PRIMARY KEY)");
+        assert!(keys(&state,"DELETE FROM t WHERE id='550E8400-E29B-41D4-A716-446655440000'",&[]).is_none());
+    }
+    #[test]
+    fn user_defined_comparison_types_keep_their_existing_path() {
+        let mut state=Relational::default();
+        for sql in ["CREATE TYPE mood AS ENUM('ok','bad')", "CREATE TABLE t(id bigint PRIMARY KEY,v mood)"] {
+            let p=Prepared::parse(sql,1,state.epoch).unwrap();
+            state.execute(&p,&[],None).unwrap();
+        }
+        assert!(keys(&state,"DELETE FROM t WHERE id IN(1,2) AND v=$1",&[Value::Text("unknown".into())]).is_none());
+    }
+    #[test]
+    fn composite_cartesian_expansion_is_ordered_and_capped() {
+        use Value::Int;
+        let state = image("CREATE TABLE t(a bigint,b bigint,v bigint,PRIMARY KEY(a,b))");
+        assert_eq!(keys(&state,"DELETE FROM t WHERE b IN(2,1,2) AND a IN(2,1)",&[]),
+            Some(vec![vec![Int(1),Int(1)],vec![Int(1),Int(2)],vec![Int(2),Int(1)],vec![Int(2),Int(2)]]));
+        assert!(keys(&state,"DELETE FROM t WHERE a=1",&[]).is_none());
+        let list = (0..15).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let under = (0..13).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(keys(&state,&format!("DELETE FROM t WHERE a IN({under}) AND b IN({list})"),&[]).unwrap().len(),195);
+        assert!(keys(&state,&format!("DELETE FROM t WHERE a IN({list}) AND b IN({list})"),&[]).is_none());
     }
 }

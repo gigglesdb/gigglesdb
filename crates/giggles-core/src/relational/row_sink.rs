@@ -96,6 +96,15 @@ pub(crate) trait RowSink {
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
+    /// Optional exact PK candidates; other sinks retain the existing page scan.
+    fn mutation_pages(
+        &mut self,
+        table: &TableDef,
+        _keys: Option<&[Vec<Value>]>,
+        page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
+    ) -> Result<(), CoreError> {
+        self.ddl_pages(table, table, true, page)
+    }
     fn ddl_pages(
         &mut self,
         _table: &TableDef,

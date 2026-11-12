@@ -72,7 +72,32 @@ pub(super) fn execute(
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
     let mut output = scan::Retention::new(MAX_RESULT_BYTES);
-    sink.ddl_pages(&table, &table, true, &mut |mut rows| {
+    let mut point_keys = keys.is_none().then(|| searched::target(prepared)
+        .and_then(|q| q.mutation_primary_keys(state, &table, params))).flatten();
+    // External UNIQUE witnesses are checked after each old page. Combining keys
+    // can mask that error with a later CHECK, and even one row's RETURNING can
+    // mask a page-local duplicate. Preserve the old path in those cases.
+    let returning = match &prepared.statement {
+        Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
+            => returning.is_some(),
+        _ => false,
+    };
+    // Old pages project RETURNING before checking assignments on later pages.
+    if returning && point_keys.as_ref().is_some_and(|keys| keys.len() > 1) {
+        point_keys = None;
+    }
+    if point_keys.as_ref().is_some_and(|keys| keys.len() > 1 || returning && !keys.is_empty()) {
+        let changed = match &prepared.statement {
+            Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+            _ => Vec::new(),
+        };
+        if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
+            .any(|c| c.id == *id && changed.contains(&&c.name)))) {
+            point_keys = None;
+        }
+    }
+    sink.mutation_pages(&table, point_keys.as_deref(), &mut |mut rows| {
         let mut unchanged = DdlRows::new();
         if let Some(keys) = &keys {
             rows.retain(|key, row| {

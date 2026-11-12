@@ -1,3 +1,6 @@
+#[path = "v2_mutation_point_tests.rs"]
+mod mutation_point;
+
 use super::*;
 use engine::{
     catalog_codec, codec,

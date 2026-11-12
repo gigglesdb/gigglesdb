@@ -825,6 +825,46 @@ impl RowSink for SqlRows<'_> {
             .map_err(CoreError::Sql)?;
         Ok(Some((last, rows)))
     }
+    fn mutation_pages(
+        &mut self,
+        table: &TableDef,
+        keys: Option<&[Vec<relational::Value>]>,
+        page: &mut dyn FnMut(DdlRows) -> Result<DdlRows, CoreError>,
+    ) -> Result<(), CoreError> {
+        #[cfg(test)]
+        let keys = if DISABLE_MUTATION_POINTS.get() { None } else { keys };
+        let Some(keys) = keys else { return self.ddl_pages(table, table, true, page); };
+        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new() };
+        let mut rows = DdlRows::new();
+        let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+        for key in keys {
+            crate::cancellation::check()?;
+            #[cfg(test)]
+            MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
+            if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
+                #[cfg(test)]
+                MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
+                let row = SqlRow { values: row.values, version: row.version };
+                let key = relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?;
+                let bytes = relational::row_sink::retained_bytes(&key, &row).map_err(CoreError::Sql)?;
+                // Sparse targets can aggregate wider rows than any old page.
+                // Leave room for the eight UNIQUE sidecars and their work meters;
+                // fall back before invoking the callback or publishing a write.
+                if retention.charge(bytes).is_err() || retention.used() > 256 * 1024 {
+                    return self.ddl_pages(table, table, true, page);
+                }
+                rows.insert(key, row);
+            }
+        }
+        #[cfg(test)]
+        {
+            if let Some(hook) = AFTER_MUTATION_PAGE.with_borrow_mut(Option::take) { hook(); }
+        }
+        let rewritten = page(rows.clone())?;
+        self.apply_indexes(table, Some(table), &rows, &rewritten, &self.indexes())?;
+        self.apply(table, &rows, &rewritten)
+    }
     fn ddl_pages(
         &mut self,
         table: &TableDef,
@@ -872,6 +912,11 @@ impl RowSink for SqlRows<'_> {
                 .map(|row| relational::row_sink::row_key(table, &row).map(|key| (key, row)))
                 .collect::<Result<BTreeMap<_, _>, _>>()
                 .map_err(CoreError::Sql)?;
+            #[cfg(test)]
+            {
+                MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + rows.len());
+                if let Some(hook) = AFTER_MUTATION_PAGE.with_borrow_mut(Option::take) { hook(); }
+            }
             let rewritten = page(rows.clone())?;
             if mutating {
                 self.apply_indexes(table, Some(after), &rows, &rewritten, &self.indexes())?;
@@ -1450,6 +1495,10 @@ type TableScanHook = Box<dyn FnMut(&str)>;
 
 #[cfg(test)]
 thread_local! {
+    static DISABLE_MUTATION_POINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MUTATION_POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MUTATION_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_MUTATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_INDEX_CHUNK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CRASH_AFTER_INDEX_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AFTER_TABLE_SCAN: std::cell::RefCell<Option<TableScanHook>> = const { std::cell::RefCell::new(None) };
