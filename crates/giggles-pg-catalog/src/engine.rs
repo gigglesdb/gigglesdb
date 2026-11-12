@@ -261,8 +261,8 @@ pub fn plan(sql: &str) -> R<Option<Plan>> {
     plan_inner(sql, false, None)
 }
 
-/// Classify a gateway query, reserving implicit catalog evaluation for literal
-/// keepalives. Other scalars must pass the core binder and gateway authority.
+/// Classify a gateway query, including table-free catalog introspection.
+/// Other scalars must pass the core binder and gateway authority.
 pub fn plan_gateway(sql: &str) -> R<Option<Plan>> {
     plan_inner(sql, true, None)
 }
@@ -278,6 +278,9 @@ struct Scan {
     catalog: bool,
     explicit_catalog: bool,
     core_scalar: bool,
+    introspection: bool,
+    introspection_only: bool,
+    has_relations: bool,
     user: bool,
     nodes: usize,
     depth: usize,
@@ -294,7 +297,12 @@ impl Visitor for Scan {
         }
         ControlFlow::Continue(())
     }
+    fn pre_visit_table_factor(&mut self, factor: &a::TableFactor) -> ControlFlow<Error> {
+        self.has_relations |= !matches!(factor, a::TableFactor::Derived { .. } | a::TableFactor::NestedJoin { .. });
+        ControlFlow::Continue(())
+    }
     fn pre_visit_relation(&mut self, n: &a::ObjectName) -> ControlFlow<Error> {
+        self.has_relations = true;
         let p = object(n);
         let is_catalog = match p.as_slice() {
             [n] => {
@@ -314,10 +322,24 @@ impl Visitor for Scan {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, e: &A) -> ControlFlow<Error> {
-        // Implicit catalog context is reserved for literal keepalives.
-        // The core binder owns other scalar expressions and proves its
-        // supported calls before the gateway grants table-free authority.
+        // Except for the closed introspection route below, the core binder
+        // owns nonliteral scalars without explicit catalog context.
         self.core_scalar |= !matches!(e, A::Value(_) | A::Nested(_));
+        // This additional gateway route is deliberately closed: nested scalar
+        // calls and base relations must keep their existing core routing.
+        // Special SQL function forms (SUBSTRING, TRIM, etc.) are excluded too.
+        self.introspection_only &= matches!(e,
+            A::Value(_) | A::Nested(_) | A::Identifier(_) | A::CompoundIdentifier(_)
+            | A::Function(_) | A::Cast { .. } | A::UnaryOp { .. } | A::BinaryOp { .. }
+            | A::IsNull(_) | A::IsNotNull(_));
+        if let A::Function(f) = e {
+            let introspection = function(&f.name).is_ok_and(|n| matches!(n.as_str(),
+                "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
+                | "pg_get_userbyid" | "format_type" | "obj_description"
+                | "col_description" | "shobj_description"));
+            self.introspection |= introspection;
+            self.introspection_only &= introspection;
+        }
         self.nodes += 1;
         self.depth += 1;
         if self.nodes > 4096 || self.depth > 48 {
@@ -384,6 +406,9 @@ impl Scan {
             catalog: false,
             explicit_catalog: false,
             core_scalar: false,
+            introspection: false,
+            introspection_only: true,
+            has_relations: false,
             user: false,
             nodes: 0,
             depth: 0,
@@ -560,6 +585,8 @@ fn plan_inner(
     if let ControlFlow::Break(e) = statements.visit(&mut scan) {
         return Err(e);
     }
+    let introspection = scan.introspection && scan.introspection_only && !scan.has_relations;
+    scan.catalog |= introspection;
     if !scan.catalog {
         return Ok(None);
     }
@@ -570,7 +597,7 @@ fn plan_inner(
         return Err(Error::MixedRelations);
     }
     // Without explicit catalog context the core binder owns scalar semantics.
-    if gateway && scan.core_scalar && !scan.explicit_catalog {
+    if gateway && scan.core_scalar && !scan.explicit_catalog && !introspection {
         return Ok(None);
     }
     let a::Statement::Query(q) = &statements[0] else {

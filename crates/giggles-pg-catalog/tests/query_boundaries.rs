@@ -1,6 +1,35 @@
 use giggles_pg_catalog::{CatalogSnapshot, Error, execute, plan};
 
 #[test]
+fn gateway_introspection_requires_only_catalog_calls_and_no_base_relations() {
+    use giggles_pg_catalog::plan_gateway;
+    for sql in [
+        "SELECT pg_catalog.pg_get_indexdef(0,1,true), format_type(23,NULL)",
+        "SELECT * FROM (SELECT pg_get_indexdef(0,1,true) AS col, 0 AS dummy) tmp ORDER BY dummy",
+        "SELECT pg_get_indexdef(pg_get_userbyid(10)::oid,1,true)",
+        "SELECT \"pg_catalog\".\"pg_get_indexdef\"(0,1,true)",
+    ] {
+        assert!(plan_gateway(sql).unwrap().is_some(), "{sql}");
+    }
+    for sql in [
+        "SELECT pg_get_indexdef(0,1,true), abs(-1)",
+        "SELECT * FROM (SELECT pg_get_indexdef(0,1,true) AS col, lower('X') AS other) tmp",
+        "SELECT pg_get_indexdef(0,1,true), substring('abc' FROM 1 FOR 1)",
+        "SELECT pg_get_indexdef(0,1,true) FROM UNNEST($1::int[]) u",
+        "SELECT public.pg_get_indexdef(0,1,true)",
+        "SELECT \"PG_GET_INDEXDEF\"(0,1,true)",
+        // Recognized by the compiler, but execution is not implemented.
+        "SELECT pg_get_viewdef(0,true)",
+    ] {
+        assert!(plan_gateway(sql).unwrap().is_none(), "{sql}");
+    }
+    let relations = std::collections::BTreeMap::new();
+    assert!(giggles_pg_catalog::plan_gateway_with_relations(
+        "SELECT pg_get_indexdef(0,1,true) FROM app", &relations,
+    ).unwrap().is_none());
+}
+
+#[test]
 fn table_free_keepalive_selects_are_real_typed_queries() {
     use giggles_pg_catalog::{PgType, Value};
     for sql in [

@@ -26,6 +26,90 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
+#[tokio::test]
+async fn catalog_introspection_mixed_calls_keep_core_errors() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    c.simple_query("CREATE TABLE introspection_app (id integer PRIMARY KEY)").await.unwrap();
+    for (sql, state) in [
+        ("SELECT pg_get_indexdef(0,1,true), abs(-1)", "0A000"),
+        ("SELECT * FROM (SELECT pg_catalog.pg_get_indexdef(0,1,true) AS col, lower('X') AS other) tmp", "0A000"),
+        ("SELECT pg_get_indexdef(0,1,true) FROM introspection_app", "0A000"),
+        ("SELECT public.pg_get_indexdef(0,1,true)", "42883"),
+    ] {
+        assert_eq!(code(c.simple_query(sql).await.unwrap_err()), state, "{sql}");
+        assert_eq!(code(c.query(sql, &[]).await.unwrap_err()), state, "{sql}");
+    }
+    drop(c);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn catalog_introspection_table_free_and_derived_both_protocols() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    for sql in include_str!("../../../compat/gui/sample.sql").split(';').map(str::trim)
+        .filter(|s| s.starts_with("CREATE SCHEMA") || s.starts_with("CREATE TABLE") || s.starts_with("CREATE INDEX")) {
+        c.simple_query(sql).await.unwrap();
+    }
+    let oid: u32 = c.query_one("SELECT oid FROM pg_class WHERE relname='child_amount_idx'", &[]).await.unwrap().get(0);
+    // PG 18.6 returns an empty string for an out-of-range index column, not NULL.
+    for (expression, expected) in [
+        (format!("pg_catalog.pg_get_indexdef({oid},1,true)"), Some("amount")),
+        (format!("pg_get_indexdef({oid},2,true)"), Some("")),
+        ("pg_get_indexdef(0,1,true)".into(), None),
+        ("pg_get_indexdef(NULL,1,true)".into(), None),
+        ("pg_get_constraintdef(0,true)".into(), None),
+        ("pg_get_expr(NULL,0,true)".into(), None),
+        ("format_type(23,NULL)".into(), Some("integer")),
+        ("obj_description(0,'pg_class')".into(), None),
+        ("col_description(0,1)".into(), None),
+        ("shobj_description(0,'pg_database')".into(), None),
+    ] {
+        for sql in [
+            format!("SELECT {expression} AS column"),
+            format!("SELECT * FROM (SELECT {expression} AS column, 0 AS dummy) tmp ORDER BY dummy"),
+        ] {
+            let messages = c.simple_query(&sql).await.unwrap();
+            let rows: Vec<_> = messages.iter().filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r), _ => None,
+            }).collect();
+            assert_eq!(rows.len(), 1, "{sql}");
+            assert_eq!(rows[0].get(0), expected, "{sql}");
+            let row = c.query_one(&sql, &[]).await.unwrap();
+            assert_eq!(row.get::<_, Option<String>>(0).as_deref(), expected, "{sql}");
+            if row.len() == 2 {
+                assert_eq!(row.get::<_, i32>(1), 0);
+            }
+        }
+    }
+    let stmt = c.prepare("SELECT pg_catalog.pg_get_indexdef($1, $2, $3)").await.unwrap();
+    assert_eq!(c.query_one(&stmt, &[&oid, &1i32, &true]).await.unwrap().get::<_, String>(0), "amount");
+    let user: String = c.query_one("SELECT pg_get_userbyid(10)", &[]).await.unwrap().get(0);
+    let catalog_user: String = c.query_one("SELECT pg_get_userbyid(10) FROM pg_namespace LIMIT 1", &[]).await.unwrap().get(0);
+    assert_eq!(user, catalog_user);
+    c.simple_query("CREATE ROLE introspection_reader LOGIN").await.unwrap();
+    let (reader, connection) = Config::new().hostaddr(f.pg.address.ip()).port(f.pg.address.port())
+        .user("introspection_reader").dbname("postgres").connect(NoTls).await.unwrap();
+    let connection = tokio::spawn(connection);
+    let sql = format!("SELECT pg_get_indexdef({oid},1,true)");
+    let prepared = reader.prepare(&sql).await.unwrap();
+    // Catalog visibility and fresh authorization apply even to an already
+    // prepared table-free call, including after a privilege is revoked.
+    for (grant, expected) in [(false, None), (true, Some("amount")), (false, None)] {
+        let action = if grant { "GRANT SELECT ON gui_sales.child TO" } else { "REVOKE SELECT ON gui_sales.child FROM" };
+        c.simple_query(&format!("{action} introspection_reader")).await.unwrap();
+        let messages = reader.simple_query(&sql).await.unwrap();
+        let row = messages.iter().find_map(|m| match m { SimpleQueryMessage::Row(r) => Some(r), _ => None }).unwrap();
+        assert_eq!(row.get(0), expected);
+        assert_eq!(reader.query_one(&prepared, &[]).await.unwrap().get::<_, Option<String>>(0).as_deref(), expected);
+    }
+    drop(reader);
+    connection.await.unwrap().unwrap();
+    drop(c);
+    f.stop().await;
+}
+
 struct Fixture {
     service: Arc<Service>,
     pg: Running,
