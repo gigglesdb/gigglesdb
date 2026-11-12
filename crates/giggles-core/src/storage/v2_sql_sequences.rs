@@ -21,12 +21,12 @@ pub(super) fn callback(
             .ok_or(CoreError::Sql(SqlError::UnknownTable))?;
         let mut live = crate::cancellation::lock(&db.sql_counters)?;
         let mut check = db.begin(Isolation::ReadCommitted);
-        let committed = db
-            .catalog()
-            .parts(&mut check)?
-            .ext
-            .sequences
-            .get(&id)
+        // Preserve the fresh committed-incarnation check without cloning every
+        // table, constraint and sequence into CatalogParts on every value.
+        let committed = check
+            .get(Keyspace::Catalog, &engine::catalog_codec::sequence_key(id))?
+            .map(|bytes| engine::catalog_codec::decode_sequence(&bytes))
+            .transpose()?
             .is_some_and(|current| current.incarnation == def.incarnation);
         if !committed && baseline.get(&id) == Some(&def.incarnation) {
             return Err(CoreError::Sql(SqlError::UnknownTable));
@@ -56,8 +56,8 @@ pub(super) fn callback(
         } else {
             pending.get(&id).cloned()
         };
-        if let Some(counter) = prior {
-            state.seq.insert(id, counter);
+        if let Some(counter) = &prior {
+            state.seq.insert(id, counter.clone());
         }
         let result = match operation {
             "nextval" => sequences::next(&mut state, id),
@@ -75,11 +75,26 @@ pub(super) fn callback(
             .remove(&id)
             .expect("successful sequence evaluation");
         if committed {
-            db.sequencer.write_counter(
-                key,
-                engine::catalog_codec::encode_counter(&counter, def)?,
-                256,
-            )?;
+            // next() already computes the bounded 32-step recovery lookahead.
+            // The unchanged codec writes log_hw as the recovered last_value.
+            // A wrap must be written even when its highwater equals the old one.
+            let reservation_changed = prior.as_ref().is_none_or(|old| {
+                !old.is_called
+                    || old.log_hw != counter.log_hw
+                    || (def.cycle
+                        && if def.increment > 0 {
+                            counter.last_value < old.last_value
+                        } else {
+                            counter.last_value > old.last_value
+                        })
+            });
+            if operation == "setval" || reservation_changed {
+                db.sequencer.write_counter(
+                    key,
+                    engine::catalog_codec::encode_counter(&counter, def)?,
+                    256,
+                )?;
+            }
             live.insert(id, counter);
         } else {
             pending.insert(id, counter);
@@ -112,3 +127,7 @@ pub(super) fn stage_pending(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "v2_sequence_reservation_tests.rs"]
+mod reservation_tests;

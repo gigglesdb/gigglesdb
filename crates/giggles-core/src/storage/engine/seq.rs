@@ -9,6 +9,9 @@ use std::{
 };
 
 const DEFAULT_BLOCK: u64 = 1024;
+// DML reserves 1,000,001 versions per statement. Amortize its Sync over 64
+// statements without allocating memory proportional to the reservation.
+const ROW_VERSION_CHUNK: u64 = 64 * 1_000_001;
 type SequenceKey = [u8; 9];
 
 #[derive(Default)]
@@ -62,8 +65,9 @@ impl SequenceAllocator {
         Ok(value)
     }
 
-    /// Reserves `n` contiguous values beyond all cached reservations. Unused
-    /// cached values are abandoned so later calls also advance past the range.
+    /// Reserves `n` contiguous values from a durable cached block when possible.
+    /// Otherwise abandon its remainder and synchronously reserve a new chunk.
+    /// next() and ranges consume the same cursor under the same sequence lock.
     /// Zero length and exclusive-highwater overflow leave the sequence unchanged.
     pub(crate) fn reserve_range(
         &self,
@@ -78,11 +82,24 @@ impl SequenceAllocator {
         let slot = self.slot(key)?;
         let mut block = slot.lock().map_err(|_| TxnError::Misuse)?;
         self.check_live()?;
+        if n <= block.end - block.cur {
+            let start = block.cur;
+            block.cur += n;
+            return Ok(start..block.cur);
+        }
         let start = self.highwater(&key)?;
         let end = start.checked_add(n).ok_or(TxnError::Misuse)?;
-        self.persist_highwater(key, end)?;
-        block.cur = 0;
-        block.end = 0;
+        let chunk = if kind == 3 && id == 0 {
+            ROW_VERSION_CHUNK
+        } else {
+            self.block
+        };
+        // Near exhaustion reserve the representable tail, provided n fits.
+        let reserved_end = start.saturating_add(n.max(chunk));
+        self.persist_highwater(key, reserved_end)?;
+        // Publish only after Sync succeeds, just as next() does.
+        block.cur = end;
+        block.end = reserved_end;
         Ok(start..end)
     }
 
@@ -220,5 +237,44 @@ mod range_tests {
         assert!(seq.reserve_range(0, 0, 0).is_err());
         assert!(seq.reserve_range(0, 0, u64::MAX).is_err());
         assert_eq!(seq.next(0, 0).unwrap(), 2);
+    }
+
+    #[test]
+    fn row_version_chunks_serve_64_statements_before_refill() {
+        let mem = Arc::new(MemKv::new());
+        let seq = SequenceAllocator::new(Arc::new(Kv::new(mem.clone())), 7);
+        let first = seq.reserve_range(3, 0, 1_000_001).unwrap();
+        assert_eq!(first, 1..1_000_002);
+        // Leave a write failure armed: cached ranges must perform no writes.
+        mem.fail_next_write(KvError::Io("refill boundary".into()));
+        let mut end = first.end;
+        for _ in 1..64 {
+            let range = seq.reserve_range(3, 0, 1_000_001).unwrap();
+            assert_eq!(range.start, end);
+            end = range.end;
+        }
+        assert_eq!(end, 1 + ROW_VERSION_CHUNK);
+        let reopened = SequenceAllocator::new(Arc::new(Kv::new(Arc::new(mem.crash()))), 7);
+        assert!(reopened.reserve_range(3, 0, 1_000_001).unwrap().start >= end);
+        assert!(seq.reserve_range(3, 0, 1_000_001).is_err());
+        assert!(seq.next(3, 0).is_err());
+    }
+
+    #[test]
+    fn ranges_share_next_cursor_and_obey_floors_and_overflow() {
+        let mem = Arc::new(MemKv::new());
+        let kv = Arc::new(Kv::new(mem.clone()));
+        let seq = SequenceAllocator::new(kv, 8);
+        assert_eq!(seq.reserve_range(0, 0, 3).unwrap(), 1..4);
+        assert_eq!(seq.next(0, 0).unwrap(), 4);
+        assert_eq!(seq.reserve_range(0, 0, 2).unwrap(), 5..7);
+        seq.ensure_at_least(0, 0, 8).unwrap();
+        assert!(seq.reserve_range(0, 0, 2).unwrap().start >= 8);
+        seq.ensure_at_least(0, 0, u64::MAX - 4).unwrap();
+        assert!(seq.reserve_range(0, 0, 5).is_err());
+        assert_eq!(seq.reserve_range(0, 0, 4).unwrap(), u64::MAX - 4..u64::MAX);
+        assert!(seq.reserve_range(0, 0, 1).is_err());
+        let reopened = SequenceAllocator::new(Arc::new(Kv::new(Arc::new(mem.crash()))), 8);
+        assert!(reopened.reserve_range(0, 0, 1).is_err());
     }
 }
