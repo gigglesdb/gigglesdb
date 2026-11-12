@@ -43,6 +43,59 @@ pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     })
 }
 
+fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
+    unique: &[secondary_index::Descriptor],
+) -> Option<Vec<Vec<Value>>> {
+    let table = state.tables.get(prepared.table()?)?;
+    let mut point_keys = searched::target(prepared)
+        .and_then(|q| q.mutation_primary_keys(state, table, params));
+    // Preserve the page executor's RETURNING and UNIQUE error order.
+    let returning = match &prepared.statement {
+        Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
+            => returning.is_some(),
+        _ => false,
+    };
+    if returning && point_keys.as_ref().is_some_and(|keys| keys.len() > 1) {
+        point_keys = None;
+    }
+    if point_keys.as_ref().is_some_and(|keys| keys.len() > 1 || returning && !keys.is_empty()) {
+        let changed = match &prepared.statement {
+            Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+            _ => Vec::new(),
+        };
+        if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
+            .any(|c| c.id == *id && changed.contains(&&c.name)))) {
+            point_keys = None;
+        }
+    }
+    point_keys
+}
+
+impl Prepared {
+    /// The same logical route and candidate set as the bounded point publisher.
+    /// The storage bridge must also check its data-dependent retention fallback.
+    pub(crate) fn mutation_lock_keys(&self, state: &Relational, params: &[Value],
+        indexes: &[secondary_index::Descriptor],
+    ) -> Option<Vec<Vec<Value>>> {
+        if !eligible(state, self) { return None; }
+        let table = state.tables.get(self.table()?)?;
+        let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).cloned().collect::<Vec<_>>();
+        point_keys(state, self, params, &unique)
+    }
+
+    /// Plain VALUES appends use physical latest-owner PK/UNIQUE checks.
+    pub(crate) fn plain_values_append(&self, state: &Relational) -> bool {
+        let Some(table) = self.table().and_then(|name| state.tables.get(name)) else { return false; };
+        if state.ext.constraints.get(&table.id).into_iter().flatten().any(|c|
+            matches!(c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ref_table == table.id)) {
+            return false;
+        }
+        matches!(&self.statement, Statement::Insert { .. } | Statement::InsertExpressions(_))
+            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none())
+    }
+}
+
 pub(super) fn execute(
     state: &mut Relational,
     prepared: &Prepared,
@@ -72,31 +125,10 @@ pub(super) fn execute(
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
     let mut output = scan::Retention::new(MAX_RESULT_BYTES);
-    let mut point_keys = keys.is_none().then(|| searched::target(prepared)
-        .and_then(|q| q.mutation_primary_keys(state, &table, params))).flatten();
+    let point_keys = keys.is_none().then(|| point_keys(state, prepared, params, &unique)).flatten();
     // External UNIQUE witnesses are checked after each old page. Combining keys
     // can mask that error with a later CHECK, and even one row's RETURNING can
     // mask a page-local duplicate. Preserve the old path in those cases.
-    let returning = match &prepared.statement {
-        Statement::Update { returning, .. } | Statement::UpdateExpressions { returning, .. }
-            => returning.is_some(),
-        _ => false,
-    };
-    // Old pages project RETURNING before checking assignments on later pages.
-    if returning && point_keys.as_ref().is_some_and(|keys| keys.len() > 1) {
-        point_keys = None;
-    }
-    if point_keys.as_ref().is_some_and(|keys| keys.len() > 1 || returning && !keys.is_empty()) {
-        let changed = match &prepared.statement {
-            Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-            Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
-            _ => Vec::new(),
-        };
-        if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
-            .any(|c| c.id == *id && changed.contains(&&c.name)))) {
-            point_keys = None;
-        }
-    }
     sink.mutation_pages(&table, point_keys.as_deref(), &mut |mut rows| {
         let mut unchanged = DdlRows::new();
         if let Some(keys) = &keys {

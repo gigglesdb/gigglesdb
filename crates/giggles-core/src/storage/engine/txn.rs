@@ -313,6 +313,23 @@ impl Transaction {
         }
         mvcc::read_at(self.seq.kv(), ks, key, ts)
     }
+    /// SQL destination sentinel; acquire without choosing or inspecting a snapshot.
+    pub(crate) fn lock_sql_sentinel(
+        &self,
+        table: u64,
+        mode: LockMode,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), TxnError> {
+        if !matches!(mode, LockMode::Shared | LockMode::Exclusive) {
+            return Err(TxnError::Misuse);
+        }
+        self.locks.acquire(self.id, LockKey::Row { table, pk: Vec::new() }, mode, None, cancel)?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn sql_waiting_count(&self) -> usize {
+        self.locks.waiting_count()
+    }
     /// Selects the snapshot before waiting. Errors keep the transaction open; rollback or drop releases its locks.
     pub(crate) fn lock_for_write(
         &mut self,

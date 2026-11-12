@@ -219,19 +219,48 @@ fn pk_mutation_visibility_own_writes_deleted_rows_and_uncommitted_writer() {
         assert_eq!(s.execute("UPDATE t SET v=v+1 WHERE id=3",&[],None).unwrap().affected,0);
         s.execute("ROLLBACK",&[],None).unwrap();
         let entry=TableEntry { def:f.parts().tables["t"].clone(),heap:false,columns_ext:BTreeMap::new() };
-        let mut writer=f.db().begin(Isolation::ReadCommitted);
-        f.db().rows.update(&mut writer,&entry,&[Int(2)],&[(1,Int(99))],None,None,&||false).unwrap();
-        // Commit the other transaction after this statement reads its snapshot,
-        // before its publisher validates the row witness. Both paths conflict.
-        AFTER_MUTATION_PAGE.with_borrow_mut(|hook| *hook=Some(Box::new(move || {
-            writer.commit().unwrap();
-        })));
-        assert_eq!(s.execute("UPDATE t SET v=v+1 WHERE id=2",&[],None),Err(CoreError::Sql(SqlError::Conflict)));
-        assert!(AFTER_MUTATION_PAGE.with_borrow(|hook|hook.is_none()));
-        assert_eq!(contents(&mut s,"t"),vec![vec![Int(2),Int(99)]]);
-        // SQL writers serialize on the existing destination lock before choosing
-        // their statement snapshot. An uncommitted SQL writer still makes this
-        // request wait (and cancel), without reaching either mutation reader.
+        if disabled {
+            let mut writer=f.db().begin(Isolation::ReadCommitted);
+            f.db().rows.update(&mut writer,&entry,&[Int(2)],&[(1,Int(99))],None,None,&||false).unwrap();
+            // Direct RowStore writers bypass the SQL sentinel. The scan path
+            // still reads its preimage before locking this row, so a direct
+            // commit after that read retains the existing 40001 witness check.
+            AFTER_MUTATION_PAGE.with_borrow_mut(|hook| *hook=Some(Box::new(move || {
+                writer.commit().unwrap();
+            })));
+            assert_eq!(s.execute("UPDATE t SET v=v+1 WHERE id=2",&[],None),Err(CoreError::Sql(SqlError::Conflict)));
+            assert!(AFTER_MUTATION_PAGE.with_borrow(|hook|hook.is_none()));
+            assert_eq!(contents(&mut s,"t"),vec![vec![Int(2),Int(99)]]);
+        } else {
+            for commit in [false,true] {
+                f.execute("UPDATE t SET v=20 WHERE id=2");
+                let mut writer=f.db().begin(Isolation::ReadCommitted);
+                f.db().rows.update(&mut writer,&entry,&[Int(2)],&[(1,Int(99))],None,None,&||false).unwrap();
+                let release=std::thread::spawn(move || {
+                    let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
+                    while writer.sql_waiting_count()==0 {
+                        assert!(std::time::Instant::now()<until,"SQL UPDATE never waited on the direct writer's physical row lock");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    assert!(writer.sql_waiting_count()>0);
+                    if commit { writer.commit().unwrap(); } else { writer.rollback(); }
+                });
+                // PG18 READ COMMITTED: wait for the concurrent updater, then
+                // re-read its committed version (or the original on rollback).
+                // Point locks precede this snapshot; the scan path above does not.
+                let result=s.execute("UPDATE t SET v=v+1 WHERE id=2 RETURNING v",&[],None);
+                release.join().unwrap();
+                let expected=Int(if commit { 100 } else { 21 });
+                assert_eq!(result.unwrap().rows[0].values,vec![expected.clone()]);
+                assert_eq!(contents(&mut s,"t"),vec![vec![Int(2),expected]]);
+            }
+            // Restore the common baseline for the cancellation check below.
+            f.execute("UPDATE t SET v=99 WHERE id=2");
+        }
+        // SQL writers wait on the destination sentinel (scan) or physical row
+        // (point) before choosing their final snapshot. An uncommitted SQL writer
+        // still makes this request wait/cancel without reaching a mutation reader.
         let mut writer=f.admin().sql_session();
         writer.execute("BEGIN",&[],None).unwrap();
         writer.execute("UPDATE t SET v=111 WHERE id=2",&[],None).unwrap();

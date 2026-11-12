@@ -272,8 +272,8 @@ impl SqlSession {
                                 txn.begin_statement();
                             }
                         }
-                        // Lock before choosing the statement snapshot/image. SQL mutations
-                        // serialize per table; readers retain MVCC snapshot visibility.
+                        // Resolve and lock relations before choosing the final statement
+                        // snapshot/image; readers retain MVCC snapshot visibility.
                         let parts = db.catalog().parts(txn)?;
                         // Bind from the original references, preserving explicit public
                         // qualification even when another schema shadows the bare name.
@@ -379,14 +379,57 @@ impl SqlSession {
                             && let Some(table) =
                                 target_name.as_ref().and_then(|name| parts.tables.get(name))
                         {
-                            // Empty PK cannot name a real row. Serialize SQL writers
-                            // only on the destination; source readers remain MVCC.
-                            txn.lock_for_write(
-                                Keyspace::Rows,
-                                &table.id.to_be_bytes(),
-                                None,
-                                &|| crate::cancellation::check().is_err(),
-                            )?;
+                            // Shared point/append writers still exclude every paged,
+                            // conflict/action, COPY and fixed-snapshot writer. Actual
+                            // target rows are locked in physical order BEFORE refreshing.
+                            let candidates = (expected_version.is_none()
+                                && self.copy_input.is_none()
+                                && txn.isolation() == Isolation::ReadCommitted)
+                                .then(|| bound.mutation_lock_keys(&binding, params, &parts.indexes))
+                                .flatten();
+                            let append = self.copy_input.is_none()
+                                && txn.isolation() == Isolation::ReadCommitted
+                                && expected_version.is_none()
+                                && bound.plain_values_append(&binding);
+                            #[cfg(test)]
+                            let candidates = if DISABLE_MUTATION_POINTS.get() { None } else { candidates };
+                            let shared = append || candidates.is_some();
+                            txn.lock_sql_sentinel(table.id,
+                                if shared { LockMode::Shared } else { LockMode::Exclusive },
+                                &|| crate::cancellation::check().is_err())?;
+                            if let Some(keys) = candidates {
+                                let physical = keys.iter().map(|key| {
+                                    let mut physical = table.id.to_be_bytes().to_vec();
+                                    physical.extend(codec::pk_bytes(key)?);
+                                    Ok(physical)
+                                }).collect::<Result<BTreeSet<_>, CoreError>>()?;
+                                let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+                                let mut fits = true;
+                                for key in physical {
+                                    let target = txn.lock_for_write(Keyspace::Rows, &key, None,
+                                        &|| crate::cancellation::check().is_err())?;
+                                    if let Some(bytes) = target.current {
+                                        // Locked targets cannot grow before the final
+                                        // snapshot. Reuse the publisher's exact budget.
+                                        let charge = (|| {
+                                            let record = codec::decode_row(&key, &bytes)?;
+                                            if record.tombstone || record.values.len() > table.columns.len() {
+                                                return Err(CoreError::Corrupt("invalid v2 SQL row witness".into()));
+                                            }
+                                            let mut row = SqlRow { values: record.values, version: record.row_version };
+                                            row.values.resize(table.columns.len(), relational::Value::Null);
+                                            charge_mutation_point(table, &row, &mut retention)
+                                        })();
+                                        fits &= charge.unwrap_or(false);
+                                    }
+                                }
+                                if !fits {
+                                    // The point publisher would scan pages. Upgrade
+                                    // before taking its snapshot; never refresh mid-scan.
+                                    txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
+                                        &|| crate::cancellation::check().is_err())?;
+                                }
+                            }
                         }
                         // Choose ONE snapshot after every potentially blocking lock.
                         // No refresh occurs while staging any of the statement's rows.
@@ -749,6 +792,10 @@ fn check_post_image(
 #[path = "v2_sql_tests.rs"]
 mod tests;
 
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_writer_lock_tests.rs"]
+mod writer_lock_tests;
+
 /// Transient statement images use legacy keys. Only this sink translates them
 /// into the existing v2 key/row codec; it never persists relational image bytes.
 type IndexRange = (relational::secondary_index::Descriptor, Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -762,6 +809,15 @@ struct SqlRows<'a> {
     prepared: &'a relational::Prepared,
     params: &'a [relational::Value],
 }
+
+fn charge_mutation_point(table: &TableDef, row: &SqlRow,
+    retention: &mut relational::scan::Retention,
+) -> Result<bool, CoreError> {
+    let key = relational::row_sink::row_key(table, row).map_err(CoreError::Sql)?;
+    let bytes = relational::row_sink::retained_bytes(&key, row).map_err(CoreError::Sql)?;
+    Ok(retention.charge(bytes).is_ok() && retention.used() <= 256 * 1024)
+}
+
 impl RowSink for SqlRows<'_> {
     fn mutation_keys(
         &mut self, state: &relational::Relational, prepared: &relational::Prepared,
@@ -847,11 +903,10 @@ impl RowSink for SqlRows<'_> {
                 MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
                 let row = SqlRow { values: row.values, version: row.version };
                 let key = relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?;
-                let bytes = relational::row_sink::retained_bytes(&key, &row).map_err(CoreError::Sql)?;
                 // Sparse targets can aggregate wider rows than any old page.
                 // Leave room for the eight UNIQUE sidecars and their work meters;
                 // fall back before invoking the callback or publishing a write.
-                if retention.charge(bytes).is_err() || retention.used() > 256 * 1024 {
+                if !charge_mutation_point(table, &row, &mut retention)? {
                     return self.ddl_pages(table, table, true, page);
                 }
                 rows.insert(key, row);
