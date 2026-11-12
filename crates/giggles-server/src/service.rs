@@ -566,14 +566,13 @@ impl Session {
         };
         self.check_binding().map_err(|error| sqlstate(&error))?;
         if let crate::auth::statements::AdminStatement::DropTable(optional, names) = stmt
-            && names.len() == 1
             && self.in_transaction()
             && self.sql.set_ddl_owner(Some(name))
         {
             let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-            let target = if let Some((schema, table)) = names[0].split_once('\0') {
+            let target = names.iter().map(|name| if let Some((schema, table)) = name.split_once('\0') {
                 format!("{}.{}", quote(schema), quote(table))
-            } else { quote(&names[0]) };
+            } else { quote(name) }).collect::<Vec<_>>().join(", ");
             let sql = format!("DROP TABLE {}{target}", if *optional { "IF EXISTS " } else { "" });
             self.execute_sql(&sql, &[]).map_err(|e| sqlstate(&e))?;
             return Ok("DROP TABLE");
@@ -858,11 +857,11 @@ impl Session {
             if let Some(table) = alter_target {
                 session.authorize_alter_table(&table)?;
             }
-            let drop_target = Prepared::drop_table_target(sql).map_err(|error| {
+            let drop_targets = Prepared::drop_table_targets(sql).map_err(|error| {
                 session.sql.abort();
                 parse_error(session, CoreError::Sql(error))
             })?;
-            if let Some(table) = drop_target {
+            for table in drop_targets {
                 session.authorize_alter_table(&table)?;
             }
             let sequence_targets = Prepared::sequence_ddl_targets(sql).map_err(|error| {
@@ -1218,13 +1217,15 @@ impl Session {
                 || p.is_drop_table()
                 || (p.command() == "DROP INDEX" && p.table().is_some())
             {
-                let table = p.table().ok_or(CoreError::Policy(Error::Scope))?;
-                let name_at_commit = self.sql.table_authority_name(table)?;
-                self.sql
-                    .table_owner(&name_at_commit)
-                    .map_err(|_| CoreError::Policy(Error::Scope))?
-                    .as_deref()
-                    == Some(name.as_str())
+                let targets = if p.is_drop_table() { p.drop_tables().iter().map(String::as_str).collect() }
+                    else { vec![p.table().ok_or(CoreError::Policy(Error::Scope))?] };
+                let mut owns_all = true;
+                for table in targets {
+                    let name_at_commit = self.sql.table_authority_name(table)?;
+                    owns_all &= self.sql.table_owner(&name_at_commit)
+                        .map_err(|_| CoreError::Policy(Error::Scope))?.as_deref() == Some(name.as_str());
+                }
+                owns_all
             } else if p.is_ddl() {
                 let schema = if p.command() == "CREATE TABLE" {
                     self.sql.creation_schema(p)?

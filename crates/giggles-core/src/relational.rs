@@ -920,7 +920,7 @@ enum Statement {
     TypeDdl(user_types::Ddl),
     CompositeSelect(user_types::CompositeSelect),
     DropTable {
-        name: String,
+        names: Vec<String>,
         optional: bool,
         cascade: bool,
         resolution_error: Option<SqlError>,
@@ -1221,25 +1221,24 @@ impl Parser {
             } else {
                 false
             };
-            let first = alter_table::raw_name(self)?;
-            let (name, resolution_error) = if self.sym('.') {
-                let name = alter_table::raw_name(self)?;
-                let error = ident::ident(&name).err();
-                self.relations
-                    .push(schemas::Reference::read(name.clone(), Some(first.clone())));
-                (format!("{first}\0{name}"), error)
-            } else {
-                let error = ident::ident(&first).err();
-                self.relations
-                    .push(schemas::Reference::read(first.clone(), None));
-                (first, error)
-            };
+            let mut names = Vec::new();
+            let mut resolution_error = None;
+            loop {
+                let first = alter_table::raw_name(self)?;
+                let (name, schema) = if self.sym('.') {
+                    (alter_table::raw_name(self)?, Some(first))
+                } else { (first, None) };
+                resolution_error = resolution_error.or_else(|| ident::ident(&name).err());
+                self.relations.push(schemas::Reference::read(name.clone(), schema.clone()));
+                names.push(schema.map_or_else(|| name.clone(), |s| format!("{s}\0{name}")));
+                if !self.sym(',') { break; }
+            }
             let cascade = self.word("cascade");
             if !cascade {
                 self.word("restrict");
             }
             Statement::DropTable {
-                name,
+                names,
                 optional,
                 cascade,
                 resolution_error,
@@ -2183,7 +2182,7 @@ impl Prepared {
     /// Parsed table target for gateway authorization. Controls have no target.
     pub fn table(&self) -> Option<&str> {
         match &self.statement {
-            Statement::Truncate { names, .. } => names.first().map(String::as_str),
+            Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.first().map(String::as_str),
             Statement::Query(q) => {
                 if q.is_table_free() {
                     None
@@ -2197,7 +2196,6 @@ impl Prepared {
             Statement::DropIndex(index) => index.table.as_deref(),
             Statement::InsertMulti(insert) => Some(&insert.table),
             Statement::Create { name, .. }
-            | Statement::DropTable { name, .. }
             | Statement::Insert { name, .. }
             | Statement::Select { name, .. }
             | Statement::Update { name, .. }
@@ -2253,6 +2251,9 @@ impl Prepared {
                 | Statement::AlterTable(_)
                 | Statement::DropTable { .. }
         )
+    }
+    pub fn drop_tables(&self) -> &[String] {
+        match &self.statement { Statement::DropTable { names, .. } => names, _ => &[] }
     }
     pub fn is_drop_table(&self) -> bool {
         matches!(self.statement, Statement::DropTable { .. })
@@ -2602,12 +2603,12 @@ impl Prepared {
         Ok(Some(alter_table::parse(&mut parser)?.table))
     }
     /// Parse DROP ownership targets without consulting the catalog.
-    pub fn drop_table_target(sql: &str) -> R<Option<String>> {
+    pub fn drop_table_targets(sql: &str) -> R<Vec<String>> {
         let Ok(tokens) = lex(sql) else {
-            return Ok(None);
+            return Ok(vec![]);
         };
         if !matches!(tokens.first(),Some(Token::Word(word)) if word == "drop") {
-            return Ok(None);
+            return Ok(vec![]);
         }
         let mut parser = Parser {
             tokens,
@@ -2616,8 +2617,8 @@ impl Prepared {
             relations: Vec::new(),
         };
         match parser.parse()? {
-            Statement::DropTable { name, .. } => Ok(Some(name)),
-            _ => Ok(None),
+            Statement::DropTable { names, .. } => Ok(names),
+            _ => Ok(vec![]),
         }
     }
     /// Parse-only negative routing hint. No binding, evaluation, metadata or authority.
@@ -3452,7 +3453,7 @@ impl Relational {
                 alter_table::execute(self, alter, &prepared.search_path, clock, &mut cancel)?;
             }
             Statement::DropTable {
-                name,
+                names,
                 optional,
                 cascade,
                 resolution_error,
@@ -3463,9 +3464,18 @@ impl Relational {
                 if expected.is_some() {
                     return Err(SqlError::Unsupported);
                 }
-                if !self.drop_table_with_actions(name, *cascade)? && !optional {
+                // Validate the entire set before removing anything. Dependencies
+                // between listed tables do not require CASCADE (including cycles).
+                let ids = names.iter().filter_map(|n| self.tables.get(n).map(|t| t.id)).collect::<BTreeSet<_>>();
+                if !optional && names.iter().any(|n| !self.tables.contains_key(n)) {
                     return Err(SqlError::UnknownTable);
                 }
+                if !cascade && self.ext.constraints.iter().any(|(id, constraints)|
+                    !ids.contains(id) && constraints.iter().any(|c|
+                        matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ids.contains(ref_table)))) {
+                    return Err(SqlError::DependentObjects);
+                }
+                for name in names { self.drop_table_with_actions(name, true)?; }
             }
             Statement::SetConstraints(_, _) => return Err(SqlError::NoActiveTransaction),
             Statement::DropIndex(index) => {

@@ -373,3 +373,6 @@ mod orm_identity_metadata;
 
 #[path = "orm_casts.rs"]
 mod orm_casts;
+
+#[path = "orm_rows.rs"]
+mod orm_rows;

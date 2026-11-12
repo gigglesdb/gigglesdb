@@ -796,7 +796,11 @@ impl Filter {
                     Scalar::parse(p, depth)
                 }
             };
-            let a = parse_scalar(p, depth)?;
+            // A comma at the outer parenthesis level distinguishes a row from
+            // scalar grouping. Lower rows here, keeping scalar and wire types unchanged.
+            let a = if Self::starts_row(p) {
+                Scalar::Predicate(Box::new(Self::row_filter(p, depth, aggregate_argument)?))
+            } else { parse_scalar(p, depth)? };
             let not = matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w == "not")
                 && matches!(p.tokens.get(p.at + 1), Some(Token::Word(w)) if w == "in" || w == "between" || w == "like" || w == "ilike");
             if not {
@@ -963,6 +967,67 @@ impl Filter {
             );
         }
         Ok(f)
+    }
+    fn row_filter(p: &mut Parser, depth: usize, aggregate_argument: bool) -> R<Self> {
+        let a = Self::row(p, depth, aggregate_argument)?;
+        let not = p.word("not");
+        let mut rows = Vec::new();
+        let inequality = if p.word("in") {
+            p.punct('(')?;
+            loop {
+                rows.push(Self::row(p, depth, aggregate_argument)?);
+                if !p.sym(',') { break; }
+            }
+            p.punct(')')?;
+            false
+        } else {
+            if not { return Err(SqlError::Syntax); }
+            let Some(Token::Op(op)) = p.tokens.get(p.at) else { return Err(SqlError::Syntax); };
+            let inequality = match op.as_str() {
+                "=" => false, "<>" | "!=" => true, _ => return Err(SqlError::Unsupported),
+            };
+            p.at += 1;
+            rows.push(Self::row(p, depth, aggregate_argument)?);
+            inequality
+        };
+        let mut comparisons = Vec::new();
+        admit_expansion(&Scalar::Call(String::new(), a.clone()), rows.len())?;
+        for b in rows {
+            if a.len() != b.len() { return Err(SqlError::Syntax); }
+            let fields = a.iter().cloned().zip(b).map(|(a, b)| Self::Compare(a, "=".into(), b)).collect::<Vec<_>>();
+            comparisons.push(Self::combine(&fields, true));
+        }
+        let f = Self::combine(&comparisons, false);
+        let f = if not || inequality { Self::Not(Box::new(f)) } else { f };
+        f.admit_shape(depth, &mut 0)?;
+        // Reuse the normal IS / AND / OR suffix parser without scalar changes.
+        Ok(f)
+    }
+    fn starts_row(p: &Parser) -> bool {
+        if p.tokens.get(p.at) != Some(&Token::Symbol('(')) { return false; }
+        let mut level = 0;
+        for token in &p.tokens[p.at..] {
+            match token {
+                Token::Symbol('(') => level += 1,
+                Token::Symbol(')') => { level -= 1; if level == 0 { break; } }
+                Token::Symbol(',') if level == 1 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+    fn row(p: &mut Parser, depth: usize, aggregate: bool) -> R<Vec<Scalar>> {
+        p.punct('(')?;
+        let mut fields = vec![Scalar::parse_expr(p, depth + 1, aggregate)?];
+        while p.sym(',') { fields.push(Scalar::parse_expr(p, depth + 1, aggregate)?); }
+        p.punct(')')?;
+        Ok(fields)
+    }
+    fn combine(filters: &[Self], and: bool) -> Self {
+        if filters.len() == 1 { return filters[0].clone(); }
+        let middle = filters.len() / 2;
+        Self::Logic(Box::new(Self::combine(&filters[..middle], and)), and,
+            Box::new(Self::combine(&filters[middle..], and)))
     }
     // Split the list in half so large IN lists retain logarithmic filter depth.
     // Callers must call admit_expansion first: every entry clones the lhs.

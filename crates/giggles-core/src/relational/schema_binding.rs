@@ -129,15 +129,14 @@ impl Prepared {
             }
         };
         match &mut bound.statement {
-            Statement::Truncate { names, .. } => names.iter_mut().for_each(read),
+            Statement::Truncate { names, .. } | Statement::DropTable { names, .. } => names.iter_mut().for_each(read),
             Statement::Create {
                 name, constraints, ..
             } => {
                 *name = create(name)?;
                 definitions(constraints);
             }
-            Statement::DropTable { name, .. }
-            | Statement::Insert { name, .. }
+            Statement::Insert { name, .. }
             | Statement::Select { name, .. } => read(name),
             Statement::Update { name, search, .. } | Statement::Delete { name, search, .. } => {
                 read(name);

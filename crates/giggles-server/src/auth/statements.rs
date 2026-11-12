@@ -222,8 +222,11 @@ impl Parser {
             let names = self
                 .names(table)
                 .map_err(|e| if table && e == "fallback" { "42601" } else { e })?;
+            if table && (self.kw("cascade") || self.kw("restrict")) && self.pos == self.tokens.len() {
+                return Err("fallback"); // Core SQL owns dependency actions and transactional DDL.
+            }
             if self.pos != self.tokens.len() {
-                return Err(if !table || self.kw("cascade") || self.kw("restrict") {
+                return Err(if !table {
                     "0A000"
                 } else {
                     "42601"
@@ -960,7 +963,7 @@ mod tests {
             "DROP TABLE IF EXISTS public.t, u RESTRICT;",
         ] {
             assert!(
-                matches!(parse(sql), Some(AdminStatement::Error("0A000"))),
+                parse(sql).is_none(),
                 "{sql}"
             );
         }

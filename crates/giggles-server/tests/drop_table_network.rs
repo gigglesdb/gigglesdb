@@ -370,12 +370,10 @@ async fn guards(protocol: Protocol) {
     protocol
         .ok(&owner, "CREATE TABLE t (id BIGINT PRIMARY KEY)")
         .await;
-    protocol
-        .error(&owner, "DROP TABLE t CASCADE", "0A000")
-        .await;
-    protocol
-        .error(&owner, "DROP TABLE t RESTRICT", "0A000")
-        .await;
+    for action in ["CASCADE", "RESTRICT"] {
+        protocol.ok(&owner, &format!("DROP TABLE t {action}")).await;
+        protocol.ok(&owner, "CREATE TABLE t (id BIGINT PRIMARY KEY)").await;
+    }
     protocol.ok(&owner, "BEGIN").await;
     protocol.error(&owner, "DROP TABLE t", "25001").await;
     protocol.ok(&owner, "ROLLBACK").await;

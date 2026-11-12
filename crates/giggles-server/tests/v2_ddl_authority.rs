@@ -98,6 +98,26 @@ fn prepared_ddl_ownership_commits_and_rolls_back_without_deadlock() {
                 assert_eq!(client.query("SELECT id FROM created", &[]).await.unwrap().len(), 1);
                 assert!(roles.table_privileges("created", "owner").unwrap().contains(&TablePrivilege::Select));
             }
+            client.execute("CREATE TABLE child (id bigint PRIMARY KEY, parent bigint REFERENCES created)", &[]).await.unwrap();
+            client.execute("INSERT INTO child VALUES (1,1)", &[]).await.unwrap();
+            for simple in [false, true] {
+                client.execute("BEGIN", &[]).await.unwrap();
+                client.execute("SAVEPOINT keep", &[]).await.unwrap();
+                let err = client.execute("DROP TABLE created RESTRICT", &[]).await.unwrap_err();
+                assert_eq!(err.code().unwrap().code(), "2BP01");
+                client.execute("ROLLBACK TO keep", &[]).await.unwrap();
+                for sql in ["DROP TABLE created CASCADE", "DROP TABLE created, child RESTRICT", "DROP TABLE child, created"] {
+                    if simple { client.simple_query(sql).await.unwrap(); }
+                    else { client.execute(sql, &[]).await.unwrap(); }
+                    client.execute("ROLLBACK TO keep", &[]).await.unwrap();
+                    assert_eq!(client.query("SELECT * FROM child", &[]).await.unwrap().len(), 1);
+                }
+                client.execute("DROP TABLE created CASCADE", &[]).await.unwrap();
+                client.execute("ROLLBACK", &[]).await.unwrap();
+                let err = client.execute("INSERT INTO child VALUES (2,999)", &[]).await.unwrap_err();
+                assert_eq!(err.code().unwrap().code(), "23503");
+            }
+            client.execute("DROP TABLE child", &[]).await.unwrap();
             client.execute("CREATE INDEX created_ix ON created (id)", &[]).await.unwrap();
             client.execute("BEGIN", &[]).await.unwrap();
             client.execute("SAVEPOINT keep", &[]).await.unwrap();
