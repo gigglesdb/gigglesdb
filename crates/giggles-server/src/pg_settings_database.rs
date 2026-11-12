@@ -316,7 +316,7 @@ fn validate(name: Show, values: Vec<Token>) -> Result<String> {
             Ok("UTF8".into())
         }
         Show::StandardConformingStrings if lower == "on" => Ok("on".into()),
-        Show::IntervalStyle if lower == "postgres" => Ok("postgres".into()),
+        Show::IntervalStyle => interval_style(&value),
         Show::ByteaOutput if lower == "hex" => Ok("hex".into()),
         Show::ClientMinMessages
             if matches!(
@@ -421,6 +421,15 @@ fn search_path(values: Vec<Token>) -> Result<String> {
         }
     }
     Ok(schemas.join(", "))
+}
+
+pub(crate) fn interval_style(value: &str) -> Result<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "postgres" | "postgres_verbose" | "sql_standard" | "iso_8601" => {
+            Ok(value.to_ascii_lowercase())
+        }
+        _ => Err("22023"),
+    }
 }
 
 fn boolean(value: &str) -> Result<bool> {

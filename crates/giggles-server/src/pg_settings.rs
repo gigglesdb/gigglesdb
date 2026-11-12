@@ -23,6 +23,7 @@ pub(crate) struct Settings {
     pub extra_float_digits: i32,
     pub timezone: String,
     pub datestyle: String,
+    pub intervalstyle: String,
     /// Only public contains engine tables; non-public schemas resolve nothing.
     /// Unqualified names still resolve to public even for an empty path, until
     /// schemas exist. This is an intentional restore-compatibility divergence.
@@ -49,6 +50,7 @@ impl Default for Settings {
             extra_float_digits: 1,
             timezone: "UTC".into(),
             datestyle: "ISO".into(),
+            intervalstyle: "postgres".into(),
             search_path: r#""$user", public"#.into(),
             client_min_messages: "notice".into(),
             check_function_bodies: "on".into(),
@@ -191,6 +193,7 @@ impl Settings {
             }
             Show::TimeZone => self.timezone = value,
             Show::DateStyle => self.datestyle = value,
+            Show::IntervalStyle => self.intervalstyle = value,
             Show::SearchPath => self.search_path = value,
             Show::ClientMinMessages => self.client_min_messages = value,
             Show::CheckFunctionBodies => self.check_function_bodies = value,
@@ -316,7 +319,7 @@ impl Show {
             Self::MaxIndexKeys => ("max_index_keys", "32".into()),
             Self::DateStyle => ("DateStyle", settings.datestyle.clone()),
             Self::TimeZone => ("TimeZone", settings.timezone.clone()),
-            Self::IntervalStyle => ("IntervalStyle", "postgres".into()),
+            Self::IntervalStyle => ("IntervalStyle", settings.intervalstyle.clone()),
             Self::ByteaOutput => ("bytea_output", "hex".into()),
             Self::TransactionTimeout => ("transaction_timeout", "0".into()),
             Self::ClientMinMessages => {
@@ -544,6 +547,48 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Vec<Setting>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn intervalstyle_tracks_reset_local_and_rollback() {
+        let mut state = SessionSettings::default();
+        state.defaults.intervalstyle = "sql_standard".into();
+        for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
+            let settings = parse_database(&format!("SET IntervalStyle = '{style}'"))
+                .unwrap()
+                .unwrap();
+            state.apply(&settings[0], false);
+            assert_eq!(
+                show_database("SHOW intervalstyle"),
+                Ok(Some(Show::IntervalStyle))
+            );
+            assert_eq!(Show::IntervalStyle.value(&state.current).1, style);
+        }
+        state.transaction(false, true, "BEGIN");
+        let local = parse_database("SET LOCAL intervalstyle = postgres_verbose")
+            .unwrap()
+            .unwrap();
+        state.apply(&local[0], true);
+        assert_eq!(state.current.intervalstyle, "postgres_verbose");
+        state.transaction(true, false, "COMMIT");
+        assert_eq!(state.current.intervalstyle, "iso_8601");
+        state.transaction(false, true, "BEGIN");
+        state.apply(&local[0], true);
+        state.transaction(true, false, "ROLLBACK");
+        assert_eq!(state.current.intervalstyle, "iso_8601");
+        for sql in [
+            "RESET intervalstyle",
+            "SET intervalstyle = DEFAULT",
+            "RESET ALL",
+        ] {
+            let settings = parse_database(sql).unwrap().unwrap();
+            state.apply(&settings[0], false);
+            assert_eq!(state.current.intervalstyle, "sql_standard");
+        }
+        assert!(parse_database("SET intervalstyle = ISO_8601").is_ok());
+        assert_eq!(parse_database("SET intervalstyle = invalid"), Err("22023"));
+        // The certificate-authenticated agent grammar stays closed.
+        assert_eq!(parse("SET intervalstyle = iso_8601"), Err("0A000"));
+    }
+
     #[test]
     fn inspection_parser_rejects_suffixes_and_unknown_settings() {
         for query in [

@@ -1916,7 +1916,12 @@ pub(crate) async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
         ("integer_datetimes", "on"),
         ("DateStyle", "ISO"),
         ("TimeZone", timezone.as_str()),
-    ] {
+    ]
+    .into_iter()
+    .chain(matches!(session.role, Role::Database { .. }).then_some((
+        "IntervalStyle",
+        startup_settings.intervalstyle.as_str(),
+    ))) {
         let mut b = vec![];
         z(key, &mut b);
         z(value, &mut b);

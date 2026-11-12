@@ -66,10 +66,19 @@ async fn case_folded_timezone_and_duplicate_on_postgresql_listener() {
         vec![("timezone", "UTC")],
         vec![("TIMEZONE", "UTC")],
         vec![("timezone", "America/Chicago")],
+        vec![("IntervalStyle", "postgres")],
+        vec![("intervalstyle", "postgres_verbose")],
+        vec![("INTERVALSTYLE", "sql_standard")],
+        vec![("IntervalStyle", "iso_8601")],
         vec![("TimeZone", "UTC"), ("timezone", "UTC")],
     ] {
         let duplicate = fields.len() == 2;
         let expected = fields[0].1;
+        let parameter = if fields[0].0.eq_ignore_ascii_case("intervalstyle") {
+            &b"IntervalStyle"[..]
+        } else {
+            &b"TimeZone"[..]
+        };
         let mut stream = TcpStream::connect(pg.address).await.unwrap();
         let mut body = 196608u32.to_be_bytes().to_vec();
         for (key, value) in [("user", "owner"), ("database", "postgres")]
@@ -95,7 +104,7 @@ async fn case_folded_timezone_and_duplicate_on_postgresql_listener() {
                 assert_ne!(tag, b'E', "startup rejected: {body:?}");
                 if tag == b'S' {
                     let fields: Vec<_> = body.split(|b| *b == 0).collect();
-                    if fields[0] == b"TimeZone" {
+                    if fields[0] == parameter {
                         timezone = Some(fields[1].to_vec());
                     }
                 }
@@ -104,6 +113,24 @@ async fn case_folded_timezone_and_duplicate_on_postgresql_listener() {
                 }
             }
             assert_eq!(timezone.as_deref(), Some(expected.as_bytes()));
+            if parameter == b"IntervalStyle" {
+                let sql = b"SHOW intervalstyle; SET intervalstyle = postgres; RESET intervalstyle; SHOW intervalstyle;\0";
+                stream.write_u8(b'Q').await.unwrap();
+                stream.write_u32((sql.len() + 4) as u32).await.unwrap();
+                stream.write_all(sql).await.unwrap();
+                let mut values = Vec::new();
+                loop {
+                    let (tag, body) = frame(&mut stream).await;
+                    assert_ne!(tag, b'E', "query rejected: {body:?}");
+                    if tag == b'D' {
+                        values.push(body[6..].to_vec());
+                    }
+                    if tag == b'Z' {
+                        break;
+                    }
+                }
+                assert_eq!(values, vec![expected.as_bytes(), expected.as_bytes()]);
+            }
         }
     }
     pg.shutdown().await.unwrap();

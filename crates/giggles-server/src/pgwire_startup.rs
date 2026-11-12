@@ -62,6 +62,7 @@ pub(crate) fn parse_startup(
                     "client_encoding",
                     "application_name",
                     "DateStyle",
+                    "IntervalStyle",
                     "TimeZone",
                     "extra_float_digits",
                 ] {
@@ -104,6 +105,9 @@ pub(crate) fn parse_startup(
             }
         }
         if fields.keys().any(|k| {
+            if k == "IntervalStyle" && matches!(policy, StartupPolicy::Postgresql { .. }) {
+                return false;
+            }
             !matches!(
                 k.as_str(),
                 "user"
@@ -163,6 +167,10 @@ pub(crate) fn parse_startup(
         if let Some(digits) = fields.get("extra_float_digits") {
             startup_settings.extra_float_digits = digits.parse().map_err(|_| "22023")?;
         }
+        if let Some(style) = fields.get("IntervalStyle") {
+            reason = "invalid value for parameter IntervalStyle";
+            startup_settings.intervalstyle = crate::pg_settings::database::interval_style(style)?;
+        }
         startup_settings.timezone = timezone.clone();
         Ok(Startup {
             user: fields.remove("user").unwrap(),
@@ -192,6 +200,47 @@ pub(crate) async fn reject_startup<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intervalstyle_startup_validates_all_styles_and_case_folded_duplicates() {
+        let databases = vec!["giggles".into()];
+        let pg = StartupPolicy::Postgresql {
+            databases: &databases,
+        };
+        for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
+            let startup = parse_startup(
+                &body(&[
+                    ("user", "giggles"),
+                    ("database", "giggles"),
+                    ("INTERVALSTYLE", &style.to_ascii_uppercase()),
+                ]),
+                &pg,
+            )
+            .ok()
+            .unwrap();
+            assert_eq!(startup.settings.intervalstyle, style);
+        }
+        let fields = [
+            ("user", "giggles"),
+            ("database", "giggles"),
+            ("IntervalStyle", "invalid"),
+        ];
+        assert_eq!(error(&fields, &pg).0, "22023");
+        assert_eq!(error(&fields, &StartupPolicy::Agent).0, "0A000");
+        assert_eq!(
+            error(
+                &[
+                    ("user", "giggles"),
+                    ("database", "giggles"),
+                    ("IntervalStyle", "postgres"),
+                    ("intervalstyle", "iso_8601")
+                ],
+                &pg
+            )
+            .0,
+            "08P01"
+        );
+    }
 
     fn body(fields: &[(&str, &str)]) -> Vec<u8> {
         let mut b = 196608u32.to_be_bytes().to_vec();
