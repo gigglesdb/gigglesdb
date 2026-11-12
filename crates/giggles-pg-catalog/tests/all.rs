@@ -102,3 +102,6 @@ mod user_defined_types;
 
 #[path = "datagrip_refresh.rs"]
 mod datagrip_refresh;
+
+#[path = "orm_regtype.rs"]
+mod orm_regtype;

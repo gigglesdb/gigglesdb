@@ -667,12 +667,8 @@ pub(super) fn install_create(
     candidate
         .tables
         .insert(relation_key(schema, &table.name), table.clone());
-    for ((column, _default), (spec, typmod)) in table
-        .columns
-        .iter()
-        .zip(defaults)
-        .zip(sequences.iter().zip(typmods))
-    {
+    // Sequence mutators validate the complete catalog, including later columns.
+    for (column, typmod) in table.columns.iter().zip(typmods) {
         let logical = match column.data_type {
             DataType::Uuid => Some(catalog_ext::LogicalKind::Uuid),
             DataType::Jsonb => Some(catalog_ext::LogicalKind::Jsonb),
@@ -704,6 +700,8 @@ pub(super) fn install_create(
         if let Some(typmod) = typmod {
             candidate.ext.columns.entry(column.id).or_default().typmod = Some(*typmod);
         }
+    }
+    for (column, spec) in table.columns.iter().zip(sequences) {
         if let Some(spec) = spec {
             let name = candidate.choose_sequence_name(&candidate.table_key(&table), &column.name);
             let definition = sequence_definition(

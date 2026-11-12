@@ -1,6 +1,7 @@
 use crate::{catalog, *};
 mod flat_union;
 mod join_selection;
+mod regtype;
 use a::{BinaryOperator as Op, Expr as A};
 use sqlparser::ast::{Visit, Visitor};
 use sqlparser::{
@@ -50,6 +51,7 @@ impl Plan {
 #[derive(Debug, Clone)]
 struct Col {
     qualifier: String,
+    namespace: Option<String>,
     field: Field,
     natural_hidden: bool,
     system: bool,
@@ -1534,6 +1536,12 @@ impl Compiler {
         } else {
             default
         };
+        let namespace = match &source {
+            Source::Catalog(name) if alias.is_none() && catalog::tableoid(name).is_some() => {
+                Some(catalog::relation_namespace(name).to_owned())
+            }
+            _ => None,
+        };
         let tableoid = match &source {
             Source::Catalog(name) => catalog::tableoid(name)
                 .or_else(|| self.user_relations.contains_key(name).then_some(0)),
@@ -1545,6 +1553,7 @@ impl Compiler {
             .into_iter()
             .map(|field| Col {
                 qualifier: qualifier.clone(),
+                namespace: namespace.clone(),
                 system: catalog_system_columns && field.name == "xmin",
                 field,
                 natural_hidden: false,
@@ -1556,6 +1565,7 @@ impl Compiler {
         if tableoid.is_some() {
             schema.push(Col {
                 qualifier,
+                namespace,
                 field: Field {
                     name: "tableoid".into(),
                     data_type: PgType::Oid,
@@ -1879,6 +1889,17 @@ impl Compiler {
                             "regtype" | "regprocedure" | "regoperator"
                         )
                     {
+                        if registered
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .ends_with("regtype")
+                        {
+                            let value = self.expr(inner, schema)?;
+                            return Ok(E {
+                                kind: K::Call("_regtype_display".into(), vec![value]),
+                                ty: PgType::Text,
+                            });
+                        }
                         let mut value = self.expr(value, schema)?;
                         // pg_amproc.amproc already has the nominal regproc descriptor.
                         // Admit it only inside this complete textual regprocedure form.
@@ -1895,6 +1916,14 @@ impl Compiler {
                 }
                 let mut e = Box::new(self.expr(expr, schema)?);
                 match name {
+                    "regtype" if numeric(e.ty) => {
+                        coerce(&mut e, PgType::Oid)?;
+                        return Ok(*e);
+                    }
+                    "regtype" => {
+                        expect(&mut e, PgType::Text)?;
+                        (K::Call("_regtype".into(), vec![*e]), PgType::Oid)
+                    }
                     "regclass" => (K::Regclass(e), PgType::Oid),
                     "regnamespace" => {
                         if let K::Literal(Value::Text(name)) = &e.kind {
@@ -2361,6 +2390,11 @@ fn reject_local_series_reference(factor: &a::TableFactor, local: &[Col]) -> R<()
 }
 
 fn lookup(schema: &[Col], p: &[String]) -> R<usize> {
+    let (namespace, p) = if p.len() == 3 {
+        (Some(&p[0]), &p[1..])
+    } else {
+        (None, p)
+    };
     if p.is_empty() || p.len() > 2 {
         return Err(Error::UnknownColumn);
     }
@@ -2369,7 +2403,7 @@ fn lookup(schema: &[Col], p: &[String]) -> R<usize> {
         .iter()
         .filter(|c| {
             if p.len() == 2 {
-                c.qualifier == p[0]
+                c.qualifier == p[0] && namespace.is_none_or(|n| c.namespace.as_ref() == Some(n))
             } else {
                 c.field.name == p[0] && !c.natural_hidden
             }
@@ -2382,6 +2416,7 @@ fn lookup(schema: &[Col], p: &[String]) -> R<usize> {
         .enumerate()
         .filter(|(_, c)| {
             c.scope_depth == depth
+                && namespace.is_none_or(|n| c.namespace.as_ref() == Some(n))
                 && c.field.name == p[p.len() - 1]
                 && (p.len() != 1 || !c.natural_hidden)
                 && (p.len() == 1 || c.qualifier == p[0])
@@ -2630,6 +2665,7 @@ fn check_expr(e: &mut E) -> R<()> {
             e.ty = t;
         }
         K::Call(n, args) => match n.as_str() {
+            "to_regtype" | "_regtype" => expect(&mut args[0], PgType::Text)?,
             "array_remove" => {
                 let element = array_element(args[0].ty)?;
                 expect(&mut args[1], element)?;
@@ -2749,6 +2785,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
             | "current_role" | "current_catalog",
             0,
         ) => PgType::Name,
+        ("to_regtype", 1) => PgType::Oid,
         ("pg_backend_pid", 0) => PgType::Int4,
         ("txid_current", 0) => PgType::Int8,
         ("age", 1) if a[0].ty == PgType::Xid => PgType::Int4,
@@ -3875,6 +3912,23 @@ impl Runtime<'_> {
             return Ok(N);
         }
         Ok(match n {
+            "to_regtype" | "_regtype" => {
+                let value = self.regtype(&text(v[0].clone())?)?;
+                if value == N && n == "_regtype" {
+                    return Err(Error::Unsupported);
+                }
+                value
+            }
+            "_regtype_display" => {
+                let oid = integer(v[0].clone())?;
+                let rows = &self.catalogs["pg_type"].rows;
+                self.charge(rows.len())?;
+                S(if rows.iter().any(|r| r[0] == I(oid)) {
+                    format_type(oid, N, rows)?
+                } else {
+                    oid.to_string()
+                })
+            }
             "pg_backend_pid" => I(i64::from(self.snapshot.backend_pid)),
             "age" => {
                 let xid = u32::try_from(integer(v[0].clone())?).map_err(|_| Error::Type)?;

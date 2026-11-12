@@ -146,13 +146,11 @@ fn nominal_binding_does_not_widen_other_expression_contracts() {
         .unwrap()
         .unwrap();
     assert_eq!(describe(&p).unwrap()[0].data_type, PgType::Oid);
-    // Existing explicit cast planning is unchanged; this does not add nominal I/O.
-    for sql in [
-        "SELECT 1::pg_node_tree FROM pg_type",
-        "SELECT 1::regtype FROM pg_type",
-    ] {
-        assert!(matches!(plan(sql), Err(Error::Unsupported)), "{sql}");
-    }
+    // pg_node_tree's unsupported explicit I/O remains closed.
+    assert!(matches!(
+        plan("SELECT 1::pg_node_tree FROM pg_type"),
+        Err(Error::Unsupported)
+    ));
 }
 
 #[test]

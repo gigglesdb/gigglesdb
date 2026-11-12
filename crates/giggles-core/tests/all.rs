@@ -367,3 +367,6 @@ mod exists_probe;
 
 #[path = "bare_alias.rs"]
 mod bare_alias;
+
+#[path = "orm_identity_metadata.rs"]
+mod orm_identity_metadata;

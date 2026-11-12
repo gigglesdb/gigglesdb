@@ -31,7 +31,6 @@ fn strict_null_and_nonnull_refusal() {
         "pg_get_function_arguments(1)",
         "pg_get_function_result(1)",
         "pg_get_function_sqlbody(1)",
-        "1::regtype::text",
         "1::regprocedure::varchar",
         "1::regoperator::text",
     ] {
@@ -56,13 +55,10 @@ fn closed_signatures_and_cast_boundary() {
         "pg_get_function_result('bad')",
         "other.pg_get_function_result(NULL)",
         "pg_get_functiondef(NULL)",
-        "NULL::regtype",
         "NULL::regprocedure",
         "NULL::regoperator",
         "NULL::other.regtype::text",
-        "NULL::regtype::name",
         "true::regtype::text",
-        "'int4'::regtype::text",
     ] {
         assert!(
             plan(&format!("SELECT {expression} FROM pg_namespace n")).is_err(),
@@ -85,7 +81,7 @@ fn display_parameter_traversal() {
     let p = plan("SELECT $1::regtype::text FROM pg_namespace n WHERE n.oid=11")
         .unwrap()
         .unwrap();
-    assert_eq!(p.parameter_types(), &[PgType::Oid]);
+    assert_eq!(p.parameter_types(), &[PgType::Text]);
     assert!(!p.allows_numeric_input_override());
     assert_eq!(
         execute(&p, &CatalogSnapshot::default(), &[Value::Null])
@@ -94,8 +90,10 @@ fn display_parameter_traversal() {
         vec![vec![Value::Null]]
     );
     assert_eq!(
-        execute(&p, &CatalogSnapshot::default(), &[Value::Int(23)]).unwrap_err(),
-        Error::Unsupported
+        execute(&p, &CatalogSnapshot::default(), &[Value::Int(23)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("integer".into())]]
     );
 }
 
