@@ -114,7 +114,7 @@ fn character_variants_keep_pg_oids_and_text_payloads() {
             let value = Value::Text("a  ".into());
             assert_eq!(decode(b"a  ", &ty, format), Ok(value.clone()));
             assert_eq!(
-                super::encode(&value, &ty, format, 1, super::SessionZone::Fixed(0)),
+                super::encode(&value, &ty, format, &Default::default(), super::SessionZone::Fixed(0)),
                 Ok(Some(b"a  ".to_vec()))
             );
             assert_eq!(decode(&[0xff], &ty, format), Err("22021"));
@@ -129,4 +129,13 @@ fn character_variants_keep_pg_oids_and_text_payloads() {
         super::sql_declared_type(&DataType::Varchar, 25),
         Some(DataType::Text)
     );
+}
+
+#[test]
+fn interval_binary_is_independent_of_output_style() {
+    let interval = giggles_pg_types::temporal::Interval::parse("-1 year 2 days 04:05:06.7").unwrap();
+    for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
+        let settings = crate::pg_settings::Settings { intervalstyle: style.into(), ..Default::default() };
+        assert_eq!(super::encode(&Value::Interval(interval), &DataType::Interval, 1, &settings, super::SessionZone::Fixed(0)).unwrap(), Some(interval.to_binary().to_vec()));
+    }
 }

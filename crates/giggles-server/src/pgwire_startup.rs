@@ -72,6 +72,11 @@ pub(crate) fn parse_startup(
                     }
                 }
             }
+            if matches!(policy, StartupPolicy::Postgresql { .. })
+                && let Ok(name) = crate::pg_settings::database::lookup_name(&k)
+            {
+                k = name.value(&startup_settings).0.into();
+            }
             if fields.insert(k, v).is_some() {
                 return Err("08P01");
             }
@@ -104,8 +109,10 @@ pub(crate) fn parse_startup(
                 }
             }
         }
-        if fields.keys().any(|k| {
-            if k == "IntervalStyle" && matches!(policy, StartupPolicy::Postgresql { .. }) {
+        if let Some(rejected) = fields.keys().find(|k| {
+            if matches!(policy, StartupPolicy::Postgresql { .. })
+                && crate::pg_settings::database::lookup_name(k).is_ok()
+            {
                 return false;
             }
             !matches!(
@@ -119,6 +126,11 @@ pub(crate) fn parse_startup(
                     | "extra_float_digits"
             )
         }) {
+            eprintln!("protocol=postgresql rejected stage=startup parameter={rejected:?}");
+            if matches!(policy, StartupPolicy::Postgresql { .. }) {
+                reason = "unrecognized configuration parameter";
+                return Err("42704");
+            }
             reason = "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits";
             return Err("0A000");
         }
@@ -170,6 +182,19 @@ pub(crate) fn parse_startup(
         if let Some(style) = fields.get("IntervalStyle") {
             reason = "invalid value for parameter IntervalStyle";
             startup_settings.intervalstyle = crate::pg_settings::database::interval_style(style)?;
+        }
+        if matches!(policy, StartupPolicy::Postgresql { .. }) {
+            for (name, value) in &fields {
+                if matches!(name.as_str(), "user" | "database" | "client_encoding" | "application_name" | "DateStyle" | "IntervalStyle" | "TimeZone" | "extra_float_digits") {
+                    continue;
+                }
+                reason = "invalid startup configuration parameter";
+                let (_, assignment) = crate::pg_settings::database::function_assignment(name, value, false)?;
+                let mut session = crate::pg_settings::SessionSettings::default();
+                session.current = startup_settings;
+                session.apply(&assignment, false);
+                startup_settings = session.current;
+            }
         }
         startup_settings.timezone = timezone.clone();
         Ok(Startup {
@@ -242,6 +267,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_startup_gucs_use_session_validation() {
+        let databases = vec!["giggles".into()];
+        let pg = StartupPolicy::Postgresql { databases: &databases };
+        let startup = parse_startup(&body(&[("user", "giggles"), ("database", "giggles"), ("SEARCH_PATH", "public"), ("client_min_messages", "warning"), ("statement_timeout", "0")]), &pg).ok().unwrap();
+        assert_eq!(startup.settings.search_path, "public");
+        assert_eq!(startup.settings.client_min_messages, "warning");
+        assert_eq!(error(&[("user", "giggles"), ("database", "giggles"), ("max_identifier_length", "63")], &pg).0, "55P02");
+        assert_eq!(error(&[("user", "giggles"), ("database", "giggles"), ("search_path", "public"), ("SEARCH_PATH", "public")], &pg).0, "08P01");
+    }
+
     fn body(fields: &[(&str, &str)]) -> Vec<u8> {
         let mut b = 196608u32.to_be_bytes().to_vec();
         for (key, value) in fields {
@@ -299,8 +335,12 @@ mod tests {
         for policy in [StartupPolicy::Agent, StartupPolicy::Postgresql { databases: &databases }] {
             assert_eq!(error(&[("user", "giggles"), ("user", "giggles")], &policy),
                 ("08P01", "malformed PostgreSQL startup packet"));
-            assert_eq!(error(&[("user", "giggles"), ("database", "giggles"), ("unknown", "x")], &policy),
-                ("0A000", "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits"));
+            let expected = if matches!(policy, StartupPolicy::Postgresql { .. }) {
+                ("42704", "unrecognized configuration parameter")
+            } else {
+                ("0A000", "unsupported startup parameter; allowed: user, database, client_encoding, application_name, DateStyle, TimeZone, extra_float_digits")
+            };
+            assert_eq!(error(&[("user", "giggles"), ("database", "giggles"), ("unknown", "x")], &policy), expected);
         }
     }
 

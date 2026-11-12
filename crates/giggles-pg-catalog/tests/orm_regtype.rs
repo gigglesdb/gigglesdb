@@ -84,3 +84,16 @@ fn sqlalchemy_schema_qualified_catalog_columns() {
         assert_eq!(plan(sql).unwrap_err(), Error::UnknownColumn);
     }
 }
+
+#[test]
+fn prisma_schema_exists_and_immutable_presets() {
+    let sql = "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1), version(), current_setting('server_version_num')::integer as numeric_version";
+    let p = plan_gateway(sql).unwrap().unwrap();
+    assert_eq!(p.parameter_types(), &[PgType::Name]);
+    for (schema, expected) in [("public", true), ("missing", false)] {
+        let rows = execute(&p, &CatalogSnapshot::default(), &[Value::Text(schema.into())]).unwrap().rows;
+        assert_eq!(rows[0][0], Value::Bool(expected));
+        assert_eq!(rows[0][2], Value::Int(180000));
+    }
+    assert!(plan_gateway("SELECT current_setting('search_path') FROM pg_namespace").is_err());
+}

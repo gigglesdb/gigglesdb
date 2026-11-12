@@ -136,7 +136,7 @@ impl State {
                     value,
                     &column.data_type,
                     u16::from(options.format == 2),
-                    self.settings.current.extra_float_digits,
+                    &self.settings.current,
                     session.zone().unwrap_or(SessionZone::Fixed(0)),
                 )? {
                     None if options.format == 2 => data.extend((-1i32).to_be_bytes()),
@@ -328,7 +328,7 @@ impl State {
             };
             row_description(&d, &[], out)?;
             rows(
-                self.settings.current.extra_float_digits,
+                &self.settings.current,
                 session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result,
                 &d,
@@ -367,7 +367,7 @@ impl State {
             let (description, result) = inspect(show, &self.settings.current, session)?;
             row_description(&description, &[], out)?;
             rows(
-                self.settings.current.extra_float_digits,
+                &self.settings.current,
                 session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result,
                 &description,
@@ -465,7 +465,7 @@ impl State {
                             ..SqlResult::default()
                         };
                         rows(
-                            self.settings.current.extra_float_digits,
+                            &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
                             &result,
                             &d,
@@ -486,7 +486,7 @@ impl State {
                 if !d.columns.is_empty() {
                     row_description(&d, &[], out)?;
                     rows(
-                        self.settings.current.extra_float_digits,
+                        &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
                         &result,
                         &d,

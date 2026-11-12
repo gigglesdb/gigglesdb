@@ -541,7 +541,7 @@ fn encode(
     v: &Value,
     ty: &DataType,
     format: u16,
-    extra_float_digits: i32,
+    settings: &crate::pg_settings::Settings,
     zone: SessionZone,
 ) -> R<Option<Vec<u8>>> {
     if format > 1 {
@@ -565,14 +565,23 @@ fn encode(
             Value::TimeTz(v) => v.to_string().into_bytes(),
             Value::Timestamp(v) => v.to_string().into_bytes(),
             Value::TimestampTz(v) => v.format_in_zone(zone).map_err(temporal_error)?.into_bytes(),
-            Value::Interval(v) => v.to_string().into_bytes(),
+            Value::Interval(v) => {
+                use giggles_pg_types::temporal::IntervalOutputStyle as Style;
+                let style = match settings.intervalstyle.as_str() {
+                    "postgres_verbose" => Style::PostgresVerbose,
+                    "sql_standard" => Style::SqlStandard,
+                    "iso_8601" => Style::Iso8601,
+                    _ => Style::Postgres,
+                };
+                v.format_with_style(style).into_bytes()
+            },
             Value::Numeric(v) => v.to_string().into_bytes(),
             Value::Float4(v) => v
-                .to_text_with_extra_float_digits(extra_float_digits)
+                .to_text_with_extra_float_digits(settings.extra_float_digits)
                 .map_err(numeric_error)?
                 .into_bytes(),
             Value::Float8(v) => v
-                .to_text_with_extra_float_digits(extra_float_digits)
+                .to_text_with_extra_float_digits(settings.extra_float_digits)
                 .map_err(numeric_error)?
                 .into_bytes(),
             Value::Int(v) => v.to_string().into_bytes(),
@@ -610,7 +619,7 @@ fn encode(
 }
 #[allow(clippy::too_many_arguments)]
 fn rows(
-    extra_float_digits: i32,
+    settings: &crate::pg_settings::Settings,
     zone: SessionZone,
     result: &SqlResult,
     d: &Description,
@@ -627,7 +636,7 @@ fn rows(
                 v,
                 &d.columns.get(i).ok_or("XX000")?.data_type,
                 format_at(formats, i),
-                extra_float_digits,
+                settings,
                 zone,
             )? {
                 None => b.extend((-1i32).to_be_bytes()),
@@ -1678,7 +1687,7 @@ impl State {
                     }
                     let result = p.result.as_ref().unwrap();
                     rows(
-                        self.settings.current.extra_float_digits,
+                        &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
                         result,
                         &p.s.d,
@@ -1704,7 +1713,7 @@ impl State {
                         affected: 0,
                     };
                     rows(
-                        self.settings.current.extra_float_digits,
+                        &self.settings.current,
                         session.zone().unwrap_or(SessionZone::Fixed(0)),
                         &result,
                         &p.s.d,
@@ -1743,7 +1752,7 @@ impl State {
                             ..SqlResult::default()
                         };
                         rows(
-                            self.settings.current.extra_float_digits,
+                            &self.settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
                             &result,
                             &p.s.d,
@@ -1804,7 +1813,7 @@ impl State {
                     p.at.saturating_add(max as usize).min(result.rows.len())
                 };
                 rows(
-                    self.settings.current.extra_float_digits,
+                    &self.settings.current,
                     session.zone().unwrap_or(SessionZone::Fixed(0)),
                     result,
                     &p.s.d,

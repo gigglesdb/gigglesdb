@@ -85,7 +85,7 @@ pub(super) fn execute(
     }
     let result = portal.result.as_ref().unwrap();
     rows(
-        settings.current.extra_float_digits,
+        &settings.current,
         session.zone().unwrap_or(SessionZone::Fixed(0)),
         result,
         &portal.s.d,
@@ -119,7 +119,7 @@ impl State {
             let description = description(function);
             row_description(&description, &[], out)?;
             rows(
-                self.settings.current.extra_float_digits,
+                &self.settings.current,
                 session.zone().unwrap_or(SessionZone::Fixed(0)),
                 &result,
                 &description,

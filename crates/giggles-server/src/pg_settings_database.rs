@@ -172,6 +172,9 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "default_table_access_method" => Ok(Show::DefaultTableAccessMethod),
         "server_version" => Ok(Show::ServerVersion),
         "server_version_num" => Ok(Show::ServerVersionNum),
+        "max_identifier_length" => Ok(Show::MaxIdentifierLength),
+        "block_size" => Ok(Show::BlockSize),
+        "integer_datetimes" => Ok(Show::IntegerDatetimes),
         "max_index_keys" => Ok(Show::MaxIndexKeys),
         _ => Err("42704"),
     }
@@ -221,6 +224,9 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
     let time_zone =
         matches!(p.tokens.get(p.at), Some(Token::Word(w)) if w.eq_ignore_ascii_case("TIME"));
     let name = p.name()?;
+    if matches!(name, Show::MaxIdentifierLength | Show::BlockSize | Show::IntegerDatetimes) {
+        return Err("55P02");
+    }
     if matches!(
         name,
         Show::ServerVersion
@@ -439,8 +445,11 @@ fn boolean(value: &str) -> Result<bool> {
         _ => Err("22023"),
     }
 }
-pub(super) fn function_assignment(name: &str, value: &str, local: bool) -> Result<(Show, Setting)> {
+pub(crate) fn function_assignment(name: &str, value: &str, local: bool) -> Result<(Show, Setting)> {
     let name = lookup_name(name)?;
+    if matches!(name, Show::MaxIdentifierLength | Show::BlockSize | Show::IntegerDatetimes) {
+        return Err("55P02");
+    }
     if matches!(
         name,
         Show::ServerVersion

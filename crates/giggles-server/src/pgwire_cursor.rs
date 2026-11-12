@@ -308,7 +308,7 @@ impl Cursors {
                             ..SqlResult::default()
                         };
                         rows(
-                            settings.current.extra_float_digits,
+                            &settings.current,
                             session.zone().unwrap_or(SessionZone::Fixed(0)),
                             &result,
                             &c.description,

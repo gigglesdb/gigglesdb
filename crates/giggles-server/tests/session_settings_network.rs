@@ -687,3 +687,35 @@ async fn settings_diagnostics_do_not_rewrite_core_parameter_errors() {
     drop(c);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn orm_interval_output_and_readonly_presets() {
+    let f = Fixture::new().await;
+    let c = f.client().await;
+    for (style, expected) in [
+        ("postgres", ["1 year 2 mons 3 days 04:05:06.7", "-1 years -2 mons -3 days -04:05:06.7", "00:00:00", "-1 years +2 days"]),
+        ("postgres_verbose", ["@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs", "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs ago", "@ 0", "@ 1 year -2 days ago"]),
+        ("sql_standard", ["+1-2 +3 +4:05:06.7", "-1-2 -3 -4:05:06.7", "0", "-1-0 +2 +0:00:00"]),
+        ("iso_8601", ["P1Y2M3DT4H5M6.7S", "P-1Y-2M-3DT-4H-5M-6.7S", "PT0S", "P-1Y2D"]),
+    ] {
+        c.batch_execute(&format!("SET IntervalStyle={style}")).await.unwrap();
+        for (literal, expected) in ["1 year 2 mons 3 days 04:05:06.7", "-1 year -2 mons -3 days -04:05:06.7", "0", "-1 year 2 days"].into_iter().zip(expected) {
+            let result = c.simple_query(&format!("SELECT interval '{literal}'")).await.unwrap();
+            assert_eq!(values(&result), [expected], "{style}: {literal}");
+        }
+    }
+    for (name, expected) in [("max_identifier_length", "63"), ("max_index_keys", "32"), ("block_size", "8192"), ("integer_datetimes", "on")] {
+        assert_eq!(values(&c.simple_query(&format!("SHOW {name}")).await.unwrap()), [expected]);
+    }
+    for sql in ["SET max_identifier_length=63", "RESET block_size", "SELECT set_config('integer_datetimes', 'on', false)"] {
+        assert_eq!(code(c.simple_query(sql).await.unwrap_err()), "55P02");
+    }
+    let sql = "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1), version(), current_setting('server_version_num')::integer as numeric_version";
+    for (schema, expected) in [("public", true), ("missing", false)] {
+        let row = c.query_one(sql, &[&schema]).await.unwrap();
+        assert_eq!(row.get::<_, bool>(0), expected);
+        assert_eq!(row.get::<_, i32>(2), 180000);
+    }
+    drop(c);
+    f.stop().await;
+}

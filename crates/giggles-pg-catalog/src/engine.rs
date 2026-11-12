@@ -2238,6 +2238,23 @@ impl Compiler {
                     if f.over.is_some() {
                         return Err(Error::Unsupported);
                     }
+                    // Only immutable presets can be folded here. Session GUCs
+                    // remain owned by the server's settings evaluator.
+                    if n == "current_setting" && args.len() == 1 {
+                        let K::Literal(Value::Text(name)) = &args[0].kind else {
+                            return Err(Error::Unsupported);
+                        };
+                        let value = match name.to_ascii_lowercase().as_str() {
+                            "server_version" => "18.0",
+                            "server_version_num" => "180000",
+                            "max_identifier_length" => "63",
+                            "max_index_keys" => "32",
+                            "block_size" => "8192",
+                            "integer_datetimes" => "on",
+                            _ => return Err(Error::Unsupported),
+                        };
+                        return Ok(literal(Value::Text(value.into()), PgType::Text));
+                    }
                     if n == "_pg_expandarray" {
                         if args.len() != 1 {
                             return Err(Error::Type);
