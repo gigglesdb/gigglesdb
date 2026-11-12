@@ -5,12 +5,14 @@ sys.dont_write_bytecode = True
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import argparse
+import hashlib
 import json
 import os
 import queue
 import random
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -25,7 +27,21 @@ def require(ok, detail):
 
 
 def size(path):
-    return sum(p.stat().st_size for p in path.rglob('*') if p.is_file())
+    total = 0
+    for p in path.rglob('*'):
+        try:
+            info = p.stat()
+        except FileNotFoundError:
+            continue  # RocksDB compaction can unlink an SST during the walk.
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+    return total
+
+
+def payload(seed, row, length):
+    # Independent rows avoid repeated/compressible padding and allow random access
+    # when checking samples after a crash or export/restore. Hex is COPY/SQL safe.
+    return hashlib.shake_256(f'{seed}:{row}'.encode('ascii')).hexdigest((length+1)//2)[:length]
 
 
 class SqlError(RuntimeError):
@@ -34,7 +50,7 @@ class SqlError(RuntimeError):
 
 class Psql:
     def __init__(self, run, port):
-        self.run = run
+        self.run, self.port = run, port
         self.log = (run.root / f'psql-{uuid.uuid4().hex[:10]}.log').open('w', encoding='utf-8')
         self.lines = queue.Queue()
         self.process = subprocess.Popen(['docker', 'exec', '-i', run.container, 'psql',
@@ -78,6 +94,22 @@ class Psql:
     def rows(self, sql):
         return [r.split('\t') for r in self.sql(sql) if '\t' in r or r.lstrip('-').isdigit()]
 
+    def copy(self, table, text, count):
+        # A separate psql -c session cannot leave the persistent SQL connection
+        # in COPY input mode after a rejection. Each COPY is one autocommit chunk.
+        result = subprocess.run(['docker', 'exec', '-i', self.run.container, 'psql',
+            '-X', '-v', 'ON_ERROR_STOP=1', '-h', 'host.docker.internal',
+            '-p', str(self.port), '-U', 'postgres', '-d', 'postgres',
+            '-c', f'COPY {table} FROM STDIN'], input=text, capture_output=True,
+            text=True, encoding='utf-8', env=self.run.env,
+            timeout=self.run.args.command_timeout)
+        self.log.write(f'COPY {table}: rows={count}; bytes={len(text.encode("utf-8"))}\n' +
+                       result.stdout + result.stderr)
+        self.log.flush()
+        if result.returncode:
+            raise SqlError(f'COPY failed ({result.returncode}): {result.stderr[:1000]}')
+        require(f'COPY {count}' in result.stdout.splitlines(), 'COPY did not acknowledge all rows')
+
     def close(self):
         if self.process.poll() is None:
             try:
@@ -106,6 +138,7 @@ class Qualification:
         self.container = 'p1-pc-' + uuid.uuid4().hex[:12]
         self.server, self.clients, self.cells, self.serial = None, [], {}, 0
         self.restarts = []
+        self.loaded_rows = 0
 
     def client(self, port):
         client = Psql(self, port)
@@ -142,15 +175,68 @@ class Qualification:
             (self.server.run/'bin'/self.args.server_bin.name).unlink(missing_ok=True)
             self.server = None
 
-    def load_batches(self, c, table, rows, values):
-        for lo in range(0, rows, self.args.batch):
+    def check_size(self):
+        disk = size(self.root)
+        require(disk <= self.args.max_bytes,
+                f'qualification exceeded --max-bytes={self.args.max_bytes}: bytes={disk}')
+
+    def load_batches(self, c, table, rows, values, start=0):
+        checked = start
+        for lo in range(start, rows, self.args.batch):
             hi = min(rows, lo+self.args.batch)
-            reply = c.sql(f'BEGIN; INSERT INTO {table} VALUES ' +
-                          ','.join(values(i) for i in range(lo, hi)) + '; COMMIT;')
-            require('COMMIT' in reply, 'batch did not acknowledge COMMIT')
-            require(size(self.root) <= 8_000_000_000, 'qualification exceeded 8 GB')
-            if hi % 100000 == 0:
+            self.insert_batch(c, table, lo, hi, values)
+            if hi-checked >= self.args.size_check_rows or hi == rows:
+                self.check_size()
+                checked = hi
                 print(f'{table}: {hi}/{rows} rows', flush=True)
+
+    def insert_batch(self, c, table, lo, hi, values):
+        reply = c.sql(f'BEGIN; INSERT INTO {table} VALUES ' +
+                      ','.join(values(i) for i in range(lo, hi)) + '; COMMIT;')
+        require('COMMIT' in reply, 'batch did not acknowledge COMMIT')
+
+    def big_values(self, i):
+        extra = f",'{payload(self.args.seed, i, self.args.payload_bytes)}'" if self.args.payload_bytes else ''
+        return f'({i},{i},{i*17}{extra})'
+
+    def load_large(self, c, data):
+        checked, disk, copy_enabled = 0, 0, True
+        stats = dict(copy_rows=0, copy_bytes=0, copy_seconds=0.0, insert_rows=0)
+        lo = 0
+        while lo < self.args.rows:
+            hi = min(self.args.rows, lo+self.args.copy_batch)
+            if copy_enabled:
+                began = time.monotonic()
+                text = ''.join(f'{i}\t{i}\t{i*17}' +
+                               ('\t'+payload(self.args.seed, i, self.args.payload_bytes)
+                                if self.args.payload_bytes else '') + '\n' for i in range(lo, hi))
+                try:
+                    c.copy('big', text, hi-lo)
+                except SqlError as exc:
+                    # Never retry a chunk whose commit acknowledgement was lost.
+                    require(c.rows(f'SELECT count(*) FROM big WHERE id>={lo} AND id<{hi};') == [['0']],
+                            'failed COPY left rows behind; refusing ambiguous INSERT retry')
+                    copy_enabled = False
+                    stats['copy_fallback'] = str(exc)
+                    print(f'COPY rejected; falling back to INSERT: {exc}', flush=True)
+                else:
+                    stats['copy_rows'] += hi-lo
+                    stats['copy_bytes'] += len(text.encode('utf-8'))
+                    stats['copy_seconds'] += time.monotonic()-began
+            if not copy_enabled:
+                # Keep INSERT chunks bounded too, including target/limit sampling.
+                hi = min(self.args.rows, lo+self.args.batch)
+                self.insert_batch(c, 'big', lo, hi, self.big_values)
+                stats['insert_rows'] += hi-lo
+            self.loaded_rows = hi
+            if hi-checked >= self.args.size_check_rows or hi == self.args.rows:
+                self.check_size()
+                disk, checked = size(data), hi
+                print(f'big: {hi}/{self.args.rows} rows; bytes={disk}', flush=True)
+                if self.args.target_bytes and disk >= self.args.target_bytes:
+                    break
+            lo = hi
+        return disk, stats
 
     def crash_load(self):
         for iteration in range(self.args.iterations):
@@ -293,7 +379,7 @@ class Qualification:
             self.report()
 
     def verify_large(self, c):
-        n = self.args.rows
+        n = self.loaded_rows
         require(c.rows('SELECT count(*),count(h),min(h),max(h) FROM big;') == [[str(n), str(n), '0', str((n-1)*17)]],
                 'large-load count/min/max mismatch')
         for i in sorted({0, n//2, n-1}):
@@ -301,11 +387,28 @@ class Qualification:
         hi = min(n, 100)
         require(c.rows(f'SELECT id,h FROM big WHERE v>=0 AND v<{hi} ORDER BY v;') ==
                 [[str(i), str(i*17)] for i in range(hi)], 'secondary range scan mismatch')
+        if self.args.payload_bytes:
+            try:
+                require(c.sql("SELECT md5('abc');") == ['900150983cd24fb0d6963f7d28e17f72'], 'md5 probe mismatch')
+                digest = True
+            except SqlError as exc:
+                if not str(exc).startswith('42883:'):
+                    raise
+                digest = False
+            for i in sorted({0, n//2, n-1}):
+                expected = payload(self.args.seed, i, self.args.payload_bytes)
+                if digest:
+                    actual = c.rows(f'SELECT length(payload),md5(payload) FROM big WHERE id={i};')
+                    require(actual == [[str(len(expected)), hashlib.md5(expected.encode('ascii')).hexdigest()]],
+                            f'payload length/md5 mismatch at row {i}')
+                else:
+                    require(c.rows(f'SELECT id,payload FROM big WHERE id={i};') == [[str(i), expected]],
+                            f'payload text mismatch at row {i}')
 
     def large_sum(self, c):
         # SUM over bigint is bounded by the shared aggregate work budget (DD-0068 E1260);
         # record the outcome separately so the storage cells stay strict.
-        n = self.args.rows
+        n = self.loaded_rows
         try:
             ok = c.rows('SELECT sum(h) FROM big;') == [[str(n*(n-1)//2*17)]]
             self.cells['large-sum'] = ('PASS', 'sum(h) matches') if ok else ('FAIL', 'sum(h) mismatch')
@@ -315,17 +418,29 @@ class Qualification:
     def large(self):
         data = self.root/'large-data'
         c = self.client(self.start(data))
-        c.sql('CREATE TABLE big (id BIGINT PRIMARY KEY,v BIGINT,h BIGINT);'
+        extra = ',payload TEXT' if self.args.payload_bytes else ''
+        c.sql(f'CREATE TABLE big (id BIGINT PRIMARY KEY,v BIGINT,h BIGINT{extra});'
               'CREATE INDEX big_v ON big(v); CREATE INDEX big_h ON big(h);')
         start = time.monotonic()
-        self.load_batches(c, 'big', self.args.rows, lambda i: f'({i},{i},{i*17})')
-        elapsed, disk = time.monotonic()-start, size(data)
+        disk, stats = self.load_large(c, data)
+        elapsed = time.monotonic()-start
         self.kill(); self.stop()
         c = self.client(self.start(data))
         restart = self.restarts[-1]
         self.verify_large(c)
         self.large_sum(c); self.stop()
-        self.cells['large-load'] = ('PASS', f'rows={self.args.rows}; rows/s={self.args.rows/elapsed:.1f}; bytes={disk}; restart={restart}s')
+        n = self.loaded_rows
+        detail = f'rows={n}; rows/s={n/elapsed:.1f}; bytes={disk}; disk MB/s={disk/elapsed/1e6:.3f}; restart={restart}s'
+        if stats['copy_rows']:
+            seconds = stats['copy_seconds']
+            detail += (f'; COPY rows={stats["copy_rows"]}; COPY seconds={seconds:.3f}'
+                       f'; COPY rows/s={stats["copy_rows"]/seconds:.1f}'
+                       f'; COPY input MB/s={stats["copy_bytes"]/seconds/1e6:.3f}')
+        if stats['insert_rows']:
+            detail += f'; INSERT rows={stats["insert_rows"]}; fallback={stats["copy_fallback"]}'
+        if self.args.target_bytes:
+            detail += f'; target bytes={self.args.target_bytes}; target reached={disk >= self.args.target_bytes}'
+        self.cells['large-load'] = ('PASS', detail)
 
     def backup(self):
         data = self.root/'large-data'
@@ -336,16 +451,22 @@ class Qualification:
         for name, cmd in [('export', [cli, 'export', data/'db', backup]),
                           ('restore', [cli, 'restore', backup, restored/'db'])]:
             result = subprocess.run(list(map(str, cmd)), env=self.env, cwd=self.root,
-                                    capture_output=True, text=True, timeout=3600)
+                                    capture_output=True, text=True, timeout=self.args.command_timeout)
             (self.root/f'{name}.log').write_text(result.stdout+result.stderr, encoding='utf-8')
             require(result.returncode == 0, f'{name} failed: {result.stdout} {result.stderr}')
+            if name == 'export':
+                # The verified export is the only copy needed for restore; dropping the
+                # source first keeps peak disk at roughly one database plus its export.
+                shutil.rmtree(data)
         self.verify_large(self.client(self.start(restored))); self.stop()
-        self.cells['backup-restore'] = ('PASS', 'v2 export/restore count and checksum verified')
-        shutil.rmtree(data); shutil.rmtree(restored); backup.unlink()
+        self.cells['backup-restore'] = ('PASS', 'v2 export/restore count, indexes and sampled payload verified')
+        shutil.rmtree(restored); backup.unlink()
 
     def report(self):
         lines = ['# v2 real-process qualification', '', f'Seed: {self.args.seed}',
                  f'Iterations: {self.args.iterations}; rows: {self.args.rows}',
+                 f'Loaded rows: {self.loaded_rows}; payload bytes/row: {self.args.payload_bytes}; '
+                 f'target bytes: {self.args.target_bytes}; max bytes: {self.args.max_bytes}',
                  f'Runtime: {time.monotonic()-self.started:.3f}s',
                  f'Start/restart seconds: {self.restarts}', '', '| Cell | Result | Evidence |', '|---|---|---|']
         for name in ['kill-under-load', 'kill-during-DDL', 'large-load', 'large-sum', 'backup-restore']:
@@ -383,10 +504,25 @@ if __name__ == '__main__':
     parser.add_argument('--work', type=Path, default=Path('J:/gigglesdb-work/p1-pc/qual'))
     parser.add_argument('--seed', type=int, default=5412)
     parser.add_argument('--iterations', type=int, default=30)
+    parser.add_argument('--command-timeout', type=int, default=3600,
+                        help='seconds allowed for each export or restore command')
     parser.add_argument('--rows', type=int, default=5_000_000)
     parser.add_argument('--batch', type=int, default=200)
+    parser.add_argument('--copy-batch', type=int, default=10000,
+                        help='rows per autocommit COPY chunk in the large-load cell')
+    parser.add_argument('--size-check-rows', type=int, default=100000,
+                        help='sample disk size after this many acknowledged rows (and at end)')
+    parser.add_argument('--max-bytes', type=int, default=8_000_000_000,
+                        help='maximum sampled qualification directory size, in bytes')
+    parser.add_argument('--target-bytes', type=int, default=0,
+                        help='stop large-load at this sampled database size; --rows is an upper bound')
+    parser.add_argument('--payload-bytes', type=int, default=0,
+                        help='deterministic text bytes per row; zero preserves the narrow schema')
     args = parser.parse_args()
-    require(min(args.iterations, args.rows, args.batch) > 0, 'counts must be positive')
+    require(min(args.iterations, args.rows, args.batch, args.copy_batch,
+                args.size_check_rows, args.max_bytes, args.command_timeout) > 0, 'counts/limits must be positive')
+    require(args.payload_bytes >= 0 and args.target_bytes >= 0, 'payload/target bytes must be nonnegative')
+    require(args.target_bytes <= args.max_bytes, '--target-bytes must not exceed --max-bytes')
     args.server_bin, args.work = args.server_bin.resolve(), args.work.resolve()
     require(args.work.is_relative_to(Path('J:/gigglesdb-work').resolve()), '--work must be under J:/gigglesdb-work')
     sys.exit(Qualification(args).run())
