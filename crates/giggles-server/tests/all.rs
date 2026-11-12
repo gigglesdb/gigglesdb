@@ -171,3 +171,5 @@ mod derived_authority;
 mod comment_presentation;
 #[path = "view_ddl.rs"]
 mod view_ddl;
+#[path = "prepared_rollback_network.rs"]
+mod prepared_rollback_network;

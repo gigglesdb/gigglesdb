@@ -837,6 +837,8 @@ enum Plan {
 #[derive(Clone)]
 struct Statement {
     sql_bytes: usize,
+    sql: String,
+    declared_oids: Vec<u32>,
     p: Plan,
     d: Description,
     parameter_oids: Vec<u32>,
@@ -1053,6 +1055,243 @@ impl State {
         session.set_extra_float_digits(self.settings.current.extra_float_digits);
         result
     }
+    fn prepare_statement(
+        &mut self,
+        sql: &str,
+        oids: Vec<u32>,
+        session: &mut Session,
+    ) -> R<Statement> {
+        if !is_copy_sql(sql) {
+            core(session.authorize_sequence_sql(sql))?;
+        }
+        let (mut p, mut d) = if let Some(tables) =
+            crate::auth::statements::access_share_tables(sql)?
+        {
+            (
+                Plan::AccessShare(tables),
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if is_copy_sql(sql) {
+            let (copy, prepared) = core(session.prepare_copy(sql))?;
+            (
+                Plan::Copy(copy, Box::new(prepared)),
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if let Some(mut command) = cursor::parse(sql)? {
+            if !session.role.is_sql() {
+                return Err("42501");
+            }
+            let d = self.cursors.describe(&mut command, session, &oids)?;
+            (Plan::Cursor(command), d)
+        } else if let Some(stmt) = crate::auth::statements::parse(sql) {
+            (
+                Plan::Admin(stmt),
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if crate::pg_settings::empty_sql(sql)? {
+            (
+                Plan::Empty,
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if let Some(command) = parse_control(sql, session, &mut self.diagnostic)? {
+            if !session.role.is_sql() {
+                return Err("42501");
+            }
+            (
+                Plan::Control(command),
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if let Some(show) = show_settings(sql, session, &mut self.diagnostic)? {
+            let (description, _) = inspect(show, &self.settings.current, session)?;
+            (Plan::Inspect(show), description)
+        } else if let Some(settings) = parse_settings(sql, session, &mut self.diagnostic)? {
+            if !session.role.is_sql() {
+                return Err("42501");
+            }
+            if settings.len() != 1 {
+                return Err("42601");
+            }
+            (
+                Plan::Settings(settings),
+                Description {
+                    type_oids: vec![],
+                    typmods: vec![],
+                    columns: vec![],
+                    parameters: vec![],
+                },
+            )
+        } else if sql
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .starts_with("GIGGLES")
+        {
+            if !matches!(session.role, Role::Task { .. }) {
+                return Err("42501");
+            }
+            let task = crate::task_statement::TaskStatement::parse(sql)?;
+            (Plan::Task(task), task.description())
+        } else if let Some(function) =
+            settings_functions::parse(sql, session, &mut self.diagnostic)?
+        {
+            let description = settings_functions::description(&function);
+            (Plan::SettingsFunction(function), description)
+        } else if !session.role.is_sql() && Prepared::rejects_unsupported_table_free_scalar(sql) {
+            // DD-0068: authority precedes routine classification. Sessions without
+            // SQL authority (task bindings) must not learn whether a routine
+            // exists; they get the same 42501 that application prepare gives them.
+            self.diagnostic.phase = "application prepare";
+            return Err("42501");
+        } else if let Some(plan) = catalog_plan(sql, &mut self.diagnostic, session)? {
+            let (epoch, _, _) = core(session.catalog_snapshot())?;
+            let fields = giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
+            let d = Description {
+                type_oids: vec![],
+                typmods: vec![-1; fields.len()],
+                parameters: vec![DataType::Text; plan.parameter_count()],
+                columns: fields
+                    .iter()
+                    .map(|f| giggles_core::relational::ColumnDef {
+                        id: 0,
+                        name: f.name.clone(),
+                        data_type: DataType::Text,
+                        not_null: false,
+                    })
+                    .collect(),
+            };
+            (Plan::Catalog(Box::new(plan), fields, epoch), d)
+        } else {
+            self.diagnostic.phase = "application prepare";
+            prepare_declared_sql(session, sql, &oids)?
+        };
+        if oids.len() > d.parameters.len() {
+            return Err("08P01");
+        }
+        let mut parameter_oids: Vec<u32> = match &p {
+            Plan::Catalog(plan, _, _) => plan.parameter_types().iter().map(|t| t.oid()).collect(),
+            _ => d.parameters.iter().map(oid).collect(),
+        };
+        // Retry only the catalog declaration mismatch that would otherwise be
+        // 0A000. Keep catalog validation and successful numeric overrides intact.
+        if let Plan::Catalog(plan, _, _) = &p {
+            let mismatch =
+                oids.iter()
+                    .zip(&parameter_oids)
+                    .enumerate()
+                    .any(|(i, (o, inferred))| {
+                        *o != 0 && o != inferred && !catalog_input_override(plan, i, *o, *inferred)
+                    });
+            if session.role.is_sql()
+                && mismatch
+                && oids.iter().all(|o| {
+                    *o == 0
+                        || core_declared_type(*o).is_some()
+                        || catalog_wire::parameter_type(*o).is_ok()
+                })
+            {
+                let was_aborted = session.is_aborted();
+                match prepare_declared_sql(session, sql, &oids) {
+                    Ok((application, description))
+                        if oids.len() <= description.parameters.len()
+                            && oids
+                                .iter()
+                                .zip(&description.parameters)
+                                .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
+                    {
+                        p = application;
+                        d = description;
+                        parameter_oids = d.parameters.iter().map(oid).collect();
+                    }
+                    Err(error) if !was_aborted && session.is_aborted() => {
+                        return Err(error);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.diagnostic.phase = "parameter type declaration";
+        for (i, (o, t)) in oids.iter().copied().zip(&mut d.parameters).enumerate() {
+            if matches!(p, Plan::Catalog(..)) {
+                if o != 0 {
+                    catalog_wire::parameter_type(o)?;
+                    // The catalog compiler fixes parameter and result
+                    // types together. A wire override must not silently
+                    // change only ParameterDescription while leaving a
+                    // projected parameter's output type unchanged.
+                    if o != parameter_oids[i] {
+                        let safe = matches!(&p, Plan::Catalog(plan, _, _)
+                            if catalog_input_override(plan, i, o, parameter_oids[i]));
+                        if !safe {
+                            return Err("0A000");
+                        }
+                    }
+                    parameter_oids[i] = o;
+                }
+                continue;
+            }
+            if o != 0 && o != oid(t) {
+                // Application integer parameters share Value::Int, but
+                // decode using the client's declared wire width. Core
+                // still enforces the destination range at execution.
+                if !matches!(p, Plan::Sql(_)) {
+                    return Err("0A000");
+                }
+                *t = sql_declared_type(t, o).ok_or("0A000")?;
+            }
+            if o != 0 {
+                parameter_oids[i] = o;
+            }
+        }
+        Ok(Statement {
+            sql_bytes: sql.len(),
+            sql: sql.to_owned(),
+            declared_oids: oids,
+            p,
+            d,
+            parameter_oids,
+            query_id: self.diagnostic.query_id.clone(),
+        })
+    }
+    fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
+        let old = self.statements.get(name).ok_or("26000")?.clone();
+        if !matches!(&old.p, Plan::Sql(p) | Plan::Copy(_, p) if !session.sql.prepared_is_current(p)) {
+            return Ok(());
+        }
+        let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session)?;
+        if old.parameter_oids != new.parameter_oids
+            || old.d.columns != new.d.columns
+            || old.d.type_oids != new.d.type_oids
+            || old.d.typmods != new.d.typmods
+        {
+            self.diagnostic.message = Some("cached plan must not change result type");
+            return Err("0A000");
+        }
+        self.statements.insert(name.to_owned(), new);
+        Ok(())
+    }
     fn handle_inner(
         &mut self,
         tag: u8,
@@ -1154,236 +1393,20 @@ impl State {
                 {
                     return Err("54000");
                 }
-                if !is_copy_sql(&sql) {
-                    core(session.authorize_sequence_sql(&sql))?;
-                }
-                let (mut p, mut d) = if let Some(tables) =
-                    crate::auth::statements::access_share_tables(&sql)?
-                {
-                    (
-                        Plan::AccessShare(tables),
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if is_copy_sql(&sql) {
-                    let (copy, prepared) = core(session.prepare_copy(&sql))?;
-                    (
-                        Plan::Copy(copy, Box::new(prepared)),
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if let Some(mut command) = cursor::parse(&sql)? {
-                    if !session.role.is_sql() {
-                        return Err("42501");
-                    }
-                    let d = self.cursors.describe(&mut command, session, &oids)?;
-                    (Plan::Cursor(command), d)
-                } else if let Some(stmt) = crate::auth::statements::parse(&sql) {
-                    (
-                        Plan::Admin(stmt),
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if crate::pg_settings::empty_sql(&sql)? {
-                    (
-                        Plan::Empty,
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if let Some(command) = parse_control(&sql, session, &mut self.diagnostic)? {
-                    if !session.role.is_sql() {
-                        return Err("42501");
-                    }
-                    (
-                        Plan::Control(command),
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if let Some(show) = show_settings(&sql, session, &mut self.diagnostic)? {
-                    let (description, _) = inspect(show, &self.settings.current, session)?;
-                    (Plan::Inspect(show), description)
-                } else if let Some(settings) = parse_settings(&sql, session, &mut self.diagnostic)?
-                {
-                    if !session.role.is_sql() {
-                        return Err("42501");
-                    }
-                    if settings.len() != 1 {
-                        return Err("42601");
-                    }
-                    (
-                        Plan::Settings(settings),
-                        Description {
-                            type_oids: vec![],
-                            typmods: vec![],
-                            columns: vec![],
-                            parameters: vec![],
-                        },
-                    )
-                } else if sql
-                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
-                    .starts_with("GIGGLES")
-                {
-                    if !matches!(session.role, Role::Task { .. }) {
-                        return Err("42501");
-                    }
-                    let task = crate::task_statement::TaskStatement::parse(&sql)?;
-                    (Plan::Task(task), task.description())
-                } else if let Some(function) =
-                    settings_functions::parse(&sql, session, &mut self.diagnostic)?
-                {
-                    let description = settings_functions::description(&function);
-                    (Plan::SettingsFunction(function), description)
-                } else if !session.role.is_sql()
-                    && Prepared::rejects_unsupported_table_free_scalar(&sql)
-                {
-                    // DD-0068: authority precedes routine classification. Sessions without
-                    // SQL authority (task bindings) must not learn whether a routine
-                    // exists; they get the same 42501 that application prepare gives them.
-                    self.diagnostic.phase = "application prepare";
-                    return Err("42501");
-                } else if let Some(plan) = catalog_plan(&sql, &mut self.diagnostic, session)? {
-                    let (epoch, _, _) = core(session.catalog_snapshot())?;
-                    let fields =
-                        giggles_pg_catalog::describe(&plan).map_err(catalog_wire::error)?;
-                    let d = Description {
-                        type_oids: vec![],
-                        typmods: vec![-1; fields.len()],
-                        parameters: vec![DataType::Text; plan.parameter_count()],
-                        columns: fields
-                            .iter()
-                            .map(|f| giggles_core::relational::ColumnDef {
-                                id: 0,
-                                name: f.name.clone(),
-                                data_type: DataType::Text,
-                                not_null: false,
-                            })
-                            .collect(),
-                    };
-                    (Plan::Catalog(Box::new(plan), fields, epoch), d)
-                } else {
-                    self.diagnostic.phase = "application prepare";
-                    prepare_declared_sql(session, &sql, &oids)?
-                };
-                if n > d.parameters.len() {
-                    return Err("08P01");
-                }
-                let mut parameter_oids: Vec<u32> = match &p {
-                    Plan::Catalog(plan, _, _) => {
-                        plan.parameter_types().iter().map(|t| t.oid()).collect()
-                    }
-                    _ => d.parameters.iter().map(oid).collect(),
-                };
-                // Retry only the catalog declaration mismatch that would otherwise be
-                // 0A000. Keep catalog validation and successful numeric overrides intact.
-                if let Plan::Catalog(plan, _, _) = &p {
-                    let mismatch =
-                        oids.iter()
-                            .zip(&parameter_oids)
-                            .enumerate()
-                            .any(|(i, (o, inferred))| {
-                                *o != 0
-                                    && o != inferred
-                                    && !catalog_input_override(plan, i, *o, *inferred)
-                            });
-                    if session.role.is_sql()
-                        && mismatch
-                        && oids.iter().all(|o| {
-                            *o == 0
-                                || core_declared_type(*o).is_some()
-                                || catalog_wire::parameter_type(*o).is_ok()
-                        })
-                    {
-                        let was_aborted = session.is_aborted();
-                        match prepare_declared_sql(session, &sql, &oids) {
-                            Ok((application, description))
-                                if oids.len() <= description.parameters.len()
-                                    && oids
-                                        .iter()
-                                        .zip(&description.parameters)
-                                        .all(|(o, ty)| sql_declared_type(ty, *o).is_some()) =>
-                            {
-                                p = application;
-                                d = description;
-                                parameter_oids = d.parameters.iter().map(oid).collect();
-                            }
-                            Err(error) if !was_aborted && session.is_aborted() => {
-                                return Err(error);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                self.diagnostic.phase = "parameter type declaration";
-                for (i, (o, t)) in oids.into_iter().zip(&mut d.parameters).enumerate() {
-                    if matches!(p, Plan::Catalog(..)) {
-                        if o != 0 {
-                            catalog_wire::parameter_type(o)?;
-                            // The catalog compiler fixes parameter and result
-                            // types together. A wire override must not silently
-                            // change only ParameterDescription while leaving a
-                            // projected parameter's output type unchanged.
-                            if o != parameter_oids[i] {
-                                let safe = matches!(&p, Plan::Catalog(plan, _, _)
-                                    if catalog_input_override(plan, i, o, parameter_oids[i]));
-                                if !safe {
-                                    return Err("0A000");
-                                }
-                            }
-                            parameter_oids[i] = o;
-                        }
-                        continue;
-                    }
-                    if o != 0 && o != oid(t) {
-                        // Application integer parameters share Value::Int, but
-                        // decode using the client's declared wire width. Core
-                        // still enforces the destination range at execution.
-                        if !matches!(p, Plan::Sql(_)) {
-                            return Err("0A000");
-                        }
-                        *t = sql_declared_type(t, o).ok_or("0A000")?;
-                    }
-                    if o != 0 {
-                        parameter_oids[i] = o;
-                    }
-                }
+                let statement = self.prepare_statement(&sql, oids, session)?;
                 if !name.is_empty() {
                     self.named_statement_bytes += sql.len();
                 }
                 self.statements.insert(
                     name,
-                    Statement {
-                        sql_bytes: sql.len(),
-                        p,
-                        d,
-                        parameter_oids,
-                        query_id: self.diagnostic.query_id.clone(),
-                    },
+                    statement,
                 );
                 frame(b'1', &[], out)?;
             }
             b'B' => {
                 let name = r.text()?;
                 let stmt = r.text()?;
+                self.refresh_statement(&stmt, session)?;
                 let s = self.statements.get(&stmt).ok_or("26000")?.clone();
                 self.diagnostic.query_id = s.query_id.clone();
                 s.describe(session)?;
@@ -1480,6 +1503,7 @@ impl State {
                 r.end()?;
                 match kind {
                     b'S' => {
+                        self.refresh_statement(&name, session)?;
                         let s = self.statements.get(&name).ok_or("26000")?;
                         self.diagnostic.query_id = s.query_id.clone();
                         let d = s.describe(session)?;

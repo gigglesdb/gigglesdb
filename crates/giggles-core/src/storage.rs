@@ -2474,6 +2474,11 @@ impl SqlSession {
     pub fn is_aborted(&self) -> bool {
         self.aborted
     }
+    /// Whether a prepared statement belongs to the current transaction lifetime.
+    pub fn prepared_is_current(&self, p: &relational::Prepared) -> bool {
+        p.transaction.is_none() || p.transaction == self.transaction_id
+    }
+
     pub fn prepare(&mut self, sql: &str) -> Result<relational::Prepared, CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             return self.prepare_v2(sql, u128::from_be_bytes(db.meta.domain));
@@ -3814,8 +3819,11 @@ mod typed_session_tests {
         let prepared = session
             .prepare("INSERT INTO native_items VALUES (7,1,'old',0)")
             .unwrap();
+        assert!(session.prepared_is_current(&prepared));
         session.commit_engine().unwrap();
+        assert!(!session.prepared_is_current(&prepared));
         session.begin_engine().unwrap();
+        assert!(!session.prepared_is_current(&prepared));
         assert_eq!(
             session.execute_prepared(&prepared, &[], None),
             Err(CoreError::Sql(E::StaleSchema))
