@@ -89,6 +89,7 @@ pub struct Snapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Check {
+    SplitTransactionDdl,
     Version,
     WalLevel,
     SlotHeadroom,
@@ -136,6 +137,7 @@ impl Check {
             Self::DatabaseCreate => "database_create",
             Self::EventTriggerPrivilege => "event_trigger_privilege",
             Self::OriginGrants => "origin_grants",
+            Self::SplitTransactionDdl => "split_transaction_ddl_hazards",
             Self::Table => "table",
             Self::Key => "key",
             Self::ReplicaIdentity => "replica_identity",
@@ -189,6 +191,9 @@ impl Check {
             }
             Self::OriginGrants => {
                 "GRANT EXECUTE on each reported pg_catalog.pg_replication_origin_* function to the reverse apply role and recheck that role on the reverse endpoint."
+            }
+            Self::SplitTransactionDdl => {
+                "Stop concurrent index/reindex/partition detach operations; resolve named invalid or unready indexes and pending detaches, quiesce schema changes, then restart from a fresh snapshot."
             }
             Self::Table => {
                 "Select an existing permanent ordinary/partitioned table; remove RLS restrictions for the capture role or explicitly exclude the table."
@@ -402,6 +407,7 @@ fn classify_rows<F: Fn(&ColumnType) -> bool>(
         }
     };
     match observation.check {
+        Check::SplitTransactionDdl => verdict(rows.is_empty()),
         Check::SchemaDescriptor => verdict(!rows.is_empty()),
         Check::Version => {
             if (16..=18).contains(&major) {

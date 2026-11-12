@@ -4,7 +4,15 @@
 //! only then apply its DML. Capture must continue after a boundary stop. Message
 //! LSNs are not commit positions. An end trigger cannot guard intermediate
 //! commits of concurrent/split-transaction DDL: prohibit those commands while
-//! migrating, or provide a separately qualified start-time guard (S3b).
+//! migrating. Milestone 1 detects hazards at preflight, double-samples a scoped
+//! catalog fingerprint around slot creation, and persists sticky drift/hazard
+//! blockers at readiness watermarks and the final cutover marker. Any scoped
+//! drift (including captured transactional DDL, F10) requires quiescence and a
+//! fresh snapshot. Polls can miss transient reverted changes; a start-time
+//! ddl_command_start guard remains a planned follow-up (S3b).
+
+mod operational;
+pub use operational::*;
 
 mod classify;
 mod sql;
@@ -163,7 +171,7 @@ pub fn decode(
 /// a fresh consistent snapshot; polling alone does not establish apply safety.
 pub const FINGERPRINT_SQL: &str = include_str!("../../artifacts/spikes/s3-ddl/fingerprint.sql");
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PollPoint {
     Watermark(u64),
     FinalMarker(u64),

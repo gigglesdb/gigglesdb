@@ -445,3 +445,34 @@ independent-history gates.
 - Verified-ready while default production collectors are absent.
 - Source-side unreadability of excluded columns from adapter filtering alone.
 - Safe side effects merely because a command parses or a definition validates.
+
+## Schema changes during a migration
+
+Milestone 1 prohibits `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`,
+`REINDEX CONCURRENTLY`, and `ALTER TABLE ... DETACH PARTITION CONCURRENTLY` on
+in-scope tables. Quiesce schema changes before starting and throughout migration.
+
+Source preflight reports named invalid/unready indexes, active index builds and
+pending partition detaches. Slot setup fingerprints scoped table catalogs
+immediately before and after slot creation; any difference or hazard fails
+closed. The accepted 32-hex baseline is journaled durably. Readiness watermarks
+and the final cutover marker repeat the fingerprint and hazard probe. Drift,
+hazards or invalid fingerprints set a durable sticky blocker with the reason, observed
+value and poll point. It survives restart and prevents apply admission,
+readiness and cutover; `skedaddle status` exposes it and recovery instructions.
+
+Failed probes fail the current attempt without persisting a blocker. A migration
+started before this version has no stored baseline and refuses to resume; restart
+it from a fresh snapshot.
+
+Recovery: quiesce schema changes, resolve the named hazards, and start a new
+migration from a fresh snapshot. Returning catalogs to the baseline does not
+clear a blocker. There is no re-baselining. Any scoped drift currently blocks,
+including transactional DDL captured by the end trigger (limitation F10).
+Polling can miss transient changes that leave no catalog difference between
+polls; it cannot identify the first affected commit. A `ddl_command_start`
+guard is a planned follow-up, and is not installed in milestone 1.
+
+The operational fingerprint excludes roles, ownership, ACLs, publications and
+Skedaddle administration. Relation OIDs intentionally bind table identity so
+that drop/recreate blocks; storage rewrites alone do not change the hash.

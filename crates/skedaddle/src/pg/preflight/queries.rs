@@ -212,6 +212,36 @@ pub(super) async fn collect(
             .await?;
             continue;
         }
+        let schemas = vec![object.schema.clone()];
+        let names = vec![object.name.clone()];
+        tx.batch_execute("SAVEPOINT skedaddle_hazards").await?;
+        let result = tx
+            .query(crate::pg::ddl::HAZARD_SQL, &[&schemas, &names])
+            .await;
+        let (rows, error) = match result {
+            Ok(rows) => {
+                tx.batch_execute("RELEASE SAVEPOINT skedaddle_hazards")
+                    .await?;
+                (rows.iter().map(|r| serde_json::json!({"kind":r.get::<_,String>(0),"relation":r.get::<_,String>(1),"object":r.get::<_,String>(2)})).collect(), None)
+            }
+            Err(_) => {
+                tx.batch_execute(
+                    "ROLLBACK TO SAVEPOINT skedaddle_hazards; RELEASE SAVEPOINT skedaddle_hazards",
+                )
+                .await?;
+                (
+                    vec![],
+                    Some("split-transaction DDL hazard probe failed".into()),
+                )
+            }
+        };
+        snapshot.observations.push(Observation {
+            check: Check::SplitTransactionDdl,
+            object: Some(object.clone()),
+            sql: crate::pg::ddl::HAZARD_SQL.into(),
+            rows,
+            error,
+        });
         let oid = table_oid(object);
         add(&mut snapshot, tx, Check::Table, Some(object), &format!("SELECT c.relkind::text AS kind,c.relpersistence::text AS persistence,c.relreplident::text AS replica_identity,c.relrowsecurity AS rls,c.relforcerowsecurity AS force_rls,row_security_active(c.oid) AS rls_active FROM pg_catalog.pg_class c WHERE c.oid IN ({oid})")).await?;
         let keys = format!(

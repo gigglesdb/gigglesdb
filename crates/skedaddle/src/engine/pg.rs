@@ -32,6 +32,9 @@ pub struct PgInstaller {
     pub installation: String,
     pub tables: Vec<pg::chunk::QualifiedName>,
     pub checkpoint: Option<Checkpoint>,
+    pub schema_baseline: Option<String>,
+    /// Canonical fingerprint scope from the stored migration definition.
+    pub schema_tables: Vec<pg::chunk::QualifiedName>,
 }
 fn identifier(s: &str) -> Result<String> {
     if s.is_empty() || s.contains('\0') {
@@ -44,6 +47,9 @@ impl Installer for PgInstaller {
         serde_json::json!({"publication":self.publication,"slot":self.slot,
             "installation":self.installation,"tables":self.tables})
         .to_string()
+    }
+    fn schema_baseline(&self) -> Option<String> {
+        self.schema_baseline.clone()
     }
     fn slot_marker(&self) -> Result<Option<String>> {
         self.checkpoint
@@ -138,6 +144,11 @@ impl Installer for PgInstaller {
                 let existing = self.source.query_opt("SELECT plugin,database,active,confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1", &[&self.slot]).await?;
                 if let Some(row) = existing {
                     // A pre-existing slot is only adopted with its saved lineage.
+                    if self.schema_baseline.is_none() {
+                        return Err(recovery(
+                            "existing slot has no durable scoped schema baseline; quiesce and restart from a fresh snapshot",
+                        ));
+                    }
                     let checkpoint = self.checkpoint.as_ref().ok_or_else(|| recovery("existing slot needs saved checkpoint; reconcile interrupted slot creation"))?;
                     checkpoint
                         .lineage
@@ -154,11 +165,27 @@ impl Installer for PgInstaller {
                     if self.checkpoint.is_some() {
                         return Err(recovery("saved slot is missing"));
                     }
+                    let before = pg::ddl::observe(&self.source, &self.schema_tables).await?;
+                    if !before.hazards.is_empty() {
+                        return Err(recovery(format!(
+                            "split-transaction DDL hazards: {:?}. {}",
+                            before.hazards,
+                            pg::ddl::SCHEMA_REMEDIATION
+                        )));
+                    }
                     let created = self
                         .replication
                         .create_slot(&self.slot)
                         .await
                         .map_err(recovery)?;
+                    let after = pg::ddl::observe(&self.source, &self.schema_tables).await?;
+                    if before != after || !after.hazards.is_empty() {
+                        return Err(recovery(format!(
+                            "slot-time schema drift/hazard. {}",
+                            pg::ddl::SCHEMA_REMEDIATION
+                        )));
+                    }
+                    self.schema_baseline = Some(before.fingerprint);
                     self.checkpoint = Some(Checkpoint {
                         lineage: self.replication.lineage().clone(),
                         slot: self.slot.clone(),
@@ -484,6 +511,11 @@ impl<D: Destination, P: PgTransactionPlanner> PgApplier<D, P> {
         if stop.as_ref().is_some_and(|s| *s.borrow()) {
             return Ok(false);
         }
+        runtime
+            .snapshot()
+            .operational_schema
+            .require_clear()
+            .map_err(recovery)?;
         let transaction = std::sync::Mutex::new(None);
         let stream = &self.stream;
         let applied = std::sync::Mutex::new(None);
@@ -597,6 +629,9 @@ impl<D: Destination, P: PgTransactionPlanner> Destination for PlanningDestinatio
             .take()
             .ok_or(apply::ApplyError::Invalid("missing planning transaction"))?;
         let snapshot = self.runtime.snapshot();
+        if snapshot.operational_schema.require_clear().is_err() {
+            return Err(executor::Error::Blocked);
+        }
         super::final_marker::transaction_marker(&txn).map_err(|_| {
             executor::Error::Apply(apply::ApplyError::Invalid(
                 "unknown captured control payload",
@@ -656,6 +691,15 @@ impl<D: Destination, P: PgTransactionPlanner> Destination for PlanningDestinatio
         plan.progress = envelope.progress.clone();
         // From this point onward cancellation must drain, including persistence
         // of the reader checkpoint and receipt retention in ReaderLoop::step.
+        if self
+            .runtime
+            .snapshot()
+            .operational_schema
+            .require_clear()
+            .is_err()
+        {
+            return Err(executor::Error::Blocked);
+        }
         self.destination.apply(&plan).await
     }
     async fn retain_after_checkpoint(

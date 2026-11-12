@@ -521,6 +521,12 @@ impl Service {
     }
     async fn execute(&self, deadline_ms: u64) -> coordinator::Result<CutoverOutcome> {
         let runtime = self.engine.runtime();
+        runtime
+            .state()
+            .await
+            .operational_schema
+            .require_clear()
+            .map_err(|e| coordinator::Error::RecoveryRequired(e.to_string()))?;
         let saved = replay(&runtime.state().await)?;
         // A fenced replay cannot meet pre-fence live readiness again. Its
         // authenticated admitted state/deadline, not a UI snapshot, resumes it.
@@ -946,6 +952,7 @@ fn run_hooks(
     Ok(())
 }
 struct Source<'a> {
+    task: &'a Task,
     pg: driver::pg::Source<Pg, Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
     drain: Arc<AtomicU64>,
 }
@@ -966,7 +973,32 @@ impl driver::SourceFence for Source<'_> {
         Ok(result)
     }
     fn final_marker(&mut self, k: &driver::Key) -> driver::Result<driver::Marker> {
-        self.pg.final_marker(k)
+        let tables = self
+            .pg
+            .connection
+            .rt
+            .block_on(self.task.runtime.scoped_schema_tables())
+            .map_err(component)?;
+        self.pg
+            .connection
+            .rt
+            .block_on(self.task.runtime.poll_schema(
+                &self.pg.connection.session.client,
+                &tables,
+                crate::pg::ddl::PollPoint::FinalMarker(self.drain.load(Ordering::SeqCst)),
+            ))
+            .map_err(component)?;
+        let marker = self.pg.final_marker(k)?;
+        self.pg
+            .connection
+            .rt
+            .block_on(self.task.runtime.poll_schema(
+                &self.pg.connection.session.client,
+                &tables,
+                crate::pg::ddl::PollPoint::FinalMarker(marker.lsn),
+            ))
+            .map_err(component)?;
+        Ok(marker)
     }
     fn unfence(&mut self, k: &driver::Key, j: &mut driver::Journal<'_>) -> driver::Result<()> {
         self.pg.unfence(k, j)
@@ -1278,6 +1310,7 @@ impl Task {
         let drain = Arc::new(AtomicU64::new(saved.borrow().source.drain_lsn.unwrap_or(0)));
         let hook_rt = rt.clone();
         let mut source = Source {
+            task: self,
             pg: driver::pg::Source {
                 connection: source_connection,
                 state: saved.borrow().source.clone(),

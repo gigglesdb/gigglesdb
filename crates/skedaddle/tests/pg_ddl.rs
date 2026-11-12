@@ -997,3 +997,114 @@ async fn tls_connect(
     assert!(transport.warnings.is_empty());
     Ok((client, driver))
 }
+
+#[tokio::test]
+async fn scoped_operational_drift_is_sticky() -> LiveResult<()> {
+    let _guard = LIVE_LOCK.lock().await;
+    let Some(live) = Live::open("scoped_operational_drift_is_sticky").await? else {
+        return Ok(());
+    };
+    let result: LiveResult<()> = async {
+        let scope = vec![skedaddle::pg::chunk::QualifiedName {
+            schema: live.id.clone(),
+            name: "mapped".into(),
+        }];
+        let before = observe(&live.client, &scope).await?;
+        assert!(before.hazards.is_empty());
+        let mut state = OperationalSchema {
+            baseline: Some(before.fingerprint),
+            blocker: None,
+        };
+        live.client
+            .batch_execute(&format!(
+                "ALTER TABLE {}.mapped ADD COLUMN drift text",
+                live.id
+            ))
+            .await?;
+        assert!(
+            state
+                .poll(
+                    PollPoint::Watermark(1),
+                    observe(&live.client, &scope).await?
+                )
+                .is_err()
+        );
+        live.client
+            .batch_execute(&format!("ALTER TABLE {}.mapped DROP COLUMN drift", live.id))
+            .await?;
+        let mut restarted: OperationalSchema =
+            serde_json::from_str(&serde_json::to_string(&state)?)?;
+        assert!(
+            restarted
+                .poll(
+                    PollPoint::FinalMarker(2),
+                    observe(&live.client, &scope).await?
+                )
+                .is_err()
+        );
+        assert_eq!(state, restarted);
+        Ok(())
+    }
+    .await;
+    let cleanup = live.close().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+async fn invalid_concurrent_index_blocks_source_preflight() -> LiveResult<()> {
+    let _guard = LIVE_LOCK.lock().await;
+    let Some(mut live) = Live::open("invalid_concurrent_index_blocks_source_preflight").await?
+    else {
+        return Ok(());
+    };
+    let result: LiveResult<()> = async {
+        live.client
+            .batch_execute(&format!("INSERT INTO {}.mapped VALUES (1),(1)", live.id))
+            .await?;
+        assert!(
+            live.client
+                .batch_execute(&format!(
+                    "CREATE UNIQUE INDEX CONCURRENTLY broken ON {}.mapped(id)",
+                    live.id
+                ))
+                .await
+                .is_err()
+        );
+        let scope = vec![skedaddle::pg::chunk::QualifiedName {
+            schema: live.id.clone(),
+            name: "mapped".into(),
+        }];
+        assert!(
+            observe(&live.client, &scope)
+                .await?
+                .hazards
+                .iter()
+                .any(|h| h.kind == "invalid-or-unready-index")
+        );
+        use skedaddle::{
+            definition::{ObjectKind, ObjectSelector},
+            pg::preflight,
+        };
+        let objects = vec![ObjectSelector {
+            schema: live.id.clone(),
+            name: "mapped".into(),
+            kind: ObjectKind::Table,
+            exclude_columns: vec![],
+        }];
+        let snapshot = preflight::collect(&mut live.client, &objects).await?;
+        let evidence = snapshot
+            .observations
+            .iter()
+            .find(|o| o.check == preflight::Check::SplitTransactionDdl)
+            .unwrap();
+        assert!(evidence.error.is_none());
+        assert!(!evidence.rows.is_empty());
+        let report =
+            preflight::classify("test", &snapshot, &preflight::Options::default(), |_| true);
+        assert!(!report.blocking().is_empty());
+        Ok(())
+    }
+    .await;
+    let cleanup = live.close().await;
+    result.and(cleanup)
+}

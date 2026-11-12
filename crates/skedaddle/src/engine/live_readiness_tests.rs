@@ -416,3 +416,58 @@ pub(crate) async fn retired_ddl_runtime(control: PathBuf) -> (Runtime, Journal) 
     assert!(live.schema.unwrap().blocked_boundary.is_some());
     (runtime, f.journal)
 }
+
+#[tokio::test]
+async fn installer_readiness_and_cutover_share_stored_definition_scope() {
+    use crate::definition::{ExcludedObject, ObjectKind, ObjectSelector};
+    let mut definition = crate::MigrationDefinition::from_json(
+        include_str!("../../README.md")
+            .split("```json")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let object = |schema: &str, name: &str, kind| ObjectSelector {
+        schema: schema.into(),
+        name: name.into(),
+        kind,
+        exclude_columns: vec![],
+    };
+    definition.selected_objects = vec![
+        object("z", "parent", ObjectKind::Table),
+        object("a", "child", ObjectKind::Table),
+        object("a", "other", ObjectKind::Table),
+        object("a", "child", ObjectKind::Table),
+        object("a", "view", ObjectKind::View),
+        object("a", "seq", ObjectKind::Sequence),
+    ];
+    definition.excluded_objects = vec![ExcludedObject {
+        object: object("a", "excluded", ObjectKind::Table),
+        reason: "out of scope".into(),
+    }];
+    let deduplicated = crate::pg::ddl::scoped_schema_tables(&definition);
+    assert_eq!(deduplicated.len(), 3);
+    // Coordinator definitions reject duplicate selectors; exercise normalization
+    // above, then store the equivalent valid definition for all three phases.
+    definition.selected_objects.sort();
+    definition.selected_objects.dedup();
+    let fixture = Fixture::with_definition(Some(definition)).await;
+    let runtime = fixture.engine.runtime();
+    // These phases all use this runtime accessor, including installer schema_tables.
+    let installer_scope = runtime.scoped_schema_tables().await.unwrap();
+    let readiness_scope = runtime.scoped_schema_tables().await.unwrap();
+    let cutover_scope = runtime.scoped_schema_tables().await.unwrap();
+    assert_eq!(installer_scope, deduplicated);
+    assert_eq!(installer_scope, readiness_scope);
+    assert_eq!(installer_scope, cutover_scope);
+    assert_eq!(
+        installer_scope
+            .iter()
+            .map(|t| (t.schema.as_str(), t.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("a", "child"), ("a", "other"), ("z", "parent")]
+    );
+}

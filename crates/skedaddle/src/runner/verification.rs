@@ -130,7 +130,7 @@ pub fn verification_status(root: &Path, id: &str, state: &Materialized) -> Json 
         }
         Some(status.verification)
     })();
-    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run),"readiness":readiness_status(&control, state)})
+    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run),"operational_schema":state.operational_schema,"schema_remediation":crate::pg::ddl::SCHEMA_REMEDIATION,"readiness":readiness_status(&control, state)})
 }
 
 fn control_file(root: &Path, name: &str) -> std::io::Result<File> {
@@ -546,6 +546,14 @@ impl Readiness {
         let mut facts =
             super::readiness::Facts::sample(state.definition.as_ref(), self.buffer.as_deref());
         facts.compose_live(state.definition.as_ref(), &self.runtime.live_readiness());
+        if let Err(error) = state.operational_schema.require_clear() {
+            facts.schema_jobs.ready = false;
+            facts.schema_jobs.blocker = Some(crate::status::Blocker {
+                code: "scoped-schema-blocked".into(),
+                reason: error.to_string(),
+                remediation: crate::pg::ddl::SCHEMA_REMEDIATION.into(),
+            });
+        }
         if let Some(fact) = self.fence_fact(state) {
             facts.fence_risks = fact;
         }

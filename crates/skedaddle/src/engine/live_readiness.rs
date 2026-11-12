@@ -337,7 +337,30 @@ impl Hub {
         }
     }
 }
+// A failed observation has no evidence of schema drift and must never produce
+// a durable marker. Successful observations alone can create a sticky blocker.
+fn evaluate_schema_poll<E: std::fmt::Display>(
+    mut schema: crate::pg::ddl::OperationalSchema,
+    point: crate::pg::ddl::PollPoint,
+    observation: std::result::Result<crate::pg::ddl::SchemaObservation, E>,
+) -> Result<crate::pg::ddl::OperationalSchema> {
+    schema.require_clear().map_err(recovery)?;
+    let observed = observation.map_err(recovery)?;
+    // poll records the blocker in schema; the caller persists it before failing.
+    let _ = schema.poll(point, observed);
+    Ok(schema)
+}
+
 impl Runtime {
+    pub async fn scoped_schema_tables(&self) -> Result<Vec<crate::pg::chunk::QualifiedName>> {
+        self.state()
+            .await
+            .definition
+            .as_ref()
+            .map(crate::pg::ddl::scoped_schema_tables)
+            .ok_or_else(|| recovery("missing migration definition for schema scope"))
+    }
+
     pub fn live_readiness(&self) -> LiveReadinessObservation {
         self.7.sample()
     }
@@ -346,6 +369,26 @@ impl Runtime {
     /// come from the same configured endpoint. A captured transactional marker
     /// proves coverage of this sampled tip, including otherwise idle sources.
     /// Caller starts the freshness clock before connection/query awaits.
+    pub async fn poll_schema(
+        &self,
+        admin: &tokio_postgres::Client,
+        tables: &[crate::pg::chunk::QualifiedName],
+        point: crate::pg::ddl::PollPoint,
+    ) -> Result<()> {
+        let schema = self.state().await.operational_schema.clone();
+        schema.require_clear().map_err(recovery)?;
+        let schema =
+            evaluate_schema_poll(schema, point, crate::pg::ddl::observe(admin, tables).await)?;
+        if let Some(blocker) = &schema.blocker {
+            self.marker(
+                crate::pg::ddl::BLOCKER_STREAM,
+                serde_json::to_string(blocker)?,
+                "sticky".into(),
+            )
+            .await?;
+        }
+        schema.require_clear().map_err(recovery)
+    }
     pub async fn probe_readiness(
         &self,
         admin: &tokio_postgres::Client,
@@ -355,6 +398,8 @@ impl Runtime {
         let result = async {
             let row = admin.query_one("SELECT pg_current_wal_lsn()::text, (extract(epoch FROM clock_timestamp()) * 1000000)::bigint", &[]).await.map_err(recovery)?;
             let tip = crate::pg::replication::parse_lsn(&row.get::<_, String>(0)).map_err(recovery)?;
+            let tables = self.scoped_schema_tables().await?;
+            self.poll_schema(admin, &tables, crate::pg::ddl::PollPoint::Watermark(tip)).await?;
             let marker = super::verification::verification_marker(uuid::Uuid::new_v4());
             self.7.source_tip(lineage, tip, row.get(1), started, marker.clone())?;
             marker.emit(admin).await.map_err(recovery)?;
@@ -373,6 +418,60 @@ impl Runtime {
 #[cfg(test)]
 mod bounds {
     use super::*;
+    #[test]
+    fn failed_schema_observation_never_produces_a_blocker() {
+        use crate::pg::ddl::{OperationalSchema, PollPoint, SchemaObservation};
+        let baseline = "0123456789abcdef0123456789abcdef".to_owned();
+        let schema = OperationalSchema {
+            baseline: Some(baseline.clone()),
+            blocker: None,
+        };
+        for point in [PollPoint::Watermark(10), PollPoint::FinalMarker(20)] {
+            assert!(
+                evaluate_schema_poll(
+                    schema.clone(),
+                    point.clone(),
+                    Err::<SchemaObservation, _>("connection lost")
+                )
+                .is_err()
+            );
+            let clean = evaluate_schema_poll(
+                schema.clone(),
+                point.clone(),
+                Ok::<_, &str>(SchemaObservation {
+                    fingerprint: baseline.clone(),
+                    hazards: vec![],
+                }),
+            )
+            .unwrap();
+            assert!(clean.blocker.is_none());
+            for observed in [
+                SchemaObservation {
+                    fingerprint: "invalid".into(),
+                    hazards: vec![],
+                },
+                SchemaObservation {
+                    fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    hazards: vec![],
+                },
+                SchemaObservation {
+                    fingerprint: baseline.clone(),
+                    hazards: vec![crate::pg::ddl::Hazard {
+                        kind: "invalid-or-unready-index".into(),
+                        relation: "public.t".into(),
+                        object: "t_idx".into(),
+                    }],
+                },
+            ] {
+                let blocked =
+                    evaluate_schema_poll(schema.clone(), point.clone(), Ok::<_, &str>(observed))
+                        .unwrap();
+                assert!(blocked.blocker.is_some());
+                assert!(blocked.require_clear().is_err());
+            }
+        }
+    }
+
     #[test]
     fn bounded_queue_overflow_and_unknown_writer_fail_closed() {
         let source = SourceIdentity {

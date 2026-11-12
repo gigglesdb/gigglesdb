@@ -266,6 +266,11 @@ impl Engine {
         !self.runtime.snapshot().progress.contains_key(COVERAGE_LOSS)
     }
     pub(super) fn require_coverage(&self) -> Result<()> {
+        self.runtime
+            .snapshot()
+            .operational_schema
+            .require_clear()
+            .map_err(recovery)?;
         if self.resumable() {
             Ok(())
         } else {

@@ -445,6 +445,14 @@ pub async fn run(
     let publication = format!("skedaddle_{id}");
     let slot = format!("skedaddle_{id}");
     let mut installer = PgInstaller {
+        schema_tables: engine.runtime().scoped_schema_tables().await?,
+        schema_baseline: engine
+            .runtime()
+            .state()
+            .await
+            .operational_schema
+            .baseline
+            .clone(),
         source: source_client,
         destination: destination_client,
         replication: connection,
@@ -460,7 +468,16 @@ pub async fn run(
     };
     if !resume {
         Box::pin(engine.start(&mut installer)).await?;
+    } else if installer.schema_baseline.is_none() {
+        return Err(coordinator::Error::RecoveryRequired("Missing durable scoped schema baseline; quiesce schema changes and restart from a fresh snapshot".into()).into());
     }
+    engine
+        .runtime()
+        .state()
+        .await
+        .operational_schema
+        .require_clear()
+        .map_err(|e| coordinator::Error::RecoveryRequired(e.to_string()))?;
     let mut checkpoint = installer
         .checkpoint
         .take()

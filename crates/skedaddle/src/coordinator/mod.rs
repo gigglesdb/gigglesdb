@@ -576,6 +576,11 @@ pub struct Materialized {
 /// Cold metadata shares one allocation while retaining the checkpoint wire shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedMetadata {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pg::ddl::OperationalSchema::is_empty"
+    )]
+    pub operational_schema: crate::pg::ddl::OperationalSchema,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<rollback::Checkpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -703,6 +708,39 @@ impl Materialized {
                         marker,
                         position,
                     } => {
+                        if stream == crate::pg::ddl::BASELINE_STREAM {
+                            let value = crate::pg::ddl::OperationalSchema {
+                                baseline: Some(marker.clone()),
+                                blocker: None,
+                            };
+                            // Validate a baseline without permitting replacement or clearing a blocker.
+                            let mut validation = value.clone();
+                            validation
+                                .poll(
+                                    crate::pg::ddl::PollPoint::Watermark(0),
+                                    crate::pg::ddl::SchemaObservation {
+                                        fingerprint: marker.clone(),
+                                        hazards: vec![],
+                                    },
+                                )
+                                .map_err(|e| Error::RecoveryRequired(e.to_string()))?;
+                            if self
+                                .operational_schema
+                                .baseline
+                                .as_ref()
+                                .is_some_and(|b| b != marker)
+                            {
+                                return Err(Error::RecoveryRequired(
+                                    "schema baseline replacement forbidden".into(),
+                                ));
+                            }
+                            self.operational_schema.baseline = value.baseline;
+                        }
+                        if stream == crate::pg::ddl::BLOCKER_STREAM
+                            && self.operational_schema.blocker.is_none()
+                        {
+                            self.operational_schema.blocker = Some(serde_json::from_str(marker)?);
+                        }
                         self.progress
                             .insert(stream.clone(), (marker.clone(), position.clone()));
                     }

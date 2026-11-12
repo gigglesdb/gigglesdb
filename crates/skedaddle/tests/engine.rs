@@ -676,6 +676,8 @@ async fn copy_table(
                 .await?;
         }
         let mut installer = PgInstaller {
+            schema_tables: vec![table(&id).relation],
+            schema_baseline: None,
             source: connect(source_admin, ca).await?,
             destination: connect(destination_admin, ca).await?,
             replication: connection,

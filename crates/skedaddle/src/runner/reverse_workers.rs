@@ -1335,6 +1335,7 @@ mod tests {
     fn breach_reason_replays_as_critical_alert() {
         let state = Materialized {
             metadata: Box::new(coordinator::MaterializedMetadata {
+                operational_schema: Default::default(),
                 rollback_eligibility_ended: Some(EligibilityEnd::SourceFenceBreach),
                 ..Default::default()
             }),

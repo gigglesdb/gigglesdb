@@ -66,6 +66,9 @@ impl Installation {
     }
 }
 pub trait Installer {
+    fn schema_baseline(&self) -> Option<String> {
+        None
+    }
     /// `identity` is a stable, nonsecret description binding names and objects.
     fn identity(&self) -> String;
     fn install(&mut self, step: Installation) -> impl Future<Output = Result<()>>;
@@ -296,6 +299,17 @@ impl Engine {
                 coordinator.state().clone();
             drop(coordinator);
             outcome?;
+            if step == Installation::Slot
+                && let Some(baseline) = installer.schema_baseline()
+            {
+                self.runtime
+                    .marker(
+                        crate::pg::ddl::BASELINE_STREAM,
+                        baseline,
+                        "slot-double-sample".into(),
+                    )
+                    .await?;
+            }
             if step == Installation::Slot
                 && let Some(marker) = installer.slot_marker()?
             {
@@ -1219,6 +1233,11 @@ async fn apply_loop(
         if *cancel.borrow() {
             return Ok(());
         }
+        runtime
+            .snapshot()
+            .operational_schema
+            .require_clear()
+            .map_err(recovery)?;
         runtime.retention_tick().await?;
         if !applier.controlled_step(runtime, cancel.clone()).await? {
             tokio::select! {

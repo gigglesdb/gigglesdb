@@ -451,3 +451,71 @@ async fn planner_errors_and_invalid_plans_fail_closed_and_require_recovery() {
         assert!(applier.step(&f.engine.runtime()).await.is_err());
     }
 }
+
+#[tokio::test]
+async fn durable_schema_blocker_refuses_apply_readiness_and_cutover_admission() {
+    use crate::pg::ddl::*;
+    let (f, _capture, _tx) = populated().await;
+    let runtime = f.engine.runtime();
+    runtime
+        .marker(BASELINE_STREAM, "a".repeat(32), "slot-double-sample".into())
+        .await
+        .unwrap();
+    let mut state = runtime.state().await.operational_schema.clone();
+    state
+        .poll(
+            PollPoint::Watermark(42),
+            SchemaObservation {
+                fingerprint: "b".repeat(32),
+                hazards: vec![],
+            },
+        )
+        .unwrap_err();
+    runtime
+        .marker(
+            BLOCKER_STREAM,
+            serde_json::to_string(state.blocker.as_ref().unwrap()).unwrap(),
+            "sticky".into(),
+        )
+        .await
+        .unwrap();
+    f.journal.checkpoint(&runtime.state().await).await.unwrap();
+    let replay = f.journal.load(true).await.unwrap();
+    assert_eq!(replay.operational_schema, state);
+    assert_eq!(
+        f.journal.load(false).await.unwrap().operational_schema,
+        state
+    );
+    assert!(f.engine.evaluate_readiness().await.is_err());
+    // Both ordinary and fenced cutover worker admission use require_coverage.
+    assert!(f.engine.require_coverage().is_err());
+    let count = Arc::new(AtomicU64::new(0));
+    let mut apply = applier(
+        &f,
+        count.clone(),
+        |_txn: &AssembledTxn,
+         _mseq: u64,
+         _state: &Materialized|
+         -> std::result::Result<apply::TransactionPlan, apply::ApplyError> {
+            panic!("blocked apply must not plan")
+        },
+    );
+    assert!(apply.step(&runtime).await.is_err());
+    assert_eq!(count.load(AtomicOrdering::SeqCst), 0);
+    runtime
+        .marker(
+            BASELINE_STREAM,
+            "a".repeat(32),
+            "repeat cannot clear blocker".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .state()
+            .await
+            .operational_schema
+            .require_clear()
+            .is_err()
+    );
+}
