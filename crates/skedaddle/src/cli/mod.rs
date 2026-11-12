@@ -255,7 +255,11 @@ fn redact_ca_references(value: &mut Value) {
 fn unwired(name: &str) -> Failure {
     fail(
         Outcome::NotWired,
-        format!("{name} has no operational CLI adapter"),
+        if matches!(name, "rollback" | "finalize") {
+            format!("{name} requires the rollback-window owner (not yet available)")
+        } else {
+            format!("{name} has no operational CLI adapter")
+        },
         "The public primitives require live components and verified evidence; a lifecycle change alone cannot perform this operation.",
         &format!(
             "Do not retry {name} until its operational adapter is installed; run report <id> with the same --state-root to inspect durable evidence."
@@ -452,6 +456,7 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
             | Command::Pause { .. }
             | Command::Verify { .. }
             | Command::Cutover { .. }
+            | Command::Buffer { .. }
     ) {
         None
     } else {
@@ -728,7 +733,27 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
         }
         Command::Rollback { .. } => Err(unwired("rollback")),
         Command::Finalize { .. } => Err(unwired("finalize")),
-        Command::Buffer { .. } => Err(unwired("buffer gc")),
+        Command::Buffer { .. } => {
+            let response = crate::runner::request_gc(root, id).await;
+            let outcome = match response.exit_code {
+                0 => Outcome::Success,
+                3 => Outcome::InvalidInput,
+                8 => Outcome::NonOwner,
+                _ => Outcome::Infrastructure,
+            };
+            if response.exit_code == 0 {
+                Ok((outcome, response.data))
+            } else {
+                let mut error = fail(
+                    outcome,
+                    "Buffer GC request failed",
+                    "Inspect data.error.kind.",
+                    "Restore the active owner and retry.",
+                );
+                error.2 = response.data;
+                Err(error)
+            }
+        }
         _ => unreachable!(),
     }
 }

@@ -283,6 +283,50 @@ impl Runtime {
         let c = self.0.lock().await;
         *self.1.write().expect("engine snapshot poisoned") = c.state().clone();
     }
+    /// One bounded owner-requested pass. It uses the same checkpoint, fence and
+    /// retention interval as automatic GC; a request never bypasses policy.
+    pub async fn collect_buffer_once(&self) -> Result<serde_json::Value> {
+        let mut guard = self.3.lock().await;
+        let retention = guard
+            .as_mut()
+            .ok_or_else(|| recovery("retention unavailable"))?;
+        {
+            let mut owner = self.0.lock().await;
+            owner.refresh().await?;
+            if !owner.is_owner() || owner.state().epoch != retention.expected_epoch {
+                return Err(coordinator::Error::LostOwnership);
+            }
+        }
+        let mseq = retention.cursor;
+        let objects = retention.status.deleted_objects;
+        let bytes = retention.status.deleted_bytes;
+        let result = self.retention_step(retention).await;
+        {
+            let owner = self.0.lock().await;
+            if owner.state().epoch != retention.expected_epoch
+                || (!owner.is_owner() && self.pause_reason().is_none())
+            {
+                return Err(coordinator::Error::LostOwnership);
+            }
+        }
+        result?;
+        if retention.status.blocked_reason.is_some() {
+            return Err(recovery("buffer retention blocked"));
+        }
+        let deleted = retention.status.deleted_objects - objects;
+        let retained = retention
+            .store
+            .get(&retention.config.manifest_key(mseq))
+            .await
+            .map_err(recovery)?
+            .is_some();
+        Ok(serde_json::json!({
+            "examined_mseq": mseq, "next_mseq": retention.cursor,
+            "deleted_objects": deleted, "deleted_bytes": retention.status.deleted_bytes - bytes,
+            "retained_mseq": retained.then_some(mseq),
+            "scope": "One manifest cursor step; durable checkpoints, chunk pins and retention policy remain authoritative."
+        }))
+    }
     pub(super) async fn retention_tick(&self) -> Result<()> {
         let mut guard = self.3.lock().await;
         let Some(retention) = guard.as_mut() else {
@@ -291,6 +335,9 @@ impl Runtime {
         if Instant::now() < retention.next_tick {
             return Ok(());
         }
+        self.retention_step(retention).await
+    }
+    async fn retention_step(&self, retention: &mut Retention) -> Result<()> {
         retention.next_tick = Instant::now() + retention.cadence;
         let result = retention.tick(self).await;
         self.sync_authority().await;

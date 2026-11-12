@@ -196,7 +196,16 @@ fn initialized_status_report_assessment_and_not_wired_commands() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(invoke(&r, &["buffer", "gc", &id]).0, 9);
+    let (code, gc) = invoke(&r, &["buffer", "gc", &id]);
+    assert_eq!(code, 6, "{gc}");
+    assert_eq!(gc["data"]["error"]["kind"], "no_owner");
+    for args in [
+        vec!["buffer", "gc"],
+        vec!["buffer", "gc", "../bad"],
+        vec!["buffer", "gc", &id, "--unknown"],
+    ] {
+        assert_eq!(invoke(&r, &args).0, 3);
+    }
     let (code, idle) = invoke(&r, &["pause", &id]);
     assert_eq!(code, 0);
     assert_eq!(idle["data"]["pause_requested"], false);

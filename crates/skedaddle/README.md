@@ -258,11 +258,11 @@ Init uses the first 24 hex characters of the definition digest as migration ID.
 | `status <id> [--watch]` | Wired observer; watch is flushed NDJSON. |
 | `verify <id> [--tables ...]` | Wired active-owner request; exit 6 with no owner. |
 | `cutover <id> --deadline <dur>` | Wired active-owner request to `request_cutover`; exits 0 completed, 2 not ready or deadline, 3 invalid, 5 uncertain or breach, 6 no owner or infrastructure, 8 lost ownership. |
-| `rollback <id>` | Not wired: exit 9. |
-| `finalize <id> [--drop-objects]` | Not wired: exit 9. |
+| `rollback <id>` | Requires the rollback-window owner (not yet available): exit 9. |
+| `finalize <id> [--drop-objects]` | Requires the rollback-window owner (not yet available): exit 9. |
 | `abort <id>` | Wired coordinator-only; exit 9 if journal history records any external effect; no database restoration. |
 | `report <id>` | Wired safe trust/status reporting. |
-| `buffer gc <id>` | Not wired: exit 9. |
+| `buffer gc <id>` | Request one bounded retention pass from the active owner; reports deleted objects/bytes and retained manifest cursor. Exit 0 on success, 3 for invalid arguments, 6 for no/stopped owner or infrastructure failure, 8 for lost ownership/stale generation. |
 
 Start/resume report `--until` choices `catching-up`,
 `verified-ready` and `paused`. Ctrl-C/SIGINT and Unix SIGTERM request graceful stop.

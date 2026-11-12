@@ -141,7 +141,7 @@ fn control_file(root: &Path, name: &str) -> std::io::Result<File> {
         .truncate(false)
         .open(root.join(name))
 }
-fn active(root: &Path) -> std::io::Result<Option<String>> {
+pub(super) fn active(root: &Path) -> std::io::Result<Option<String>> {
     if !root.is_dir() {
         return Ok(None);
     }
@@ -159,7 +159,7 @@ fn active(root: &Path) -> std::io::Result<Option<String>> {
         Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
-fn write_json(path: &Path, value: &impl Serialize) -> coordinator::Result<()> {
+pub(super) fn write_json(path: &Path, value: &impl Serialize) -> coordinator::Result<()> {
     let staging = path.with_extension(format!("{}.staging", uuid::Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .write(true)

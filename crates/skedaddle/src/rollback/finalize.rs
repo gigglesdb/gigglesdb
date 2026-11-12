@@ -57,6 +57,7 @@ impl Finalize {
         installed: Inventory,
     ) -> cutover::Result<Self> {
         cutover::State::new(key.clone())?;
+        active_capture_sql(&owned_slots(&installed))?;
         for object in &installed {
             if object.name.is_empty()
                 || object.name.len() > 63
@@ -89,6 +90,7 @@ impl Finalize {
         stop_capture: &mut impl FnMut(&cutover::Key) -> cutover::Result<()>,
         journal: &mut Journal<'_>,
     ) -> cutover::Result<()> {
+        active_capture_sql(&owned_slots(&self.installed))?;
         let key = self.key.clone();
         authority.run(&key, || {
             if self.next == FinalizeStep::Complete {
@@ -240,14 +242,14 @@ fn owned_slots(installed: &Inventory) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Active-capture probe restricted to `slots`; `None` when nothing is owned.
+/// Active-capture probe restricted to a non-empty installation slot set.
 /// `Connection` has no bind parameters, so names are escaped literals.
-fn active_capture_sql(slots: &BTreeSet<&str>) -> Option<String> {
+fn active_capture_sql(slots: &BTreeSet<&str>) -> cutover::Result<String> {
     if slots.is_empty() {
-        return None;
+        return Err(cutover::Error::Invalid("finalize requires installed slots"));
     }
     let names: Vec<_> = slots.iter().map(|name| literal(name)).collect();
-    Some(format!(
+    Ok(format!(
         "{ACTIVE_CAPTURE_SQL} AND slot_name IN ({})",
         names.join(",")
     ))
@@ -260,10 +262,7 @@ fn verify_global_drop(
     connection: &mut impl Connection,
     slots: &BTreeSet<&str>,
 ) -> cutover::Result<()> {
-    let active = match active_capture_sql(slots) {
-        Some(sql) => query(connection, &sql)?,
-        None => Vec::new(),
-    };
+    let active = query(connection, &active_capture_sql(slots)?)?;
     if !active.is_empty() {
         return Err(cutover::Error::Invalid(
             "finalize requires all capture stopped",
@@ -399,9 +398,22 @@ mod tests {
             active_capture_sql(&BTreeSet::from(["a'b\\c"])).unwrap(),
             format!("{ACTIVE_CAPTURE_SQL} AND slot_name IN (E'a''b\\\\c')")
         );
-        assert_eq!(active_capture_sql(&BTreeSet::new()), None);
+        assert!(matches!(
+            active_capture_sql(&BTreeSet::new()),
+            Err(cutover::Error::Invalid("finalize requires installed slots"))
+        ));
     }
 
+    #[test]
+    fn nonempty_manifest_executes_scoped_capture_probe() {
+        let mut connection = Recording::default();
+        verify_global_drop(&mut connection, &BTreeSet::from(["skedaddle_m"])).unwrap();
+        assert_eq!(
+            connection.sql[0],
+            format!("{ACTIVE_CAPTURE_SQL} AND slot_name IN (E'skedaddle_m')")
+        );
+        assert_eq!(connection.sql[1], OWNED_TRIGGER_SQL);
+    }
     #[test]
     fn unrelated_active_slot_does_not_block_global_drop() {
         // A connection reporting an active slot for any unrestricted probe.
@@ -416,7 +428,10 @@ mod tests {
             }
         }
         verify_global_drop(&mut Foreign, &BTreeSet::from(["skedaddle_m"])).unwrap();
-        verify_global_drop(&mut Foreign, &BTreeSet::new()).unwrap();
+        assert!(matches!(
+            verify_global_drop(&mut Foreign, &BTreeSet::new()),
+            Err(cutover::Error::Invalid("finalize requires installed slots"))
+        ));
     }
 
     #[test]
@@ -508,10 +523,32 @@ mod tests {
 mod ordering_tests {
     use super::*;
     #[test]
+    fn slot_free_manifest_fails_closed() {
+        let key = cutover::Key {
+            migration: "m".into(),
+            cutover: "c".into(),
+            epoch: 1,
+            coordinator: "owner".into(),
+        };
+        let installed = Inventory::from([Object {
+            side: Side::Source,
+            kind: ObjectKind::Publication,
+            name: "publication".into(),
+        }]);
+        assert!(matches!(
+            Finalize::new(key, true, installed),
+            Err(cutover::Error::Invalid("finalize requires installed slots"))
+        ));
+    }
+    #[test]
     fn drop_order_removes_both_endpoints_triggers_before_global_ddl() {
         // The safety callback rejects a global drop until every event trigger
         // has been removed, including the later-sorting destination side.
-        let mut installed = Inventory::new();
+        let mut installed = Inventory::from([Object {
+            side: Side::Source,
+            kind: ObjectKind::Slot,
+            name: "skedaddle_m".into(),
+        }]);
         for side in [Side::Source, Side::Destination] {
             for (kind, name) in [
                 (ObjectKind::EventTrigger, "skedaddle_ddl_d9"),

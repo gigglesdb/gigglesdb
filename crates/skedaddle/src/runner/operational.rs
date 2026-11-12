@@ -687,7 +687,7 @@ pub async fn run(
         source: identity.clone(),
         monitor,
         pause: joined_pause.clone(),
-        joined: workers_joined,
+        joined: workers_joined.clone(),
     };
     let copy_config = CopyConfig {
         source: identity,
@@ -733,9 +733,20 @@ pub async fn run(
     // Never drop a running blocking cutover task: the service finishes its
     // guarded operation even when the forward workers stop independently.
     let services = async {
+        let gc = super::gc::serve(
+            engine.runtime(),
+            root.join(format!("{id}.control")),
+            workers_joined,
+        );
+        tokio::pin!(gc);
         let mut cutover_service = Box::pin(cutover.serve());
         let result = tokio::select! {
             result = &mut cutover_service => result,
+            result = &mut gc => {
+                joined_pause.send_replace(true);
+                let cutover_result = cutover_service.await;
+                result.and(cutover_result)
+            },
             result = Box::pin(verification.serve()) => {
                 joined_pause.send_replace(true);
                 // A live cutover must finish its guarded operation; dropping

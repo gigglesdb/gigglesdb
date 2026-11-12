@@ -739,3 +739,35 @@ async fn retention_outage_never_reacquires_replacement_authority() {
     );
     assert_eq!(f.journal.load(false).await.unwrap().applied_seq, seq);
 }
+
+#[tokio::test]
+async fn runner_requested_gc_reports_retained_then_deletes_one_manifest() {
+    let (f, writer, facts) = buffered().await;
+    let runtime = f.engine.runtime();
+    runtime.queue_writer(Some(writer)).await;
+    let retained = runtime.collect_buffer_once().await.unwrap();
+    assert_eq!(retained["deleted_objects"], 0);
+    assert_eq!(retained["retained_mseq"], 0);
+    runtime
+        .queue_applied(facts[1].0.clone(), facts[1].1.clone())
+        .await;
+    let deleted = runtime.collect_buffer_once().await.unwrap();
+    assert_eq!(deleted["deleted_objects"], 2);
+    assert!(deleted["deleted_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(deleted["next_mseq"], 1);
+    assert!(deleted["retained_mseq"].is_null());
+    assert!(
+        f.store
+            .get(&f.config.manifest_key(0))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.store
+            .get(&f.config.manifest_key(1))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

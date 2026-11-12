@@ -1,6 +1,8 @@
 //! Qualified PostgreSQL runner preparation and joined foreground operation.
 
 mod cutover;
+mod gc;
+pub use gc::request_gc;
 mod destination_readiness;
 mod fence_readiness;
 mod operational;
