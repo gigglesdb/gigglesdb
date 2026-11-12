@@ -147,7 +147,23 @@ pub(crate) fn snapshot(
     if generation_epoch != epoch {
         return Err("40001");
     }
+    let mut presentation = session.service.admin.catalog_presentation()
+        .map_err(|e| crate::service::sqlstate(&e))?;
+    if presentation.epoch != epoch { return Err("40001"); }
+    presentation.defaults.retain(|id, _| columns.contains(id));
+    presentation.identities.retain(|id, _| columns.contains(id));
+    presentation.primary_names.retain(|id, _| visible.contains(id));
     Ok(giggles_pg_catalog::CatalogSnapshot {
+        column_defaults: presentation.defaults, column_identities: presentation.identities,
+        primary_names: presentation.primary_names,
+        constraints: presentation.constraints.into_iter().filter(|c| visible.contains(&c.table)
+            && (c.foreign_table == 0 || visible.contains(&c.foreign_table)))
+            .map(|c| giggles_pg_catalog::ConstraintDef {
+                id: c.id, table: c.table, name: c.name, kind: c.kind, columns: c.columns,
+                foreign_table: c.foreign_table, foreign_columns: c.foreign_columns,
+                update: c.update, delete: c.delete, deferrable: c.deferrable, deferred: c.deferred,
+                validated: c.validated, expression: c.expression,
+            }).collect(),
         generation,
         backend_pid: session.backend_pid,
         backend_ssl: session.backend_ssl,
@@ -1262,7 +1278,7 @@ mod tests {
             Value::Text("NULL".into()),
             Value::Null,
             Value::Text("a,\"b\\c".into()),
-            Value::Text("λ".into()),
+            Value::Text("Î»".into()),
         ]);
         let binary = encode(&value, PgType::TextArray, 1).unwrap().unwrap();
         assert_eq!(
@@ -1271,12 +1287,12 @@ mod tests {
                 Some("NULL".into()),
                 None,
                 Some("a,\"b\\c".into()),
-                Some("λ".into())
+                Some("Î»".into())
             ]
         );
         assert_eq!(
             String::from_utf8(encode(&value, PgType::TextArray, 0).unwrap().unwrap()).unwrap(),
-            "{\"NULL\",NULL,\"a,\\\"b\\\\c\",\"λ\"}"
+            "{\"NULL\",NULL,\"a,\\\"b\\\\c\",\"Î»\"}"
         );
         let empty = encode(&Value::Array(vec![]), PgType::OidArray, 1)
             .unwrap()

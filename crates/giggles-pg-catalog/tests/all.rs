@@ -1,3 +1,5 @@
+#[path = "constraint_metadata.rs"]
+mod constraint_metadata;
 // Single integration-test binary: every tests/*.rs file is a module here, so the
 // crate links once instead of once per file. Files that re-run the test binary
 // by exact test name (current_exe) stay separate [[test]] targets in Cargo.toml.

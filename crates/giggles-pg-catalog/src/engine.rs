@@ -4454,6 +4454,7 @@ impl Runtime<'_> {
             "pg_indexam_has_property" => N,
             "pg_get_constraintdef" => {
                 let oid = integer(v[0].clone())?;
+                if let Some(def) = catalog::definition(self.snapshot, oid, v.get(1) == Some(&B(true))) { return Ok(S(def)); }
                 self.catalogs["pg_constraint"]
                     .rows
                     .iter()
@@ -4591,7 +4592,14 @@ impl Runtime<'_> {
             .filter(|c| *c != '\0')
             .ok_or(Error::Type)?
             .to_string()),
-            "pg_get_expr" => return Err(Error::Unsupported),
+            "pg_get_expr" => {
+                let known = [("pg_attrdef", 3, 1), ("pg_constraint", 18, 4)].iter().any(|(name, expr, rel)|
+                    self.catalogs[*name].rows.iter().any(|r| r[*expr] == v[0] && r[*rel] == v[1]));
+                if !known { return Err(Error::Unsupported); }
+                if v.get(2) == Some(&B(true)) && let S(expr) = &v[0] {
+                    S(expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')).unwrap_or(expr).into())
+                } else { v[0].clone() }
+            },
             "obj_description" | "col_description" => N,
             "shobj_description" => {
                 let class = catalog::relation_oid(&text(v[1].clone())?)

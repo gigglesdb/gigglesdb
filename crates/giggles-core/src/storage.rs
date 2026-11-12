@@ -1880,6 +1880,9 @@ impl Admin {
             Ok((s.sql.epoch, generation))
         })
     }
+    pub fn catalog_presentation(&self) -> Result<relational::CatalogPresentation, CoreError> {
+        self.inner.inspect_metadata(|s| s.sql.catalog_presentation().map_err(CoreError::Sql))
+    }
     pub fn catalog_schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
         self.inner.inspect_metadata(|s| Ok(s.sql.schema_metadata()))
     }

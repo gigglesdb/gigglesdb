@@ -82,6 +82,14 @@ pub struct IndexDef {
     pub columns: Vec<u64>,
     pub unique: bool,
 }
+/// Read-only CHECK/FK metadata, using stable core IDs and PostgreSQL action codes.
+#[derive(Debug, Clone, Default)]
+pub struct ConstraintDef {
+    pub id: u64, pub table: u64, pub name: String, pub kind: char,
+    pub columns: Vec<u64>, pub foreign_table: u64, pub foreign_columns: Vec<u64>,
+    pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
+    pub validated: bool, pub expression: Option<String>,
+}
 /// Presentation metadata only; these flags do not implement role privileges or policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDef {
@@ -118,6 +126,10 @@ pub struct CatalogSnapshot {
     /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
     /// xmin exposes its low 32 bits; this is never a raw HLC timestamp.
     pub generation: u64,
+    pub constraints: Vec<ConstraintDef>,
+    pub column_defaults: std::collections::BTreeMap<u64, String>,
+    pub column_identities: std::collections::BTreeMap<u64, char>,
+    pub primary_names: std::collections::BTreeMap<u64, String>,
     /// Current wire backend identity, supplied by the host (0 in offline snapshots).
     pub backend_pid: i32,
     /// Whether this connection actually completed a TLS handshake.
@@ -156,6 +168,8 @@ impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
             generation: 0,
+            constraints: Vec::new(), column_defaults: Default::default(),
+            column_identities: Default::default(), primary_names: Default::default(),
             backend_pid: 0,
             backend_ssl: false,
             user_relations: Default::default(),

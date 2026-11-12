@@ -1,4 +1,6 @@
 mod information_schema;
+mod constraints;
+pub(crate) use constraints::definition;
 use crate::*;
 use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct Relation {
@@ -1019,6 +1021,9 @@ pub(crate) fn scalar(t: ScalarType) -> (u32, &'static str, i64, u32) {
     }
 }
 pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>> {
+    if snapshot.primary_names.iter().any(|(id, name)| name.is_empty() || name.len() > 63 || !snapshot.tables.iter().any(|t| t.id == *id)) {
+        return Err(Error::InvalidSnapshot);
+    }
     if snapshot.tables.len() > 128 || snapshot.roles.len() > MAX_ROWS - PREDEFINED_ROLES.len() {
         return Err(Error::Limit);
     }
@@ -1192,7 +1197,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             suffix += 1;
         }
         occupied.insert((snapshot.table_schema(t.id).0, name.clone()));
-        key_names.insert(t.id, name);
+        key_names.insert(t.id, snapshot.primary_names.get(&t.id).cloned().unwrap_or(name));
     }
     let mut all: BTreeMap<String, Relation> = known_names()
         .iter()
@@ -1991,6 +1996,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         })
         .collect::<BTreeSet<_>>();
     let mut next_oid = i64::from(u32::MAX);
+    for c in &snapshot.constraints {
+        if !used_oids.insert(i64::from(table_oid(c.id)?)) { return Err(Error::InvalidSnapshot); }
+    }
     let mut tables = snapshot.tables.iter().collect::<Vec<_>>();
     tables.sort_by_key(|table| table.id);
     for table in tables {
@@ -2026,6 +2034,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             next_oid -= 1;
         }
     }
+    constraints::populate(snapshot, &mut all, &mut used_oids, &mut next_oid)?;
     for row in &mut all.get_mut("pg_constraint").unwrap().rows {
         row.extend([I(0), B(false), B(true), B(true), I(0)]);
     }

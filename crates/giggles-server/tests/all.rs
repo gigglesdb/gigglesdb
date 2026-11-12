@@ -1,5 +1,8 @@
 // Each file keeps its own support modules, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "constraint_catalog_network.rs"]
+mod constraint_catalog_network;
+
 
 // Single integration-test binary: every tests/*.rs file is a module here, so the
 // crate links once instead of once per file. Files that re-run the test binary
