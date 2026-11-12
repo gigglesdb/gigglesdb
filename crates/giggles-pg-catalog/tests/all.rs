@@ -1,3 +1,5 @@
+#[path = "comment_presentation.rs"]
+mod comment_presentation;
 #[path = "constraint_metadata.rs"]
 mod constraint_metadata;
 // Single integration-test binary: every tests/*.rs file is a module here, so the

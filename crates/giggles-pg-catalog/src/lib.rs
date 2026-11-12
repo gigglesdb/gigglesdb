@@ -130,6 +130,8 @@ pub struct CatalogSnapshot {
     pub column_defaults: std::collections::BTreeMap<u64, String>,
     pub column_identities: std::collections::BTreeMap<u64, char>,
     pub primary_names: std::collections::BTreeMap<u64, String>,
+    /// Stable (table ID, column ID), with zero identifying a table comment.
+    pub comments: std::collections::BTreeMap<(u64, u64), String>,
     /// Current wire backend identity, supplied by the host (0 in offline snapshots).
     pub backend_pid: i32,
     /// Whether this connection actually completed a TLS handshake.
@@ -170,6 +172,7 @@ impl Default for CatalogSnapshot {
             generation: 0,
             constraints: Vec::new(), column_defaults: Default::default(),
             column_identities: Default::default(), primary_names: Default::default(),
+            comments: Default::default(),
             backend_pid: 0,
             backend_ssl: false,
             user_relations: Default::default(),

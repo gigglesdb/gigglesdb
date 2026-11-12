@@ -713,8 +713,10 @@ impl Session {
                 }
                 Role::Task { .. } => return Err(CoreError::Policy(Error::Scope)),
             };
-            let (epoch, catalog) = session.service.admin.catalog()?;
-            let schemas = session.sql.schema_metadata()?;
+            let metadata = session.sql.catalog_metadata()?;
+            let epoch = metadata.presentation.epoch;
+            let catalog = metadata.tables;
+            let schemas = metadata.schemas;
             let visible = catalog
                 .into_iter()
                 .filter(|table| !session.sql.table_dropped_in_transaction(table.id))
@@ -730,11 +732,7 @@ impl Session {
                     })
                 })
                 .collect::<Vec<_>>();
-            let (index_epoch, indexes) = session.service.admin.secondary_index_catalog()?;
-            if index_epoch != epoch {
-                return Err(CoreError::Sql(relational::SqlError::Conflict));
-            }
-            let indexes = indexes
+            let indexes = metadata.indexes
                 .into_iter()
                 .filter(|index| visible.iter().any(|table| table.id == index.table))
                 .collect();
@@ -757,8 +755,9 @@ impl Session {
     > {
         self.authority_scope(|session| {
             let (epoch, tables, indexes) = session.catalog_snapshot()?;
-            let (typmod_epoch, mut typmods) = session.service.admin.catalog_typmods()?;
-            if typmod_epoch != epoch {
+            let metadata = session.sql.catalog_metadata()?;
+            let mut typmods = metadata.typmods;
+            if metadata.presentation.epoch != epoch {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
             typmods.retain(|id, _| {
@@ -766,9 +765,7 @@ impl Session {
                     .iter()
                     .any(|table| table.columns.iter().any(|column| column.id == *id))
             });
-            // Match the committed-only tables, indexes and typmods above;
-            // private DDL must not splice the active session's newer epoch here.
-            let types = session.service.admin.sql_session().user_type_catalog()?;
+            let types = metadata.types;
             if types.epoch != epoch {
                 return Err(CoreError::Sql(relational::SqlError::Conflict));
             }
@@ -804,7 +801,7 @@ impl Session {
         }
         // A concurrent trusted DDL operation cannot splice two generations
         // into this snapshot or make validation certify a different catalog.
-        if self.service.admin.catalog()?.0 != epoch {
+        if self.sql.catalog_metadata()?.presentation.epoch != epoch {
             return Err(CoreError::Sql(relational::SqlError::Conflict));
         }
         Ok((epoch, visible))

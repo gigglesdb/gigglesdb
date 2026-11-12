@@ -10,6 +10,8 @@ pub struct CatalogConstraint {
 #[derive(Clone, Debug, Default)]
 pub struct CatalogPresentation {
     pub epoch: u64,
+    /// Stable (table ID, column ID), with zero identifying the table itself.
+    pub comments: BTreeMap<(u64, u64), String>,
     pub defaults: BTreeMap<u64, String>,
     pub identities: BTreeMap<u64, char>,
     pub primary_names: BTreeMap<u64, String>,

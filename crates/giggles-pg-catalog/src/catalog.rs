@@ -1277,6 +1277,17 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         all.get_mut(name).unwrap().rows.push(row);
     };
     add("pg_description", vec![I(2200), I(2615), I(0), s("standard public schema"), N]);
+    for table in &snapshot.tables {
+        for (&(id, column), description) in &snapshot.comments {
+            if id != table.id { continue; }
+            let subid = if column == 0 { 0 } else {
+                let Some(offset) = table.columns.iter().position(|c| c.id == column) else { continue; };
+                offset + 1
+            };
+            add("pg_description", vec![I(i64::from(table_oid(id)?)), I(1259),
+                I(subid as i64), s(description), N]);
+        }
+    }
     // PG18.6 casts from the integer/text GUI edit-type inventories. Both ends
     // are supported built-in scalar/catalog types; this is not a routine registry.
     for (oid, source, target, function, context, method) in [

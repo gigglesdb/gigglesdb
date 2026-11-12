@@ -14,6 +14,19 @@ use sqlparser::{
 };
 use std::{collections::BTreeMap, ops::ControlFlow};
 
+fn description(rows: &[Vec<Value>], name: &str, args: &[Value]) -> Value {
+    use Value::{Int as I, Text as S, Null as N};
+    if args.contains(&N) { return N; }
+    let (class, subid) = if name == "col_description" { (Some(I(1259)), args[1].clone()) }
+        else { (args.get(1).map(|v| match v {
+            S(s) => catalog::relation_oid(s).map(|oid| I(i64::from(oid))).unwrap_or(N),
+            _ => N,
+        }), I(0)) };
+    rows.iter().find(|r| r[0] == args[0] && r[2] == subid
+        && class.as_ref().is_none_or(|c| r[1] == *c))
+        .map_or(N, |r| r[3].clone())
+}
+
 #[derive(Debug, Clone)]
 pub struct Plan {
     query: Query,
@@ -4849,7 +4862,7 @@ impl Runtime<'_> {
                 // Zero measures those surfaces, not the shared engine's disk use.
                 if n == "pg_stat_get_numscans" || self.catalogs["pg_class"].rows.iter().any(|r| r[0] == v[0]) { I(0) } else { N }
             }
-            "obj_description" | "col_description" => N,
+            "obj_description" | "col_description" => description(&self.catalogs["pg_description"].rows, n, &v),
             "shobj_description" => {
                 let class = catalog::relation_oid(&text(v[1].clone())?)
                     .map(|id| I(i64::from(id)))

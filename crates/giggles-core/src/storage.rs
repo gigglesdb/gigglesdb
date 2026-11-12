@@ -185,6 +185,7 @@ struct MetadataDomain {
 struct MetadataSql<'a> {
     image: &'a relational::Relational,
     epoch: u64,
+    comments: Option<&'a BTreeMap<(u64, u64), String>>,
 }
 impl std::ops::Deref for MetadataSql<'_> {
     type Target = relational::Relational;
@@ -208,13 +209,14 @@ impl MetadataSql<'_> {
     ) -> Result<relational::CatalogPresentation, relational::SqlError> {
         let mut metadata = self.image.catalog_presentation()?;
         metadata.epoch = self.epoch;
+        metadata.comments = self.comments.cloned().unwrap_or_default();
         Ok(metadata)
     }
 }
 impl<'a> MetadataState<'a> {
     fn new(image: &'a relational::Relational, epoch: u64, domain: u128) -> Self {
         Self {
-            sql: MetadataSql { image, epoch },
+            sql: MetadataSql { image, epoch, comments: None },
             view: MetadataDomain { domain },
         }
     }
@@ -1957,11 +1959,44 @@ impl Admin {
         })
     }
 }
+/// One coherent presentation read for the wire catalog adapter.
+pub struct CatalogMetadata {
+    pub presentation: relational::CatalogPresentation,
+    pub tables: Vec<relational::TableDef>,
+    pub schemas: relational::SchemaMetadata,
+    pub types: relational::UserTypeCatalog,
+    pub generation: u64,
+    pub typmods: BTreeMap<u64, i32>,
+    pub indexes: Vec<IndexInfo>,
+}
 /// One conversion point for the V2 catalog xid (physical milliseconds -> seconds).
 fn catalog_xid_from_hlc(epoch: u64) -> u64 {
     (epoch >> 16) / 1000
 }
 impl SqlSession {
+    /// Coherent catalog metadata, including V2 transaction-private DDL.
+    pub fn catalog_metadata(&self) -> Result<CatalogMetadata, CoreError> {
+        let read = |s: &MetadataState<'_>| Ok(CatalogMetadata {
+            presentation: s.sql.catalog_presentation().map_err(CoreError::Sql)?,
+            tables: s.sql.tables.values().cloned().collect(),
+            schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
+            generation: match &self.admin.inner.backend {
+                Backend::Legacy(_) => s.sql.generation,
+                Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
+            },
+            typmods: s.sql.catalog_ext().columns.iter()
+                .filter_map(|(&id, c)| c.typmod.map(|m| (id, m))).collect(),
+            indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
+                id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
+                columns: d.columns.clone(), unique: d.unique,
+            }).collect(),
+        });
+        // Legacy wire catalogs retain their established committed-only behavior.
+        match &self.admin.inner.backend {
+            Backend::Legacy(_) => self.admin.inner.inspect_metadata(read),
+            Backend::V2(_) => self.inspect_metadata(read),
+        }
+    }
     fn inspect_metadata<T>(
         &self,
         f: impl FnOnce(&MetadataState<'_>) -> Result<T, CoreError>,

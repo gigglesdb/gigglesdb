@@ -118,11 +118,9 @@ pub(crate) fn snapshot(
             )
         })
         .collect();
-    let metadata = session
-        .service
-        .admin
-        .catalog_schema_metadata()
+    let catalog = session.sql.catalog_metadata()
         .map_err(|e| crate::service::sqlstate(&e))?;
+    let metadata = catalog.schemas;
     if metadata.epoch != epoch {
         return Err("40001");
     }
@@ -139,21 +137,16 @@ pub(crate) fn snapshot(
             Ok((name, (oid, owner)))
         })
         .collect::<Result<_>>()?;
-    let (generation_epoch, generation) = session
-        .service
-        .admin
-        .catalog_generation()
-        .map_err(|e| crate::service::sqlstate(&e))?;
-    if generation_epoch != epoch {
-        return Err("40001");
-    }
-    let mut presentation = session.service.admin.catalog_presentation()
-        .map_err(|e| crate::service::sqlstate(&e))?;
+    let generation = catalog.generation;
+    let mut presentation = catalog.presentation;
     if presentation.epoch != epoch { return Err("40001"); }
     presentation.defaults.retain(|id, _| columns.contains(id));
     presentation.identities.retain(|id, _| columns.contains(id));
     presentation.primary_names.retain(|id, _| visible.contains(id));
+    presentation.comments.retain(|(table, column), _| visible.contains(table)
+        && (*column == 0 || columns.contains(column)));
     Ok(giggles_pg_catalog::CatalogSnapshot {
+        comments: presentation.comments,
         column_defaults: presentation.defaults, column_identities: presentation.identities,
         primary_names: presentation.primary_names,
         constraints: presentation.constraints.into_iter().filter(|c| visible.contains(&c.table)

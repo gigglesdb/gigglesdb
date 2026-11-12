@@ -156,11 +156,13 @@ impl V2Db {
             // Preserve the owned metadata API's provenance read and its errors.
             self.origin_at(engine::hlc::Ts(epoch))?;
             let image = catalog.image().map_err(CoreError::Sql)?;
-            inspect(&super::MetadataState::new(
+            let mut state = super::MetadataState::new(
                 &image,
                 epoch,
                 u128::from_be_bytes(self.meta.domain),
-            ))
+            );
+            state.sql.comments = Some(&catalog.parts.comments);
+            inspect(&state)
         })
     }
 
