@@ -466,6 +466,15 @@ impl Relational {
         image.validate()?;
         Ok(image)
     }
+    /// Fork a validated rows-free catalog template for a mutable statement.
+    /// The SQL bridge supplies the same reserved/derived allocator ceilings as
+    /// catalog_image; metadata and cursor readers retain the immutable template.
+    pub(crate) fn catalog_image_for_statement(&self, next_id: u64, next_version: u64) -> Self {
+        let mut image = self.clone();
+        image.next_id = next_id;
+        image.next_version = next_version;
+        image
+    }
     pub(crate) fn catalog_indexes(&mut self, descriptors: &[secondary_index::Descriptor]) -> R<()> {
         self.secondary = self.secondary_build_complete_engine(descriptors, || {
             crate::cancellation::check().is_err()

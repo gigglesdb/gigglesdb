@@ -14,7 +14,7 @@ pub struct Cursor {
 }
 enum Data {
     Scan {
-        image: Box<relational::Relational>,
+        image: Arc<relational::Relational>,
         source: Option<V2Snapshot>,
         plan: Box<Plan>,
     },
@@ -151,7 +151,8 @@ impl SqlSession {
                     let txn = self.v2_transaction.as_mut().unwrap_or_else(|| {
                         implicit.insert(db.begin(engine::txn::Isolation::ReadCommitted))
                     });
-                    let parts = db.catalog().parts(txn)?;
+                    let catalog = db.catalog().snapshot(txn)?;
+                    let parts = &catalog.parts;
                     for name in p.read_tables() {
                         let name = parts.tables.keys().find(|key| **key == name).cloned();
                         if let Some(name) = name {
@@ -172,13 +173,11 @@ impl SqlSession {
                     let guard = db.sequencer.snapshot();
                     txn.begin_statement();
                     let ts = txn.snapshot_ts();
-                    let parts = db.catalog().parts(txn)?;
+                    let catalog = db.catalog().snapshot(txn)?;
                     // Cursors allocate no catalog IDs. Match metadata snapshots:
                     // include every validated schema/type/enum-label ID without
                     // duplicating the catalog allocator's object inventory.
-                    let image =
-                        relational::Relational::catalog_image(parts.tables, parts.ext, u64::MAX, 1)
-                            .map_err(CoreError::Sql)?;
+                    let image = catalog.cursor_image().map_err(CoreError::Sql)?;
                     // Sequence-bearing selects use the established execution path.
                     if !p.sequences().is_empty() {
                         return self.buffer_cursor(&p, params, clock, buffer_limit);
@@ -188,7 +187,7 @@ impl SqlSession {
                         Some(V2Snapshot {
                             #[cfg(test)]
                             index_reads: std::cell::Cell::new(0),
-                            indexes: parts.indexes,
+                            indexes: catalog.parts.indexes.clone(),
                             db: db.clone(),
                             _guard: guard,
                             ts,
@@ -226,13 +225,13 @@ impl SqlSession {
                             self.search_path.clone(),
                         ))
                     });
-                    (s.sql, None, context)
+                    (Arc::new(s.sql), None, context)
                 }
             };
             match Plan::new(&image, &p, params, context.clone()).map_err(CoreError::Sql)? {
                 Some(plan) => Ok(Cursor {
                     data: Data::Scan {
-                        image: Box::new(image),
+                        image,
                         source,
                         plan: Box::new(plan),
                     },

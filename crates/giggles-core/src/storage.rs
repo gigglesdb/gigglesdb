@@ -171,6 +171,57 @@ pub(crate) struct State {
     pub next_approval: u64,
     pub origin: Option<u128>,
 }
+
+/// Borrowed metadata facade. The catalog image's version and a metadata read's
+/// public epoch are different: data commits advance the latter without changing
+/// the former. Keep that per-read stamp outside the shared immutable image.
+pub(super) struct MetadataState<'a> {
+    sql: MetadataSql<'a>,
+    view: MetadataDomain,
+}
+struct MetadataDomain {
+    domain: u128,
+}
+struct MetadataSql<'a> {
+    image: &'a relational::Relational,
+    epoch: u64,
+}
+impl std::ops::Deref for MetadataSql<'_> {
+    type Target = relational::Relational;
+    fn deref(&self) -> &Self::Target {
+        self.image
+    }
+}
+impl MetadataSql<'_> {
+    fn schema_metadata(&self) -> relational::SchemaMetadata {
+        let mut metadata = self.image.schema_metadata();
+        metadata.epoch = self.epoch;
+        metadata
+    }
+    fn user_type_catalog(&self) -> relational::UserTypeCatalog {
+        let mut metadata = self.image.user_type_catalog();
+        metadata.epoch = self.epoch;
+        metadata
+    }
+    fn catalog_presentation(
+        &self,
+    ) -> Result<relational::CatalogPresentation, relational::SqlError> {
+        let mut metadata = self.image.catalog_presentation()?;
+        metadata.epoch = self.epoch;
+        Ok(metadata)
+    }
+}
+impl<'a> MetadataState<'a> {
+    fn new(image: &'a relational::Relational, epoch: u64, domain: u128) -> Self {
+        Self {
+            sql: MetadataSql { image, epoch },
+            view: MetadataDomain { domain },
+        }
+    }
+    fn borrow(state: &'a State) -> Self {
+        Self::new(&state.sql, state.sql.epoch, state.view.domain)
+    }
+}
 fn relation_names(state: &State) -> BTreeMap<(bool, u64), String> {
     state
         .sql
@@ -591,13 +642,13 @@ impl Inner {
     /// Inspect metadata only. Native/task operations must keep using `db(feature)`.
     fn inspect_metadata<T>(
         &self,
-        f: impl FnOnce(&State) -> Result<T, CoreError>,
+        f: impl FnOnce(&MetadataState<'_>) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         match &self.backend {
-            Backend::Legacy(_) => self.inspect(f),
+            Backend::Legacy(_) => self.inspect(|state| f(&MetadataState::borrow(state))),
             Backend::V2(db) => {
                 let _ticket = self.enter()?;
-                f(&db.metadata_state(None)?)
+                db.inspect_metadata(None, f)
             }
         }
     }
@@ -1911,24 +1962,24 @@ fn catalog_xid_from_hlc(epoch: u64) -> u64 {
 impl SqlSession {
     fn inspect_metadata<T>(
         &self,
-        f: impl FnOnce(&State) -> Result<T, CoreError>,
+        f: impl FnOnce(&MetadataState<'_>) -> Result<T, CoreError>,
     ) -> Result<T, CoreError> {
         match &self.admin.inner.backend {
             Backend::Legacy(_) => match &self.staged {
-                Some(state) => f(state),
-                None => self.admin.inner.inspect(f),
+                Some(state) => f(&MetadataState::borrow(state)),
+                None => self.admin.inner.inspect(|state| f(&MetadataState::borrow(state))),
             },
             Backend::V2(db) => {
                 let _ticket = self.admin.inner.enter()?;
-                f(&db.metadata_state(self.v2_transaction.as_ref())?)
+                db.inspect_metadata(self.v2_transaction.as_ref(), f)
             }
         }
     }
 
     pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
-        let resolve = |s: &State| Ok(s.sql.resolve_relation_key(name, &self.search_path));
+        let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(name, &self.search_path));
         match &self.staged {
-            Some(s) => resolve(s),
+            Some(s) => resolve(&MetadataState::borrow(s)),
             None => self.inspect_metadata(resolve),
         }
     }
@@ -1940,13 +1991,13 @@ impl SqlSession {
     ) -> Result<relational::Prepared, CoreError> {
         let mut prepared = prepared.clone();
         prepared.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-        let bind = |s: &State| {
+        let bind = |s: &MetadataState<'_>| {
             Ok(prepared
                 .bind_schemas(&s.sql)
                 .unwrap_or_else(|_| prepared.clone()))
         };
         match &self.staged {
-            Some(s) => bind(s),
+            Some(s) => bind(&MetadataState::borrow(s)),
             None => self.inspect_metadata(bind),
         }
     }
@@ -1958,14 +2009,14 @@ impl SqlSession {
         self.search_path = relational::schema_search_path(path, user);
     }
     pub fn schema_metadata(&self) -> Result<relational::SchemaMetadata, CoreError> {
-        let read = |s: &State| Ok(s.sql.schema_metadata());
+        let read = |s: &MetadataState<'_>| Ok(s.sql.schema_metadata());
         match &self.staged {
-            Some(s) => read(s),
+            Some(s) => read(&MetadataState::borrow(s)),
             None => self.inspect_metadata(read),
         }
     }
     pub fn relation_schema(&self, name: &str) -> Result<String, CoreError> {
-        let read = |s: &State| {
+        let read = |s: &MetadataState<'_>| {
             Ok(s.sql
                 .tables
                 .get(&s.sql.resolve_relation_key(name, &self.search_path))
@@ -1973,14 +2024,14 @@ impl SqlSession {
                 .to_owned())
         };
         match &self.staged {
-            Some(s) => read(s),
+            Some(s) => read(&MetadataState::borrow(s)),
             None => self.inspect_metadata(read),
         }
     }
     pub fn creation_schema(&self, p: &relational::Prepared) -> Result<String, CoreError> {
-        let read = |s: &State| p.creation_schema(&s.sql).map_err(CoreError::Sql);
+        let read = |s: &MetadataState<'_>| p.creation_schema(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
-            Some(s) => read(s),
+            Some(s) => read(&MetadataState::borrow(s)),
             None => self.inspect_metadata(read),
         }
     }
@@ -2039,13 +2090,13 @@ impl SqlSession {
 
     /// Tables cleared by TRUNCATE, including its transitive CASCADE closure.
     pub fn truncate_tables(&self, p: &relational::Prepared) -> Result<Vec<String>, CoreError> {
-        let targets = |s: &State| {
+        let targets = |s: &MetadataState<'_>| {
             p.bind_schemas(&s.sql)
                 .and_then(|p| p.truncate_authority_tables(&s.sql))
                 .map_err(CoreError::Sql)
         };
         match &self.staged {
-            Some(s) => targets(s),
+            Some(s) => targets(&MetadataState::borrow(s)),
             None => self.inspect_metadata(targets),
         }
     }
@@ -2054,9 +2105,9 @@ impl SqlSession {
         &self,
         p: &relational::Prepared,
     ) -> Result<Vec<Option<String>>, CoreError> {
-        let dependencies = |s: &State| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
+        let dependencies = |s: &MetadataState<'_>| p.implicit_sequences(&s.sql).map_err(CoreError::Sql);
         match &self.staged {
-            Some(s) => dependencies(s),
+            Some(s) => dependencies(&MetadataState::borrow(s)),
             None => self.inspect_metadata(dependencies),
         }
     }
@@ -2065,15 +2116,15 @@ impl SqlSession {
     }
     pub fn normalize_sequence_reference(&self, text: &str) -> Result<String, CoreError> {
         let name = sequences::sequence_name(text).map_err(CoreError::Sql)?;
-        let resolve = |s: &State| Ok(s.sql.resolve_relation_key(&name, &self.search_path));
+        let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(&name, &self.search_path));
         match &self.staged {
-            Some(s) => resolve(s),
+            Some(s) => resolve(&MetadataState::borrow(s)),
             None => self.inspect_metadata(resolve),
         }
     }
     /// Sequence names and owning tables for authorization, without evaluating SQL.
     pub fn sequence_owners(&self) -> Result<Vec<(String, Option<String>)>, CoreError> {
-        let owners = |s: &State| {
+        let owners = |s: &MetadataState<'_>| {
             Ok(s.sql
                 .catalog_ext()
                 .sequences
@@ -2091,7 +2142,7 @@ impl SqlSession {
                 .collect())
         };
         match &self.staged {
-            Some(s) => owners(s),
+            Some(s) => owners(&MetadataState::borrow(s)),
             None => self.inspect_metadata(owners),
         }
     }
@@ -2108,18 +2159,18 @@ impl SqlSession {
             if p.transaction.is_some() && p.transaction != self.transaction_id {
                 return Err(CoreError::Sql(relational::SqlError::StaleSchema));
             }
-            let describe = |s: &State| {
+            let describe = |s: &MetadataState<'_>| {
                 if p.domain != s.view.domain {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
                 let mut metadata_plan = p.clone();
                 if matches!(self.admin.inner.backend, Backend::V2(_)) {
-                    metadata_plan.epoch = s.sql.epoch;
+                    metadata_plan.epoch = s.sql.image.epoch;
                 }
                 metadata_plan.describe(&s.sql).map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
-                describe(s)
+                describe(&MetadataState::borrow(s))
             } else {
                 self.inspect_metadata(describe)
             }
@@ -2142,20 +2193,20 @@ impl SqlSession {
             if p.transaction.is_some() && p.transaction != self.transaction_id {
                 return Err(CoreError::Sql(relational::SqlError::StaleSchema));
             }
-            let describe = |s: &State| {
+            let describe = |s: &MetadataState<'_>| {
                 if p.domain != s.view.domain {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
                 }
                 let mut metadata_plan = p.clone();
                 if matches!(self.admin.inner.backend, Backend::V2(_)) {
-                    metadata_plan.epoch = s.sql.epoch;
+                    metadata_plan.epoch = s.sql.image.epoch;
                 }
                 metadata_plan
                     .validate_immutable_constants(&s.sql)
                     .map_err(CoreError::Sql)
             };
             if let Some(s) = &self.staged {
-                describe(s)
+                describe(&MetadataState::borrow(s))
             } else {
                 self.inspect_metadata(describe)
             }
@@ -2441,12 +2492,12 @@ impl SqlSession {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             let mut copy = relational::Copy::parse(sql).map_err(CoreError::Sql)?;
-            let resolve = |s: &State| Ok(copy.schema_key(&s.sql, &self.search_path));
+            let resolve = |s: &MetadataState<'_>| Ok(copy.schema_key(&s.sql, &self.search_path));
             copy.table = match &self.staged {
-                Some(s) => resolve(s)?,
+                Some(s) => resolve(&MetadataState::borrow(s))?,
                 None => self.inspect_metadata(resolve)?,
             };
-            let prepare = |s: &State| {
+            let prepare = |s: &MetadataState<'_>| {
                 let mut p = copy
                     .prepared(&s.sql, s.view.domain)
                     .map_err(CoreError::Sql)?;
@@ -2455,7 +2506,7 @@ impl SqlSession {
                 Ok(p.bind_schemas(&s.sql).unwrap_or(p))
             };
             let mut prepared = match &self.staged {
-                Some(s) => prepare(s)?,
+                Some(s) => prepare(&MetadataState::borrow(s))?,
                 None => self.inspect_metadata(prepare)?,
             };
             if matches!(self.admin.inner.backend, Backend::V2(_)) {
@@ -2477,9 +2528,9 @@ impl SqlSession {
         let inner = self.admin.inner.clone();
         let _ticket = inner.enter_sql()?;
         relational::assert_sql_frontend_allowed();
-        let columns = |s: &State| copy.columns_in(&s.sql).map_err(CoreError::Sql);
+        let columns = |s: &MetadataState<'_>| copy.columns_in(&s.sql).map_err(CoreError::Sql);
         let result = match &self.staged {
-            Some(s) => columns(s),
+            Some(s) => columns(&MetadataState::borrow(s)),
             None => self.inspect_metadata(columns),
         };
         if result.is_err() {
@@ -3117,7 +3168,7 @@ impl SqlSession {
     }
     /// Check the session's staged relation namespace, or the committed catalog.
     pub fn relation_exists(&self, name: &str) -> Result<bool, CoreError> {
-        let exists = |state: &State| {
+        let exists = |state: &MetadataState<'_>| {
             state.sql.tables.contains_key(name)
                 || state
                     .sql
@@ -3127,7 +3178,7 @@ impl SqlSession {
                     .any(|sequence| sequence.name == name)
         };
         match &self.staged {
-            Some(state) => Ok(exists(state)),
+            Some(state) => Ok(exists(&MetadataState::borrow(state))),
             None => self.inspect_metadata(|state| Ok(exists(state))),
         }
     }

@@ -129,37 +129,55 @@ impl V2Db {
         &self,
         txn: Option<&engine::txn::Transaction>,
     ) -> Result<super::State, CoreError> {
+        self.with_metadata_catalog(txn, |catalog, epoch| {
+            let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
+            state.origin = self.origin_at(engine::hlc::Ts(epoch))?;
+            state.sql = (*catalog.image().map_err(CoreError::Sql)?).clone();
+            state.sql.epoch = epoch;
+            Ok(state)
+        })
+    }
+
+    /// Metadata helpers borrow the validated image rather than cloning all its
+    /// tables for every name, type, default or authorization dependency lookup.
+    pub(super) fn inspect_metadata<T>(
+        &self,
+        txn: Option<&engine::txn::Transaction>,
+        inspect: impl FnOnce(&super::MetadataState<'_>) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        self.with_metadata_catalog(txn, |catalog, epoch| {
+            // Preserve the owned metadata API's provenance read and its errors.
+            self.origin_at(engine::hlc::Ts(epoch))?;
+            let image = catalog.image().map_err(CoreError::Sql)?;
+            inspect(&super::MetadataState::new(
+                &image,
+                epoch,
+                u128::from_be_bytes(self.meta.domain),
+            ))
+        })
+    }
+
+    fn with_metadata_catalog<T>(
+        &self,
+        txn: Option<&engine::txn::Transaction>,
+        inspect: impl FnOnce(Arc<engine::catalog::CatalogSnapshot>, u64) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
         let mut committed;
-        let (parts, epoch) = match txn {
+        let (catalog, epoch) = match txn {
             Some(txn) => (
-                self.catalog.metadata_parts(txn)?,
+                self.catalog.metadata_snapshot(txn)?,
                 txn.current_snapshot_ts()
                     .unwrap_or_else(|| self.sequencer.visible_ts())
                     .0,
             ),
             None => {
                 committed = self.begin(engine::txn::Isolation::ReadCommitted);
-                let parts = self.catalog.parts(&mut committed)?;
-                (parts, committed.snapshot_ts().0)
+                let catalog = self.catalog.snapshot(&mut committed)?;
+                (catalog, committed.snapshot_ts().0)
             }
         };
-        let mut state = super::empty(u128::from_be_bytes(self.meta.domain));
-        state.origin = self.origin_at(engine::hlc::Ts(epoch))?;
-        state.sql = crate::relational::Relational::catalog_image(
-            parts.tables,
-            parts.ext,
-            u64::MAX,
-            u64::MAX,
-        )
-        .map_err(CoreError::Sql)?;
-        state
-            .sql
-            .catalog_indexes(&parts.indexes)
-            .map_err(CoreError::Sql)?;
-        state.sql.epoch = epoch;
-        Ok(state)
+        inspect(catalog, epoch)
     }
-
     /// Older SQL-only v2 databases have no kernel image. When present, its
     /// existing metadata record carries restore provenance.
     pub(super) fn origin_at(&self, ts: engine::hlc::Ts) -> Result<Option<u128>, CoreError> {
@@ -202,3 +220,7 @@ mod tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_metadata_tests.rs"]
 mod metadata_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_catalog_snapshot_tests.rs"]
+mod catalog_snapshot_tests;

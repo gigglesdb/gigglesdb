@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Bound, Range},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -133,14 +133,107 @@ impl CatalogView {
     }
 }
 
+/// Derived, rows-free metadata for one committed catalog version, or one private
+/// overlay. Only committed instances enter CatalogCache; their images are never
+/// mutated by a statement. Failed/cancelled construction is not cached.
+pub(crate) struct CatalogSnapshot {
+    pub(crate) parts: CatalogParts,
+    image: OnceLock<Arc<relational::Relational>>,
+    cursor_image: OnceLock<Arc<relational::Relational>>,
+    image_build: Mutex<()>,
+    allocation_floor: OnceLock<Result<u64, SqlError>>,
+}
+impl CatalogSnapshot {
+    fn new(view: &CatalogView) -> Self {
+        Self {
+            parts: view.parts(),
+            image: OnceLock::new(),
+            cursor_image: OnceLock::new(),
+            image_build: Mutex::new(()),
+            allocation_floor: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn image(&self) -> Result<Arc<relational::Relational>, SqlError> {
+        if let Some(image) = self.image.get() {
+            return Ok(image.clone());
+        }
+        let _build = self.image_build.lock().map_err(|_| SqlError::Unsupported)?;
+        if let Some(image) = self.image.get() {
+            return Ok(image.clone());
+        }
+        let mut image = relational::Relational::catalog_image(
+            self.parts.tables.clone(),
+            self.parts.ext.clone(),
+            u64::MAX,
+            u64::MAX,
+        )?;
+        image.catalog_indexes(&self.parts.indexes)?;
+        let image = Arc::new(image);
+        let _ = self.image.set(image.clone());
+        Ok(image)
+    }
+
+    /// Preserve the cursor's existing rows-free image: no in-memory secondary
+    /// sidecar and a next-version ceiling of one. Its RowSource owns the index
+    /// descriptors independently. This variant is validated once per version.
+    pub(crate) fn cursor_image(&self) -> Result<Arc<relational::Relational>, SqlError> {
+        if let Some(image) = self.cursor_image.get() {
+            return Ok(image.clone());
+        }
+        let _build = self.image_build.lock().map_err(|_| SqlError::Unsupported)?;
+        if let Some(image) = self.cursor_image.get() {
+            return Ok(image.clone());
+        }
+        let image = Arc::new(relational::Relational::catalog_image(
+            self.parts.tables.clone(),
+            self.parts.ext.clone(),
+            u64::MAX,
+            1,
+        )?);
+        let _ = self.cursor_image.set(image.clone());
+        Ok(image)
+    }
+
+    /// The same non-DDL validation ceiling formerly derived at each execution.
+    pub(crate) fn allocation_floor(&self) -> Result<u64, SqlError> {
+        self.allocation_floor
+            .get_or_init(|| {
+                self.parts
+                    .tables
+                    .values()
+                    .flat_map(|table| {
+                        std::iter::once(table.id)
+                            .chain(table.columns.iter().map(|column| column.id))
+                    })
+                    .chain(self.parts.indexes.iter().map(|index| index.id))
+                    .chain(self.parts.ext.constraints.values().flatten().map(|c| c.id))
+                    .chain(self.parts.ext.sequences.keys().copied())
+                    .chain(self.parts.ext.types.iter().map(|(&id, ty)| match ty {
+                        relational::TypeDef::Enum { labels, .. } => {
+                            id.saturating_add(labels.len() as u64)
+                        }
+                        _ => id,
+                    }))
+                    .chain(self.parts.ext.schemas.values().map(|schema| schema.id))
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(SqlError::Overflow)
+            })
+            .clone()
+    }
+}
 pub(crate) struct CatalogCache {
     versions: Vec<(Ts, Arc<CatalogView>)>,
+    snapshots: BTreeMap<Ts, Arc<CatalogSnapshot>>,
     poisoned: bool,
 }
 impl CatalogCache {
     pub(crate) fn load(kv: &Kv, visible: Ts) -> Result<Self, CoreError> {
         let mut cache = Self {
             versions: Vec::new(),
+            snapshots: BTreeMap::new(),
             poisoned: false,
         };
         cache.publish(visible, load_view(kv, visible)?);
@@ -158,6 +251,7 @@ impl CatalogCache {
         if self.poisoned {
             return;
         }
+        self.snapshots.remove(&ts);
         match self.versions.binary_search_by_key(&ts, |(ts, _)| *ts) {
             Ok(index) => self.versions[index].1 = Arc::new(view),
             Err(index) => self.versions.insert(index, (ts, Arc::new(view))),
@@ -171,6 +265,8 @@ impl CatalogCache {
         let end = self.versions.partition_point(|(ts, _)| *ts <= horizon);
         if let Some(anchor) = end.checked_sub(1) {
             self.versions.drain(..anchor);
+            let first = self.versions[0].0;
+            self.snapshots.retain(|ts, _| *ts >= first);
         }
     }
     fn ensure_live(&self) -> Result<(), TxnError> {
@@ -218,35 +314,85 @@ impl Catalog {
     }
 
     pub(crate) fn parts(&self, txn: &mut Transaction) -> Result<CatalogParts, CoreError> {
+        Ok(self.snapshot(txn)?.parts.clone())
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        txn: &mut Transaction,
+    ) -> Result<Arc<CatalogSnapshot>, CoreError> {
         self.check().map_err(CoreError::from)?;
-        let cache = self
+        let mut cache = self
             .cache
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
-        let view = match cache.view_at(txn.snapshot_ts()) {
-            Some(view) => view,
-            None => Arc::new(load_view(self.sequencer.kv(), txn.snapshot_ts())?),
-        };
-        Ok(overlay_view(&view, txn.catalog_writes())?.parts())
+        let ts = txn.snapshot_ts();
+        self.snapshot_locked(&mut cache, txn, ts)
     }
 
-    /// Metadata reads include this transaction's private DDL without changing its snapshot.
-    pub(crate) fn metadata_parts(&self, txn: &Transaction) -> Result<CatalogParts, CoreError> {
+    /// Does not refresh or assign a transaction snapshot; metadata preserves the
+    /// existing fallback to visible_ts when no snapshot has been chosen yet.
+    pub(crate) fn metadata_snapshot(
+        &self,
+        txn: &Transaction,
+    ) -> Result<Arc<CatalogSnapshot>, CoreError> {
         self.check().map_err(CoreError::from)?;
-        let ts = txn
-            .current_snapshot_ts()
-            .unwrap_or_else(|| self.sequencer.visible_ts());
-        let cache = self
+        // Pin the existing visible-timestamp fallback only for this acquisition.
+        // Do not assign a transaction snapshot: metadata must still leave an
+        // unselected transaction unselected. The pin prevents pruning/GC from
+        // passing the chosen timestamp while this reader waits for the mutex.
+        let pin;
+        let ts = match txn.current_snapshot_ts() {
+            Some(ts) => ts,
+            None => {
+                pin = self.sequencer.snapshot();
+                pin.ts()
+            }
+        };
+        let mut cache = self
             .cache
             .lock()
             .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
-        let view = match cache.view_at(ts) {
-            Some(view) => view,
-            None => Arc::new(load_view(self.sequencer.kv(), ts)?),
-        };
-        Ok(overlay_view(&view, txn.catalog_writes())?.parts())
+        self.snapshot_locked(&mut cache, txn, ts)
     }
 
+    fn snapshot_locked(
+        &self,
+        cache: &mut CatalogCache,
+        txn: &Transaction,
+        ts: Ts,
+    ) -> Result<Arc<CatalogSnapshot>, CoreError> {
+        cache.ensure_live().map_err(CoreError::from)?;
+        // Acquisition also reclaims derived versions after a long-lived reader
+        // leaves, even when subsequent commits contain no catalog writes.
+        cache.prune(self.sequencer.oldest_active(), self.sequencer.visible_ts());
+        let end = cache
+            .versions
+            .partition_point(|(version, _)| *version <= ts);
+        let Some(index) = end.checked_sub(1) else {
+            // Preserve the existing old-snapshot fallback. Do not invent a
+            // committed catalog-version key for a view loaded at a data timestamp.
+            let view = load_view(self.sequencer.kv(), ts)?;
+            return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
+                &view,
+                txn.catalog_writes(),
+            )?)));
+        };
+        let (version, view) = &cache.versions[index];
+        if txn.catalog_writes().next().is_some() {
+            return Ok(Arc::new(CatalogSnapshot::new(&overlay_view(
+                view,
+                txn.catalog_writes(),
+            )?)));
+        }
+        let version = *version;
+        if let Some(snapshot) = cache.snapshots.get(&version) {
+            return Ok(snapshot.clone());
+        }
+        let snapshot = Arc::new(CatalogSnapshot::new(view));
+        cache.snapshots.insert(version, snapshot.clone());
+        Ok(snapshot)
+    }
     pub(crate) fn apply_diff(
         &self,
         txn: &mut Transaction,
@@ -1136,3 +1282,7 @@ mod diff_tests;
 #[cfg(test)]
 #[path = "catalog_commit_fast_tests.rs"]
 mod commit_fast_tests;
+
+#[cfg(test)]
+#[path = "catalog_snapshot_tests.rs"]
+mod snapshot_tests;

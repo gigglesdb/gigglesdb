@@ -141,8 +141,8 @@ impl SqlSession {
                             let mut txn = db.begin(Isolation::ReadCommitted);
                             self.sequence_baseline = db
                                 .catalog()
-                                .parts(&mut txn)?
-                                .ext
+                                .snapshot(&mut txn)?
+                                .parts.ext
                                 .sequences
                                 .iter()
                                 .map(|(&id, def)| (id, def.incarnation))
@@ -274,24 +274,17 @@ impl SqlSession {
                         }
                         // Resolve and lock relations before choosing the final statement
                         // snapshot/image; readers retain MVCC snapshot visibility.
-                        let parts = db.catalog().parts(txn)?;
+                        let catalog = db.catalog().snapshot(txn)?;
+                        let parts = &catalog.parts;
                         // Bind from the original references, preserving explicit public
                         // qualification even when another schema shadows the bare name.
-                        let mut binding = relational::Relational::catalog_image(
-                            parts.tables.clone(),
-                            parts.ext.clone(),
-                            u64::MAX,
-                            u64::MAX,
-                        )
+                        let binding = catalog.image()
                         .map_err(|error| match error {
                             E::Unsupported => CoreError::Sql(E::Unsupported),
                             error => {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
                         })?;
-                        binding
-                            .catalog_indexes(&parts.indexes)
-                            .map_err(CoreError::Sql)?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
                         let target_name = bound.table().map(str::to_owned);
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
@@ -436,34 +429,15 @@ impl SqlSession {
                         if !self.copy_input.as_ref().is_some_and(|input| input.started) {
                             txn.begin_statement();
                         }
-                        let old = db.catalog().parts(txn)?;
+                        let catalog = db.catalog().snapshot(txn)?;
+                        let old = &catalog.parts;
                         // This bounds every ID E1 DDL allocates per statement.
                         let ids = if ddl {
                             db.reserve_sql_ids(txn, 3 * relational::MAX_COLUMNS as u64 + 64)?
                         } else {
                             // DML/reads allocate no catalog objects. Derive only the
                             // validation ceiling, without a durable ID reservation.
-                            let floor = old
-                                .tables
-                                .values()
-                                .flat_map(|table| {
-                                    std::iter::once(table.id)
-                                        .chain(table.columns.iter().map(|column| column.id))
-                                })
-                                .chain(old.indexes.iter().map(|index| index.id))
-                                .chain(old.ext.constraints.values().flatten().map(|c| c.id))
-                                .chain(old.ext.sequences.keys().copied())
-                                .chain(old.ext.types.iter().map(|(&id, ty)| match ty {
-                                    relational::TypeDef::Enum { labels, .. } => {
-                                        id.saturating_add(labels.len() as u64)
-                                    }
-                                    _ => id,
-                                }))
-                                .chain(old.ext.schemas.values().map(|schema| schema.id))
-                                .max()
-                                .unwrap_or(0)
-                                .checked_add(1)
-                                .ok_or(CoreError::Sql(E::Overflow))?;
+                            let floor = catalog.allocation_floor().map_err(CoreError::Sql)?;
                             floor..floor
                         };
                         let versions = if matches!(class, V2Class::Dml) {
@@ -483,21 +457,13 @@ impl SqlSession {
                         } else {
                             1..u64::MAX
                         };
-                        let mut image = relational::Relational::catalog_image(
-                            old.tables.clone(),
-                            old.ext.clone(),
-                            ids.start,
-                            versions.start,
-                        )
+                        let mut image = catalog.image()
                         .map_err(|error| match error {
                             E::Unsupported => CoreError::Sql(E::Unsupported),
                             error => {
                                 CoreError::Corrupt(format!("invalid stored v2 catalog: {error:?}"))
                             }
-                        })?;
-                        image
-                            .catalog_indexes(&old.indexes)
-                            .map_err(CoreError::Sql)?;
+                        })?.catalog_image_for_statement(ids.start, versions.start);
                         let context = clock.map(|clock| {
                             clock.with_sequences(sql_sequences::callback(
                                 db.clone(),
@@ -520,7 +486,7 @@ impl SqlSession {
                                     conflict_floor: None,
                                     db,
                                     txn,
-                                    parts: &old,
+                                    parts: old,
                                     writing,
                                     prepared: &bound,
                                     params,
@@ -536,7 +502,7 @@ impl SqlSession {
                         }
                         if !writing && image.streaming_reduction(&bound) {
                             let source = reduction::Source::new(SqlRows {
-                                conflict_floor: None, db, txn, parts: &old,
+                                conflict_floor: None, db, txn, parts: old,
                                 writing, prepared: &bound, params,
                             });
                             let result = image.execute_reduction(
@@ -554,7 +520,7 @@ impl SqlSession {
                                 conflict_floor: None,
                                 db,
                                 txn,
-                                parts: &old,
+                                parts: old,
                                 writing,
                                 prepared: &bound,
                                 params,
@@ -631,10 +597,10 @@ impl SqlSession {
                                 || old.indexes.iter().any(|index| {
                                     !new.indexes.iter().any(|next| next.id == index.id)
                                 });
-                        db.catalog().apply_diff(txn, &old, &new, &ids, None, &|| {
+                        db.catalog().apply_diff(txn, old, &new, &ids, None, &|| {
                             crate::cancellation::check().is_err()
                         })?;
-                        roles::engine::assign_created(txn, &old, &new, self.ddl_owner.as_deref())?;
+                        roles::engine::assign_created(txn, old, &new, self.ddl_owner.as_deref())?;
                         if let Some((id, value)) = restart_seed {
                             let definition = &new.ext.sequences[&id];
                             let counter = sequences::SeqCounter {
@@ -735,14 +701,10 @@ fn validate_pending(
     if deferred.pending.is_empty() {
         return Ok(());
     }
-    let parts = db.catalog().parts(txn)?;
-    let mut image = relational::Relational::catalog_image(
-        parts.tables.clone(),
-        parts.ext.clone(),
-        u64::MAX,
-        u64::MAX,
-    )
-    .map_err(CoreError::Sql)?;
+    let catalog = db.catalog().snapshot(txn)?;
+    let parts = &catalog.parts;
+    let mut image = catalog.cursor_image().map_err(CoreError::Sql)?
+        .catalog_image_for_statement(u64::MAX, u64::MAX);
     let p = relational::Prepared::parse(
         "SET CONSTRAINTS ALL IMMEDIATE",
         u128::from_be_bytes(db.meta.domain),
@@ -758,7 +720,7 @@ fn validate_pending(
             conflict_floor: None,
             db,
             txn,
-            parts: &parts,
+            parts,
             writing: true,
             prepared: &p,
             params: &[],
