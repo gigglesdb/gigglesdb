@@ -1,27 +1,96 @@
 """Generate the pinned compatibility matrix (Python stdlib only).
 
-Run: python -I compat/gen_matrix.py compat/reports/adb1f1e5/report.json
+Run: python -I compat/gen_matrix.py <report.json>
 """
 import argparse
 from collections import Counter, defaultdict
 import json
+import os
+import shlex
+from urllib.parse import quote
 from pathlib import Path
 
-DIVERGENCES = (
-    ('Type names are globally unique across schemas', '42710', 'global_type_name'),
-    ('Composite-typed columns', '0A000', 'composite_column'),
-    ('DROP TYPE CASCADE', '0A000', 'drop_type_cascade'),
-    ('Casts to a domain type', '42704', 'domain_cast'),
-    ('Arrays with more than one dimension', '22P02', 'multidimensional_array'),
-)
+def cell(value):
+    """Keep report diagnostics on one Markdown table line."""
+    return ' '.join(str(value if value is not None else '').split()).replace('|', '&#124;')
 
 
-def generate(report):
+def table_row(values):
+    return '| ' + ' | '.join(cell(value) for value in values) + ' |'
+
+
+def relative_path(path, output):
+    return Path(os.path.relpath(path.resolve(), output.resolve().parent)).as_posix()
+
+
+def evidence(path, output):
+    link = relative_path(path, output)
+    return 'Evidence: [JSON](' + quote(link, safe='/.:') + ').'
+
+
+def orm_section(report, path, output):
+    lines = ['', '## ORM results', '', evidence(path, output), '',
+             '| ORM | PG oracle PASS/total | GigglesDB PASS/total | Direct failures | Blocked |',
+             '| --- | ---: | ---: | ---: | ---: |']
+    rows = report['results']
+    for orm in sorted({row['orm'] for row in rows}):
+        pg = [row for row in rows if row['orm'] == orm and row['target'] == 'pg']
+        gd = [row for row in rows if row['orm'] == orm and row['target'] == 'giggles']
+        passes = lambda lane: f"{sum(row['status'] == 'PASS' for row in lane)}/{len(lane)}"
+        blocked = sum(row.get('classification') == 'blocked' or row['status'] == 'BLOCKED' for row in gd)
+        direct = sum(row['status'] == 'FAIL' and row.get('classification') != 'blocked' for row in gd)
+        lines.append(table_row([orm, passes(pg), passes(gd), direct, blocked]))
+    lines += ['', '| ORM | Target | Case | Result | SQLSTATE | Reason |',
+              '| --- | --- | --- | --- | --- | --- |']
+    for row in rows:
+        if row['status'] in ('FAIL', 'BLOCKED'):
+            status = 'BLOCKED' if row.get('classification') == 'blocked' else row['status']
+            states = [row.get('sqlstate')]
+            states += [failure.get('sqlstate') for failure in row.get('failures', [])]
+            states += [item.get('sqlstate') for item in row.get('server_evidence', [])]
+            state = ', '.join(dict.fromkeys(value for value in states if value))
+            lines.append(table_row([row['orm'], row['target'], row['step'], status, state,
+                                    row.get('reason') or row.get('error', '')]))
+    return lines
+
+
+def gui_section(report, path, output):
+    lines = ['', '## GUI results', '', evidence(path, output), '',
+             '| Tool | PASS | FAIL | HARNESS_ERROR | Total |', '| --- | ---: | ---: | ---: | ---: |']
+    rows = report['results']
+    for tool in sorted({row['tool'] for row in rows}):
+        counts = Counter(row['outcome'] for row in rows if row['tool'] == tool)
+        lines.append(table_row([tool, counts['PASS'], counts['FAIL'], counts['HARNESS_ERROR'], sum(counts.values())]))
+    lines += ['', '| Tool | Node/query | Result | SQLSTATE | Owner |', '| --- | --- | --- | --- | --- |']
+    for row in rows:
+        if row['outcome'] != 'PASS':
+            lines.append(table_row([row['tool'], row['node'], row['outcome'],
+                                    row.get('sqlstate') or row.get('giggles', {}).get('sqlstate'), row.get('owner', '')]))
+    if report.get('limitations'):
+        lines += ['', 'Qualification limits:'] + ['- ' + cell(item) for item in report['limitations']]
+    return lines
+
+
+def generate(report, orm_report=None, gui_report=None, *,
+             orm_path=Path('orm-report.json'), gui_path=Path('gui-report.json'),
+             output=Path(__file__).with_name('MATRIX.md'),
+             report_path=Path('report.json'), server_commit=None):
+    command = ['python', '-I', relative_path(Path(__file__), output),
+               relative_path(report_path, output), '--output', output.name]
+    for flag, value in (('--orm-report', orm_path if orm_report is not None else None),
+                        ('--gui-report', gui_path if gui_report is not None else None)):
+        if value is not None:
+            command += [flag, relative_path(value, output)]
+    if server_commit:
+        command += ['--server-commit', server_commit]
+    report_link = quote(relative_path(report_path.with_suffix('.md'), output), safe='/.:')
+    json_link = quote(relative_path(report_path, output), safe='/.:')
+    commit = report.get('build', {}).get('commit') or server_commit or 'unrecorded'
     lines = ['# PostgreSQL compatibility matrix', '',
-             'Generated by `compat/gen_matrix.py` from the pinned R0 report. Regenerate with:', '',
-             '```sh', 'python -I compat/gen_matrix.py compat/reports/adb1f1e5/report.json', '```', '',
-             f"Evidence: [report](reports/adb1f1e5/report.md), [JSON](reports/adb1f1e5/report.json); run `{report['run_id']}`.",
-             f"Server commit: `{report['build']['commit']}`. Client versions and image digests are preserved in the report identity block.", '',
+             "Generated by `compat/gen_matrix.py` from the pinned R0 report. Regenerate from this file's directory with:", '',
+             '```sh', shlex.join(command), '```', '',
+             f"Evidence: [report]({report_link}), [JSON]({json_link}); run `{report['run_id']}`.",
+             f"Server commit: `{commit}`. Client versions and image digests are preserved in the report identity block.", '',
              'These results describe the tested checks and corpus at that commit; they do not claim complete PostgreSQL coverage.', '',
              '## Per-client check results', '', '| Client | Version | PASS | FAIL | UNTESTED | HARNESS_ERROR |',
              '| --- | --- | ---: | ---: | ---: | ---: |']
@@ -39,10 +108,22 @@ def generate(report):
     total = sum(areas.values(), Counter())
     lines += ['| **Total** | ' + ' | '.join([str(sum(total.values())), *(str(total[k]) for k in outcomes)]) + ' |', '',
               '## Deliberate divergences', '',
-              'The cases below pin GigglesDB SQLSTATEs separately from the historical R0 totals above. Each linked case is an intentional difference from PostgreSQL 18.6.', '',
+              'The cases below are the INTENTIONAL outcomes included in the corpus totals above. Each linked case is an intentional difference from PostgreSQL 18.6.', '',
               '| Behavior | GigglesDB SQLSTATE | Corpus case |', '| --- | --- | --- |']
-    for title, state, case in DIVERGENCES:
-        lines.append(f'| {title} | `{state}` | [{case}](corpus/known_gaps/{case}.sql) |')
+    for case in report['differential']['cases']:
+        if case['outcome'] != 'INTENTIONAL':
+            continue
+        state = ((case.get('first_divergence') or {}).get('giggles') or {}).get('sqlstate')
+        case_path = Path(__file__).parent / 'corpus' / case['area'] / (case['id'] + '.sql')
+        label = case['id']
+        if case_path.is_file():
+            link = quote(relative_path(case_path, output), safe='/.:')
+            label = f'[{label}]({link})'
+        lines.append(table_row([case['title'], f'`{state}`' if state else 'unrecorded', label]))
+    if orm_report is not None:
+        lines += orm_section(orm_report, orm_path, output)
+    if gui_report is not None:
+        lines += gui_section(gui_report, gui_path, output)
     return '\n'.join(lines) + '\n'
 
 
@@ -50,8 +131,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('report', type=Path)
     parser.add_argument('--output', type=Path, default=Path(__file__).with_name('MATRIX.md'))
+    parser.add_argument('--orm-report', type=Path)
+    parser.add_argument('--gui-report', type=Path)
+    parser.add_argument('--server-commit', help='Fallback SHA when the report has no build commit')
     args = parser.parse_args()
-    args.output.write_text(generate(json.loads(args.report.read_text(encoding='utf-8'))), encoding='utf-8', newline='\n')
+    load = lambda path: json.loads(path.read_text(encoding='utf-8')) if path else None
+    args.output.write_text(generate(load(args.report), load(args.orm_report), load(args.gui_report),
+                                    orm_path=args.orm_report, gui_path=args.gui_report, output=args.output,
+                                    report_path=args.report, server_commit=args.server_commit),
+                           encoding='utf-8', newline='\n')
 
 
 if __name__ == '__main__':
