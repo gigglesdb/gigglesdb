@@ -1,0 +1,349 @@
+use super::{ChunkError, ChunkId, ChunkRange, Key, MESSAGE_PREFIX, Result, TableKey, key_bytes};
+use crate::{
+    buffer::format::SegmentRecord,
+    event::{AssembledTxn, Event, EventKind, Position, Row, SourceIdentity, TxnId},
+    mapping::Value,
+    pg::pgoutput::Message,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use tokio_postgres::Client;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatermarkKind {
+    Low,
+    High,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Watermark {
+    pub wm: WatermarkKind,
+    pub chunk: ChunkId,
+    pub attempt: u64,
+}
+impl Watermark {
+    pub const EMIT_SQL: &'static str = "SELECT pg_logical_emit_message(true, $1::text, $2::text)";
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.chunk.validate()?;
+        Ok(serde_json::to_vec(self)?)
+    }
+    /// Reject foreign prefixes, nontransactional markers, invalid identities,
+    /// duplicate/unknown fields and all malformed JSON. Other skedaddle control
+    /// messages must be routed by the capture loop before calling this codec.
+    pub fn parse(message: &Message<'_>) -> Result<Self> {
+        let Message::LogicalMessage {
+            transactional: true,
+            prefix: MESSAGE_PREFIX,
+            content,
+            ..
+        } = message
+        else {
+            return Err(ChunkError::Invalid("foreign or nontransactional watermark"));
+        };
+        if content.len() > 64 * 1024 {
+            return Err(ChunkError::Invalid("watermark too large"));
+        }
+        let value: Self = serde_json::from_slice(content)?;
+        value.chunk.validate()?;
+        Ok(value)
+    }
+    /// Use a dedicated idle admin connection: this statement commits in its own
+    /// implicit transaction. Never run inside the chunk's read transaction.
+    pub async fn emit(&self, admin: &Client) -> Result<()> {
+        let payload =
+            String::from_utf8(self.encode()?).map_err(|_| ChunkError::Invalid("watermark UTF8"))?;
+        admin
+            .query_one(Self::EMIT_SQL, &[&MESSAGE_PREFIX, &payload])
+            .await?;
+        Ok(())
+    }
+}
+
+/// Coordinator integration seam. Journal Started before any side effects and
+/// Done only AFTER ChunkRows is durable. A mere observed high is not completion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ChunkTransition {
+    ChunkStarted {
+        chunk: ChunkRange,
+        attempt: u64,
+    },
+    ChunkDone {
+        chunk: ChunkRange,
+        attempt: u64,
+        high_lsn: u64,
+    },
+}
+
+/// Started without Done (including a second Started after a prior Done) is
+/// redone. Unknown/stale plans and mismatched bounds fail instead of skipping.
+pub fn unfinished_chunks(
+    plan: &[ChunkRange],
+    journal: &[ChunkTransition],
+) -> Result<Vec<ChunkRange>> {
+    let mut states = BTreeMap::new();
+    for chunk in plan {
+        chunk.id.validate()?;
+        let id = serde_json::to_vec(&chunk.id)?;
+        if states.insert(id, (chunk, None)).is_some() {
+            return Err(ChunkError::Invalid("duplicate chunk in plan"));
+        }
+    }
+    for transition in journal {
+        let chunk = match transition {
+            ChunkTransition::ChunkStarted { chunk, .. }
+            | ChunkTransition::ChunkDone { chunk, .. } => chunk,
+        };
+        let (expected, state) = states
+            .get_mut(&serde_json::to_vec(&chunk.id)?)
+            .ok_or(ChunkError::Invalid("journal plan mismatch"))?;
+        if *expected != chunk {
+            return Err(ChunkError::Invalid("journal bounds mismatch"));
+        }
+        match transition {
+            ChunkTransition::ChunkStarted { attempt, .. } => {
+                if state.is_some_and(|(previous, _)| *attempt <= previous) {
+                    return Err(ChunkError::Invalid("chunk attempt reused/out of order"));
+                }
+                *state = Some((*attempt, false));
+            }
+            ChunkTransition::ChunkDone {
+                attempt, high_lsn, ..
+            } => {
+                if !state.is_some_and(|(started, _)| started == *attempt) || *high_lsn == 0 {
+                    return Err(ChunkError::Invalid("Done without matching Started/high"));
+                }
+                *state = Some((*attempt, true));
+            }
+        }
+    }
+    let mut unfinished = Vec::new();
+    for chunk in plan {
+        let id = serde_json::to_vec(&chunk.id)?;
+        if !states[&id].1.is_some_and(|(_, done)| done) {
+            unfinished.push(chunk.clone());
+        }
+    }
+    Ok(unfinished)
+}
+
+// Avoid ordering PG values: rows were already selected by PostgreSQL's range
+// predicate. Removing all touched identities among these rows is exactly the
+// intersection with [lo,hi), including key changes into/out of the range.
+pub struct Window {
+    table: TableKey,
+    chunk: ChunkRange,
+    attempt: u64,
+    rows: Vec<(Vec<u8>, Row)>,
+    keys: BTreeSet<Vec<u8>>,
+    touched: BTreeSet<Vec<u8>>,
+    low: Option<u64>,
+    high: Option<u64>,
+    failed: bool,
+}
+impl Window {
+    pub fn new(table: TableKey, chunk: ChunkRange, rows: Vec<Row>, attempt: u64) -> Result<Self> {
+        table.read_query(&chunk)?;
+        let mut unique = BTreeSet::new();
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let key = row_key(&table, &row)?;
+                let bytes = key_bytes(&key)?;
+                if !unique.insert(bytes.clone()) {
+                    return Err(ChunkError::Invalid("duplicate snapshot key"));
+                }
+                Ok((bytes, row))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            table,
+            chunk,
+            attempt,
+            rows,
+            keys: unique,
+            touched: BTreeSet::new(),
+            low: None,
+            high: None,
+            failed: false,
+        })
+    }
+
+    /// Feed committed stream markers in order. Markers for other chunks are
+    /// validated and ignored, allowing concurrent chunk readers in one stream.
+    /// commit_lsn is the COMMIT boundary of the transaction containing the
+    /// marker, matching assembled-event positions. Using the earlier logical
+    /// message LSN could place a chunk before an in-window concurrent commit.
+    pub fn watermark(&mut self, message: &Message<'_>, commit_lsn: u64) -> Result<()> {
+        let result = self.watermark_inner(message, commit_lsn);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn watermark_inner(&mut self, message: &Message<'_>, commit_lsn: u64) -> Result<()> {
+        if self.failed {
+            return Err(ChunkError::Invalid("window poisoned; replay required"));
+        }
+        let wm = Watermark::parse(message)?;
+        if wm.chunk != self.chunk.id || wm.attempt != self.attempt {
+            return Ok(());
+        }
+        let Message::LogicalMessage { lsn, .. } = message else {
+            unreachable!()
+        };
+        if *lsn == 0 || commit_lsn < *lsn {
+            return Err(ChunkError::Invalid("watermark commit boundary"));
+        }
+        match wm.wm {
+            WatermarkKind::Low if self.low.is_none() && self.high.is_none() => {
+                self.low = Some(commit_lsn)
+            }
+            WatermarkKind::High
+                if self.high.is_none() && self.low.is_some_and(|low| commit_lsn > low) =>
+            {
+                self.high = Some(commit_lsn)
+            }
+            _ => return Err(ChunkError::Invalid("watermark order/replay mismatch")),
+        }
+        Ok(())
+    }
+
+    /// Caller supplies mapped COMMITTED events, including old Event.key and
+    /// new after-key columns on key changes. No comparisons of text/UUID keys.
+    /// Events before L and after H do not participate in exclusion.
+    pub fn event(&mut self, event: &Event) -> Result<()> {
+        let result = self.event_inner(event);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn event_inner(&mut self, event: &Event) -> Result<()> {
+        if self.failed {
+            return Err(ChunkError::Invalid("window poisoned; replay required"));
+        }
+        if self.low.is_none() || self.high.is_some() {
+            return Ok(());
+        }
+        if let EventKind::Truncate { relations, .. } = &event.kind {
+            if relations.contains(&self.table.table) {
+                self.rows.clear();
+            }
+            return Ok(());
+        }
+        if event.table.as_deref() != Some(&self.table.table) {
+            return Ok(());
+        }
+        if !matches!(
+            event.kind,
+            EventKind::Insert | EventKind::Update | EventKind::Delete
+        ) {
+            return Ok(());
+        }
+        self.touch(&event.key)?;
+        if let Some(before) = &event.before {
+            let mut old = event.key.clone();
+            old.extend(before.clone());
+            self.touch(&old)?;
+        }
+        if matches!(event.kind, EventKind::Insert | EventKind::Update) {
+            let after = event
+                .after
+                .as_ref()
+                .ok_or(ChunkError::Invalid("missing insert/update image"))?;
+            let mut new = event.key.clone();
+            new.extend(after.clone());
+            self.touch(&new)?;
+        }
+        Ok(())
+    }
+    fn touch(&mut self, row: &Row) -> Result<()> {
+        let bytes = key_bytes(&row_key(&self.table, row)?)?;
+        // Bound memory by the chunk, regardless of stream-window activity.
+        if self.keys.contains(&bytes) {
+            self.touched.insert(bytes);
+        }
+        Ok(())
+    }
+
+    /// One atomic buffer record containing zero or more row events at H.
+    /// Source must be the same lineage as the capture loop. Call only after
+    /// the transaction carrying H has committed in the decoded stream.
+    pub fn finish(
+        self,
+        source: SourceIdentity,
+        order_domain: &str,
+        schema_version: u64,
+    ) -> Result<SegmentRecord> {
+        if self.failed {
+            return Err(ChunkError::Invalid("window poisoned; replay required"));
+        }
+        let high = self
+            .high
+            .ok_or(ChunkError::Invalid("high watermark not observed"))?;
+        if order_domain.is_empty() {
+            return Err(ChunkError::Invalid("position domain"));
+        }
+        let position = Position::new(order_domain, high.to_be_bytes());
+        let mut identity = Sha256::new();
+        identity.update(b"skedaddle-chunk-record-v1\0");
+        identity.update(serde_json::to_vec(&self.chunk.id)?);
+        identity.update(self.attempt.to_be_bytes());
+        identity.update(high.to_be_bytes());
+        let txn = TxnId(identity.finalize().to_vec());
+        let mut events = Vec::new();
+        for (bytes, row) in self.rows {
+            if self.touched.contains(&bytes) {
+                continue;
+            }
+            let key = self
+                .table
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), row[&c.name].clone()))
+                .collect();
+            events.push(Event {
+                source: source.clone(),
+                txn: txn.clone(),
+                ordinal_in_txn: events.len() as u64,
+                position: position.clone(),
+                schema_version,
+                kind: EventKind::ChunkRows,
+                table: Some(self.table.table.clone()),
+                key,
+                before: None,
+                after: Some(row),
+                unchanged_cols: BTreeSet::new(),
+            });
+        }
+        Ok(SegmentRecord::ChunkRows(AssembledTxn::new(
+            source, txn, position, None, events,
+        )?))
+    }
+}
+
+fn row_key(table: &TableKey, row: &Row) -> Result<Key> {
+    let key = table
+        .columns
+        .iter()
+        .map(|c| {
+            let opaque = row
+                .get(&c.name)
+                .ok_or(ChunkError::Invalid("missing key column"))?;
+            if opaque.type_id.is_empty() {
+                return Err(ChunkError::Invalid("missing key type identity"));
+            }
+            let bytes = opaque
+                .bytes
+                .as_deref()
+                .ok_or(ChunkError::Invalid("NULL key"))?;
+            Ok(Value::from_canonical_bytes(bytes)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    table.validate_key(&key)?;
+    Ok(key)
+}

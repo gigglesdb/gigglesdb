@@ -81,7 +81,39 @@ pub fn preflight(definition: &crate::MigrationDefinition) -> Result<usize> {
 }
 
 pub(crate) fn state(state: &Materialized) -> Result<()> {
-    check(Budget::Chunks, state.chunks.len(), CHUNKS)?;
+    if let Some(report) = &state.verification.report {
+        report.validate()?;
+    }
+    check(Budget::VerifierRanges, state.verification.runs.len(), 128)?;
+    check(
+        Budget::VerifierRanges,
+        serde_json::to_vec(&state.verification.runs)?.len(),
+        16 * 1024,
+    )?;
+    let planned = state.chunk_plans.values().try_fold(0usize, |count, plan| {
+        plan.validate()?;
+        count
+            .checked_add(plan.chunks)
+            .ok_or_else(|| super::chunk::invalid("chunk count overflow"))
+    })?;
+    check(
+        Budget::Chunks,
+        state
+            .chunks
+            .len()
+            .saturating_add(planned)
+            .saturating_add(state.chunk_plans.len()),
+        CHUNKS,
+    )?;
+    check(
+        Budget::Chunks,
+        state
+            .chunks
+            .len()
+            .saturating_add(state.chunk_plans.len())
+            .saturating_add(state.chunk_attempts.len()),
+        CHUNKS,
+    )?;
     check(
         Budget::VerifierRanges,
         state.verifier_ranges.len(),

@@ -1,9 +1,256 @@
 mod support;
 
+#[test]
+fn typed_started_survives_process_crash_before_local_apply() {
+    use skedaddle::{
+        coordinator::{
+            Transition,
+            chunk::ChunkPlan,
+            journal::{Entry, Journal},
+            local::Local,
+        },
+        mapping::{PgType, Value},
+        pg::chunk::{Direction, KeyColumn, QualifiedName, TableKey},
+    };
+    use support::{fs_store, scratch};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    if let Some(root) = std::env::var_os("SKEDADDLE_CHUNK_CRASH_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        assert!(root.starts_with("J:/gigglesdb-work"));
+        runtime.block_on(async {
+            let journal = Journal::new(
+                fs_store(root.join("objects")),
+                "p2",
+                "typed-crash",
+                std::time::Duration::from_secs(3),
+            )
+            .unwrap();
+            let mut local = Local::create(root.join("db")).unwrap();
+            let owner = Entry::new(
+                local.state(),
+                Transition::AcquireOwnership { epoch: 1 },
+                "owner",
+            )
+            .unwrap();
+            journal.put(&owner).await.unwrap();
+            local.apply(&owner).unwrap();
+            let plan = ChunkPlan::new(
+                TableKey {
+                    table: "public.rows".into(),
+                    relation: QualifiedName {
+                        schema: "public".into(),
+                        name: "rows".into(),
+                    },
+                    columns: vec![KeyColumn {
+                        name: "k".into(),
+                        pg_type: PgType::Int4,
+                        sql_type: QualifiedName {
+                            schema: "pg_catalog".into(),
+                            name: "int4".into(),
+                        },
+                        collation: None,
+                        direction: Direction::Asc,
+                    }],
+                },
+                100,
+                vec![vec![Value::Int4(10)]],
+            )
+            .unwrap();
+            let reference = journal.publish_chunk_plan(&plan).await.unwrap();
+            let planned = Entry::new(
+                local.state(),
+                Transition::ChunkPlanned { plan: reference },
+                "owner",
+            )
+            .unwrap();
+            journal.put(&planned).await.unwrap();
+            local.apply(&planned).unwrap();
+            let started = Entry::new(
+                local.state(),
+                Transition::ChunkStarted {
+                    chunk: plan.ranges[0].clone(),
+                    attempt: 4,
+                },
+                "owner",
+            )
+            .unwrap();
+            journal.put(&started).await.unwrap();
+            // A real process exit bypasses Drop; local cache is one entry behind.
+            std::process::exit(86);
+        });
+    }
+    let root = scratch("typed-process-crash");
+    std::fs::create_dir(root.join("objects")).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "typed_started_survives_process_crash_before_local_apply",
+            "--nocapture",
+        ])
+        .env("SKEDADDLE_CHUNK_CRASH_ROOT", &root)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(86), "{result:?}");
+    runtime.block_on(async {
+        let journal = Journal::new(
+            fs_store(root.join("objects")),
+            "p2",
+            "typed-crash",
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap();
+        let local = Local::open_journal(root.join("db"), &journal)
+            .await
+            .unwrap();
+        assert_eq!(local.state().applied_seq, 3);
+        let plan = journal
+            .chunk_plan(&local.state().chunk_plans["public.rows"])
+            .await
+            .unwrap();
+        assert_eq!(local.state().unfinished_chunks(&plan).unwrap(), plan.ranges);
+        assert_eq!(
+            local
+                .state()
+                .chunk_attempts
+                .values()
+                .next()
+                .unwrap()
+                .attempt,
+            4
+        );
+        let mut successor = skedaddle::coordinator::epoch::Coordinator::observer(
+            journal.clone(),
+            local,
+            "successor",
+        )
+        .unwrap();
+        successor.acquire().await.unwrap();
+        assert!(
+            successor
+                .commit(Transition::ChunkStarted {
+                    chunk: plan.ranges[0].clone(),
+                    attempt: 4
+                })
+                .await
+                .is_err()
+        );
+        successor
+            .commit(Transition::ChunkStarted {
+                chunk: plan.ranges[0].clone(),
+                attempt: 5,
+            })
+            .await
+            .unwrap();
+        assert_eq!(journal.load(false).await.unwrap(), *successor.state());
+    });
+}
+
 #[cfg(feature = "test-crash")]
 use skedaddle::coordinator::{journal::Journal, local::Local, *};
 #[cfg(feature = "test-crash")]
 use support::*;
+
+#[cfg(feature = "test-crash")]
+#[test]
+fn lifecycle_regression_survives_crash_before_local_apply() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    if let Some(root) = std::env::var_os("SKEDADDLE_LIFECYCLE_CRASH_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        assert!(root.starts_with("J:/gigglesdb-work"));
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        runtime.block_on(async {
+            let journal = Journal::new(
+                fs_store(root.join("objects")),
+                "p2",
+                "lifecycle-crash",
+                std::time::Duration::from_secs(3),
+            )
+            .unwrap();
+            let local = Local::create(root.join("db")).unwrap();
+            let mut c = epoch::Coordinator::observer(journal, local, "owner").unwrap();
+            c.acquire().await.unwrap();
+            for to in [State::Assessed, State::Copying, State::CatchingUp] {
+                c.commit(Transition::Lifecycle {
+                    event: Event::Advance { to },
+                })
+                .await
+                .unwrap();
+            }
+            c.commit(Transition::Progress {
+                stream: "applied".into(),
+                marker: "commit-lsn".into(),
+                position: "0/123".into(),
+            })
+            .await
+            .unwrap();
+            c.commit(Transition::Lifecycle {
+                event: Event::Readiness { facts: ready() },
+            })
+            .await
+            .unwrap();
+            let mut facts = ready();
+            facts.lineage_matches = false;
+            c.set_crash_seam(CrashSeam::AfterJournalPut);
+            c.commit(Transition::Lifecycle {
+                event: Event::Readiness { facts },
+            })
+            .await
+            .unwrap();
+            panic!("crash seam did not terminate the child");
+        });
+        return;
+    }
+    let root = scratch("lifecycle-crash");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lifecycle_regression_survives_crash_before_local_apply",
+            "--nocapture",
+        ])
+        .env("SKEDADDLE_LIFECYCLE_CRASH_ROOT", &root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > std::time::Duration::from_secs(30) {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    runtime.block_on(async {
+        let journal = Journal::new(
+            fs_store(root.join("objects")),
+            "p2",
+            "lifecycle-crash",
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap();
+        let recovered = journal.load(false).await.unwrap();
+        assert_eq!(recovered.applied_seq, 7);
+        assert_eq!(recovered.lifecycle.state, State::CatchingUp);
+        assert_eq!(recovered.lifecycle.authority, Authority::Source);
+        assert_eq!(recovered.lifecycle.blockers, ["lineage-mismatch"]);
+        assert_eq!(
+            recovered.progress["applied"],
+            ("commit-lsn".into(), "0/123".into())
+        );
+        assert!(matches!(journal.entry(7).await.unwrap().transition,
+            Transition::Lifecycle { event: Event::Readiness { facts } } if !facts.lineage_matches));
+        let mut prefix = Materialized::default();
+        for entry in journal.history_page_through(0, 10, 6).await.unwrap() {
+            prefix.apply(&entry).unwrap();
+        }
+        assert_eq!(prefix.lifecycle.state, State::VerifiedReady);
+        let mut local = Local::open(root.join("db"), &prefix).unwrap();
+        local.replay_journal(&journal).await.unwrap();
+        assert_eq!(local.state(), &recovered);
+    });
+}
 
 #[cfg(feature = "test-crash")]
 fn fixture(
@@ -127,10 +374,7 @@ async fn crash_after_put_before_local_apply_replays() {
 async fn pg_crash_effect_adoption_preserves_original_key() {
     let cfg = config();
     for op in ["effect-pg-before", "effect-pg"] {
-        let (mut client, connection) =
-            tokio_postgres::connect(cfg["pg"].as_str().unwrap(), tokio_postgres::NoTls)
-                .await
-                .unwrap();
+        let (mut client, connection) = tls_connect(cfg["pg"].as_str().unwrap()).await.unwrap();
         tokio::spawn(async move {
             connection.await.unwrap();
         });
@@ -212,10 +456,7 @@ async fn pg_crash_effect_adoption_preserves_original_key() {
 #[ignore = "DOCKER PG18/TOXIPROXY: real lost COMMIT reply; run harness/run.ps1 p2"]
 async fn pg_commit_response_loss_steps_down_and_deduplicates() {
     let cfg = config();
-    let (mut direct, connection) =
-        tokio_postgres::connect(cfg["pg"].as_str().unwrap(), tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (mut direct, connection) = tls_connect(cfg["pg"].as_str().unwrap()).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -229,10 +470,9 @@ async fn pg_commit_response_loss_steps_down_and_deduplicates() {
         .send()
         .await
         .unwrap();
-    let (mut proxied, connection) =
-        tokio_postgres::connect(cfg["proxy_pg"].as_str().unwrap(), tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (mut proxied, connection) = tls_connect(cfg["proxy_pg"].as_str().unwrap())
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -304,10 +544,7 @@ async fn pg_commit_response_loss_steps_down_and_deduplicates() {
 #[ignore = "DOCKER PG18: migrations have separate durable effect namespaces; run harness/run.ps1 p2"]
 async fn pg_effect_namespaces_do_not_cross_fence_or_deduplicate() {
     let cfg = config();
-    let (mut client, connection) =
-        tokio_postgres::connect(cfg["pg"].as_str().unwrap(), tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (mut client, connection) = tls_connect(cfg["pg"].as_str().unwrap()).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -369,10 +606,7 @@ async fn pg_effect_namespaces_do_not_cross_fence_or_deduplicate() {
 #[ignore = "DOCKER PG18: fresh authority schema including repeated setup; run harness/run.ps1 p2"]
 async fn pg_authority_schema_initializes_fresh_database() {
     let cfg = config();
-    let (admin, connection) =
-        tokio_postgres::connect(cfg["pg"].as_str().unwrap(), tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (admin, connection) = tls_connect(cfg["pg"].as_str().unwrap()).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -392,10 +626,7 @@ async fn pg_authority_schema_initializes_fresh_database() {
         .as_str()
         .unwrap()
         .replace("dbname=skedaddle", &format!("dbname={name}"));
-    let (mut client, connection) =
-        tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (mut client, connection) = tls_connect(&connection_string).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -512,3 +743,32 @@ async fn rebuild_on_new_host_equals_original() {
 #[test]
 #[ignore = "CRASH SUITE SKIPPED: enable --features test-crash, or run harness/run.ps1 p2 (no environment-controlled crash seams)"]
 fn crash_suite_requires_test_crash_feature() {}
+
+// The harness CA is explicit; missing trust is a failure once a DB gate is set.
+#[cfg(feature = "test-crash")]
+fn tls_config(postgres: tokio_postgres::Config) -> skedaddle::pg::tls::Config {
+    let path = std::env::var_os("SKEDADDLE_TEST_CONFIG").expect("TLS harness config required");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read TLS harness config"))
+            .expect("TLS harness JSON");
+    let ca_pem = config["ca_pem"]
+        .as_str()
+        .or_else(|| config["replication"]["ca_pem"].as_str())
+        .expect("harness ca_pem or replication.ca_pem required");
+    skedaddle::pg::tls::Config::new(postgres, ca_pem)
+}
+
+#[cfg(feature = "test-crash")]
+async fn tls_connect(
+    dsn: &str,
+) -> std::result::Result<
+    (tokio_postgres::Client, skedaddle::pg::tls::Driver),
+    skedaddle::pg::tls::Error,
+> {
+    let config = tls_config(dsn.parse().expect("harness PostgreSQL configuration"));
+    let (client, driver, transport) =
+        skedaddle::pg::tls::connect(&config, &skedaddle::security::TlsPolicy::Required).await?;
+    assert!(transport.encrypted());
+    assert!(transport.warnings.is_empty());
+    Ok((client, driver))
+}

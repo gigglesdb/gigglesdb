@@ -1,4 +1,4 @@
-//! Engine-neutral events and canonical version 1 binary records.
+//! Engine-neutral events and canonical version 2 binary records.
 //!
 //! Integers and lengths are big-endian (lengths/counts are u32). A record is
 //! `SKEV | version:u16 | kind:u8 | fields | SHA-256(prefix)`. Kinds 1 and 2
@@ -7,17 +7,24 @@
 //! strictly increasing by UTF-8 column name. Transactions embed event fields
 //! without nested envelopes. Their stored digest is the envelope's trailer,
 //! excluded from its own preimage. Decoders reject noncanonical representations.
+//! Version 2 adds grouped TRUNCATE payloads and optional transaction source
+//! origins. Like the buffer's canonical-record writer, readers accept only the
+//! current version: v1 records fail explicitly with UnsupportedVersion(1).
+//! TRUNCATE tag 3 is followed by a u32 relation count, length-prefixed table
+//! identities in source order, then cascade and restart_identity boolean bytes.
+//! Transaction origin is an option after commit_time: name string then u64 LSN.
 
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
+    io::{self, Read, Seek, SeekFrom, Write},
 };
 
 use sha2::{Digest, Sha256};
 
-pub const ENCODING_VERSION: u16 = 1;
+pub const ENCODING_VERSION: u16 = 2;
 pub type ContentDigest = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -86,13 +93,19 @@ pub struct OpaqueValue {
 
 pub type Row = BTreeMap<String, OpaqueValue>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventKind {
     Insert = 0,
     Update = 1,
     Delete = 2,
-    Truncate = 3,
+    /// One atomic statement. Relation identities are unique and retain source
+    /// order; Event.table is None and row images/keys/TOAST markers are empty.
+    Truncate {
+        relations: Vec<String>,
+        cascade: bool,
+        restart_identity: bool,
+    } = 3,
     DdlBoundary = 4,
     Watermark = 5,
     FinalMarker = 6,
@@ -107,7 +120,8 @@ pub struct Event {
     pub position: Position,
     pub schema_version: u64,
     pub kind: EventKind,
-    /// None for source-wide control records.
+    /// None for source-wide controls and grouped TRUNCATE (whose kind carries
+    /// every relation identity).
     pub table: Option<String>,
     pub key: Row,
     pub before: Option<Row>,
@@ -125,12 +139,220 @@ pub struct AssembledTxn {
     /// Connector-reported Unix microseconds, if available; never derived from
     /// commit_position and never used to order transactions.
     pub commit_time: Option<i64>,
+    pub source_origin: Option<SourceOrigin>,
     pub events: Vec<Event>,
     pub digest: ContentDigest,
 }
 
+/// Original publisher metadata, separate from the connector's commit position
+/// and the destination's stream-specific replication origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceOrigin {
+    pub name: String,
+    pub lsn: u64,
+}
+
+/// Common transaction metadata. StreamingTxn stores optional source origin
+/// separately so existing origin-free producers retain their constructor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionMetadata {
+    pub source: SourceIdentity,
+    pub txn: TxnId,
+    pub commit_position: Position,
+    pub commit_time: Option<i64>,
+}
+
+/// A complete canonical transaction backed by caller-owned seekable storage.
+/// Use a file (or a product scratch guard implementing Read/Write/Seek) for a
+/// transaction-independent memory bound. No event Vec or ordinal index is kept.
+/// The storage owner controls its lifetime and crash-reclamation policy.
+pub struct StreamingTxn<S> {
+    storage: S,
+    metadata: TransactionMetadata,
+    source_origin: Option<SourceOrigin>,
+    event_count: u32,
+    canonical_len: u64,
+    canonical_start: u64,
+    digest: ContentDigest,
+}
+
+impl<S: Read + Write + Seek> StreamingTxn<S> {
+    /// Consumes at most one event at a time, validating membership and ordering
+    /// while writing and hashing exactly the same bytes as AssembledTxn v2.
+    /// `storage` must be empty. Failed output is provisional and must be discarded.
+    /// `event_count` is required before encoding; a count mismatch is an error.
+    pub fn from_events(
+        metadata: TransactionMetadata,
+        event_count: u32,
+        events: impl IntoIterator<Item = Result<Event, EventError>>,
+        storage: S,
+    ) -> Result<Self, EventError> {
+        Self::from_events_with_origin(metadata, None, event_count, events, storage)
+    }
+
+    pub fn from_events_with_origin(
+        metadata: TransactionMetadata,
+        source_origin: Option<SourceOrigin>,
+        event_count: u32,
+        events: impl IntoIterator<Item = Result<Event, EventError>>,
+        mut storage: S,
+    ) -> Result<Self, EventError> {
+        if storage.seek(SeekFrom::End(0))? != 0 {
+            return Err(EventError::InvalidTransaction(
+                "stream storage must be empty",
+            ));
+        }
+        let mut hashed = HashWriter::new(&mut storage);
+        put_transaction_header(
+            &mut hashed,
+            &metadata.source,
+            &metadata.txn,
+            &metadata.commit_position,
+            metadata.commit_time,
+            source_origin.as_ref(),
+            event_count as usize,
+        )?;
+        let mut count = 0_u32;
+        let mut last = None;
+        for event in events {
+            let event = event?;
+            if count == event_count {
+                return Err(EventError::InvalidTransaction(
+                    "stream event count mismatch",
+                ));
+            }
+            if event.source != metadata.source || event.txn != metadata.txn {
+                return Err(EventError::InvalidTransaction(
+                    "event source/transaction mismatch",
+                ));
+            }
+            if event.position.order_domain != metadata.commit_position.order_domain {
+                return Err(EventError::PositionDomainMismatch);
+            }
+            if last.is_some_and(|ordinal| ordinal >= event.ordinal_in_txn) {
+                return Err(EventError::InvalidTransaction(
+                    "event ordinals must strictly increase",
+                ));
+            }
+            last = Some(event.ordinal_in_txn);
+            put_event(&mut hashed, &event)?;
+            count += 1;
+        }
+        if count != event_count {
+            return Err(EventError::InvalidTransaction(
+                "stream event count mismatch",
+            ));
+        }
+        let digest = hashed.digest();
+        let canonical_len = hashed
+            .bytes
+            .checked_add(32)
+            .ok_or(EventError::InvalidEncoding("record size overflow"))?;
+        storage.write_all(&digest)?;
+        storage.flush()?;
+        Ok(Self {
+            storage,
+            metadata,
+            source_origin,
+            event_count,
+            canonical_len,
+            canonical_start: 0,
+            digest,
+        })
+    }
+}
+
+impl<S: Read + Seek> StreamingTxn<S> {
+    /// Validates a file-backed transaction without retaining its events.
+    pub fn from_storage(mut storage: S) -> Result<Self, EventError> {
+        let length = storage.seek(SeekFrom::End(0))?;
+        Self::from_storage_range(storage, 0, length, |_| Ok(()))
+    }
+
+    pub(crate) fn from_storage_range(
+        mut storage: S,
+        start: u64,
+        length: u64,
+        mut visit: impl FnMut(&Event) -> Result<(), EventError>,
+    ) -> Result<Self, EventError> {
+        storage.seek(SeekFrom::Start(start))?;
+        let mut input = stream_prefix(&mut storage, length, 2)?;
+        let metadata = TransactionMetadata {
+            source: input.source()?,
+            txn: TxnId(input.bytes()?),
+            commit_position: input.position()?,
+            commit_time: input.option(|r| Ok(i64::from_be_bytes(r.array()?)))?,
+        };
+        let source_origin = input.option(Reader::origin)?;
+        let event_count = u32::try_from(input.count()?)
+            .map_err(|_| EventError::InvalidEncoding("event count"))?;
+        let mut last = None;
+        for _ in 0..event_count {
+            let event = input.event()?;
+            if event.source != metadata.source || event.txn != metadata.txn {
+                return Err(EventError::InvalidTransaction(
+                    "event source/transaction mismatch",
+                ));
+            }
+            if event.position.order_domain != metadata.commit_position.order_domain {
+                return Err(EventError::PositionDomainMismatch);
+            }
+            if last.is_some_and(|n| n >= event.ordinal_in_txn) {
+                return Err(EventError::InvalidTransaction(
+                    "event ordinals must strictly increase",
+                ));
+            }
+            last = Some(event.ordinal_in_txn);
+            visit(&event)?;
+        }
+        let digest = stream_finish(input)?;
+        Ok(Self {
+            storage,
+            metadata,
+            source_origin,
+            event_count,
+            canonical_len: length,
+            canonical_start: start,
+            digest,
+        })
+    }
+
+    pub fn metadata(&self) -> &TransactionMetadata {
+        &self.metadata
+    }
+
+    pub fn source_origin(&self) -> Option<&SourceOrigin> {
+        self.source_origin.as_ref()
+    }
+
+    pub fn event_count(&self) -> u32 {
+        self.event_count
+    }
+
+    pub fn canonical_len(&self) -> u64 {
+        self.canonical_len
+    }
+
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+
+    /// Rewinds a bounded, read-only view. Keeping the transaction alive keeps
+    /// its storage alive through segment encoding and publication retries.
+    pub fn canonical_reader(&mut self) -> Result<io::Take<&mut S>, EventError> {
+        self.storage.seek(SeekFrom::Start(self.canonical_start))?;
+        Ok((&mut self.storage).take(self.canonical_len))
+    }
+
+    /// Transfers storage ownership (and any associated cleanup responsibility).
+    pub fn into_storage(self) -> S {
+        self.storage
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventError {
+    Io(io::ErrorKind),
     UnsupportedVersion(u16),
     InvalidEncoding(&'static str),
     DigestMismatch,
@@ -142,6 +364,7 @@ pub enum EventError {
 impl fmt::Display for EventError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io(kind) => write!(f, "canonical record I/O: {kind}"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported event encoding version {v}"),
             Self::InvalidEncoding(reason) => write!(f, "invalid event encoding: {reason}"),
             Self::DigestMismatch => f.write_str("event/transaction digest mismatch"),
@@ -161,11 +384,36 @@ impl fmt::Display for EventError {
 
 impl Error for EventError {}
 
+impl From<io::Error> for EventError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
 impl Event {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, EventError> {
-        let mut out = header(1);
-        put_event(&mut out, self)?;
-        Ok(seal(out))
+        let mut out = Vec::new();
+        self.write_canonical(&mut out)?;
+        Ok(out)
+    }
+
+    /// Writes the v2 envelope without allocating an encoded event.
+    /// On error the destination contains a provisional, incomplete record.
+    pub fn write_canonical(&self, out: &mut impl Write) -> Result<(), EventError> {
+        let mut hashed = HashWriter::new(out);
+        hashed.write_all(&header(1))?;
+        put_event(&mut hashed, self)?;
+        let digest = hashed.digest();
+        hashed.inner.write_all(&digest)?;
+        Ok(())
+    }
+
+    /// Reads exactly one sized event, allocating only the decoded event fields.
+    pub fn read_canonical(reader: impl Read, length: u64) -> Result<Self, EventError> {
+        let mut input = stream_prefix(reader, length, 1)?;
+        let event = input.event()?;
+        stream_finish(input)?;
+        Ok(event)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, EventError> {
@@ -177,9 +425,10 @@ impl Event {
 
     /// SHA-256 of the versioned canonical prefix, excluding the digest trailer.
     pub fn digest(&self) -> Result<ContentDigest, EventError> {
-        let mut out = header(1);
+        let mut out = HashWriter::new(io::sink());
+        out.write_all(&header(1))?;
         put_event(&mut out, self)?;
-        Ok(sha256(&out))
+        Ok(out.digest())
     }
 }
 
@@ -191,15 +440,27 @@ impl AssembledTxn {
         commit_time: Option<i64>,
         events: Vec<Event>,
     ) -> Result<Self, EventError> {
+        Self::new_with_origin(source, txn, commit_position, commit_time, None, events)
+    }
+
+    pub fn new_with_origin(
+        source: SourceIdentity,
+        txn: TxnId,
+        commit_position: Position,
+        commit_time: Option<i64>,
+        source_origin: Option<SourceOrigin>,
+        events: Vec<Event>,
+    ) -> Result<Self, EventError> {
         let mut txn = Self {
             source,
             txn,
             commit_position,
             commit_time,
+            source_origin,
             events,
             digest: [0; 32],
         };
-        txn.digest = sha256(&txn.prefix()?);
+        txn.digest = txn.computed_digest()?;
         Ok(txn)
     }
 
@@ -224,29 +485,45 @@ impl AssembledTxn {
         Ok(())
     }
 
-    fn prefix(&self) -> Result<Vec<u8>, EventError> {
+    fn write_prefix(&self, out: &mut impl Write) -> Result<(), EventError> {
         self.validate()?;
-        let mut out = header(2);
-        put_source(&mut out, &self.source)?;
-        put_bytes(&mut out, &self.txn.0)?;
-        put_position(&mut out, &self.commit_position)?;
-        put_option(&mut out, self.commit_time.as_ref(), |out, time| {
-            out.extend(time.to_be_bytes());
-            Ok(())
-        })?;
-        put_len(&mut out, self.events.len())?;
+        put_transaction_header(
+            out,
+            &self.source,
+            &self.txn,
+            &self.commit_position,
+            self.commit_time,
+            self.source_origin.as_ref(),
+            self.events.len(),
+        )?;
         for event in &self.events {
-            put_event(&mut out, event)?;
+            put_event(out, event)?;
         }
-        Ok(out)
+        Ok(())
+    }
+
+    fn computed_digest(&self) -> Result<ContentDigest, EventError> {
+        let mut hashed = HashWriter::new(io::sink());
+        self.write_prefix(&mut hashed)?;
+        Ok(hashed.digest())
+    }
+
+    /// Streams an owned transaction without allocating its encoded record.
+    /// A failed validation or I/O leaves provisional output; discard it.
+    pub fn write_canonical(&self, out: &mut impl Write) -> Result<(), EventError> {
+        let mut hashed = HashWriter::new(out);
+        self.write_prefix(&mut hashed)?;
+        if hashed.digest() != self.digest {
+            return Err(EventError::DigestMismatch);
+        }
+        hashed.inner.write_all(&self.digest)?;
+        Ok(())
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, EventError> {
-        let out = self.prefix()?;
-        if sha256(&out) != self.digest {
-            return Err(EventError::DigestMismatch);
-        }
-        Ok(seal(out))
+        let mut out = Vec::new();
+        self.write_canonical(&mut out)?;
+        Ok(out)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, EventError> {
@@ -255,6 +532,7 @@ impl AssembledTxn {
         let txn = TxnId(input.bytes()?);
         let commit_position = input.position()?;
         let commit_time = input.option(|input| Ok(i64::from_be_bytes(input.array()?)))?;
+        let source_origin = input.option(Reader::origin)?;
         let count = input.count()?;
         let mut events = Vec::new();
         for _ in 0..count {
@@ -267,6 +545,7 @@ impl AssembledTxn {
             txn,
             commit_position,
             commit_time,
+            source_origin,
             events,
             digest: sha256(&bytes[..bytes.len() - 32]),
         };
@@ -317,7 +596,9 @@ impl RedeliveryCheck {
 
     pub fn check_transaction(&mut self, txn: &AssembledTxn) -> Result<Redelivery, EventError> {
         // Validate even on a matching stored digest: public fields may have changed.
-        txn.canonical_bytes()?;
+        if txn.computed_digest()? != txn.digest {
+            return Err(EventError::DigestMismatch);
+        }
         let key = (txn.source.clone(), txn.txn.clone());
         if let Some(existing) = self.txns.get(&key) {
             return if *existing == txn.digest {
@@ -378,52 +659,154 @@ fn header(kind: u8) -> Vec<u8> {
     out
 }
 
-fn seal(mut out: Vec<u8>) -> Vec<u8> {
-    let digest = sha256(&out);
-    out.extend(digest);
-    out
+struct HashWriter<W> {
+    inner: W,
+    hash: Sha256,
+    bytes: u64,
 }
 
-fn open(bytes: &[u8], kind: u8) -> Result<Reader<'_>, EventError> {
-    let mut input = Reader { bytes };
-    if input.take(4)? != b"SKEV" {
-        return Err(EventError::InvalidEncoding("magic"));
+impl<W> HashWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hash: Sha256::new(),
+            bytes: 0,
+        }
     }
-    let version = u16::from_be_bytes(input.array()?);
-    if version != ENCODING_VERSION {
-        return Err(EventError::UnsupportedVersion(version));
+
+    fn digest(&self) -> ContentDigest {
+        self.hash.clone().finalize().into()
     }
-    if input.byte()? != kind {
-        return Err(EventError::InvalidEncoding("record kind"));
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.bytes = self.bytes.checked_add(written as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "canonical record size overflow")
+        })?;
+        self.hash.update(&bytes[..written]);
+        Ok(written)
     }
-    if input.bytes.len() < 32 {
-        return Err(EventError::InvalidEncoding("missing digest"));
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
+}
+
+fn put_transaction_header(
+    out: &mut impl Write,
+    source: &SourceIdentity,
+    txn: &TxnId,
+    position: &Position,
+    time: Option<i64>,
+    origin: Option<&SourceOrigin>,
+    count: usize,
+) -> Result<(), EventError> {
+    out.write_all(&header(2))?;
+    put_source(out, source)?;
+    put_bytes(out, &txn.0)?;
+    put_position(out, position)?;
+    put_option(out, time.as_ref(), |out, time| {
+        out.write_all(&time.to_be_bytes())?;
+        Ok(())
+    })?;
+    put_option(out, origin, |out, origin| {
+        put_bytes(out, origin.name.as_bytes())?;
+        out.write_all(&origin.lsn.to_be_bytes())?;
+        Ok(())
+    })?;
+    put_len(out, count)
+}
+
+fn open(bytes: &[u8], kind: u8) -> Result<Reader<io::Cursor<&[u8]>>, EventError> {
+    if bytes.len() < 39 {
+        return Err(EventError::InvalidEncoding("missing envelope/digest"));
+    }
+    check_envelope(&bytes[..7], kind)?;
     let end = bytes.len() - 32;
     if sha256(&bytes[..end]).as_slice() != &bytes[end..] {
         return Err(EventError::DigestMismatch);
     }
     Ok(Reader {
-        bytes: &bytes[7..end],
+        input: io::Cursor::new(&bytes[7..end]),
+        remaining: (end - 7) as u64,
     })
 }
 
-fn put_len(out: &mut Vec<u8>, len: usize) -> Result<(), EventError> {
-    out.extend(
-        u32::try_from(len)
+fn check_envelope(bytes: &[u8], kind: u8) -> Result<(), EventError> {
+    if &bytes[..4] != b"SKEV" {
+        return Err(EventError::InvalidEncoding("magic"));
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != ENCODING_VERSION {
+        return Err(EventError::UnsupportedVersion(version));
+    }
+    if bytes[6] != kind {
+        return Err(EventError::InvalidEncoding("record kind"));
+    }
+    Ok(())
+}
+
+struct HashRead<R> {
+    inner: R,
+    hash: Sha256,
+}
+impl<R: Read> Read for HashRead<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(bytes)?;
+        self.hash.update(&bytes[..n]);
+        Ok(n)
+    }
+}
+fn stream_prefix<R: Read>(
+    reader: R,
+    length: u64,
+    kind: u8,
+) -> Result<Reader<HashRead<R>>, EventError> {
+    if length < 39 {
+        return Err(EventError::InvalidEncoding("missing envelope/digest"));
+    }
+    let mut input = Reader {
+        input: HashRead {
+            inner: reader,
+            hash: Sha256::new(),
+        },
+        remaining: length - 32,
+    };
+    let envelope: [u8; 7] = input.array()?;
+    check_envelope(&envelope, kind)?;
+    Ok(input)
+}
+fn stream_finish<R: Read>(mut input: Reader<HashRead<R>>) -> Result<ContentDigest, EventError> {
+    if input.remaining != 0 {
+        return Err(EventError::InvalidEncoding("trailing bytes"));
+    }
+    let digest: ContentDigest = input.input.hash.finalize().into();
+    let mut trailer = [0; 32];
+    input.input.inner.read_exact(&mut trailer)?;
+    if digest != trailer {
+        return Err(EventError::DigestMismatch);
+    }
+    Ok(digest)
+}
+
+fn put_len(out: &mut impl Write, len: usize) -> Result<(), EventError> {
+    out.write_all(
+        &u32::try_from(len)
             .map_err(|_| EventError::InvalidEncoding("length exceeds u32"))?
             .to_be_bytes(),
-    );
+    )?;
     Ok(())
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), EventError> {
+fn put_bytes(out: &mut impl Write, bytes: &[u8]) -> Result<(), EventError> {
     put_len(out, bytes.len())?;
-    out.extend(bytes);
+    out.write_all(bytes)?;
     Ok(())
 }
 
-fn put_source(out: &mut Vec<u8>, source: &SourceIdentity) -> Result<(), EventError> {
+fn put_source(out: &mut impl Write, source: &SourceIdentity) -> Result<(), EventError> {
     for field in [
         &source.engine,
         &source.system_id,
@@ -436,24 +819,24 @@ fn put_source(out: &mut Vec<u8>, source: &SourceIdentity) -> Result<(), EventErr
     Ok(())
 }
 
-fn put_position(out: &mut Vec<u8>, position: &Position) -> Result<(), EventError> {
+fn put_position(out: &mut impl Write, position: &Position) -> Result<(), EventError> {
     put_bytes(out, position.order_domain.as_bytes())?;
     put_bytes(out, &position.bytes)
 }
 
-fn put_option<T>(
-    out: &mut Vec<u8>,
+fn put_option<T, W: Write>(
+    out: &mut W,
     value: Option<&T>,
-    write: impl FnOnce(&mut Vec<u8>, &T) -> Result<(), EventError>,
+    write: impl FnOnce(&mut W, &T) -> Result<(), EventError>,
 ) -> Result<(), EventError> {
-    out.push(u8::from(value.is_some()));
+    out.write_all(&[u8::from(value.is_some())])?;
     if let Some(value) = value {
         write(out, value)?;
     }
     Ok(())
 }
 
-fn put_row(out: &mut Vec<u8>, row: &Row) -> Result<(), EventError> {
+fn put_row(out: &mut impl Write, row: &Row) -> Result<(), EventError> {
     put_len(out, row.len())?;
     for (column, value) in row {
         put_bytes(out, column.as_bytes())?;
@@ -465,13 +848,36 @@ fn put_row(out: &mut Vec<u8>, row: &Row) -> Result<(), EventError> {
     Ok(())
 }
 
-fn put_event(out: &mut Vec<u8>, event: &Event) -> Result<(), EventError> {
+fn put_event(out: &mut impl Write, event: &Event) -> Result<(), EventError> {
+    validate_truncate(event)?;
     put_source(out, &event.source)?;
     put_bytes(out, &event.txn.0)?;
-    out.extend(event.ordinal_in_txn.to_be_bytes());
+    out.write_all(&event.ordinal_in_txn.to_be_bytes())?;
     put_position(out, &event.position)?;
-    out.extend(event.schema_version.to_be_bytes());
-    out.push(event.kind as u8);
+    out.write_all(&event.schema_version.to_be_bytes())?;
+    let tag = match &event.kind {
+        EventKind::Insert => 0,
+        EventKind::Update => 1,
+        EventKind::Delete => 2,
+        EventKind::Truncate { .. } => 3,
+        EventKind::DdlBoundary => 4,
+        EventKind::Watermark => 5,
+        EventKind::FinalMarker => 6,
+        EventKind::ChunkRows => 7,
+    };
+    out.write_all(&[tag])?;
+    if let EventKind::Truncate {
+        relations,
+        cascade,
+        restart_identity,
+    } = &event.kind
+    {
+        put_len(out, relations.len())?;
+        for relation in relations {
+            put_bytes(out, relation.as_bytes())?;
+        }
+        out.write_all(&[u8::from(*cascade), u8::from(*restart_identity)])?;
+    }
     put_option(out, event.table.as_ref(), |out, table| {
         put_bytes(out, table.as_bytes())
     })?;
@@ -485,24 +891,37 @@ fn put_event(out: &mut Vec<u8>, event: &Event) -> Result<(), EventError> {
     Ok(())
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
+fn validate_truncate(event: &Event) -> Result<(), EventError> {
+    if let EventKind::Truncate { relations, .. } = &event.kind {
+        let mut seen = BTreeSet::new();
+        if relations.is_empty()
+            || relations.iter().any(|r| r.is_empty() || !seen.insert(r))
+            || event.table.is_some()
+            || !event.key.is_empty()
+            || event.before.is_some()
+            || event.after.is_some()
+            || !event.unchanged_cols.is_empty()
+        {
+            return Err(EventError::InvalidEncoding("invalid grouped truncate"));
+        }
+    }
+    Ok(())
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], EventError> {
-        let value = self
-            .bytes
-            .get(..count)
-            .ok_or(EventError::InvalidEncoding("truncated field"))?;
-        self.bytes = &self.bytes[count..];
-        Ok(value)
-    }
+struct Reader<R> {
+    input: R,
+    remaining: u64,
+}
 
+impl<R: Read> Reader<R> {
     fn array<const N: usize>(&mut self) -> Result<[u8; N], EventError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| EventError::InvalidEncoding("fixed width"))
+        if N as u64 > self.remaining {
+            return Err(EventError::InvalidEncoding("truncated field"));
+        }
+        let mut value = [0; N];
+        self.input.read_exact(&mut value)?;
+        self.remaining -= N as u64;
+        Ok(value)
     }
 
     fn byte(&mut self) -> Result<u8, EventError> {
@@ -512,7 +931,7 @@ impl<'a> Reader<'a> {
     fn count(&mut self) -> Result<usize, EventError> {
         let count = usize::try_from(u32::from_be_bytes(self.array()?))
             .map_err(|_| EventError::InvalidEncoding("count overflow"))?;
-        if count > self.bytes.len() {
+        if count as u64 > self.remaining {
             return Err(EventError::InvalidEncoding("count exceeds remaining bytes"));
         }
         Ok(count)
@@ -520,7 +939,10 @@ impl<'a> Reader<'a> {
 
     fn bytes(&mut self) -> Result<Vec<u8>, EventError> {
         let count = self.count()?;
-        Ok(self.take(count)?.to_vec())
+        let mut value = vec![0; count];
+        self.input.read_exact(&mut value)?;
+        self.remaining -= count as u64;
+        Ok(value)
     }
 
     fn string(&mut self) -> Result<String, EventError> {
@@ -550,6 +972,21 @@ impl<'a> Reader<'a> {
 
     fn position(&mut self) -> Result<Position, EventError> {
         Ok(Position::new(self.string()?, self.bytes()?))
+    }
+
+    fn origin(&mut self) -> Result<SourceOrigin, EventError> {
+        Ok(SourceOrigin {
+            name: self.string()?,
+            lsn: u64::from_be_bytes(self.array()?),
+        })
+    }
+
+    fn boolean(&mut self) -> Result<bool, EventError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(EventError::InvalidEncoding("boolean tag")),
+        }
     }
 
     fn row(&mut self) -> Result<Row, EventError> {
@@ -584,7 +1021,18 @@ impl<'a> Reader<'a> {
             0 => EventKind::Insert,
             1 => EventKind::Update,
             2 => EventKind::Delete,
-            3 => EventKind::Truncate,
+            3 => {
+                let count = self.count()?;
+                let mut relations = Vec::new();
+                for _ in 0..count {
+                    relations.push(self.string()?);
+                }
+                EventKind::Truncate {
+                    relations,
+                    cascade: self.boolean()?,
+                    restart_identity: self.boolean()?,
+                }
+            }
             4 => EventKind::DdlBoundary,
             5 => EventKind::Watermark,
             6 => EventKind::FinalMarker,
@@ -606,7 +1054,7 @@ impl<'a> Reader<'a> {
             }
             unchanged_cols.insert(column);
         }
-        Ok(Event {
+        let event = Event {
             source,
             txn,
             ordinal_in_txn,
@@ -618,11 +1066,13 @@ impl<'a> Reader<'a> {
             before,
             after,
             unchanged_cols,
-        })
+        };
+        validate_truncate(&event)?;
+        Ok(event)
     }
 
     fn finish(self) -> Result<(), EventError> {
-        if self.bytes.is_empty() {
+        if self.remaining == 0 {
             Ok(())
         } else {
             Err(EventError::InvalidEncoding("trailing bytes"))

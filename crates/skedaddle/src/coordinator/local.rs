@@ -99,7 +99,7 @@ fn execute(s: &mut SqlSession, sql: &str, params: &[V]) -> Result<()> {
 
 pub struct Local {
     admin: Admin,
-    state: Materialized,
+    state: Box<Materialized>,
     path: PathBuf,
 }
 
@@ -125,7 +125,11 @@ impl Local {
         )?;
         execute(&mut s, "INSERT INTO journal_applied VALUES (0,0,'')", &[])?;
         execute(&mut s, "COMMIT", &[])?;
-        let local = Self { admin, state, path };
+        let local = Self {
+            admin,
+            state: Box::new(state),
+            path,
+        };
         local.validate_schema()?;
         Ok(local)
     }
@@ -137,7 +141,7 @@ impl Local {
         let admin = Admin::open(&path, Limits::default())?;
         let mut local = Self {
             admin,
-            state: Materialized::default(),
+            state: Box::default(),
             path,
         };
         local.validate_schema()?;
@@ -160,7 +164,7 @@ impl Local {
                 "local anchor differs; recover to a new path from the paged journal".into(),
             ));
         }
-        local.state = journal.clone();
+        *local.state = journal.clone();
         // Reconstruct an independent expected projection and compare every durable row.
         local.validate_rows(true)?;
         Ok(local)
@@ -178,7 +182,7 @@ impl Local {
         let admin = Admin::open(&path, Limits::default())?;
         let probe = Self {
             admin,
-            state: Materialized::default(),
+            state: Box::default(),
             path: path.clone(),
         };
         probe.validate_schema()?;
@@ -269,6 +273,8 @@ impl Local {
         Ok(())
     }
 
+    /// Apply an entry already authenticated by the authoritative Journal,
+    /// including its immutable plan/buffer object prerequisites.
     pub fn apply(&mut self, entry: &Entry) -> Result<()> {
         self.apply_checked(entry, true)
     }
@@ -366,7 +372,7 @@ impl Local {
         }
         result?;
         if commit {
-            self.state = next;
+            *self.state = next;
         }
         Ok(())
     }
@@ -375,7 +381,7 @@ impl Local {
     /// Missing intermediate anchors must be obtained through replay_journal.
     pub fn replay(&mut self, journal: &Materialized) -> Result<()> {
         if self.state.applied_seq == journal.applied_seq {
-            return if self.state == *journal {
+            return if *self.state == *journal {
                 Ok(())
             } else {
                 Err(Error::RecoveryRequired(
@@ -432,12 +438,12 @@ impl Local {
                 .history_page_through(self.state.applied_seq, 128, verified.applied_seq)
                 .await?;
             for entry in page {
-                let mut next = self.state.clone();
+                let mut next = (*self.state).clone();
                 journal.apply_entry(&mut next, &entry).await?;
                 self.replace_state(next, true)?;
             }
         }
-        if self.state != verified {
+        if *self.state != verified {
             return Err(Error::RecoveryRequired(
                 "replayed state differs from verified journal".into(),
             ));
@@ -613,6 +619,51 @@ pub(crate) fn projection(
             optional(&c.high_wm),
         ]);
     }
+    // Reuse the bounded chunks collection; prefixes cannot collide with legacy
+    // JSON-array keys. Plans contain references only, never samples/range lists.
+    for (table, plan) in &state.chunk_plans {
+        rows.get_mut("chunks").unwrap().push(vec![
+            text(format!("plan:{table}")),
+            text(table),
+            text(""),
+            text(""),
+            json(plan)?,
+            V::Null,
+            V::Null,
+        ]);
+    }
+    for (id, attempt) in &state.chunk_attempts {
+        rows.get_mut("chunks").unwrap().push(vec![
+            text(format!("attempt:{id}")),
+            text(&attempt.chunk.id.table),
+            text(""),
+            text(""),
+            json(attempt)?,
+            V::Null,
+            V::Null,
+        ]);
+    }
+    let mut verification_key = String::from("completed-verification-v1");
+    while state.verifier_ranges.contains_key(&verification_key) {
+        verification_key.push(':');
+    }
+    if state.verification.report.is_none() && state.verification.generation > 0 {
+        rows.get_mut("verifier_ranges").unwrap().push(vec![
+            text(&verification_key),
+            json(&state.verification.generation)?,
+        ]);
+    }
+    if let Some(reference) = &state.verification.report {
+        rows.get_mut("verifier_ranges").unwrap().push(vec![
+            text(&verification_key),
+            json(&(
+                reference,
+                state.verification.invalidated,
+                state.verification.generation,
+                &state.verification.runs,
+            ))?,
+        ]);
+    }
     for (id, value) in &state.verifier_ranges {
         rows.get_mut("verifier_ranges")
             .unwrap()
@@ -622,6 +673,23 @@ pub(crate) fn projection(
         rows.get_mut("verifier_exceptions")
             .unwrap()
             .push(vec![text(id), json(value)?]);
+    }
+    if let Some(reverse) = &state.verification.reverse {
+        let mut key = String::from("reverse-consistent-point-v1");
+        while state.fence_state.contains_key(&key) {
+            key.push(':');
+        }
+        for (part, fragment) in fragments(&serde_json::to_string(reverse)?)
+            .into_iter()
+            .enumerate()
+        {
+            rows.get_mut("fence_state").unwrap().push(vec![
+                json(&(&key, part))?,
+                text("reverse"),
+                text(""),
+                text(fragment),
+            ]);
+        }
     }
     for (id, (db, role, saved)) in &state.fence_state {
         for (part, fragment) in fragments(saved).into_iter().enumerate() {
@@ -701,9 +769,14 @@ impl Local {
     /// archive and staging files before publishing the checkpoint.
     pub async fn checkpoint(&self, journal: &super::journal::Journal) -> Result<()> {
         use base64::Engine;
-        let archive = super::scratch::with_archive(&self.path, |export| {
+        let archive = super::scratch::with_archive(&self.path, |scratch, export| {
+            use std::io::Read;
             self.admin.export(export)?;
-            Ok(std::fs::read(export)?)
+            let mut bytes = Vec::new();
+            scratch
+                .open_file("archive.export")?
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
         })?;
         journal
             .checkpoint_archive(
@@ -732,11 +805,8 @@ impl Local {
                 .map_err(|e| {
                     Error::RecoveryRequired(format!("invalid local checkpoint encoding: {e}"))
                 })?;
-            let admin = super::scratch::with_archive(&path, |export| {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(export)?;
+            let admin = super::scratch::with_archive(&path, |scratch, export| {
+                let mut file = scratch.create_file("archive.export")?;
                 file.write_all(&archive)?;
                 file.sync_all()?;
                 drop(file);
@@ -748,7 +818,7 @@ impl Local {
             })?;
             let mut local = Self {
                 admin,
-                state: cp.state.clone(),
+                state: Box::new(cp.state.clone()),
                 path,
             };
             local.validate_schema()?;
@@ -763,7 +833,7 @@ impl Local {
                     "local archive anchor differs from checkpoint".into(),
                 ));
             }
-            if local.state != recovery.state {
+            if *local.state != recovery.state {
                 local.replace_state(recovery.state, true)?;
             }
             return Ok(local);

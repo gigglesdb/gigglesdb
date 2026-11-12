@@ -1,5 +1,534 @@
 mod support;
 
+fn typed_plan() -> chunk::ChunkPlan {
+    use skedaddle::{
+        mapping::{PgType, Value},
+        pg::chunk::*,
+    };
+    chunk::ChunkPlan::new(
+        TableKey {
+            table: "public.rows".into(),
+            relation: QualifiedName {
+                schema: "public".into(),
+                name: "rows".into(),
+            },
+            columns: vec![KeyColumn {
+                name: "k".into(),
+                pg_type: PgType::Int4,
+                sql_type: QualifiedName {
+                    schema: "pg_catalog".into(),
+                    name: "int4".into(),
+                },
+                collation: None,
+                direction: Direction::Asc,
+            }],
+        },
+        100,
+        vec![vec![Value::Int4(10)], vec![Value::Int4(20)]],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn typed_done_without_publication_is_rejected_during_journal_recovery() {
+    let objects = scratch("typed-invalid-done");
+    let store = fs_store(&objects);
+    let (buffer, config) = chunk_buffer();
+    let journal = support::journal(store.clone(), "migration").with_chunk_buffer(
+        buffer,
+        config,
+        Arc::new(ChunkOrder),
+    );
+    let mut c = coordinator(journal.clone(), "typed-invalid-done");
+    c.acquire().await.unwrap();
+    let plan = typed_plan();
+    c.commit(Transition::ChunkPlanned {
+        plan: journal.publish_chunk_plan(&plan).await.unwrap(),
+    })
+    .await
+    .unwrap();
+    c.commit(Transition::ChunkStarted {
+        chunk: plan.ranges[0].clone(),
+        attempt: 1,
+    })
+    .await
+    .unwrap();
+    let invalid = Entry::new(
+        c.state(),
+        Transition::ChunkDone {
+            chunk: plan.ranges[0].clone(),
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows: chunk::ChunkRowsRef {
+                mseq: 0,
+                manifest_digest: [0; 32],
+            },
+        },
+        c.instance_id(),
+    )
+    .unwrap();
+    assert!(journal.put(&invalid).await.is_err());
+    // Inject a correctly hashed but semantically invalid durable journal entry.
+    store
+        .put_opts(
+            &journal.entry_key(invalid.seq),
+            serde_json::to_vec(&invalid).unwrap().into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        journal.load(false).await,
+        Err(Error::RecoveryRequired(_))
+    ));
+}
+
+struct ChunkOrder;
+impl skedaddle::event::PositionOrder for ChunkOrder {
+    fn domain(&self) -> &str {
+        "pg-chunk-test"
+    }
+    fn compare(
+        &self,
+        a: &[u8],
+        b: &[u8],
+    ) -> std::result::Result<std::cmp::Ordering, skedaddle::event::EventError> {
+        Ok(a.cmp(b))
+    }
+}
+
+fn chunk_buffer() -> (
+    Arc<dyn skedaddle::buffer::backends::BufferStore>,
+    skedaddle::buffer::reader::ReaderConfig,
+) {
+    let store = skedaddle::buffer::backends::ObjectBufferStore::local(
+        scratch("chunk-buffer"),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    (
+        Arc::new(store),
+        skedaddle::buffer::reader::ReaderConfig {
+            prefix: "chunks".into(),
+            migration_id: "migration".into(),
+            stream: "forward".into(),
+            limits: skedaddle::buffer::format::Limits::default(),
+            required_next_mseq: 0,
+        },
+    )
+}
+
+async fn chunk_manifest(
+    store: &dyn skedaddle::buffer::backends::BufferStore,
+    config: &skedaddle::buffer::reader::ReaderConfig,
+    range: &skedaddle::pg::chunk::ChunkRange,
+    attempt: u64,
+    high: u64,
+    durable: bool,
+    transaction_kind: bool,
+) -> chunk::ChunkRowsRef {
+    use sha2::{Digest, Sha256};
+    use skedaddle::{buffer::format::*, event::*};
+    let mut hash = Sha256::new();
+    hash.update(b"skedaddle-chunk-record-v1\0");
+    hash.update(serde_json::to_vec(&range.id).unwrap());
+    hash.update(attempt.to_be_bytes());
+    hash.update(high.to_be_bytes());
+    let position = Position::new("pg-chunk-test", high.to_be_bytes());
+    let txn = AssembledTxn::new(
+        SourceIdentity {
+            engine: "postgres".into(),
+            system_id: "source".into(),
+            lineage: "lineage".into(),
+            db_name: "test".into(),
+            slot: "slot".into(),
+        },
+        TxnId(hash.finalize().to_vec()),
+        position.clone(),
+        None,
+        vec![],
+    )
+    .unwrap();
+    let mut encoder = SegmentEncoder::new(
+        Vec::new(),
+        SegmentHeader {
+            migration_id: config.migration_id.clone(),
+            stream: config.stream.clone(),
+            epoch: 1,
+            first_pos: position.clone(),
+            last_pos: position.clone(),
+            record_count: 1,
+        },
+        config.limits,
+    )
+    .unwrap();
+    encoder
+        .write_record(&if transaction_kind {
+            SegmentRecord::Transaction(txn)
+        } else {
+            SegmentRecord::ChunkRows(txn)
+        })
+        .unwrap();
+    let (bytes, summary) = encoder.finish().unwrap();
+    let manifest = ManifestEntry {
+        mseq: attempt,
+        epoch: 1,
+        prev_digest: [0; 32],
+        segment_key: segment_key(
+            &config.prefix,
+            &config.migration_id,
+            &config.stream,
+            &position,
+            &position,
+            1,
+        ),
+        segment_digest: summary.digest,
+        first_pos: position.clone(),
+        last_pos: position,
+        txn_count: 1,
+        bytes: summary.bytes,
+    };
+    if durable {
+        store
+            .put_create_only(&manifest.segment_key, &bytes)
+            .await
+            .unwrap();
+        store
+            .put_create_only(
+                &config.manifest_key(manifest.mseq),
+                &manifest.canonical_json().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    chunk::ChunkRowsRef {
+        mseq: manifest.mseq,
+        manifest_digest: manifest.digest().unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn typed_chunk_codec_and_durable_done_roundtrip() {
+    let (buffer, config) = chunk_buffer();
+    let journal = fresh_journal("typed-codec").with_chunk_buffer(
+        buffer.clone(),
+        config.clone(),
+        Arc::new(ChunkOrder),
+    );
+    let mut c = coordinator(journal.clone(), "typed-codec");
+    c.acquire().await.unwrap();
+    let plan = typed_plan();
+    let reference = journal.publish_chunk_plan(&plan).await.unwrap();
+    let chunk_rows = chunk_manifest(
+        buffer.as_ref(),
+        &config,
+        &plan.ranges[1],
+        1,
+        100,
+        true,
+        false,
+    )
+    .await;
+    for transition in [
+        Transition::ChunkPlanned { plan: reference },
+        Transition::ChunkStarted {
+            chunk: plan.ranges[1].clone(),
+            attempt: 1,
+        },
+        Transition::ChunkDone {
+            chunk: plan.ranges[1].clone(),
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows,
+        },
+    ] {
+        let entry = c.commit(transition.clone()).await.unwrap();
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let decoded: Entry = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.transition, transition);
+        assert_eq!(journal.entry(entry.seq).await.unwrap(), decoded);
+    }
+    assert_eq!(journal.load(false).await.unwrap(), *c.state());
+    c.checkpoint().await.unwrap();
+    let local = Local::recover(scratch("typed-restored").join("db"), &journal)
+        .await
+        .unwrap();
+    assert_eq!(local.state(), c.state());
+    assert_eq!(
+        local.state().unfinished_chunks(&plan).unwrap(),
+        vec![plan.ranges[0].clone(), plan.ranges[2].clone()]
+    );
+    c.commit(Transition::ChunkStarted {
+        chunk: plan.ranges[1].clone(),
+        attempt: 2,
+    })
+    .await
+    .unwrap();
+    assert_eq!(c.state().unfinished_chunks(&plan).unwrap(), plan.ranges);
+    assert_eq!(c.state().chunk_attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn typed_chunk_stale_attempt_and_foreign_bounds_fail_closed() {
+    let journal = fresh_journal("typed-attempt");
+    let mut c = coordinator(journal.clone(), "typed-attempt");
+    c.acquire().await.unwrap();
+    let plan = typed_plan();
+    let reference = journal.publish_chunk_plan(&plan).await.unwrap();
+    c.commit(Transition::ChunkPlanned { plan: reference })
+        .await
+        .unwrap();
+    for attempt in [1, 2] {
+        c.commit(Transition::ChunkStarted {
+            chunk: plan.ranges[0].clone(),
+            attempt,
+        })
+        .await
+        .unwrap();
+    }
+    let before = c.state().clone();
+    for attempt in [0, 1, 2] {
+        assert!(
+            c.commit(Transition::ChunkStarted {
+                chunk: plan.ranges[0].clone(),
+                attempt
+            })
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        c.commit(Transition::ChunkDone {
+            chunk: plan.ranges[0].clone(),
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows: chunk::ChunkRowsRef {
+                mseq: 1,
+                manifest_digest: [0; 32]
+            }
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(c.state(), &before);
+    let mut foreign = plan.ranges[1].clone();
+    foreign.lo = None;
+    assert!(
+        c.commit(Transition::ChunkStarted {
+            chunk: foreign.clone(),
+            attempt: 1
+        })
+        .await
+        .is_err()
+    );
+    // Bypass the coordinator API to prove journal replay also validates bounds.
+    let entry = Entry::new(
+        &before,
+        Transition::ChunkStarted {
+            chunk: foreign,
+            attempt: 1,
+        },
+        &before.owner,
+    )
+    .unwrap();
+    assert!(journal.put(&entry).await.is_err());
+    let objects = scratch("typed-corrupt");
+    let store = fs_store(&objects);
+    let corrupt = support::journal(store.clone(), "migration");
+    corrupt.publish_chunk_plan(&plan).await.unwrap();
+    for seq in 1..=before.applied_seq {
+        let saved = journal.entry(seq).await.unwrap();
+        store
+            .put_opts(
+                &corrupt.entry_key(seq),
+                serde_json::to_vec(&saved).unwrap().into(),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .put_opts(
+            &corrupt.entry_key(entry.seq),
+            serde_json::to_vec(&entry).unwrap().into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    assert!(corrupt.load(false).await.is_err());
+}
+
+#[tokio::test]
+async fn typed_chunk_done_requires_durable_matching_chunk_rows() {
+    let (buffer, config) = chunk_buffer();
+    let journal = fresh_journal("typed-publication").with_chunk_buffer(
+        buffer.clone(),
+        config.clone(),
+        Arc::new(ChunkOrder),
+    );
+    let mut c = coordinator(journal.clone(), "typed-publication");
+    c.acquire().await.unwrap();
+    let plan = typed_plan();
+    c.commit(Transition::ChunkPlanned {
+        plan: journal.publish_chunk_plan(&plan).await.unwrap(),
+    })
+    .await
+    .unwrap();
+    let chunk = plan.ranges[0].clone();
+    c.commit(Transition::ChunkStarted {
+        chunk: chunk.clone(),
+        attempt: 1,
+    })
+    .await
+    .unwrap();
+    let missing = chunk_manifest(buffer.as_ref(), &config, &chunk, 1, 100, false, false).await;
+    assert!(
+        c.commit(Transition::ChunkDone {
+            chunk: chunk.clone(),
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows: missing.clone()
+        })
+        .await
+        .is_err()
+    );
+    assert!(c.state().chunk_attempts.values().all(|a| a.done.is_none()));
+    // A durable Transaction with the expected ID is still not ChunkRows.
+    let wrong = chunk_manifest(buffer.as_ref(), &config, &chunk, 1, 100, true, true).await;
+    assert!(
+        c.commit(Transition::ChunkDone {
+            chunk: chunk.clone(),
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows: wrong
+        })
+        .await
+        .is_err()
+    );
+    c.commit(Transition::ChunkStarted {
+        chunk: chunk.clone(),
+        attempt: 2,
+    })
+    .await
+    .unwrap();
+    let durable = chunk_manifest(buffer.as_ref(), &config, &chunk, 2, 200, true, false).await;
+    assert!(
+        c.commit(Transition::ChunkDone {
+            chunk: chunk.clone(),
+            attempt: 2,
+            high_lsn: 201,
+            chunk_rows: durable.clone()
+        })
+        .await
+        .is_err()
+    );
+    let mut wrong_digest = durable.clone();
+    wrong_digest.manifest_digest[0] ^= 1;
+    assert!(
+        c.commit(Transition::ChunkDone {
+            chunk: chunk.clone(),
+            attempt: 2,
+            high_lsn: 200,
+            chunk_rows: wrong_digest
+        })
+        .await
+        .is_err()
+    );
+    c.commit(Transition::ChunkDone {
+        chunk,
+        attempt: 2,
+        high_lsn: 200,
+        chunk_rows: durable,
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.load(false).await.unwrap(), *c.state());
+}
+
+#[tokio::test]
+async fn typed_plan_reuses_source_samples_on_resume_and_is_bounded() {
+    let journal = fresh_journal("typed-plan");
+    let mut c = coordinator(journal.clone(), "typed-plan");
+    c.acquire().await.unwrap();
+    let plan = typed_plan();
+    let reference = journal.publish_chunk_plan(&plan).await.unwrap();
+    c.commit(Transition::ChunkPlanned {
+        plan: reference.clone(),
+    })
+    .await
+    .unwrap();
+    c.commit(Transition::ChunkStarted {
+        chunk: plan.ranges[0].clone(),
+        attempt: 7,
+    })
+    .await
+    .unwrap();
+    c.checkpoint().await.unwrap();
+    drop(c);
+    let saved = journal.load(true).await.unwrap();
+    let recovered = journal
+        .chunk_plan(&saved.chunk_plans["public.rows"])
+        .await
+        .unwrap();
+    assert_eq!(recovered, plan);
+    assert_eq!(saved.unfinished_chunks(&recovered).unwrap(), plan.ranges);
+    let mut c = coordinator(journal.clone(), "typed-resumed");
+    c.acquire().await.unwrap();
+    assert!(
+        c.commit(Transition::ChunkPlanned { plan: reference })
+            .await
+            .is_err()
+    );
+    c.commit(Transition::ChunkStarted {
+        chunk: plan.ranges[0].clone(),
+        attempt: 8,
+    })
+    .await
+    .unwrap();
+    // >60 KiB of samples/ranges stay in an immutable object, not a local row.
+    let mut large_table = plan.table.clone();
+    large_table.table = "public.large".into();
+    let many = chunk::ChunkPlan::new(
+        large_table,
+        100,
+        (0..1500)
+            .map(|i| vec![skedaddle::mapping::Value::Int4(i)])
+            .collect(),
+    )
+    .unwrap();
+    assert!(serde_json::to_vec(&many).unwrap().len() > budget::ROW_BYTES);
+    let reference = journal.publish_chunk_plan(&many).await.unwrap();
+    assert!(serde_json::to_vec(&reference).unwrap().len() < 512);
+    assert_eq!(journal.chunk_plan(&reference).await.unwrap(), many);
+    c.commit(Transition::ChunkPlanned { plan: reference })
+        .await
+        .unwrap();
+    assert!(Local::estimate(c.state()).unwrap() < budget::ENVELOPE_BYTES);
+    c.checkpoint().await.unwrap();
+    assert_eq!(journal.load(true).await.unwrap(), *c.state());
+    let mut oversized = plan.table.clone();
+    oversized.table = "t".repeat(chunk::PLAN_BYTES / 2);
+    assert!(matches!(
+        chunk::ChunkPlan::new(
+            oversized,
+            100,
+            vec![vec![skedaddle::mapping::Value::Int4(10)]]
+        ),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert!(
+        chunk::ChunkPlan::new(
+            plan.table,
+            100,
+            (0..budget::CHUNKS as i32)
+                .map(|i| vec![skedaddle::mapping::Value::Int4(i)])
+                .collect()
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn upstream_local_store_and_core_checkpoints_leave_no_scratch() {
     let objects = support::scratch("cleanup-objects");
@@ -163,8 +692,8 @@ const STATES: &[State] = &[
     State::RecoveryRequired,
 ];
 
-// Independent literal reference table transcribed from §3.11; never consults the implementation.
-fn reference_edges(state: State) -> &'static [State] {
+// Advance events exclude edges requiring interruption reasons or fresh facts.
+fn reference_advance_edges(state: State) -> &'static [State] {
     use State::*;
     match state {
         Defined => &[Assessed],
@@ -199,7 +728,7 @@ fn only_legal_transitions() {
             let result = next_lifecycle(&current, &Event::Advance { to: *to }, 42);
             assert_eq!(
                 result.is_ok(),
-                reference_edges(*state).contains(to),
+                reference_advance_edges(*state).contains(to),
                 "{state:?} -> {to:?}"
             );
             if let Ok(next) = result {
@@ -261,8 +790,8 @@ fn only_legal_transitions() {
                 resume_state: Some(*prior),
                 ..current.clone()
             };
-            let expected = [State::Paused, State::Blocked].contains(state)
-                && [State::Defined, State::Copying, State::CatchingUp].contains(prior);
+            let expected =
+                *state == State::Paused && [State::Copying, State::CatchingUp].contains(prior);
             assert_eq!(
                 next_lifecycle(&current, &Event::Resume, 42).is_ok(),
                 expected
@@ -280,12 +809,12 @@ fn only_legal_transitions() {
             let to = STATES[rng as usize % STATES.len()];
             match next_lifecycle(&current, &Event::Advance { to }, seq) {
                 Ok(next) => {
-                    assert!(reference_edges(current.state).contains(&to));
+                    assert!(reference_advance_edges(current.state).contains(&to));
                     current = next;
                 }
-                Err(_) => assert!(!reference_edges(current.state).contains(&to)),
+                Err(_) => assert!(!reference_advance_edges(current.state).contains(&to)),
             }
-            if reference_edges(current.state).is_empty() {
+            if reference_advance_edges(current.state).is_empty() {
                 current = Lifecycle::default();
             }
         }
@@ -300,31 +829,480 @@ fn every_readiness_regression_is_recorded() {
     };
     let ready_state = next_lifecycle(&current, &Event::Readiness { facts: ready() }, 9).unwrap();
     assert_eq!(ready_state.state, State::VerifiedReady);
-    let changes: [fn(&mut ReadinessFacts); 14] = [
-        |f| f.all_chunks_done = false,
-        |f| f.capture_healthy = false,
-        |f| f.lineage_matches = false,
-        |f| f.apply_lag = 6,
-        |f| f.blocked_ddl = true,
-        |f| f.unknown_schema_job = true,
-        |f| f.verified_rows = 99,
-        |f| f.busy_rows_past_budget = 1,
-        |f| f.dead_letters = 1,
-        |f| f.indexes_constraints_valid = false,
-        |f| f.sequences_syncable = false,
-        |f| f.reverse_prerequisites = false,
-        |f| f.fence_risks_acknowledged = false,
-        |f| f.buffer_contract_matches = false,
+    use readiness::{BlockerCode::*, Readiness, Reason};
+    assert_eq!(ready().evaluate(), Readiness::Ready);
+    type FactChange = fn(&mut ReadinessFacts);
+    let changes: [(FactChange, readiness::BlockerCode); 15] = [
+        (|f| f.all_chunks_done = false, ChunksIncomplete),
+        (|f| f.capture_healthy = false, CaptureUnhealthy),
+        (|f| f.lineage_matches = false, LineageMismatch),
+        (|f| f.apply_lag = 6, ApplyLagOverBudget),
+        (|f| f.blocked_ddl = true, SchemaBoundaryPending),
+        (|f| f.unknown_schema_job = true, SchemaBoundaryPending),
+        (|f| f.verified_rows = 99, VerificationIncomplete),
+        (|f| f.verified_rows = 101, VerificationIncomplete),
+        (|f| f.busy_rows_past_budget = 1, BusyRowBudgetExhausted),
+        (|f| f.dead_letters = 1, DeadLettersPresent),
+        (
+            |f| f.indexes_constraints_valid = false,
+            DestinationSchemaInvalid,
+        ),
+        (|f| f.sequences_syncable = false, SequencesNotSyncable),
+        (
+            |f| f.reverse_prerequisites = false,
+            ReversePrerequisitesMissing,
+        ),
+        (
+            |f| f.fence_risks_acknowledged = false,
+            FenceRiskUnacknowledged,
+        ),
+        (
+            |f| f.buffer_contract_matches = false,
+            BufferContractMismatch,
+        ),
     ];
-    for change in changes {
+    for (change, code) in changes {
         let mut facts = ready();
         change(&mut facts);
+        assert_eq!(
+            facts.evaluate(),
+            Readiness::NotReady {
+                reasons: vec![Reason { code }]
+            }
+        );
         let next = next_lifecycle(&ready_state, &Event::Readiness { facts }, 10).unwrap();
         assert_eq!(next.state, State::CatchingUp);
         assert_eq!(next.since_seq, 10);
         assert_eq!(next.authority, Authority::Source);
-        assert!(!next.blockers.is_empty());
+        assert_eq!(next.blockers, [code.as_str()]);
+        // A subsequent call uses new facts, rather than the previous result.
+        let restored = next_lifecycle(&next, &Event::Readiness { facts: ready() }, 11).unwrap();
+        assert_eq!(restored.state, State::VerifiedReady);
+        assert!(restored.blockers.is_empty());
     }
+}
+
+// Independent literal §3.11 table; saved-state resume is checked separately.
+fn reference_edges(state: State) -> &'static [State] {
+    use State::*;
+    match state {
+        Defined => &[Assessed, Blocked],
+        Assessed => &[Copying],
+        Copying => &[CatchingUp, Paused, Blocked, Failed, RecoveryRequired],
+        CatchingUp => &[VerifiedReady, Paused, Blocked, Failed, RecoveryRequired],
+        VerifiedReady => &[SourceFenced, CatchingUp],
+        SourceFenced => &[FinalBoundaryApplied, AbortedToSource],
+        FinalBoundaryApplied => &[DestinationActive, AbortedToSource],
+        DestinationActive => &[RollbackWindow],
+        RollbackWindow => &[RollingBack, Finalized],
+        RollingBack => &[SourceActiveAfterRollback],
+        Finalized
+        | SourceActiveAfterRollback
+        | AbortedToSource
+        | Paused
+        | Blocked
+        | Failed
+        | RecoveryRequired => &[],
+    }
+}
+
+#[test]
+fn every_states_allowed_set_equals_the_plan_table() {
+    assert_eq!(State::ALL.as_slice(), STATES);
+    for state in STATES {
+        assert_eq!(state.allowed_next(), reference_edges(*state));
+        assert_eq!(
+            state.is_terminal(),
+            matches!(
+                state,
+                State::Finalized | State::SourceActiveAfterRollback | State::AbortedToSource
+            )
+        );
+        let current = Lifecycle {
+            state: *state,
+            ..Default::default()
+        };
+        assert_eq!(current.allowed_next(), reference_edges(*state));
+        for to in STATES {
+            let mut regressed = ready();
+            regressed.capture_healthy = false;
+            let events = [
+                Event::Advance { to: *to },
+                Event::Interrupt {
+                    to: *to,
+                    reason: "test interruption".into(),
+                },
+                Event::Readiness { facts: ready() },
+                Event::Readiness { facts: regressed },
+                Event::Resume,
+                Event::ResumeAfterRecheck {
+                    remaining_blockers: vec![],
+                    facts: Some(ready()),
+                },
+            ];
+            let mut accepted = false;
+            for event in events {
+                match next_lifecycle(&current, &event, 42) {
+                    Ok(next) => accepted |= next.state != *state && next.state == *to,
+                    Err(error) => assert!(matches!(error, Error::Lifecycle(_)), "{error:?}"),
+                }
+            }
+            assert_eq!(
+                accepted,
+                reference_edges(*state).contains(to),
+                "{state:?} -> {to:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resume_is_saved_state_only_and_blocked_requires_recheck() {
+    use TransitionRejectionCode as Code;
+    let codes = [
+        Code::NotAllowed,
+        Code::ReadinessRequired,
+        Code::ReasonRequired,
+        Code::ResumeStateMissing,
+        Code::ResumeBoundary,
+        Code::BlockerRecheckRequired,
+        Code::BlockersStillHold,
+        Code::OperatorRecoveryRequired,
+    ];
+    for code in codes {
+        assert!(!code.remediation().trim().is_empty());
+    }
+    let assert_code = |result: Result<Lifecycle>, code: TransitionRejectionCode| {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(code.remediation()));
+        assert!(matches!(error, Error::Lifecycle(rejection) if rejection.code == code));
+    };
+    for state in [State::Paused, State::Blocked] {
+        for saved in STATES {
+            let current = Lifecycle {
+                state,
+                resume_state: Some(*saved),
+                authority: Authority::Unknown,
+                blockers: vec!["operator pause or blocker".into()],
+                ..Default::default()
+            };
+            let allowed = [State::Copying, State::CatchingUp].contains(saved)
+                || (state == State::Blocked && *saved == State::Defined);
+            assert_eq!(
+                current.allowed_next(),
+                if allowed {
+                    std::slice::from_ref(saved)
+                } else {
+                    &[]
+                }
+            );
+            let mut facts = ready();
+            facts.lineage_matches = false;
+            let checked = Event::ResumeAfterRecheck {
+                remaining_blockers: vec![],
+                facts: Some(facts),
+            };
+            let result = next_lifecycle(&current, &checked, 4);
+            if allowed {
+                let next = result.unwrap();
+                assert_eq!(next.state, *saved);
+                assert_eq!(next.authority, Authority::Unknown);
+                assert_eq!(next.resume_state, None);
+                assert_eq!(
+                    next.blockers,
+                    if *saved == State::CatchingUp {
+                        vec!["lineage-mismatch"]
+                    } else {
+                        vec![]
+                    }
+                );
+                let ready_checked = Event::ResumeAfterRecheck {
+                    remaining_blockers: vec![],
+                    facts: Some(ready()),
+                };
+                assert_eq!(
+                    next_lifecycle(&current, &ready_checked, 4).unwrap().state,
+                    *saved
+                );
+                if state == State::Blocked {
+                    assert_code(
+                        next_lifecycle(&current, &Event::Resume, 4),
+                        Code::BlockerRecheckRequired,
+                    );
+                }
+                let still_blocked = Event::ResumeAfterRecheck {
+                    remaining_blockers: vec!["still holds".into()],
+                    facts: Some(ready()),
+                };
+                assert_code(
+                    next_lifecycle(&current, &still_blocked, 4),
+                    Code::BlockersStillHold,
+                );
+                if *saved == State::CatchingUp {
+                    let missing = Event::ResumeAfterRecheck {
+                        remaining_blockers: vec![],
+                        facts: None,
+                    };
+                    assert_code(
+                        next_lifecycle(&current, &missing, 4),
+                        Code::ReadinessRequired,
+                    );
+                }
+            } else {
+                assert_code(result, Code::ResumeBoundary);
+            }
+        }
+        let missing = Lifecycle {
+            state,
+            ..Default::default()
+        };
+        assert_code(
+            next_lifecycle(&missing, &Event::Resume, 4),
+            Code::ResumeStateMissing,
+        );
+    }
+    for state in [State::Failed, State::RecoveryRequired] {
+        let current = Lifecycle {
+            state,
+            resume_state: Some(State::Copying),
+            ..Default::default()
+        };
+        for event in [
+            Event::Resume,
+            Event::ResumeAfterRecheck {
+                remaining_blockers: vec![],
+                facts: Some(ready()),
+            },
+        ] {
+            assert_code(
+                next_lifecycle(&current, &event, 4),
+                Code::OperatorRecoveryRequired,
+            );
+        }
+    }
+}
+
+#[test]
+fn readiness_reports_all_failed_conditions_and_every_code_has_remediation() {
+    use readiness::{BlockerCode, Condition, Readiness};
+    let facts = ReadinessFacts {
+        apply_lag: 1,
+        blocked_ddl: true,
+        in_scope_rows: 1,
+        busy_rows_past_budget: 1,
+        dead_letters: 1,
+        ..Default::default()
+    };
+    let Readiness::NotReady { reasons } = facts.evaluate() else {
+        panic!("must fail")
+    };
+    assert_eq!(
+        reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+        BlockerCode::ALL
+    );
+    let conditions = [
+        Condition::Chunks,
+        Condition::CaptureAndLineage,
+        Condition::ApplyLag,
+        Condition::SchemaJobs,
+        Condition::Verification,
+        Condition::DestinationSchema,
+        Condition::Sequences,
+        Condition::ReverseReplication,
+        Condition::FencePlan,
+        Condition::BufferContract,
+    ];
+    for condition in conditions {
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.code.condition() == condition)
+        );
+    }
+    let mut codes = std::collections::BTreeSet::new();
+    for code in BlockerCode::ALL {
+        assert!(codes.insert(code.as_str()));
+        assert!(!code.message().trim().is_empty());
+        assert!(!code.remediation().trim().is_empty());
+        assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
+    }
+    let mut boundary = ready();
+    boundary.apply_lag = boundary.lag_budget;
+    boundary.verified_rows = 0;
+    boundary.in_scope_rows = 0;
+    assert_eq!(boundary.evaluate(), Readiness::Ready);
+}
+
+async fn advance_to_catching_up(c: &mut Coordinator) {
+    for to in [State::Assessed, State::Copying, State::CatchingUp] {
+        c.commit(Transition::Lifecycle {
+            event: Event::Advance { to },
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn interruptions_preserve_authority_and_every_marker_through_replay() {
+    for start in [State::Defined, State::Copying, State::CatchingUp] {
+        for to in [
+            State::Paused,
+            State::Blocked,
+            State::Failed,
+            State::RecoveryRequired,
+        ] {
+            if !reference_edges(start).contains(&to) {
+                continue;
+            }
+            // Last-known authority is preserved even if unknown; it is never inferred
+            // from an interruption state. The durable path below starts at source.
+            for authority in [
+                Authority::Source,
+                Authority::Destination,
+                Authority::Neither,
+                Authority::Unknown,
+            ] {
+                let current = Lifecycle {
+                    state: start,
+                    authority,
+                    ..Default::default()
+                };
+                let next = next_lifecycle(
+                    &current,
+                    &Event::Interrupt {
+                        to,
+                        reason: "preserve evidence".into(),
+                    },
+                    7,
+                )
+                .unwrap();
+                assert_eq!(next.authority, authority);
+                assert_eq!(next.resume_state, Some(start));
+            }
+            let journal = fresh_journal("lifecycle-markers");
+            let mut c = coordinator(journal.clone(), "owner");
+            c.acquire().await.unwrap();
+            if start != State::Defined {
+                for state in [State::Assessed, State::Copying, State::CatchingUp] {
+                    c.commit(Transition::Lifecycle {
+                        event: Event::Advance { to: state },
+                    })
+                    .await
+                    .unwrap();
+                    if state == start {
+                        break;
+                    }
+                }
+            }
+            for i in 0..budget::PROGRESS {
+                c.commit(Transition::Progress {
+                    stream: format!("stream-{i}"),
+                    marker: format!("marker-{i}"),
+                    position: format!("position-{i}"),
+                })
+                .await
+                .unwrap();
+            }
+            let before = c.state().clone();
+            let event = Event::Interrupt {
+                to,
+                reason: "preserve evidence".into(),
+            };
+            let entry = c
+                .commit(Transition::Lifecycle {
+                    event: event.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(c.state().progress, before.progress);
+            assert_eq!(c.state().lifecycle.authority, before.lifecycle.authority);
+            assert_eq!(c.state().lifecycle.resume_state, Some(start));
+            assert_eq!(
+                journal.entry(entry.seq).await.unwrap().transition,
+                Transition::Lifecycle { event }
+            );
+            assert_eq!(&journal.load(false).await.unwrap(), c.state());
+            c.checkpoint().await.unwrap();
+            assert_eq!(&journal.load(true).await.unwrap(), c.state());
+            if matches!(to, State::Paused | State::Blocked) {
+                c.commit(Transition::Lifecycle {
+                    event: Event::ResumeAfterRecheck {
+                        remaining_blockers: vec![],
+                        facts: Some(ready()),
+                    },
+                })
+                .await
+                .unwrap();
+                assert_eq!(c.state().lifecycle.state, start);
+                assert_eq!(c.state().progress, before.progress);
+                assert_eq!(&journal.load(false).await.unwrap(), c.state());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn readiness_regression_is_journaled_and_lifecycle_budget_rejection_is_atomic() {
+    let journal = fresh_journal("readiness-regression");
+    let mut c = coordinator(journal.clone(), "owner");
+    c.acquire().await.unwrap();
+    advance_to_catching_up(&mut c).await;
+    c.commit(Transition::Lifecycle {
+        event: Event::Readiness { facts: ready() },
+    })
+    .await
+    .unwrap();
+    let mut facts = ready();
+    facts.capture_healthy = false;
+    facts.dead_letters = 1;
+    let event = Event::Readiness { facts };
+    let entry = c
+        .commit(Transition::Lifecycle {
+            event: event.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(c.state().lifecycle.state, State::CatchingUp);
+    assert_eq!(
+        c.state().lifecycle.blockers,
+        ["capture-unhealthy", "dead-letters-present"]
+    );
+    assert_eq!(
+        journal.entry(entry.seq).await.unwrap().transition,
+        Transition::Lifecycle { event }
+    );
+    assert_eq!(&journal.load(false).await.unwrap(), c.state());
+    c.checkpoint().await.unwrap();
+    assert_eq!(&journal.load(true).await.unwrap(), c.state());
+    let before = c.state().clone();
+    let error = c
+        .commit(Transition::Lifecycle {
+            event: Event::Advance {
+                to: State::VerifiedReady,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Lifecycle(TransitionRejection {
+            code: TransitionRejectionCode::ReadinessRequired,
+            ..
+        })
+    ));
+    let error = c
+        .commit(Transition::Lifecycle {
+            event: Event::Interrupt {
+                to: State::Blocked,
+                reason: "x".repeat(budget::ROW_BYTES + 1),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::BudgetExceeded(_)), "{error:?}");
+    assert_eq!(c.state(), &before);
+    assert_eq!(journal.load(false).await.unwrap(), before);
 }
 
 async fn race(store: Arc<dyn ObjectStore>, name: &str) {
@@ -1476,10 +2454,7 @@ fn directory_bytes(path: &std::path::Path) -> u64 {
 #[ignore = "DOCKER REQUIRED: real PG18 authority and idempotency rows; harness/run.ps1 p2"]
 async fn stale_epoch_effect_rejected_by_db_authority_row() {
     let cfg = config();
-    let (mut client, connection) =
-        tokio_postgres::connect(cfg["pg"].as_str().unwrap(), tokio_postgres::NoTls)
-            .await
-            .unwrap();
+    let (mut client, connection) = tls_connect(cfg["pg"].as_str().unwrap()).await.unwrap();
     let connection = tokio::spawn(async move {
         connection.await.unwrap();
     });
@@ -2457,4 +3432,31 @@ async fn explicit_legacy_copy_rejects_incomplete_or_unsafe_destinations() {
         Err(Error::Rejected(_))
     ));
     assert_eq!(stored_object_bytes(&store).await, before);
+}
+
+// The harness CA is explicit; missing trust is a failure once a DB gate is set.
+fn tls_config(postgres: tokio_postgres::Config) -> skedaddle::pg::tls::Config {
+    let path = std::env::var_os("SKEDADDLE_TEST_CONFIG").expect("TLS harness config required");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read TLS harness config"))
+            .expect("TLS harness JSON");
+    let ca_pem = config["ca_pem"]
+        .as_str()
+        .or_else(|| config["replication"]["ca_pem"].as_str())
+        .expect("harness ca_pem or replication.ca_pem required");
+    skedaddle::pg::tls::Config::new(postgres, ca_pem)
+}
+
+async fn tls_connect(
+    dsn: &str,
+) -> std::result::Result<
+    (tokio_postgres::Client, skedaddle::pg::tls::Driver),
+    skedaddle::pg::tls::Error,
+> {
+    let config = tls_config(dsn.parse().expect("harness PostgreSQL configuration"));
+    let (client, driver, transport) =
+        skedaddle::pg::tls::connect(&config, &skedaddle::security::TlsPolicy::Required).await?;
+    assert!(transport.encrypted());
+    assert!(transport.warnings.is_empty());
+    Ok((client, driver))
 }

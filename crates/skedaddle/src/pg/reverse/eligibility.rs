@@ -1,0 +1,238 @@
+use std::{cell::RefCell, rc::Rc};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    mapping::{Classification, Mapping, MappingError, Value},
+    pg::{
+        pgoutput::{Relation, RelationColumn},
+        source::{self, ColumnMapping, TypeResolver},
+    },
+};
+
+/// Stable, typed journal/status reasons. Values themselves are never recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Violation {
+    Value { reason: MappingFailure },
+    UnsupportedDdl { reason: String },
+    NewType { relation: String, column: String },
+    Extension { name: String },
+    IrreversibleMapping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MappingFailure {
+    Invalid,
+    OutOfDomain,
+    Unverified,
+    Unsupported,
+    LossyText,
+}
+impl From<&MappingError> for MappingFailure {
+    fn from(error: &MappingError) -> Self {
+        match error {
+            MappingError::Invalid(_) => Self::Invalid,
+            MappingError::OutOfDomain(_) => Self::OutOfDomain,
+            MappingError::Unverified(_) => Self::Unverified,
+            MappingError::Unsupported(_) => Self::Unsupported,
+            MappingError::LossyText(_) => Self::LossyText,
+        }
+    }
+}
+
+type Journal = Box<dyn FnMut(&Violation) -> Result<(), String>>;
+struct State {
+    first: Option<Violation>,
+    journaled: bool,
+    journal: Journal,
+}
+
+/// Shared by all column mappings and capture. The latch closes BEFORE trying
+/// the journal; a journal failure cannot reopen eligibility. Retry `flush` and
+/// persist/restore the first reason before resuming any work after a restart.
+#[derive(Clone)]
+pub struct Eligibility(Rc<RefCell<State>>);
+impl Eligibility {
+    pub fn new(journal: impl FnMut(&Violation) -> Result<(), String> + 'static) -> Self {
+        Self::restore(None, journal)
+    }
+    pub fn restore(
+        first: Option<Violation>,
+        journal: impl FnMut(&Violation) -> Result<(), String> + 'static,
+    ) -> Self {
+        Self(Rc::new(RefCell::new(State {
+            journaled: first.is_some(),
+            first,
+            journal: Box::new(journal),
+        })))
+    }
+    pub fn first_violation(&self) -> Option<Violation> {
+        self.0.borrow().first.clone()
+    }
+    pub fn eligible(&self) -> bool {
+        self.0.borrow().first.is_none()
+    }
+    pub fn flush(&self) -> Result<(), MappingError> {
+        let mut state = self.0.borrow_mut();
+        if !state.journaled
+            && let Some(reason) = state.first.clone()
+        {
+            (state.journal)(&reason)
+                .map_err(|_| MappingError::Unverified("eligibility journal unavailable".into()))?;
+            state.journaled = true;
+        }
+        Ok(())
+    }
+    pub fn end(&self, reason: Violation) -> Result<(), MappingError> {
+        {
+            let mut state = self.0.borrow_mut();
+            if state.first.is_none() {
+                state.first = Some(reason);
+            }
+        }
+        self.flush()
+    }
+    pub fn ensure(&self) -> Result<(), MappingError> {
+        self.flush()?;
+        if !self.eligible() {
+            return Err(MappingError::OutOfDomain(
+                "rollback eligibility permanently ended".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn check(&self, inverse: &dyn Mapping, value: &Value) -> Result<(), MappingError> {
+        self.ensure()?;
+        if !inverse.is_reversible() {
+            self.end(Violation::IrreversibleMapping)?;
+            return Err(MappingError::Unsupported(
+                "inverse mapping is not reversible".into(),
+            ));
+        }
+        if let Err(reason) = inverse.domain_check(value) {
+            self.end(Violation::Value {
+                reason: (&reason).into(),
+            })?;
+            return Err(reason);
+        }
+        Ok(())
+    }
+    /// For consumers of buffered reverse DDL. New type/extension operations
+    /// fail independently of whether a subsequent row happens to use them.
+    pub fn check_ddl(
+        &self,
+        schemas: &mut crate::pg::ddl::SchemaVersions,
+        records: &[crate::pg::ddl::DdlRecord],
+    ) -> Result<(), MappingError> {
+        self.ensure()?;
+        if let crate::pg::ddl::Classification::SafeBoundaryStop(stop) =
+            schemas.classify_transaction(records)
+        {
+            let record = records.iter().find(|r| r.version == stop.schema_version);
+            let violation = match record {
+                Some(r)
+                    if r.tag.contains("EXTENSION")
+                        || r.commands
+                            .iter()
+                            .any(|c| c.in_extension || c.object_type == "extension") =>
+                {
+                    Violation::Extension {
+                        name: "destination extension DDL".into(),
+                    }
+                }
+                Some(r) if r.tag.contains("TYPE") || r.tag.contains("DOMAIN") => {
+                    Violation::NewType {
+                        relation: "destination type DDL".into(),
+                        column: String::new(),
+                    }
+                }
+                _ => Violation::UnsupportedDdl {
+                    reason: stop.reason,
+                },
+            };
+            self.end(violation)?;
+            return self.ensure();
+        }
+        Ok(())
+    }
+}
+
+/// The supplied mapping's domain is the destination (reverse input) domain.
+/// Its inverse maps destination values back to the old source. It must be
+/// qualified in this direction; a forward-only domain predicate is insufficient.
+pub struct InverseMapping {
+    mapping: Box<dyn Mapping>,
+    eligibility: Eligibility,
+}
+impl InverseMapping {
+    pub fn new(mapping: Box<dyn Mapping>, eligibility: Eligibility) -> Self {
+        Self {
+            mapping,
+            eligibility,
+        }
+    }
+}
+impl Mapping for InverseMapping {
+    fn forward(&self, value: &Value) -> Result<Value, MappingError> {
+        self.domain_check(value)?;
+        match self.mapping.inverse(value) {
+            Ok(v) => Ok(v),
+            Err(reason) => {
+                self.eligibility.end(Violation::Value {
+                    reason: (&reason).into(),
+                })?;
+                Err(reason)
+            }
+        }
+    }
+    fn inverse(&self, value: &Value) -> Result<Value, MappingError> {
+        self.domain_check(value)?;
+        self.mapping.forward(value)
+    }
+    fn domain_check(&self, value: &Value) -> Result<(), MappingError> {
+        self.eligibility.check(self.mapping.as_ref(), value)
+    }
+    fn is_reversible(&self) -> bool {
+        self.mapping.is_reversible() && self.eligibility.eligible()
+    }
+    fn classification(&self) -> Classification {
+        self.mapping.classification()
+    }
+}
+
+pub struct ReverseResolver<R> {
+    resolver: R,
+    eligibility: Eligibility,
+}
+impl<R> ReverseResolver<R> {
+    pub fn new(resolver: R, eligibility: Eligibility) -> Self {
+        Self {
+            resolver,
+            eligibility,
+        }
+    }
+}
+impl<R: TypeResolver> TypeResolver for ReverseResolver<R> {
+    fn resolve(
+        &mut self,
+        relation: &Relation<'_>,
+        column: &RelationColumn<'_>,
+    ) -> source::Result<ColumnMapping> {
+        self.eligibility.ensure().map_err(source::Error::Mapping)?;
+        match self.resolver.resolve(relation, column) {
+            Ok(value) => Ok(ColumnMapping {
+                pg_type: value.pg_type,
+                mapping: Box::new(InverseMapping::new(value.mapping, self.eligibility.clone())),
+            }),
+            Err(e) => {
+                self.eligibility
+                    .end(Violation::NewType {
+                        relation: format!("{}.{}", relation.namespace, relation.name),
+                        column: column.name.into(),
+                    })
+                    .map_err(source::Error::Mapping)?;
+                Err(e)
+            }
+        }
+    }
+}

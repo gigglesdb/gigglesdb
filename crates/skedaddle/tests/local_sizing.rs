@@ -615,7 +615,12 @@ fn oversized_definition_is_a_critical_check_time_blocker() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    let report: skedaddle::CapabilityReport = serde_json::from_slice(&output.stdout).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["outcome"], "blocked");
+    assert_eq!(envelope["exit_code"], 2);
+    let report: skedaddle::CapabilityReport =
+        serde_json::from_value(envelope["data"].clone()).unwrap();
     let item = report
         .blocking()
         .into_iter()

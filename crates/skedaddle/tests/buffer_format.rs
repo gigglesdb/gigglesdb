@@ -1,8 +1,8 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
-    fs::{self, File},
-    io::{self, BufReader, BufWriter, Cursor, Read, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -12,7 +12,10 @@ use skedaddle::{
         END_MAGIC, FormatError, Limits, ManifestEntry, SegmentDecoder, SegmentEncoder,
         SegmentHeader, SegmentRecord, manifest_key, segment_key,
     },
-    event::{AssembledTxn, Event, EventKind, OpaqueValue, Position, Row, SourceIdentity, TxnId},
+    event::{
+        AssembledTxn, Event, EventKind, OpaqueValue, Position, Row, SourceIdentity, StreamingTxn,
+        TransactionMetadata, TxnId,
+    },
 };
 
 // Track live allocations only on the large-stream test's thread. System does
@@ -162,9 +165,8 @@ fn resign_segment(bytes: &mut [u8]) {
     bytes[end..].copy_from_slice(&digest);
 }
 
-// Independently constructed using Python struct.pack/hashlib, including the
-// P3a transaction encoding, record digest, header and complete segment trailer.
-const GOLDEN: &str = concat!(
+// Original independently constructed v1 fixture, retained as rejection evidence.
+const GOLDEN_V1: &str = concat!(
     "534b45445345470000010000002e000000016d00000001730000000000000007",
     "00000001640000000109000000016400000001090000000000000001",
     "0000000000000059534b45560001020000000270670000000173000000016c",
@@ -174,10 +176,35 @@ const GOLDEN: &str = concat!(
     "4d6fa58b20fa624e7cb98feb2028ff1d260d56adb7651d680797b1919b05d920",
 );
 
+// Independently constructed using Python struct.pack/hashlib, including the
+// P3a v2 transaction encoding (including absent source origin), record digest,
+// header and complete segment trailer. The outer segment remains version 1.
+const GOLDEN_V2: &str = concat!(
+    "534b45445345470000010000002e000000016d00000001730000000000000007",
+    "0000000164000000010900000001640000000109000000000000000100000000",
+    "0000005a534b45560002020000000270670000000173000000016c0000000264",
+    "6200000004736c6f740000000101000000016400000001090000000000007f08",
+    "0fc05aceac5ed7d42a4a27caf5e76f6db40bfea4ed1305531b6b376ee78b0000",
+    "000000000000534b4544454e4400000000000000000137ce5fc7682f258ce800",
+    "8bf61006c528fe692b3141882c1e5c5221137d12ae75",
+);
+const GOLDEN_CHUNK_V1: &str = concat!(
+    "534b43520001534b45560001020000000270670000000173000000016c000000026462",
+    "00000004736c6f740000000101000000016400000001090000000000",
+    "dba702fe63fa8822942316ddf436a2bd27dc86473bd74bbe3f3001152fe0b780",
+    "d799104d0d304d1f1a840f0de781a58b2bd0029bb9c1a291c65ab543ae4b9cd6"
+);
+const GOLDEN_CHUNK_V2: &str = concat!(
+    "534b43520001534b45560002020000000270670000000173000000016c000000",
+    "02646200000004736c6f74000000010100000001640000000109000000000000",
+    "7f080fc05aceac5ed7d42a4a27caf5e76f6db40bfea4ed1305531b6b376ee78b",
+    "4858d277b66c85e436687ac5eabe37723d556afa1ed477bc05cf21bb124c7b3d"
+);
+
 #[test]
 fn golden_bytes_are_stable_and_reuse_p3a_record() {
     let bytes = encode(&[transaction()]);
-    assert_eq!(bytes, unhex(GOLDEN));
+    assert_eq!(bytes, unhex(GOLDEN_V2));
     let SegmentRecord::Transaction(txn) = transaction() else {
         unreachable!()
     };
@@ -186,19 +213,257 @@ fn golden_bytes_are_stable_and_reuse_p3a_record() {
     assert_eq!(&bytes[start..start + canonical.len()], canonical);
     assert_eq!(decode(&bytes).unwrap(), vec![transaction()]);
     // Independent Python struct.pack/hashlib golden for an empty ChunkRows
-    // batch, including its embedded unchanged P3a envelope and outer checksum.
+    // batch, including its embedded P3a v2 envelope and outer checksum.
     let SegmentRecord::Transaction(txn) = transaction() else {
         unreachable!()
     };
     let chunk = SegmentRecord::ChunkRows(txn);
-    assert_eq!(
-        chunk.canonical_bytes().unwrap(),
-        unhex(concat!(
-            "534b43520001534b45560001020000000270670000000173000000016c000000026462",
-            "00000004736c6f740000000101000000016400000001090000000000",
-            "dba702fe63fa8822942316ddf436a2bd27dc86473bd74bbe3f3001152fe0b780",
-            "d799104d0d304d1f1a840f0de781a58b2bd0029bb9c1a291c65ab543ae4b9cd6"
+    assert_eq!(chunk.canonical_bytes().unwrap(), unhex(GOLDEN_CHUNK_V2));
+}
+
+#[test]
+fn v1_goldens_are_explicitly_rejected_after_event_encoding_upgrade() {
+    assert!(matches!(
+        decode(&unhex(GOLDEN_V1)),
+        Err(FormatError::Event(
+            skedaddle::event::EventError::UnsupportedVersion(1)
         ))
+    ));
+    assert!(matches!(
+        SegmentRecord::from_canonical_bytes(&unhex(GOLDEN_CHUNK_V1)),
+        Err(FormatError::Event(
+            skedaddle::event::EventError::UnsupportedVersion(1)
+        ))
+    ));
+    let old_segment = unhex(GOLDEN_V1);
+    let mut decoder = SegmentDecoder::new(old_segment.as_slice(), Limits::default()).unwrap();
+    assert!(matches!(
+        decoder.next_transaction_into(Cursor::new(Vec::new())),
+        Err(FormatError::Event(
+            skedaddle::event::EventError::UnsupportedVersion(1)
+        ))
+    ));
+    let start = record_start(&old_segment);
+    let length = u64::from_be_bytes(old_segment[start..start + 8].try_into().unwrap());
+    let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+    assert!(matches!(
+        encoder.write_transaction_reader(
+            &pos(),
+            length,
+            &old_segment[start + 8..start + 8 + length as usize]
+        ),
+        Err(FormatError::Event(
+            skedaddle::event::EventError::UnsupportedVersion(1)
+        ))
+    ));
+}
+
+#[test]
+fn sized_canonical_transaction_reader_preserves_golden_bytes() {
+    let canonical = transaction().canonical_bytes().unwrap();
+    let mut encoder =
+        SegmentEncoder::new(Fragmented(Vec::new()), header(1), Limits::default()).unwrap();
+    encoder
+        .write_transaction_reader(
+            &pos(),
+            canonical.len() as u64,
+            Fragmented(canonical.as_slice()),
+        )
+        .unwrap();
+    let (output, summary) = encoder.finish().unwrap();
+    assert_eq!(output.0, unhex(GOLDEN_V2));
+    assert_eq!(summary.record_count, 1);
+    assert_eq!(decode(&output.0).unwrap(), vec![transaction()]);
+}
+
+#[test]
+fn sized_reader_rejects_bad_envelopes_lengths_checksums_and_poisoned_output() {
+    let canonical = transaction().canonical_bytes().unwrap();
+    for case in 0..8 {
+        let mut bytes = canonical.clone();
+        let mut length = bytes.len() as u64;
+        match case {
+            0 => bytes[0] ^= 1,
+            1 => bytes[4..6].copy_from_slice(&u16::MAX.to_be_bytes()),
+            2 => bytes[6] = 1,
+            3 => bytes[12] ^= 1,
+            4 => {
+                bytes.pop();
+            }
+            5 => bytes.push(0),
+            6 => length = 38,
+            7 => length = Limits::default().max_record_bytes + 1,
+            _ => unreachable!(),
+        }
+        let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+        assert!(
+            encoder
+                .write_transaction_reader(&pos(), length, bytes.as_slice())
+                .is_err(),
+            "case {case}"
+        );
+        assert!(matches!(
+            encoder.write_transaction_reader(&pos(), canonical.len() as u64, canonical.as_slice()),
+            Err(FormatError::Poisoned)
+        ));
+        assert!(matches!(encoder.finish(), Err(FormatError::Poisoned)));
+    }
+    let mut encoder = SegmentEncoder::new(Vec::new(), header(0), Limits::default()).unwrap();
+    assert!(matches!(
+        encoder.write_transaction_reader(&pos(), canonical.len() as u64, canonical.as_slice()),
+        Err(FormatError::CountMismatch { .. })
+    ));
+    let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+    assert!(
+        encoder
+            .write_transaction_reader(
+                &Position::new("wrong", vec![9]),
+                canonical.len() as u64,
+                canonical.as_slice()
+            )
+            .is_err()
+    );
+    struct Failed;
+    impl Read for Failed {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::Other.into())
+        }
+    }
+    let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+    assert!(matches!(
+        encoder.write_transaction_reader(&pos(), canonical.len() as u64, Failed),
+        Err(FormatError::Io(_))
+    ));
+    assert!(matches!(encoder.finish(), Err(FormatError::Poisoned)));
+}
+
+#[test]
+fn large_streaming_txn_codec_bounded_memory_300_mb() {
+    const BUDGET: usize = 256 * 1024;
+    const PAYLOAD: usize = 64 * 1024;
+    const EVENTS: u32 = 4_800;
+    let root = std::path::PathBuf::from(
+        std::env::var_os("SKEDADDLE_TEST_ROOT").expect("SKEDADDLE_TEST_ROOT required"),
+    )
+    .join("format-streaming-large");
+    fs::create_dir_all(&root).unwrap();
+    // Reuse these two retained evidence paths on reruns, staying below 1 GB.
+    let create = |name| {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(root.join(name))
+            .unwrap()
+    };
+    let storage = create("transaction.canonical");
+    let mut segment = create("segment.seg");
+    let metadata = TransactionMetadata {
+        source: source(),
+        txn: TxnId(vec![1]),
+        commit_position: pos(),
+        commit_time: Some(42),
+    };
+    ALLOCATIONS.with(|a| {
+        a.set(Allocations {
+            enabled: true,
+            ..Default::default()
+        })
+    });
+    let events = (0..EVENTS).map(|ordinal| {
+        Ok(Event {
+            source: source(),
+            txn: TxnId(vec![1]),
+            ordinal_in_txn: ordinal as u64,
+            position: pos(),
+            schema_version: 1,
+            kind: EventKind::Insert,
+            table: Some("public.t".into()),
+            key: Row::new(),
+            before: None,
+            after: Some(Row::from([(
+                "v".into(),
+                OpaqueValue {
+                    type_id: "bytes".into(),
+                    bytes: Some(vec![42; PAYLOAD]),
+                },
+            )])),
+            unchanged_cols: Default::default(),
+        })
+    });
+    let mut txn = StreamingTxn::from_events(metadata, EVENTS, events, storage).unwrap();
+    let length = txn.canonical_len();
+    assert!(length >= 300_000_000);
+    let mut encoder = SegmentEncoder::new(
+        &mut segment,
+        header(1),
+        Limits {
+            max_record_bytes: 1_000_000_000,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    encoder.write_streaming_transaction(&mut txn).unwrap();
+    let (_, summary) = encoder.finish().unwrap();
+    assert_eq!(summary.record_count, 1);
+    assert!(length + summary.bytes < 1_000_000_000);
+
+    // Independently verify the one-record framing, canonical record digest and
+    // complete segment digest by reading fixed chunks, without owned decoding.
+    fn hash_prefix(reader: &mut impl Read, mut length: u64) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 16 * 1024];
+        while length > 0 {
+            let size = length.min(bytes.len() as u64) as usize;
+            reader.read_exact(&mut bytes[..size]).unwrap();
+            hash.update(&bytes[..size]);
+            length -= size as u64;
+        }
+        hash.finalize().into()
+    }
+    segment.rewind().unwrap();
+    let mut prefix = [0; 14];
+    segment.read_exact(&mut prefix).unwrap();
+    let header_length = u32::from_be_bytes(prefix[10..14].try_into().unwrap());
+    segment
+        .seek(SeekFrom::Current(header_length as i64))
+        .unwrap();
+    let mut encoded_length = [0; 8];
+    segment.read_exact(&mut encoded_length).unwrap();
+    assert_eq!(u64::from_be_bytes(encoded_length), length);
+    assert_eq!(hash_prefix(&mut segment, length - 32), txn.digest());
+    let mut digest = [0; 32];
+    segment.read_exact(&mut digest).unwrap();
+    assert_eq!(digest, txn.digest());
+    let mut trailer = [0; 24];
+    segment.read_exact(&mut trailer).unwrap();
+    assert_eq!(&trailer[..8], &0_u64.to_be_bytes());
+    assert_eq!(&trailer[8..16], END_MAGIC);
+    assert_eq!(&trailer[16..], &1_u64.to_be_bytes());
+    segment.read_exact(&mut digest).unwrap();
+    assert_eq!(digest, summary.digest);
+    assert_eq!(segment.read(&mut [0]).unwrap(), 0);
+    segment.rewind().unwrap();
+    assert_eq!(
+        hash_prefix(&mut segment, summary.bytes - 32),
+        summary.digest
+    );
+    let measured = ALLOCATIONS.with(|a| {
+        let measured = a.get();
+        a.set(Allocations::default());
+        measured
+    });
+    eprintln!(
+        "streaming codec: canonical={length}, segment={}, budget={BUDGET}, one_event_payload={PAYLOAD}, measured_peak_live={}, retained_files={}",
+        summary.bytes,
+        measured.peak,
+        length + summary.bytes
+    );
+    assert!(
+        measured.peak <= BUDGET + PAYLOAD + 32 * 1024,
+        "peak {} exceeds budget plus one event plus 32 KiB",
+        measured.peak
     );
 }
 
@@ -821,6 +1086,10 @@ fn manifest_rejects_tampering_unknown_duplicate_and_invalid_digest_fields() {
 #[test]
 fn key_layout_padding_order_and_components_are_stable() {
     assert_eq!(
+        manifest_key("p///", "M_1-A", "s-2_B", 1),
+        "p/buffer/M_1-A/s-2_B/manifest/00000000000000000001.json"
+    );
+    assert_eq!(
         manifest_key("p/", "m", "s", 1),
         "p/buffer/m/s/manifest/00000000000000000001.json"
     );
@@ -876,4 +1145,347 @@ fn zero_record_length_is_only_a_trailer_sentinel() {
         &bytes[record_start(&bytes) + 8..record_start(&bytes) + 16],
         END_MAGIC
     );
+}
+
+fn segment_with_raw_record(record: &[u8]) -> Vec<u8> {
+    let mut bytes = encode(&[transaction()]);
+    let start = record_start(&bytes);
+    let end = bytes.len() - 56;
+    let mut frame = (record.len() as u64).to_be_bytes().to_vec();
+    frame.extend_from_slice(record);
+    bytes.splice(start..end, frame);
+    resign_segment(&mut bytes);
+    bytes
+}
+
+#[test]
+fn short_chunk_envelopes_are_rejected_before_digest_or_inner_decoding() {
+    let canonical = chunk(0).canonical_bytes().unwrap();
+    for length in 4..38 {
+        assert!(matches!(
+            SegmentRecord::from_canonical_bytes(&canonical[..length]),
+            Err(FormatError::Truncated("ChunkRows envelope"))
+        ));
+    }
+    for length in 6..77 {
+        let bytes = segment_with_raw_record(&canonical[..length]);
+        let mut decoder = SegmentDecoder::new(bytes.as_slice(), Limits::default()).unwrap();
+        assert!(matches!(
+            decoder.next_transaction_into(Cursor::new(Vec::new())),
+            Err(FormatError::Truncated("ChunkRows envelope"))
+        ));
+        assert!(matches!(decoder.next_record(), Err(FormatError::Poisoned)));
+    }
+}
+
+#[test]
+fn complete_minimum_envelopes_reach_transaction_field_validation() {
+    // Independently form the seven-byte transaction envelope and its checksum.
+    // The sized-copy API checks this framing, leaving field semantics to its caller.
+    let mut minimal_txn = b"SKEV\0\x02\x02".to_vec();
+    minimal_txn.extend_from_slice(&Sha256::digest(&minimal_txn));
+    assert_eq!(minimal_txn.len(), 39);
+    let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+    encoder
+        .write_transaction_reader(&pos(), 39, minimal_txn.as_slice())
+        .unwrap();
+    let bytes = encoder.finish().unwrap().0;
+    assert!(matches!(decode(&bytes), Err(FormatError::Event(_))));
+
+    // A complete outer checksum must reach the inner codec, even when its
+    // transaction fields are absent. It is not an outer-envelope truncation.
+    let mut empty_chunk = b"SKCR\0\x01".to_vec();
+    empty_chunk.extend_from_slice(&Sha256::digest(&empty_chunk));
+    assert_eq!(empty_chunk.len(), 38);
+    assert!(matches!(
+        SegmentRecord::from_canonical_bytes(&empty_chunk),
+        Err(FormatError::Event(_))
+    ));
+    let mut minimal_chunk = b"SKCR\0\x01".to_vec();
+    minimal_chunk.extend_from_slice(&minimal_txn);
+    minimal_chunk.extend_from_slice(&Sha256::digest(&minimal_chunk));
+    assert_eq!(minimal_chunk.len(), 77);
+    let bytes = segment_with_raw_record(&minimal_chunk);
+    let mut decoder = SegmentDecoder::new(bytes.as_slice(), Limits::default()).unwrap();
+    assert!(matches!(
+        decoder.next_transaction_into(Cursor::new(Vec::new())),
+        Err(FormatError::Event(_))
+    ));
+    assert!(matches!(decoder.next_record(), Err(FormatError::Poisoned)));
+}
+
+#[test]
+fn sized_reader_rejects_authenticated_wrong_magic_and_record_kind() {
+    for offset in [0, 6] {
+        let mut canonical = transaction().canonical_bytes().unwrap();
+        canonical[offset] ^= 1;
+        resign_segment(&mut canonical);
+        let mut encoder = SegmentEncoder::new(Vec::new(), header(1), Limits::default()).unwrap();
+        assert!(matches!(
+            encoder.write_transaction_reader(&pos(), canonical.len() as u64, canonical.as_slice()),
+            Err(FormatError::Invalid("expected canonical transaction"))
+        ));
+        assert!(matches!(encoder.finish(), Err(FormatError::Poisoned)));
+    }
+}
+
+#[test]
+fn endpoint_checks_distinguish_first_last_and_interior_records() {
+    let positions = [
+        Position::new("d", vec![250]),
+        Position::new("d", vec![128]),
+        Position::new("d", vec![1]),
+    ];
+    let at = |position| {
+        SegmentRecord::Transaction(
+            AssembledTxn::new(source(), TxnId(vec![1]), position, None, vec![]).unwrap(),
+        )
+    };
+    let records: Vec<_> = positions.iter().cloned().map(at).collect();
+    let mut endpoints = header(3);
+    endpoints.first_pos = positions[0].clone();
+    endpoints.last_pos = positions[2].clone();
+    let mut encoder =
+        SegmentEncoder::new(Vec::new(), endpoints.clone(), Limits::default()).unwrap();
+    for record in &records {
+        encoder.write_record(record).unwrap();
+    }
+    let valid = encoder.finish().unwrap().0;
+    // Opaque positions have no global byte ordering; decreasing endpoints work.
+    assert_eq!(decode(&valid).unwrap(), records);
+    for (index, position, reason) in [
+        (
+            0,
+            Position::new("d", vec![251]),
+            "segment endpoint position",
+        ),
+        (1, Position::new("e", vec![128]), "position domain"),
+        (2, Position::new("d", vec![2]), "segment endpoint position"),
+    ] {
+        let bad = at(position);
+        let mut encoder =
+            SegmentEncoder::new(Vec::new(), endpoints.clone(), Limits::default()).unwrap();
+        for record in &records[..index] {
+            encoder.write_record(record).unwrap();
+        }
+        assert!(matches!(encoder.write_record(&bad), Err(FormatError::Invalid(r)) if r == reason));
+        assert!(matches!(encoder.finish(), Err(FormatError::Poisoned)));
+
+        let mut bytes = valid.clone();
+        let mut start = record_start(&bytes);
+        for _ in 0..index {
+            let length = u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
+            start += 8 + length as usize;
+        }
+        let canonical = bad.canonical_bytes().unwrap();
+        bytes[start + 8..start + 8 + canonical.len()].copy_from_slice(&canonical);
+        resign_segment(&mut bytes);
+        assert!(matches!(decode(&bytes), Err(FormatError::Invalid(r)) if r == reason));
+    }
+    let mut single = endpoints;
+    single.record_count = 1;
+    assert!(matches!(
+        SegmentEncoder::new(Vec::new(), single, Limits::default()),
+        Err(FormatError::Invalid("single-record endpoints"))
+    ));
+}
+
+#[test]
+fn streaming_decoder_preserves_records_and_reports_owned_buffer_capacity() {
+    let SegmentRecord::Transaction(empty) = transaction() else {
+        unreachable!()
+    };
+    let SegmentRecord::ChunkRows(mut batch) = chunk(17 * 1024) else {
+        unreachable!()
+    };
+    let mut second = batch.events[0].clone();
+    second.ordinal_in_txn = 1;
+    batch.events.push(second);
+    let records = [
+        transaction(),
+        SegmentRecord::ChunkRows(reseal(batch)),
+        SegmentRecord::ChunkRows(empty),
+    ];
+    let bytes = encode(&records);
+    let header_length = record_start(&bytes) - 14;
+    let mut decoder = SegmentDecoder::new(bytes.as_slice(), Limits::default()).unwrap();
+    let initial_peak = decoder.peak_buffer_bytes();
+    assert!(initial_peak >= header_length);
+    for record in &records {
+        let mut streamed = decoder
+            .next_transaction_into(Cursor::new(Vec::new()))
+            .unwrap()
+            .unwrap();
+        let expected = match record {
+            SegmentRecord::Transaction(txn) | SegmentRecord::ChunkRows(txn) => txn,
+        };
+        let mut canonical = Vec::new();
+        streamed
+            .canonical_reader()
+            .unwrap()
+            .read_to_end(&mut canonical)
+            .unwrap();
+        assert_eq!(canonical, expected.canonical_bytes().unwrap());
+        assert_eq!(
+            streamed.metadata().commit_position,
+            expected.commit_position
+        );
+        assert_eq!(decoder.peak_buffer_bytes(), initial_peak);
+    }
+    assert!(
+        decoder
+            .next_transaction_into(Cursor::new(Vec::new()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        decoder
+            .next_transaction_into(Cursor::new(Vec::new()))
+            .unwrap()
+            .is_none()
+    );
+    let (_, summary) = decoder.finish().unwrap();
+    assert_eq!(summary.record_count, 3);
+    assert_eq!(summary.bytes, bytes.len() as u64);
+    assert_eq!(summary.peak_buffer_bytes, initial_peak);
+    assert_eq!(summary.digest.as_slice(), &bytes[bytes.len() - 32..]);
+
+    let mut owned = SegmentDecoder::new(bytes.as_slice(), Limits::default()).unwrap();
+    for record in &records {
+        assert_eq!(owned.next_record().unwrap().as_ref(), Some(record));
+        assert!(owned.peak_buffer_bytes() >= record.canonical_bytes().unwrap().len());
+    }
+    let peak = owned.peak_buffer_bytes();
+    assert_eq!(owned.finish().unwrap().1.peak_buffer_bytes, peak);
+}
+
+#[test]
+fn format_errors_retain_diagnostics_and_typed_causes() {
+    for (error, expected) in [
+        (FormatError::WrongMagic, "wrong segment magic"),
+        (
+            FormatError::UnsupportedVersion(321),
+            "unsupported segment version 321",
+        ),
+        (
+            FormatError::Truncated("header field"),
+            "truncated header field",
+        ),
+        (
+            FormatError::LengthLimit {
+                field: "record",
+                length: 42,
+                maximum: 7,
+            },
+            "record length 42 exceeds maximum 7",
+        ),
+        (FormatError::Allocation, "buffer allocation failed"),
+        (FormatError::RecordDigestMismatch, "record digest mismatch"),
+        (
+            FormatError::TrailerDigestMismatch,
+            "segment trailer digest mismatch",
+        ),
+        (
+            FormatError::CountMismatch {
+                expected: 2,
+                actual: 1,
+            },
+            "record count mismatch: expected 2, got 1",
+        ),
+        (FormatError::TrailingGarbage, "trailing segment garbage"),
+        (
+            FormatError::Invalid("fixture"),
+            "invalid buffer encoding: fixture",
+        ),
+        (
+            FormatError::ManifestDigestMismatch,
+            "manifest digest mismatch",
+        ),
+        (FormatError::Poisoned, "segment stream failed previously"),
+    ] {
+        assert_eq!(error.to_string(), expected);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+    let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+    for (index, (error, prefix)) in [
+        (
+            FormatError::from(io::Error::other("fault injection")),
+            "segment I/O: ",
+        ),
+        (
+            FormatError::from(skedaddle::event::EventError::UnsupportedVersion(321)),
+            "canonical record: ",
+        ),
+        (FormatError::from(json_error), "manifest JSON: "),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cause = std::error::Error::source(&error).expect("wrapped error retains its cause");
+        assert!(match index {
+            0 => cause.is::<io::Error>(),
+            1 => cause.is::<skedaddle::event::EventError>(),
+            _ => cause.is::<serde_json::Error>(),
+        });
+        assert_eq!(error.to_string(), format!("{prefix}{cause}"));
+    }
+}
+
+#[test]
+fn trailer_eof_retries_only_interrupted_reads_and_poisons_other_errors() {
+    struct EofFault {
+        bytes: Cursor<Vec<u8>>,
+        fault: Option<io::ErrorKind>,
+    }
+    impl Read for EofFault {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.position() == self.bytes.get_ref().len() as u64
+                && let Some(kind) = self.fault.take()
+            {
+                return Err(kind.into());
+            }
+            self.bytes.read(out)
+        }
+    }
+    for streaming in [false, true] {
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::Other] {
+            let reader = EofFault {
+                bytes: Cursor::new(encode(&[transaction(), chunk(0)])),
+                fault: Some(kind),
+            };
+            let mut decoder = SegmentDecoder::new(reader, Limits::default()).unwrap();
+            for _ in 0..2 {
+                if streaming {
+                    assert!(
+                        decoder
+                            .next_transaction_into(Cursor::new(Vec::new()))
+                            .unwrap()
+                            .is_some()
+                    );
+                } else {
+                    assert!(decoder.next_record().unwrap().is_some());
+                }
+            }
+            let result = decoder.next_record();
+            if kind == io::ErrorKind::Interrupted {
+                assert!(result.unwrap().is_none());
+                assert!(decoder.next_record().unwrap().is_none());
+                assert!(
+                    decoder
+                        .next_transaction_into(Cursor::new(Vec::new()))
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(decoder.finish().unwrap().1.record_count, 2);
+            } else {
+                assert!(matches!(result, Err(FormatError::Io(e)) if e.kind() == kind));
+                assert!(matches!(decoder.next_record(), Err(FormatError::Poisoned)));
+                assert!(matches!(
+                    decoder.next_transaction_into(Cursor::new(Vec::new())),
+                    Err(FormatError::Poisoned)
+                ));
+                assert!(matches!(decoder.finish(), Err(FormatError::Poisoned)));
+            }
+        }
+    }
 }

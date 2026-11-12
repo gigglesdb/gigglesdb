@@ -8,7 +8,7 @@ if (-not $TaskRoot.StartsWith('J:/gigglesdb-work/',[StringComparison]::OrdinalIg
 $env:CARGO_TARGET_DIR="$TaskRoot/target"
 $env:TEMP="$TaskRoot/tmp"
 $env:TMP=$env:TEMP
-$env:CARGO_BUILD_JOBS='2'
+$env:CARGO_BUILD_JOBS='4'
 $env:SKEDADDLE_TEST_ROOT="$TaskRoot/scratch"
 $env:CARGO_HOME="$TaskRoot/cargo-home"
 $env:PYTHONDONTWRITEBYTECODE='1'

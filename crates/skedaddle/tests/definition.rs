@@ -6,11 +6,12 @@ use std::{
         OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 use skedaddle::{CapabilityReport, Criticality, DefinitionError, ItemStatus, MigrationDefinition};
+use skedaddle::{definition::HookPhase, hooks::OperatorHook, security::TlsPolicy};
 
 fn readme_examples() -> Vec<String> {
     let readme =
@@ -87,6 +88,202 @@ fn gcs_backend() -> Value {
     json!({"type": "gcs", "options": {
         "bucket": "migration-buffer", "prefix": "", "credentials_ref": "file:/run/secrets/gcs"
     }})
+}
+
+#[test]
+fn reserved_schema_is_rejected_only_for_selected_objects() {
+    let mut value = example_value();
+    value["selected_objects"][0]["schema"] = json!("_skedaddle");
+    let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+        panic!("reserved schema needs typed definition validation error");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.path == "selected_objects[0].schema"
+                && error.message.contains("reserved"))
+    );
+    for schema in ["public", "_Skedaddle", "_skedaddle_extra"] {
+        value["selected_objects"][0]["schema"] = json!(schema);
+        assert!(parse_value(&value).is_ok());
+    }
+    value["excluded_objects"] = json!([{
+        "object": {"schema":"_skedaddle", "name":"apply_progress", "kind":"table"},
+        "reason":"tool metadata"
+    }]);
+    assert!(parse_value(&value).is_ok());
+}
+
+#[test]
+fn connections_default_to_required_tls_and_reject_plaintext() {
+    let definition = valid_definition();
+    for connection in [&definition.source, &definition.destination] {
+        assert_eq!(connection.tls, TlsPolicy::Required);
+        assert!(connection.tls.check(true).unwrap().is_empty());
+        assert_eq!(
+            connection.tls.check(false),
+            Err(skedaddle::security::SecurityError::PlaintextRefused)
+        );
+    }
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side]["tls"] = json!("require");
+        assert_eq!(parse_value(&value).unwrap(), definition);
+        for invalid in [json!("disable"), json!(null), json!(false)] {
+            value[side]["tls"] = invalid;
+            assert!(matches!(parse_value(&value), Err(DefinitionError::Json(_))));
+        }
+    }
+}
+
+#[test]
+fn local_test_tls_policy_produces_security_warning() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side]["tls"] = json!("disable-for-local-test");
+        value[side].as_object_mut().unwrap().remove("tls_ca_ref");
+        let definition = parse_value(&value).unwrap();
+        let connection = if side == "source" {
+            &definition.source
+        } else {
+            &definition.destination
+        };
+        assert_eq!(connection.tls, TlsPolicy::DisableForLocalTest);
+        for encrypted in [false, true] {
+            let warnings = connection.tls.check(encrypted).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].code, "plaintext_local_test_only");
+            assert!(warnings[0].message.contains("TLS DISABLED FOR LOCAL TEST"));
+        }
+        assert_eq!(
+            serde_json::to_value(connection).unwrap()["tls"],
+            "disable-for-local-test"
+        );
+    }
+}
+
+#[test]
+fn hook_timeout_must_be_present_and_positive() {
+    let mut value = example_value();
+    value["hooks"][0]["timeout_seconds"] = json!(0);
+    let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+        panic!("zero timeout must produce a semantic validation error");
+    };
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].path, "hooks[0].timeout_seconds");
+    assert_eq!(errors[0].message, "must be greater than zero");
+    for seconds in [1, u64::MAX] {
+        value["hooks"][0]["timeout_seconds"] = json!(seconds);
+        let definition = parse_value(&value).unwrap();
+        assert_eq!(
+            OperatorHook::try_from(&definition.hooks[0])
+                .unwrap()
+                .timeout,
+            Duration::from_secs(seconds)
+        );
+    }
+    let mut hook = valid_definition().hooks.remove(0);
+    hook.timeout_seconds = 0;
+    assert_eq!(
+        OperatorHook::try_from(&hook).unwrap_err().path,
+        "timeout_seconds"
+    );
+    value["hooks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("timeout_seconds");
+    assert!(
+        parse_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `timeout_seconds`")
+    );
+}
+
+#[test]
+fn hook_phases_and_legacy_aliases_convert_to_operator_hooks() {
+    use skedaddle::hooks::HookPhase as OperatorPhase;
+
+    for (input, canonical, phase, operator_phase) in [
+        (
+            "pre-fence",
+            "pre-fence",
+            HookPhase::PreFence,
+            OperatorPhase::PreFence,
+        ),
+        (
+            "post-activate",
+            "post-activate",
+            HookPhase::PostActivate,
+            OperatorPhase::PostActivate,
+        ),
+        (
+            "pre-rollback",
+            "pre-rollback",
+            HookPhase::PreRollback,
+            OperatorPhase::PreRollback,
+        ),
+        (
+            "post-rollback",
+            "post-rollback",
+            HookPhase::PostRollback,
+            OperatorPhase::PostRollback,
+        ),
+        (
+            "before-fence",
+            "pre-fence",
+            HookPhase::PreFence,
+            OperatorPhase::PreFence,
+        ),
+        (
+            "after-cutover",
+            "post-activate",
+            HookPhase::PostActivate,
+            OperatorPhase::PostActivate,
+        ),
+    ] {
+        let mut value = example_value();
+        value["hooks"][0]["phase"] = json!(input);
+        let definition = parse_value(&value).unwrap();
+        let hook = &definition.hooks[0];
+        assert_eq!(hook.phase, phase);
+        assert_eq!(serde_json::to_value(hook).unwrap()["phase"], canonical);
+        let operator = OperatorHook::try_from(hook).unwrap();
+        assert_eq!(operator.phase, operator_phase);
+        assert_eq!(operator.name, hook.name);
+        assert_eq!(operator.command, hook.command);
+        assert_eq!(operator.secret_env, hook.secret_env);
+        assert_eq!(operator.timeout, Duration::from_secs(hook.timeout_seconds));
+        value["hooks"][0]["phase"] = json!(canonical);
+        assert_eq!(
+            definition.canonical_digest().unwrap(),
+            parse_value(&value).unwrap().canonical_digest().unwrap()
+        );
+    }
+}
+
+#[test]
+fn ambiguous_on_rollback_phase_has_actionable_error() {
+    let mut value = example_value();
+    value["hooks"][0]["phase"] = json!("on-rollback");
+    let error = parse_value(&value).unwrap_err();
+    assert!(matches!(error, DefinitionError::Json(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("on-rollback is ambiguous; choose pre-rollback or post-rollback")
+    );
+}
+
+#[test]
+fn before_snapshot_still_parses_but_has_no_operator_phase() {
+    let mut value = example_value();
+    value["hooks"][0]["phase"] = json!("before-snapshot");
+    let definition = parse_value(&value).unwrap();
+    assert_eq!(definition.hooks[0].phase, HookPhase::BeforeSnapshot);
+    let error = OperatorHook::try_from(&definition.hooks[0]).unwrap_err();
+    assert_eq!(error.path, "phase");
+    assert!(error.message.contains("before-snapshot"));
 }
 
 #[test]
@@ -197,6 +394,8 @@ fn rejects_inline_secret_values() {
     for pointer in [
         "/source/connection_ref",
         "/destination/connection_ref",
+        "/source/tls_ca_ref",
+        "/destination/tls_ca_ref",
         "/hooks/0/secret_env/ADMIN_TOKEN",
     ] {
         let mut value = example_value();
@@ -384,8 +583,8 @@ fn unsupported_engine_blocks_preflight() {
             );
             assert_eq!(
                 report.items.len(),
-                2,
-                "one blocker and one advisory exclusion"
+                4,
+                "one blocker, two advisory trust summaries and one advisory exclusion"
             );
         }
     }
@@ -587,6 +786,7 @@ fn postgres_versions_are_declared_but_never_live_verified() {
 
 #[test]
 fn cli_emits_json_for_blockers_and_rejects_invalid_input() {
+    let definition = MigrationDefinition::from_path(fixture(&readme_examples()[0])).unwrap();
     let path = fixture(&readme_examples()[0]);
     let output = Command::new(env!("CARGO_BIN_EXE_skedaddle"))
         .arg("check")
@@ -595,17 +795,30 @@ fn cli_emits_json_for_blockers_and_rejects_invalid_input() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stderr.is_empty());
-    let report: CapabilityReport = serde_json::from_slice(&output.stdout).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["outcome"], "blocked");
+    assert_eq!(envelope["exit_code"], 2);
+    let report: CapabilityReport = serde_json::from_value(envelope["data"].clone()).unwrap();
+    assert_eq!(
+        report.definition_digest,
+        definition.canonical_digest().unwrap()
+    );
     assert!(!report.blocking().is_empty());
     let output = Command::new(env!("CARGO_BIN_EXE_skedaddle"))
         .arg("check")
         .arg(fixture("{\"typo\":true}"))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["outcome"], "invalid-input");
+    assert_eq!(envelope["exit_code"], 3);
     assert!(
-        String::from_utf8(output.stderr)
+        envelope["problem"]["what"]
+            .as_str()
             .unwrap()
             .contains("unknown field")
     );
@@ -624,4 +837,209 @@ fn denies_unknown_fields_in_capability_structures() {
             .insert("typo".to_owned(), json!(true));
         assert!(serde_json::from_value::<CapabilityReport>(value).is_err());
     }
+}
+
+#[test]
+fn tls_ca_reference_is_required_and_contradictory_plaintext_is_rejected() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side].as_object_mut().unwrap().remove("tls_ca_ref");
+        for policy in [None, Some("require")] {
+            if let Some(policy) = policy {
+                value[side]["tls"] = json!(policy);
+            }
+            let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+                panic!("required TLS without explicit CA trust must be rejected");
+            };
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].path, format!("{side}.tls_ca_ref"));
+            assert!(errors[0].message.contains("set tls_ca_ref"));
+            assert!(errors[0].message.contains("PEM bundle path"));
+        }
+        value[side]["tls_ca_ref"] = json!("env:UNRESOLVED_CA_PATH");
+        value[side]["tls"] = json!("disable-for-local-test");
+        let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+            panic!("plaintext with CA trust must be rejected");
+        };
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, format!("{side}.tls_ca_ref"));
+        assert!(errors[0].message.contains("remove tls_ca_ref"));
+    }
+}
+
+#[test]
+fn explicit_ca_references_round_trip_without_resolution_and_reports_hide_identifiers() {
+    let mut value = example_value();
+    value["source"]["tls_ca_ref"] = json!("env:PRIVATE_UNRESOLVED_CA_PATH");
+    value["destination"]["tls_ca_ref"] = json!("file:/private/unread-ca-path-reference");
+    let definition = parse_value(&value).unwrap();
+    let serialized = serde_json::to_string(&definition).unwrap();
+    assert_eq!(
+        MigrationDefinition::from_json(&serialized).unwrap(),
+        definition
+    );
+    let report = CapabilityReport::from_definition(&definition).unwrap();
+    let output = serde_json::to_string(&report).unwrap();
+    assert!(!output.contains("PRIVATE_UNRESOLVED_CA_PATH"));
+    assert!(!output.contains("/private/unread-ca-path-reference"));
+    for (side, kind) in [("source", "env"), ("destination", "file")] {
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.id == format!("{side}.tls_trust"))
+            .unwrap();
+        assert_eq!(item.status, ItemStatus::Unverified);
+        assert_eq!(item.criticality, Criticality::Advisory);
+        assert!(item.evidence[0].description.contains("CA configured: true"));
+        assert!(
+            item.evidence[0]
+                .description
+                .contains(&format!("reference kind: {kind}"))
+        );
+    }
+    let mut changed = definition.clone();
+    changed.source.tls_ca_ref =
+        Some(skedaddle::definition::SecretRef::parse("env:OTHER_CA").unwrap());
+    assert_ne!(
+        definition.canonical_digest().unwrap(),
+        changed.canonical_digest().unwrap()
+    );
+}
+
+#[test]
+fn column_exclusions_default_empty_and_preserve_existing_digest() {
+    use sha2::{Digest, Sha256};
+    let baseline = valid_definition();
+    let serialized = serde_json::to_value(&baseline).unwrap();
+    assert!(
+        serialized["selected_objects"][0]
+            .get("exclude_columns")
+            .is_none()
+    );
+    assert!(
+        serialized["excluded_objects"][0]["object"]
+            .get("exclude_columns")
+            .is_none()
+    );
+    // serde_json's default map order is the canonical lexicographic key order.
+    let old_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&serialized).unwrap())
+    );
+    assert_eq!(baseline.canonical_digest().unwrap(), old_digest);
+    let mut explicit_empty = example_value();
+    explicit_empty["selected_objects"][0]["exclude_columns"] = json!([]);
+    explicit_empty["excluded_objects"][0]["object"]["exclude_columns"] = json!([]);
+    assert_eq!(parse_value(&explicit_empty).unwrap(), baseline);
+    assert_eq!(
+        parse_value(&explicit_empty)
+            .unwrap()
+            .canonical_digest()
+            .unwrap(),
+        old_digest
+    );
+    explicit_empty["selected_objects"][0]["exclude_columns"] = json!(["private_payload"]);
+    let excluded = parse_value(&explicit_empty).unwrap();
+    assert_ne!(excluded.canonical_digest().unwrap(), old_digest);
+    assert_eq!(
+        serde_json::to_value(excluded).unwrap()["selected_objects"][0]["exclude_columns"],
+        json!(["private_payload"])
+    );
+}
+
+#[test]
+fn column_exclusions_reject_empty_duplicate_and_non_table_names() {
+    for (names, expected) in [
+        (json!([""]), "must not be empty"),
+        (json!(["  "]), "must not be empty"),
+        (json!(["secret", "secret"]), "duplicate excluded column"),
+    ] {
+        let mut value = example_value();
+        value["selected_objects"][0]["exclude_columns"] = names;
+        let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+            panic!("invalid exclusions accepted");
+        };
+        assert!(
+            errors.iter().any(|error| error
+                .path
+                .starts_with("selected_objects[0].exclude_columns")
+                && error.message.contains(expected)),
+            "{errors:?}"
+        );
+    }
+    for kind in [
+        "sequence",
+        "view",
+        "materialized-view",
+        "function",
+        "type",
+        "extension",
+    ] {
+        let mut value = example_value();
+        value["selected_objects"][0]["kind"] = json!(kind);
+        value["selected_objects"][0]["exclude_columns"] = json!(["private_payload"]);
+        assert!(
+            parse_value(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("column exclusions are allowed only for tables")
+        );
+    }
+}
+
+#[test]
+fn column_exclusions_do_not_change_object_identity_validation() {
+    let mut value = example_value();
+    let mut same = value["selected_objects"][0].clone();
+    same["exclude_columns"] = json!(["private_payload"]);
+    value["selected_objects"]
+        .as_array_mut()
+        .unwrap()
+        .push(same.clone());
+    assert!(
+        parse_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate selected object")
+    );
+    value["selected_objects"].as_array_mut().unwrap().pop();
+    value["excluded_objects"][0]["object"] = same;
+    assert!(
+        parse_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("both selected and excluded")
+    );
+    let mut value = example_value();
+    let mut duplicate = value["excluded_objects"][0].clone();
+    duplicate["object"]["exclude_columns"] = json!(["private_payload"]);
+    value["excluded_objects"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(
+        parse_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate excluded object")
+    );
+}
+
+#[test]
+fn capability_report_lists_column_exclusion_names_per_table() {
+    let mut value = example_value();
+    value["selected_objects"][0]["exclude_columns"] = json!(["private_payload", "internal_note"]);
+    let definition = parse_value(&value).unwrap();
+    let report = CapabilityReport::from_definition(&definition).unwrap();
+    let entry = report
+        .items
+        .iter()
+        .find(|item| item.id == "selected_objects[0].exclude_columns")
+        .unwrap();
+    assert_eq!(entry.object.as_ref(), Some(&definition.selected_objects[0]));
+    assert_eq!(entry.status, ItemStatus::Supported);
+    assert_eq!(entry.criticality, Criticality::Advisory);
+    assert!(entry.evidence[0].description.contains("private_payload"));
+    assert!(entry.evidence[0].description.contains("internal_note"));
+    assert!(entry.evidence[0].description.contains("No column values"));
 }

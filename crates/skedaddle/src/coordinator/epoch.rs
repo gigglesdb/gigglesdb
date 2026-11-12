@@ -1,12 +1,21 @@
 //! Ownership and journal-before-effect ordering, with PostgreSQL fencing.
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
+
+use super::exclusion::{self, ExclusionGuard, MigrationExclusion};
 
 use super::{
     EffectKind, Error, Materialized, Result, Transition,
     journal::{Entry, Journal},
     local::Local,
 };
+
+fn exclusion_error(error: exclusion::Error) -> Error {
+    match error {
+        exclusion::Error::Lost => Error::LostOwnership,
+        error => Error::Rejected(error.to_string()),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct EffectToken {
@@ -40,9 +49,10 @@ impl EffectToken {
 }
 
 pub struct Coordinator {
-    journal: Journal,
+    pub(super) journal: Journal,
     local: Local,
-    instance: String,
+    instance: Box<str>,
+    exclusion: Option<Arc<MigrationExclusion>>,
     owns: bool,
     checkpoint_every: u64,
     #[cfg(feature = "test-crash")]
@@ -59,7 +69,8 @@ impl Coordinator {
         Ok(Self {
             journal,
             local,
-            instance: format!("{instance}/{}", uuid::Uuid::new_v4()),
+            instance: format!("{instance}/{}", uuid::Uuid::new_v4()).into_boxed_str(),
+            exclusion: None,
             owns: false,
             checkpoint_every: 1000,
             #[cfg(feature = "test-crash")]
@@ -68,6 +79,9 @@ impl Coordinator {
     }
     pub fn state(&self) -> &Materialized {
         self.local.state()
+    }
+    pub(super) fn gc_journal(&self) -> &Journal {
+        &self.journal
     }
     pub fn instance_id(&self) -> &str {
         &self.instance
@@ -112,7 +126,7 @@ impl Coordinator {
         };
         let result = self.local.sync_verified(&verified, &self.journal).await;
         if result.is_err()
-            || (self.owns && (self.state().owner != self.instance || self.state().epoch != epoch))
+            || (self.owns && (self.state().owner != *self.instance || self.state().epoch != epoch))
         {
             self.owns = false;
         }
@@ -121,6 +135,63 @@ impl Coordinator {
 
     pub async fn acquire(&mut self) -> Result<u64> {
         self.owns = false;
+        let guard = match self.exclusion.clone() {
+            Some(exclusion) => Some(
+                Box::pin(exclusion.acquire(self.journal.migration_id()))
+                    .await
+                    .map_err(exclusion_error)?,
+            ),
+            None => None,
+        };
+        self.acquire_inner(guard.as_ref()).await
+    }
+
+    pub fn with_exclusion(mut self, exclusion: Arc<MigrationExclusion>) -> Self {
+        self.exclusion = Some(exclusion);
+        self
+    }
+
+    /// Promote under an existing capability, without recursive acquisition.
+    pub async fn acquire_with_guard(&mut self, guard: &ExclusionGuard) -> Result<u64> {
+        self.owns = false;
+        self.validate_guard(guard).map_err(exclusion_error)?;
+        self.acquire_inner(Some(guard)).await
+    }
+
+    fn validate_guard(&self, guard: &ExclusionGuard) -> exclusion::Result<()> {
+        guard.validate(
+            self.exclusion
+                .as_ref()
+                .ok_or(exclusion::Error::NotConfigured)?,
+            self.journal.migration_id(),
+        )
+    }
+
+    /// Owned, borrow-free capability for an external closure. Refresh under the
+    /// lock authenticates its captured instance and epoch. Keep it for the whole
+    /// closure; nested promotion uses acquire_with_guard.
+    pub async fn exclusive(&mut self) -> exclusion::Result<ExclusionGuard> {
+        let exclusion = self
+            .exclusion
+            .clone()
+            .ok_or(exclusion::Error::NotConfigured)?;
+        if !self.owns {
+            return Err(exclusion::Error::NotOwner);
+        }
+        let mut guard = Box::pin(exclusion.acquire(self.journal.migration_id())).await?;
+        self.refresh().await.map_err(|_| exclusion::Error::Lost)?;
+        if !self.owns {
+            return Err(exclusion::Error::NotOwner);
+        }
+        guard.check_alive().await?;
+        guard.bind_owner(&self.instance, self.state().epoch);
+        Ok(guard)
+    }
+
+    async fn acquire_inner(&mut self, guard: Option<&ExclusionGuard>) -> Result<u64> {
+        if let Some(guard) = guard {
+            guard.check_alive().await.map_err(exclusion_error)?;
+        }
         self.refresh().await?;
         let epoch = self
             .state()
@@ -129,15 +200,22 @@ impl Coordinator {
             .ok_or_else(|| Error::Rejected("epoch exhausted".into()))?;
         self.commit_inner(Transition::AcquireOwnership { epoch })
             .await?;
+        if let Some(guard) = guard {
+            guard.check_alive().await.map_err(exclusion_error)?;
+        }
         self.owns = true;
         Ok(epoch)
     }
 
     /// Captured journal state makes racing owners compete for the same seq.
     /// A failed or uncertain put always revokes this process's write capability.
-    async fn commit_inner(&mut self, transition: Transition) -> Result<Entry> {
+    pub(super) async fn commit_inner(&mut self, transition: Transition) -> Result<Entry> {
+        self.journal.validate_reverse(&transition)?;
         let entry = Entry::new(self.state(), transition, &self.instance)?;
         self.local.validate_transition(&entry)?;
+        self.journal
+            .validate_chunk_objects(self.state(), &entry.transition)
+            .await?;
         if let Err(error) = self.journal.put(&entry).await {
             self.owns = false;
             // Best effort refresh must never replace the original put failure.
@@ -165,12 +243,20 @@ impl Coordinator {
         if !self.owns {
             return Err(Error::Observer);
         }
+        if matches!(&transition, Transition::Progress { stream, .. } if stream.starts_with("buffer-gc:"))
+        {
+            return Err(Error::Rejected(
+                "buffer GC facts require the dedicated authority methods".into(),
+            ));
+        }
         if matches!(
             transition,
             Transition::AcquireOwnership { .. }
                 | Transition::Intent { .. }
                 | Transition::ResumeEffect { .. }
                 | Transition::EffectCompleted { .. }
+                | Transition::ReverseSetup { .. }
+                | Transition::ReverseConsistentPoint { .. }
         ) {
             return Err(Error::Rejected(
                 "ownership and effects require their dedicated methods".into(),
@@ -232,7 +318,7 @@ impl Coordinator {
         ) {
             return Err(Error::Rejected("not an effect intent".into()));
         }
-        if intent.epoch != self.state().epoch || intent.coordinator_instance != self.instance {
+        if intent.epoch != self.state().epoch || intent.coordinator_instance != *self.instance {
             return Err(Error::LostOwnership);
         }
         let root = self.original_intent(seq).await?;
@@ -333,7 +419,7 @@ impl Coordinator {
         F: FnOnce(EffectToken) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        if intent.epoch != self.state().epoch || intent.coordinator_instance != self.instance {
+        if intent.epoch != self.state().epoch || intent.coordinator_instance != *self.instance {
             return Err(Error::LostOwnership);
         }
         let root = self.original_intent(intent.seq).await?;
@@ -375,7 +461,7 @@ impl Coordinator {
         self.crash = Some(seam);
     }
     #[cfg(feature = "test-crash")]
-    fn crash_at(&self, seam: super::CrashSeam) {
+    pub(super) fn crash_at(&self, seam: super::CrashSeam) {
         if self.crash == Some(seam) {
             std::process::exit(86);
         }
@@ -385,10 +471,25 @@ impl Coordinator {
 /// Initialize only in explicit connector setup, on BOTH source and destination.
 /// P10/P11 own fence/activation SQL; P2 supplies its transactional authority gate.
 pub async fn initialize_pg_authority(client: &tokio_postgres::Client) -> Result<()> {
-    client.batch_execute("CREATE SCHEMA IF NOT EXISTS _skedaddle;
-        CREATE TABLE IF NOT EXISTS _skedaddle.authority (migration text PRIMARY KEY, epoch bigint NOT NULL);
-        CREATE TABLE IF NOT EXISTS _skedaddle.effects (migration text NOT NULL, epoch bigint NOT NULL, seq bigint NOT NULL, payload text NOT NULL, PRIMARY KEY(migration,epoch,seq));").await?;
-    Ok(())
+    client.batch_execute("BEGIN").await?;
+    let result = async {
+        let rows = client
+            .query(crate::pg::ddl::ADMIN_INSTALLATION_SQL, &[])
+            .await?
+            .into_iter()
+            .map(|row| vec![row.get::<_, String>(0)])
+            .collect();
+        let origin = crate::pg::ddl::administrative_origin_sql(&rows)
+            .map_err(|e| Error::Rejected(e.to_string()))?;
+        client.batch_execute(&format!("{origin}CREATE SCHEMA IF NOT EXISTS _skedaddle;
+            CREATE TABLE IF NOT EXISTS _skedaddle.authority (migration text PRIMARY KEY, epoch bigint NOT NULL);
+            CREATE TABLE IF NOT EXISTS _skedaddle.effects (migration text NOT NULL, epoch bigint NOT NULL, seq bigint NOT NULL, payload text NOT NULL, PRIMARY KEY(migration,epoch,seq)); COMMIT;")).await?;
+        Ok(())
+    }.await;
+    if result.is_err() {
+        let _ = client.batch_execute("ROLLBACK").await;
+    }
+    result
 }
 
 /// The authority update, idempotency ledger, and SQL effect share one PG transaction.
@@ -436,6 +537,17 @@ where
         .try_into()
         .map_err(|_| Error::Rejected("PG authority epoch overflow".into()))?;
     let tx = client.transaction().await?;
+    let rows = tx
+        .query(crate::pg::ddl::ADMIN_INSTALLATION_SQL, &[])
+        .await?
+        .into_iter()
+        .map(|row| vec![row.get::<_, String>(0)])
+        .collect();
+    let origin = crate::pg::ddl::administrative_origin_sql(&rows)
+        .map_err(|e| Error::Rejected(e.to_string()))?;
+    if !origin.is_empty() {
+        tx.batch_execute(&origin).await?;
+    }
     tx.execute(
         "INSERT INTO _skedaddle.authority VALUES ($1,0) ON CONFLICT DO NOTHING",
         &[&token.migration],
@@ -536,5 +648,118 @@ mod tests {
                 .await,
             Err(Error::LostOwnership)
         ));
+    }
+}
+
+#[cfg(test)]
+mod administrative_pg_tests {
+    use super::*;
+    use crate::pg::{
+        ddl::{self, Classification, SchemaVersions, TriggerSql},
+        pgoutput::{Decoder, Message},
+    };
+    use futures::FutureExt;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn authority_and_effect_transactions_tag_live_capture_and_public_ddl_still_stops() {
+        let Some(path) = std::env::var_os("SKEDADDLE_TEST_CONFIG") else {
+            writeln!(std::io::stderr(), "LOUD SKIP authority_and_effect_transactions_tag_live_capture_and_public_ddl_still_stops: SKEDADDLE_TEST_CONFIG unset; requires disposable PG16/17/18 superuser with CREATEDB and logical WAL; no Docker started").unwrap();
+            return;
+        };
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let dsn = std::env::var("SKEDADDLE_PG_ACTIVATE_DSN")
+            .ok()
+            .or_else(|| {
+                config["env"]["SKEDADDLE_PG_ACTIVATE_DSN"]
+                    .as_str()
+                    .or_else(|| config["pg"].as_str())
+                    .map(str::to_owned)
+            })
+            .expect("harness PG admin DSN");
+        let ca = config["ca_pem"]
+            .as_str()
+            .or_else(|| config["replication"]["ca_pem"].as_str())
+            .expect("harness CA");
+        let postgres: tokio_postgres::Config = dsn.parse().unwrap();
+        let connect = |postgres| crate::pg::tls::Config::new(postgres, ca);
+        let (admin, driver, _) = crate::pg::tls::connect(
+            &connect(postgres.clone()),
+            &crate::security::TlsPolicy::Required,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(driver);
+        let db = format!(
+            "d9_authority_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        );
+        admin
+            .batch_execute(&format!("CREATE DATABASE {db}"))
+            .await
+            .unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            let mut postgres = postgres;
+            postgres.dbname(&db);
+            let (mut client, driver, _) = crate::pg::tls::connect(&connect(postgres), &crate::security::TlsPolicy::Required).await.map_err(|e| Error::Rejected(e.to_string()))?;
+            tokio::spawn(driver);
+            initialize_pg_authority(&client).await?; // Initial setup without installation.
+            let id = format!("d9e_{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+            client.batch_execute(&format!("CREATE TABLE public.mapped(id int); CREATE PUBLICATION {id} FOR TABLE public.mapped;")).await?;
+            client.simple_query(&format!("SELECT slot_name FROM pg_create_logical_replication_slot('{id}','pgoutput')")).await?;
+            let version: String = client.query_one("SHOW server_version_num", &[]).await?.get(0);
+            let trigger = TriggerSql::new(&id, version.parse().unwrap()).unwrap();
+            client.batch_execute(&trigger.install).await?;
+            let version: i64 = client.query_one(&format!("SELECT version FROM _skedaddle.skedaddle_ddl_{id}_version"), &[]).await?.get(0);
+            let changes = format!("SELECT data FROM pg_logical_slot_get_binary_changes('{id}',NULL,NULL,'proto_version','1','publication_names','{id}','messages','true')");
+            client.query(&changes, &[]).await?;
+            let mut versions = SchemaVersions::new(id.clone(), version as u64, []).unwrap();
+            initialize_pg_authority(&client).await?;
+            let token = |seq, payload: &str| EffectToken { migration: "d9".into(), authority_epoch: 1, epoch: 1, seq, effect: EffectKind::Fence, payload: payload.into() };
+            apply_pg_effect(&mut client, token(1, &format!("SELECT 1 / CASE WHEN current_setting('skedaddle.admin_origin',true)='{id}' THEN 1 ELSE 0 END; CREATE TABLE _skedaddle.d9_effect(id int)"))).await?;
+            let mut records = vec![];
+            for row in client.query(&changes, &[]).await? {
+                let bytes: Vec<u8> = row.get(0);
+                let message = Decoder::default().decode(&bytes).unwrap();
+                if let Message::LogicalMessage { prefix: ddl::MESSAGE_PREFIX, .. } = message { records.push(ddl::decode(&message, &id).unwrap()); }
+            }
+            assert!(records.iter().any(|record| record.query.contains("CREATE SCHEMA")));
+            assert!(records.iter().any(|record| record.query.contains("d9_effect")));
+            let mut start = 0;
+            while start < records.len() {
+                let end = (start + 1..records.len()).find(|&i| records[i].xid != records[start].xid).unwrap_or(records.len());
+                assert!(records[start..end].iter().all(|record| record.origin.as_deref() == Some(id.as_str())));
+                assert!(matches!(versions.classify_transaction(&records[start..end]), Classification::Supported { .. }));
+                start = end;
+            }
+            for (seq, payload) in [(2, "CREATE TABLE public.d9_public(id int)"), (3, "CREATE PUBLICATION d9_global FOR TABLE public.mapped")] {
+                apply_pg_effect(&mut client, token(seq, payload)).await?;
+                let mut records = vec![];
+                for row in client.query(&changes, &[]).await? {
+                    let bytes: Vec<u8> = row.get(0);
+                    let message = Decoder::default().decode(&bytes).unwrap();
+                    if let Message::LogicalMessage { prefix: ddl::MESSAGE_PREFIX, .. } = message { records.push(ddl::decode(&message, &id).unwrap()); }
+                }
+                assert!(!records.is_empty());
+                assert!(records.iter().all(|record| record.origin.as_deref() == Some(id.as_str())));
+                let mut next = versions.clone();
+                assert!(matches!(next.classify_transaction(&records), Classification::SafeBoundaryStop(_)));
+                // The public record stops apply, but the next test needs a fresh baseline.
+                versions = SchemaVersions::new(id.clone(), records.last().unwrap().version, []).unwrap();
+            }
+            Ok::<(), Error>(())
+        }).catch_unwind().await;
+        admin
+            .batch_execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+            .await
+            .unwrap();
+        match result {
+            Ok(result) => result.unwrap(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }

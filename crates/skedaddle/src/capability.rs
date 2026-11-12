@@ -140,6 +140,42 @@ impl CapabilityReport {
             }
         }
 
+        for (index, object) in definition.selected_objects.iter().enumerate() {
+            if !object.exclude_columns.is_empty() {
+                let mut entry = item(
+                    &format!("selected_objects[{index}].exclude_columns"),
+                    ItemStatus::Supported,
+                    Criticality::Advisory,
+                    "Review excluded column names; live preparation must retain every operational and replica-identity key.",
+                    format!(
+                        "Explicitly excluded columns: {}. No column values are inspected or reported.",
+                        serde_json::to_string(&object.exclude_columns)
+                            .expect("column names serialize")
+                    ),
+                );
+                entry.object = Some(object.clone());
+                items.push(entry);
+            }
+        }
+
+        for (side, connection) in [
+            ("source", &definition.source),
+            ("destination", &definition.destination),
+        ] {
+            let trust = tls_trust(connection);
+            items.push(item(
+                &format!("{side}.tls_trust"),
+                ItemStatus::Unverified,
+                Criticality::Advisory,
+                "Resolve the explicit CA reference to a PEM bundle path and qualify certificate and hostname verification before migration.",
+                format!(
+                    "CA configured: {}; reference kind: {}. Trust material has not been resolved or verified.",
+                    trust.ca_configured,
+                    trust.reference_kind.unwrap_or("none")
+                ),
+            ));
+        }
+
         for (index, excluded) in definition.excluded_objects.iter().enumerate() {
             let mut entry = item(
                 &format!("excluded_objects[{index}]"),
@@ -179,5 +215,26 @@ fn item(
             source: "migration-definition".to_owned(),
             description,
         }],
+    }
+}
+
+/// Safe offline trust summary: neither the identifier nor its resolved value
+/// crosses the reporting boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TlsTrust {
+    pub ca_configured: bool,
+    pub reference_kind: Option<&'static str>,
+}
+
+pub fn tls_trust(connection: &crate::definition::Connection) -> TlsTrust {
+    TlsTrust {
+        ca_configured: connection.tls_ca_ref.is_some(),
+        reference_kind: connection.tls_ca_ref.as_ref().map(|reference| {
+            if reference.as_str().starts_with("env:") {
+                "env"
+            } else {
+                "file"
+            }
+        }),
     }
 }

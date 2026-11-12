@@ -2,6 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{Error, Result};
+use crate::fsconfine::Dir;
 
 fn root(database: &Path) -> Result<PathBuf> {
     let mut name = database
@@ -13,12 +14,16 @@ fn root(database: &Path) -> Result<PathBuf> {
 }
 
 pub(super) fn check(database: &Path) -> Result<()> {
-    let root = root(database)?;
-    match root.symlink_metadata() {
-        Ok(_) => Err(orphan(&root)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+    let root = std::path::absolute(root(database)?)?;
+    let parent = Dir::open_root(root.parent().ok_or_else(|| orphan(&root))?)?;
+    if parent
+        .names()?
+        .iter()
+        .any(|name| Some(name.as_os_str()) == root.file_name())
+    {
+        return Err(orphan(&root));
     }
+    Ok(())
 }
 
 fn orphan(root: &Path) -> Error {
@@ -32,20 +37,30 @@ fn orphan(root: &Path) -> Error {
 /// are confined to this newly created scratch root, including on failure.
 pub(super) fn with_archive<T>(
     database: &Path,
-    operation: impl FnOnce(&Path) -> Result<T>,
+    operation: impl FnOnce(&Dir, &Path) -> Result<T>,
 ) -> Result<T> {
-    let root = root(database)?;
-    std::fs::create_dir(&root).map_err(|e| {
+    let root = std::path::absolute(root(database)?)?;
+    let parent = Dir::open_root(root.parent().ok_or_else(|| orphan(&root))?)?;
+    let name = root.file_name().ok_or_else(|| orphan(&root))?;
+    let scratch = parent.create_dir(Path::new(name)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             orphan(&root)
         } else {
             e.into()
         }
     })?;
-    let result = operation(&root.join("archive.export"));
-    // Run on success AND error. Cleanup errors are visible rather than hidden
-    // behind an export/restore error; retain its context for diagnosis.
-    if let Err(error) = cleanup(&root) {
+    let archive = scratch.core_path(&root, "archive.export")?;
+    let result = operation(&scratch, &archive);
+    // Both outcomes clean through the same retained capability. The displayed
+    // pathname is never re-opened for enumeration or file deletion.
+    let cleanup = cleanup(&scratch, &root);
+    drop(scratch);
+    let cleanup = cleanup.and_then(|()| {
+        parent.remove_dir(Path::new(name))?;
+        parent.sync()?;
+        Ok(())
+    });
+    if let Err(error) = cleanup {
         return Err(Error::RecoveryRequired(format!(
             "scratch cleanup failed at {}: {error}; operation error: {:?}",
             root.display(),
@@ -55,20 +70,18 @@ pub(super) fn with_archive<T>(
     result
 }
 
-fn cleanup(root: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let stage = name.strip_prefix("archive.export.staging-");
-        let owned = name == "archive.export"
+fn cleanup(root: &Dir, display: &Path) -> Result<()> {
+    for name in root.names()? {
+        let text = name.to_string_lossy();
+        let stage = text.strip_prefix("archive.export.staging-");
+        let owned = text == "archive.export"
             || stage.is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()));
-        if !owned || !entry.file_type()?.is_file() {
-            return Err(orphan(&entry.path()));
+        if !owned {
+            return Err(orphan(&display.join(&name)));
         }
-        std::fs::remove_file(entry.path())?;
+        root.remove_file(Path::new(&name))?;
     }
-    std::fs::remove_dir(root)?;
+    root.sync()?;
     Ok(())
 }
 
@@ -92,7 +105,7 @@ mod tests {
             RecoveryPoint::ExportVerify,
             RecoveryPoint::ExportPublish,
         ] {
-            let result = with_archive(&database, |archive| {
+            let result = with_archive(&database, |_, archive| {
                 Ok(admin.export_with_fault(archive, point)?)
             });
             assert!(matches!(result, Err(Error::Core(_))));

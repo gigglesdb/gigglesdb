@@ -10,8 +10,9 @@
 //! snapshot rows at H, grouped into one atomic apply unit. Empty chunks are
 //! supported. No transaction or event encoding is duplicated here.
 //!
-//! Memory is O(max header + one bounded record), independent of segment size.
-//! The P3a codec materializes one record; it never materializes the segment.
+//! `write_transaction_reader` encodes a sized canonical transaction using a
+//! fixed 16 KiB copy buffer. The owned record/decode compatibility APIs retain
+//! O(max header + one bounded record) memory, independent of segment size.
 //! Decoder records are provisional until `next_record()` returns None or
 //! `finish()` succeeds: only then are the count, trailer and EOF verified.
 //! Any error poisons the stream; retrying after a partial I/O cannot seal it.
@@ -19,17 +20,62 @@
 use std::{
     error::Error,
     fmt,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::event::{AssembledTxn, ContentDigest, EventError, EventKind, Position};
+use crate::event::{
+    AssembledTxn, ContentDigest, EventError, EventKind, Position, PositionOrder, SourceIdentity,
+    StreamingTxn,
+};
 
 pub const MAGIC: &[u8; 8] = b"SKEDSEG\0";
 pub const END_MAGIC: &[u8; 8] = b"SKEDEND\0";
 pub const FORMAT_VERSION: u16 = 1;
+
+/// Coordinator checkpoint schema. Version 2 records the consumed equal-H slot.
+pub const CHECKPOINT_VERSION: u16 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordBoundary {
+    pub source: SourceIdentity,
+    pub chunk_rows: bool,
+}
+
+pub(crate) fn record_follows(
+    position: &Position,
+    source: &SourceIdentity,
+    chunk_rows: bool,
+    previous: Option<(&Position, &RecordBoundary)>,
+    order: &dyn PositionOrder,
+) -> Result<bool, EventError> {
+    use std::cmp::Ordering;
+    position.compare(position, order)?;
+    let Some((last, boundary)) = previous else {
+        return Ok(true);
+    };
+    Ok(match position.compare(last, order)? {
+        Ordering::Greater => true,
+        Ordering::Equal => chunk_rows && !boundary.chunk_rows && source == &boundary.source,
+        Ordering::Less => false,
+    })
+}
+
+/// A segment starting in the equal-H slot must not collide with the H-only
+/// segment at the same epoch. Its record encoding is unchanged.
+pub(crate) fn boundary_segment_key(
+    key: String,
+    first: &Position,
+    previous: Option<&Position>,
+) -> String {
+    if previous == Some(first) {
+        format!("{key}.chunk-rows")
+    } else {
+        key
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -120,7 +166,7 @@ impl SegmentRecord {
     }
 }
 
-fn validate_chunk(txn: &AssembledTxn) -> Result<(), FormatError> {
+pub(crate) fn validate_chunk(txn: &AssembledTxn) -> Result<(), FormatError> {
     for event in &txn.events {
         if event.kind != EventKind::ChunkRows {
             return Err(FormatError::Invalid("expected ChunkRows event"));
@@ -292,6 +338,132 @@ impl<W: Write> SegmentEncoder<W> {
         Ok(())
     }
 
+    /// Streams the canonical encoder's validated transaction and position.
+    pub fn write_streaming_transaction<S: Read + Seek>(
+        &mut self,
+        txn: &mut StreamingTxn<S>,
+    ) -> Result<(), FormatError> {
+        if self.poisoned {
+            return Err(FormatError::Poisoned);
+        }
+        let position = txn.metadata().commit_position.clone();
+        let length = txn.canonical_len();
+        let reader = txn
+            .canonical_reader()
+            .inspect_err(|_| self.poisoned = true)?;
+        self.write_transaction_reader(&position, length, reader)
+    }
+
+    /// Streams one complete v1 canonical transaction without materializing it.
+    /// The caller supplies a canonical transaction and its commit position (for
+    /// example from event::StreamingTxn). This checks the envelope, byte count
+    /// and SHA-256, not the transaction's field semantics or the supplied
+    /// position; those must come from the canonical transaction encoder.
+    /// The reader must end exactly at `length`. Any error poisons the segment.
+    pub fn write_transaction_reader(
+        &mut self,
+        position: &Position,
+        length: u64,
+        reader: impl Read,
+    ) -> Result<(), FormatError> {
+        self.write_transaction_reader_kind(position, length, reader, false)
+    }
+
+    /// Streams a validated ChunkRows transaction using the same SKCR envelope
+    /// as `write_record`. The caller must validate ChunkRows field semantics.
+    pub(crate) fn write_chunk_rows<S: Read + Seek>(
+        &mut self,
+        txn: &mut StreamingTxn<S>,
+    ) -> Result<(), FormatError> {
+        if self.poisoned {
+            return Err(FormatError::Poisoned);
+        }
+        let position = txn.metadata().commit_position.clone();
+        let length = txn.canonical_len();
+        let reader = txn
+            .canonical_reader()
+            .inspect_err(|_| self.poisoned = true)?;
+        self.write_transaction_reader_kind(&position, length, reader, true)
+    }
+
+    fn write_transaction_reader_kind(
+        &mut self,
+        position: &Position,
+        length: u64,
+        mut reader: impl Read,
+        chunk: bool,
+    ) -> Result<(), FormatError> {
+        if self.poisoned {
+            return Err(FormatError::Poisoned);
+        }
+        self.poisoned = true;
+        if self.count >= self.header.record_count {
+            return Err(FormatError::CountMismatch {
+                expected: self.header.record_count,
+                actual: self.count.saturating_add(1),
+            });
+        }
+        check_position(&self.header, position, self.count)?;
+        let record_length = length
+            .checked_add(if chunk { 38 } else { 0 })
+            .ok_or(FormatError::Invalid("record size overflow"))?;
+        check_length("record", record_length, self.limits.max_record_bytes)?;
+        if length < 39 {
+            return Err(FormatError::Truncated("canonical transaction"));
+        }
+        let mut envelope = [0; 7];
+        reader.read_exact(&mut envelope)?;
+        if &envelope[..4] != b"SKEV" || envelope[6] != 2 {
+            return Err(FormatError::Invalid("expected canonical transaction"));
+        }
+        let version = u16::from_be_bytes([envelope[4], envelope[5]]);
+        if version != crate::event::ENCODING_VERSION {
+            return Err(EventError::UnsupportedVersion(version).into());
+        }
+        self.write(&record_length.to_be_bytes())?;
+        let mut chunk_hash = Sha256::new();
+        if chunk {
+            let mut prefix = *b"SKCR\0\0";
+            prefix[4..].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+            self.write(&prefix)?;
+            chunk_hash.update(prefix);
+        }
+        self.write(&envelope)?;
+        if chunk {
+            chunk_hash.update(envelope);
+        }
+        let mut hash = Sha256::new();
+        hash.update(envelope);
+        let mut remaining = length - 39;
+        let mut buffer = [0; 16 * 1024];
+        while remaining > 0 {
+            let size = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..size])?;
+            hash.update(&buffer[..size]);
+            if chunk {
+                chunk_hash.update(&buffer[..size]);
+            }
+            self.write(&buffer[..size])?;
+            remaining -= size as u64;
+        }
+        let mut digest = [0; 32];
+        reader.read_exact(&mut digest)?;
+        if hash.finalize().as_slice() != digest {
+            return Err(FormatError::RecordDigestMismatch);
+        }
+        if reader.read(&mut [0])? != 0 {
+            return Err(FormatError::TrailingGarbage);
+        }
+        self.write(&digest)?;
+        if chunk {
+            chunk_hash.update(digest);
+            self.write(&chunk_hash.finalize())?;
+        }
+        self.count += 1;
+        self.poisoned = false;
+        Ok(())
+    }
+
     /// Writes and flushes the trailer. Flush alone does not imply backend
     /// durability; segment put and manifest put are a later layer's contract.
     pub fn finish(mut self) -> Result<(W, SegmentSummary), FormatError> {
@@ -398,12 +570,126 @@ impl<R: Read> SegmentDecoder<R> {
             return Ok(None);
         }
         self.poisoned = true;
-        let value = self.read_next()?;
+        let value = self.read_next_with(|decoder, length| {
+            let mut encoded = allocate("record", length, decoder.limits.max_record_bytes)?;
+            decoder.peak = decoder.peak.max(encoded.capacity());
+            decoder.read(&mut encoded, "record")?;
+            let record = SegmentRecord::from_canonical_bytes(&encoded)?;
+            let position = record.position().clone();
+            Ok((record, position))
+        })?;
         self.poisoned = false;
         Ok(value)
     }
 
-    fn read_next(&mut self) -> Result<Option<SegmentRecord>, FormatError> {
+    /// Copies one record into caller-owned empty storage, then validates it
+    /// one event at a time. The storage guard survives in the returned value.
+    /// Supports both transaction and ChunkRows envelopes. Errors poison decoding.
+    pub fn next_transaction_into<S: Read + Write + Seek>(
+        &mut self,
+        storage: S,
+    ) -> Result<Option<StreamingTxn<S>>, FormatError> {
+        Ok(self
+            .next_transaction_with_kind(storage)?
+            .map(|(_, txn)| txn))
+    }
+
+    /// Retains the envelope kind for writer recovery without materializing rows.
+    pub(crate) fn next_transaction_with_kind<S: Read + Write + Seek>(
+        &mut self,
+        mut storage: S,
+    ) -> Result<Option<(bool, StreamingTxn<S>)>, FormatError> {
+        if self.poisoned {
+            return Err(FormatError::Poisoned);
+        }
+        if self.summary.is_some() {
+            return Ok(None);
+        }
+        self.poisoned = true;
+        let value = self.read_next_with(|decoder, length| {
+            if storage.seek(SeekFrom::End(0))? != 0 {
+                return Err(FormatError::Invalid("stream storage must be empty"));
+            }
+            let mut buffer = [0; 16 * 1024];
+            let mut remaining = length;
+            while remaining != 0 {
+                let n = remaining.min(buffer.len() as u64) as usize;
+                decoder.read(&mut buffer[..n], "record")?;
+                storage.write_all(&buffer[..n])?;
+                remaining -= n as u64;
+            }
+            storage.rewind()?;
+            let mut envelope = [0; 6];
+            storage.read_exact(&mut envelope)?;
+            let chunk = &envelope[..4] == b"SKCR";
+            let (start, inner_len) = if chunk {
+                if length < 77 {
+                    return Err(FormatError::Truncated("ChunkRows envelope"));
+                }
+                let version = u16::from_be_bytes([envelope[4], envelope[5]]);
+                if version != FORMAT_VERSION {
+                    return Err(FormatError::UnsupportedVersion(version));
+                }
+                storage.rewind()?;
+                let mut remaining = length - 32;
+                let mut hash = Sha256::new();
+                while remaining != 0 {
+                    let n = remaining.min(buffer.len() as u64) as usize;
+                    storage.read_exact(&mut buffer[..n])?;
+                    hash.update(&buffer[..n]);
+                    remaining -= n as u64;
+                }
+                let mut digest = [0; 32];
+                storage.read_exact(&mut digest)?;
+                if hash.finalize().as_slice() != digest {
+                    return Err(FormatError::RecordDigestMismatch);
+                }
+                (6, length - 38)
+            } else {
+                (0, length)
+            };
+            let mut first = None;
+            let txn = StreamingTxn::from_storage_range(storage, start, inner_len, |event| {
+                if chunk {
+                    if event.kind != EventKind::ChunkRows {
+                        return Err(EventError::InvalidTransaction("expected ChunkRows event"));
+                    }
+                    let fields = (
+                        event.position.clone(),
+                        event.table.clone(),
+                        event.schema_version,
+                    );
+                    if first.as_ref().is_some_and(|old| old != &fields) {
+                        return Err(EventError::InvalidTransaction(
+                            "ChunkRows table/schema/watermark",
+                        ));
+                    }
+                    first = Some(fields);
+                }
+                Ok(())
+            })
+            .map_err(|e| match e {
+                EventError::DigestMismatch => FormatError::RecordDigestMismatch,
+                e => FormatError::Event(e),
+            })?;
+            if chunk
+                && first
+                    .as_ref()
+                    .is_some_and(|(position, _, _)| position != &txn.metadata().commit_position)
+            {
+                return Err(FormatError::Invalid("ChunkRows watermark"));
+            }
+            let position = txn.metadata().commit_position.clone();
+            Ok(((chunk, txn), position))
+        })?;
+        self.poisoned = false;
+        Ok(value)
+    }
+
+    fn read_next_with<T>(
+        &mut self,
+        decode: impl FnOnce(&mut Self, u64) -> Result<(T, Position), FormatError>,
+    ) -> Result<Option<T>, FormatError> {
         let mut prefix = [0u8; 8];
         self.read(&mut prefix, "record length")?;
         let length = u64::from_be_bytes(prefix);
@@ -462,11 +748,8 @@ impl<R: Read> SegmentDecoder<R> {
                 actual: self.count.saturating_add(1),
             });
         }
-        let mut encoded = allocate("record", length, self.limits.max_record_bytes)?;
-        self.peak = self.peak.max(encoded.capacity());
-        self.read(&mut encoded, "record")?;
-        let record = SegmentRecord::from_canonical_bytes(&encoded)?;
-        check_position(&self.header, record.position(), self.count)?;
+        let (record, position) = decode(self, length)?;
+        check_position(&self.header, &position, self.count)?;
         self.count += 1;
         Ok(Some(record))
     }

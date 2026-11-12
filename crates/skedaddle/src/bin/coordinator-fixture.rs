@@ -37,13 +37,22 @@ async fn main() -> Result<()> {
     coordinator.acquire().await?;
     if args[0].starts_with("effect-pg") {
         let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(output)?)?;
-        let (mut client, connection) = tokio_postgres::connect(
-            cfg["pg"]
-                .as_str()
-                .ok_or_else(|| Error::Rejected("missing PG configuration".into()))?,
-            tokio_postgres::NoTls,
+        let (mut client, connection, transport) = skedaddle::pg::tls::connect(
+            &skedaddle::pg::tls::Config::new(
+                cfg["pg"]
+                    .as_str()
+                    .ok_or_else(|| Error::Rejected("missing PG configuration".into()))?
+                    .parse()?,
+                cfg["ca_pem"]
+                    .as_str()
+                    .or_else(|| cfg["replication"]["ca_pem"].as_str())
+                    .ok_or_else(|| Error::Rejected("missing TLS CA configuration".into()))?,
+            ),
+            &skedaddle::security::TlsPolicy::Required,
         )
-        .await?;
+        .await
+        .map_err(|_| Error::Rejected("verified TLS connection failed".into()))?;
+        assert!(transport.encrypted());
         tokio::spawn(async move {
             connection.await.expect("PG connection");
         });

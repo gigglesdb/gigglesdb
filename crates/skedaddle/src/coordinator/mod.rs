@@ -5,11 +5,20 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 
 pub mod budget;
+pub mod chunk;
 pub mod epoch;
+pub mod exclusion;
+pub mod gc_authority;
 pub mod gcs;
 pub mod journal;
 pub mod local;
+pub mod readiness;
+pub mod reverse;
 mod scratch;
+pub mod verification;
+
+pub use exclusion::{ExclusionGuard, MigrationExclusion};
+pub use readiness::ReadinessFacts;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -18,6 +27,8 @@ pub enum Error {
     BudgetExceeded(budget::Blocker),
     RecoveryRequired(String),
     Rejected(String),
+    Lifecycle(TransitionRejection),
+    ReverseProof(reverse::ProofError),
     LostOwnership,
     Observer,
     UnknownOutcome(String),
@@ -48,6 +59,8 @@ impl fmt::Display for Error {
                 f,
                 "transition rejected: {s}; inspect status and resolve the prerequisite"
             ),
+            Self::Lifecycle(rejection) => rejection.fmt(f),
+            Self::ReverseProof(error) => error.fmt(f),
             Self::LostOwnership => {
                 f.write_str("ownership lost; stop effects and reload as an observer")
             }
@@ -111,6 +124,123 @@ pub enum State {
     RecoveryRequired,
 }
 
+impl State {
+    pub const ALL: [Self; 17] = [
+        Self::Defined,
+        Self::Assessed,
+        Self::Copying,
+        Self::CatchingUp,
+        Self::VerifiedReady,
+        Self::SourceFenced,
+        Self::FinalBoundaryApplied,
+        Self::DestinationActive,
+        Self::RollbackWindow,
+        Self::RollingBack,
+        Self::Finalized,
+        Self::SourceActiveAfterRollback,
+        Self::AbortedToSource,
+        Self::Paused,
+        Self::Blocked,
+        Self::Failed,
+        Self::RecoveryRequired,
+    ];
+
+    /// Fixed edges from §3.11. Catching-up's ellipsis inherits copying's
+    /// interruptions. Paused/blocked have a separate, saved-state-only resume edge.
+    pub fn allowed_next(self) -> &'static [State] {
+        use State::*;
+        match self {
+            Defined => &[Assessed, Blocked],
+            Assessed => &[Copying],
+            Copying => &[CatchingUp, Paused, Blocked, Failed, RecoveryRequired],
+            CatchingUp => &[VerifiedReady, Paused, Blocked, Failed, RecoveryRequired],
+            VerifiedReady => &[SourceFenced, CatchingUp],
+            SourceFenced => &[FinalBoundaryApplied, AbortedToSource],
+            FinalBoundaryApplied => &[DestinationActive, AbortedToSource],
+            DestinationActive => &[RollbackWindow],
+            RollbackWindow => &[RollingBack, Finalized],
+            RollingBack => &[SourceActiveAfterRollback],
+            Finalized
+            | SourceActiveAfterRollback
+            | AbortedToSource
+            | Paused
+            | Blocked
+            | Failed
+            | RecoveryRequired => &[],
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Finalized | Self::SourceActiveAfterRollback | Self::AbortedToSource
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionRejectionCode {
+    NotAllowed,
+    ReadinessRequired,
+    ReasonRequired,
+    ResumeStateMissing,
+    ResumeBoundary,
+    BlockerRecheckRequired,
+    BlockersStillHold,
+    OperatorRecoveryRequired,
+}
+
+impl TransitionRejectionCode {
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::NotAllowed => {
+                "Inspect the lifecycle and use an allowed next state with its required event."
+            }
+            Self::ReadinessRequired => {
+                "Supply a fresh readiness facts snapshot; readiness transitions cannot be forced."
+            }
+            Self::ReasonRequired => "Record a non-empty interruption reason before retrying.",
+            Self::ResumeStateMissing => {
+                "Restore the saved pre-interruption state from the verified journal."
+            }
+            Self::ResumeBoundary => {
+                "Resume only to the recorded pre-fence state; reconcile authority through explicit operator recovery."
+            }
+            Self::BlockerRecheckRequired => {
+                "Recheck the blocker and supply ResumeAfterRecheck with the remaining blockers."
+            }
+            Self::BlockersStillHold => {
+                "Resolve every remaining blocker, then recheck before resuming."
+            }
+            Self::OperatorRecoveryRequired => {
+                "Preserve the journal and progress markers and perform explicit operator recovery; plain resume is forbidden."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransitionRejection {
+    pub from: State,
+    pub to: Option<State>,
+    pub code: TransitionRejectionCode,
+}
+
+impl fmt::Display for TransitionRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "lifecycle {:?} -> {:?} rejected ({:?}); {}",
+            self.from,
+            self.to,
+            self.code,
+            self.code.remediation()
+        )
+    }
+}
+
+impl std::error::Error for TransitionRejection {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Authority {
@@ -120,66 +250,26 @@ pub enum Authority {
     Unknown,
 }
 
-/// All ten readiness conditions are independently re-evaluated by callers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadinessFacts {
-    pub all_chunks_done: bool,
-    pub capture_healthy: bool,
-    pub lineage_matches: bool,
-    pub apply_lag: u64,
-    pub lag_budget: u64,
-    pub blocked_ddl: bool,
-    pub unknown_schema_job: bool,
-    pub verified_rows: u64,
-    pub in_scope_rows: u64,
-    pub busy_rows_past_budget: u64,
-    pub dead_letters: u64,
-    pub indexes_constraints_valid: bool,
-    pub sequences_syncable: bool,
-    pub reverse_prerequisites: bool,
-    pub fence_risks_acknowledged: bool,
-    pub buffer_contract_matches: bool,
-}
-
-impl ReadinessFacts {
-    pub fn blockers(&self) -> Vec<String> {
-        let conditions = [
-            (self.all_chunks_done, "chunks-incomplete"),
-            (self.capture_healthy, "capture-unhealthy"),
-            (self.lineage_matches, "lineage-mismatch"),
-            (self.apply_lag <= self.lag_budget, "apply-lag-over-budget"),
-            (
-                !self.blocked_ddl && !self.unknown_schema_job,
-                "schema-boundary-pending",
-            ),
-            (
-                self.verified_rows == self.in_scope_rows,
-                "verification-incomplete",
-            ),
-            (self.busy_rows_past_budget == 0, "busy-row-budget-exhausted"),
-            (self.dead_letters == 0, "dead-letters-present"),
-            (self.indexes_constraints_valid, "destination-schema-invalid"),
-            (self.sequences_syncable, "sequences-not-syncable"),
-            (self.reverse_prerequisites, "reverse-prerequisites-missing"),
-            (self.fence_risks_acknowledged, "fence-risk-unacknowledged"),
-            (self.buffer_contract_matches, "buffer-contract-mismatch"),
-        ];
-        conditions
-            .into_iter()
-            .filter(|(ok, _)| !ok)
-            .map(|(_, why)| why.to_owned())
-            .collect()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Event {
-    Advance { to: State },
-    Readiness { facts: ReadinessFacts },
-    Interrupt { to: State, reason: String },
+    Advance {
+        to: State,
+    },
+    Readiness {
+        facts: ReadinessFacts,
+    },
+    Interrupt {
+        to: State,
+        reason: String,
+    },
     Resume,
+    /// Explicit recheck evidence is journaled, just like a readiness snapshot.
+    /// Empty remaining blockers is required for a blocked migration to resume.
+    ResumeAfterRecheck {
+        remaining_blockers: Vec<String>,
+        facts: Option<ReadinessFacts>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,42 +293,60 @@ impl Default for Lifecycle {
     }
 }
 
+impl Lifecycle {
+    /// Resume never adds a forward edge or restores a fenced/ready state.
+    pub fn allowed_next(&self) -> &[State] {
+        if matches!(self.state, State::Paused | State::Blocked) {
+            return match &self.resume_state {
+                Some(prior @ (State::Defined | State::Copying | State::CatchingUp)) => {
+                    // Defined can only have been interrupted by Blocked.
+                    if self.state == State::Paused && *prior == State::Defined {
+                        &[]
+                    } else {
+                        std::slice::from_ref(prior)
+                    }
+                }
+                _ => &[],
+            };
+        }
+        self.state.allowed_next()
+    }
+}
+
 /// Total function: every state/event pair either returns a new value or rejects.
-/// The ellipsis in §3.11 catching-up inherits copying's interruptions. Resume
-/// is limited to paused/blocked before fencing; failed/recovery require repair.
+/// Same-state readiness observations are not lifecycle edges. No readiness
+/// decision can be made through Advance or restored from a stored ready flag.
 pub fn next_lifecycle(current: &Lifecycle, event: &Event, seq: u64) -> Result<Lifecycle> {
     use State::*;
+    use TransitionRejectionCode as Code;
+    let reject = |to, code| {
+        Error::Lifecycle(TransitionRejection {
+            from: current.state,
+            to,
+            code,
+        })
+    };
     let mut next = current.clone();
     let target = match event {
         Event::Advance { to } => {
-            let legal = matches!(
-                (current.state, *to),
-                (Defined, Assessed | Blocked)
-                    | (Assessed, Copying)
-                    | (Copying, CatchingUp)
-                    | (VerifiedReady, SourceFenced)
-                    | (SourceFenced, FinalBoundaryApplied | AbortedToSource)
-                    | (FinalBoundaryApplied, DestinationActive | AbortedToSource)
-                    | (DestinationActive, RollbackWindow)
-                    | (RollbackWindow, RollingBack | Finalized)
-                    | (RollingBack, SourceActiveAfterRollback)
-            );
-            if !legal {
-                return Err(Error::Rejected(format!("{:?} -> {to:?}", current.state)));
+            if !current.state.allowed_next().contains(to) {
+                return Err(reject(Some(*to), Code::NotAllowed));
             }
-            if *to == Blocked {
-                return Err(Error::Rejected(
-                    "blocking requires a recorded reason".into(),
-                ));
+            if matches!(to, Paused | Blocked | Failed | RecoveryRequired) {
+                return Err(reject(Some(*to), Code::ReasonRequired));
+            }
+            if matches!(
+                (current.state, *to),
+                (CatchingUp, VerifiedReady) | (VerifiedReady, CatchingUp)
+            ) {
+                return Err(reject(Some(*to), Code::ReadinessRequired));
             }
             next.blockers.clear();
             *to
         }
         Event::Readiness { facts } => {
             if !matches!(current.state, CatchingUp | VerifiedReady) {
-                return Err(Error::Rejected(
-                    "readiness is evaluated in catching-up or verified-ready".into(),
-                ));
+                return Err(reject(None, Code::NotAllowed));
             }
             next.blockers = facts.blockers();
             if next.blockers.is_empty() {
@@ -248,38 +356,54 @@ pub fn next_lifecycle(current: &Lifecycle, event: &Event, seq: u64) -> Result<Li
             }
         }
         Event::Interrupt { to, reason } => {
-            let legal = matches!(
-                (current.state, *to),
-                (Defined, Blocked)
-                    | (
-                        Copying | CatchingUp,
-                        Paused | Blocked | Failed | RecoveryRequired
-                    )
-            );
-            if !legal || reason.trim().is_empty() {
-                return Err(Error::Rejected(
-                    "interruption needs a legal state and a reason".into(),
-                ));
+            if !matches!(to, Paused | Blocked | Failed | RecoveryRequired)
+                || !current.state.allowed_next().contains(to)
+            {
+                return Err(reject(Some(*to), Code::NotAllowed));
+            }
+            if reason.trim().is_empty() {
+                return Err(reject(Some(*to), Code::ReasonRequired));
             }
             next.resume_state = Some(current.state);
             next.blockers = vec![reason.clone()];
             *to
         }
-        Event::Resume => {
+        Event::Resume | Event::ResumeAfterRecheck { .. } => {
+            if matches!(current.state, Failed | RecoveryRequired) {
+                return Err(reject(current.resume_state, Code::OperatorRecoveryRequired));
+            }
             if !matches!(current.state, Paused | Blocked) {
-                return Err(Error::Rejected(
-                    "only paused/blocked may resume after prerequisites are rechecked".into(),
-                ));
+                return Err(reject(current.resume_state, Code::NotAllowed));
             }
             let prior = current
                 .resume_state
-                .ok_or_else(|| Error::Rejected("missing resume state".into()))?;
-            if !matches!(prior, Defined | Copying | CatchingUp) {
-                return Err(Error::Rejected(
-                    "resume crosses an authority boundary".into(),
-                ));
+                .ok_or_else(|| reject(None, Code::ResumeStateMissing))?;
+            if !current.allowed_next().contains(&prior) {
+                return Err(reject(Some(prior), Code::ResumeBoundary));
             }
             next.blockers.clear();
+            match event {
+                Event::ResumeAfterRecheck {
+                    remaining_blockers,
+                    facts,
+                } => {
+                    if !remaining_blockers.is_empty() {
+                        return Err(reject(Some(prior), Code::BlockersStillHold));
+                    }
+                    if prior == CatchingUp {
+                        let facts = facts
+                            .as_ref()
+                            .ok_or_else(|| reject(Some(prior), Code::ReadinessRequired))?;
+                        // Re-evaluate but never jump forward on resume. A separate
+                        // fresh Readiness event is required to enter verified-ready.
+                        next.blockers = facts.blockers();
+                    }
+                }
+                Event::Resume if current.state == Blocked => {
+                    return Err(reject(Some(prior), Code::BlockerRecheckRequired));
+                }
+                _ => {}
+            }
             next.resume_state = None;
             prior
         }
@@ -361,6 +485,19 @@ pub enum Transition {
     Chunk {
         chunk: Chunk,
     },
+    ChunkPlanned {
+        plan: chunk::ChunkPlanRef,
+    },
+    ChunkStarted {
+        chunk: crate::pg::chunk::ChunkRange,
+        attempt: u64,
+    },
+    ChunkDone {
+        chunk: crate::pg::chunk::ChunkRange,
+        attempt: u64,
+        high_lsn: u64,
+        chunk_rows: chunk::ChunkRowsRef,
+    },
     VerifierRange {
         id: String,
         range: Option<VerifierRange>,
@@ -368,6 +505,23 @@ pub enum Transition {
     VerifierException {
         id: String,
         exception: Option<VerifierException>,
+    },
+    VerificationCompleted {
+        report: Box<verification::ReportRef>,
+    },
+    VerificationInvalidated {
+        invalidation: verification::Invalidation,
+    },
+    ReverseSetup {
+        record: Box<reverse::SetupRecord>,
+    },
+    ReverseConsistentPoint {
+        proof: Box<reverse::ReverseConsistentPoint>,
+    },
+    /// A later owner records the durable native activation receipt so it can
+    /// publish DestinationActive without re-fencing (see reverse.rs).
+    RecoveredActivation {
+        receipt: Box<reverse::ActivationReceipt>,
     },
     FenceState {
         db: String,
@@ -398,15 +552,27 @@ pub struct Materialized {
     pub digest: String,
     pub progress: BTreeMap<String, (String, String)>,
     pub chunks: BTreeMap<String, Chunk>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chunk_plans: BTreeMap<String, chunk::ChunkPlanRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chunk_attempts: BTreeMap<String, chunk::ChunkAttempt>,
     pub fence_state: BTreeMap<String, (String, String, String)>,
     /// Active original/current intents and the latest replay anchor, never history.
     pub audit: BTreeMap<u64, journal::Entry>,
     pub intent_roots: BTreeMap<u64, u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "verification::VerificationState::is_empty"
+    )]
+    pub verification: Box<verification::VerificationState>,
     pub verifier_ranges: BTreeMap<String, VerifierRange>,
     pub verifier_exceptions: BTreeMap<String, VerifierException>,
 }
 
 impl Materialized {
+    /// Project a verified journal entry. Object prerequisites for typed chunk
+    /// transitions are authenticated by Journal publication/recovery, not this
+    /// synchronous, rebuildable cache operation.
     pub fn apply(&mut self, entry: &journal::Entry) -> Result<()> {
         *self = self.projected(entry)?;
         Ok(())
@@ -468,7 +634,24 @@ impl Materialized {
                         self.definition = Some((**definition).clone());
                         self.lifecycle.since_seq = entry.seq;
                     }
+                    Transition::ReverseSetup { record } => {
+                        reverse::apply_setup(self, record, entry.seq)?;
+                    }
+                    Transition::ReverseConsistentPoint { proof } => {
+                        reverse::apply_proof(self, proof, entry.seq)?;
+                    }
+                    Transition::RecoveredActivation { receipt } => {
+                        reverse::apply_recovered(self, receipt)?;
+                    }
                     Transition::Lifecycle { event } => {
+                        if matches!(
+                            event,
+                            Event::Advance {
+                                to: State::DestinationActive
+                            }
+                        ) {
+                            reverse::require_activation(self)?;
+                        }
                         self.lifecycle = next_lifecycle(&self.lifecycle, event, entry.seq)?
                     }
                     Transition::Progress {
@@ -485,6 +668,9 @@ impl Materialized {
                             chunk.clone(),
                         );
                     }
+                    Transition::ChunkPlanned { .. }
+                    | Transition::ChunkStarted { .. }
+                    | Transition::ChunkDone { .. } => self.apply_chunk(transition)?,
                     Transition::VerifierRange { id, range } => {
                         if let Some(range) = range {
                             self.verifier_ranges.insert(id.clone(), range.clone());
@@ -498,6 +684,75 @@ impl Materialized {
                                 .insert(id.clone(), exception.clone());
                         } else {
                             self.verifier_exceptions.remove(id);
+                        }
+                    }
+                    Transition::VerificationCompleted { report } => {
+                        report.validate()?;
+                        let definition = self.definition.as_ref().ok_or_else(|| {
+                            Error::Rejected("verification requires definition".into())
+                        })?;
+                        let selected = definition
+                            .selected_objects
+                            .iter()
+                            .filter(|o| o.kind == crate::definition::ObjectKind::Table)
+                            .map(|o| (o.schema.clone(), o.name.clone()))
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let covered = report
+                            .summary
+                            .scope
+                            .iter()
+                            .map(|s| (s.schema.clone(), s.table.clone()))
+                            .collect::<std::collections::BTreeSet<_>>();
+                        if report.summary.generation != self.verification.generation
+                            || report.summary.epoch != self.epoch
+                            || report.summary.definition_digest != definition.canonical_digest()?
+                            || selected.is_empty()
+                            || covered != selected
+                        {
+                            return Err(Error::Rejected(
+                                "verification epoch/definition/full scope differs".into(),
+                            ));
+                        }
+                        if self.verification.runs.contains_key(&report.summary.run)
+                            || self.verification.runs.len() >= 128
+                        {
+                            return Err(Error::Rejected(
+                                "verification run already completed".into(),
+                            ));
+                        }
+                        self.verification
+                            .runs
+                            .insert(report.summary.run.clone(), report.digest.clone());
+                        self.verification.report = Some(report.clone());
+                        self.verification.invalidated = false;
+                    }
+                    Transition::VerificationInvalidated { invalidation } => {
+                        invalidation.validate()?;
+                        if let verification::InvalidationScope::Tables(tables) = &invalidation.scope
+                        {
+                            let relevant = self.definition.as_ref().is_some_and(|d| {
+                                d.selected_objects.iter().any(|o| {
+                                    o.kind == crate::definition::ObjectKind::Table
+                                        && tables.contains(&(o.schema.clone(), o.name.clone()))
+                                })
+                            });
+                            if !relevant {
+                                return Err(Error::Rejected(
+                                    "invalidation outside migration scope".into(),
+                                ));
+                            }
+                        }
+                        self.verification.generation =
+                            self.verification.generation.checked_add(1).ok_or_else(|| {
+                                Error::Rejected("verification generation exhausted".into())
+                            })?;
+                        if self
+                            .verification
+                            .report
+                            .as_ref()
+                            .is_some_and(|r| invalidation.applies(r))
+                        {
+                            self.verification.invalidated = true;
                         }
                     }
                     Transition::FenceState {
@@ -575,6 +830,8 @@ impl Materialized {
 #[cfg(feature = "test-crash")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrashSeam {
+    AfterReverseSetup,
+    AfterVerificationReport,
     AfterJournalPut,
     AfterLocalApply,
     AfterEffect,

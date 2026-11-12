@@ -138,6 +138,21 @@ impl Checkpoint {
     }
     fn validate_materialization(&self) -> Result<()> {
         self.validate()?;
+        if matches!(
+            self.state.lifecycle.state,
+            super::State::DestinationActive
+                | super::State::RollbackWindow
+                | super::State::Finalized
+        ) && self
+            .state
+            .verification
+            .reverse
+            .as_ref()
+            .and_then(|r| r.proof.as_ref())
+            .is_none()
+        {
+            return Err(Error::ReverseProof(super::reverse::ProofError::Missing));
+        }
         super::budget::state(&self.state)?;
         super::local::projection(&self.state)?;
         for (seq, entry) in &self.state.audit {
@@ -227,6 +242,7 @@ pub struct Journal {
     root: Path,
     index: Path,
     put_timeout: Duration,
+    pub(crate) chunk_buffer: Option<super::chunk::ChunkBuffer>,
 }
 
 /// Configure upstream's durable local backend. Refuse identifiable unfinished
@@ -294,10 +310,14 @@ impl Journal {
             root,
             index,
             put_timeout,
+            chunk_buffer: None,
         })
     }
     pub fn entry_key(&self, seq: u64) -> Path {
         self.root.clone().join(format!("{seq:020}.json"))
+    }
+    pub fn migration_id(&self) -> &str {
+        self.root.filename().expect("validated migration path")
     }
     pub fn namespace(&self) -> &str {
         self.root.as_ref()
@@ -308,15 +328,34 @@ impl Journal {
     pub fn checkpoint_index_key(&self, ordinal: u64) -> Path {
         self.index.clone().join(format!("{ordinal:020}.json"))
     }
-    async fn read(&self, key: &Path) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn read(&self, key: &Path) -> Result<Option<Vec<u8>>> {
         match self.store.get(key).await {
             Ok(result) => Ok(Some(result.bytes().await?.to_vec())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
+    pub(crate) async fn read_bounded(&self, key: &Path, cap: usize) -> Result<Option<Vec<u8>>> {
+        let result = match self.store.get(key).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if result.meta.size > cap as u64 {
+            return Err(Error::Rejected(format!("object exceeds {cap} byte limit")));
+        }
+        let mut stream = result.into_stream();
+        let mut bytes = Vec::new();
+        while let Some(part) = stream.try_next().await? {
+            if bytes.len().saturating_add(part.len()) > cap {
+                return Err(Error::Rejected(format!("object exceeds {cap} byte limit")));
+            }
+            bytes.extend_from_slice(&part);
+        }
+        Ok(Some(bytes))
+    }
     /// A timeout is never a vote: compare durable bytes at this exact key.
-    async fn create(&self, key: &Path, bytes: Vec<u8>) -> Result<()> {
+    pub(crate) async fn create(&self, key: &Path, bytes: Vec<u8>) -> Result<()> {
         let outcome = tokio::time::timeout(
             self.put_timeout,
             self.store
@@ -343,6 +382,30 @@ impl Journal {
     }
     pub async fn put(&self, entry: &Entry) -> Result<()> {
         entry.validate()?;
+        self.validate_reverse(&entry.transition)?;
+        if matches!(
+            entry.transition,
+            Transition::Lifecycle {
+                event: super::Event::Advance {
+                    to: super::State::DestinationActive
+                }
+            } | Transition::ReverseSetup { .. }
+                | Transition::ReverseConsistentPoint { .. }
+                | Transition::VerificationInvalidated { .. }
+                | Transition::VerificationCompleted { .. }
+                | Transition::ChunkPlanned { .. }
+                | Transition::ChunkStarted { .. }
+                | Transition::ChunkDone { .. }
+        ) {
+            let state = self.load(true).await?;
+            if entry.seq > state.applied_seq {
+                state.projected(entry)?;
+                self.validate_chunk_objects(&state, &entry.transition)
+                    .await?;
+            } else if self.entry(entry.seq).await? != *entry {
+                return Err(Error::LostOwnership);
+            }
+        }
         self.create(&self.entry_key(entry.seq), serde_json::to_vec(entry)?)
             .await
     }
@@ -447,6 +510,9 @@ impl Journal {
     /// its entire adoption chain in Materialized. New owners adopt the current
     /// alias directly; full rebuild also accepts the older wire history.
     pub(crate) async fn apply_entry(&self, state: &mut Materialized, entry: &Entry) -> Result<()> {
+        self.validate_reverse(&entry.transition)?;
+        self.validate_chunk_objects(state, &entry.transition)
+            .await?;
         if let Transition::ResumeEffect { intent_seq } = entry.transition
             && !state.intent_roots.contains_key(&intent_seq)
         {
@@ -539,6 +605,9 @@ impl Journal {
     async fn write_checkpoint(&self, state: &Materialized, archive: Option<String>) -> Result<()> {
         let cp = Checkpoint::new(state, archive)?;
         cp.validate_materialization()?;
+        if let Some(report) = &cp.state.verification.report {
+            self.verification_report(report).await?;
+        }
         self.verify_snapshot(state).await?;
         let anchor = self.read(&self.entry_key(cp.seq)).await?.ok_or_else(|| {
             Error::RecoveryRequired("checkpoint journal anchor missing during publication".into())
@@ -639,6 +708,28 @@ impl Journal {
             .ok_or_else(|| Error::RecoveryRequired("published checkpoint is missing".into()))?;
         let cp: Checkpoint = decode(&bytes)?;
         cp.validate_materialization()?;
+        if let Some(report) = &cp.state.verification.report {
+            self.verification_report(report).await?;
+        }
+        for plan in cp.state.chunk_plans.values() {
+            let saved = self.chunk_plan(plan).await?;
+            for attempt in cp
+                .state
+                .chunk_attempts
+                .values()
+                .filter(|a| a.chunk.id.table == plan.table)
+            {
+                if saved
+                    .ranges
+                    .get(usize::try_from(attempt.chunk.id.ordinal).map_err(super::chunk::invalid)?)
+                    != Some(&attempt.chunk)
+                {
+                    return Err(super::chunk::invalid(
+                        "checkpoint bounds differ from durable plan",
+                    ));
+                }
+            }
+        }
         if cp.seq != head.seq
             || cp.digest != head.checkpoint_digest
             || cp.journal_digest != head.journal_digest
@@ -661,7 +752,9 @@ impl Journal {
         Ok(cp)
     }
     pub async fn load(&self, use_checkpoint: bool) -> Result<Materialized> {
-        Ok(self.recover(use_checkpoint).await?.state)
+        // Recovery is a large state machine. Keep it heap-bound so optional
+        // verification metadata cannot amplify nested coordinator future stacks.
+        Ok(Box::pin(self.recover(use_checkpoint)).await?.state)
     }
 
     /// Explicit maintenance operation, never a recovery fallback. Stop all
@@ -738,6 +831,18 @@ impl Journal {
                 ));
             }
             self.apply_entry(&mut state, &entry).await?;
+            if let Transition::VerificationCompleted { report } = &entry.transition {
+                let object = self.verification_report(report).await?;
+                if destination.publish_verification(&object).await? != **report {
+                    return Err(Error::Rejected("copied verification differs".into()));
+                }
+            }
+            if let Transition::ChunkPlanned { plan } = &entry.transition {
+                let object = self.chunk_plan(plan).await?;
+                if destination.publish_chunk_plan(&object).await? != *plan {
+                    return Err(super::chunk::invalid("copied plan reference differs"));
+                }
+            }
             destination
                 .create(&destination.entry_key(seq), bytes)
                 .await?;
@@ -775,6 +880,12 @@ impl Journal {
                 self.apply_entry(&mut state, &entry)
                     .await
                     .map_err(|e| Error::RecoveryRequired(format!("journal tail at {seq}: {e}")))?;
+            }
+            // P11a authority requires its actual producer entries, including
+            // after a restart through Local::recover. Never trust injected cache
+            // metadata; retain raw setup history throughout the fenced window.
+            if state.verification.reverse.is_some() {
+                return Box::pin(self.recover(false)).await;
             }
             return Ok(Recovery {
                 checkpoint: Some(checkpoint),
@@ -854,6 +965,9 @@ impl Journal {
                     .ok_or_else(|| Error::RecoveryRequired("listed checkpoint vanished".into()))?;
                 let cp: Checkpoint = decode(&bytes)?;
                 cp.validate_materialization()?;
+                if let Some(report) = &cp.state.verification.report {
+                    self.verification_report(report).await?;
+                }
                 if cp.seq != *seq || cp.state != state {
                     return Err(Error::RecoveryRequired(
                         "checkpoint differs from scrubbed journal projection".into(),

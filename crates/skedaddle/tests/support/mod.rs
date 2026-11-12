@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod counting;
+pub mod oracle;
+pub mod workload;
 
 use object_store::ObjectStore;
 use skedaddle::coordinator::{

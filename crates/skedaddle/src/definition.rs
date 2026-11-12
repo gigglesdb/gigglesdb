@@ -83,6 +83,13 @@ pub struct MigrationDefinition {
 pub struct Connection {
     pub connection_ref: SecretRef,
     pub engine: Engine,
+    #[serde(default)]
+    pub tls: crate::security::TlsPolicy,
+    /// Reference to a UTF-8 PEM bundle path, not PEM text. Resolution reads the
+    /// env/file value as a path for pg::tls::Config::ca_pem, avoiding temporary
+    /// certificate files. No DSN, ambient environment, or system-root fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_ref: Option<SecretRef>,
     /// Server version to qualify, e.g. "17.2". This is a declaration, not evidence.
     pub version: String,
 }
@@ -120,6 +127,9 @@ pub struct ObjectSelector {
     pub schema: String,
     pub name: String,
     pub kind: ObjectKind,
+    /// Explicit source column exclusions; operational keys remain mandatory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_columns: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -239,19 +249,81 @@ pub struct FencePlan {
 pub struct Hook {
     pub name: String,
     pub phase: HookPhase,
+    pub timeout_seconds: u64,
     /// Executable and arguments. P1 records this contract but never executes it.
     /// Credentials must be supplied through secret_env, not embedded here.
     pub command: Vec<String>,
     pub secret_env: BTreeMap<String, SecretRef>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookPhase {
     BeforeSnapshot,
-    BeforeFence,
-    AfterCutover,
-    OnRollback,
+    PreFence,
+    PostActivate,
+    PreRollback,
+    PostRollback,
+}
+
+impl<'de> Deserialize<'de> for HookPhase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "before-snapshot" => Ok(Self::BeforeSnapshot),
+            "pre-fence" | "before-fence" => Ok(Self::PreFence),
+            "post-activate" | "after-cutover" => Ok(Self::PostActivate),
+            "pre-rollback" => Ok(Self::PreRollback),
+            "post-rollback" => Ok(Self::PostRollback),
+            "on-rollback" => Err(de::Error::custom(
+                "on-rollback is ambiguous; choose pre-rollback or post-rollback",
+            )),
+            _ => Err(de::Error::unknown_variant(
+                &value,
+                &[
+                    "before-snapshot",
+                    "pre-fence",
+                    "post-activate",
+                    "pre-rollback",
+                    "post-rollback",
+                    "before-fence",
+                    "after-cutover",
+                ],
+            )),
+        }
+    }
+}
+
+impl TryFrom<&Hook> for crate::hooks::OperatorHook {
+    type Error = ValidationError;
+
+    fn try_from(hook: &Hook) -> Result<Self, Self::Error> {
+        let phase = match hook.phase {
+            HookPhase::PreFence => crate::hooks::HookPhase::PreFence,
+            HookPhase::PostActivate => crate::hooks::HookPhase::PostActivate,
+            HookPhase::PreRollback => crate::hooks::HookPhase::PreRollback,
+            HookPhase::PostRollback => crate::hooks::HookPhase::PostRollback,
+            HookPhase::BeforeSnapshot => {
+                return Err(ValidationError {
+                    path: "phase".to_owned(),
+                    message: "before-snapshot has no operator hook execution phase".to_owned(),
+                });
+            }
+        };
+        if hook.timeout_seconds == 0 {
+            return Err(ValidationError {
+                path: "timeout_seconds".to_owned(),
+                message: "must be greater than zero".to_owned(),
+            });
+        }
+        Ok(Self {
+            name: hook.name.clone(),
+            phase,
+            command: hook.command.clone(),
+            secret_env: hook.secret_env.clone(),
+            timeout: std::time::Duration::from_secs(hook.timeout_seconds),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +437,19 @@ impl MigrationDefinition {
             nonempty(&mut errors, path, value);
         }
         for (path, connection) in [("source", &self.source), ("destination", &self.destination)] {
+            match (&connection.tls, &connection.tls_ca_ref) {
+                (crate::security::TlsPolicy::Required, None) => push_error(
+                    &mut errors,
+                    &format!("{path}.tls_ca_ref"),
+                    "TLS require needs explicit CA trust; set tls_ca_ref to env:NAME or file:/absolute/path whose resolved UTF-8 value is a PEM bundle path",
+                ),
+                (crate::security::TlsPolicy::DisableForLocalTest, Some(_)) => push_error(
+                    &mut errors,
+                    &format!("{path}.tls_ca_ref"),
+                    "CA trust contradicts disable-for-local-test; remove tls_ca_ref or select tls require",
+                ),
+                _ => {}
+            }
             if connection.engine == Engine::Postgresql
                 && postgres_major(&connection.version).is_none()
             {
@@ -385,7 +470,16 @@ impl MigrationDefinition {
         let mut selected = std::collections::BTreeSet::new();
         for (index, object) in self.selected_objects.iter().enumerate() {
             validate_object(&mut errors, &format!("selected_objects[{index}]"), object);
-            if !selected.insert(object) {
+            // PG folds unquoted names; our reserved schema is always quoted.
+            // Compare exactly, so distinct quoted names remain selectable.
+            if object.schema == "_skedaddle" {
+                push_error(
+                    &mut errors,
+                    &format!("selected_objects[{index}].schema"),
+                    "_skedaddle is reserved for tool metadata and cannot be selected",
+                );
+            }
+            if !selected.insert((&object.schema, &object.name, object.kind)) {
                 push_error(
                     &mut errors,
                     &format!("selected_objects[{index}]"),
@@ -398,10 +492,18 @@ impl MigrationDefinition {
             let path = format!("excluded_objects[{index}]");
             validate_object(&mut errors, &format!("{path}.object"), &exclusion.object);
             nonempty(&mut errors, &format!("{path}.reason"), &exclusion.reason);
-            if !excluded.insert(&exclusion.object) {
+            if !excluded.insert((
+                &exclusion.object.schema,
+                &exclusion.object.name,
+                exclusion.object.kind,
+            )) {
                 push_error(&mut errors, &path, "duplicate excluded object");
             }
-            if selected.contains(&exclusion.object) {
+            if selected.contains(&(
+                &exclusion.object.schema,
+                &exclusion.object.name,
+                exclusion.object.kind,
+            )) {
                 push_error(
                     &mut errors,
                     &path,
@@ -498,6 +600,13 @@ impl MigrationDefinition {
         for (index, hook) in self.hooks.iter().enumerate() {
             let path = format!("hooks[{index}]");
             nonempty(&mut errors, &format!("{path}.name"), &hook.name);
+            if hook.timeout_seconds == 0 {
+                push_error(
+                    &mut errors,
+                    &format!("{path}.timeout_seconds"),
+                    "must be greater than zero",
+                );
+            }
             if !hook_names.insert(&hook.name) {
                 push_error(
                     &mut errors,
@@ -579,6 +688,21 @@ fn nonempty(errors: &mut Vec<ValidationError>, path: &str, value: &str) {
 fn validate_object(errors: &mut Vec<ValidationError>, path: &str, object: &ObjectSelector) {
     nonempty(errors, &format!("{path}.schema"), &object.schema);
     nonempty(errors, &format!("{path}.name"), &object.name);
+    if !object.exclude_columns.is_empty() && object.kind != ObjectKind::Table {
+        push_error(
+            errors,
+            &format!("{path}.exclude_columns"),
+            "column exclusions are allowed only for tables",
+        );
+    }
+    let mut columns = std::collections::BTreeSet::new();
+    for (index, column) in object.exclude_columns.iter().enumerate() {
+        let field = format!("{path}.exclude_columns[{index}]");
+        nonempty(errors, &field, column);
+        if !columns.insert(column) {
+            push_error(errors, &field, "duplicate excluded column");
+        }
+    }
 }
 
 fn public_http_endpoint(endpoint: &str) -> bool {

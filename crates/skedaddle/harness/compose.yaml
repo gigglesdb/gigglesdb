@@ -6,7 +6,50 @@ x-common: &common
     driver: json-file
     options: {max-size: 2m, max-file: '2'}
   networks: [test]
+x-pg-matrix: &pg-matrix
+  <<: *common
+  profiles: [pg-matrix]
+  image: ${PG_MATRIX_IMAGE:-postgres:16-alpine}
+  entrypoint: [sh, /harness/pg-start.sh]
+  environment: &pg-matrix-env
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: skedaddle
+    POSTGRES_DB: skedaddle
+    PGDATA: /var/lib/postgresql/h1/data
+    POSTGRES_INITDB_ARGS: --auth-local=trust --auth-host=scram-sha-256
+    POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+  ports: ['127.0.0.1::5432']
+  mem_limit: 384m
+  shm_size: 32m
+  healthcheck:
+    # TCP proves the final TLS server is ready, not the initdb socket server.
+    test: [CMD-SHELL, 'PGPASSWORD=skedaddle psql "host=127.0.0.1 user=postgres dbname=skedaddle sslmode=verify-full sslrootcert=/var/lib/postgresql/h1/tls/ca.pem" -Atqc "SELECT 1"']
+    interval: 2s
+    timeout: 3s
+    retries: 60
 services:
+  pg-source:
+    <<: *pg-matrix
+    volumes:
+      - pgsource:/var/lib/postgresql
+      - ./pg-start.sh:/harness/pg-start.sh:ro
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/10-h1-roles.sql:ro
+  pg-destination:
+    <<: *pg-matrix
+    volumes:
+      - pgdestination:/var/lib/postgresql
+      - ./pg-start.sh:/harness/pg-start.sh:ro
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/10-h1-roles.sql:ro
+  # A separate negative-control server; source and destination stay logical.
+  pg-replica-wal:
+    <<: *pg-matrix
+    environment:
+      <<: *pg-matrix-env
+      HARNESS_WAL_LEVEL: replica
+    volumes:
+      - pgreplica:/var/lib/postgresql
+      - ./pg-start.sh:/harness/pg-start.sh:ro
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/10-h1-roles.sql:ro
   pg:
     <<: *common
     image: ${PG_IMAGE}
@@ -39,7 +82,8 @@ services:
     command: [-scheme, http, -port, '4443', -backend, filesystem, -filesystem-root, /storage]
     volumes: [gcsdata:/storage]
     ports: ['127.0.0.1::4443']
-    mem_limit: 128m
+    # JSON media uploads materialize request bodies; allow the P3 100 MB case.
+    mem_limit: 768m
     healthcheck:
       test: [CMD-SHELL, wget -q -O - http://127.0.0.1:4443/storage/v1/b]
       interval: 2s
@@ -74,6 +118,16 @@ services:
       timeout: 3s
       retries: 30
 volumes:
+  # Hard aggregate cap: three 256 MiB volumes = 768 MiB, including WAL/TLS.
+  pgsource:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=256m,mode=0700'}
+  pgdestination:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=256m,mode=0700'}
+  pgreplica:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=256m,mode=0700'}
   pgdata: {labels: {skedaddle.test: '${RUN_ID}'}}
   miniodata: {labels: {skedaddle.test: '${RUN_ID}'}}
   gcsdata: {labels: {skedaddle.test: '${RUN_ID}'}}
