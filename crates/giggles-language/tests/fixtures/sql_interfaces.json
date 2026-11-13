@@ -139,7 +139,7 @@
       "unverified": ["libpq/psql, JDBC, ODBC, ORMs and other driver versions are unqualified."],
       "limit_ids": ["server_frame_bytes", "server_response_bytes", "pg_startup_bytes", "pg_objects", "pg_name_bytes", "sql_bytes", "sql_rows", "sql_result_bytes"],
       "docs": ["crates/giggles-server/COMPATIBILITY.md", "crates/giggles-server/SECURITY.md", "crates/giggles-core/SQL.md"],
-      "sources": [{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_OBJECTS: usize = 32;"}, {"path":"crates/giggles-server/COMPATIBILITY.md","needle":"tokio-postgres0.7.15"}],
+      "sources": [{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_NAMED_STATEMENTS: usize = 1024;"}, {"path":"crates/giggles-server/COMPATIBILITY.md","needle":"tokio-postgres0.7.15"}],
       "evidence": [{"path":"crates/giggles-server/tests/network.rs","test":"pinned_driver_extended_binary_types_describe_and_rollback","scope":"Actual pinned driver, binary parameters, Describe and rollback."}, {"path":"crates/giggles-server/tests/network.rs","test":"raw_wire_text_parameters_binary_results_close_and_error_drain","scope":"Raw protocol formats and Sync recovery."}, {"path":"crates/giggles-server/tests/copy_network.rs","test":"simple_copy_atomic_recovery_and_transaction_status","scope":"COPY FROM STDIN text CopyIn, atomic error recovery and transaction status."}, {"path":"crates/giggles-server/tests/network.rs","test":"portal_suspension_transaction_cleanup_and_object_limits","scope":"Portal lifetime and object caps."}]
     },
     {
@@ -238,7 +238,7 @@
     {"id":"server_io_timeout_seconds","value":10,"unit":"seconds per framed IO operation","source":{"path":"crates/giggles-server/src/transport.rs","needle":"pub const IO_TIMEOUT: Duration = Duration::from_secs(10);"}},
     {"id":"server_deadline_ms","value":10000,"unit":"maximum native Deadline budget milliseconds","source":{"path":"crates/giggles-server/src/service.rs","needle":"budget_ms > 10_000"}},
     {"id":"pg_startup_bytes","value":8192,"unit":"maximum pgwire startup bytes including length","source":{"path":"crates/giggles-server/src/pgwire_startup.rs","needle":"!(8..=8192).contains(&n)"}},
-    {"id":"pg_objects","value":32,"unit":"prepared statements and separately portals per session","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_OBJECTS: usize = 32;"}},
+    {"id":"pg_objects","value":1024,"unit":"prepared statements and separately portals per session","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"const MAX_NAMED_STATEMENTS: usize = 1024;"}},
     {"id":"pg_name_bytes","value":63,"unit":"prepared statement/portal name bytes","source":{"path":"crates/giggles-server/src/pgwire.rs","needle":"name.len() > 63"}},
     {"id":"prepared_task_bytes","value":4096,"unit":"finite prepared task statement bytes","source":{"path":"crates/giggles-server/src/task_statement.rs","needle":"4096"}},
     {"id":"sdk_frame_bytes","value":65536,"unit":"consensus native task frame bytes; not the server SQL frame budget","source":{"path":"crates/giggles-consensus/src/native.rs","needle":"pub const MAX_FRAME: usize = 64 * 1024;"}},

@@ -49,11 +49,11 @@ from SQL NULL.
 Stock pgJDBC cancellation sends plaintext CancelRequest and cannot cancel this
 server's authenticated mTLS session. Do not rely on JDBC query timeout as proof
 that a write stopped. The pinned Rust driver's TLS cancel transport is tested.
-The server accepts at most 32 named statements; pgJDBC's default 256-entry cache
-can exceed that bound. `preparedStatementCacheQueries=16` leaves room for other
-live statements, but does not remove the server limit or qualify every driver
-cache path. Close unused statements; concurrent explicitly open statements still
-count. Ordinary prepared statements survive commits/rollbacks, with schema and
+Each session accepts at most 1,024 named prepared statements, 1,024 named
+portals and 1,024 cursors, and the SQL text of its named statements may total
+max(16 MiB, twice the maximum statement size); exceeding either returns 54000
+before anything runs. pgJDBC's default 256-entry cache fits; close unused
+statements, since concurrent explicitly open statements still count. Ordinary prepared statements survive commits/rollbacks, with schema and
 binding checks on reuse.
 
 Joins and uncorrelated `IN (SELECT ...)` subqueries follow PostgreSQL's
