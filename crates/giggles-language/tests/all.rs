@@ -27,6 +27,8 @@ mod insert_many;
 mod inspection;
 #[path = "inspection_capabilities.rs"]
 mod inspection_capabilities;
+#[path = "native_parity.rs"]
+mod native_parity;
 #[path = "once.rs"]
 mod once;
 #[path = "once_capabilities.rs"]
