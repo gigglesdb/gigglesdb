@@ -48,7 +48,7 @@ impl Prepared {
             if comment.view { return Err(SqlError::WrongObjectType); }
             (table.id, table.logical_columns().map(|c| (c.id, c.name.as_str())).collect::<Vec<_>>())
         } else {
-            let id = state.view_names.get(&comment.table).ok_or(SqlError::UnknownTable)?;
+            let id = state.view_names.get(&comment.table).map(|(id, _)| id).ok_or(SqlError::UnknownTable)?;
             let view = parts.sql_views.get(id).ok_or(SqlError::UnknownTable)?;
             (*id, view.columns.iter().map(|c| (c.id, c.name.as_str())).collect())
         };

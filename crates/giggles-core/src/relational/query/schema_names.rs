@@ -12,6 +12,7 @@ impl Query {
         for source in &mut self.sources {
             bind(&mut source.name);
         }
+        self.bind_views(state);
         for join in &mut self.joins {
             join.on.bind_schema_names(bind, state, path);
         }

@@ -705,6 +705,7 @@ pub(super) fn bind<'a>(
         .map(|(((b, (i, alias)), source), output_name)| {
             let mut column = if let Some(c) = source {
                 let mut column = tables[c.source].columns[c.column].clone();
+                if let Item::Scalar(Scalar::Column(c)) = i { column.name = c.name.clone(); }
                 if c.source > 0 && q.joins.get(c.source - 1).is_some_and(|j| j.left) {
                     column.not_null = false;
                 }

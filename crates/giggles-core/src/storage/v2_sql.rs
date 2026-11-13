@@ -290,6 +290,7 @@ impl SqlSession {
                         })?;
                         let bound = p.bind_schemas(&binding).map_err(CoreError::Sql)?;
                         let target_name = bound.table().map(str::to_owned);
+                        if writing && !ddl && target_name.as_ref().is_some_and(|n| binding.view_names.contains_key(n)) { return Err(CoreError::Sql(E::Unsupported)); }
                         let mut names = bound.read_tables().into_iter().collect::<BTreeSet<_>>();
                         let truncating = bound.command() == "TRUNCATE TABLE";
                         if truncating {
@@ -329,7 +330,7 @@ impl SqlSession {
                         }
                         let mut locks = BTreeMap::new();
                         for name in &names {
-                            if let Some(id) = binding.view_names.get(name) {
+                            if let Some(id) = binding.view_names.get(name).map(|(id, _)| id) {
                                 locks.insert(*id, if ddl && target_name.as_ref() == Some(name) { LockMode::AccessExclusive } else { LockMode::AccessShare });
                             }
                             if let Some(table) = parts.tables.get(name) {

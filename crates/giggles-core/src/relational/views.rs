@@ -76,10 +76,9 @@ impl Prepared {
         if let Some(query) = &ddl.query {
             let name = &ddl.names[0];
             if state.relation_name_taken(name) { return Err(SqlError::Duplicate); }
-            let source = query.read_tables();
-            let [source] = source.as_slice() else { return Err(SqlError::Unsupported); };
+            let source = query.view_source()?;
             let mut binding = state.clone();
-            if let Some(id) = state.view_names.get(source) {
+            if let Some(id) = state.view_names.get(source).map(|(id, _)| id) {
                 let view = &parts.sql_views[id];
                 binding.tables.insert(source.clone(), TableDef { id: *id, name: split_key(source).1.into(),
                     columns: view.columns.iter().map(|c| ColumnDef { id: c.id, name: c.name.clone(), data_type: c.storage_type.clone(), not_null: false }).collect(), primary_key: vec![] });
@@ -111,7 +110,7 @@ impl Prepared {
             let mut dropped = BTreeSet::new();
             for name in &ddl.names {
                 if state.relation_name_taken(name) && !state.view_names.contains_key(name) { return Err(SqlError::WrongObjectType); }
-                match state.view_names.get(name) {
+                match state.view_names.get(name).map(|(id, _)| id) {
                     Some(id) => { dropped.insert(*id); }
                     None if ddl.optional => user_types::view_missing_notice(split_key(name).1.trim_start_matches('\0')),
                     None => return Err(SqlError::UnknownTable),

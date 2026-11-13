@@ -204,6 +204,10 @@ fn diagnostic_error(
         b.push(b'D');
         z(&detail, &mut b);
     }
+    if code == "0A000" && diagnostic.and_then(|d| d.wire_message.as_deref()) == Some("view projection bindings unavailable; recreate the view") {
+        b.push(b'H');
+        z("Recreate the view to store projection bindings.", &mut b);
+    }
     b.push(0);
     let _ = frame(b'E', &b, out);
 }

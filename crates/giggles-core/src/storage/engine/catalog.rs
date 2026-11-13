@@ -178,10 +178,7 @@ impl CatalogSnapshot {
             u64::MAX,
         )?;
         image.catalog_indexes(&self.parts.indexes)?;
-        for (id, view) in &self.parts.sql_views {
-            let name = catalog_codec::sql_views::relation_name(view, &self.parts.ext.schemas).map_err(|_| SqlError::InvalidSchema)?;
-            image.view_names.insert(name, *id);
-        }
+        image.catalog_views(&self.parts.sql_views)?;
         let image = Arc::new(image);
         let _ = self.image.set(image.clone());
         Ok(image)
@@ -198,12 +195,14 @@ impl CatalogSnapshot {
         if let Some(image) = self.cursor_image.get() {
             return Ok(image.clone());
         }
-        let image = Arc::new(relational::Relational::catalog_image(
+        let mut image = relational::Relational::catalog_image(
             self.parts.tables.clone(),
             self.parts.ext.clone(),
             u64::MAX,
             1,
-        )?);
+        )?;
+        image.catalog_views(&self.parts.sql_views)?;
+        let image = Arc::new(image);
         let _ = self.cursor_image.set(image.clone());
         Ok(image)
     }

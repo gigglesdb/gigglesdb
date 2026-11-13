@@ -11,6 +11,7 @@ mod insert_values;
 mod schema_names;
 mod subplans;
 mod derived;
+pub(super) mod views;
 mod outer;
 mod exists;
 use subplans::{SubplanMode, Subplans};
@@ -179,8 +180,9 @@ pub(super) struct Query {
     limit: Option<Expr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct QueryClauses {
+    view_reads: Vec<String>,
     distinct: bool,
     filter: Option<Filter>,
     group: Vec<Scalar>,
@@ -1892,6 +1894,7 @@ impl Query {
             .iter()
             .map(|s| s.name.clone())
             .chain(self.subquery_tables())
+            .chain(self.clauses().into_iter().flat_map(|c| c.view_reads.iter().cloned()))
         {
             if !out.contains(&name) {
                 out.push(name);
@@ -2539,6 +2542,7 @@ impl Query {
                 filter
             } else {
                 Some(Filter::Clauses(Box::new(QueryClauses {
+                    view_reads: vec![],
                     distinct,
                     filter,
                     group,
@@ -3073,6 +3077,7 @@ impl Query {
     }
     // Reuse the parser's mandatory AND bounds; residual SQL is still evaluated.
     pub(super) fn v2_index_predicates(&self, params: &[Value]) -> Vec<(String, String, Value)> {
+        if self.clauses().is_some_and(|c| !c.view_reads.is_empty()) { return Vec::new(); }
         if self.sources.len() != 1 || !self.joins.is_empty() || self.has_in_subquery() {
             return Vec::new();
         }
@@ -3507,7 +3512,7 @@ impl Query {
         let tables = self
             .sources
             .iter()
-            .map(|s| state.tables.get(&s.name).ok_or(SqlError::UnknownTable))
+            .map(|s| views::table(state, &s.name))
             .collect::<R<Vec<_>>>()?;
         if outer.len() > subplans::MAX_DEPTH {
             return Err(SqlError::Limit);
@@ -3515,13 +3520,13 @@ impl Query {
         let mut tables = tables;
         for scope in outer {
             for source in *scope {
-                tables.push(state.tables.get(&source.name).ok_or(SqlError::UnknownTable)?);
+                tables.push(views::table(state, &source.name)?);
             }
         }
         let outer_slots = RefCell::new(Vec::new());
         let resolve = |c: &ColumnRef, scope: usize| {
             let mapped = derived::column(self, c)?;
-            outer::resolve(self, outer, &tables, mapped.as_ref().unwrap_or(c), scope, &outer_slots)
+            outer::resolve(state, self, outer, &tables, mapped.as_ref().unwrap_or(c), scope, &outer_slots)
         };
         if self.has_in_subquery()
             && let Some(f) = self.where_filter()
@@ -3793,7 +3798,10 @@ impl Query {
                         let name = c.name.clone();
                         let c = resolve(c, tables.len())?;
                         let mut d = tables[c.source].columns[c.column].clone();
-                        if self.derived().is_some() { d.name = name; }
+                        if let Some(source) = self.sources.get(c.source) && let Some(view) = views::projection(state, &source.name)? {
+                            d = view.columns.iter().find(|(_, offset)| *offset == c.column).ok_or(SqlError::UnknownColumn)?.0.clone();
+                        }
+                        d.name = name;
                         if c.source > 0 && self.joins.get(c.source - 1).is_some_and(|j| j.left) {
                             d.not_null = false;
                         }
@@ -4358,6 +4366,7 @@ impl BoundQuery<'_> {
             || self.query.explain
             || self.query.has_in_subquery()
             || self.query.derived().is_some()
+            || self.query.clauses().is_some_and(|c| !c.view_reads.is_empty())
         {
             return None;
         }

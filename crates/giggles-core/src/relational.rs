@@ -426,7 +426,7 @@ pub(crate) struct Relational {
     next_id: u64,
     next_version: u64,
     pub tables: BTreeMap<String, TableDef>,
-    pub(crate) view_names: BTreeMap<String, u64>, // Runtime-only; absent from namespace-5.
+    pub(crate) view_names: BTreeMap<String, (u64, R<query::views::Projection>)>, // Runtime-only; absent from namespace-5.
     rows: BTreeMap<u64, BTreeMap<Vec<u8>, SqlRow>>,
     ext: CatalogExt,
     secondary: secondary_index::Sidecar,
@@ -2019,6 +2019,7 @@ impl Prepared {
         Ok(description)
     }
     fn describe_inner(&self, state: &Relational) -> R<Description> {
+        if matches!(self.command(), "INSERT" | "UPDATE" | "DELETE") && self.table().is_some_and(|n| state.view_names.contains_key(n)) { return Err(SqlError::Unsupported); }
         if matches!(self.statement, Statement::Truncate { .. }) {
             self.truncate_authority_tables(state)?;
             return Ok(Description {

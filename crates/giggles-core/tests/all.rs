@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "view_select.rs"]
+mod view_select;
 #[path = "comments.rs"]
 mod comments;
 

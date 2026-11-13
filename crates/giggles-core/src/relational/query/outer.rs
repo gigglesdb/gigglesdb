@@ -11,7 +11,9 @@ pub(super) struct OuterSlot {
     pub(super) slot: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve(
+    state: &Relational,
     query: &Query,
     outer: &[&[Source]],
     tables: &[&TableDef],
@@ -37,10 +39,10 @@ pub(super) fn resolve(
             }
             qualified |= column.qualifier.is_some();
             let table = tables[offset + source];
-            let index = table
-                .logical_offsets()
-                .into_iter()
-                .find(|n| table.columns[*n].name == column.name);
+            let projection = views::projection(state, &syntax.name)?;
+            let index = if let Some(p) = projection {
+                p.columns.iter().find(|(c, _)| c.name == column.name).map(|(_, n)| *n)
+            } else { table.logical_offsets().into_iter().find(|n| table.columns[*n].name == column.name) };
             if let Some(index) = index {
                 if found.is_some() {
                     return Err(if outer.is_empty() {
@@ -60,6 +62,7 @@ pub(super) fn resolve(
                 if column.qualifier.as_ref().is_some_and(|q| q != &syntax.alias) {
                     continue;
                 }
+                if views::projection(state, &syntax.name)?.is_some() { continue; }
                 let column = tables[offset + source].hidden_rowid().ok_or(SqlError::Unsupported)?;
                 if found.is_some() {
                     return Err(if outer.is_empty() {
