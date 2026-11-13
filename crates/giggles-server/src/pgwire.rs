@@ -1385,7 +1385,7 @@ impl State {
                 let sql = r.text()?;
                 self.diagnostic.query(&sql);
                 let n = r.u16()?;
-                if n > 256 {
+                if n > giggles_core::relational::MAX_PARAMS {
                     return Err("54000");
                 }
                 let mut oids = vec![];

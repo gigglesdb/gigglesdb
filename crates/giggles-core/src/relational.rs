@@ -76,7 +76,7 @@ pub const MAX_INSERT_TOKENS: usize = 1_000_000;
 pub const MAX_ROWS: usize = 1024;
 pub const MAX_ROW_BYTES: usize = 64 * 1024;
 pub const MAX_COLUMNS: usize = 64;
-pub const MAX_PARAMS: usize = 256;
+pub const MAX_PARAMS: usize = 65_535;
 pub const MAX_TABLES: usize = 128;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_TRANSACTIONS: usize = 8;
@@ -155,6 +155,18 @@ fn payload_bound<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
     for v in values {
         bytes = bytes.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
         if bytes > MAX_ROW_BYTES {
+            return Err(SqlError::Limit);
+        }
+    }
+    Ok(())
+}
+
+// Per-row and per-key bounds still apply where rows and keys are formed.
+fn params_bound<'a>(values: impl Iterator<Item = &'a Value>) -> R<()> {
+    let mut bytes = 0usize;
+    for v in values {
+        bytes = bytes.checked_add(value_bytes(v)).ok_or(SqlError::Limit)?;
+        if bytes > MAX_STATEMENT_SQL {
             return Err(SqlError::Limit);
         }
     }
@@ -3364,7 +3376,7 @@ impl Relational {
             }
         }
         // Bound parameters even if a statement affects no rows.
-        payload_bound(params.iter())?;
+        params_bound(params.iter())?;
         if prepared.parameter_types.iter().any(Option::is_some)
             && matches!(
                 prepared.statement,

@@ -391,3 +391,6 @@ mod temporal_column_precision;
 mod derived_orm;
 #[path = "view_ddl.rs"]
 mod view_ddl;
+
+#[path = "many_params.rs"]
+mod many_params;

@@ -59,7 +59,8 @@ pub const MAX_INSERT_ROWS: usize = MAX_ROWS;
 /// Aggregate proposed full-row payload admitted before an INSERT MANY stages.
 pub const MAX_INSERT_BYTES: usize = crate::relational::MAX_RESULT_BYTES;
 /// Maximum entries in a supplied parameter map, including unused entries.
-pub const MAX_BINDINGS: usize = crate::relational::MAX_PARAMS;
+// Native operation bindings have an independent limit from SQL parameters.
+pub const MAX_BINDINGS: usize = 256;
 /// Sum of supplied value payloads: text/bytes length, nine bytes per scalar.
 pub const MAX_BINDING_BYTES: usize = crate::relational::MAX_ROW_BYTES;
 /// Sum of resolved literal/parameter payloads, charging every occurrence.

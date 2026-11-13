@@ -218,7 +218,7 @@
     {"id":"sql_rows","value":1024,"unit":"rows per bounded result/intermediate relation","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_ROWS: usize = 1024;"}},
     {"id":"sql_value_bytes","value":65536,"unit":"row or supplied parameter payload bytes; text/bytes use length, scalar values charge nine bytes","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_ROW_BYTES: usize = 64 * 1024;"}},
     {"id":"sql_columns","value":64,"unit":"columns per table","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_COLUMNS: usize = 64;"}},
-    {"id":"sql_params","value":256,"unit":"contiguous positional parameters","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_PARAMS: usize = 256;"}},
+    {"id":"sql_params","value":65535,"unit":"contiguous positional parameters","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_PARAMS: usize = 65_535;"}},
     {"id":"sql_tables","value":128,"unit":"catalog tables","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_TABLES: usize = 128;"}},
     {"id":"sql_result_bytes","value":1048576,"unit":"raw result value bytes","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_RESULT_BYTES: usize = 1024 * 1024;"}},
     {"id":"sql_transactions","value":8,"unit":"staged transactions shared per database","source":{"path":"crates/giggles-core/src/relational.rs","needle":"pub const MAX_TRANSACTIONS: usize = 8;"}},

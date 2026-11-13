@@ -179,3 +179,6 @@ mod prepared_rollback_network;
 mod view_presentation;
 #[path = "savepoint_reuse_network.rs"]
 mod savepoint_reuse_network;
+
+#[path = "many_params_network.rs"]
+mod many_params_network;

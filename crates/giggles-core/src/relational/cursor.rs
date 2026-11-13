@@ -36,7 +36,7 @@ impl Plan {
         if params.len() != p.params || params.len() > MAX_PARAMS {
             return Err(SqlError::Parameters);
         }
-        payload_bound(params.iter())?;
+        params_bound(params.iter())?;
         let Statement::Query(query) = &p.statement else {
             return Ok(None);
         };
