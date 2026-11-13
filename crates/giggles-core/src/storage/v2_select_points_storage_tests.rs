@@ -36,3 +36,19 @@ fn select_points_prepared_composite_order_and_own_writes() {
     for disabled in [false,true] { assert_eq!(rows(&mut s,&p,&[],disabled),vec![vec![Int(5)],vec![Int(1000)]]); }
     s.execute("ROLLBACK",&[],None).unwrap();
 }
+#[test]
+fn oid_zero_decoded_bigint_large_in_uses_points() {
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    s.execute("CREATE TABLE t(id bigint PRIMARY KEY)", &[], None).unwrap();
+    let insert=format!("INSERT INTO t VALUES {}",(1..=2000).map(|i|format!("({i})")).collect::<Vec<_>>().join(","));
+    s.execute(&insert,&[],None).unwrap();
+    let sql=format!("SELECT id FROM t WHERE id IN ({})",(1..=1000).map(|i|format!("${i}")).collect::<Vec<_>>().join(","));
+    let p=s.prepare(&sql).unwrap();
+    let params=(1..=1000).map(Value::Int).collect::<Vec<_>>();
+    DISABLE_SELECT_POINTS.set(false);
+    SELECT_POINT_READS.set(0);
+    assert_eq!(s.execute_prepared(&p,&params,None).unwrap().rows.len(),1000);
+    assert_eq!(SELECT_POINT_READS.get(),1000);
+    SELECT_POINT_READS.set(0);
+}

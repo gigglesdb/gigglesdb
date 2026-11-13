@@ -182,3 +182,5 @@ mod savepoint_reuse_network;
 
 #[path = "many_params_network.rs"]
 mod many_params_network;
+
+#[path = "select_points_network.rs"] mod select_points_network;

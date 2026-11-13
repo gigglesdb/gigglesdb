@@ -3097,11 +3097,11 @@ impl Query {
     pub(super) fn mutation_primary_keys(
         &self, state: &Relational, table: &TableDef, params: &[Value],
     ) -> Option<Vec<Vec<Value>>> {
-        self.primary_key_candidates(state, table, params, 200)
+        self.primary_key_candidates(state, table, params, 200).map(|(keys, _)| keys)
     }
     fn primary_key_candidates(
         &self, state: &Relational, table: &TableDef, params: &[Value], max_keys: usize,
-    ) -> Option<Vec<Vec<Value>>> {
+    ) -> Option<(Vec<Vec<Value>>, bool)> {
         // Keep one candidate page within the existing 200-row staging budgets.
         fn supported(ty: &DataType) -> bool {
             matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
@@ -3212,6 +3212,35 @@ impl Query {
             *op == "=" && value(&scalar, &table.columns[*i], params).is_some()
         });
         if !exact_bounds && !total(filter, table, params) { return None; }
+        // An exact domain contains each key column once, with only ORs within
+        // that column's equality domain. Repeated AND bounds retain evaluation.
+        fn exact_column(f: &Filter, table: &TableDef, params: &[Value]) -> Option<usize> {
+            match f {
+                Filter::Logic(a, false, b) => {
+                    let column = exact_column(a, table, params)?;
+                    (exact_column(b, table, params)? == column).then_some(column)
+                }
+                Filter::Compare(a, op, b) if op == "=" => {
+                    let (c, s) = match (a, b) {
+                        (Scalar::Column(c), s) | (s, Scalar::Column(c)) => (c, s),
+                        _ => return None,
+                    };
+                    let i = *table.primary_key.iter().find(|i| table.columns[**i].name == c.name)?;
+                    value(s, &table.columns[i], params)?;
+                    Some(i)
+                }
+                _ => None,
+            }
+        }
+        fn exact_columns(f: &Filter, table: &TableDef, params: &[Value], seen: &mut BTreeSet<usize>) -> bool {
+            match f {
+                Filter::Logic(a, true, b) => exact_columns(a, table, params, seen)
+                    && exact_columns(b, table, params, seen),
+                _ => exact_column(f, table, params).is_some_and(|i| seen.insert(i)),
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let exact = exact_columns(filter, table, params, &mut seen) && seen.len() == table.primary_key.len();
         let mut tuples = BTreeMap::from([(Vec::new(), Vec::new())]);
         for offset in &table.primary_key {
             let values = domain(filter, &table.columns[*offset], params, max_keys)?;
@@ -3226,7 +3255,7 @@ impl Query {
             }
             tuples = next;
         }
-        Some(tuples.into_values().collect())
+        Some((tuples.into_values().collect(), exact))
     }
 
     pub(super) fn target(&self) -> &str {
@@ -4998,9 +5027,11 @@ impl BoundQuery<'_> {
         let select_key_cap = SELECT_PRIMARY_KEY_CAP;
         #[cfg(test)]
         let select_key_cap = select_points::SELECT_KEY_CAP.get().unwrap_or(SELECT_PRIMARY_KEY_CAP);
+        let mut exact_points = false;
         let input = if points_enabled && !empty_input && self.tables.len() == 1 && self.joins.is_empty()
-            && let Some(keys) = self.query.primary_key_candidates(state, self.tables[0], params, select_key_cap)
+            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, select_key_cap)
         {
+            exact_points = exact;
             let mut keys = keys.iter().map(|key| encode_key(key)).collect::<R<Vec<_>>>()?;
             keys.sort();
             keys.dedup();
@@ -5023,6 +5054,11 @@ impl BoundQuery<'_> {
                 Ok(row) => row,
                 Err(e) => return Some(Err(e)),
             };
+            if exact_points {
+                #[cfg(test)]
+                select_points::SELECT_FILTER_SKIPS.with(|count| count.set(count.get() + 1));
+                return Some(Ok(row));
+            }
             let mut filter_work = 0;
             match self
                 .filter
