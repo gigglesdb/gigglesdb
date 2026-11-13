@@ -23,6 +23,9 @@ pub(super) fn view_recreate_error() {
 pub(super) fn view_missing_notice(name: &str) {
     SQL_NOTICES.with(|notices| notices.borrow_mut().push((format!("view \"{name}\" does not exist, skipping"), None)));
 }
+pub(super) fn view_replace_error(message: String) {
+    SQL_ERROR_MESSAGE.with(|pending| *pending.borrow_mut() = Some(message));
+}
 pub(super) fn truncate_reference_error() {
     SQL_ERROR_MESSAGE.with(|message| {
         *message.borrow_mut() =

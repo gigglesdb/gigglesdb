@@ -2,6 +2,8 @@
 mod v2_cascade_point_tests;
 #[path = "v2_mutation_point_tests.rs"]
 mod mutation_point;
+#[path = "v2_view_ddl_tests.rs"]
+mod view_ddl;
 
 use super::*;
 use engine::{

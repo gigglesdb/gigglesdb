@@ -98,6 +98,7 @@ impl SqlSession {
         clock: Option<&relational::clock::ExecutionClock>,
     ) -> Result<relational::SqlResult, CoreError> {
         use relational::{SqlError as E, V2Class};
+        p.clear_view_diagnostics();
         if self
             .copy_input
             .as_ref()
@@ -357,6 +358,9 @@ impl SqlSession {
                                     },
                                 );
                             }
+                        }
+                        for id in bound.view_drop_locks(&binding, parts) {
+                            locks.insert(id, LockMode::AccessExclusive);
                         }
                         // A single table-id order includes read sources and FK witnesses.
                         let table_names = parts

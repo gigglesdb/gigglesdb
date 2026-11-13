@@ -9,14 +9,18 @@ pub(super) struct Ddl {
     columns: Vec<String>,
     optional: bool,
     cascade: bool,
+    replace: bool,
 }
 pub(super) fn claims(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop")
-        && matches!(tokens.get(1), Some(Token::Word(w)) if w == "view")
+        && (matches!(tokens.get(1), Some(Token::Word(w)) if w == "view")
+            || matches!(&tokens[1..], [Token::Word(a), Token::Word(b), Token::Word(c), ..] if a == "or" && b == "replace" && c == "view"))
 }
 pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     let create = p.word("create");
     if !create { p.need("drop")?; }
+    let replace = create && p.word("or");
+    if replace { p.need("replace")?; }
     p.need("view")?;
     let optional = !create && p.word("if");
     if optional { p.need("exists")?; }
@@ -39,7 +43,7 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     if !create && !cascade { p.word("restrict"); }
     p.sym(';');
     if p.at != p.tokens.len() { return Err(SqlError::Syntax); }
-    Ok(Ddl { names, query, columns, optional, cascade })
+    Ok(Ddl { names, query, columns, optional, cascade, replace })
 }
 fn oid(ty: &DataType) -> u32 {
     match ty {
@@ -55,6 +59,23 @@ fn oid(ty: &DataType) -> u32 {
 }
 fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 impl Prepared {
+    pub fn is_view_replacement(&self) -> bool { matches!(&self.statement, Statement::View(ddl) if ddl.replace) }
+    pub(crate) fn clear_view_diagnostics(&self) {
+        if matches!(self.statement, Statement::View(_) | Statement::Comment(_)) { user_types::clear_sql_error_message(); }
+    }
+    pub(crate) fn view_drop_locks(&self, state: &Relational, parts: &CatalogParts) -> BTreeSet<u64> {
+        let Statement::View(ddl) = &self.statement else { return BTreeSet::new(); };
+        if ddl.query.is_some() { return BTreeSet::new(); }
+        let mut ids = ddl.names.iter().filter_map(|n| state.view_names.get(n).map(|v| v.0)).collect::<BTreeSet<_>>();
+        if ddl.cascade { loop {
+            let before = ids.len();
+            for (id, v) in &parts.sql_views {
+                if v.dependencies.iter().any(|d| ids.contains(&d.relation)) { ids.insert(*id); }
+            }
+            if before == ids.len() { break; }
+        } }
+        ids
+    }
     pub(crate) fn check_view_drop(&self, state: &Relational) -> R<()> {
         if self.command() == "DROP TABLE" && self.drop_tables().iter().any(|n| state.view_names.contains_key(n)) {
             return Err(SqlError::WrongObjectType);
@@ -75,8 +96,13 @@ impl Prepared {
         let Statement::View(ddl) = &self.statement else { return Ok(()); };
         if let Some(query) = &ddl.query {
             let name = &ddl.names[0];
-            if state.relation_name_taken(name) { return Err(SqlError::Duplicate); }
+            let existing = state.view_names.get(name).map(|v| v.0);
+            if state.relation_name_taken(name) && (!ddl.replace || existing.is_none()) {
+                return Err(if ddl.replace { SqlError::WrongObjectType } else { SqlError::Duplicate });
+            }
             let source = query.view_source()?;
+            if existing.is_some() && state.view_names.get(source).is_some_and(|(_, projection)|
+                projection.as_ref().is_ok_and(|p| p.reads.contains(name))) { return Err(SqlError::Unsupported); }
             let mut binding = state.clone();
             if let Some(id) = state.view_names.get(source).map(|(id, _)| id) {
                 let view = &parts.sql_views[id];
@@ -95,14 +121,26 @@ impl Prepared {
                 let original = table.logical_columns().find(|s| s.id == c.id).unwrap();
                 format!("{} AS {}", quote(&original.name), quote(&c.name))
             }).collect::<Vec<_>>().join(", "), quote(split_key(source).0), quote(split_key(source).1));
-            let id = allocate(&mut next)?;
-            let columns = outputs.iter().map(|c| {
+            let id = match existing { Some(id) => id, None => allocate(&mut next)? };
+            let previous = existing.and_then(|id| parts.sql_views.get(&id));
+            let columns = outputs.iter().enumerate().map(|(position, c)| {
                 let inherited = parts.sql_views.get(&table.id).and_then(|v| v.columns.iter().find(|s| s.id == c.id));
-                Ok(SqlViewColumn { id: allocate(&mut next)?, name: c.name.clone(), storage_type: c.data_type.clone(),
+                Ok(SqlViewColumn { id: match previous.and_then(|v| v.columns.get(position)) { Some(c) => c.id, None => allocate(&mut next)? }, name: c.name.clone(), storage_type: c.data_type.clone(),
                     pg_type_oid: match inherited { Some(c) => c.pg_type_oid, None => state.ext.columns.get(&c.id).and_then(|c| c.type_id).map(type_oid).transpose()?.unwrap_or_else(|| oid(&c.data_type)) },
                     typmod: inherited.map_or_else(|| state.column_typmod(c.id), |c| c.typmod),
                     source: Some((table.id, c.id)) })
             }).collect::<R<Vec<_>>>()?;
+            if let Some(previous) = previous {
+                let message = if columns.len() < previous.columns.len() { Some("cannot drop columns from view".into()) } else {
+                    previous.columns.iter().zip(&columns).find_map(|(old, new)| {
+                        if old.name != new.name { Some(format!("cannot change name of view column \"{}\" to \"{}\"", old.name, new.name)) }
+                        else if old.pg_type_oid != new.pg_type_oid || old.typmod != new.typmod || old.storage_type != new.storage_type {
+                            Some(format!("cannot change data type of view column \"{}\"", old.name))
+                        } else { None }
+                    })
+                };
+                if let Some(message) = message { user_types::view_replace_error(message); return Err(SqlError::InvalidTableDefinition); }
+            }
             let (schema, name) = split_key(name);
             let schema = if schema == "public" { 0 } else { state.ext.schemas.get(schema).ok_or(SqlError::InvalidSchema)?.id };
             parts.sql_views.insert(id, SqlViewDef { schema, name: name.into(), columns, select, dependencies });

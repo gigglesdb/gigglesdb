@@ -1228,6 +1228,7 @@ impl Session {
                 superuser = true;
                 true
             } else if p.command() == "COMMENT" || p.is_alter_table()
+                || (p.is_view_replacement() && self.sql.relation_exists(p.table().unwrap_or(""))?)
                 || p.is_drop_table()
                 || (p.command() == "DROP INDEX" && p.table().is_some())
             {

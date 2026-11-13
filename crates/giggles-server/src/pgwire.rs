@@ -142,6 +142,7 @@ impl Diagnostic {
                     | giggles_core::relational::SqlError::InvalidParameterValue
                     | giggles_core::relational::SqlError::Null
                     | giggles_core::relational::SqlError::Unsupported
+                    | giggles_core::relational::SqlError::InvalidTableDefinition
             ))
         ) {
             self.wire_message = message;

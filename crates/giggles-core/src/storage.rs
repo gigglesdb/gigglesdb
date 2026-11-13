@@ -3230,6 +3230,7 @@ impl SqlSession {
     pub fn relation_exists(&self, name: &str) -> Result<bool, CoreError> {
         let exists = |state: &MetadataState<'_>| {
             state.sql.tables.contains_key(name)
+                || state.sql.view_names.contains_key(name)
                 || state
                     .sql
                     .catalog_ext()

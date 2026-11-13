@@ -12,7 +12,7 @@ async fn view_ddl_authorization_precedes_semantics() {
         admin.roles().create(NewRole { name: name.into(), login: true, ..Default::default() }).unwrap();
         admin.roles().grant_schema("public", name, &[SchemaPrivilege::Create, SchemaPrivilege::Usage]).unwrap();
     }
-    let service = Service::new(admin, vec![], Clock::new(0,3600).unwrap()).unwrap();
+    let service = Service::new(admin.clone(), vec![], Clock::new(0,3600).unwrap()).unwrap();
     service.role_session("owner").unwrap().execute_sql("CREATE TABLE t(id int)",&[]).unwrap();
     let config = PostgresqlConfig { listen: "127.0.0.1:0".parse().unwrap(), tls: TlsMode::Disabled,
         certificate: None, private_key: None, client_ca: None, certificates: BTreeMap::new(),
@@ -31,7 +31,35 @@ async fn view_ddl_authorization_precedes_semantics() {
                 assert_eq!(error.as_ref().and_then(|e| e.code()).map(|c| c.code()).unwrap_or(""), expected, "{user}: {sql}");
             }
         }
+        if user == "owner" {
+            if engine == Engine::V2 { client.simple_query("CREATE VIEW ro AS SELECT id FROM t").await.unwrap(); }
+            for extended in [false, true] {
+                for sql in ["CREATE VIEW ro AS SELECT id FROM t", "DROP VIEW IF EXISTS ro", "COMMENT ON TABLE t IS 'ro'", "ALTER TABLE t ADD COLUMN ro int"] {
+                    let sql = if engine == Engine::Legacy && sql.starts_with("DROP VIEW") { "DROP VIEW t" } else { sql };
+                    client.simple_query("BEGIN READ ONLY").await.unwrap();
+                    let error = if extended { client.execute(sql, &[]).await.unwrap_err() } else { client.simple_query(sql).await.unwrap_err() };
+                    assert_eq!(error.code().unwrap().code(), "25006", "{sql}");
+                    client.simple_query("ROLLBACK").await.unwrap();
+                }
+                if engine == Engine::V2 {
+                    client.simple_query("CREATE OR REPLACE VIEW v(x) AS SELECT id FROM t").await.unwrap();
+                    for (sql, code, message) in [("CREATE OR REPLACE VIEW v AS SELECT id FROM t", "42P16", "cannot change name of view column"),
+                        ("CREATE OR REPLACE VIEW t AS SELECT id FROM t", "42809", "")] {
+                        let error = if extended { client.execute(sql, &[]).await.unwrap_err() } else { client.simple_query(sql).await.unwrap_err() };
+                        assert_eq!(error.code().unwrap().code(), code);
+                        assert!(error.as_db_error().unwrap().message().starts_with(message));
+                    }
+                }
+            }
+        } else if engine == Engine::V2 {
+            admin.roles().grant_table("t", "other", &[giggles_core::roles::TablePrivilege::Select]).unwrap();
+            for extended in [false, true] {
+                let sql = "CREATE OR REPLACE VIEW v(x) AS SELECT id FROM t";
+                let error = if extended { client.execute(sql, &[]).await.unwrap_err() } else { client.simple_query(sql).await.unwrap_err() };
+                assert_eq!(error.code().unwrap().code(), "42501");
+            }
+        }
         drop(client); connection.await.unwrap().unwrap();
     }
-    running.shutdown().await.unwrap(); drop(service); std::fs::remove_dir_all(path).unwrap();
+    running.shutdown().await.unwrap(); drop(service); drop(admin); std::fs::remove_dir_all(path).unwrap();
 }
