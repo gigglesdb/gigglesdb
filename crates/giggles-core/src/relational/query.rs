@@ -3097,8 +3097,12 @@ impl Query {
     pub(super) fn mutation_primary_keys(
         &self, state: &Relational, table: &TableDef, params: &[Value],
     ) -> Option<Vec<Vec<Value>>> {
+        self.primary_key_candidates(state, table, params, 200)
+    }
+    fn primary_key_candidates(
+        &self, state: &Relational, table: &TableDef, params: &[Value], max_keys: usize,
+    ) -> Option<Vec<Vec<Value>>> {
         // Keep one candidate page within the existing 200-row staging budgets.
-        const MAX_KEYS: usize = 200;
         fn supported(ty: &DataType) -> bool {
             matches!(ty, DataType::Boolean | DataType::SmallInt | DataType::Integer
                 | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes
@@ -3144,7 +3148,7 @@ impl Query {
                 _ => false,
             }
         }
-        fn domain(f: &Filter, column: &ColumnDef, params: &[Value]) -> Option<BTreeMap<Vec<u8>, Value>> {
+        fn domain(f: &Filter, column: &ColumnDef, params: &[Value], max_keys: usize) -> Option<BTreeMap<Vec<u8>, Value>> {
             match f {
                 Filter::Compare(a, op, b) if op == "=" => {
                     let s = match (a, b) {
@@ -3155,7 +3159,7 @@ impl Query {
                     Some(BTreeMap::from([(encode_key(std::slice::from_ref(&v)).ok()?, v)]))
                 }
                 Filter::Logic(a, and, b) => {
-                    let (a, b) = (domain(a, column, params), domain(b, column, params));
+                    let (a, b) = (domain(a, column, params, max_keys), domain(b, column, params, max_keys));
                     if *and {
                         // Either mandatory conjunct supplies a sound superset.
                         match (a, b) {
@@ -3165,7 +3169,7 @@ impl Query {
                     } else {
                         let mut out = a?;
                         out.extend(b?);
-                        (out.len() <= MAX_KEYS).then_some(out)
+                        (out.len() <= max_keys).then_some(out)
                     }
                 }
                 _ => None,
@@ -3210,8 +3214,8 @@ impl Query {
         if !exact_bounds && !total(filter, table, params) { return None; }
         let mut tuples = BTreeMap::from([(Vec::new(), Vec::new())]);
         for offset in &table.primary_key {
-            let values = domain(filter, &table.columns[*offset], params)?;
-            if tuples.len().checked_mul(values.len())? > MAX_KEYS { return None; }
+            let values = domain(filter, &table.columns[*offset], params, max_keys)?;
+            if tuples.len().checked_mul(values.len())? > max_keys { return None; }
             let mut next = BTreeMap::new();
             for prefix in tuples.into_values() {
                 for v in values.values() {
@@ -4985,7 +4989,29 @@ impl BoundQuery<'_> {
         } else {
             scan::KeyRange::from_bounds(bounds)
         };
-        let input = self.input_rows(source, params, &range, empty_input)?;
+        #[cfg(not(test))]
+        let points_enabled = true;
+        #[cfg(test)]
+        let points_enabled = !select_points::DISABLE_SELECT_POINTS.get();
+        const SELECT_PRIMARY_KEY_CAP: usize = 2048;
+        #[cfg(not(test))]
+        let select_key_cap = SELECT_PRIMARY_KEY_CAP;
+        #[cfg(test)]
+        let select_key_cap = select_points::SELECT_KEY_CAP.get().unwrap_or(SELECT_PRIMARY_KEY_CAP);
+        let input = if points_enabled && !empty_input && self.tables.len() == 1 && self.joins.is_empty()
+            && let Some(keys) = self.query.primary_key_candidates(state, self.tables[0], params, select_key_cap)
+        {
+            let mut keys = keys.iter().map(|key| encode_key(key)).collect::<R<Vec<_>>>()?;
+            keys.sort();
+            keys.dedup();
+            let table = self.tables[0];
+            Box::new(keys.into_iter().filter_map(move |key| {
+                if crate::cancellation::check().is_err() { return Some(Err(SqlError::Aborted)); }
+                #[cfg(test)]
+                select_points::SELECT_POINT_READS.with(|reads| reads.set(reads.get() + 1));
+                source.get(table, &key).transpose()
+            })) as scan::SourceRows<'_>
+        } else { self.input_rows(source, params, &range, empty_input)? };
         let mut meter = if subquery || self.aggregate || !self.joins.is_empty() {
             scan::Meter::per_row(cancel)
         } else {
@@ -6266,3 +6292,7 @@ mod mutation_primary_key_tests {
         assert!(keys(&state,&format!("DELETE FROM t WHERE a IN({list}) AND b IN({list})"),&[]).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "../storage/v2_select_points_tests.rs"]
+pub(crate) mod select_points;

@@ -1638,3 +1638,7 @@ fn unique_constraint_origin_survives_v2_reopen_and_owned_index_drop() {
     assert!(f.admin().catalog_presentation().unwrap().constraints.is_empty());
     assert_eq!(f.parts().indexes.len(), 1);
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[path = "v2_select_points_storage_tests.rs"]
+mod select_points;
