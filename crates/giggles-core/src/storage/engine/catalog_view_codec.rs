@@ -1,4 +1,4 @@
-//! SQL-view DTO v1 and catalog-wide reference validation.
+//! SQL-view DTO v1/v2 and catalog-wide reference validation.
 use super::{corrupt, object_key};
 use crate::{
     CoreError,
@@ -41,6 +41,7 @@ pub(crate) struct SqlViewColumn {
     pub(crate) storage_type: DataType,
     pub(crate) pg_type_oid: u32,
     pub(crate) typmod: i32,
+    pub(crate) source: Option<(u64, u64)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SqlViewDependency {
@@ -67,6 +68,7 @@ fn validate(view: &SqlViewDef) -> Result<(), CoreError> {
     if !identifier(&view.name)
         || view.columns.is_empty()
         || view.columns.len() > MAX_COLUMNS
+        || view.columns.iter().any(|c| c.source.is_some() != view.columns[0].source.is_some())
         || view.select.is_empty()
         || view.select.len() > MAX_SELECT_BYTES
         || view.select.contains('\0')
@@ -77,6 +79,8 @@ fn validate(view: &SqlViewDef) -> Result<(), CoreError> {
                 || !ids.insert(c.id)
                 || !names.insert(&c.name)
                 || c.pg_type_oid == 0
+                || c.source.is_some_and(|(relation, column)| !view.dependencies.iter()
+                    .any(|d| d.relation == relation && d.columns.contains(&column)))
         })
         || view
             .dependencies
@@ -97,10 +101,12 @@ fn string(out: &mut Vec<u8>, text: &str) {
 /// storage tag u8, PG OID u32, typmod i32); SELECT; dependency count u32;
 /// dependencies (relation u64, column count u32, ordered column IDs u64).
 /// Dependencies ascend by relation ID; unique columns follow source column order.
-/// All integers are BE; strings are u32 byte length followed by UTF-8.
+/// V2 appends one (source relation u64, source column u64) per output, in output order.
+/// V1 has no bindings. All integers are BE; strings are u32 byte length plus UTF-8.
 pub(crate) fn encode_view(view: &SqlViewDef) -> Result<Vec<u8>, CoreError> {
     validate(view)?;
-    let mut out = vec![1];
+    let version = if view.columns[0].source.is_some() { 2 } else { 1 };
+    let mut out = vec![version];
     out.extend(view.schema.to_be_bytes());
     string(&mut out, &view.name);
     out.extend((view.columns.len() as u32).to_be_bytes());
@@ -123,6 +129,10 @@ pub(crate) fn encode_view(view: &SqlViewDef) -> Result<Vec<u8>, CoreError> {
         for column in &dependency.columns {
             out.extend(column.to_be_bytes());
         }
+    }
+    for (relation, source) in view.columns.iter().filter_map(|c| c.source) {
+        out.extend(relation.to_be_bytes());
+        out.extend(source.to_be_bytes());
     }
     Ok(out)
 }
@@ -157,7 +167,8 @@ impl Reader<'_> {
 }
 pub(crate) fn decode_view(bytes: &[u8]) -> Result<SqlViewDef, CoreError> {
     let mut input = Reader(bytes);
-    if input.bytes::<1>()? != [1] {
+    let version = input.bytes::<1>()?[0];
+    if !matches!(version, 1 | 2) {
         return Err(corrupt("unsupported SQL view version"));
     }
     let schema = u64::from_be_bytes(input.bytes()?);
@@ -174,6 +185,7 @@ pub(crate) fn decode_view(bytes: &[u8]) -> Result<SqlViewDef, CoreError> {
                 .clone(),
             pg_type_oid: u32::from_be_bytes(input.bytes()?),
             typmod: i32::from_be_bytes(input.bytes()?),
+            source: None,
         });
     }
     let select = input.string(MAX_SELECT_BYTES)?;
@@ -187,6 +199,11 @@ pub(crate) fn decode_view(bytes: &[u8]) -> Result<SqlViewDef, CoreError> {
             columns.push(u64::from_be_bytes(input.bytes()?));
         }
         dependencies.push(SqlViewDependency { relation, columns });
+    }
+    if version == 2 {
+        for column in &mut columns {
+            column.source = Some((u64::from_be_bytes(input.bytes()?), u64::from_be_bytes(input.bytes()?)));
+        }
     }
     if !input.0.is_empty() {
         return Err(corrupt("trailing SQL view bytes"));

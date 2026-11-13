@@ -36,15 +36,17 @@ impl Drop for Fixture {
 
 #[test]
 fn drop_schema_with_persisted_view_reports_dependency() {
-    use engine::catalog_codec::sql_views::{SqlViewColumn, SqlViewDef};
+    use engine::catalog_codec::sql_views::{SqlViewColumn, SqlViewDef, SqlViewDependency};
     let f = Fixture::new(); let mut sql = f.admin().sql_session();
     sql.execute("CREATE SCHEMA s", &[], None).unwrap();
+    sql.execute("CREATE TABLE base(c bigint)", &[], None).unwrap();
     let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
     let old = db.catalog().parts(&mut tx).unwrap(); let mut new = old.clone();
     let ids = db.catalog().reserve_ids(2).unwrap();
+    let base = &old.tables["base"]; let source = (base.id, base.columns[0].id);
     new.sql_views.insert(ids.start, SqlViewDef { schema: old.ext.schemas["s"].id, name: "v".into(),
-        columns: vec![SqlViewColumn { id: ids.start+1, name: "c".into(), storage_type: crate::relational::DataType::BigInt, pg_type_oid: 20, typmod: -1 }],
-        select: "SELECT 1".into(), dependencies: vec![] });
+        columns: vec![SqlViewColumn { id: ids.start+1, name: "c".into(), storage_type: crate::relational::DataType::BigInt, pg_type_oid: 20, typmod: -1, source: Some(source) }],
+        select: "SELECT c FROM base".into(), dependencies: vec![SqlViewDependency { relation: source.0, columns: vec![source.1] }] });
     db.catalog().apply_diff(&mut tx, &old, &new, &ids, None, &|| false).unwrap(); db.catalog().commit_ddl(tx).unwrap();
     assert_eq!(sql.execute("DROP SCHEMA s", &[], None).unwrap_err(), CoreError::Sql(crate::relational::SqlError::DependentObjects));
 }
@@ -209,4 +211,56 @@ fn sql_concurrent_ddl_and_point_dml_do_not_observe_stale_catalog_images() {
             });
         }
     });
+}
+
+#[test]
+fn projection_view_source_bindings_survive_reopen() {
+    let mut f = Fixture::new(); let mut sql = f.admin().sql_session();
+    for statement in ["CREATE TABLE t(a int, b int)",
+        "CREATE VIEW reordered AS SELECT b,a FROM t",
+        "CREATE VIEW repeated AS SELECT a AS x,a AS y FROM t",
+        "CREATE VIEW star AS SELECT * FROM t",
+        "CREATE VIEW nested AS SELECT y,x FROM repeated"] {
+        sql.execute(statement, &[], None).unwrap();
+    }
+    let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    let wanted = db.catalog().parts(&mut tx).unwrap(); tx.rollback();
+    let t = &wanted.tables["t"]; let (a,b) = (t.columns[0].id, t.columns[1].id);
+    for (name, sources) in [("reordered", vec![b,a]), ("repeated", vec![a,a]), ("star", vec![a,b])] {
+        let v = wanted.sql_views.values().find(|v| v.name == name).unwrap();
+        assert_eq!(v.columns.iter().map(|c| c.source).collect::<Vec<_>>(), sources.iter().map(|c| Some((t.id,*c))).collect::<Vec<_>>());
+        let expected = if name == "repeated" { vec![a] } else { vec![a,b] };
+        assert_eq!(v.dependencies[0].columns, expected);
+    }
+    let (id, repeated) = wanted.sql_views.iter().find(|(_,v)| v.name == "repeated").unwrap();
+    let nested = wanted.sql_views.values().find(|v| v.name == "nested").unwrap();
+    assert_eq!(nested.columns.iter().map(|c| c.source).collect::<Vec<_>>(), vec![Some((*id,repeated.columns[1].id)),Some((*id,repeated.columns[0].id))]);
+    assert_eq!(sql.execute("ALTER TABLE t DROP COLUMN a", &[], None), Err(CoreError::Sql(crate::relational::SqlError::DependentObjects)));
+    drop(sql); f.admin.take();
+    f.admin = Some(Admin::open(&f.path, Limits::default()).unwrap());
+    let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    assert_eq!(db.catalog().parts(&mut tx).unwrap().sql_views, wanted.sql_views);
+}
+
+#[test]
+fn legacy_view_bytes_survive_unrelated_ddl_and_reopen() {
+    use engine::catalog_codec::sql_views::{encode_view, view_key};
+    let mut f = Fixture::new(); let mut sql = f.admin().sql_session();
+    sql.execute("CREATE TABLE base(c int)", &[], None).unwrap();
+    sql.execute("CREATE VIEW v AS SELECT c FROM base", &[], None).unwrap();
+    let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    let old = db.catalog().parts(&mut tx).unwrap(); let mut new = old.clone();
+    let (&id, view) = new.sql_views.iter_mut().next().unwrap();
+    for column in &mut view.columns { column.source = None; }
+    let legacy = encode_view(view).unwrap(); assert_eq!(legacy[0], 1);
+    db.catalog().apply_diff(&mut tx, &old, &new, &(0..0), None, &|| false).unwrap();
+    db.catalog().commit_ddl(tx).unwrap();
+    for statement in ["CREATE TABLE unrelated(x int)", "COMMENT ON TABLE unrelated IS 'retained'"] {
+        sql.execute(statement, &[], None).unwrap();
+    }
+    drop(sql); f.admin.take();
+    f.admin = Some(Admin::open(&f.path, Limits::default()).unwrap());
+    let db = f.db(); let mut tx = db.begin(engine::txn::Isolation::ReadCommitted);
+    assert_eq!(tx.get(engine::kv::Keyspace::Catalog, &view_key(id)).unwrap(), Some(legacy));
+    assert_eq!(db.catalog().parts(&mut tx).unwrap().sql_views, new.sql_views);
 }

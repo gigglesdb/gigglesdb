@@ -1,4 +1,4 @@
-//! Projection-view DDL; persisted definitions use the existing v2 DTO.
+//! Projection-view DDL; persisted definitions use the kind-17 v2 DTO.
 use super::*;
 use crate::storage::{CatalogParts, SqlViewColumn, SqlViewDef, SqlViewDependency};
 
@@ -101,7 +101,8 @@ impl Prepared {
                 let inherited = parts.sql_views.get(&table.id).and_then(|v| v.columns.iter().find(|s| s.id == c.id));
                 Ok(SqlViewColumn { id: allocate(&mut next)?, name: c.name.clone(), storage_type: c.data_type.clone(),
                     pg_type_oid: match inherited { Some(c) => c.pg_type_oid, None => state.ext.columns.get(&c.id).and_then(|c| c.type_id).map(type_oid).transpose()?.unwrap_or_else(|| oid(&c.data_type)) },
-                    typmod: inherited.map_or_else(|| state.column_typmod(c.id), |c| c.typmod) })
+                    typmod: inherited.map_or_else(|| state.column_typmod(c.id), |c| c.typmod),
+                    source: Some((table.id, c.id)) })
             }).collect::<R<Vec<_>>>()?;
             let (schema, name) = split_key(name);
             let schema = if schema == "public" { 0 } else { state.ext.schemas.get(schema).ok_or(SqlError::InvalidSchema)?.id };

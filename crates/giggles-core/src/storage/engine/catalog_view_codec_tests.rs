@@ -9,6 +9,7 @@ fn view() -> SqlViewDef {
             storage_type: DataType::Integer,
             pg_type_oid: 23,
             typmod: -1,
+            source: Some((2, 4)),
         }],
         select: "SELECT c FROM t".into(),
         dependencies: vec![SqlViewDependency {
@@ -21,10 +22,11 @@ fn view() -> SqlViewDef {
 fn exact_wire_and_all_storage_tags() {
     assert_eq!(view_key(9), [17, 0, 0, 0, 0, 0, 0, 0, 9]);
     let golden = concat!(
-        "010000000000000001000000017600000001",
+        "020000000000000001000000017600000001",
         "000000000000000300000001630200000017ffffffff",
         "0000000f53454c45435420632046524f4d2074",
-        "000000010000000000000002000000010000000000000004"
+        "000000010000000000000002000000010000000000000004",
+        "00000000000000020000000000000004"
     );
     let bytes: Vec<_> = (0..golden.len())
         .step_by(2)
@@ -32,6 +34,12 @@ fn exact_wire_and_all_storage_tags() {
         .collect();
     assert_eq!(encode_view(&view()).unwrap(), bytes);
     assert_eq!(decode_view(&bytes).unwrap(), view());
+    let mut legacy = bytes[..bytes.len()-16].to_vec(); legacy[0] = 1;
+    let mut expected = view(); expected.columns[0].source = None;
+    assert_eq!(decode_view(&legacy).unwrap(), expected);
+    assert_eq!(encode_view(&expected).unwrap(), legacy);
+    for end in 0..legacy.len() { assert!(decode_view(&legacy[..end]).is_err()); }
+    legacy.push(0); assert!(decode_view(&legacy).is_err());
     for (tag, ty) in STORAGE_TYPES.iter().enumerate() {
         let mut v = view();
         v.columns[0].storage_type = ty.clone();
@@ -47,13 +55,13 @@ fn malformed_wire_and_every_truncation_fail_closed() {
         assert!(decode_view(&bytes[..end]).is_err());
     }
     let mut trailing = bytes.clone();
-    let n = trailing.len(); trailing[n-24..n-20].copy_from_slice(&2u32.to_be_bytes());
-    trailing.extend_from_slice(&bytes[n-20..]); assert!(decode_view(&trailing).is_err());
+    trailing[59..63].copy_from_slice(&2u32.to_be_bytes());
+    trailing.extend_from_slice(&bytes[63..83]); assert!(decode_view(&trailing).is_err());
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(decode_view(&trailing).is_err());
     for (offset, value) in [
-        (0, 2),
+        (0, 3),
         (9, 255),
         (13, 255),
         (14, 255),
@@ -61,6 +69,8 @@ fn malformed_wire_and_every_truncation_fail_closed() {
         (40, 255),
         (59, 255),
         (71, 255),
+        (90, 3),
+        (98, 5),
     ] {
         let mut bad = bytes.clone();
         bad[offset] = value;
@@ -78,7 +88,7 @@ fn bounded_utf8_names_ids_and_dependency_order() {
     assert_eq!(decode_view(&encode_view(&v).unwrap()).unwrap(), v);
     v.select.push('x');
     assert!(encode_view(&v).is_err());
-    for change in 0..10 {
+    for change in 0..12 {
         let mut bad = view();
         match change {
             0 => bad.dependencies.push(bad.dependencies[0].clone()),
@@ -90,7 +100,9 @@ fn bounded_utf8_names_ids_and_dependency_order() {
             6 => bad.columns.push(bad.columns[0].clone()),
             7 => bad.select.clear(),
             8 => bad.dependencies[0].relation = 0,
-            _ => bad.dependencies[0].columns.push(0),
+            9 => bad.dependencies[0].columns.push(0),
+            10 => bad.columns[0].source = Some((3, 4)),
+            _ => bad.columns[0].source = Some((2, 5)),
         }
         assert!(encode_view(&bad).is_err(), "case {change}");
     }
@@ -101,5 +113,16 @@ fn bounded_utf8_names_ids_and_dependency_order() {
     }
     let mut v = view();
     v.dependencies.insert(0, SqlViewDependency { relation: 9, columns: vec![] });
+    assert!(encode_view(&v).is_err());
+}
+
+#[test]
+fn mixed_view_source_bindings_are_rejected() {
+    let mut v = view();
+    let mut column = v.columns[0].clone();
+    column.id += 1; column.name = "other".into(); column.source = None;
+    v.columns.push(column);
+    assert!(encode_view(&v).is_err());
+    v.columns.reverse();
     assert!(encode_view(&v).is_err());
 }

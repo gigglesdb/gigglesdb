@@ -7,7 +7,7 @@ fn fixture(ids: &Range<u64>) -> CatalogParts {
     p.ext = CatalogExt::default();
     p.ext.schemas.insert("s".into(), relational::schemas::Schema { id: t+2, owner: "owner".into() });
     p.sql_views.insert(t+3, SqlViewDef { schema: t+2, name: "v".into(),
-        columns: vec![SqlViewColumn { id: t+4, name: "c".into(), storage_type: DataType::BigInt, pg_type_oid: 20, typmod: -1 }],
+        columns: vec![SqlViewColumn { id: t+4, name: "c".into(), storage_type: DataType::BigInt, pg_type_oid: 20, typmod: -1, source: Some((t, t+1)) }],
         select: "SELECT id FROM serial_table".into(),
         dependencies: vec![SqlViewDependency { relation: t, columns: vec![t+1] }] });
     p
@@ -86,11 +86,13 @@ fn views_validate_names_ids_dependencies_comments_and_drops() {
     let mut v = chain.sql_views[&(t+3)].clone();
     v.name = "w".into(); v.columns[0].id = t+6;
     v.dependencies = vec![SqlViewDependency { relation: t+3, columns: vec![t+4] }];
+    v.columns[0].source = Some((t+3, t+4));
     chain.sql_views.insert(t+5, v);
     parts_records(&chain).unwrap();
     let mut removed = chain.clone(); removed.sql_views.remove(&(t+3)); removed.comments.clear();
     assert!(matches!(parts_records(&removed), Err(CoreError::Sql(SqlError::DependentObjects))));
     chain.sql_views.get_mut(&(t+3)).unwrap().dependencies = vec![SqlViewDependency { relation: t+5, columns: vec![t+6] }];
+    chain.sql_views.get_mut(&(t+3)).unwrap().columns[0].source = Some((t+5, t+6));
     assert!(matches!(parts_records(&chain), Err(CoreError::Sql(SqlError::DependentObjects))));
     // Direct writes exercise commit-time validation against the latest catalog.
     tx.delete(Keyspace::Catalog, table_key(t)).unwrap();
@@ -179,4 +181,24 @@ fn view_column_rewrite_waiting_behind_comment_serializes() {
     catalog.commit_ddl(comment).unwrap();
     assert!(matches!(rewrite.join().unwrap(), Err(TxnError::Serialization(_))));
     }
+}
+
+#[test]
+fn invalid_view_bindings_fail_commit_content_check_and_open() {
+    let (mem, seq, locks, catalog) = setup(); let ids = catalog.reserve_ids(8).unwrap();
+    let wanted = fixture(&ids); let view = &wanted.sql_views[&(ids.start+3)];
+    let mut tx = txn(&seq, &locks, 1);
+    catalog.apply_diff(&mut tx, &empty(), &wanted, &ids, None, &|| false).unwrap();
+    catalog.commit_ddl(tx).unwrap();
+    let mut bad = encode_view(view).unwrap(); let end = bad.len();
+    bad[end-8..].copy_from_slice(&999u64.to_be_bytes());
+    let mut tx = txn(&seq, &locks, 2);
+    tx.put(Keyspace::Catalog, view_key(ids.start+3), bad.clone()).unwrap();
+    assert!(matches!(catalog.commit_ddl(tx), Err(TxnError::Kv(KvError::Corrupt(_)))));
+    assert_eq!(parts(&catalog, &seq).sql_views, wanted.sql_views);
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Catalog, codec::user_key_seek_at(&view_key(ids.start+3), seq.visible_ts()), mvcc::encode_live(&bad));
+    mem.write(batch, Durability::Sync).unwrap();
+    assert!(matches!(content_check::check(seq.kv(), features(seq.kv())), Err(super::super::super::meta::FormatError::Corrupt(_))));
+    assert!(matches!(Catalog::open(seq.clone(), locks, Arc::new(SequenceAllocator::new(Arc::new(Kv::new(mem)), 64))), Err(CoreError::Corrupt(_))));
 }
