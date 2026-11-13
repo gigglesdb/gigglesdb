@@ -386,12 +386,12 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         (
             vec![column("id", DataType::BigInt, true); 2],
             vec!["id".into()],
-            Error::Core("Sql(Duplicate)".into()),
+            Error::Duplicate,
         ),
         (
             vec![column("id", DataType::BigInt, true)],
             vec!["id".into(), "id".into()],
-            Error::Core("Sql(Duplicate)".into()),
+            Error::Duplicate,
         ),
         (
             vec![column("id", DataType::BigInt, true)],
@@ -431,7 +431,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         &admin,
         &engine,
         &create("base"),
-        Error::Core("Sql(Duplicate)".into()),
+        Error::Duplicate,
     );
     let valid = create(&"a".repeat(63));
     let result = engine.execute_catalog(&valid).unwrap();

@@ -205,10 +205,10 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
         .iter()
         .find(|e| e.name.as_deref() == Some("NativeErrorClass"))
         .unwrap();
-    assert_eq!(error.value.len(), 19); // sentinel plus the eighteen stable core classes
+    assert_eq!(error.value.len(), 20); // sentinel plus the eighteen stable core classes
     assert_eq!(
         error.value.last().unwrap().name.as_deref(),
-        Some("NATIVE_ERROR_CLASS_PLAN_REQUIRED")
+        Some("NATIVE_ERROR_CLASS_DUPLICATE")
     );
     let reply = file
         .message_type

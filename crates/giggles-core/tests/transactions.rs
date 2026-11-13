@@ -8,7 +8,7 @@ use giggles_core::{
         MAX_EMIT_VALUES, MAX_EXPRESSION_NODES, MAX_INPUT, MAX_RETAINED_LOCAL_BYTES,
         MAX_TRANSACTION_ITEMS, Projection, Request, Sort, Transaction, TransactionStep, ValueExpr,
     },
-    relational::{DataType, MAX_TRANSACTIONS, SqlError, SqlRow, Value as V},
+    relational::{DataType, MAX_TRANSACTIONS, SqlRow, Value as V},
 };
 use std::{
     collections::BTreeSet,
@@ -604,7 +604,7 @@ fn transaction_late_failure_rolls_back_rows_generation_and_version_allocator() {
         &engine,
         &duplicate,
         &Bindings::new(),
-        Error::Core(CoreError::Sql(SqlError::Duplicate).to_string()),
+        Error::Duplicate,
     );
 }
 

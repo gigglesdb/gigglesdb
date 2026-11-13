@@ -361,7 +361,7 @@ fn insert_many_canonical_keys_and_existing_conflicts_are_atomic() {
         ],
     };
     let ordinary_error = engine.execute(&existing, &Bindings::new()).unwrap_err();
-    assert_eq!(ordinary_error, Error::Core("Sql(Duplicate)".into()));
+    assert_eq!(ordinary_error, Error::Duplicate);
     runtime_failure(
         &admin,
         &engine,
@@ -450,7 +450,7 @@ fn insert_many_row_and_table_limits_are_finite() {
         &engine,
         &many(&["id"], vec![vec![int(1)]], 1),
         &Bindings::new(),
-        Error::Core("Sql(Duplicate)".into()),
+        Error::Duplicate,
     );
     let (_, admin, engine) = fixture();
     seed_ids(&admin, MAX_INSERT_ROWS - 1);
@@ -646,7 +646,7 @@ fn insert_many_prepared_and_transaction_local_contracts() {
     let before = digest(&admin);
     assert_eq!(
         engine.execute_bound(&bound),
-        Err(Error::Core("Sql(Duplicate)".into()))
+        Err(Error::Duplicate)
     );
     assert_eq!(digest(&admin), before);
     admin

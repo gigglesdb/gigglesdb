@@ -530,7 +530,7 @@ fn transaction_preserves_present_empty_emit_and_all_step_and_emit_arms() {
 }
 
 #[test]
-fn all_eighteen_native_errors_are_fixed_and_redact_internal_details() {
+fn all_nineteen_native_errors_are_fixed_and_redact_internal_details() {
     let errors = [
         o::Error::Syntax { offset: usize::MAX },
         o::Error::Unsupported,
@@ -550,10 +550,14 @@ fn all_eighteen_native_errors_are_fixed_and_redact_internal_details() {
         o::Error::RequirementFailed,
         o::Error::DuplicateTarget,
         o::Error::PlanRequired,
+        o::Error::Duplicate,
     ];
     for (index, error) in errors.into_iter().enumerate() {
         let v = encode_error(error);
         assert_eq!(v.kind, index as i32 + 1);
+        use prost::Message;
+        let decoded = p::NativeError::decode(v.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, v);
         let json = serde_json::to_value(v).unwrap();
         assert!(!json.to_string().contains("PRIVATE"));
         assert_eq!(json.get("syntaxOffset").is_some(), index == 0);

@@ -93,6 +93,7 @@ pub enum Error {
     RequirementFailed,
     DuplicateTarget,
     PlanRequired,
+    Duplicate,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -100,6 +101,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// SQLSTATE for the duplicate-key identity preserved by native execution.
+    pub fn sqlstate(&self) -> Option<&'static str> {
+        match self {
+            Self::Duplicate => Some("23505"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueExpr {
@@ -424,6 +434,7 @@ pub struct Engine {
 fn core(e: CoreError) -> Error {
     match e {
         CoreError::Sql(SqlError::Conflict) => Error::Conflict,
+        CoreError::Sql(SqlError::Duplicate) => Error::Duplicate,
         _ => Error::Core(e.to_string()),
     }
 }
@@ -2539,4 +2550,44 @@ fn insert_many(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod duplicate_error_encoding_regression {
+    use super::Error;
+    #[test]
+    fn existing_error_bytes_are_stable() {
+        let errors = [
+            Error::Syntax { offset: 7 },
+            Error::Unsupported,
+            Error::Limit,
+            Error::Bind("x".into()),
+            Error::Type,
+            Error::NotFound,
+            Error::AmbiguousMatch,
+            Error::ConditionFailed,
+            Error::TooManyMatches,
+            Error::ClaimNotConsumed,
+            Error::Conflict,
+            Error::Core("x".into()),
+            Error::Unknown,
+            Error::Overflow,
+            Error::DivisionByZero,
+            Error::RequirementFailed,
+            Error::DuplicateTarget,
+            Error::PlanRequired,
+        ];
+        for (index, error) in errors.iter().enumerate() {
+            let mut expected = (index as u32).to_le_bytes().to_vec();
+            match index {
+                0 => expected.extend(7u64.to_le_bytes()),
+                3 | 11 => {
+                    expected.extend(1u64.to_le_bytes());
+                    expected.push(b'x');
+                }
+                _ => {}
+            }
+            assert_eq!(bincode::serialize(error).unwrap(), expected);
+        }
+    }
 }

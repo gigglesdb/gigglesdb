@@ -365,7 +365,7 @@ fn insert_many_text_tree_and_bound_execution_match_without_sql() {
     let before = digest(&admin);
     assert_eq!(
         with_sql_parser_forbidden(|| engine.execute_bound(&bound)),
-        Err(Error::Core("Sql(Duplicate)".into()))
+        Err(Error::Duplicate)
     );
     assert_eq!(digest(&admin), before);
     admin

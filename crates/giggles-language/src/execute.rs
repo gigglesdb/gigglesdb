@@ -1209,6 +1209,7 @@ pub(crate) fn error(error: operations::Error) -> Error {
         operations::Error::RequirementFailed => Error::RequirementFailed,
         operations::Error::DuplicateTarget => Error::DuplicateTarget,
         operations::Error::PlanRequired => Error::PlanRequired,
+        operations::Error::Duplicate => Error::Duplicate,
     }
 }
 

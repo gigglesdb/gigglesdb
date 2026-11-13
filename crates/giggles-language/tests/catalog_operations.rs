@@ -436,7 +436,7 @@ fn catalog_rejections_and_populated_policy_are_atomic() {
     let before = digest(&admin);
     assert_eq!(
         engine.execute_catalog(&create("items")),
-        Err(Error::Core("Sql(Duplicate)".into()))
+        Err(Error::Duplicate)
     );
     assert_eq!(digest(&admin), before);
     for source in [

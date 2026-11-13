@@ -1408,6 +1408,14 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_is_not_terminal() {
+        assert!(!super::super::terminal(&Error::Duplicate));
+        assert!(!super::super::terminal(&Error::Core(
+            "Sql(Duplicate)".into()
+        )));
+    }
+
+    #[test]
     fn golden_result_and_terminal_tags_do_not_follow_rust_enum_layout() {
         for (tag, error) in [
             Error::NotFound,
@@ -1435,6 +1443,7 @@ mod tests {
             Error::Unsupported,
             Error::Bind("column".into()),
             Error::Core("Sql(Duplicate)".into()),
+            Error::Duplicate,
         ] {
             assert_eq!(encode(&Err(error)), Err(OnceError::InvalidOutcome));
         }

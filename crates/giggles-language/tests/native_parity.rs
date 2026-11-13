@@ -112,10 +112,19 @@ struct Observation {
     step: Step,
 }
 fn parity(sql: &Observation, native: &Observation) -> bool {
-    sql == native // No unsupported/error wildcard can produce a pass.
+    sql == native
+        || (sql.state == native.state
+            && matches!(
+                (&sql.step, &native.step),
+                (
+                    Step::Sql(SqlError::Duplicate),
+                    Step::Native(Error::Duplicate)
+                )
+            )
+            && Error::Duplicate.sqlstate() == Some("23505"))
 }
 #[test]
-fn legacy_create_insert_update_select_and_duplicate_gap() {
+fn legacy_create_insert_update_select_and_duplicate_parity() {
     let (sql_db, sql_admin) = Database::fresh(StorageEngine::Legacy);
     let (native_db, native_admin) = Database::fresh(StorageEngine::Legacy);
     let sql_texts = [
@@ -150,11 +159,10 @@ fn legacy_create_insert_update_select_and_duplicate_gap() {
         assert_eq!(left.state, right.state, "step {i}");
         assert_eq!(left.state[0].rows.len(), [0, 1, 2, 2, 2, 2][i]);
         if i == 5 {
-            // TODO(R2 plan item 9): preserve structured core errors in native.
-            // Assert the opaque Core variant; never derive a SQLSTATE from text.
             assert_eq!(left.step, Step::Sql(SqlError::Duplicate));
-            assert!(matches!(right.step, Step::Native(Error::Core(_))));
-            assert!(!parity(&left, &right), "known error gap is not parity");
+            assert_eq!(right.step, Step::Native(Error::Duplicate));
+            assert!(parity(&left, &right), "step {i}: SQLSTATE parity");
+            assert_eq!(Error::Duplicate.sqlstate(), Some("23505"));
             assert_eq!(left.state[0].rows, expected_rows, "failed insert is atomic");
         } else {
             assert!(parity(&left, &right), "step {i}: {left:?} != {right:?}");

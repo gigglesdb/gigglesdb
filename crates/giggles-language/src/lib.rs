@@ -275,6 +275,7 @@ pub enum Error {
     RequirementFailed,
     DuplicateTarget,
     PlanRequired,
+    Duplicate,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -282,6 +283,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// SQLSTATE for the duplicate-key identity preserved by native execution.
+    pub fn sqlstate(&self) -> Option<&'static str> {
+        match self {
+            Self::Duplicate => Some("23505"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueExpr {
@@ -749,5 +759,35 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
         },
         trusted_admin: true,
         automatic_retries: false,
+    }
+}
+
+#[cfg(test)]
+mod duplicate_error_encoding_regression {
+    use super::Error;
+    #[test]
+    fn existing_error_bytes_are_stable() {
+        for (error, expected) in [
+            (Error::Syntax { offset: 7 }, r#"{"Syntax":{"offset":7}}"#),
+            (Error::Unsupported, r#""Unsupported""#),
+            (Error::Limit, r#""Limit""#),
+            (Error::Bind("x".into()), r#"{"Bind":"x"}"#),
+            (Error::Type, r#""Type""#),
+            (Error::NotFound, r#""NotFound""#),
+            (Error::AmbiguousMatch, r#""AmbiguousMatch""#),
+            (Error::ConditionFailed, r#""ConditionFailed""#),
+            (Error::TooManyMatches, r#""TooManyMatches""#),
+            (Error::ClaimNotConsumed, r#""ClaimNotConsumed""#),
+            (Error::Conflict, r#""Conflict""#),
+            (Error::Core("x".into()), r#"{"Core":"x"}"#),
+            (Error::Unknown, r#""Unknown""#),
+            (Error::Overflow, r#""Overflow""#),
+            (Error::DivisionByZero, r#""DivisionByZero""#),
+            (Error::RequirementFailed, r#""RequirementFailed""#),
+            (Error::DuplicateTarget, r#""DuplicateTarget""#),
+            (Error::PlanRequired, r#""PlanRequired""#),
+        ] {
+            assert_eq!(serde_json::to_vec(&error).unwrap(), expected.as_bytes());
+        }
     }
 }

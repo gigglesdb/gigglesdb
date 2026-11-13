@@ -607,6 +607,7 @@ pub(crate) fn encode_error(v: o::Error) -> p::NativeError {
         o::Error::RequirementFailed => 16,
         o::Error::DuplicateTarget => 17,
         o::Error::PlanRequired => 18,
+        o::Error::Duplicate => 19,
     };
     p::NativeError {
         kind,
