@@ -4121,3 +4121,7 @@ mod catalog_typmods_tests;
 mod text_kind_tests;
 
 pub mod logical_types;
+
+#[cfg(test)]
+#[path = "storage/v2_join_cache_tests.rs"]
+pub(crate) mod v2_join_cache_tests;

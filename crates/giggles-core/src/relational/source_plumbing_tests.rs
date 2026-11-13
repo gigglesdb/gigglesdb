@@ -211,7 +211,8 @@ fn join_lookups_read_only_the_supplied_source() {
     )
     .unwrap();
     let (result, source) = query_from_source(&state, &prepared, &[]);
-    source.assert_calls(1, 3, 0);
+    // one get per distinct join key per statement (join PK-lookup cache)
+    source.assert_calls(1, 2, 0);
     assert_eq!(result.rows.len(), 3);
     assert_eq!(
         result.rows[2].values,
@@ -233,7 +234,8 @@ fn grouped_and_aggregate_queries_read_only_the_supplied_source() {
         ),
         (
             "SELECT u.label, count(*) FROM source_t t JOIN source_u u ON u.id = t.bucket GROUP BY u.label ORDER BY u.label",
-            3,
+            // one get per distinct join key per statement (join PK-lookup cache)
+            2,
             vec![
                 vec![Value::Text("ten".into()), Value::Int(2)],
                 vec![Value::Text("twenty".into()), Value::Int(1)],

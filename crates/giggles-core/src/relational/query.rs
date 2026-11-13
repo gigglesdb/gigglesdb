@@ -4042,6 +4042,15 @@ fn join_rows<'a>(
     outer: &'a [Vec<Value>],
     charge_base: bool,
 ) -> impl Iterator<Item = R<Tuple>> + 'a {
+    // Retain owned point results only for this iterator's lifetime.
+    let mut point_cache = std::collections::HashMap::<
+        (usize, Vec<u8>), Option<(Vec<u8>, SqlRow)>>::new();
+    let mut point_retention = scan::Retention::new(scan::retention_limit());
+    let mut cache_full = false;
+    #[cfg(test)]
+    let cache_disabled = super::v2_join_cache_tests::DISABLED.get();
+    #[cfg(not(test))]
+    let cache_disabled = false;
     struct Frame<'a> {
         rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
         matched: bool,
@@ -4132,7 +4141,34 @@ fn join_rows<'a>(
                     )? }
                 } else {
                     let candidate = match join.key(&row)? {
-                        Some(key) => source.get(table, &encode_key(&key)?)?,
+                        Some(key) => {
+                            let key = (depth, encode_key(&key)?);
+                            if let Some(cached) = point_cache.get(&key) {
+                                cached.as_ref().map(|(key, row)| scan::SourceRow {
+                                    key: std::borrow::Cow::Owned(key.clone()),
+                                    row: std::borrow::Cow::Owned(row.clone()),
+                                })
+                            } else {
+                                #[cfg(test)]
+                                super::v2_join_cache_tests::GETS.set(super::v2_join_cache_tests::GETS.get() + 1);
+                                let candidate = source.get(table, &key.1)?;
+                                if !cache_full && !cache_disabled {
+                                    let bytes = key.1.len().saturating_add(
+                                        std::mem::size_of::<((usize, Vec<u8>), Option<(Vec<u8>, SqlRow)>)>()
+                                    ).saturating_add(candidate.as_ref().map_or(0, |c| {
+                                        c.key.len().saturating_add(c.row.values.iter().map(value_bytes).sum::<usize>())
+                                    }));
+                                    if point_retention.charge(bytes).is_ok() {
+                                        point_cache.insert(key, candidate.as_ref().map(|c| {
+                                            (c.key.to_vec(), c.row.as_ref().clone())
+                                        }));
+                                    } else {
+                                        cache_full = true;
+                                    }
+                                }
+                                candidate
+                            }
+                        },
                         None => None,
                     };
                     Box::new(candidate.into_iter().map(Ok))
