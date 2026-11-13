@@ -1,6 +1,10 @@
 //! Point join cache equivalence.
 use super::*;
 thread_local! {
+    pub(crate) static BUCKET_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BUCKET_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static BUCKET_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static BUCKET_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static GETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -55,6 +59,60 @@ fn v2_transaction_own_writes_are_visible() {
     assert_eq!(GETS.get(), 4);
     assert_eq!(cached, plain);
     assert_eq!(cached.len(), 5);
+    session.execute("ROLLBACK", &[], None).unwrap();
+    drop(session); drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+#[cfg(feature = "engine-rocksdb")]
+fn scan_buckets_preserve_order_and_fallback() {
+    use crate::storage::{Admin, Engine, Limits};
+    let path = std::env::temp_dir().join(format!("scan-buckets-{}", std::process::id()));
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    for sql in [
+        "CREATE TABLE o(id bigint PRIMARY KEY,k int,t text)",
+        "CREATE TABLE i(id bigint PRIMARY KEY,k bigint,t text,q bigint)",
+        "CREATE TABLE p(id bigint PRIMARY KEY,v bigint)",
+        "BEGIN",
+        "INSERT INTO o VALUES(1,1,'a'),(2,1,'a'),(3,9,'z'),(4,NULL,NULL)",
+        "INSERT INTO i VALUES(1,1,'a',2),(2,1,'a',3),(3,NULL,NULL,4),(4,2,'b',5)",
+        "INSERT INTO p VALUES(1,10),(2,20)",
+    ] { session.execute(sql, &[], None).unwrap(); }
+    for id in 5..=2000 {
+        session.execute(&format!("INSERT INTO o VALUES({id},1,'a')"), &[], None).unwrap();
+    }
+    for count in [64usize, 65, 2000] {
+        let sql = format!("SELECT o.id,i.id FROM o JOIN i ON o.k=i.k WHERE o.id <= {count}");
+        BUCKET_DISABLED.set(true);
+        let plain = session.execute(&sql, &[], None).unwrap().rows;
+        BUCKET_DISABLED.set(false); BUCKET_BUILDS.set(0); BUCKET_PROBES.set(0);
+        let adaptive = session.execute(&sql, &[], None).unwrap().rows;
+        assert_eq!(adaptive, plain);
+        assert_eq!(BUCKET_BUILDS.get(), usize::from(count > 64));
+        assert_eq!(BUCKET_PROBES.get(), count.saturating_sub(64));
+    }
+    for sql in [
+        "SELECT o.id,i.id FROM o JOIN i ON o.k=i.k",
+        "SELECT o.id,i.id FROM o LEFT JOIN i ON o.k=i.k",
+        "SELECT o.id,i.id FROM o LEFT JOIN i ON o.k=i.k AND o.t=i.t",
+        "SELECT o.id,i.id FROM o LEFT JOIN i ON o.t=i.t",
+        "SELECT o.id,sum(i.q*p.v) FROM o JOIN i ON o.k=i.k JOIN p ON p.id=i.id GROUP BY o.id",
+    ] {
+        BUCKET_DISABLED.set(true);
+        let plain = session.execute(sql, &[], None).unwrap().rows;
+        BUCKET_DISABLED.set(false); BUCKET_BUILDS.set(0); BUCKET_PROBES.set(0);
+        let cached = session.execute(sql, &[], None).unwrap().rows;
+        assert_eq!(cached, plain, "{sql}");
+        assert_eq!(BUCKET_BUILDS.get(), 1, "{sql}");
+        assert!(BUCKET_PROBES.get() > 1, "{sql}");
+        BUCKET_LIMIT.set(Some(1)); BUCKET_BUILDS.set(0);
+        let fallback = session.execute(sql, &[], None).unwrap().rows;
+        BUCKET_LIMIT.set(None);
+        assert_eq!(fallback, plain, "{sql}");
+        assert_eq!(BUCKET_BUILDS.get(), 0);
+    }
     session.execute("ROLLBACK", &[], None).unwrap();
     drop(session); drop(admin);
     std::fs::remove_dir_all(path).unwrap();

@@ -4051,6 +4051,11 @@ fn join_rows<'a>(
     let cache_disabled = super::v2_join_cache_tests::DISABLED.get();
     #[cfg(not(test))]
     let cache_disabled = false;
+    type Buckets = std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, SqlRow)>>;
+    let mut buckets: Vec<Option<Buckets>> = (0..query.joins.len()).map(|_| None).collect();
+    let mut bucket_disabled = vec![false; query.joins.len()];
+    const BUCKET_AFTER_PROBES: usize = 64;
+    let mut bucket_probes = vec![0usize; query.joins.len()];
     struct Frame<'a> {
         rows: Box<dyn Iterator<Item = R<scan::SourceRow<'a>>> + 'a>,
         matched: bool,
@@ -4131,7 +4136,56 @@ fn join_rows<'a>(
                         .map(|(outer, inner, outer_ty, inner_ty)|
                             Ok((inner.column, functions::join_key(row.get(*outer), outer_ty, inner_ty)?)))
                         .collect::<R<Vec<_>>>()?;
-                    if let Some(rows) = source.join_probe(table, &keys, false)? { rows } else { source.scan(
+                    #[cfg(test)]
+                    let disabled = super::v2_join_cache_tests::BUCKET_DISABLED.get();
+                    #[cfg(not(test))]
+                    let disabled = false;
+                    bucket_probes[depth] = bucket_probes[depth].saturating_add(1);
+                    let eligible = bucket_probes[depth] > BUCKET_AFTER_PROBES && !disabled && !bucket_disabled[depth]
+                        && source.streams_reductions() && !keys.is_empty()
+                        && keys.len() == join.equalities.len();
+                    if eligible && buckets[depth].is_none() {
+                        #[cfg(test)]
+                        let limit = super::v2_join_cache_tests::BUCKET_LIMIT.get().unwrap_or(scan::retention_limit());
+                        #[cfg(not(test))]
+                        let limit = scan::retention_limit();
+                        let mut retention = scan::Retention::new(limit);
+                        let mut built = Buckets::new();
+                        for candidate in source.scan(table, &scan::KeyRange {
+                            lo: std::ops::Bound::Unbounded,
+                            hi: std::ops::Bound::Unbounded,
+                        }, scan::Direction::Forward)? {
+                            crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
+                            let candidate = candidate?;
+                            let values = keys.iter().map(|(column, _)| candidate.row.values[*column].clone()).collect::<Vec<_>>();
+                            if values.contains(&Value::Null) { continue; }
+                            let key = encode_key(&values)?;
+                            let bytes = key.len().saturating_add(candidate.key.len())
+                                .saturating_add(std::mem::size_of::<(Vec<u8>, SqlRow)>())
+                                .saturating_add(candidate.row.values.iter().map(value_bytes).sum::<usize>());
+                            if retention.charge(bytes).is_err() {
+                                bucket_disabled[depth] = true;
+                                break;
+                            }
+                            built.entry(key).or_default().push((candidate.key.to_vec(), candidate.row.as_ref().clone()));
+                        }
+                        if !bucket_disabled[depth] {
+                            buckets[depth] = Some(built);
+                            #[cfg(test)]
+                            super::v2_join_cache_tests::BUCKET_BUILDS.set(super::v2_join_cache_tests::BUCKET_BUILDS.get() + 1);
+                        }
+                    }
+                    if eligible && !bucket_disabled[depth] {
+                        let values = keys.iter().map(|(_, value)| value.clone().unwrap_or(Value::Null)).collect::<Vec<_>>();
+                        let candidates = if values.contains(&Value::Null) { Vec::new() } else {
+                            buckets[depth].as_ref().and_then(|b| b.get(&encode_key(&values).ok()?)).cloned().unwrap_or_default()
+                        };
+                        #[cfg(test)]
+                        super::v2_join_cache_tests::BUCKET_PROBES.set(super::v2_join_cache_tests::BUCKET_PROBES.get() + 1);
+                        Box::new(candidates.into_iter().map(|(key, row)| Ok(scan::SourceRow {
+                            key: std::borrow::Cow::Owned(key), row: std::borrow::Cow::Owned(row),
+                        })))
+                    } else if let Some(rows) = source.join_probe(table, &keys, false)? { rows } else { source.scan(
                         table,
                         &scan::KeyRange {
                             lo: std::ops::Bound::Unbounded,

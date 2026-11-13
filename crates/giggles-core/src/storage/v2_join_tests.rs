@@ -113,7 +113,7 @@ fn parity_nulls_residuals_and_own_writes() {
 }
 
 #[test]
-fn unindexed_visit_limit() {
+fn unindexed_visit_limit_and_equality_buckets() {
     let f = Fixture::new();
     f.execute("CREATE TABLE a(id bigint PRIMARY KEY, v bigint)");
     f.execute("CREATE TABLE b(id bigint PRIMARY KEY, v bigint)");
@@ -126,5 +126,13 @@ fn unindexed_visit_limit() {
         }
     }
     txn.commit().unwrap();
-    assert_eq!(f.admin().sql_session().execute("SELECT count(*) FROM a JOIN b ON a.v=b.v", &[], None), Err(CoreError::Sql(SqlError::Limit)));
+    let mut session = f.admin().sql_session();
+    assert_eq!(values(&mut session, "SELECT count(*) FROM a JOIN b ON a.v=b.v"), vec![vec![Int(4097)]]);
+    // Equality buckets avoid the Cartesian scan, while the original path retains its visit bound.
+    relational::v2_join_cache_tests::BUCKET_DISABLED.set(true);
+    let uncached = session.execute("SELECT count(*) FROM a JOIN b ON a.v=b.v", &[], None);
+    relational::v2_join_cache_tests::BUCKET_DISABLED.set(false);
+    assert_eq!(uncached, Err(CoreError::Sql(SqlError::Limit)));
+    // A non-equality join cannot use buckets and must still enforce MAX_JOIN_VISITS.
+    assert_eq!(session.execute("SELECT count(*) FROM a JOIN b ON a.v <= b.v", &[], None), Err(CoreError::Sql(SqlError::Limit)));
 }
