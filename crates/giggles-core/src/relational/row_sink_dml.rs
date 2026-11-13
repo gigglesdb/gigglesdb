@@ -278,9 +278,22 @@ pub(super) fn cascade(
     let mut work = ActionWork { queue: std::collections::VecDeque::new(),
         retention: scan::Retention::new(scan::retention_limit()), visited: BTreeSet::new(), pending, immediate: DeferralState::default() };
     let mut output = scan::Retention::new(MAX_RESULT_BYTES);
+    let candidates = if !pk_move && keys.is_none() {
+        searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
+            .map(|keys| sink.mutation_candidates(&table, &keys)).transpose()?.flatten()
+    } else { None };
+    let point = candidates.is_some();
+    let mut candidates = candidates;
     let mut after = None;
-    while let Some((last, mut rows)) = sink.read_page(&table, after)? {
-        after = Some(last);
+    loop {
+        let mut rows = if point {
+            let Some(rows) = candidates.take() else { break; };
+            rows
+        } else {
+            let Some((last, rows)) = sink.read_page(&table, after)? else { break; };
+            after = Some(last);
+            rows
+        };
         // Own writes can move a primary key ahead of the physical cursor.
         rows.retain(|key, row| row.version < first_version && keys.as_ref().is_none_or(|keys| keys.contains(key)));
         // Immediate PK/UNIQUE checks precede evaluation of the next logical row.

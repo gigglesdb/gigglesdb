@@ -1,3 +1,5 @@
+#[path = "v2_cascade_point_tests.rs"]
+mod v2_cascade_point_tests;
 #[path = "v2_mutation_point_tests.rs"]
 mod mutation_point;
 

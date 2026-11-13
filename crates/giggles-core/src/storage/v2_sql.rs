@@ -869,6 +869,28 @@ impl RowSink for SqlRows<'_> {
             .map_err(CoreError::Sql)?;
         Ok(Some((last, rows)))
     }
+    fn mutation_candidates(&mut self, table: &TableDef, keys: &[Vec<relational::Value>])
+        -> Result<Option<DdlRows>, CoreError> {
+        #[cfg(test)]
+        if DISABLE_MUTATION_POINTS.get() { return Ok(None); }
+        let entry = TableEntry { def: table.clone(), heap: self.parts.heap.contains(&table.id),
+            columns_ext: BTreeMap::new() };
+        let mut rows = DdlRows::new();
+        let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+        for key in keys {
+            crate::cancellation::check()?;
+            #[cfg(test)]
+            MUTATION_POINT_READS.set(MUTATION_POINT_READS.get() + 1);
+            if let Some(row) = self.db.rows.get(self.txn, &entry, key)? {
+                #[cfg(test)]
+                MUTATION_ROWS_READ.set(MUTATION_ROWS_READ.get() + 1);
+                let row = SqlRow { values: row.values, version: row.version };
+                if !charge_mutation_point(table, &row, &mut retention)? { return Ok(None); }
+                rows.insert(relational::row_sink::row_key(table, &row).map_err(CoreError::Sql)?, row);
+            }
+        }
+        Ok(Some(rows))
+    }
     fn mutation_pages(
         &mut self,
         table: &TableDef,

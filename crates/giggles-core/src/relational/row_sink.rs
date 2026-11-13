@@ -96,6 +96,10 @@ pub(crate) trait RowSink {
     ) -> Result<Option<(Vec<u8>, DdlRows)>, CoreError> {
         Err(CoreError::Sql(SqlError::Unsupported))
     }
+    /// Read bounded candidates without publishing; other sinks retain the cursor.
+    fn mutation_candidates(&mut self, _table: &TableDef, _keys: &[Vec<Value>])
+        -> Result<Option<DdlRows>, CoreError> { Ok(None) }
+
     /// Optional exact PK candidates; other sinks retain the existing page scan.
     fn mutation_pages(
         &mut self,
