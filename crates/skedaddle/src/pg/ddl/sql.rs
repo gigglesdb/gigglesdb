@@ -51,7 +51,7 @@ impl TriggerSql {
 DECLARE details jsonb; v bigint;
 BEGIN
   SELECT coalesce(jsonb_agg(jsonb_build_object(
-    'classid',d.classid,'objid',d.objid,'objsubid',d.objsubid,
+    'classid',d.classid::bigint,'objid',d.objid::bigint,'objsubid',d.objsubid,
     'command_tag',d.command_tag,'object_type',d.object_type,
     'schema_name',d.schema_name,'object_identity',d.object_identity,'in_extension',d.in_extension,
     'columns',(SELECT jsonb_agg(jsonb_build_object(
@@ -59,16 +59,16 @@ BEGIN
       'notnull',a.attnotnull,'dropped',a.attisdropped,'identity',a.attidentity,'generated',a.attgenerated,
       'missing',a.atthasmissing,'missing_value',to_jsonb(a.attmissingval),
       'default',pg_get_expr(ad.adbin,ad.adrelid),
-      'attributes',jsonb_build_object('type_oid',a.atttypid,'typmod',a.atttypmod,
-        'collation',a.attcollation,'acl',a.attacl,'storage',a.attstorage,
+      'attributes',jsonb_build_object('type_oid',a.atttypid::bigint,'typmod',a.atttypmod,
+        'collation',a.attcollation::bigint,'acl',a.attacl,'storage',a.attstorage,
         'compression',a.attcompression,'options',a.attoptions,'fdwoptions',a.attfdwoptions,
         'local',a.attislocal,'inhcount',a.attinhcount)) ORDER BY a.attnum)
       FROM pg_attribute a LEFT JOIN pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
       WHERE d.classid='pg_class'::regclass AND a.attrelid=d.objid AND a.attnum>0),
     'relation',(SELECT jsonb_build_object('kind',c.relkind,'partition',c.relispartition,
-      'filenode',c.relfilenode,'name',c.relname,'namespace',c.relnamespace,
-      'owner',c.relowner,'acl',c.relacl,'options',c.reloptions,'replica_identity',c.relreplident,
-      'tablespace',c.reltablespace,'persistence',c.relpersistence,'access_method',c.relam,
+      'filenode',c.relfilenode::bigint,'name',c.relname,'namespace',c.relnamespace::bigint,
+      'owner',c.relowner::bigint,'acl',c.relacl,'options',c.reloptions,'replica_identity',c.relreplident,
+      'tablespace',c.reltablespace::bigint,'persistence',c.relpersistence,'access_method',c.relam::bigint,
       'row_security',c.relrowsecurity,'force_row_security',c.relforcerowsecurity,
       'partition_key',CASE WHEN c.relkind='p' THEN pg_get_partkeydef(c.oid) END,
       'partition_bound',c.relpartbound::text,
@@ -76,7 +76,7 @@ BEGIN
       'indexes',(SELECT coalesce(jsonb_agg(jsonb_build_array(pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready,i.indislive) ORDER BY i.indexrelid),'[]'::jsonb) FROM pg_index i WHERE i.indrelid=c.oid),
       'triggers',(SELECT coalesce(jsonb_agg(jsonb_build_array(pg_get_triggerdef(t.oid),t.tgenabled) ORDER BY t.oid),'[]'::jsonb) FROM pg_trigger t WHERE t.tgrelid=c.oid),
       'policies',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.oid),'[]'::jsonb) FROM pg_policy p WHERE p.polrelid=c.oid),
-      'parents',(SELECT coalesce(jsonb_agg(jsonb_build_array(i.inhparent,i.inhdetachpending) ORDER BY i.inhseqno),'[]'::jsonb) FROM pg_inherits i WHERE i.inhrelid=c.oid))
+      'parents',(SELECT coalesce(jsonb_agg(jsonb_build_array(i.inhparent::bigint,i.inhdetachpending) ORDER BY i.inhseqno),'[]'::jsonb) FROM pg_inherits i WHERE i.inhrelid=c.oid))
       FROM pg_class c WHERE d.classid='pg_class'::regclass AND c.oid=d.objid)
     ) ORDER BY d.classid,d.objid,d.objsubid),'[]'::jsonb)
     INTO details FROM pg_event_trigger_ddl_commands() d;

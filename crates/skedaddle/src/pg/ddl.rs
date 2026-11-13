@@ -60,13 +60,18 @@ pub struct DdlRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DdlCommand {
-    pub classid: u32,
-    pub objid: u32,
-    pub objsubid: i32,
+    /// Absent only for PostgreSQL's identity-less privilege commands.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub classid: Option<u32>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub objid: Option<u32>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub objsubid: Option<i32>,
     pub command_tag: String,
     pub object_type: String,
     pub schema_name: Option<String>,
-    pub object_identity: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    pub object_identity: Option<String>,
     pub in_extension: bool,
     pub columns: Option<Vec<Column>>,
     pub relation: Option<Value>,
@@ -106,12 +111,29 @@ impl DdlRecord {
             return Err(DdlError("foreign or malformed DDL envelope".into()));
         }
         for command in &self.commands {
-            if command.classid == 0
-                || command.objid == 0
-                || command.objsubid < 0
+            // SCT_Grant and SCT_AlterDefaultPrivileges have no object address.
+            // Permit only the complete identity-less shape with matching tags.
+            let identity_less = matches!(
+                self.tag.as_str(),
+                "GRANT" | "REVOKE" | "ALTER DEFAULT PRIVILEGES"
+            ) && command.command_tag == self.tag
+                && command.classid.is_none()
+                && command.objid.is_none()
+                && command.objsubid.is_none()
+                && command.schema_name.is_none()
+                && command.object_identity.is_none()
+                && command.columns.is_none()
+                && command.relation.is_none();
+            let addressed = command.classid.is_some_and(|oid| oid > 0)
+                && command.objid.is_some_and(|oid| oid > 0)
+                && command.objsubid.is_some_and(|subid| subid >= 0)
+                && command
+                    .object_identity
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty());
+            if (!identity_less && !addressed)
                 || command.command_tag.is_empty()
                 || command.object_type.is_empty()
-                || command.object_identity.is_empty()
                 || command.relation.as_ref().is_some_and(|v| !v.is_object())
             {
                 return Err(DdlError("malformed DDL command".into()));

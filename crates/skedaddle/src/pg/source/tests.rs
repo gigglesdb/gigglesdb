@@ -574,13 +574,13 @@ async fn application_alter_advances_only_its_table_and_recovery_uses_retained_ve
     record.tag = "ALTER TABLE".into();
     record.query = "ALTER TABLE public.a ADD COLUMN extra text".into();
     record.commands.push(ddl::DdlCommand {
-        classid: 1259,
-        objid: 1,
-        objsubid: 0,
+        classid: Some(1259),
+        objid: Some(1),
+        objsubid: Some(0),
         command_tag: "ALTER TABLE".into(),
         object_type: "table".into(),
         schema_name: Some("public".into()),
-        object_identity: "public.a".into(),
+        object_identity: Some("public.a".into()),
         in_extension: false,
         columns: Some(after.columns),
         relation: Some(after.relation),

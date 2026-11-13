@@ -87,13 +87,13 @@ fn record(sql: &str, before: &TableDescriptor, version: u64) -> DdlRecord {
         xid: "123".into(),
         query: sql.into(),
         commands: vec![DdlCommand {
-            classid: 1259,
-            objid: after.oid,
-            objsubid: 0,
+            classid: Some(1259),
+            objid: Some(after.oid),
+            objsubid: Some(0),
             command_tag: "ALTER TABLE".into(),
             object_type: "table".into(),
             schema_name: Some(after.schema),
-            object_identity: "miniflux.feeds".into(),
+            object_identity: Some("miniflux.feeds".into()),
             in_extension: false,
             columns: Some(after.columns),
             relation: Some(after.relation),
@@ -186,6 +186,137 @@ fn codec_round_trip_and_rejects_foreign_or_malformed_messages() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn oid_numbers_are_strict_and_cover_unsigned_range() {
+    let original = record("ALTER TABLE feeds ADD COLUMN x integer", &baseline(), 1);
+    for oid in [2_147_483_648u32, u32::MAX] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["commands"][0]["objid"] = json!(oid);
+        let result = decoded(
+            &serde_json::to_vec(&value).unwrap(),
+            MESSAGE_PREFIX,
+            true,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(result.commands[0].objid, Some(oid));
+    }
+    for field in ["classid", "objid"] {
+        for bad in [
+            json!(-1),
+            json!(4_294_967_296u64),
+            json!(1.5),
+            json!("42"),
+            json!(true),
+            json!(0),
+            json!(null),
+        ] {
+            let mut value = serde_json::to_value(&original).unwrap();
+            value["commands"][0][field] = bad;
+            assert!(
+                decoded(
+                    &serde_json::to_vec(&value).unwrap(),
+                    MESSAGE_PREFIX,
+                    true,
+                    "test"
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn identity_less_privileges_decode_but_only_owned_grant_revoke_are_internal() {
+    let original = record("ALTER TABLE feeds ADD COLUMN x integer", &baseline(), 1);
+    for tag in ["GRANT", "REVOKE", "ALTER DEFAULT PRIVILEGES"] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["tag"] = json!(tag);
+        let command = &mut value["commands"][0];
+        command["command_tag"] = json!(tag);
+        command["object_type"] = json!("TABLE");
+        for field in [
+            "classid",
+            "objid",
+            "objsubid",
+            "schema_name",
+            "object_identity",
+            "columns",
+            "relation",
+        ] {
+            command[field] = json!(null);
+        }
+        let event = decoded(
+            &serde_json::to_vec(&value).unwrap(),
+            MESSAGE_PREFIX,
+            true,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(encode(&event).unwrap(), serde_json::to_vec(&event).unwrap());
+        for origin in [None, Some("foreign"), Some("test")] {
+            let mut event = event.clone();
+            event.origin = origin.map(str::to_owned);
+            let mut versions = SchemaVersions::new("test".into(), 0, [baseline()]).unwrap();
+            let supported = matches!(
+                versions.classify_transaction(&[event]),
+                Classification::Supported { .. }
+            );
+            assert_eq!(
+                supported,
+                origin == Some("test") && tag != "ALTER DEFAULT PRIVILEGES"
+            );
+        }
+        for (field, bad) in [
+            ("classid", json!(1259)),
+            ("objid", json!(42)),
+            ("objsubid", json!(0)),
+            ("schema_name", json!("public")),
+            ("object_identity", json!("public.feeds")),
+            ("columns", json!([])),
+            ("relation", json!({})),
+            ("command_tag", json!("ALTER TABLE")),
+        ] {
+            let mut bad_value = value.clone();
+            bad_value["commands"][0][field] = bad;
+            assert!(
+                decoded(
+                    &serde_json::to_vec(&bad_value).unwrap(),
+                    MESSAGE_PREFIX,
+                    true,
+                    "test"
+                )
+                .is_err(),
+                "{tag} {field}"
+            );
+        }
+        value["tag"] = json!("ALTER TABLE");
+        value["commands"][0]["command_tag"] = json!("ALTER TABLE");
+        assert!(
+            decoded(
+                &serde_json::to_vec(&value).unwrap(),
+                MESSAGE_PREFIX,
+                true,
+                "test"
+            )
+            .is_err()
+        );
+    }
+    for field in ["classid", "objid", "objsubid", "object_identity"] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["commands"][0][field] = json!(null);
+        assert!(
+            decoded(
+                &serde_json::to_vec(&value).unwrap(),
+                MESSAGE_PREFIX,
+                true,
+                "test"
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -430,9 +561,9 @@ fn internal_record(tag: &str) -> DdlRecord {
     event.tag = tag.into();
     event.origin = Some("test".into());
     event.commands[0].command_tag = tag.into();
-    event.commands[0].objid = 100;
+    event.commands[0].objid = Some(100);
     event.commands[0].schema_name = Some("_skedaddle".into());
-    event.commands[0].object_identity = "_skedaddle.x".into();
+    event.commands[0].object_identity = Some("_skedaddle.x".into());
     event
 }
 
@@ -460,7 +591,7 @@ fn internal_schema_identity_and_only_the_allowed_empty_command_tags_are_accepted
         let mut event = internal_record("CREATE SCHEMA");
         event.commands[0].schema_name = None;
         event.commands[0].object_type = "schema".into();
-        event.commands[0].object_identity = identity.into();
+        event.commands[0].object_identity = Some(identity.into());
         let mut versions = SchemaVersions::new("test".into(), 0, []).unwrap();
         assert!(matches!(
             versions.classify_transaction(&[event]),
@@ -521,7 +652,7 @@ fn internal_ddl_fails_closed_on_public_mixed_missing_untagged_or_wrong_origin() 
                 event.commands[0].command_tag = "CREATE SCHEMA".into();
                 event.commands[0].object_type = "schema".into();
                 event.commands[0].schema_name = None;
-                event.commands[0].object_identity = "public".into();
+                event.commands[0].object_identity = Some("public".into());
             }
             _ => unreachable!(),
         }
@@ -648,6 +779,15 @@ fn trigger_sql_is_versioned_and_execution_is_journaled() {
         assert!(sql.install.starts_with("BEGIN;"));
         assert!(sql.install.ends_with("COMMIT;"));
         assert!(sql.verify.contains("e.evtenabled='O'"));
+        for cast in [
+            "d.classid::bigint",
+            "d.objid::bigint",
+            "a.atttypid::bigint",
+            "a.attcollation::bigint",
+        ] {
+            assert!(sql.install.contains(cast));
+            assert!(sql.verify.contains(cast));
+        }
         for intent in [TriggerIntent::Install, TriggerIntent::Remove] {
             let calls = RefCell::new(Vec::new());
             sql.run(
@@ -793,6 +933,14 @@ impl Live {
             if prefix != MESSAGE_PREFIX {
                 continue;
             }
+            let root = std::env::var("SKEDADDLE_TEST_ROOT")?;
+            let path = Path::new(&root).join(format!("{}-wire.jsonl", self.id));
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            file.write_all(content)?;
+            file.write_all(b"\n")?;
             records.push(decode(
                 &Message::LogicalMessage {
                     transactional: bytes[1] == 1,
@@ -838,6 +986,61 @@ impl Live {
 }
 
 #[tokio::test]
+async fn live_addressed_and_identity_less_wire_shapes() -> LiveResult<()> {
+    let _guard = LIVE_LOCK.lock().await;
+    let Some(live) = Live::open("live_addressed_and_identity_less_wire_shapes").await? else {
+        return Ok(());
+    };
+    let result: LiveResult<()> = async {
+        for (tag, statement) in [
+            (
+                "ALTER TABLE",
+                format!("ALTER TABLE {}.mapped ADD COLUMN wire integer", live.id),
+            ),
+            (
+                "GRANT",
+                format!("GRANT SELECT ON {}.mapped TO PUBLIC", live.id),
+            ),
+            (
+                "REVOKE",
+                format!("REVOKE SELECT ON {}.mapped FROM PUBLIC", live.id),
+            ),
+            (
+                "ALTER DEFAULT PRIVILEGES",
+                format!(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA {} GRANT SELECT ON TABLES TO PUBLIC",
+                    live.id
+                ),
+            ),
+        ] {
+            live.client.batch_execute(&statement).await?;
+            let records = live.records().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].tag, tag);
+            assert_eq!(records[0].commands.len(), 1);
+            let command = &records[0].commands[0];
+            assert_eq!(command.command_tag, tag);
+            if tag == "ALTER TABLE" {
+                assert_eq!(command.classid, Some(1259));
+                assert!(command.objid.is_some_and(|oid| oid > 0));
+                assert_eq!(command.objsubid, Some(0));
+                assert!(command.object_identity.is_some());
+            } else {
+                assert_eq!(command.classid, None);
+                assert_eq!(command.objid, None);
+                assert_eq!(command.objsubid, None);
+                assert_eq!(command.schema_name, None);
+                assert_eq!(command.object_identity, None);
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup = live.close().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 async fn supported_ddl_follows_boundary() -> LiveResult<()> {
     let _guard = LIVE_LOCK.lock().await;
     let Some(live) = Live::open("supported_ddl_follows_boundary").await? else {
@@ -857,7 +1060,7 @@ async fn supported_ddl_follows_boundary() -> LiveResult<()> {
             tracker.classify_transaction(&records),
             Classification::Supported { .. }
         ));
-        let oid = records[0].commands[0].objid;
+        let oid = records[0].commands[0].objid.unwrap();
         assert_eq!(
             tracker
                 .table(oid)

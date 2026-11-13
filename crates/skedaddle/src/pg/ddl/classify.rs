@@ -15,7 +15,9 @@ pub struct TableDescriptor {
 impl TableDescriptor {
     pub fn from_command(command: &DdlCommand) -> Result<Self, DdlError> {
         let descriptor = Self {
-            oid: command.objid,
+            oid: command
+                .objid
+                .ok_or_else(|| DdlError("missing table OID".into()))?,
             schema: command
                 .schema_name
                 .clone()
@@ -323,15 +325,16 @@ impl SchemaVersions {
         }
         let mut advanced = BTreeMap::new();
         for command in &record.commands {
-            if command.classid != 1259
-                || command.objsubid != 0
+            if command.classid != Some(1259)
+                || command.objsubid != Some(0)
                 || command.command_tag != "ALTER TABLE"
                 || command.object_type != "table"
                 || command.in_extension
             {
                 return Err("unattributed, extension or non-table DDL".into());
             }
-            let Some(table) = self.tables.get_mut(&command.objid) else {
+            let oid = command.objid.ok_or("missing table OID")?;
+            let Some(table) = self.tables.get_mut(&oid) else {
                 // Unknown OIDs may affect mapped objects through dependencies.
                 // S3 qualifies only known mapped ordinary tables.
                 return Err("DDL references an unknown table OID; impact cannot be proven".into());
@@ -341,7 +344,7 @@ impl SchemaVersions {
             validate_additions(&table.descriptor, &after, &additions)?;
             table.descriptor = after;
             table.version = record.version;
-            advanced.insert(command.objid, record.version);
+            advanced.insert(oid, record.version);
         }
         self.last_version = record.version;
         Ok(advanced)
@@ -375,8 +378,8 @@ fn tool_internal(record: &DdlRecord) -> bool {
                 && command.command_tag == "CREATE SCHEMA"
                 && command.object_type == "schema"
                 && matches!(
-                    command.object_identity.as_str(),
-                    "_skedaddle" | "\"_skedaddle\""
+                    command.object_identity.as_deref(),
+                    Some("_skedaddle" | "\"_skedaddle\"")
                 ))
     })
 }
