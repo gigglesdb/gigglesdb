@@ -396,6 +396,65 @@ impl Fixture {
         };
         Ok((latest, origin))
     }
+    async fn receipt(&self, target: &Progress) -> TestResult<Option<Progress>> {
+        let row = self.admin.client.query_opt(
+            "SELECT txn, digest, record_kind, manifest_digest, previous_manifest_digest FROM _skedaddle.apply_receipts WHERE stream=$1 AND mseq=$2::text::numeric AND position=$3",
+            &[&self.id, &target.mseq.to_string(), &target.lsn.to_be_bytes().as_slice()],
+        ).await?;
+        row.map(|r| {
+            require(
+                target.evidence.is_none(),
+                "ordinary receipt helper requires legacy evidence",
+            )?;
+            require(
+                r.get::<_, Option<i16>>(2).is_none()
+                    && r.get::<_, Option<Vec<u8>>>(3).is_none()
+                    && r.get::<_, Option<Vec<u8>>>(4).is_none(),
+                "unexpected receipt evidence encoding",
+            )?;
+            let mut receipt = target.clone();
+            receipt.txn = TxnId(r.get(0));
+            receipt.digest = r
+                .get::<_, Vec<u8>>(1)
+                .try_into()
+                .map_err(|_| "invalid receipt digest")?;
+            Ok(receipt)
+        })
+        .transpose()
+    }
+    async fn commit_evidence(&self, plan: &TransactionPlan, committed: bool) -> TestResult<()> {
+        let (latest, native) = self.evidence().await?;
+        let receipt = self.receipt(&plan.progress).await?;
+        eprintln!("commit evidence: L={latest:?}, R={receipt:?}, N={native}");
+        require(
+            receipt.is_some() == committed,
+            "incorrect receipt after termination",
+        )?;
+        require(
+            latest.is_some() == committed,
+            "incorrect progress after termination",
+        )?;
+        require(
+            self.count().await? == i64::from(committed),
+            "incorrect effects after termination",
+        )?;
+        require(
+            resolve_commit(&plan.progress, latest.as_ref(), native, receipt.as_ref())?
+                == if committed {
+                    CommitDecision::Applied
+                } else {
+                    CommitDecision::NotApplied
+                },
+            "transactional evidence disagrees with commit",
+        )?;
+        if committed {
+            require(
+                receipt.as_ref() == Some(&plan.progress) && latest.as_ref() == Some(&plan.progress),
+                "committed identity/digest changed",
+            )?;
+        }
+        Ok(())
+    }
     async fn count(&self) -> TestResult<i64> {
         Ok(self
             .admin
@@ -437,6 +496,7 @@ impl Connector for HarnessConnector {
 }
 struct Crash<'a> {
     fixture: &'a Fixture,
+    plan: Option<&'a TransactionPlan>,
     seam: Seam,
     lost_commit_response: bool,
     resume_commit: bool,
@@ -462,6 +522,15 @@ impl Observer for Crash<'_> {
             .kill(client)
             .await
             .map_err(|_| executor::Error::Database)?;
+        if let Some(plan) = self.plan {
+            self.fixture
+                .commit_evidence(
+                    plan,
+                    self.lost_commit_response || seam != Seam::BeforeCommit,
+                )
+                .await
+                .map_err(|_| executor::Error::Database)?;
+        }
         if self.resume_commit {
             Ok(())
         } else {
@@ -491,6 +560,7 @@ async fn exactly_one_effect_after_crash_matrix() -> TestResult<()> {
             let mut executor = fixture.executor()?;
             let mut crash = Crash {
                 fixture: &fixture,
+                plan: Some(&plan),
                 seam,
                 lost_commit_response: false,
                 resume_commit: false,
@@ -518,6 +588,7 @@ async fn exactly_one_effect_after_crash_matrix() -> TestResult<()> {
                 fixture.count().await? == 1,
                 "crash replay did not leave exactly one row",
             )?;
+            fixture.commit_evidence(&plan, true).await?;
             TestResult::Ok(())
         }
         .await;
@@ -540,6 +611,7 @@ async fn ambiguous_commit_resolved_by_progress() -> TestResult<()> {
             let mut executor = fixture.executor()?;
             let mut crash = Crash {
                 fixture: &fixture,
+                plan: Some(&plan),
                 seam: Seam::BeforeCommit,
                 lost_commit_response: committed,
                 resume_commit: true,
@@ -549,6 +621,8 @@ async fn ambiguous_commit_resolved_by_progress() -> TestResult<()> {
             require(crash.fired, "lost-response injection not reached")?;
             executor.close().await?;
             replay(&fixture, &plan).await?;
+            replay(&fixture, &plan).await?;
+            fixture.commit_evidence(&plan, true).await?;
             require(
                 fixture.count().await? == 1,
                 "ambiguous replay duplicated effects",
@@ -722,8 +796,8 @@ async fn completed_range_missing_row_is_fault() -> TestResult<()> {
             // Read through another connection before close: rollback must have
             // happened inside the executor, not in test cleanup.
             require(
-                fixture.evidence().await? == (None, 0),
-                "failed apply advanced progress",
+                fixture.evidence().await?.0.is_none(),
+                "failed apply committed progress",
             )?;
             require(fixture.count().await? == 0, "failed apply wrote a row")?;
             let receipts: i64 = fixture
@@ -789,6 +863,7 @@ impl skedaddle::event::PositionOrder for PairOrder {
 
 async fn pair_buffer(
     fixture: &Fixture,
+    marker: bool,
 ) -> TestResult<(
     std::sync::Arc<dyn skedaddle::buffer::backends::BufferStore>,
     skedaddle::buffer::reader::ReaderConfig,
@@ -816,7 +891,11 @@ async fn pair_buffer(
         limits: Limits::default(),
         required_next_mseq: 2,
     };
-    let h = fixture.transaction(EventKind::Insert)?;
+    let h = fixture.transaction(if marker {
+        EventKind::FinalMarker
+    } else {
+        EventKind::Insert
+    })?;
     let mut rows = fixture.transaction(EventKind::ChunkRows)?;
     rows.txn = TxnId(vec![2]);
     rows.events[0].txn = rows.txn.clone();
@@ -918,7 +997,7 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
             return Ok(());
         };
         let result = async {
-            let (store, config) = pair_buffer(&fixture).await?;
+            let (store, config) = pair_buffer(&fixture, false).await?;
             let order = std::sync::Arc::new(PairOrder(fixture.id.clone()));
             let reader = BufferReader::new(
                 store.clone(),
@@ -929,6 +1008,7 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
             let mut runner = ReaderLoop::new(reader, fixture.id.clone());
             let crash = (mode != 0).then_some(Crash {
                 fixture: &fixture,
+                plan: None,
                 seam: match mode {
                     3 => Seam::AfterCommit,
                     4 => Seam::BeforeAck,
@@ -959,6 +1039,13 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
                 )
                 .await?;
             require(durable.next_mseq == 1, "H checkpoint was not saved")?;
+            let before_rows = durable.clone();
+            if mode == 1 {
+                destination.executor.close().await?;
+                abort_origin_attempt(&fixture, 200).await?;
+                destination.executor = fixture.executor()?;
+                require(fixture.evidence().await?.1 > 100, "abort did not lead H")?;
+            }
             let outcome = runner
                 .step(
                     &mut destination,
@@ -973,6 +1060,10 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
             require(
                 outcome.is_err(),
                 "checkpoint/fault injection did not stop the loop",
+            )?;
+            require(
+                durable == before_rows,
+                "failed apply advanced durable checkpoint",
             )?;
             if let Some(crash) = &destination.crash {
                 require(crash.fired, "pair crash seam not reached")?;
@@ -1073,7 +1164,7 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
         return Ok(());
     };
     let result = async {
-        let (store, config) = pair_buffer(&fixture).await?;
+        let (store, config) = pair_buffer(&fixture, false).await?;
         let order = std::sync::Arc::new(PairOrder(fixture.id.clone()));
         let mut reader = BufferReader::new(
             store.clone(),
@@ -1117,4 +1208,294 @@ async fn equal_h_executor_campaign() -> TestResult<()> {
     cleanup?;
 
     Ok(())
+}
+
+// Set transaction metadata and write WAL, then explicitly roll back. No native
+// reset is performed: PostgreSQL may retain the attempted position as high-water.
+async fn abort_origin_attempt(fixture: &Fixture, lsn: u64) -> TestResult<()> {
+    let connection = Connection::open(&fixture.dsn).await?;
+    connection
+        .client
+        .query_one(
+            "SELECT pg_replication_origin_session_setup($1)",
+            &[&fixture.origin],
+        )
+        .await?;
+    connection.client.batch_execute("BEGIN").await?;
+    connection
+        .client
+        .query_one(
+            "SELECT pg_replication_origin_xact_setup($1::text::pg_lsn, now())",
+            &[&format!("0/{lsn:X}")],
+        )
+        .await?;
+    connection
+        .client
+        .batch_execute(&format!(
+            "INSERT INTO {}.rows VALUES (2, 'aborted'); ROLLBACK",
+            fixture.id
+        ))
+        .await?;
+    connection.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn explicit_rollback_and_committed_prefix_with_aborted_successor() -> TestResult<()> {
+    // The reverse runner constructs the same executor with a distinct _rev
+    // stream/origin. Exercise both bindings without changing reverse production.
+    for reverse in [false, true] {
+        let Some(mut fixture) = Fixture::open().await? else {
+            return Ok(());
+        };
+        if reverse {
+            fixture
+                .admin
+                .client
+                .query_one("SELECT pg_replication_origin_drop($1)", &[&fixture.origin])
+                .await?;
+            let old = fixture.id.clone();
+            fixture.id.push_str("_rev");
+            fixture.origin = format!("skedaddle_{}", fixture.id);
+            fixture
+                .admin
+                .client
+                .batch_execute(&format!("ALTER SCHEMA {old} RENAME TO {}", fixture.id))
+                .await?;
+            fixture
+                .admin
+                .client
+                .query_one(
+                    "SELECT pg_replication_origin_create($1)",
+                    &[&fixture.origin],
+                )
+                .await?;
+        }
+        let result = async {
+            let a = fixture.plan(EventKind::Insert, RangeState::Completed)?;
+            abort_origin_attempt(&fixture, 150).await?;
+            fixture.commit_evidence(&a, false).await?;
+            replay(&fixture, &a).await?;
+            let mut b = fixture.transaction(EventKind::Update)?;
+            b.txn = TxnId(vec![2]);
+            b.commit_position = Position::new(&fixture.id, 175_u64.to_be_bytes());
+            b.events[0].txn = b.txn.clone();
+            b.events[0].position = b.commit_position.clone();
+            let b = AssembledTxn::new(b.source, b.txn, b.commit_position, b.commit_time, b.events)?;
+            let b = fixture.plan_at(&b, 2, RangeState::Completed)?;
+            let mut executor = fixture.executor()?;
+            let mut crash = Crash {
+                fixture: &fixture,
+                plan: None,
+                seam: Seam::BeforeCommit,
+                lost_commit_response: false,
+                resume_commit: false,
+                fired: false,
+            };
+            require(
+                executor.apply_observed(&b, &mut crash).await.is_err() && crash.fired,
+                "B was not aborted before commit",
+            )?;
+            drop(executor);
+            let (latest, native) = fixture.evidence().await?;
+            require(
+                native > a.progress.lsn,
+                "abort failed to retain native lead",
+            )?;
+            require(
+                resolve_commit(
+                    &a.progress,
+                    latest.as_ref(),
+                    native,
+                    fixture.receipt(&a.progress).await?.as_ref(),
+                )? == CommitDecision::Applied,
+                "abort invalidated committed A",
+            )?;
+            require(
+                fixture.receipt(&b.progress).await?.is_none(),
+                "aborted B has receipt",
+            )?;
+            require(
+                resolve_commit(&b.progress, latest.as_ref(), native, None)?
+                    == CommitDecision::NotApplied,
+                "native lead skipped B",
+            )?;
+            replay(&fixture, &a).await?;
+            replay(&fixture, &b).await?;
+            fixture
+                .admin
+                .client
+                .batch_execute(&format!("UPDATE {}.rows SET body='sentinel'", fixture.id))
+                .await?;
+            replay(&fixture, &b).await?;
+            let body: String = fixture
+                .admin
+                .client
+                .query_one(
+                    &format!("SELECT body FROM {}.rows WHERE id=1", fixture.id),
+                    &[],
+                )
+                .await?
+                .get(0);
+            require(body == "sentinel", "B redelivery repeated row effect")?;
+            fixture.commit_evidence(&b, true).await?;
+            TestResult::Ok(())
+        }
+        .await;
+        let cleanup = fixture.cleanup().await;
+        result?;
+        cleanup?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn competing_same_origin_executor_is_rejected() -> TestResult<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let plan = fixture.plan(EventKind::Insert, RangeState::Completed)?;
+        let mut owner = fixture.executor()?;
+        owner.apply(&plan).await?;
+        let mut competitor = fixture.executor()?;
+        require(
+            matches!(
+                competitor.apply(&plan).await,
+                Err(executor::Error::Database)
+            ),
+            "competing origin owner was accepted",
+        )?;
+        competitor.close().await?;
+        owner.close().await?;
+        replay(&fixture, &plan).await?;
+        fixture.commit_evidence(&plan, true).await
+    }
+    .await;
+    let cleanup = fixture.cleanup().await;
+    result?;
+    cleanup
+}
+
+#[tokio::test]
+#[ignore = "REAL-PG APPLY SKIPPED: Docker harness must supply pg_apply; run --ignored --nocapture"]
+async fn aborted_final_marker_does_not_publish_checkpoint_from_native_lead() -> TestResult<()> {
+    use skedaddle::buffer::reader::{BufferReader, ReaderCheckpoint};
+    use skedaddle::pg::apply::executor::ReaderLoop;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let (store, config) = pair_buffer(&fixture, true).await?;
+        abort_origin_attempt(&fixture, 200).await?;
+        let order = std::sync::Arc::new(PairOrder(fixture.id.clone()));
+        let reader = BufferReader::new(
+            store.clone(),
+            config.clone(),
+            ReaderCheckpoint::default(),
+            order.clone(),
+        )?;
+        let mut runner = ReaderLoop::new(reader, fixture.id.clone());
+        let mut destination = RetainedExecutor {
+            executor: fixture.executor()?,
+            crash: None,
+            plans: vec![],
+        };
+        // RetainedExecutor injects on mseq 1 for the pair campaign; this marker
+        // is mseq 0, so use a dedicated observer destination below.
+        let mut marker_destination = MarkerCrash {
+            executor: fixture.executor()?,
+            crash: Crash {
+                fixture: &fixture,
+                plan: None,
+                seam: Seam::BeforeCommit,
+                lost_commit_response: false,
+                resume_commit: false,
+                fired: false,
+            },
+            plan: None,
+        };
+        let mut published = false;
+        let outcome = runner
+            .step(
+                &mut marker_destination,
+                |txn, mseq| {
+                    fixture
+                        .plan_at(txn, mseq, RangeState::Completed)
+                        .map_err(|_| ApplyError::InvalidTransaction)
+                },
+                |_| {
+                    published = true;
+                    async { Ok(()) }
+                },
+            )
+            .await;
+        require(
+            outcome.is_err() && marker_destination.crash.fired && !published,
+            "aborted marker published checkpoint/activation evidence",
+        )?;
+        let plan = marker_destination
+            .plan
+            .as_ref()
+            .ok_or("marker plan absent")?;
+        let (latest, native) = fixture.evidence().await?;
+        require(
+            native > plan.progress.lsn
+                && latest.is_none()
+                && fixture.receipt(&plan.progress).await?.is_none(),
+            "aborted marker has transactional evidence",
+        )?;
+        drop(marker_destination);
+        let reader = BufferReader::new(store, config, ReaderCheckpoint::default(), order)?;
+        let mut restarted = ReaderLoop::new(reader, fixture.id.clone());
+        restarted
+            .step(
+                &mut destination,
+                |txn, mseq| {
+                    fixture
+                        .plan_at(txn, mseq, RangeState::Completed)
+                        .map_err(|_| ApplyError::InvalidTransaction)
+                },
+                |cp| {
+                    published = cp.next_mseq == 1;
+                    async { Ok(()) }
+                },
+            )
+            .await?;
+        require(
+            published && fixture.count().await? == 0,
+            "replayed marker did not publish only after commit",
+        )?;
+        require(
+            destination.executor.apply(&destination.plans[0]).await? == CommitDecision::Applied,
+            "committed marker lacked authenticated skip",
+        )?;
+        destination.executor.close().await?;
+        TestResult::Ok(())
+    }
+    .await;
+    let cleanup = fixture.cleanup().await;
+    result?;
+    cleanup
+}
+
+struct MarkerCrash<'a> {
+    executor: Executor<HarnessConnector>,
+    crash: Crash<'a>,
+    plan: Option<TransactionPlan>,
+}
+#[async_trait]
+impl Destination for MarkerCrash<'_> {
+    async fn apply(&mut self, plan: &TransactionPlan) -> executor::Result<CommitDecision> {
+        self.plan = Some(plan.clone());
+        self.executor.apply_observed(plan, &mut self.crash).await
+    }
+    async fn retain_after_checkpoint(
+        &mut self,
+        _: &skedaddle::buffer::reader::ReaderCheckpoint,
+    ) -> executor::Result<()> {
+        Ok(())
+    }
 }

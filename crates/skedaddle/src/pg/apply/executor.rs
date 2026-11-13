@@ -1,5 +1,8 @@
 //! Atomic destination apply. Use a dedicated, non-pooled connection; the origin
 //! session lock excludes competing executors before any evidence is read.
+//! Callers preserve the dedicated stream/origin binding under coordinator authority.
+//! Transactional progress and exact receipts prove commit; native origin high-water
+//! can lead them after abort and supplies only a lower-bound consistency check.
 //!
 //! Receipt retention follows the *durably saved*, never rewound reader checkpoint.
 //! Retain all transactions in the unfinished segment; delete only mseqs below
@@ -182,6 +185,8 @@ impl<C: Connector> Executor<C> {
         self.client.as_ref().expect("connected executor")
     }
 
+    // Ownership stabilizes these separate reads. Flush native high-water, but
+    // never infer committed effects from it or normalize a legitimate abort lead.
     async fn decision(&self, target: &Progress) -> Result<CommitDecision> {
         let latest = self.client().query_opt("SELECT last_mseq::text, last_txn, last_position, last_digest, record_kind, manifest_digest, previous_manifest_digest FROM _skedaddle.apply_progress WHERE stream = $1", &[&self.stream]).await?;
         let latest = latest

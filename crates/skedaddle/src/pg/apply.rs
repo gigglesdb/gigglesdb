@@ -879,6 +879,9 @@ pub enum CommitDecision {
 /// apply_progress consistently (no concurrent applier). `receipt` is an exact
 /// historical transaction receipt when replaying BEFORE the latest row. A lone
 /// latest digest cannot prove an older transaction's digest: fail closed.
+/// Native progress is attempted-position high-water, including aborted work;
+/// it may lead transactional progress but must never be behind a committed row.
+/// Only transactional identity and digest prove commit, never native coverage.
 pub fn resolve_commit(
     target: &Progress,
     latest: Option<&Progress>,
@@ -899,13 +902,13 @@ pub fn resolve_commit(
             .is_some_and(|e| e.kind == RecordKind::ChunkRows)
     };
     let Some(latest) = latest else {
-        return if origin_lsn == 0 && receipt.is_none() && !chunk(target) {
+        return if receipt.is_none() && !chunk(target) {
             Ok(CommitDecision::NotApplied)
         } else {
             Err(ApplyError::InconsistentProgress)
         };
     };
-    if latest.stream != target.stream || latest.lsn != origin_lsn {
+    if latest.stream != target.stream || origin_lsn < latest.lsn {
         return Err(ApplyError::InconsistentProgress);
     }
     match latest.lsn.cmp(&target.lsn) {

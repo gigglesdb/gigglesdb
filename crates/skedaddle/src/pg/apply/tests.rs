@@ -749,59 +749,95 @@ fn invalid_keys_schema_and_identifiers_fail_closed() {
 #[test]
 fn ambiguous_commit_decision_table_requires_matching_digest() {
     let target = plan(&transaction(EventKind::Delete, None), RangeState::Copying).progress;
-    assert_eq!(
-        resolve_commit(&target, None, 0, None),
-        Ok(CommitDecision::NotApplied)
-    );
-    assert_eq!(
-        resolve_commit(&target, None, 99, None),
-        Err(ApplyError::InconsistentProgress)
-    );
-    assert_eq!(
-        resolve_commit(&target, Some(&target), 99, None),
-        Ok(CommitDecision::Applied)
-    );
     let mut bad = target.clone();
     bad.digest[0] ^= 1;
-    assert_eq!(
-        resolve_commit(&target, Some(&bad), 99, None),
-        Err(ApplyError::DigestMismatch)
-    );
-    assert_eq!(
-        resolve_commit(&target, Some(&target), 98, None),
-        Err(ApplyError::InconsistentProgress)
-    );
     let mut earlier = target.clone();
-    earlier.lsn = 98;
+    earlier.lsn = 97;
     earlier.txn = TxnId(vec![2]);
-    assert_eq!(
-        resolve_commit(&target, Some(&earlier), 98, None),
-        Ok(CommitDecision::NotApplied)
-    );
     let mut later = target.clone();
     later.lsn = 100;
     later.txn = TxnId(vec![3]);
-    assert_eq!(
-        resolve_commit(&target, Some(&later), 100, None),
-        Err(ApplyError::MissingDigestEvidence)
-    );
-    assert_eq!(
-        resolve_commit(&target, Some(&later), 100, Some(&target)),
-        Ok(CommitDecision::Applied)
-    );
-    assert_eq!(
-        resolve_commit(&target, Some(&later), 100, Some(&bad)),
-        Err(ApplyError::DigestMismatch)
-    );
-    for wrong in ["stream", "mseq", "txn"] {
-        let mut latest = target.clone();
-        match wrong {
-            "stream" => latest.stream.push('x'),
-            "mseq" => latest.mseq += 1,
-            _ => latest.txn.0.push(2),
+    for n in [0, 1, 98, 99, 100, 200] {
+        assert_eq!(
+            resolve_commit(&target, None, n, None),
+            Ok(CommitDecision::NotApplied)
+        );
+        assert_eq!(
+            resolve_commit(&target, None, n, Some(&target)),
+            Err(ApplyError::InconsistentProgress)
+        );
+    }
+    for n in [97, 98, 99, 100, 200] {
+        assert_eq!(
+            resolve_commit(&target, Some(&earlier), n, None),
+            Ok(CommitDecision::NotApplied)
+        );
+        assert_eq!(
+            resolve_commit(&target, Some(&earlier), n, Some(&target)),
+            Err(ApplyError::InconsistentProgress)
+        );
+        let mut contradictory = earlier.clone();
+        contradictory.mseq = target.mseq + 1;
+        assert_eq!(
+            resolve_commit(&target, Some(&contradictory), n, None),
+            Err(ApplyError::InconsistentProgress)
+        );
+    }
+    for n in [99, 100, 200] {
+        for receipt in [None, Some(&target)] {
+            assert_eq!(
+                resolve_commit(&target, Some(&target), n, receipt),
+                Ok(CommitDecision::Applied)
+            );
         }
         assert_eq!(
-            resolve_commit(&target, Some(&latest), 99, None),
+            resolve_commit(&target, Some(&bad), n, None),
+            Err(ApplyError::DigestMismatch)
+        );
+        assert_eq!(
+            resolve_commit(&target, Some(&target), n, Some(&bad)),
+            Err(ApplyError::DigestMismatch)
+        );
+        for wrong in ["stream", "mseq", "txn"] {
+            let mut latest = target.clone();
+            match wrong {
+                "stream" => latest.stream.push('x'),
+                "mseq" => latest.mseq += 1,
+                _ => latest.txn.0.push(2),
+            }
+            assert_eq!(
+                resolve_commit(&target, Some(&latest), n, None),
+                Err(ApplyError::InconsistentProgress)
+            );
+            assert_eq!(
+                resolve_commit(&target, Some(&target), n, Some(&latest)),
+                Err(ApplyError::InconsistentProgress)
+            );
+        }
+    }
+    for n in [100, 101, 200] {
+        assert_eq!(
+            resolve_commit(&target, Some(&later), n, None),
+            Err(ApplyError::MissingDigestEvidence)
+        );
+        assert_eq!(
+            resolve_commit(&target, Some(&later), n, Some(&target)),
+            Ok(CommitDecision::Applied)
+        );
+        assert_eq!(
+            resolve_commit(&target, Some(&later), n, Some(&bad)),
+            Err(ApplyError::DigestMismatch)
+        );
+        let mut contradictory = later.clone();
+        contradictory.mseq = target.mseq - 1;
+        assert_eq!(
+            resolve_commit(&target, Some(&contradictory), n, Some(&target)),
+            Err(ApplyError::InconsistentProgress)
+        );
+    }
+    for n in [0, 1, 98] {
+        assert_eq!(
+            resolve_commit(&target, Some(&target), n, None),
             Err(ApplyError::InconsistentProgress)
         );
     }
@@ -841,141 +877,155 @@ fn equal_h_pair() -> (Progress, Progress) {
 
 #[test]
 fn equal_h_probe_new_chunk_rows_is_not_applied() {
-    let (h, rows) = equal_h_pair();
-    assert_eq!(
-        resolve_commit(&rows, Some(&h), 20, None),
-        Ok(CommitDecision::NotApplied)
-    );
-    assert_eq!(
-        resolve_commit(&rows, Some(&rows), 20, Some(&rows)),
-        Ok(CommitDecision::Applied)
-    );
-    assert_eq!(
-        resolve_commit(&h, Some(&h), 20, None),
-        Ok(CommitDecision::Applied)
-    );
+    for origin in [20, 200] {
+        let (h, rows) = equal_h_pair();
+        assert_eq!(
+            resolve_commit(&rows, Some(&h), origin, None),
+            Ok(CommitDecision::NotApplied)
+        );
+        assert_eq!(
+            resolve_commit(&rows, Some(&rows), origin, Some(&rows)),
+            Ok(CommitDecision::Applied)
+        );
+        assert_eq!(
+            resolve_commit(&rows, Some(&rows), origin, None),
+            Ok(CommitDecision::Applied)
+        );
+        assert_eq!(
+            resolve_commit(&h, Some(&h), origin, None),
+            Ok(CommitDecision::Applied)
+        );
+    }
 }
 
 #[test]
 fn equal_h_probe_transaction_replay_requires_authenticated_manifest_receipt() {
-    let (h, rows) = equal_h_pair();
-    assert_eq!(
-        resolve_commit(&h, Some(&rows), 20, Some(&h)),
-        Ok(CommitDecision::Applied)
-    );
-    assert_eq!(
-        resolve_commit(&h, Some(&rows), 20, None),
-        Err(ApplyError::MissingDigestEvidence)
-    );
-    let mut legacy = h.clone();
-    legacy.evidence = None;
-    assert_eq!(
-        resolve_commit(&h, Some(&rows), 20, Some(&legacy)),
-        Err(ApplyError::MissingDigestEvidence)
-    );
-    let mut conflict = h.clone();
-    conflict.digest[0] ^= 1;
-    assert_eq!(
-        resolve_commit(&h, Some(&rows), 20, Some(&conflict)),
-        Err(ApplyError::DigestMismatch)
-    );
-    conflict = h.clone();
-    conflict.txn.0.push(9);
-    assert_eq!(
-        resolve_commit(&h, Some(&rows), 20, Some(&conflict)),
-        Err(ApplyError::InconsistentProgress)
-    );
+    for origin in [20, 200] {
+        let (h, rows) = equal_h_pair();
+        assert_eq!(
+            resolve_commit(&h, Some(&rows), origin, Some(&h)),
+            Ok(CommitDecision::Applied)
+        );
+        assert_eq!(
+            resolve_commit(&h, Some(&rows), origin, None),
+            Err(ApplyError::MissingDigestEvidence)
+        );
+        let mut legacy = h.clone();
+        legacy.evidence = None;
+        assert_eq!(
+            resolve_commit(&h, Some(&rows), origin, Some(&legacy)),
+            Err(ApplyError::MissingDigestEvidence)
+        );
+        let mut conflict = h.clone();
+        conflict.digest[0] ^= 1;
+        assert_eq!(
+            resolve_commit(&h, Some(&rows), origin, Some(&conflict)),
+            Err(ApplyError::DigestMismatch)
+        );
+        conflict = h.clone();
+        conflict.txn.0.push(9);
+        assert_eq!(
+            resolve_commit(&h, Some(&rows), origin, Some(&conflict)),
+            Err(ApplyError::InconsistentProgress)
+        );
+    }
 }
 
 #[test]
 fn equal_h_invalid_ties_missing_predecessor_and_evidence_fail_closed() {
-    let (h, rows) = equal_h_pair();
-    let mut second = rows.clone();
-    second.mseq += 1;
-    second.txn.0.push(3);
-    second.evidence = Some(RecordEvidence::new(
-        RecordKind::ChunkRows,
-        [13; 32],
-        [12; 32],
-        &second,
-    ));
-    assert_eq!(
-        resolve_commit(&second, Some(&rows), 20, None),
-        Err(ApplyError::InconsistentProgress)
-    );
-    assert_eq!(
-        resolve_commit(&rows, None, 0, None),
-        Err(ApplyError::InconsistentProgress)
-    );
-    let mut earlier = h.clone();
-    earlier.lsn -= 1;
-    earlier.evidence = Some(RecordEvidence::new(
-        RecordKind::Transaction,
-        [11; 32],
-        [10; 32],
-        &earlier,
-    ));
-    assert_eq!(
-        resolve_commit(&rows, Some(&earlier), 19, None),
-        Err(ApplyError::InconsistentProgress)
-    );
-    for invalid in 0..6 {
-        let mut target = rows.clone();
-        match invalid {
-            0 => target.evidence = None,
-            1 => target.evidence.as_mut().unwrap().kind = RecordKind::Transaction,
-            2 => target.evidence.as_mut().unwrap().previous_manifest_digest[0] ^= 1,
-            3 => target.mseq += 1,
-            4 => target.mseq = h.mseq,
-            _ => target.stream.push('x'),
-        }
+    for origin in [20, 200] {
+        let (h, rows) = equal_h_pair();
+        let mut second = rows.clone();
+        second.mseq += 1;
+        second.txn.0.push(3);
+        second.evidence = Some(RecordEvidence::new(
+            RecordKind::ChunkRows,
+            [13; 32],
+            [12; 32],
+            &second,
+        ));
         assert_eq!(
-            resolve_commit(&target, Some(&h), 20, None),
+            resolve_commit(&second, Some(&rows), origin, None),
+            Err(ApplyError::InconsistentProgress)
+        );
+        assert_eq!(
+            resolve_commit(&rows, None, origin, None),
+            Err(ApplyError::InconsistentProgress)
+        );
+        let mut earlier = h.clone();
+        earlier.lsn -= 1;
+        earlier.evidence = Some(RecordEvidence::new(
+            RecordKind::Transaction,
+            [11; 32],
+            [10; 32],
+            &earlier,
+        ));
+        assert_eq!(
+            resolve_commit(&rows, Some(&earlier), origin - 1, None),
+            Err(ApplyError::InconsistentProgress)
+        );
+        for invalid in 0..6 {
+            let mut target = rows.clone();
+            match invalid {
+                0 => target.evidence = None,
+                1 => target.evidence.as_mut().unwrap().kind = RecordKind::Transaction,
+                2 => target.evidence.as_mut().unwrap().previous_manifest_digest[0] ^= 1,
+                3 => target.mseq += 1,
+                4 => target.mseq = h.mseq,
+                _ => target.stream.push('x'),
+            }
+            assert_eq!(
+                resolve_commit(&target, Some(&h), origin, None),
+                Err(ApplyError::InconsistentProgress)
+            );
+        }
+        let mut legacy = h.clone();
+        legacy.evidence = None;
+        assert_eq!(
+            resolve_commit(&rows, Some(&legacy), origin, None),
             Err(ApplyError::InconsistentProgress)
         );
     }
-    let mut legacy = h.clone();
-    legacy.evidence = None;
-    assert_eq!(
-        resolve_commit(&rows, Some(&legacy), 20, None),
-        Err(ApplyError::InconsistentProgress)
-    );
 }
 
 #[test]
 fn equal_h_never_ignores_existing_receipt_conflicts() {
-    let (h, rows) = equal_h_pair();
-    for invalid in 0..5 {
-        let mut receipt = rows.clone();
-        match invalid {
-            0 => receipt.digest[0] ^= 1,
-            1 => receipt.txn.0.push(9),
-            2 => receipt.mseq += 1,
-            3 => receipt.evidence.as_mut().unwrap().kind = RecordKind::Transaction,
-            _ => receipt.evidence.as_mut().unwrap().manifest_digest[0] ^= 1,
+    for origin in [20, 200] {
+        let (h, rows) = equal_h_pair();
+        for invalid in 0..5 {
+            let mut receipt = rows.clone();
+            match invalid {
+                0 => receipt.digest[0] ^= 1,
+                1 => receipt.txn.0.push(9),
+                2 => receipt.mseq += 1,
+                3 => receipt.evidence.as_mut().unwrap().kind = RecordKind::Transaction,
+                _ => receipt.evidence.as_mut().unwrap().manifest_digest[0] ^= 1,
+            }
+            assert!(resolve_commit(&rows, Some(&h), origin, Some(&receipt)).is_err());
+            assert!(resolve_commit(&rows, Some(&rows), origin, Some(&receipt)).is_err());
         }
-        assert!(resolve_commit(&rows, Some(&h), 20, Some(&receipt)).is_err());
-        assert!(resolve_commit(&rows, Some(&rows), 20, Some(&receipt)).is_err());
+        let mut conflicting = rows.clone();
+        conflicting.digest[0] ^= 1;
+        assert_eq!(
+            resolve_commit(&conflicting, Some(&rows), origin, None),
+            Err(ApplyError::DigestMismatch)
+        );
     }
-    let mut conflicting = rows.clone();
-    conflicting.digest[0] ^= 1;
-    assert_eq!(
-        resolve_commit(&conflicting, Some(&rows), 20, None),
-        Err(ApplyError::DigestMismatch)
-    );
 }
 
 #[test]
 fn equal_h_verified_proof_cannot_be_reused_with_changed_identity_or_digest() {
-    let (h, rows) = equal_h_pair();
-    for field in 0..4 {
-        let mut target = rows.clone();
-        match field {
-            0 => target.digest[0] ^= 1,
-            1 => target.txn.0.push(3),
-            2 => target.lsn += 1,
-            _ => target.mseq += 1,
+    for origin in [20, 200] {
+        let (h, rows) = equal_h_pair();
+        for field in 0..4 {
+            let mut target = rows.clone();
+            match field {
+                0 => target.digest[0] ^= 1,
+                1 => target.txn.0.push(3),
+                2 => target.lsn += 1,
+                _ => target.mseq += 1,
+            }
+            assert!(resolve_commit(&target, Some(&h), origin, None).is_err());
         }
-        assert!(resolve_commit(&target, Some(&h), 20, None).is_err());
     }
 }
