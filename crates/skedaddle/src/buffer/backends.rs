@@ -796,7 +796,8 @@ impl BufferStore for ObjectBufferStore {
                         Err(Error::LocalParentMissing) => return Ok(()),
                         Err(error) => return Err(error),
                     };
-                    match l.root.remove_file(path.as_ref()) {
+                    let physical = l.physical(&path)?;
+                    match l.root.remove_file(&physical) {
                         Ok(()) => l.sync_dirs(&guards, &path),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                         Err(e) => Err(local_error("delete-object", path.as_ref(), e)),
@@ -1359,8 +1360,9 @@ impl LocalBuffer {
             .sync_all()
             .map_err(|e| local_error("sync-stage", key.as_ref(), e))?;
         self.file_syncs.fetch_add(1, Ordering::Relaxed);
-        let leaf = key
-            .as_ref()
+        let physical = self.physical(key)?;
+        let leaf = physical
+            .as_str()
             .rsplit('/')
             .next()
             .ok_or(Error::UnsafeLocalPath)?;
@@ -1375,19 +1377,40 @@ impl LocalBuffer {
     }
     fn parents(&self, key: Option<&Path>, create: bool) -> Result<Vec<Dir>> {
         let mut guards = vec![self.root.clone()];
-        if let Some(parent) = key.and_then(|key| key.as_ref().rsplit_once('/').map(|p| p.0)) {
-            match self.root.dir(parent, create) {
-                Ok(dir) => guards.push(dir),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(Error::LocalParentMissing);
+        if let Some(key) = key {
+            let components: Vec<_> = key.as_ref().split('/').collect();
+            let mut dir = self.root.clone();
+            for (index, component) in components.iter().enumerate() {
+                let name = local_component(component);
+                validate_local_component(&name)?;
+                if name != *component {
+                    verify_component(&dir, &name, Some(component), create)?;
                 }
-                Err(e) => return Err(local_error("open-parent", parent, e)),
+                if index + 1 < components.len() {
+                    dir = match dir.dir(&name, create) {
+                        Ok(dir) => dir,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(Error::LocalParentMissing);
+                        }
+                        Err(e) => return Err(local_error("open-parent", key.as_ref(), e)),
+                    };
+                }
+            }
+            if components.len() > 1 {
+                guards.push(dir);
             }
         }
         Ok(guards)
     }
+    fn physical(&self, key: &Path) -> Result<String> {
+        let components: Vec<_> = key.as_ref().split('/').map(local_component).collect();
+        for component in &components {
+            validate_local_component(component)?;
+        }
+        Ok(components.join("/"))
+    }
     fn check_leaf(&self, key: &Path) -> Result<Option<File>> {
-        match self.root.open_file(key.as_ref()) {
+        match self.root.open_file(self.physical(key)?) {
             Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(local_error("open-object", key.as_ref(), e)),
@@ -1421,7 +1444,16 @@ impl LocalBuffer {
             .map_err(|e| local_error("list-directory", prefix, e))?
         {
             let text = name.to_str().ok_or(Error::UnsafeLocalPath)?;
-            let key = format!("{prefix}{text}");
+            if text.starts_with('#') && !text.starts_with("#skedaddle-long-") {
+                continue;
+            }
+            validate_local_component(text)?;
+            let logical = if text.starts_with("#skedaddle-long-") {
+                verify_component(dir, text, None, false)?
+            } else {
+                text.to_owned()
+            };
+            let key = format!("{prefix}{logical}");
             match dir.dir(&name, false) {
                 Ok(child) => Self::visit(&child, &format!("{key}/"), accept)?,
                 Err(_) => {
@@ -1440,6 +1472,87 @@ impl LocalBuffer {
         }
         Ok(())
     }
+}
+
+// A byte bound is conservative for both NTFS UTF-16 and Unix byte limits.
+// '#' is forbidden in logical keys, so mapped names cannot alias short names.
+const LOCAL_COMPONENT_LIMIT: usize = 255;
+fn validate_local_component(component: &str) -> Result<()> {
+    if component.len() > LOCAL_COMPONENT_LIMIT {
+        return Err(Error::Invalid(
+            "local physical path component exceeds 255 bytes",
+        ));
+    }
+    Ok(())
+}
+fn local_component(component: &str) -> String {
+    if component.len() <= LOCAL_COMPONENT_LIMIT {
+        component.to_owned()
+    } else {
+        format!("#skedaddle-long-{:x}", Sha256::digest(component.as_bytes()))
+    }
+}
+
+// Sidecars are published durably before their data/child directory. They are
+// retained after deletion: a concurrent delete/recreate must never remove a
+// mapping another writer needs. Orphan sidecars are invisible to object lists.
+fn verify_component(
+    dir: &Dir,
+    physical: &str,
+    expected: Option<&str>,
+    create: bool,
+) -> Result<String> {
+    let metadata = physical.replacen("#skedaddle-long-", "#skedaddle-name-", 1);
+    if create {
+        let expected = expected.ok_or(Error::UnsafeLocalPath)?;
+        let mut stage = StageFile::new(dir.clone(), physical)?;
+        stage
+            .file
+            .as_mut()
+            .expect("stage")
+            .write_all(expected.as_bytes())
+            .map_err(|e| local_error("write-name", physical, e))?;
+        stage
+            .file
+            .as_ref()
+            .expect("stage")
+            .sync_all()
+            .map_err(|e| local_error("sync-name", physical, e))?;
+        match dir.rename_new(&stage.name, &metadata) {
+            Ok(()) => {
+                drop(stage.file.take());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(local_error("publish-name", physical, e)),
+        }
+    }
+    let mut bytes = Vec::new();
+    dir.open_file(&metadata)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::LocalParentMissing
+            } else {
+                local_error("open-name", physical, e)
+            }
+        })?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|e| local_error("read-name", physical, e))?;
+    let logical = String::from_utf8(bytes).map_err(|_| Error::UnsafeLocalPath)?;
+    if logical.len() > 4096
+        || logical.contains('/')
+        || key_path(&logical).is_err()
+        || local_component(&logical) != physical
+        || logical == physical
+        || expected.is_some_and(|expected| expected != logical)
+    {
+        return Err(Error::UnsafeLocalPath);
+    }
+    if create {
+        dir.sync()
+            .map_err(|e| local_error("sync-name-directory", physical, e))?;
+    }
+    Ok(logical)
 }
 
 struct StageFile {
@@ -1645,6 +1758,14 @@ fn local_error(operation: &'static str, path: &str, error: std::io::Error) -> Er
 #[cfg(test)]
 mod local_io_tests {
     use super::*;
+
+    #[test]
+    fn physical_component_bound_has_an_explicit_diagnostic() {
+        assert!(validate_local_component(&"a".repeat(255)).is_ok());
+        let error = validate_local_component(&"a".repeat(256)).unwrap_err();
+        assert!(error.to_string().contains("component exceeds 255 bytes"));
+        assert!(local_component(&"a".repeat(256)).len() <= 255);
+    }
 
     #[test]
     fn local_io_diagnostic_preserves_codes_and_redacts_path_and_message() {

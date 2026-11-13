@@ -1409,3 +1409,149 @@ async fn gcs_unknown_put_outcome_resolved() {
         direct.delete(&key).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn long_local_components_preserve_logical_keys_across_restart() {
+    let root = scratch("long-local-components");
+    let domain = format!("pg:1234567890123456789:1:p5e_{}", "a".repeat(32));
+    assert_eq!(domain.len(), 61);
+    let position = format!(
+        "x{}.0000000000000001",
+        domain
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let leaf = format!("{position}-{position}-1.seg");
+    assert_eq!(leaf.len(), 287);
+    let key = format!("live/stream/wal/seg/{leaf}");
+    let other = format!(
+        "live/stream/wal/seg/{}2.seg",
+        leaf.trim_end_matches("1.seg")
+    );
+    let nested = format!("{}/child", "d".repeat(300));
+    let store = ObjectBufferStore::local(&root, Duration::from_secs(10)).unwrap();
+    // Simulate an existing buffer written before physical mapping existed.
+    std::fs::write(root.join("old-short"), b"legacy").unwrap();
+    for (name, body) in [
+        (&key, b"first".as_slice()),
+        (&other, b"second"),
+        (&nested, b"nested"),
+    ] {
+        assert_eq!(
+            store.put_create_only(name, body).await.unwrap(),
+            PutOutcome::Created
+        );
+        assert_eq!(
+            store.put_create_only(name, body).await.unwrap(),
+            PutOutcome::Resolved
+        );
+        assert_eq!(
+            store.put_create_only(name, b"different").await,
+            Err(Error::Conflict)
+        );
+    }
+    drop(store);
+    let store = ObjectBufferStore::local(&root, Duration::from_secs(10)).unwrap();
+    for (name, body) in [
+        (&key, b"first".as_slice()),
+        (&other, b"second"),
+        (&nested, b"nested"),
+    ] {
+        assert_eq!(store.get(name).await.unwrap().unwrap(), body);
+        let mut output = Vec::new();
+        assert_eq!(
+            store
+                .get_into(name, &mut output)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            body.len() as u64
+        );
+        assert_eq!(output, body);
+    }
+    assert_eq!(store.get("old-short").await.unwrap().unwrap(), b"legacy");
+    let mut listed = Vec::new();
+    let mut token = None;
+    loop {
+        let page = store.list_prefix("", token.as_deref(), 1).await.unwrap();
+        listed.extend(page.objects.into_iter().map(|o| o.key));
+        token = page.next;
+        if token.is_none() {
+            break;
+        }
+    }
+    let mut expected = vec![
+        key.clone(),
+        other.clone(),
+        nested.clone(),
+        "old-short".into(),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+    assert_eq!(
+        store
+            .list_prefix(&key[..key.len() - 6], None, 10)
+            .await
+            .unwrap()
+            .objects
+            .len(),
+        2
+    );
+    fn bounded(root: &std::path::Path) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_name().to_str().unwrap().len() <= 255);
+            if entry.file_type().unwrap().is_dir() {
+                bounded(&entry.path());
+            }
+        }
+    }
+    bounded(&root);
+    for name in expected {
+        store.delete(&name).await.unwrap();
+        store.delete(&name).await.unwrap();
+        assert_eq!(store.get(&name).await.unwrap(), None);
+    }
+    assert!(
+        store
+            .list_prefix("", None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn long_local_mapping_rejects_tampered_identity() {
+    let root = scratch("long-local-tamper");
+    let key = "x".repeat(300);
+    let store = ObjectBufferStore::local(&root, Duration::from_secs(10)).unwrap();
+    let input = root.join("input");
+    std::fs::write(&input, b"streamed").unwrap();
+    store
+        .put_file_create_only(&key, File::open(&input).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(store.get(&key).await.unwrap().unwrap(), b"streamed");
+    let metadata = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("#skedaddle-name-")
+        })
+        .unwrap();
+    std::fs::write(metadata, "y".repeat(300)).unwrap();
+    assert_eq!(store.get(&key).await, Err(Error::UnsafeLocalPath));
+    assert_eq!(store.delete(&key).await, Err(Error::UnsafeLocalPath));
+    assert_eq!(
+        store.list_prefix("", None, 10).await,
+        Err(Error::UnsafeLocalPath)
+    );
+}
