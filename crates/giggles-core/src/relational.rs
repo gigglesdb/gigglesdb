@@ -1850,6 +1850,9 @@ impl Prepared {
     pub(crate) fn commit_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Commit, domain, epoch)
     }
+    pub(crate) fn rollback_engine(domain: u128, epoch: u64) -> Self {
+        Self::engine(Statement::Rollback, domain, epoch)
+    }
     fn engine_table(table: &TableDef, state: &Relational) -> R<()> {
         // Callers cannot smuggle stale IDs, column types or unchecked key indexes
         // into the executor through a hand-built descriptor.

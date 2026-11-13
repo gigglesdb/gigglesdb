@@ -2315,6 +2315,11 @@ impl SqlSession {
         result
     }
     pub(crate) fn begin_engine(&mut self) -> Result<(), CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let prepared =
+                relational::Prepared::begin_engine(u128::from_be_bytes(db.meta.domain), 0);
+            return self.execute_bound_engine(&prepared, &[], None).map(|_| ());
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| Ok(relational::Prepared::begin_engine(domain, state.epoch)),
@@ -2323,12 +2328,28 @@ impl SqlSession {
         .map(|_| ())
     }
     pub(crate) fn commit_engine(&mut self) -> Result<(), CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let prepared =
+                relational::Prepared::commit_engine(u128::from_be_bytes(db.meta.domain), 0);
+            return self.execute_bound_engine(&prepared, &[], None).map(|_| ());
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| Ok(relational::Prepared::commit_engine(domain, state.epoch)),
             None,
         )
         .map(|_| ())
+    }
+    pub(crate) fn is_v2_engine(&self) -> bool {
+        matches!(self.admin.inner.backend, Backend::V2(_))
+    }
+    pub(crate) fn rollback_v2_engine(&mut self) -> Result<(), CoreError> {
+        let Backend::V2(db) = &self.admin.inner.backend else {
+            unreachable!()
+        };
+        let prepared =
+            relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
+        self.execute_bound_engine(&prepared, &[], None).map(|_| ())
     }
     /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
     pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {

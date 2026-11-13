@@ -150,13 +150,8 @@ fn native_sql_sessions_are_refused() {
     let path = directory();
     let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
     let mut session = admin.sql_session();
-    assert!(matches!(
-        session.begin_native(),
-        Err(CoreError::EngineUnsupported {
-            engine: "v2",
-            feature: "SQL sessions"
-        })
-    ));
+    session.begin_native().unwrap();
+    session.rollback_native().unwrap();
     let request = Request::Read {
         table: "app".into(),
         filter: None,
@@ -345,8 +340,8 @@ fn lifecycle_and_public_refusals() {
             .affected,
         1
     );
-    denied(session.begin_engine(), SQL_SESSIONS);
-    denied(session.commit_engine(), SQL_SESSIONS);
+    session.begin_engine().unwrap();
+    session.commit_engine().unwrap();
     denied(session.catalog_engine(), SQL_SESSIONS);
     denied(session.catalog_empty_engine(), SQL_SESSIONS);
     denied(session.snapshot_identity_engine(), SQL_SESSIONS);
@@ -378,4 +373,48 @@ fn lifecycle_and_public_refusals() {
     drop(session);
     drop(admin);
     fs::remove_dir_all(path).unwrap();
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_controls_match_sql_without_parsing() {
+    for controls in [
+        vec!["BEGIN", "COMMIT"],
+        vec!["BEGIN", "ROLLBACK"],
+        vec!["BEGIN", "BEGIN", "COMMIT", "ROLLBACK"],
+        vec!["COMMIT", "ROLLBACK"],
+        vec!["BEGIN", "ERROR", "BEGIN", "COMMIT", "ROLLBACK"],
+        vec!["BEGIN", "ERROR", "ROLLBACK"],
+    ] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut native = admin.sql_session();
+        let mut sql = admin.sql_session();
+        for control in controls {
+            if control == "ERROR" {
+                assert!(
+                    native
+                        .execute("SELECT * FROM missing_control_table", &[], None)
+                        .is_err()
+                );
+                assert!(
+                    sql.execute("SELECT * FROM missing_control_table", &[], None)
+                        .is_err()
+                );
+                continue;
+            }
+            let expected = sql.execute(control, &[], None).map(|_| ());
+            let actual = crate::relational::with_sql_parser_forbidden(|| match control {
+                "BEGIN" => native.begin_native(),
+                "COMMIT" => native.commit_native(),
+                _ => native.rollback_native(),
+            });
+            assert_eq!(actual, expected, "{control}");
+            assert_eq!(native.in_transaction(), sql.in_transaction());
+        }
+        drop(native);
+        drop(sql);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
 }

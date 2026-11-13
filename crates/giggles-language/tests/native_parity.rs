@@ -223,17 +223,17 @@ fn unsupported_native_construct_cannot_pass() {
     ));
 }
 #[test]
-fn native_on_v2_is_currently_refused() {
+fn native_on_v2_allows_only_transaction_controls() {
     // giggles-language's core dependency enables engine-rocksdb even when this
     // crate is tested with --no-default-features.
     let (_db, admin) = Database::fresh(StorageEngine::V2);
-    assert!(matches!(
-        with_sql_parser_forbidden(|| admin.sql_session().begin_native()),
-        Err(CoreError::EngineUnsupported {
-            engine: "v2",
-            feature: "SQL sessions"
-        })
-    ));
+    // R2 item 2: typed BEGIN/ROLLBACK run on v2 without the SQL parser.
+    with_sql_parser_forbidden(|| {
+        let mut session = admin.sql_session();
+        session.begin_native().unwrap();
+        session.rollback_native().unwrap();
+    });
+    // Every other native operation is still refused on v2.
     assert!(matches!(
         native(&admin, "create table items(id int64,primary key(id))", true),
         Step::Native(Error::Core(_))

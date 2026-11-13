@@ -109,6 +109,9 @@ impl SqlSession {
 
     /// Typed ROLLBACK remains reachable while the transaction is aborted.
     pub fn rollback_native(&mut self) -> std::result::Result<(), CoreError> {
+        if self.is_v2_engine() {
+            return self.native_control(Self::rollback_v2_engine);
+        }
         if !self.in_transaction() {
             return Err(CoreError::Sql(SqlError::Transaction));
         }
