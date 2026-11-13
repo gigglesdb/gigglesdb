@@ -52,3 +52,34 @@ fn oid_zero_decoded_bigint_large_in_uses_points() {
     assert_eq!(SELECT_POINT_READS.get(),1000);
     SELECT_POINT_READS.set(0);
 }
+#[test]
+fn cursor_points_chunked_domains() {
+    use relational::SELECT_FILTER_SKIPS;
+    let f = Fixture::new();
+    let mut s = f.admin().sql_session();
+    s.execute("CREATE TABLE t(id bigint PRIMARY KEY, v bigint)", &[], None).unwrap();
+    s.execute(&format!("INSERT INTO t VALUES {}", (1..=1000).map(|i| format!("({i},{})", i%5)).collect::<Vec<_>>().join(",")), &[], None).unwrap();
+    let params = (501..=1500).map(Value::Int).collect::<Vec<_>>();
+    let list = (1..=1000).map(|i|format!("${i}")).collect::<Vec<_>>().join(",");
+    for own in [false, true] {
+        if own { s.execute("BEGIN", &[], None).unwrap(); s.execute("INSERT INTO t VALUES(1001,3)", &[], None).unwrap(); }
+        for suffix in ["", " ORDER BY id DESC", " LIMIT 10 OFFSET 5", " AND v = 3"] {
+            let p = s.prepare(&format!("SELECT id FROM t WHERE id IN ({list}){suffix}")).unwrap();
+            let mut results = Vec::new();
+            for disabled in [false, true] {
+                DISABLE_SELECT_POINTS.set(disabled);
+                SELECT_POINT_READS.set(0);
+                SELECT_FILTER_SKIPS.set(0);
+                let mut cursor = s.open_cursor(&p, &params).unwrap();
+                let mut rows = Vec::new();
+                loop { let chunk = cursor.fetch(7, 100000).unwrap(); if chunk.is_empty() { break; } rows.extend(chunk.into_iter().map(|r|r.values)); }
+                // LIMIT/OFFSET queries keep the scan for now (their WHERE is wrapped with the clause bundle); results must match.
+                if !disabled && !suffix.contains("LIMIT") { assert!(SELECT_POINT_READS.get()>0, "own={own} suffix={suffix}"); assert_eq!(SELECT_FILTER_SKIPS.get()>0, !suffix.contains("v =")); }
+                results.push(rows);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        if own { s.execute("ROLLBACK", &[], None).unwrap(); }
+    }
+    DISABLE_SELECT_POINTS.set(false);
+}

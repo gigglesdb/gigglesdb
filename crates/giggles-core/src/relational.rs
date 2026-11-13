@@ -4127,4 +4127,4 @@ pub mod logical_types;
 pub(crate) mod v2_join_cache_tests;
 
 #[cfg(all(test, feature = "engine-rocksdb"))]
-pub(crate) use query::select_points::{DISABLE_SELECT_POINTS, SELECT_POINT_READS};
+pub(crate) use query::select_points::{DISABLE_SELECT_POINTS, SELECT_POINT_READS, SELECT_FILTER_SKIPS};

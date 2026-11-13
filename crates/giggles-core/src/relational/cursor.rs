@@ -67,6 +67,7 @@ impl Plan {
             .bind(state, self.prepared.params, &self.prepared.parameter_types)?
             .with_clock(self.clock.as_ref())
             .fetch_cursor(
+                state,
                 source,
                 &self.params,
                 &mut self.progress,

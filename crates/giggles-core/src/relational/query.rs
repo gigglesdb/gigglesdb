@@ -4531,6 +4531,7 @@ impl BoundQuery<'_> {
     }
     pub(super) fn fetch_cursor(
         &self,
+        state: &Relational,
         source: &dyn scan::RowSource,
         params: &[Value],
         progress: &mut super::cursor::Progress,
@@ -4645,10 +4646,38 @@ impl BoundQuery<'_> {
                 scan::Direction::Reverse => range.hi = Bound::Excluded(key.clone()),
             }
         }
-        let mut input = match indexed {
+        #[cfg(not(test))]
+        let points_enabled = true;
+        #[cfg(test)]
+        let points_enabled = !select_points::DISABLE_SELECT_POINTS.get();
+        #[cfg(not(test))]
+        let cap = 2048;
+        #[cfg(test)]
+        let cap = select_points::SELECT_KEY_CAP.get().unwrap_or(2048);
+        let mut exact_points = false;
+        let mut input = if points_enabled && self.tables.len() == 1 && self.joins.is_empty()
+            && let Some((keys, exact)) = self.query.primary_key_candidates(state, self.tables[0], params, cap)
+        {
+            exact_points = exact;
+            let mut keys = keys.iter().map(|key| encode_key(key)).collect::<R<Vec<_>>>()?;
+            keys.sort();
+            keys.dedup();
+            if matches!(direction, scan::Direction::Reverse) { keys.reverse(); }
+            let after = progress.after.clone();
+            let table = self.tables[0];
+            Box::new(keys.into_iter().filter(move |key| after.as_ref().is_none_or(|after| match direction {
+                scan::Direction::Forward => key > after,
+                scan::Direction::Reverse => key < after,
+            })).filter_map(move |key| {
+                if crate::cancellation::check().is_err() { return Some(Err(SqlError::Aborted)); }
+                #[cfg(test)]
+                select_points::SELECT_POINT_READS.with(|reads| reads.set(reads.get() + 1));
+                source.get(table, &key).transpose()
+            })) as scan::SourceRows<'_>
+        } else { match indexed {
             Some(input) => input,
             None => source.scan(self.tables[0], &range, direction)?,
-        };
+        }};
         loop {
             crate::cancellation::check().map_err(|_| SqlError::Aborted)?;
             let Some(row) = input.next() else {
@@ -4662,7 +4691,11 @@ impl BoundQuery<'_> {
                 version: row.row.version,
             };
             let mut work = 0;
-            if let Some(filter) = &self.filter
+            if exact_points {
+                #[cfg(test)]
+                select_points::SELECT_FILTER_SKIPS.with(|count| count.set(count.get() + 1));
+            }
+            if !exact_points && let Some(filter) = &self.filter
                 && filter.eval(&tuple, params, &mut work)? != Some(true)
             {
                 continue;

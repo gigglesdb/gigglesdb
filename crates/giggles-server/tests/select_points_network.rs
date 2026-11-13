@@ -163,8 +163,9 @@ async fn query(
     bind.extend(0u16.to_be_bytes());
     send(&mut stream, b'B', &bind).await;
     send(&mut stream, b'D', &[b'P', 0]).await;
-    send(&mut stream, b'E', &[0, 0, 0, 0, 0]).await;
-    send(&mut stream, b'S', &[]).await;
+    let chunked = oids.len() == 1000 && oids.iter().all(|oid| *oid == 0);
+    send(&mut stream, b'E', &[0, 0, 0, 0, if chunked { 100 } else { 0 }]).await;
+    send(&mut stream, if chunked { b'H' } else { b'S' }, &[]).await;
     let mut response = Response {
         context: format!("sql={sql:?}, oids={oids:?}, binary_parameters={binary_parameters}"),
         tags: vec![],
@@ -179,11 +180,13 @@ async fn query(
         let (tag, body) = read(&mut stream).await;
         response.tags.push(tag);
         match tag {
-            b'C' => response.commands.push(
+            b'C' => {
+                if chunked { send(&mut stream, b'S', &[]).await; }
+                response.commands.push(
                 std::str::from_utf8(body.strip_suffix(&[0]).expect("CommandComplete terminator"))
                     .unwrap()
                     .into(),
-            ),
+            ); },
             b'E' => {
                 let code = body
                     .split(|byte| *byte == 0)
@@ -238,6 +241,11 @@ async fn query(
                 assert_eq!(at, body.len());
                 response.rows.push(row);
             }
+            b's' if chunked => {
+                send(&mut stream, b'E', &[0, 0, 0, 0, 100]).await;
+                send(&mut stream, b'H', &[]).await;
+            }
+            b'Z' if chunked && response.tags.contains(&b's') && !response.tags.contains(&b'C') => {},
             b'Z' => return response,
             _ => {}
         }
@@ -259,6 +267,8 @@ async fn oid_zero_bigint_points() {
         assert!(r.errors.is_empty(), "{r:?}");
         assert_eq!(r.parameters,vec![20;1000]);
         assert_eq!(r.rows.len(),1000);
+        for (i,row) in r.rows.iter().enumerate() { assert_eq!(row[0].as_deref(),Some(texts[i].as_bytes())); }
+        if oids[0]==0 { assert!(r.tags.contains(&b's')); }
     }
     let mut stream=f.connect().await;
     let mut simple=format!("SELECT id FROM t WHERE id IN ({})",texts.join(",")).into_bytes();
