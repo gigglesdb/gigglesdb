@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference='Stop'
 $resolved=[IO.Path]::GetFullPath($TaskRoot).Replace('\','/')
 if (-not $resolved.StartsWith('J:/gigglesdb-work/',[StringComparison]::OrdinalIgnoreCase)) { throw 'TaskRoot must be a unique J:/gigglesdb-work subfolder' }
-$env:CARGO_TARGET_DIR=if ($Phase -eq 'pg-matrix') {'J:/gigglesdb-work/gd49-target-b'} else {"$resolved/target"}
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR="$resolved/target" }
 $env:RUSTC_WRAPPER='J:/gigglesdb-work/tools/bin/sccache.exe'
 $env:SCCACHE_DIR='J:/gigglesdb-work/sccache-cache'
 $env:SCCACHE_CACHE_SIZE='100G'
@@ -24,6 +24,10 @@ $env:SKEDADDLE_MUTANTS_FILTER=$MutationFilter
 $env:SKEDADDLE_MUTATION_SUITE=$MutationSuite
 $env:SKEDADDLE_PG_VERSION=$PgVersion
 New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+if ($Phase -eq 'pg-matrix') {
+    $clientLock=Get-Content -Raw (Join-Path $PSScriptRoot 'pg-client.lock') | ConvertFrom-Json
+    $env:SKEDADDLE_PSQL=$clientLock.executable
+}
 $result=1
 try {
     & python -B (Join-Path $PSScriptRoot 'harness.py') $Phase $resolved
@@ -32,7 +36,11 @@ try {
 finally {
     if ($Phase -eq 'pg-matrix') {
         & (Join-Path $PSScriptRoot 'cleanup.ps1') -Check -TaskRoot $resolved
-        if ($LASTEXITCODE -ne 0) { $result=1 }
+        if ($LASTEXITCODE -ne 0) { if ($Phase -eq 'pg-matrix') {
+    $clientLock=Get-Content -Raw (Join-Path $PSScriptRoot 'pg-client.lock') | ConvertFrom-Json
+    $env:SKEDADDLE_PSQL=$clientLock.executable
+}
+$result=1 }
     }
 }
 exit $result

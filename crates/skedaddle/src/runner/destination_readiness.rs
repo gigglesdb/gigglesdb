@@ -420,7 +420,7 @@ mod tests {
         let result=async {
             let setup=format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.t(id integer GENERATED ALWAYS AS IDENTITY, v integer); INSERT INTO {schema}.t(v) VALUES(1),(1);");
             source.batch_execute(&setup).await.map_err(|e|e.to_string())?;
-            destination.batch_execute(&format!("{setup} ALTER TABLE {schema}.t ADD CONSTRAINT unvalidated CHECK(v>0) NOT VALID; ALTER SEQUENCE {schema}.t_id_seq AS bigint; CREATE ROLE {role} NOLOGIN NOREPLICATION;")).await.map_err(|e|e.to_string())?;
+            destination.batch_execute(&format!("{setup} ALTER TABLE {schema}.t ADD CONSTRAINT unvalidated CHECK(v>0) NOT VALID; ALTER SEQUENCE {schema}.t_id_seq AS bigint; CREATE ROLE {role} NOLOGIN NOREPLICATION; GRANT USAGE ON SCHEMA {schema} TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role};")).await.map_err(|e|e.to_string())?;
             if destination.batch_execute(&format!("CREATE UNIQUE INDEX CONCURRENTLY bad_index ON {schema}.t(v)")).await.is_ok() { return Err("duplicate rows must leave an invalid concurrent index".into()); }
             async fn probe(retained: &std::sync::Mutex<Option<Observation>>, source: &Client, destination: &Client, state: &Materialized, schema: &str) -> Result<Checks,String> {
                 refresh(retained,Some(source),Some(destination),"r5b",Request {state,owner:"owner".into(),scope:vec![format!("{schema}.t")],started:Instant::now()}).await;

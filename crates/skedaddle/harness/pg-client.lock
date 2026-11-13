@@ -1,0 +1,8 @@
+{
+  "version": "16.15-1",
+  "psql_version": "psql (PostgreSQL) 16.15",
+  "url": "https://get.enterprisedb.com/postgresql/postgresql-16.15-1-windows-x64-binaries.zip",
+  "sha256": "25e6fcdfb8caec38691bf461125e7564508760666f7b8e5dc6a5f0818f58f81e",
+  "checksum_source": "SHA-256 of official HTTPS archive, pinned at provisioning (not a publisher-signed checksum)",
+  "executable": "J:/gigglesdb-work/tools/pg16-client/bin/psql.exe"
+}

@@ -6,6 +6,11 @@ CREATE ROLE skedaddle_capture LOGIN REPLICATION PASSWORD 'capture-test';
 CREATE ROLE skedaddle_fence LOGIN CREATEROLE PASSWORD 'fence-test';
 CREATE ROLE skedaddle_apply LOGIN PASSWORD 'apply-test';
 CREATE ROLE skedaddle_verify LOGIN PASSWORD 'verify-test';
+-- Preflight measures allocated WAL; REPLICATION alone does not allow this.
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_waldir() TO skedaddle_fixture, skedaddle_setup;
+-- rollback refuses pre-existing _skedaddle state; never reuse the matrix DB.
+CREATE DATABASE skedaddle_rollback;
+REVOKE ALL ON DATABASE skedaddle_rollback FROM PUBLIC;
 REVOKE CREATE, TEMPORARY ON DATABASE skedaddle FROM PUBLIC;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT ON DATABASE skedaddle TO skedaddle_fixture, skedaddle_setup, skedaddle_capture,

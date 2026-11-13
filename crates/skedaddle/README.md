@@ -400,7 +400,9 @@ never enter journal, local state or diagnostics.
 The plan assigns separate least-privilege roles: source capture needs REPLICATION,
 SELECT on in-scope tables and publication ownership; fencing needs ALTER ROLE,
 scoped GRANT/REVOKE and `pg_signal_backend`; destination apply needs its required
-writes; verification is read-only on both endpoints. Exact deployment grants,
+writes; verification is read-only on both endpoints. Preflight WAL measurement
+also requires `GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_waldir() TO <preflight_role>`
+in each endpoint database. This measures allocated WAL; no `pg_monitor` grant is needed. Exact deployment grants,
 over-broad-role warnings, hook isolation and whole-run secret sweeps need live
 qualification. This README does not certify all planned security gates exercised.
 

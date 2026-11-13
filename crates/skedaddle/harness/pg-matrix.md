@@ -10,9 +10,10 @@ uses `replica`, as required by `wal_level_replica_blocks`.
 powershell -NoProfile -ExecutionPolicy Bypass -File crates/skedaddle/harness/run.ps1 -Phase pg-matrix -PgVersion 16 -TaskRoot J:/gigglesdb-work/gd49-h1-FRESH-pg16
 ```
 
-Use a fresh task directory per invocation and serialize versions: they share
-`J:/gigglesdb-work/gd49-target-b`. The phase sets the shared sccache variables,
-two build jobs, and J: TEMP/TMP/scratch. It runs the disk guard before any
+Use a fresh task directory per invocation and serialize versions. Set
+`CARGO_TARGET_DIR` to the assigned stable lane target; otherwise it defaults to
+`<TaskRoot>/target`. The phase sets the shared sccache variables,
+four build jobs, and J: TEMP/TMP/scratch. It runs the disk guard before any
 resource creation or image pull. The fixture has no host data binds; harness
 scripts are mounted read-only. Each labeled data volume has a hard 256 MiB
 tmpfs cap (768 MiB total, including WAL, TLS and extracted tools). WAL retention
@@ -40,19 +41,19 @@ corresponding public `ca_pem` and validate `localhost`. libpq receives
 
 | Gated test file | Keys / environment gates read | Fixture coverage |
 | --- | --- | --- |
-| `tests/pg_replication.rs` | CONFIG; `pg`; `replication.{host,port,server_name,user,password,database,ca_pem}` | All provided; TLS client blocker below |
-| `tests/pg_source.rs` | CONFIG; `pg`; same seven `replication` fields | All provided; TLS client blocker |
-| `tests/pg_apply.rs` | CONFIG; `pg_apply` | Provided, explicit destination admin; TLS client blocker |
-| `tests/pg_preflight.rs` | CONFIG; `pg`; `pg_replica_wal` | Both provided, separate logical/replica servers; TLS client blocker |
-| `tests/pg_chunk.rs` | CONFIG; `pg_chunk`, fallback `pg` | Both provided; capture role; TLS client blocker |
-| `tests/pg_ddl.rs` | `SKEDADDLE_PG_DDL_URL` | Provided in `env` and exported; `pg_ddl` JSON alias; TLS client blocker |
-| `tests/pg_fence.rs` | `SKEDADDLE_PG_FENCE_DSN`; optional `SKEDADDLE_PSQL` (default `psql` on PATH) | DSN provided/exported, `pg_fence` alias; host psql prerequisite; TLS client blocker |
-| `tests/pg_activate.rs` | `SKEDADDLE_PG_ACTIVATE_DSN` | Provided/exported, `pg_activate` alias; TLS client blocker |
-| `tests/pg_reverse.rs` | `SKEDADDLE_PG_REVERSE_SOURCE_URL`, `SKEDADDLE_PG_REVERSE_DESTINATION_URL` | Both provided/exported; `pg_reverse.{source,destination}` aliases; TLS client blocker |
-| `tests/verify_pg.rs` | CONFIG; recursive source/destination DSN lookup, or `SKEDADDLE_VERIFY_SOURCE_URL`, `SKEDADDLE_VERIFY_DESTINATION_URL` | Explicit env overrides and `source`/`destination` plus `verify_pg` aliases provided; TLS client blocker |
-| `tests/cutover.rs` | `SKEDADDLE_CUTOVER_SOURCE_URL`, `SKEDADDLE_CUTOVER_DESTINATION_URL` | Both provided/exported; `cutover.{source,destination}` aliases; TLS client blocker |
-| `tests/rollback.rs` | `SKEDADDLE_ROLLBACK_PG_SOURCE_URL`, `SKEDADDLE_ROLLBACK_PG_DESTINATION_URL` | Both provided/exported; `rollback.{source,destination}` aliases; TLS client blocker |
-| `tests/engine.rs` | File absent at H1 inspection; contract cannot be collected | GAP: speculative `engine.{source,destination}` aliases supplied; not qualified; phase fails explicitly if absent |
+| `tests/pg_replication.rs` | CONFIG; `pg`; `replication.{host,port,server_name,user,password,database,ca_pem}` | All provided; TLS enabled |
+| `tests/pg_source.rs` | CONFIG; `pg`; same seven `replication` fields | All provided; TLS enabled |
+| `tests/pg_apply.rs` | CONFIG; `pg_apply` | Provided, explicit destination admin; TLS enabled |
+| `tests/pg_preflight.rs` | CONFIG; `pg`; `pg_replica_wal` | Both provided, separate logical/replica servers; TLS enabled |
+| `tests/pg_chunk.rs` | CONFIG; `pg_chunk`, fallback `pg` | Both provided; capture role; TLS enabled |
+| `tests/pg_ddl.rs` | `SKEDADDLE_PG_DDL_URL` | Provided in `env` and exported; `pg_ddl` JSON alias; TLS enabled |
+| `tests/pg_fence.rs` | `SKEDADDLE_PG_FENCE_DSN`; optional `SKEDADDLE_PSQL` (default `psql` on PATH) | DSN provided/exported, `pg_fence` alias; pinned host psql precheck; TLS enabled |
+| `tests/pg_activate.rs` | `SKEDADDLE_PG_ACTIVATE_DSN` | Provided/exported, `pg_activate` alias; TLS enabled |
+| `tests/pg_reverse.rs` | `SKEDADDLE_PG_REVERSE_SOURCE_URL`, `SKEDADDLE_PG_REVERSE_DESTINATION_URL` | Both provided/exported; `pg_reverse.{source,destination}` aliases; TLS enabled |
+| `tests/verify_pg.rs` | CONFIG; recursive source/destination DSN lookup, or `SKEDADDLE_VERIFY_SOURCE_URL`, `SKEDADDLE_VERIFY_DESTINATION_URL` | Explicit env overrides and `source`/`destination` plus `verify_pg` aliases provided; TLS enabled |
+| `tests/cutover.rs` | `SKEDADDLE_CUTOVER_SOURCE_URL`, `SKEDADDLE_CUTOVER_DESTINATION_URL` | Both provided/exported; `cutover.{source,destination}` aliases; TLS enabled |
+| `tests/rollback.rs` | `SKEDADDLE_ROLLBACK_PG_SOURCE_URL`, `SKEDADDLE_ROLLBACK_PG_DESTINATION_URL` | Dedicated fresh database pair; env and `rollback.{source,destination}` aliases; TLS enabled |
+| `tests/engine.rs` | CONFIG; `engine.{source,destination}` | Writable setup endpoints and TLS CA supplied |
 | `src/pg/source/tests.rs` | ROOT; no PostgreSQL config lookups in grep results | Provided; source unit tests included separately |
 
 ## Privilege assignments
@@ -81,7 +82,7 @@ event-trigger installation), `pg_fence` (all live fixtures, including its
 explicit rolsuper assertion), `pg_activate` (all three live tests, including
 database creation), `pg_reverse`, `cutover`, and the real-PG module in `rollback`.
 No superuser is assigned to `pg`, replication capture, pg_chunk, preflight,
-or verify_pg. `engine` privileges cannot be determined without its file.
+or verify_pg. `engine` uses the writable `skedaddle_setup` endpoints.
 
 | Superuser gate | Live tests using it |
 | --- | --- |
@@ -93,19 +94,41 @@ or verify_pg. `engine` privileges cannot be determined without its file.
 | `cutover` | `abort_before_activation_restores_source`, `measured_interruption_reported` |
 | `rollback::real_pg` | `rollback_preserves_destination_writes`, `rollback_restores_source_privileges_exactly`, `crash_during_rollback_recovers`, `finalize_drops_all_installed_objects` |
 
-## Known qualification blockers
+## Native Windows client prerequisite
 
-Every inspected live SQL setup/driver currently uses `tokio_postgres::NoTls`,
-including `pg_replication`/`pg_source` administration (their replication stream
-already uses TLS). `NoTls` cannot connect to this fixture's TLS-only TCP
-endpoints. Supplying a TLS DSN does not add a connector. These clients need TLS
-adapters loading the supplied CA, outside H1's harness-only edit boundary.
-The fixture deliberately retains plaintext rejection; no passing live suite is
-claimed. The source unit tests are not a replacement for live qualification.
-`tests/engine.rs` is also absent, and the future phase records this gap and
-returns failure. A host `psql` executable is required by pg_fence.
+Provision once with `powershell -NoProfile -ExecutionPolicy Bypass -File
+crates/skedaddle/harness/provision-pg-client.ps1 -TaskRoot
+J:/gigglesdb-work/<fresh-provision-task>`. `pg-client.lock` pins the official
+EDB Windows x64 zip URL, PostgreSQL 16.15-1 version and SHA-256. The script
+verifies the archive before extracting psql.exe and its bundled DLLs under
+`J:/gigglesdb-work/tools/pg16-client/bin`; it never changes PATH. The checksum
+is an archive-content pin obtained over official HTTPS, not a signed checksum.
+Both entrypoints set `SKEDADDLE_PSQL` to that absolute executable. Python runs
+`psql --version` before guard/startup/database mutation and gives a provisioning
+instruction if the executable, DLLs, or expected version are unavailable.
+TLS remains verify-full with the exported public CA bundle.
 
-The future phase runs each integration binary twice, ordinary env-gated tests
+## Isolation and WAL privileges
+
+`pg-init.sql` creates `skedaddle_rollback` on each server, accessible only to
+its explicit admin. Both rollback legacy gates and JSON aliases select these
+fresh databases, so earlier binaries' `_skedaddle` tables cannot contaminate
+rollback. Its protective assertion remains intact; no shared schema is dropped.
+
+Preflight's allocated-WAL measurement requires `EXECUTE ON FUNCTION
+pg_catalog.pg_ls_waldir()` in each endpoint database. The fixture grants it to
+`skedaddle_fixture` (the preflight gate) and `skedaddle_setup` (engine endpoints).
+No `pg_monitor` membership is granted. This measures allocated WAL, not free disk.
+
+## Remaining qualification boundaries
+
+The current live adapters support the fixture's TLS-only endpoints; the old
+H1 NoTls and missing-engine blockers no longer apply. Product issues tracked
+by the PG16 triage (DDL JSON decoding, aborted-origin apply progress, Windows
+buffer filenames and combined reverse-readiness probing) are separate from
+these harness repairs. Consult each run's qualification report for exact results.
+
+The phase runs each integration binary twice, ordinary env-gated tests
 and `--ignored`, with `--no-fail-fast --nocapture --test-threads=1`, preserving
 each cargo transcript and its libtest totals. It includes the source unit
 module and engine when present. Test failures do not suppress later binaries.

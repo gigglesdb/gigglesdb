@@ -138,6 +138,49 @@ impl Connection for Psql {
     }
 }
 
+// Armed before installation: cleanup must work even when host psql cannot start.
+struct ConstructionGuard {
+    dsn: String,
+    schema: String,
+    app: String,
+    armed: bool,
+    created_hook_schema: bool,
+}
+
+impl Drop for ConstructionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Fixture::new is synchronous. Use the TLS driver directly rather than
+        // the potentially missing/broken psql executable that caused setup to fail.
+        let Ok(runtime) = tokio::runtime::Runtime::new() else {
+            eprintln!("fence partial-construction cleanup: runtime unavailable");
+            return;
+        };
+        let result = runtime.block_on(async {
+            let (client, connection) = tls_connect(&self.dsn).await.map_err(|e| e.to_string())?;
+            let driver = tokio::spawn(connection);
+            let schema = &self.schema;
+            let app = &self.app;
+            let sql = format!("DROP EVENT TRIGGER IF EXISTS skedaddle_ddl_{schema}; DROP FUNCTION IF EXISTS _skedaddle.skedaddle_ddl_{schema}(); DROP TABLE IF EXISTS _skedaddle.skedaddle_ddl_{schema}_version; DROP SCHEMA IF EXISTS {schema} CASCADE; DROP ROLE IF EXISTS {app};");
+            let result = client.batch_execute(&sql).await.map_err(|e| e.to_string());
+            if result.is_ok() && self.created_hook_schema {
+                // No CASCADE: a concurrent/foreign installation must be preserved.
+                if let Err(error) = client.batch_execute("DROP SCHEMA IF EXISTS _skedaddle").await {
+                    eprintln!("fence partial-construction shared schema preserved: {error}");
+                }
+            }
+            drop(client);
+            let _ = driver.await;
+            result
+        });
+        if let Err(error) = result {
+            eprintln!("fence partial-construction cleanup failed: {error}");
+        }
+    }
+}
+
 struct Fixture {
     db: Psql,
     fence: Fence,
@@ -150,6 +193,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(test: &str) -> Option<Self> {
+        Self::new_with_psql(test, None)
+    }
+
+    fn new_with_psql(test: &str, executable: Option<&str>) -> Option<Self> {
         let Ok(dsn) = std::env::var("SKEDADDLE_PG_FENCE_DSN") else {
             eprintln!(
                 "LOUD SKIP {test}: SKEDADDLE_PG_FENCE_DSN is unset; requires disposable harness PG, psql, superuser, logical WAL, and prepared transactions; no Docker was started"
@@ -170,14 +217,28 @@ impl Fixture {
         fs::create_dir_all(&scratch).unwrap();
         let mut db = Psql {
             dsn,
-            executable: std::env::var("SKEDADDLE_PSQL").unwrap_or_else(|_| "psql".into()),
+            executable: executable.map(str::to_owned).unwrap_or_else(|| {
+                std::env::var("SKEDADDLE_PSQL").unwrap_or_else(|_| "psql".into())
+            }),
             scratch,
+        };
+        let mut construction = ConstructionGuard {
+            dsn: db.dsn.clone(),
+            schema: schema.clone(),
+            app: app.clone(),
+            armed: true,
+            created_hook_schema: false,
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (client, connection) = tls_connect(&db.dsn).await.unwrap();
             let driver = tokio::spawn(connection);
             let version: String = client
                 .query_one("SHOW server_version_num", &[])
+                .await
+                .unwrap()
+                .get(0);
+            construction.created_hook_schema = client
+                .query_one("SELECT to_regnamespace('_skedaddle') IS NULL", &[])
                 .await
                 .unwrap()
                 .get(0);
@@ -237,6 +298,7 @@ impl Fixture {
         })
         .unwrap();
         fence.bind_migration(&schema).unwrap();
+        construction.armed = false;
         Some(Self {
             db,
             fence,
@@ -681,4 +743,39 @@ fn same_epoch_migrations_preserve_independent_saved_state() {
     first.fence.next = Step::Save;
     first.step().unwrap();
     assert_eq!(first.fence.saved, first_saved);
+}
+
+#[test]
+fn missing_psql_cleans_partial_construction() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(dsn) = std::env::var("SKEDADDLE_PG_FENCE_DSN") else {
+        eprintln!(
+            "LOUD SKIP missing_psql_cleans_partial_construction: SKEDADDLE_PG_FENCE_DSN unset"
+        );
+        return;
+    };
+    let snapshot = || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (client, connection) = tls_connect(&dsn).await.unwrap();
+            let driver = tokio::spawn(connection);
+            let rows = client.query("SELECT 'trigger:' || evtname FROM pg_event_trigger WHERE evtname LIKE 'skedaddle_ddl_p10a_%' UNION ALL SELECT 'role:' || rolname FROM pg_roles WHERE rolname LIKE 'p10a_app_%' UNION ALL SELECT 'schema:' || nspname FROM pg_namespace WHERE nspname LIKE 'p10a_%' OR nspname='_skedaddle' ORDER BY 1", &[]).await.unwrap();
+            let names: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+            drop(client);
+            driver.await.unwrap().unwrap();
+            names
+        })
+    };
+    let before = snapshot();
+    let missing = PathBuf::from(std::env::var("SKEDADDLE_TEST_ROOT").unwrap())
+        .join("deliberately-absent-psql.exe");
+    assert!(!missing.exists());
+    let failed = std::panic::catch_unwind(|| {
+        Fixture::new_with_psql("missing_psql_cleanup", Some(missing.to_str().unwrap()))
+    });
+    assert!(failed.is_err(), "missing psql must fail setup");
+    assert_eq!(
+        snapshot(),
+        before,
+        "partial fixture leaked database objects"
+    );
 }

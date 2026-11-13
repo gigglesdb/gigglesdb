@@ -21,7 +21,7 @@ for service,key in [('pg','pg18'),('minio','minio'),('gcs','gcs'),('toxiproxy','
 PG_VERSION=ENV.get('SKEDADDLE_PG_VERSION','16')
 if PG_VERSION not in ('16','17','18'): raise ValueError('PG version must be 16, 17 or 18')
 if sys.argv[1]=='pg-matrix':
-    ENV.update(PG_MATRIX_IMAGE=LOCK['pg'+PG_VERSION]['ref'],CARGO_TARGET_DIR='J:/gigglesdb-work/gd49-target-b')
+    ENV.update(PG_MATRIX_IMAGE=LOCK['pg'+PG_VERSION]['ref'])
 
 def command(args, check=True, timeout=180):
     result=subprocess.run([str(a) for a in args],cwd=CRATE,env=ENV,text=True,encoding='utf8',errors='replace',capture_output=True,timeout=timeout)
@@ -31,7 +31,7 @@ def command(args, check=True, timeout=180):
 def docker(*args, **kwargs): return command(['docker',*args],**kwargs)
 def compose(*args, **kwargs): return docker('compose','-f',ROOT/'compose.yaml','-p','skedaddle-'+RUN,*args,**kwargs)
 def save(name,value):
-    with (TASK/name).open('x',encoding='utf8') as f: f.write(value if isinstance(value,str) else json.dumps(value,indent=2))
+    with (TASK/name).open('x',encoding='utf8',newline='\n') as f: f.write(value if isinstance(value,str) else json.dumps(value,indent=2))
 
 def resources(run=None):
     filt='label=skedaddle.test'+('='+run if run else '')
@@ -280,12 +280,12 @@ def pg_matrix_config(ports, ca_paths):
     connector must load ca_pem and validate localhost; NoTls cannot use it.
     libpq/psql additionally receives PGSSLMODE=verify-full and a public bundle.
     """
-    def dsn(side, role='skedaddle_fixture'):
+    def dsn(side, role='skedaddle_fixture', database='skedaddle'):
         password={'postgres':'skedaddle','skedaddle_fixture':'fixture-test',
                   'skedaddle_setup':'setup-test',
                   'skedaddle_capture':'capture-test','skedaddle_fence':'fence-test',
                   'skedaddle_apply':'apply-test','skedaddle_verify':'verify-test'}[role]
-        return f'host=localhost hostaddr=127.0.0.1 port={ports[side]} user={role} password={password} dbname=skedaddle sslmode=require'
+        return f'host=localhost hostaddr=127.0.0.1 port={ports[side]} user={role} password={password} dbname={database} sslmode=require'
     source=dsn('pg-source','skedaddle_setup');destination=dsn('pg-destination','skedaddle_setup')
     admin_source=dsn('pg-source','postgres');admin_destination=dsn('pg-destination','postgres')
     legacy={
@@ -298,8 +298,8 @@ def pg_matrix_config(ports, ca_paths):
         'SKEDADDLE_VERIFY_DESTINATION_URL':destination,
         'SKEDADDLE_CUTOVER_SOURCE_URL':admin_source,
         'SKEDADDLE_CUTOVER_DESTINATION_URL':admin_destination,
-        'SKEDADDLE_ROLLBACK_PG_SOURCE_URL':admin_source,
-        'SKEDADDLE_ROLLBACK_PG_DESTINATION_URL':admin_destination,
+        'SKEDADDLE_ROLLBACK_PG_SOURCE_URL':dsn('pg-source','postgres','skedaddle_rollback'),
+        'SKEDADDLE_ROLLBACK_PG_DESTINATION_URL':dsn('pg-destination','postgres','skedaddle_rollback'),
     }
     cfg={'run_id':RUN,'pg_version':int(PG_VERSION),'pg':dsn('pg-source'),
          'pg_preflight':dsn('pg-source'),'pg_replica_wal':dsn('pg-replica-wal'),
@@ -311,6 +311,7 @@ def pg_matrix_config(ports, ca_paths):
         privileged=name in ('pg_reverse','cutover','rollback')
         cfg[name]={'source':admin_source if privileged else source,
                    'destination':admin_destination if privileged else destination}
+    cfg['rollback']={side:legacy['SKEDADDLE_ROLLBACK_PG_'+side.upper()+'_URL'] for side in ('source','destination')}
     for side in ('pg-source','pg-destination'):
         cfg['roles'][side]={name:dsn(side,'skedaddle_'+name)
                             for name in ('capture','fence','apply','verify')}
@@ -350,8 +351,22 @@ def pg_matrix_probe(service, port, ca_path):
             'password_encryption':password,'plaintext_rejected':True,'scram_policy':True}
 
 
+def pg_client_precheck():
+    lock=json.loads((ROOT/'pg-client.lock').read_text())
+    ENV['SKEDADDLE_PSQL']=lock['executable']
+    try:
+        result=command([ENV['SKEDADDLE_PSQL'],'--version'],timeout=15)
+        if result.stdout.strip()!=lock['psql_version']:
+            raise RuntimeError('unexpected client version: '+result.stdout.strip())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError('PG matrix requires pinned native psql; run harness/provision-pg-client.ps1 '
+                           '-TaskRoot <fresh J:/gigglesdb-work/task> before retrying: '+str(error)) from error
+    print('host client: '+result.stdout.strip(),flush=True)
+
+
 def pg_matrix():
     """Future Docker lane only. Static acceptance never invokes this function."""
+    pg_client_precheck()  # Read-only, before any database mutation or fixture startup.
     guard()  # Includes C:/J:/Docker-VM headroom, before fixture startup/pulls.
     for directory in (SCRATCH,TASK/'tmp'): directory.mkdir(exist_ok=True)
     started=False;status=0
@@ -380,7 +395,7 @@ def pg_matrix():
         cfg=pg_matrix_config(ports,ca_paths)
         config_path=pathlib.Path(ENV.get('SKEDADDLE_TEST_CONFIG',str(TASK/('config-'+RUN+'.json')))).resolve()
         if not config_path.is_relative_to(TASK): raise RuntimeError('SKEDADDLE_TEST_CONFIG must stay in this task folder')
-        with config_path.open('x',encoding='utf8') as stream: json.dump(cfg,stream,indent=2)
+        with config_path.open('x',encoding='utf8',newline='\n') as stream: json.dump(cfg,stream,indent=2)
         ENV.update(cfg['env'],SKEDADDLE_TEST_CONFIG=str(config_path),
                    PGSSLMODE='verify-full',PGSSLROOTCERT=cfg['ca_pem'])
         # Some gates are #[ignore], others are ordinary tests with env gates.
