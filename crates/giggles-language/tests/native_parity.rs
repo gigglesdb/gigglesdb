@@ -42,12 +42,23 @@ struct Table {
     columns: Vec<(String, DataType, bool)>, // bool = nullable
     primary_key: Vec<String>,
     rows: Vec<Vec<Value>>,
+    indexes: Vec<Index>,
+}
+// Logical references retain table and column names; internal IDs never enter equality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Index {
+    name: String,
+    table: String,
+    keys: Vec<String>,
+    unique: bool,
 }
 fn values(rows: Vec<SqlRow>) -> Vec<Vec<Value>> {
     rows.into_iter().map(|row| row.values).collect()
 }
 fn snapshot(admin: &Admin) -> Vec<Table> {
-    let mut tables = admin.catalog().unwrap().1;
+    let metadata = admin.sql_session().catalog_metadata().unwrap();
+    let mut tables = metadata.tables;
+    let indexes = metadata.indexes;
     tables.sort_by(|a, b| a.name.cmp(&b.name));
     tables
         .into_iter()
@@ -64,7 +75,33 @@ fn snapshot(admin: &Admin) -> Vec<Table> {
                 primary_key.join(",")
             );
             let rows = admin.sql_session().execute(&query, &[], None).unwrap().rows;
+            let mut logical_indexes: Vec<_> = indexes
+                .iter()
+                .filter(|index| index.table == table.id)
+                .map(|index| Index {
+                    name: index.name.clone(),
+                    table: table.name.clone(),
+                    // IndexInfo exposes ordered column IDs, but no direction.
+                    // Resolve against this table only; a dangling/wrong-table ID fails.
+                    keys: index
+                        .columns
+                        .iter()
+                        .map(|id| {
+                            table
+                                .columns
+                                .iter()
+                                .find(|column| column.id == *id)
+                                .expect("index key must belong to its referenced table")
+                                .name
+                                .clone()
+                        })
+                        .collect(),
+                    unique: index.unique,
+                })
+                .collect();
+            logical_indexes.sort_by(|a, b| a.name.cmp(&b.name));
             Table {
+                indexes: logical_indexes,
                 name: table.name,
                 columns: table
                     .columns
@@ -191,6 +228,7 @@ fn legacy_create_insert_update_select_and_duplicate_parity() {
             ],
             primary_key: vec!["id".into()],
             rows: expected_rows,
+            indexes: vec![],
         }]
     );
 }
@@ -202,6 +240,7 @@ fn comparator_rejects_perturbed_rows_and_errors() {
             columns: vec![],
             primary_key: vec![],
             rows: vec![vec![Value::Int(1)]],
+            indexes: vec![],
         }],
         step: Step::Sql(SqlError::Duplicate),
     };
@@ -267,4 +306,127 @@ fn parser_trap_positive_control_covers_text_and_prepared_entry() {
         sql(&admin, "select 1"),
         Step::Success(vec![vec![Value::Int(1)]])
     );
+}
+
+// The text language has no CREATE INDEX. Exercise the existing typed native
+// nonunique API instead; unique indexes still require SQL on both databases.
+fn provision_index(admin: &Admin, native_side: bool, name: &str, keys: &[&str], unique: bool) {
+    if native_side && !unique {
+        with_sql_parser_forbidden(|| {
+            giggles_core::operations::Engine::new(admin.clone())
+                .execute_catalog(&giggles_core::operations::CatalogRequest::CreateIndex {
+                    table: "items".into(),
+                    name: name.into(),
+                    columns: keys.iter().map(|key| (*key).into()).collect(),
+                })
+                .unwrap();
+        });
+    } else {
+        assert_eq!(
+            sql(
+                admin,
+                &format!(
+                    "create {}index {name} on items({})",
+                    if unique { "unique " } else { "" },
+                    keys.join(",")
+                )
+            ),
+            Step::Success(vec![])
+        );
+    }
+}
+fn indexed_pair() -> (Database, Admin, Database, Admin) {
+    let (left_db, left) = Database::fresh(StorageEngine::Legacy);
+    let (right_db, right) = Database::fresh(StorageEngine::Legacy);
+    assert_eq!(
+        sql(
+            &left,
+            "create table items(id bigint primary key, a bigint not null, b bigint not null)"
+        ),
+        Step::Success(vec![])
+    );
+    assert_eq!(
+        native(
+            &right,
+            "create table items(id int64,a int64,b int64,primary key(id))",
+            true
+        ),
+        Step::Success(vec![])
+    );
+    (left_db, left, right_db, right)
+}
+fn reopen_observation(db: &Database) -> Observation {
+    let admin = Admin::open(&db.0, Limits::default()).unwrap();
+    Observation {
+        state: snapshot(&admin),
+        step: Step::Success(vec![]),
+    }
+}
+#[test]
+fn secondary_indexes_match_after_reopen() {
+    let (left_db, left, right_db, right) = indexed_pair();
+    for (name, keys, unique) in [
+        ("items_ab", vec!["a", "b"], false),
+        ("items_ba_unique", vec!["b", "a"], true),
+    ] {
+        provision_index(&left, false, name, &keys, unique);
+        provision_index(&right, true, name, &keys, unique);
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
+    // Native index creation has an empty-state policy: insert only after DDL.
+    assert_eq!(
+        sql(&left, "insert into items values(1,10,20)"),
+        Step::Success(vec![])
+    );
+    assert_eq!(
+        native(&right, "insert items set id=1,a=10,b=20", false),
+        Step::Success(vec![])
+    );
+    let before = snapshot(&left);
+    assert_eq!(
+        before[0].indexes,
+        vec![
+            Index {
+                name: "items_ab".into(),
+                table: "items".into(),
+                keys: vec!["a".into(), "b".into()],
+                unique: false
+            },
+            Index {
+                name: "items_ba_unique".into(),
+                table: "items".into(),
+                keys: vec!["b".into(), "a".into()],
+                unique: true
+            },
+        ]
+    );
+    drop(left);
+    drop(right);
+    let left = reopen_observation(&left_db);
+    let right = reopen_observation(&right_db);
+    assert_eq!(left.state, before);
+    assert_eq!(right.state, before);
+    assert!(parity(&left, &right));
+}
+#[test]
+fn secondary_index_controls_fail_after_reopen() {
+    for control in ["missing", "reversed", "uniqueness"] {
+        let (left_db, left, right_db, right) = indexed_pair();
+        provision_index(&left, false, "items_ab", &["a", "b"], false);
+        match control {
+            "missing" => {}
+            "reversed" => provision_index(&right, true, "items_ab", &["b", "a"], false),
+            "uniqueness" => provision_index(&right, true, "items_ab", &["a", "b"], true),
+            _ => unreachable!(),
+        }
+        drop(left);
+        drop(right);
+        let left = reopen_observation(&left_db);
+        let right = reopen_observation(&right_db);
+        // Isolate the index difference: identical rows/schema and success result.
+        let mut without_indexes = right.clone();
+        without_indexes.state[0].indexes = left.state[0].indexes.clone();
+        assert!(parity(&left, &without_indexes), "{control}");
+        assert!(!parity(&left, &right), "{control}");
+    }
 }
