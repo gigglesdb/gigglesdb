@@ -84,6 +84,50 @@ impl Prepared {
         point_keys(state, self, params, &unique)
     }
 
+    /// Bounded incoming-FK DELETE prelocks, independent of publisher eligibility.
+    pub(crate) fn fk_delete_lock_keys(&self, state: &Relational, params: &[Value]) -> Option<Vec<Vec<Value>>> {
+        if !matches!(self.statement, Statement::Delete { .. }) { return None; }
+        let table = state.tables.get(self.table()?)?;
+        let mut component = BTreeSet::from([table.id]);
+        loop {
+            let before = component.len();
+            for (owner, constraints) in &state.ext.constraints {
+                for c in constraints {
+                    if let ConstraintKind::ForeignKey { ref_table, .. } = &c.kind
+                        && (component.contains(owner) || component.contains(ref_table)) {
+                        component.insert(*owner); component.insert(*ref_table);
+                    }
+                }
+            }
+            if component.len() == before { break; }
+        }
+        let mut edges = BTreeMap::<u64, BTreeSet<u64>>::new();
+        let mut incoming = false;
+        for (owner, constraints) in &state.ext.constraints {
+            if !component.contains(owner) { continue; }
+            for c in constraints {
+                if let ConstraintKind::ForeignKey { ref_table, deferral, on_delete, .. } = &c.kind {
+                    if *deferral != Deferral::NotDeferrable || owner == ref_table { return None; }
+                    if *ref_table == table.id {
+                        incoming = true;
+                        if matches!(on_delete, catalog_ext::Action::SetDefault) { return None; }
+                    }
+                    edges.entry(*owner).or_default().insert(*ref_table);
+                }
+            }
+        }
+        // Remove sinks repeatedly: a remaining directed graph contains a cycle.
+        while !edges.is_empty() {
+            let sinks = edges.iter().filter(|(_, targets)| targets.iter().all(|t| !edges.contains_key(t)))
+                .map(|(id, _)| *id).collect::<Vec<_>>();
+            if sinks.is_empty() { return None; }
+            for id in sinks { edges.remove(&id); }
+        }
+        if !incoming { return None; }
+        let keys = searched::target(self)?.mutation_primary_keys(state, table, params)?;
+        (keys.len() <= 200).then_some(keys)
+    }
+
     /// Plain VALUES appends use physical latest-owner PK/UNIQUE checks.
     pub(crate) fn plain_values_append(&self, state: &Relational) -> bool {
         let Some(table) = self.table().and_then(|name| state.tables.get(name)) else { return false; };

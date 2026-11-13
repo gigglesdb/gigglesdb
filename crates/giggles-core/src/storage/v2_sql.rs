@@ -16,6 +16,13 @@ mod reduction;
 #[path = "v2_sql_comment_tests.rs"]
 mod comment_tests;
 
+#[cfg(test)]
+thread_local! {
+    static FK_DELETE_RETENTION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FK_DELETE_SHARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FK_DELETE_UPGRADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl SqlSession {
     pub(super) fn prepare_v2(
         &mut self,
@@ -393,7 +400,8 @@ impl SqlSession {
                             let candidates = (expected_version.is_none()
                                 && self.copy_input.is_none()
                                 && txn.isolation() == Isolation::ReadCommitted)
-                                .then(|| bound.mutation_lock_keys(&binding, params, &parts.indexes))
+                                .then(|| bound.fk_delete_lock_keys(&binding, params)
+                                    .or_else(|| bound.mutation_lock_keys(&binding, params, &parts.indexes)))
                                 .flatten();
                             let append = self.copy_input.is_none()
                                 && txn.isolation() == Isolation::ReadCommitted
@@ -401,6 +409,10 @@ impl SqlSession {
                                 && bound.plain_values_append(&binding);
                             #[cfg(test)]
                             let candidates = if DISABLE_MUTATION_POINTS.get() { None } else { candidates };
+                            #[cfg(test)]
+                            if candidates.is_some() && bound.fk_delete_lock_keys(&binding, params).is_some() {
+                                FK_DELETE_SHARED.set(FK_DELETE_SHARED.get() + 1);
+                            }
                             let shared = append || candidates.is_some();
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
@@ -411,7 +423,10 @@ impl SqlSession {
                                     physical.extend(codec::pk_bytes(key)?);
                                     Ok(physical)
                                 }).collect::<Result<BTreeSet<_>, CoreError>>()?;
-                                let mut retention = relational::scan::Retention::new(relational::scan::retention_limit());
+                                let retention_limit = relational::scan::retention_limit();
+                                #[cfg(test)]
+                                let retention_limit = FK_DELETE_RETENTION.get().unwrap_or(retention_limit);
+                                let mut retention = relational::scan::Retention::new(retention_limit);
                                 let mut fits = true;
                                 for key in physical {
                                     let target = txn.lock_for_write(Keyspace::Rows, &key, None,
@@ -432,6 +447,10 @@ impl SqlSession {
                                     }
                                 }
                                 if !fits {
+                                    #[cfg(test)]
+                                    if bound.fk_delete_lock_keys(&binding, params).is_some() {
+                                        FK_DELETE_UPGRADE.set(FK_DELETE_UPGRADE.get() + 1);
+                                    }
                                     // The point publisher would scan pages. Upgrade
                                     // before taking its snapshot; never refresh mid-scan.
                                     txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
@@ -787,6 +806,9 @@ mod tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_writer_lock_tests.rs"]
 mod writer_lock_tests;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_fk_delete_lock_tests.rs"]
+mod fk_delete_lock_tests;
 
 /// Transient statement images use legacy keys. Only this sink translates them
 /// into the existing v2 key/row codec; it never persists relational image bytes.
