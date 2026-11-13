@@ -1281,7 +1281,15 @@ impl State {
     }
     fn refresh_statement(&mut self, name: &str, session: &mut Session) -> R<()> {
         let old = self.statements.get(name).ok_or("26000")?.clone();
-        if !matches!(&old.p, Plan::Sql(p) | Plan::Copy(_, p) if !session.sql.prepared_is_current(p)) {
+        let stale = match &old.p {
+            Plan::Sql(p) | Plan::Copy(_, p) => !session.sql.prepared_is_current(p),
+            Plan::Catalog(plan, _, epoch) if !plan.depends_on_relations() => {
+                let (current, _, _) = core(session.catalog_snapshot())?;
+                current != *epoch
+            }
+            _ => false,
+        };
+        if !stale {
             return Ok(());
         }
         let new = self.prepare_statement(&old.sql, old.declared_oids.clone(), session)?;

@@ -43,6 +43,26 @@ impl Plan {
     pub fn refreshes_view_definitions(&self) -> bool {
         self.view_definitions && self.user_relations.is_empty()
     }
+    /// Returns false only for a provably relation-free compiled query.
+    /// Unknown expression and source forms retain the cached-plan fence.
+    pub fn depends_on_relations(&self) -> bool {
+        fn independent(e: &E) -> bool {
+            match &e.kind {
+                K::Literal(_) | K::Param(_) => true,
+                K::Call(name, args) if matches!(name.as_str(), "version" | "current_schema") =>
+                    args.iter().all(independent),
+                _ => false,
+            }
+        }
+        let q = &self.query;
+        !self.user_relations.is_empty()
+            || !matches!(q.source, Source::Unit | Source::Empty)
+            || !independent(&q.filter)
+            || !q.projection.iter().all(independent)
+            || !q.order.iter().all(|o| independent(&o.e))
+            || !q.group.iter().all(independent)
+            || q.expand.as_ref().is_some_and(|es| !es.iter().all(independent))
+    }
     pub fn user_relations(&self) -> &BTreeMap<String, Vec<Field>> {
         &self.user_relations
     }
@@ -5464,3 +5484,23 @@ fn comparison_operand(mut expr: &A) -> &A {
 
 // PostgreSQL 18 quote_identifier quotes all keyword categories except
 // UNRESERVED_KEYWORD. Source: REL_18_STABLE/src/include/parser/kwlist.h
+
+#[cfg(test)]
+mod relation_dependency_tests {
+    use super::*;
+
+    #[test]
+    fn conservative_dependencies() {
+        for sql in ["SELECT 1 n", "SELECT current_schema()", "SELECT version()"] {
+            assert!(!plan(sql).unwrap().unwrap().depends_on_relations(), "{sql}");
+        }
+        for sql in [
+            "SELECT oid FROM pg_catalog.pg_class",
+            "SELECT (SELECT count(*) FROM pg_catalog.pg_class)",
+            "SELECT * FROM (SELECT oid FROM pg_catalog.pg_class) x",
+            "WITH x AS (SELECT oid FROM pg_catalog.pg_class) SELECT * FROM x",
+        ] {
+            assert!(plan(sql).unwrap().unwrap().depends_on_relations(), "{sql}");
+        }
+    }
+}
