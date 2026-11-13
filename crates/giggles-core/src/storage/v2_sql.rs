@@ -613,7 +613,7 @@ impl SqlSession {
                             ext,
                             indexes,
                         };
-                        bound.apply_comment(&new.tables, &mut new.comments).map_err(CoreError::Sql)?;
+                        bound.apply_comment(&image, &mut new).map_err(CoreError::Sql)?;
                         bound.apply_view(&image, &mut new, ids.start).map_err(CoreError::Sql)?;
                         txn.reclaim_after_commit |=
                             old.tables

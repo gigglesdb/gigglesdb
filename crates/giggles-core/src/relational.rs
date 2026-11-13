@@ -27,7 +27,7 @@ pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
 mod catalog_presentation;
-pub use catalog_presentation::{CatalogConstraint, CatalogPresentation};
+pub use catalog_presentation::{CatalogConstraint, CatalogPresentation, CatalogView};
 use catalog_ext::*;
 mod ident;
 use ident::ident;

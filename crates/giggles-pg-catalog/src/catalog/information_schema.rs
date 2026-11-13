@@ -4,6 +4,7 @@ use super::*;
 // each pair is the view relation OID and its actual composite rowtype OID.
 pub(super) fn identity(name: &str) -> Option<(u32, u32)> {
     Some(match name {
+        "views" => (13568, 13570),
         "columns" => (13381, 13383),
         "key_column_usage" => (13414, 13416),
         "schemata" => (13467, 13469),
@@ -17,6 +18,10 @@ pub(super) fn identity(name: &str) -> Option<(u32, u32)> {
 /// int4 for cardinal_number, and varchar for character_data/yes_or_no.
 pub(super) fn schema(name: &str) -> Option<Vec<Field>> {
     Some(fields(match name {
+        "views" => &[("table_catalog", T::Name), ("table_schema", T::Name), ("table_name", T::Name),
+            ("view_definition", T::Varchar), ("check_option", T::Varchar), ("is_updatable", T::Varchar),
+            ("is_insertable_into", T::Varchar), ("is_trigger_updatable", T::Varchar),
+            ("is_trigger_deletable", T::Varchar), ("is_trigger_insertable_into", T::Varchar)],
         "tables" => &[
             ("table_catalog", T::Name),
             ("table_schema", T::Name),
@@ -130,6 +135,14 @@ pub(super) fn populate(
     ]
     .into_iter()
     .collect();
+    for (&id, definition) in &snapshot.views {
+        let table = snapshot.tables.iter().find(|t| t.id == id).ok_or(Error::InvalidSnapshot)?;
+        let owner = snapshot.table_owners.get(&id).copied().unwrap_or(10);
+        let can_define = snapshot.roles.iter().any(|r| r.name == snapshot.user && (r.oid == owner || r.superuser));
+        all.get_mut("views").unwrap().rows.push(vec![s(&snapshot.database), s(snapshot.table_schema(id).0),
+            s(&table.name), if can_define { s(definition) } else { N }, s("NONE"),
+            s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]);
+    }
     for row in &all["pg_namespace"].rows {
         let I(owner) = row[2] else {
             return Err(Error::InvalidSnapshot);

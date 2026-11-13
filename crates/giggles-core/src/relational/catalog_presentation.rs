@@ -7,9 +7,17 @@ pub struct CatalogConstraint {
     pub update: char, pub delete: char, pub deferrable: bool, pub deferred: bool,
     pub validated: bool, pub expression: Option<String>, pub index: u64,
 }
+#[derive(Clone, Debug)]
+pub struct CatalogView {
+    pub table: TableDef,
+    pub definition: String,
+    pub type_oids: Vec<u32>,
+    pub typmods: Vec<i32>,
+}
 #[derive(Clone, Debug, Default)]
 pub struct CatalogPresentation {
     pub epoch: u64,
+    pub views: BTreeMap<u64, CatalogView>,
     /// Stable (table ID, column ID), with zero identifying the table itself.
     pub comments: BTreeMap<(u64, u64), String>,
     pub defaults: BTreeMap<u64, String>,

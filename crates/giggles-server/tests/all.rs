@@ -173,3 +173,5 @@ mod comment_presentation;
 mod view_ddl;
 #[path = "prepared_rollback_network.rs"]
 mod prepared_rollback_network;
+#[path = "view_presentation.rs"]
+mod view_presentation;

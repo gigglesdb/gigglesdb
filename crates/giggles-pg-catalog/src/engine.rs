@@ -37,8 +37,12 @@ pub struct Plan {
     parameter_types: Vec<PgType>,
     projection_parameters: bool,
     text_cast_parameters: Vec<bool>,
+    view_definitions: bool,
 }
 impl Plan {
+    pub fn refreshes_view_definitions(&self) -> bool {
+        self.view_definitions && self.user_relations.is_empty()
+    }
     pub fn user_relations(&self) -> &BTreeMap<String, Vec<Field>> {
         &self.user_relations
     }
@@ -307,6 +311,7 @@ pub fn plan_gateway_with_relations(
     plan_inner(sql, true, Some(relations))
 }
 struct Scan {
+    view_definitions: bool,
     catalog: bool,
     explicit_catalog: bool,
     core_scalar: bool,
@@ -365,10 +370,11 @@ impl Visitor for Scan {
             | A::Function(_) | A::Cast { .. } | A::UnaryOp { .. } | A::BinaryOp { .. }
             | A::IsNull(_) | A::IsNotNull(_));
         if let A::Function(f) = e {
+            self.view_definitions |= function(&f.name).is_ok_and(|n| n == "pg_get_viewdef");
             let introspection = function(&f.name).is_ok_and(|n| matches!(n.as_str(),
                 "pg_get_indexdef" | "pg_get_constraintdef" | "pg_get_expr"
                 | "pg_get_userbyid" | "format_type" | "obj_description"
-                | "col_description" | "shobj_description"));
+                | "col_description" | "shobj_description" | "pg_get_viewdef"));
             self.introspection |= introspection;
             self.introspection_only &= introspection;
         }
@@ -435,6 +441,7 @@ impl Visitor for Scan {
 impl Scan {
     fn new() -> Self {
         Self {
+            view_definitions: false,
             catalog: false,
             explicit_catalog: false,
             core_scalar: false,
@@ -679,6 +686,7 @@ fn plan_inner(
     let mut plan = finish_plan(query, c.parameters, projection_parameters.0)?;
     if let Some(plan) = &mut plan {
         plan.user_relations = c.used_relations;
+        plan.view_definitions = scan.view_definitions;
         let mut uses = TextCastParameters(BTreeMap::new(), BTreeMap::new());
         let _ = q.visit(&mut uses);
         plan.text_cast_parameters = uses.flags(plan.parameters);
@@ -707,6 +715,7 @@ fn finish_plan(
         parameters,
         parameter_types,
         text_cast_parameters: vec![false; parameters],
+        view_definitions: false,
     }))
 }
 pub fn describe(plan: &Plan) -> R<Vec<Field>> {
@@ -3006,7 +3015,13 @@ fn check_expr(e: &mut E) -> R<()> {
                 expect(&mut args[0], PgType::Char)?;
                 coerce(&mut args[1], PgType::Oid)?;
             }
-            "pg_get_viewdef" | "pg_get_ruledef" | "pg_get_triggerdef" => {
+            "pg_get_viewdef" => {
+                if !textual(args[0].ty) { expect(&mut args[0], PgType::Oid)?; }
+                let named = textual(args[0].ty);
+                if let Some(pretty) = args.get_mut(1)
+                    && (named || pretty.ty != PgType::Int4) { expect(pretty, PgType::Bool)?; }
+            }
+            "pg_get_ruledef" | "pg_get_triggerdef" => {
                 expect(&mut args[0], PgType::Oid)?;
                 expect(&mut args[1], PgType::Bool)?;
             }
@@ -3151,7 +3166,7 @@ fn call_type(n: &str, a: &[E]) -> R<PgType> {
         ("pg_get_statisticsobjdef_columns", 1) => PgType::Text,
         ("pg_get_indexdef", 1 | 3) => PgType::Text,
         ("pg_get_constraintdef", 1 | 2) => PgType::Text,
-        ("pg_get_viewdef" | "pg_get_ruledef" | "pg_get_triggerdef" | "encode", 2)
+        ("pg_get_viewdef", 1 | 2) | ("pg_get_ruledef" | "pg_get_triggerdef" | "encode", 2)
         | ("pg_get_function_arguments" | "pg_get_function_result" | "pg_get_function_sqlbody", 1) => {
             PgType::Text
         }
@@ -4899,8 +4914,12 @@ impl Runtime<'_> {
                         })
                 }
             }
-            "pg_get_viewdef"
-            | "pg_get_ruledef"
+            "pg_get_viewdef" => {
+                let oid = match &v[0] { S(name) => i64::from(regclass_oid(name, self.snapshot)?), value => integer(value.clone())? };
+                self.snapshot.views.iter().find_map(|(id, sql)|
+                    (catalog::table_oid(*id).ok().map(i64::from) == Some(oid)).then(|| S(sql.clone()))).unwrap_or(N)
+            }
+            "pg_get_ruledef"
             | "pg_get_triggerdef"
             | "pg_get_function_arguments"
             | "pg_get_function_result"

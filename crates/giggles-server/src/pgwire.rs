@@ -847,9 +847,9 @@ struct Statement {
 impl Statement {
     fn describe(&self, session: &mut Session) -> R<Description> {
         match &self.p {
-            Plan::Catalog(_, _, epoch) => {
+            Plan::Catalog(plan, _, epoch) => {
                 let (current, _, _) = core(session.catalog_snapshot())?;
-                if current != *epoch {
+                if current != *epoch && !plan.refreshes_view_definitions() {
                     return Err("0A000");
                 }
                 Ok(self.d.clone())
@@ -1606,7 +1606,7 @@ impl State {
                     begin_implicit(session, &mut self.implicit, &mut self.settings)?;
                     let (current, tables, indexes, typmods, types) =
                         core(session.catalog_snapshot_with_typmods())?;
-                    if current != *epoch {
+                    if current != *epoch && !plan.refreshes_view_definitions() {
                         return Err("0A000");
                     }
                     if p.catalog_result.is_none() {

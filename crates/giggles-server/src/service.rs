@@ -781,8 +781,10 @@ impl Session {
             return Err(CoreError::Sql(relational::SqlError::Limit));
         }
         let schemas = self.sql.schema_metadata()?;
+        let views = self.sql.catalog_metadata()?.presentation.views;
         for table in &visible {
             giggles_core::cancellation::check()?;
+            if views.get(&table.id).is_some_and(|v| v.table == *table) { continue; }
             // Table names originate from the validated engine catalog, not
             // client SQL. Prepare/Describe do not access application rows.
             let schema = schemas

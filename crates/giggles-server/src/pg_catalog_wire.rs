@@ -107,7 +107,7 @@ pub(crate) fn snapshot(
             }
         })
         .collect();
-    let column_type_oids = types
+    let mut column_type_oids: std::collections::BTreeMap<_, _> = types
         .column_types
         .iter()
         .filter(|(id, _)| columns.contains(id))
@@ -140,12 +140,17 @@ pub(crate) fn snapshot(
     let generation = catalog.generation;
     let mut presentation = catalog.presentation;
     if presentation.epoch != epoch { return Err("40001"); }
+    presentation.views.retain(|id, _| visible.contains(id));
+    for view in presentation.views.values() {
+        column_type_oids.extend(view.table.columns.iter().zip(&view.type_oids).map(|(c, oid)| (c.id, *oid)));
+    }
     presentation.defaults.retain(|id, _| columns.contains(id));
     presentation.identities.retain(|id, _| columns.contains(id));
     presentation.primary_names.retain(|id, _| visible.contains(id));
     presentation.comments.retain(|(table, column), _| visible.contains(table)
         && (*column == 0 || columns.contains(column)));
     Ok(giggles_pg_catalog::CatalogSnapshot {
+        views: presentation.views.into_iter().map(|(id, v)| (id, v.definition)).collect(),
         comments: presentation.comments,
         column_defaults: presentation.defaults, column_identities: presentation.identities,
         primary_names: presentation.primary_names,
@@ -424,7 +429,7 @@ fn catalog_roles(
                     .map_or("public", String::as_str),
                 &table.name,
             );
-            let owner = registry.table_owner(&key).ok()??;
+            let owner = session.sql.table_owner(&key).ok()??;
             Some((table.id, *oids.get(&owner)?))
         })
         .collect();

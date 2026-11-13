@@ -187,6 +187,7 @@ struct MetadataSql<'a> {
     image: &'a relational::Relational,
     epoch: u64,
     comments: Option<&'a BTreeMap<(u64, u64), String>>,
+    views: Option<&'a BTreeMap<u64, SqlViewDef>>,
 }
 impl std::ops::Deref for MetadataSql<'_> {
     type Target = relational::Relational;
@@ -198,6 +199,11 @@ impl MetadataSql<'_> {
     fn schema_metadata(&self) -> relational::SchemaMetadata {
         let mut metadata = self.image.schema_metadata();
         metadata.epoch = self.epoch;
+        for (&id, view) in self.views.into_iter().flatten() {
+            if let Some((name, _)) = metadata.schemas.iter().find(|(_, (id, _))| *id == view.schema) {
+                metadata.tables.insert(id, name.clone());
+            }
+        }
         metadata
     }
     fn user_type_catalog(&self) -> relational::UserTypeCatalog {
@@ -211,13 +217,21 @@ impl MetadataSql<'_> {
         let mut metadata = self.image.catalog_presentation()?;
         metadata.epoch = self.epoch;
         metadata.comments = self.comments.cloned().unwrap_or_default();
+        metadata.views = self.views.into_iter().flatten().map(|(&id, v)| (id, relational::CatalogView {
+            table: relational::TableDef { id, name: v.name.clone(), primary_key: vec![],
+                columns: v.columns.iter().map(|c| relational::ColumnDef { id: c.id, name: c.name.clone(),
+                    data_type: c.storage_type.clone(), not_null: false }).collect() },
+            definition: format!("{};", v.select),
+            type_oids: v.columns.iter().map(|c| c.pg_type_oid).collect(),
+            typmods: v.columns.iter().map(|c| c.typmod).collect(),
+        })).collect();
         Ok(metadata)
     }
 }
 impl<'a> MetadataState<'a> {
     fn new(image: &'a relational::Relational, epoch: u64, domain: u128) -> Self {
         Self {
-            sql: MetadataSql { image, epoch, comments: None },
+            sql: MetadataSql { image, epoch, comments: None, views: None },
             view: MetadataDomain { domain },
         }
     }
@@ -1977,21 +1991,24 @@ fn catalog_xid_from_hlc(epoch: u64) -> u64 {
 impl SqlSession {
     /// Coherent catalog metadata, including V2 transaction-private DDL.
     pub fn catalog_metadata(&self) -> Result<CatalogMetadata, CoreError> {
-        let read = |s: &MetadataState<'_>| Ok(CatalogMetadata {
-            presentation: s.sql.catalog_presentation().map_err(CoreError::Sql)?,
-            tables: s.sql.tables.values().cloned().collect(),
-            schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
-            generation: match &self.admin.inner.backend {
-                Backend::Legacy(_) => s.sql.generation,
-                Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
-            },
-            typmods: s.sql.catalog_ext().columns.iter()
-                .filter_map(|(&id, c)| c.typmod.map(|m| (id, m))).collect(),
-            indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
-                id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
-                columns: d.columns.clone(), unique: d.unique,
-            }).collect(),
-        });
+        let read = |s: &MetadataState<'_>| {
+            let presentation = s.sql.catalog_presentation().map_err(CoreError::Sql)?;
+            let tables = s.sql.tables.values().cloned().chain(presentation.views.values().map(|v| v.table.clone())).collect();
+            Ok(CatalogMetadata {
+                presentation, tables,
+                schemas: s.sql.schema_metadata(), types: s.sql.user_type_catalog(),
+                generation: match &self.admin.inner.backend {
+                    Backend::Legacy(_) => s.sql.generation,
+                    Backend::V2(_) => catalog_xid_from_hlc(s.sql.epoch),
+                },
+                typmods: s.sql.catalog_ext().columns.iter().filter_map(|(&id, c)| c.typmod.map(|m| (id, m)))
+                    .chain(s.sql.views.into_iter().flatten().flat_map(|(_, v)| v.columns.iter().map(|c| (c.id, c.typmod)))).collect(),
+                indexes: s.sql.secondary_descriptors_engine().iter().map(|d| IndexInfo {
+                    id: d.id, table: d.table, name: relational::split_key(&d.name).1.into(),
+                    columns: d.columns.clone(), unique: d.unique,
+                }).collect(),
+            })
+        };
         // Legacy wire catalogs retain their established committed-only behavior.
         match &self.admin.inner.backend {
             Backend::Legacy(_) => self.admin.inner.inspect_metadata(read),

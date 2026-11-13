@@ -122,6 +122,7 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
         return Some(fields);
     }
     let mut result = fields(match name {
+        "pg_views" => &[("schemaname", T::Name), ("viewname", T::Name), ("viewowner", T::Name), ("definition", T::Text)],
         "pg_namespace" => &[
             ("oid", T::Oid),
             ("nspname", T::Name),
@@ -873,6 +874,8 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
 }
 pub(crate) fn known_names() -> &'static [&'static str] {
     &[
+        "views",
+        "pg_views",
         "schemata",
         "tables",
         "columns",
@@ -954,7 +957,7 @@ pub(crate) fn tableoid(name: &str) -> Option<u32> {
     if relation_namespace(name) != "pg_catalog"
         || matches!(
             name,
-            "pg_indexes" | "pg_tables"
+            "pg_indexes" | "pg_tables" | "pg_views"
                 | "pg_seclabels"
                 | "pg_user"
                 | "pg_roles"
@@ -985,6 +988,7 @@ pub(crate) fn relation_oid(name: &str) -> Option<u32> {
         "pg_index" => 2610,
         "pg_indexes" => 12006,
         "pg_tables" => 12033,
+        "pg_views" => 12028,
         "pg_constraint" => 2606,
         "pg_description" => 2609,
         "pg_attrdef" => 2604,
@@ -1104,6 +1108,11 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
     }) {
         return Err(Error::InvalidSnapshot);
     }
+    if snapshot.views.iter().any(|(id, sql)| sql.len() > 65536 || sql.is_empty()
+        || !snapshot.tables.iter().any(|t| t.id == *id && t.primary_key.is_empty()
+            && t.columns.iter().all(|c| !c.not_null))
+        || snapshot.indexes.iter().any(|i| i.table == *id)
+        || snapshot.constraints.iter().any(|c| c.table == *id)) { return Err(Error::InvalidSnapshot); }
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut input_bytes = 0usize;
@@ -1455,7 +1464,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         let fs = schema(name).unwrap();
         let info = information_schema::identity(name);
         let namespace = if info.is_some() { 13293 } else { 11 };
-        let rowtype = info.map_or(32768 + oid, |(_, ty)| i64::from(ty));
+        let rowtype = info.map_or(if name == "pg_views" { 12030 } else { 32768 + oid }, |(_, ty)| i64::from(ty));
         add(
             "pg_class",
             vec![
@@ -1640,6 +1649,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         let (schema, namespace) = snapshot.table_schema(t.id);
         let namespace = i64::from(namespace);
         let oid = table_oid(t.id)? as i64;
+        let view = snapshot.views.get(&t.id);
         let has_pk = !t.primary_key.is_empty();
         let owner = i64::from(*snapshot.table_owners.get(&t.id).unwrap_or(&10));
         add(
@@ -1648,14 +1658,14 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
                 I(oid),
                 s(&t.name),
                 I(namespace),
-                s("r"),
+                s(if view.is_some() { "v" } else { "r" }),
                 I(owner),
                 I(t.columns.len() as i64),
                 B(has_pk || visible_indexes.iter().any(|i| i.table == t.id)),
                 s("p"),
                 B(false),
                 I(oid + 3),
-                I(2),
+                I(if view.is_some() { 0 } else { 2 }),
                 I(0),
                 N,
                 N,
@@ -1667,6 +1677,9 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             "pg_type",
             composite_row((oid + 3) as u32, &t.name, namespace, oid, owner),
         );
+        if let Some(definition) = view {
+            add("pg_views", vec![s(schema), s(&t.name), s(role_name(snapshot, owner).unwrap()), s(definition)]);
+        }
         // Heap system attributes exist in pg_attribute but are excluded by
         // clients that explicitly request attnum > 0.
         for (attnum, name, ty, len) in [
@@ -1676,7 +1689,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             (-3, "cmin", 29, 4),
             (-2, "xmin", 28, 4),
             (-1, "ctid", 27, 6),
-        ] {
+        ].into_iter().filter(|_| view.is_none()) {
             add(
                 "pg_attribute",
                 vec![
@@ -1948,7 +1961,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
         });
     // Append descriptor extensions here so established field positions remain stable.
     for row in &mut all.get_mut("pg_class").unwrap().rows {
-        if row[2] == I(2200) {
+        if row[2] == I(2200) && row[3] != s("v") {
             row[10] = I(if row[3] == s("i") { 403 } else { 2 });
         }
         row.extend([
@@ -1958,7 +1971,7 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             B(false),
             B(false),
             I(0),
-            s(if row[3] == s("i") { "n" } else { "d" }),
+            s(if row[3] == s("i") || row[3] == s("v") { "n" } else { "d" }),
             I(0),
             I(0),
             Value::Float4(giggles_pg_types::Float4::parse("-1").unwrap()),

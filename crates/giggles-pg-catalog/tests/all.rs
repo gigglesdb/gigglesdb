@@ -119,3 +119,5 @@ mod temporal_column_precision;
 mod rails_columns;
 #[path = "rails_indexes.rs"]
 mod rails_indexes;
+
+#[path = "view_presentation.rs"] mod view_presentation;

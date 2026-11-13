@@ -5,6 +5,7 @@ fn gateway_introspection_requires_only_catalog_calls_and_no_base_relations() {
     use giggles_pg_catalog::plan_gateway;
     for sql in [
         "SELECT pg_catalog.pg_get_indexdef(0,1,true), format_type(23,NULL)",
+        "SELECT pg_get_viewdef(0,true)",
         "SELECT * FROM (SELECT pg_get_indexdef(0,1,true) AS col, 0 AS dummy) tmp ORDER BY dummy",
         "SELECT pg_get_indexdef(pg_get_userbyid(10)::oid,1,true)",
         "SELECT \"pg_catalog\".\"pg_get_indexdef\"(0,1,true)",
@@ -18,8 +19,7 @@ fn gateway_introspection_requires_only_catalog_calls_and_no_base_relations() {
         "SELECT pg_get_indexdef(0,1,true) FROM UNNEST($1::int[]) u",
         "SELECT public.pg_get_indexdef(0,1,true)",
         "SELECT \"PG_GET_INDEXDEF\"(0,1,true)",
-        // Recognized by the compiler, but execution is not implemented.
-        "SELECT pg_get_viewdef(0,true)",
+
     ] {
         assert!(plan_gateway(sql).unwrap().is_none(), "{sql}");
     }

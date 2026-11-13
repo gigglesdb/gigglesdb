@@ -10,6 +10,7 @@ fn run(sql: &str) -> Result<ResultSet, Error> {
 fn strict_null_and_nonnull_refusal() {
     for expression in [
         "pg_get_viewdef(NULL,true)",
+        "pg_get_viewdef(1,true)",
         "pg_get_viewdef(1,NULL)",
         "pg_get_ruledef(NULL,false)",
         "pg_get_ruledef(1,NULL)",
@@ -26,7 +27,6 @@ fn strict_null_and_nonnull_refusal() {
         assert_eq!(out.rows, vec![vec![Value::Null]], "{sql}");
     }
     for expression in [
-        "pg_get_viewdef(1,true)",
         "pg_get_ruledef(1,false)",
         "pg_get_function_arguments(1)",
         "pg_get_function_result(1)",
@@ -46,7 +46,7 @@ fn strict_null_and_nonnull_refusal() {
 #[test]
 fn closed_signatures_and_cast_boundary() {
     for expression in [
-        "pg_get_viewdef(1)",
+        "pg_get_viewdef()",
         "pg_get_ruledef(1,true,false)",
         "pg_get_function_result()",
         "pg_get_function_sqlbody(1,2)",
@@ -308,10 +308,10 @@ fn schema_and_binder_legacy_guards() {
     .unwrap();
     assert_eq!(out.rows, vec![vec![Value::Null; 3]]);
     assert!(out.fields.iter().all(|f| f.data_type == PgType::Oid));
-    let p = plan("SELECT pg_get_viewdef($1,$2) FROM pg_namespace n WHERE n.oid=11")
+    let p = plan("SELECT pg_get_viewdef($1,$2::boolean) FROM pg_namespace n WHERE n.oid=11")
         .unwrap()
         .unwrap();
-    assert_eq!(p.parameter_types(), &[PgType::Oid, PgType::Bool]);
+    assert_eq!(p.parameter_types(), &[PgType::Text, PgType::Bool]);
     assert_eq!(
         execute(
             &p,

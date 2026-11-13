@@ -879,7 +879,7 @@ fn inventory_and_columns_cover_every_modeled_table_and_view() {
         &snapshot,
         "SELECT is_updatable FROM information_schema.columns WHERE table_schema = 'information_schema'",
     );
-    assert_eq!(view_columns.rows.len(), 83);
+    assert_eq!(view_columns.rows.len(), 93);
     assert!(
         view_columns
             .rows

@@ -126,6 +126,8 @@ pub struct CatalogSnapshot {
     /// Catalog xid: legacy publication counter or V2 physical HLC seconds.
     /// xmin exposes its low 32 bits; this is never a raw HLC timestamp.
     pub generation: u64,
+    /// View IDs identify descriptors in tables; definitions are SELECT text.
+    pub views: std::collections::BTreeMap<u64, String>,
     pub constraints: Vec<ConstraintDef>,
     pub column_defaults: std::collections::BTreeMap<u64, String>,
     pub column_identities: std::collections::BTreeMap<u64, char>,
@@ -170,6 +172,7 @@ impl Default for CatalogSnapshot {
     fn default() -> Self {
         Self {
             generation: 0,
+            views: Default::default(),
             constraints: Vec::new(), column_defaults: Default::default(),
             column_identities: Default::default(), primary_names: Default::default(),
             comments: Default::default(),
