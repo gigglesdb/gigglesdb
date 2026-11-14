@@ -519,3 +519,12 @@ fn index_text_is_opt_in_and_rejects_extended_forms() {
         );
     }
 }
+
+#[test]
+fn v2_native_read_matches_sql() {
+    let (_db, admin) = Database::fresh(StorageEngine::V2);
+    sql(&admin, "create table items(id bigint primary key, note text)");
+    sql(&admin, "insert into items values(1,'one'),(2,NULL)");
+    assert_eq!(native(&admin, "items order by id limit 1024", false),
+        sql(&admin, "select * from items order by id"));
+}

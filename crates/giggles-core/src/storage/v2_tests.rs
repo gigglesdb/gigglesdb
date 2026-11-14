@@ -283,7 +283,7 @@ fn lifecycle_and_public_refusals() {
         session.validate_immutable_constants(&prepared),
         Err(CoreError::Sql(relational::SqlError::StaleSchema))
     );
-    denied(
+    assert!(matches!(
         session.scan(relational::Scan {
             table: String::new(),
             projection: vec![],
@@ -293,8 +293,8 @@ fn lifecycle_and_public_refusals() {
             reverse: false,
             limit: 0,
         }),
-        SQL_SESSIONS,
-    );
+        Err(CoreError::Sql(relational::SqlError::Transaction))
+    ));
     let clock = relational::StatementClock {
         statement_us: clock.transaction_us,
         ..clock
@@ -439,10 +439,8 @@ fn native_binding_metadata_parity() {
         };
         let native = Native::new(admin.clone());
         let handle = native.prepare_bound(&request, &Bindings::new()).unwrap();
-        // Binding permits metadata only; v2 business row execution stays refused.
-        if backend == Engine::V2 {
-            assert!(matches!(native.execute_bound(&handle), Err(Error::Core(_))));
-        }
+        // Bound reads now execute on either engine.
+        assert!(native.execute_bound(&handle).is_ok());
         let before = admin
             .inspect_catalog_engine(|domain, fence, tables| (domain, fence, tables.clone()))
             .unwrap();
@@ -498,5 +496,77 @@ fn native_binding_metadata_parity() {
         }
         drop(reopened);
         fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn bounded_native_complete_reads() {
+    use crate::relational::{MAX_ROWS, with_sql_parser_forbidden};
+    for backend in [Engine::Legacy, Engine::V2] {
+        for count in [0, MAX_ROWS, MAX_ROWS + 1] {
+            let path = directory();
+            let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+            let mut writer = admin.sql_session();
+            writer.execute("CREATE TABLE bounded (id BIGINT PRIMARY KEY)", &[], None).unwrap();
+            writer.execute("BEGIN", &[], None).unwrap();
+            for id in 0..count {
+                writer.execute(&format!("INSERT INTO bounded VALUES ({id})"), &[], None).unwrap();
+            }
+            writer.execute("COMMIT", &[], None).unwrap();
+            let mut reader = admin.sql_session();
+            reader.begin_native().unwrap();
+            let table = reader.catalog_engine().unwrap().1.remove(0);
+            // Pin the read snapshot before a concurrent boundary insert.
+            let initial = reader.complete_table_engine(&table);
+            if count <= MAX_ROWS { assert!(initial.is_ok()); }
+            else { reader.rollback_native().unwrap(); reader.begin_native().unwrap(); }
+            if count == MAX_ROWS {
+                let concurrent = admin.clone();
+                std::thread::spawn(move || concurrent.sql_session()
+                    .execute("INSERT INTO bounded VALUES (1024)", &[], None).unwrap())
+                    .join().unwrap();
+            }
+            with_sql_parser_forbidden(|| {
+                let result = reader.complete_table_engine(&table);
+                if count > MAX_ROWS {
+                    assert!(matches!(result, Err(CoreError::Limit)));
+                    assert!(reader.is_aborted());
+                } else {
+                    assert_eq!(reader.consume_complete_engine(result.unwrap(), &table).unwrap().len(), count);
+                }
+                reader.rollback_native().unwrap();
+                reader.begin_native().unwrap();
+                let cancelled = crate::Cancellation::default();
+                cancelled.cancel();
+                assert!(matches!(cancelled.scope(|| reader.complete_table_engine(&table)), Err(CoreError::Cancelled)));
+                assert!(reader.is_aborted());
+                reader.rollback_native().unwrap();
+                if count == MAX_ROWS {
+                    reader.begin_native().unwrap();
+                    assert!(matches!(reader.complete_table_engine(&table), Err(CoreError::Limit)));
+                    reader.rollback_native().unwrap();
+                }
+            });
+            if count == 0 {
+                reader.begin_native().unwrap();
+                let relation = reader.complete_table_engine(&table).unwrap();
+                reader.execute("INSERT INTO bounded VALUES (9)", &[], None).unwrap();
+                assert_eq!(reader.consume_complete_engine(relation, &table),
+                    Err(CoreError::Sql(relational::SqlError::StaleSchema)));
+                reader.rollback_native().unwrap();
+                if backend == Engine::V2 {
+                    reader.begin_native().unwrap();
+                    let relation = reader.complete_table_engine(&table).unwrap();
+                    writer.execute("INSERT INTO bounded VALUES (10)", &[], None).unwrap();
+                    reader.execute("SELECT * FROM bounded", &[], None).unwrap();
+                    assert_eq!(reader.consume_complete_engine(relation, &table),
+                        Err(CoreError::Sql(relational::SqlError::StaleSchema)));
+                    reader.rollback_native().unwrap();
+                }
+            }
+            drop(reader); drop(writer); drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 }

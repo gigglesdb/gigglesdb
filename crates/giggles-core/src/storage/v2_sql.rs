@@ -24,6 +24,29 @@ thread_local! {
 }
 
 impl SqlSession {
+    // Typed scans deliberately retain the active statement snapshot. In
+    // particular, the completeness forward/max probes must never refresh it.
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn scan_v2_engine(
+        &mut self, db: &Arc<v2::V2Db>, scan: relational::Scan,
+    ) -> Result<relational::SqlResult, CoreError> {
+        let _ticket = self.admin.inner.enter_sql()?;
+        crate::cancellation::check()?;
+        if self.aborted { return Err(CoreError::Sql(SqlError::Aborted)); }
+        let txn = self.v2_transaction.as_mut()
+            .ok_or(CoreError::Sql(SqlError::Transaction))?;
+        let catalog = db.catalog().snapshot(txn)?;
+        let mut image = (*catalog.image().map_err(CoreError::Sql)?).clone();
+        let prepared = relational::Prepared::scan(scan,
+            u128::from_be_bytes(db.meta.domain), &image).map_err(CoreError::Sql)?;
+        let result = image.execute_with_sink(&prepared, &[], None, None,
+            &mut SqlRows { db, txn, parts: &catalog.parts, writing: false,
+                conflict_floor: None, prepared: &prepared, params: &[] },
+            u64::MAX, None)?;
+        crate::cancellation::check()?;
+        Ok(result)
+    }
+
     pub(super) fn prepare_v2(
         &mut self,
         sql: &str,

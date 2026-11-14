@@ -2279,6 +2279,13 @@ impl SqlSession {
         }
     }
     pub fn scan(&mut self, scan: relational::Scan) -> Result<relational::SqlResult, CoreError> {
+        #[cfg(feature = "engine-rocksdb")]
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let result = self.scan_v2_engine(&db, scan);
+            if result.is_err() { self.abort(); }
+            return result;
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::scan(scan, domain, state),
@@ -2854,7 +2861,21 @@ impl SqlSession {
         }
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();
-            return self.execute_v2(&db, p, params, expected_version, clock);
+            // Complete native materializations expire after any staged write,
+            // including writes issued through SQL on the same v2 transaction.
+            let revision = if self.v2_transaction.is_some() && !p.is_read() && p.control().is_none() {
+                let Some(revision) = self.staged_revision.checked_add(1) else {
+                    self.abort();
+                    return Err(CoreError::Sql(relational::SqlError::Overflow));
+                };
+                Some(revision)
+            } else { None };
+            let result = self.execute_v2(&db, p, params, expected_version, clock);
+            if result.is_ok() {
+                if let Some(revision) = revision { self.staged_revision = revision; }
+                if p.control() == Some("begin") { self.staged_revision = 0; }
+            }
+            return result;
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         if self.aborted && !p.allows_aborted_transaction() {

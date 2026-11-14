@@ -8,6 +8,7 @@ struct Snapshot {
     epoch: u64,
     transaction: u128,
     revision: u64,
+    read_timestamp: Option<u64>,
     table: TableDef,
 }
 
@@ -21,9 +22,27 @@ pub(crate) struct CompleteRelation {
 }
 
 impl SqlSession {
-    fn complete_snapshot(&self, table: &TableDef) -> Result<Snapshot, CoreError> {
+    fn complete_snapshot(&mut self, table: &TableDef) -> Result<Snapshot, CoreError> {
         if self.aborted {
             return Err(CoreError::Sql(SqlError::Aborted));
+        }
+        if self.is_v2_engine() {
+            #[cfg(feature = "engine-rocksdb")]
+            self.v2_transaction.as_mut()
+                .ok_or(CoreError::Sql(SqlError::Transaction))?.snapshot_ts();
+            let (domain, epoch) = self.snapshot_identity_engine()?;
+            let transaction = self.transaction_id.ok_or(CoreError::Sql(SqlError::Transaction))?;
+            if !self.catalog_engine()?.1.contains(table) {
+                return Err(CoreError::Sql(SqlError::StaleSchema));
+            }
+            if table.hidden_rowid().is_some() {
+                return Err(CoreError::Sql(SqlError::Unsupported));
+            }
+            return Ok(Snapshot { domain, epoch, transaction,
+                revision: self.staged_revision,
+                read_timestamp: self.v2_transaction.as_ref()
+                    .and_then(|txn| txn.current_snapshot_ts()).map(|ts| ts.0),
+                table: table.clone() });
         }
         let staged = self
             .staged
@@ -44,6 +63,7 @@ impl SqlSession {
             epoch: staged.sql.epoch,
             transaction,
             revision: self.staged_revision,
+            read_timestamp: None,
             table: table.clone(),
         })
     }
