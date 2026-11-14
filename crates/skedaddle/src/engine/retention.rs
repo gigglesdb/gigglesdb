@@ -196,6 +196,7 @@ impl Engine {
             retention.status.blocked_reason = None;
             retention.status.recovery_required = false;
             retention.next_tick = Instant::now();
+            retention.next_automatic_tick = Instant::now();
         }
         *self.runtime.4.write().expect("engine stop reason poisoned") = None;
         Ok(())
@@ -219,6 +220,7 @@ pub(super) struct Retention {
     policy: RetentionPolicy,
     cadence: Duration,
     next_tick: Instant,
+    next_automatic_tick: Instant,
     cursor: u64,
     eligible_since: Option<Instant>,
     applied: Option<Position>,
@@ -252,6 +254,7 @@ impl Engine {
             policy,
             cadence,
             next_tick: Instant::now(),
+            next_automatic_tick: Instant::now(),
             cursor: 0,
             eligible_since: None,
             applied: None,
@@ -337,10 +340,28 @@ impl Runtime {
         }
         self.retention_step(retention).await
     }
+    /// Automatic apply-loop maintenance has a two-second minimum quiet period.
+    /// Explicit collection still bypasses the deadline, but never GC policy.
+    /// Delaying these coalesced GC facts only retains more objects: the applier
+    /// independently persists restart/final-marker evidence, and admission stays
+    /// charged until journaled GC. Never let a slow pass consume its own gap.
+    pub(super) async fn automatic_retention_tick(&self) -> Result<()> {
+        let mut guard = self.3.lock().await;
+        let Some(retention) = guard.as_mut() else {
+            return Ok(());
+        };
+        if Instant::now() < retention.next_tick || Instant::now() < retention.next_automatic_tick {
+            return Ok(());
+        }
+        let result = self.retention_step(retention).await;
+        retention.next_automatic_tick =
+            Instant::now() + retention.cadence.max(Duration::from_secs(2));
+        result
+    }
     async fn retention_step(&self, retention: &mut Retention) -> Result<()> {
-        retention.next_tick = Instant::now() + retention.cadence;
         let result = retention.tick(self).await;
         self.sync_authority().await;
+        retention.next_tick = Instant::now() + retention.cadence;
         match result {
             Ok(()) => {
                 retention.status.blocked_reason = None;

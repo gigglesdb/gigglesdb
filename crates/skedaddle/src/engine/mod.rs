@@ -1256,7 +1256,7 @@ fn apply_loop(
                 .operational_schema
                 .require_clear()
                 .map_err(recovery)?;
-            runtime.retention_tick().await?;
+            runtime.automatic_retention_tick().await?;
             if !applier.controlled_step(runtime, cancel.clone()).await? {
                 tokio::select! {
                     biased;

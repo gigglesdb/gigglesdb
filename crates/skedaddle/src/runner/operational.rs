@@ -442,7 +442,7 @@ pub fn run(
                     retained_for_ms: definition.buffer_retention.min_seconds.saturating_mul(1000),
                     orphan_grace_ms: definition.buffer_retention.max_seconds.saturating_mul(1000),
                 },
-                Duration::from_millis(50),
+                Duration::from_secs(2),
             )
             .await?;
         let publication = format!("skedaddle_{id}");

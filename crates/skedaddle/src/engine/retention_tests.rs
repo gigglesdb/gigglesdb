@@ -771,3 +771,86 @@ async fn runner_requested_gc_reports_retained_then_deletes_one_manifest() {
             .is_some()
     );
 }
+
+/// Opt-in local-FS timing probe; identical journal sizes before/after the fix.
+#[tokio::test]
+#[ignore = "offline retention scalability measurement"]
+async fn retention_scalability_probe() {
+    let f = Fixture::new().await;
+    f.engine
+        .enable_retention(
+            f.store.clone(),
+            f.config.clone(),
+            Arc::new(Order),
+            RetentionPolicy {
+                retained_for_ms: 0,
+                orphan_grace_ms: 0,
+            },
+            Duration::from_nanos(1),
+        )
+        .await
+        .unwrap();
+    let runtime = f.engine.runtime();
+    for target in [250, 2000] {
+        let mut owner = runtime.0.lock().await;
+        let mut state = owner.state().clone();
+        while state.applied_seq < target {
+            let entry = coordinator::journal::Entry::new(
+                &state,
+                Transition::Progress {
+                    stream: "probe".into(),
+                    marker: state.applied_seq.to_string(),
+                    position: "0".into(),
+                },
+                owner.instance_id(),
+            )
+            .unwrap();
+            f.journal.put(&entry).await.unwrap();
+            state = state.projected(&entry).unwrap();
+        }
+        let start = std::time::Instant::now();
+        owner.refresh().await.unwrap();
+        let refresh = start.elapsed();
+        drop(owner);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            runtime.automatic_retention_tick().await.unwrap();
+        }
+        println!(
+            "retention_probe seq={target} refresh_ms={:.3} ten_ticks_ms={:.3}",
+            refresh.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+#[tokio::test]
+async fn automatic_retention_leaves_a_gap_even_with_tiny_configured_cadence() {
+    let f = Fixture::new().await;
+    f.engine
+        .enable_retention(
+            f.store.clone(),
+            f.config.clone(),
+            Arc::new(Order),
+            RetentionPolicy {
+                retained_for_ms: 0,
+                orphan_grace_ms: 0,
+            },
+            Duration::from_nanos(1),
+        )
+        .await
+        .unwrap();
+    let runtime = f.engine.runtime();
+    runtime.automatic_retention_tick().await.unwrap();
+    // A new epoch makes another real GC pass fail. Consecutive apply-loop
+    // maintenance calls must do no authority I/O during the quiet period.
+    runtime.0.lock().await.acquire().await.unwrap();
+    for _ in 0..100 {
+        runtime.automatic_retention_tick().await.unwrap();
+    }
+    // Internal maintenance keeps its configured deadline, independently of
+    // automatic pacing (also used by outage injection and manual maintenance).
+    assert!(runtime.retention_tick().await.is_err());
+    // Explicit collection remains immediately fenced, despite the deadline.
+    assert!(runtime.collect_buffer_once().await.is_err());
+}
