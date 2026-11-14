@@ -82,6 +82,7 @@ fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error
         "0.11" => Ok(LanguageVersion::Embedded011),
         "0.12" => Ok(LanguageVersion::Embedded012),
         "0.13" => Ok(LanguageVersion::Embedded013),
+        "0.14" => Ok(LanguageVersion::Embedded014),
         _ => Err(Error::Unsupported),
     }
 }

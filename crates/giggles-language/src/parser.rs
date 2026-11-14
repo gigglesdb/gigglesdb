@@ -392,7 +392,8 @@ impl Parser {
             | LanguageVersion::Embedded010
             | LanguageVersion::Embedded011
             | LanguageVersion::Embedded012
-            | LanguageVersion::Embedded013 => self.sum(d),
+            | LanguageVersion::Embedded013
+            | LanguageVersion::Embedded014 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1060,13 +1061,39 @@ impl Parser {
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if create == "create" && table == "table")
+            if create == "create" && (table == "table" || table == "index"))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
         self.need("create")?;
+        if self.word("index") {
+            if !self.version.supports_indexes() {
+                return Err(Error::Unsupported);
+            }
+            let name = self.name()?;
+            self.need("on")?;
+            let table = self.name()?;
+            if !self.symbol('(') {
+                return Err(self.error());
+            }
+            let mut columns = vec![self.name()?];
+            while self.symbol(',') {
+                if columns.len() >= giggles_core::relational::MAX_COLUMNS {
+                    return Err(Error::Limit);
+                }
+                columns.push(self.name()?);
+            }
+            if !self.symbol(')') {
+                return Err(self.error());
+            }
+            return Ok(CatalogStatement::CreateIndex {
+                table,
+                name,
+                columns,
+            });
+        }
         self.need("table")?;
         let table = self.name()?;
         if !self.symbol('(') {

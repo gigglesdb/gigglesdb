@@ -243,11 +243,35 @@ pub(crate) fn validate_catalog(
     statement: &CatalogStatement,
     version: LanguageVersion,
 ) -> Result<()> {
+    if let CatalogStatement::CreateIndex {
+        table,
+        name,
+        columns,
+    } = statement
+    {
+        if !version.supports_indexes() {
+            return Err(Error::Unsupported);
+        }
+        if columns.len() > giggles_core::relational::MAX_COLUMNS {
+            return Err(Error::Limit);
+        }
+        if std::iter::once(table)
+            .chain(std::iter::once(name))
+            .chain(columns.iter())
+            .any(|name| !parser::semantic_identifier(name, version))
+        {
+            return Err(Error::Bind("identifier".into()));
+        }
+        return validate_size(statement);
+    }
     let CatalogStatement::CreateTable {
         table,
         columns,
         primary_key,
-    } = statement;
+    } = statement
+    else {
+        unreachable!()
+    };
     if columns.len() > giggles_core::relational::MAX_COLUMNS
         || primary_key.len() > giggles_core::relational::MAX_COLUMNS
     {
@@ -275,11 +299,26 @@ fn lower_catalog_checked(
         return Err(Error::Unsupported);
     }
     validate_catalog(statement, version)?;
+    if let CatalogStatement::CreateIndex {
+        table,
+        name,
+        columns,
+    } = statement
+    {
+        return Ok(operations::CatalogRequest::CreateIndex {
+            table: table.clone(),
+            name: name.clone(),
+            columns: columns.clone(),
+        });
+    }
     let CatalogStatement::CreateTable {
         table,
         columns,
         primary_key,
-    } = statement;
+    } = statement
+    else {
+        unreachable!()
+    };
     Ok(operations::CatalogRequest::CreateTable {
         table: table.clone(),
         columns: columns

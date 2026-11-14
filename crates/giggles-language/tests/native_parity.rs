@@ -308,17 +308,11 @@ fn parser_trap_positive_control_covers_text_and_prepared_entry() {
     );
 }
 
-// The text language has no CREATE INDEX. Exercise the existing typed native
-// nonunique API instead; unique indexes still require SQL on both databases.
 fn provision_index(admin: &Admin, native_side: bool, name: &str, keys: &[&str], unique: bool) {
     if native_side && !unique {
         with_sql_parser_forbidden(|| {
-            giggles_core::operations::Engine::new(admin.clone())
-                .execute_catalog(&giggles_core::operations::CatalogRequest::CreateIndex {
-                    table: "items".into(),
-                    name: name.into(),
-                    columns: keys.iter().map(|key| (*key).into()).collect(),
-                })
+            Engine::with_version(admin.clone(), LanguageVersion::Embedded014)
+                .execute_catalog_text(&format!("create index {name} on items({})", keys.join(",")))
                 .unwrap();
         });
     } else {
@@ -428,5 +422,100 @@ fn secondary_index_controls_fail_after_reopen() {
         without_indexes.state[0].indexes = left.state[0].indexes.clone();
         assert!(parity(&left, &without_indexes), "{control}");
         assert!(!parity(&left, &right), "{control}");
+    }
+}
+
+#[test]
+fn text_index_matches_typed_catalog_and_errors() {
+    let (_left_db, left) = Database::fresh(StorageEngine::Legacy);
+    let (_right_db, right) = Database::fresh(StorageEngine::Legacy);
+    for admin in [&left, &right] {
+        Engine::with_version(admin.clone(), LanguageVersion::Embedded014)
+            .execute_catalog_text("create table items(id int64,a int64,primary key(id))")
+            .unwrap();
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded014);
+    let typed = giggles_core::operations::Engine::new(right.clone());
+    let request = |columns: Vec<String>| giggles_core::operations::CatalogRequest::CreateIndex {
+        table: "items".into(),
+        name: "items_a".into(),
+        columns,
+    };
+    let native_tree = giggles_language::CatalogStatement::CreateIndex {
+        table: "items".into(),
+        name: "items_a".into(),
+        columns: vec!["a".into()],
+    };
+    for (keys, columns) in [
+        ("missing", vec!["missing".into()]),
+        ("a,a", vec!["a".into(), "a".into()]),
+    ] {
+        let text_error = with_sql_parser_forbidden(|| {
+            engine.execute_catalog_text(&format!("create index items_a on items({keys})"))
+        })
+        .unwrap_err();
+        let typed_error = typed.execute_catalog(&request(columns)).unwrap_err();
+        assert_eq!(format!("{text_error:?}"), format!("{typed_error:?}"));
+    }
+    let text_outcome = with_sql_parser_forbidden(|| {
+        engine.execute_catalog_text("create index items_a on items(a)")
+    })
+    .unwrap();
+    let tree_outcome = with_sql_parser_forbidden(|| {
+        Engine::with_version(right.clone(), LanguageVersion::Embedded014)
+            .execute_catalog(&native_tree)
+    })
+    .unwrap();
+    assert_eq!(text_outcome.table, tree_outcome.table);
+    assert_eq!(snapshot(&left), snapshot(&right));
+    for admin in [&left, &right] {
+        assert_eq!(
+            sql(admin, "insert into items values(1,2)"),
+            Step::Success(vec![])
+        );
+    }
+    assert!(matches!(
+        engine.execute_catalog_text("create index another on items(a)"),
+        Err(Error::PlanRequired)
+    ));
+    assert!(matches!(
+        typed.execute_catalog(&giggles_core::operations::CatalogRequest::CreateIndex {
+            table: "items".into(),
+            name: "another".into(),
+            columns: vec!["a".into()],
+        }),
+        Err(giggles_core::operations::Error::PlanRequired)
+    ));
+}
+
+#[test]
+fn index_text_is_opt_in_and_rejects_extended_forms() {
+    use giggles_language::{
+        CatalogStatement, parse_catalog_with_version, parse_input_with_version,
+    };
+    let text = "create index items_a on items(a)";
+    assert!(matches!(
+        parse_catalog_with_version(text, LanguageVersion::Embedded013),
+        Err(Error::Unsupported)
+    ));
+    assert!(matches!(
+        parse_catalog_with_version(text, LanguageVersion::Embedded014),
+        Ok(CatalogStatement::CreateIndex { .. })
+    ));
+    assert!(parse_input_with_version(text, LanguageVersion::Embedded014).is_ok());
+    for text in [
+        "create unique index x on items(a)",
+        "create index x on items(a desc)",
+        "create index x on items(a asc)",
+        "create index x on items(a) where a=1",
+        "create index x on public.items(a)",
+        "create index x on items()",
+        "create index x on items(a+1)",
+        "drop index x",
+    ] {
+        assert!(
+            parse_catalog_with_version(text, LanguageVersion::Embedded014).is_err(),
+            "{text}"
+        );
     }
 }

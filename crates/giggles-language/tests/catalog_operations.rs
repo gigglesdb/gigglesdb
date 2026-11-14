@@ -167,7 +167,7 @@ fn catalog_version_gates_and_required_defaults_are_explicit() {
         );
     }
     let mut noncanonical = create("candidate");
-    let CatalogStatement::CreateTable { columns, .. } = &mut noncanonical;
+    let CatalogStatement::CreateTable { columns, .. } = &mut noncanonical else { unreachable!() };
     columns[0].name = "ID".into();
     assert!(engine.prepare_catalog_bound(&noncanonical).is_err());
     assert!(engine.execute_catalog(&noncanonical).is_err());
@@ -186,7 +186,7 @@ fn catalog_version_gates_and_required_defaults_are_explicit() {
     assert_eq!(wide.table.columns.len(), 64);
     assert_eq!(wide.table.primary_key, (0..64).collect::<Vec<_>>());
     let mut over = wide_tree.clone();
-    let CatalogStatement::CreateTable { table, columns, .. } = &mut over;
+    let CatalogStatement::CreateTable { table, columns, .. } = &mut over else { unreachable!() };
     *table = "too_wide".into();
     columns.push(column("extra", CatalogType::Int64, false));
     assert_eq!(
@@ -196,7 +196,7 @@ fn catalog_version_gates_and_required_defaults_are_explicit() {
     let mut over = wide_tree;
     let CatalogStatement::CreateTable {
         table, primary_key, ..
-    } = &mut over;
+    } = &mut over else { unreachable!() };
     *table = "too_many_keys".into();
     primary_key.push("extra".into());
     assert_eq!(
@@ -288,7 +288,7 @@ fn catalog_text_tree_and_bound_execution_match_without_sql() {
                 }
                 .unwrap();
                 assert_eq!(digest(&admin), before);
-                let CatalogStatement::CreateTable { table, columns, .. } = &mut supplied;
+                let CatalogStatement::CreateTable { table, columns, .. } = &mut supplied else { unreachable!() };
                 *table = "different".into();
                 columns[0].data_type = CatalogType::Text;
                 engine.execute_catalog_bound(&bound)

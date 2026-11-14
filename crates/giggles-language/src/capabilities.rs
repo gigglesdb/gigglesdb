@@ -1710,6 +1710,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
         ),
+        LanguageVersion::Embedded014 => (
+            "crates/giggles-language/tests/native_parity.rs",
+            "index_text_is_opt_in_and_rejects_extended_forms",
+        ),
         LanguageVersion::Embedded013 => (
             "crates/giggles-language/tests/explain.rs",
             "explain_selected_manifest_rejections_use_selected_version",
