@@ -217,7 +217,7 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
             }
         }).await.unwrap();
         for i in 1201..1231 {
-            source.execute(&format!("INSERT INTO {schema}.rows VALUES($1,md5($1::text)::uuid,'concurrent','{EXCLUDED_SENTINEL}')"), &[&(i as i64)]).await.unwrap();
+            source.execute(&format!("INSERT INTO {schema}.rows VALUES($1::bigint,md5($1::bigint::text)::uuid,'concurrent','{EXCLUDED_SENTINEL}')"), &[&(i as i64)]).await.unwrap();
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let (code, reached) = child_result(&mut first).await;
