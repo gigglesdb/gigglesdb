@@ -365,7 +365,8 @@ fn lifecycle_and_public_refusals() {
     assert_eq!(session.update_engine(&table, vec![], vec![], 0),
         Err(CoreError::Sql(relational::SqlError::StaleSchema)));
     session.rollback();
-    denied(session.delete_engine(&table, vec![], 0), SQL_SESSIONS);
+    assert_eq!(session.delete_engine(&table, vec![], 0),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema)));
     drop(legacy_session);
     drop(legacy);
     fs::remove_dir_all(legacy_path).unwrap();
@@ -692,6 +693,109 @@ fn typed_keyed_update_parity() {
         assert_eq!(reopened.sql_session().execute("SELECT n FROM items", &[], None).unwrap().rows[0].values,
             vec![V::Int(1)]);
         drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn typed_keyed_delete_parity() {
+    use crate::operations::{Bindings, Compare, Error, Expr, Request, ValueExpr};
+    use crate::relational::{Value as V, with_sql_parser_forbidden};
+    for backend in [Engine::Legacy, Engine::V2] {
+        for action in ["RESTRICT", "NO ACTION", "CASCADE"] {
+            let path = directory();
+            let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+            let mut session = admin.sql_session();
+            for ddl in [
+                "CREATE TABLE parent(id BIGINT PRIMARY KEY)",
+                "INSERT INTO parent VALUES(1),(2),(3)",
+                &format!("CREATE TABLE child(id BIGINT PRIMARY KEY,p BIGINT REFERENCES parent(id) ON DELETE {action})"),
+                "INSERT INTO child VALUES(1,3)",
+            ] { session.execute(ddl, &[], None).unwrap(); }
+            let native = crate::operations::Engine::new(admin.clone());
+            let request = |id: Option<i64>, cap: Option<i64>| Request::Returning { request: Box::new(Request::Delete {
+                table: "parent".into(),
+                filter: id.map_or(Expr::Value(ValueExpr::Literal(V::Bool(true))), |id|
+                    Expr::Compare(Box::new(Expr::Field("id".into())), Compare::Eq,
+                        Box::new(Expr::Value(ValueExpr::Literal(V::Int(id)))))),
+                guard: None, cap: cap.map(|n| ValueExpr::Literal(V::Int(n))),
+            }), projection: vec![] };
+            // Cardinality rejection occurs before any mutation on both engines.
+            assert_eq!(native.execute(&request(None, Some(2)), &Bindings::new()), Err(Error::TooManyMatches));
+            let first = with_sql_parser_forbidden(|| native.execute(&request(Some(1), None), &Bindings::new())).unwrap();
+            assert_eq!(first.affected, 1);
+            assert_eq!(first.rows[0].values, vec![V::Int(1)]); // delete preimage
+            session.execute("INSERT INTO parent VALUES(1)", &[], None).unwrap();
+            let before = session.execute("SELECT * FROM parent ORDER BY id", &[], None).unwrap().rows;
+            // Obtain SQL's result inside a transaction so native sees the same input.
+            session.begin_native().unwrap();
+            let sql_result = session.execute("DELETE FROM parent", &[], None);
+            let sql_rows = if sql_result.is_ok() {
+                Some((session.execute("SELECT * FROM parent", &[], None).unwrap().rows,
+                    session.execute("SELECT * FROM child", &[], None).unwrap().rows))
+            } else { None };
+            session.rollback_native().unwrap();
+            let result = with_sql_parser_forbidden(|| native.execute(&request(None, Some(3)), &Bindings::new()));
+            if action != "CASCADE" {
+                let expected = if action == "RESTRICT" {
+                    relational::SqlError::RestrictViolation // 23001
+                } else {
+                    relational::SqlError::ForeignKeyViolation // 23503
+                };
+                assert_eq!(sql_result, Err(CoreError::Sql(expected.clone())));
+                assert_eq!(result, Err(Error::Core(CoreError::Sql(expected).to_string())));
+                // Rows 1 and 2 were selected before the failing referenced row 3.
+                assert_eq!(session.execute("SELECT * FROM parent ORDER BY id", &[], None).unwrap().rows, before);
+                assert_eq!(session.execute("SELECT * FROM child", &[], None).unwrap().rows.len(), 1);
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.affected as u64, sql_result.unwrap().affected);
+                let mut preimages: Vec<_> = result.rows.into_iter().map(|r| r.values).collect();
+                preimages.sort_by_key(|r| match r[0] { V::Int(i) => i, _ => unreachable!() });
+                assert_eq!(preimages, vec![vec![V::Int(1)], vec![V::Int(2)], vec![V::Int(3)]]);
+                let (parents, children) = sql_rows.unwrap();
+                assert_eq!(session.execute("SELECT * FROM parent", &[], None).unwrap().rows, parents);
+                assert_eq!(session.execute("SELECT * FROM child", &[], None).unwrap().rows, children);
+            }
+            drop(native); drop(session); drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn typed_keyed_delete_admission_cap() {
+    use crate::operations::{Bindings, Error, Expr, Request, ValueExpr};
+    use crate::relational::{Value as V, MAX_ROWS, with_sql_parser_forbidden};
+    for backend in [Engine::Legacy, Engine::V2] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None).unwrap();
+        session.begin_native().unwrap();
+        for id in 0..MAX_ROWS {
+            session.execute(&format!("INSERT INTO items VALUES({id})"), &[], None).unwrap();
+        }
+        session.commit_native().unwrap();
+        let native = crate::operations::Engine::new(admin.clone());
+        let request = |cap| Request::Returning { request: Box::new(Request::Delete { table: "items".into(),
+            filter: Expr::Value(ValueExpr::Literal(V::Bool(true))), guard: None,
+            cap: Some(ValueExpr::Literal(V::Int(cap))) }), projection: vec![] };
+        assert_eq!(native.execute(&request(MAX_ROWS as i64 + 1), &Bindings::new()), Err(Error::Type));
+        assert_eq!(native.execute(&request(MAX_ROWS as i64 - 1), &Bindings::new()), Err(Error::TooManyMatches));
+        let result = with_sql_parser_forbidden(|| native.execute(&request(MAX_ROWS as i64), &Bindings::new())).unwrap();
+        assert_eq!((result.affected, result.rows.len()), (MAX_ROWS, MAX_ROWS));
+        assert!(session.execute("SELECT * FROM items", &[], None).unwrap().rows.is_empty());
+        // A complete-relation overflow must refuse even a selective delete.
+        session.begin_native().unwrap();
+        for id in 0..=MAX_ROWS {
+            session.execute(&format!("INSERT INTO items VALUES({id})"), &[], None).unwrap();
+        }
+        session.commit_native().unwrap();
+        assert_eq!(native.execute(&request(MAX_ROWS as i64), &Bindings::new()), Err(Error::Limit));
+        drop(native); drop(session); drop(admin);
         fs::remove_dir_all(path).unwrap();
     }
 }

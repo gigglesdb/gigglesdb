@@ -2578,6 +2578,22 @@ impl SqlSession {
         key: Vec<relational::Value>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let result = (|| {
+                if self.aborted {
+                    return Err(CoreError::Sql(relational::SqlError::Aborted));
+                }
+                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
+                state.sql.epoch = 0;
+                let mut prepared = relational::Prepared::delete_engine(
+                    table, key, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], Some(expected_version))
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::delete_engine(table, key, domain, state),

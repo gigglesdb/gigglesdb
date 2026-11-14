@@ -270,7 +270,7 @@ fn unsupported_native_construct_cannot_pass() {
     ));
 }
 #[test]
-fn native_on_v2_allows_only_transaction_controls() {
+fn native_on_v2_still_refuses_catalog_writes() {
     // giggles-language's core dependency enables engine-rocksdb even when this
     // crate is tested with --no-default-features.
     let (_db, admin) = Database::fresh(StorageEngine::V2);
@@ -280,7 +280,7 @@ fn native_on_v2_allows_only_transaction_controls() {
         session.begin_native().unwrap();
         session.rollback_native().unwrap();
     });
-    // Every other native operation is still refused on v2.
+    // Native catalog writes remain refused; keyed reads and writes are supported.
     assert!(matches!(
         native(&admin, "create table items(id int64,primary key(id))", true),
         Step::Native(Error::Core(_))
@@ -557,4 +557,25 @@ fn v2_native_update_matches_sql() {
     assert_eq!(u64::try_from(result.affected).unwrap(), expected.affected);
     assert_eq!(Step::Success(values(result.rows)), Step::Success(values(expected.rows)));
     assert_eq!(snapshot(&left), snapshot(&right));
+}
+
+#[test]
+fn v2_native_delete_matches_sql() {
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, label text)");
+        sql(admin, "insert into items values(1,'ready'),(2,'done'),(3,'done')");
+    }
+    for (text, statement) in [
+        ("delete items where id=1", "delete from items where id=1"),
+        ("delete many items where true at most 2", "delete from items"),
+    ] {
+        let result = with_sql_parser_forbidden(|| Engine::with_version(left.clone(), LanguageVersion::Embedded07)
+            .execute_text(text, &Bindings::new())).unwrap();
+        let expected = right.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!(u64::try_from(result.affected).unwrap(), expected.affected);
+        assert_eq!(Step::Success(values(result.rows)), Step::Success(values(expected.rows)));
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
 }
