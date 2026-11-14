@@ -212,3 +212,76 @@ fn abrupt_process_bulk_atomicity() {
         }
     }
 }
+
+#[test]
+fn explicit_engine_init_run_reopen() {
+    for engine in ["legacy", "v2"] {
+        let p = path();
+        let pstr = p.to_str().unwrap();
+        let out = invoke(&[
+            "init",
+            "--engine",
+            engine,
+            pstr,
+            "create table items (id bigint primary key, state text not null)",
+        ]);
+        // Also exercises the no-RocksDB build when core defaults are disabled.
+        if engine == "v2" && !out.status.success() {
+            let error = String::from_utf8(out.stderr).unwrap();
+            assert!(error.contains("engine-rocksdb"), "{error}");
+            assert!(!p.exists());
+            continue;
+        }
+        json(&out);
+        assert_eq!(
+            json(&invoke(&[
+                "run",
+                pstr,
+                "insert items set id=1,state=\"ready\""
+            ]))["changed"],
+            1
+        );
+        assert_eq!(json(&invoke(&["run", pstr, "items"]))["matched"], 1);
+        // Init is create-new, including when a different engine is requested.
+        let other = if engine == "legacy" { "v2" } else { "legacy" };
+        assert!(!invoke(&["init", "--engine", other, pstr]).status.success());
+        assert_eq!(json(&invoke(&["run", pstr, "items"]))["matched"], 1);
+        // Engine selection is init-only: reopening always detects stored format.
+        assert!(
+            !invoke(&["run", "--engine", other, pstr, "items"])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn invalid_cli_options_have_no_filesystem_effects() {
+    let parent = path();
+    let db = parent.join("db");
+    let p = db.to_str().unwrap();
+    for args in [
+        vec!["init", "--engine", "unknown", p],
+        vec![
+            "init",
+            "--engine",
+            "unknown",
+            p,
+            "create table t(id int primary key)",
+        ],
+        vec!["init", "--language-version", "999", p],
+        vec!["init", "--engine", "legacy", "--language-version", "999", p],
+        vec!["run", "--language-version", "999", p, "items"],
+        vec!["capabilities", "--language-version", "999"],
+        vec!["capability-manifest", "--language-version", "999"],
+    ] {
+        assert!(!invoke(&args).status.success(), "{args:?}");
+        assert!(!parent.exists(), "{args:?} created a directory");
+    }
+    let out = invoke(&["init", "--engine", "unknown", p]);
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("unknown engine")
+    );
+}

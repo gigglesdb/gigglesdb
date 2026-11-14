@@ -1,4 +1,4 @@
-use giggles_core::{Admin, Limits};
+use giggles_core::{Admin, Engine as StorageEngine, Limits};
 use giggles_language::{
     Bindings, Engine, Error, InspectionOutcome, InspectionStatement, LanguageVersion, MAX_INPUT,
     ParsedInput, parse_input_with_version,
@@ -23,25 +23,7 @@ fn run() -> std::result::Result<serde_json::Value, Error> {
             serde_json::to_value(giggles_language::capability_manifest_for(language_version(version)?))
                 .map_err(|_| Error::Type)
         }
-        [command, path] if command == "init" => {
-            Admin::create(path, Limits::default()).map_err(|e| Error::Core(e.to_string()))?;
-            Ok(serde_json::json!({"initialized":true}))
-        }
-        [command, path, schema] if command == "init" => {
-            let admin =
-                Admin::create(path, Limits::default()).map_err(|e| Error::Core(e.to_string()))?;
-            let mut session = admin.sql_session();
-            let prepared = session
-                .prepare(schema)
-                .map_err(|e| Error::Core(e.to_string()))?;
-            if prepared.command() != "CREATE TABLE" {
-                return Err(Error::Unsupported);
-            }
-            session
-                .execute_prepared(&prepared, &[], None)
-                .map_err(|e| Error::Core(e.to_string()))?;
-            Ok(serde_json::json!({"initialized":true}))
-        }
+        [command, rest @ ..] if command == "init" => initialize(rest),
         [command, option, version, path, text] if command == "run" && option == "--language-version" => {
             execute(path, text, &Bindings::new(), language_version(version)?)
         }
@@ -63,9 +45,47 @@ fn run() -> std::result::Result<serde_json::Value, Error> {
             execute(path, text, &b, LanguageVersion::Embedded01)
         }
         _ => Err(Error::Bind(
-            "usage: capabilities [--language-version VERSION] | capability-manifest [--language-version VERSION] | init PATH [SQL_SCHEMA] | run [--language-version VERSION] PATH NATIVE [BINDINGS_JSON]".into(),
+            "usage: capabilities [--language-version VERSION] | capability-manifest [--language-version VERSION] | init [--engine legacy|v2] PATH [SQL_SCHEMA] | run [--language-version VERSION] PATH NATIVE [BINDINGS_JSON]".into(),
         )),
     }
+}
+// Parse all init options before calling core, which may create the directory.
+fn initialize(args: &[String]) -> Result<serde_json::Value, Error> {
+    let (engine, rest) = match args {
+        [option, engine, rest @ ..] if option == "--engine" => {
+            let engine = match engine.as_str() {
+                "legacy" => StorageEngine::Legacy,
+                "v2" => StorageEngine::V2,
+                _ => return Err(Error::Bind("unknown engine: expected legacy or v2".into())),
+            };
+            (engine, rest)
+        }
+        _ => (StorageEngine::Legacy, args),
+    };
+    let (path, schema) = match rest {
+        [path] if !path.starts_with("--") => (path, None),
+        [path, schema] if !path.starts_with("--") => (path, Some(schema)),
+        _ => {
+            return Err(Error::Bind(
+                "usage: init [--engine legacy|v2] PATH [SQL_SCHEMA]".into(),
+            ));
+        }
+    };
+    let admin = Admin::create_engine(path, Limits::default(), engine)
+        .map_err(|e| Error::Core(e.to_string()))?;
+    if let Some(schema) = schema {
+        let mut session = admin.sql_session();
+        let prepared = session
+            .prepare(schema)
+            .map_err(|e| Error::Core(e.to_string()))?;
+        if prepared.command() != "CREATE TABLE" {
+            return Err(Error::Unsupported);
+        }
+        session
+            .execute_prepared(&prepared, &[], None)
+            .map_err(|e| Error::Core(e.to_string()))?;
+    }
+    Ok(serde_json::json!({"initialized":true}))
 }
 fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error> {
     match version {

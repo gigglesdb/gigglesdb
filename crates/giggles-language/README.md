@@ -389,7 +389,14 @@ Version 0.7 adds safe standalone table creation without requiring SQL provisioni
 & $cli run --language-version 0.7 native-schema.db 'insert into work(id,state) values(1,"ready")'
 ```
 
-The existing `init PATH SQL_SCHEMA` form remains supported. Native catalog
+`init [--engine legacy|v2] PATH [SQL_SCHEMA]` selects the engine for a fresh
+database. The default remains `legacy`; for example, `init --engine v2 native.db`
+creates a v2 database when core's `engine-rocksdb` feature is compiled in.
+Otherwise v2 initialization fails before creating the database directory.
+Unknown engine names and unsupported language versions reject before filesystem
+effects. `--engine` is init-only: `run` detects the existing database's engine
+automatically, and repeated `init` refuses an existing path even with a different
+engine flag. The existing `init PATH SQL_SCHEMA` form remains supported. Native catalog
 requests use `create table name (column,...,primary key (name,...))`, with one
 explicit table-level primary key. Column syntax is `name [nullable] type`;
 types are exactly `bool`, `int32`, `int64`, `text` and `bytes`. Fields are required
