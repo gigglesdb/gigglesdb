@@ -542,3 +542,19 @@ fn v2_native_insert_matches_sql() {
     drop(left); drop(right);
     assert!(parity(&reopen_observation(&left_db), &reopen_observation(&right_db)));
 }
+
+#[test]
+fn v2_native_update_matches_sql() {
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, label text)");
+        sql(admin, "insert into items values(1,'ready')");
+    }
+    let result = with_sql_parser_forbidden(|| Engine::with_version(left.clone(), LanguageVersion::Embedded07)
+        .execute_text("update items where id=1 set label=\"done\"", &Bindings::new())).unwrap();
+    let expected = right.sql_session().execute("update items set label='done' where id=1", &[], None).unwrap();
+    assert_eq!(u64::try_from(result.affected).unwrap(), expected.affected);
+    assert_eq!(Step::Success(values(result.rows)), Step::Success(values(expected.rows)));
+    assert_eq!(snapshot(&left), snapshot(&right));
+}

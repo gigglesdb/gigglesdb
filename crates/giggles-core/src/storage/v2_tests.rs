@@ -356,13 +356,15 @@ fn lifecycle_and_public_refusals() {
         .execute("CREATE TABLE test_items (id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();
     let table = legacy.catalog().unwrap().1.remove(0);
-    denied(session.row_version_engine(&table, &[]), SQL_SESSIONS);
+    assert_eq!(session.row_version_engine(&table, &[]),
+        Err(CoreError::Sql(relational::SqlError::Transaction)));
+    session.rollback();
     assert_eq!(session.insert_engine(&table, vec![]),
         Err(CoreError::Sql(relational::SqlError::StaleSchema)));
-    denied(
-        session.update_engine(&table, vec![], vec![], 0),
-        SQL_SESSIONS,
-    );
+    session.rollback();
+    assert_eq!(session.update_engine(&table, vec![], vec![], 0),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema)));
+    session.rollback();
     denied(session.delete_engine(&table, vec![], 0), SQL_SESSIONS);
     drop(legacy_session);
     drop(legacy);
@@ -620,6 +622,76 @@ fn typed_keyed_insert_parity() {
         let admin = Admin::open(&path, Limits::default()).unwrap();
         assert_eq!(admin.sql_session().execute("SELECT * FROM child", &[], None).unwrap().rows.len(), 3);
         drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn typed_keyed_update_parity() {
+    use crate::operations::{Bindings, Compare, Expr, Intent, Request, Sort, ValueExpr};
+    use crate::relational::{Value as V, with_sql_parser_forbidden};
+    let lit = |v| ValueExpr::Literal(v);
+    let filter = || Expr::Compare(Box::new(Expr::Field("n".into())), Compare::Eq,
+        Box::new(Expr::Value(lit(V::Int(0)))));
+    let request = |claim| Request::Update {
+        table: "items".into(), filter: filter(), guard: None,
+        values: vec![("n".into(), lit(V::Int(1)))],
+        intent: if claim { Intent::Claim { order: vec![Sort { field: "id".into(), descending: false }] } }
+            else { Intent::One },
+    };
+    for backend in [Engine::Legacy, Engine::V2] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE items(id BIGINT PRIMARY KEY,n BIGINT)", &[], None).unwrap();
+        session.execute("INSERT INTO items VALUES(1,0)", &[], None).unwrap();
+        let table = session.catalog_engine().unwrap().1.remove(0);
+        let before = session.execute("SELECT * FROM items", &[], None).unwrap().rows[0].version;
+        let native = crate::operations::Engine::new(admin.clone());
+        let result = with_sql_parser_forbidden(|| native.execute(&request(false), &Bindings::new())).unwrap();
+        assert_eq!((result.affected, result.changed), (1, 1));
+        session.begin_native().unwrap();
+        let version = with_sql_parser_forbidden(|| session.row_version_engine(&table, &[V::Int(1)])).unwrap();
+        assert_ne!(version, before);
+        session.rollback_native().unwrap();
+        let noop = Request::Update { table: "items".into(), filter: Expr::Value(lit(V::Bool(true))),
+            guard: None, values: vec![("n".into(), lit(V::Int(1)))], intent: Intent::One };
+        let result = with_sql_parser_forbidden(|| native.execute(&noop, &Bindings::new())).unwrap();
+        assert_eq!((result.affected, result.changed), (1, 0));
+        assert_eq!(session.execute("SELECT * FROM items", &[], None).unwrap().rows[0].version, version);
+        assert_eq!(session.execute("UPDATE items SET n=1 WHERE id=1", &[], None).unwrap().affected, 1);
+        // SQL bumps even a no-op; native deliberately preserves its version.
+        assert_ne!(session.execute("SELECT * FROM items", &[], None).unwrap().rows[0].version, version);
+        session.begin_native().unwrap();
+        assert_eq!(with_sql_parser_forbidden(|| session.update_engine(&table, vec![V::Int(1)],
+            vec![(1, V::Int(2))], before)), Err(CoreError::Sql(relational::SqlError::Version)));
+        assert!(session.is_aborted());
+        session.rollback_native().unwrap();
+        session.execute("UPDATE items SET n=0", &[], None).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|_| {
+            let admin = admin.clone(); let barrier = barrier.clone(); let request = request(true);
+            std::thread::spawn(move || {
+                barrier.wait();
+                crate::operations::Engine::new(admin).execute(&request, &Bindings::new())
+            })
+        }).collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.affected).sum::<usize>(), 1);
+        for result in results.into_iter().flatten() {
+            if result.affected == 1 { assert_eq!(result.rows[0].values, vec![V::Int(1), V::Int(1)]); }
+        }
+        session.execute("UPDATE items SET n=0", &[], None).unwrap();
+        admin.set_crash_point(CrashPoint::ErrorAfterCommit).unwrap();
+        assert_eq!(native.execute(&request(false), &Bindings::new()), Err(crate::operations::Error::Unknown));
+        drop(native); drop(session); drop(admin);
+        // Legacy fences the handle after an ambiguous commit; inspect durability
+        // through reopen for both engines rather than retrying the mutation.
+        let reopened = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(reopened.sql_session().execute("SELECT n FROM items", &[], None).unwrap().rows[0].values,
+            vec![V::Int(1)]);
+        drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
 }

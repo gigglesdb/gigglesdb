@@ -2458,11 +2458,33 @@ impl SqlSession {
         table: &relational::TableDef,
         key: &[relational::Value],
     ) -> Result<u64, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
+
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
+            if let Backend::V2(db) = &self.admin.inner.backend {
+                let _ticket = self.admin.inner.enter_sql()?;
+                crate::cancellation::check()?;
+                let txn = self.v2_transaction.as_mut()
+                    .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+                let catalog = db.catalog().snapshot(txn)?;
+                let image = catalog.image().map_err(CoreError::Sql)?;
+                // Reuse the legacy definition/key admission before touching rows.
+                match image.row_version_engine(table, key) {
+                    Err(relational::SqlError::Conflict) => {}
+                    Err(error) => return Err(CoreError::Sql(error)),
+                    Ok(_) => return Err(CoreError::Corrupt("metadata contains rows".into())),
+                }
+                let entry = engine::catalog::TableEntry {
+                    def: table.clone(), heap: catalog.parts.heap.contains(&table.id),
+                    columns_ext: BTreeMap::new(),
+                };
+                return db.rows.get(txn, &entry, key)?
+                    .map(|row| row.version)
+                    .ok_or(CoreError::Sql(relational::SqlError::Conflict));
+            }
+            self.admin.inner.db(SQL_SESSIONS)?;
             let staged = self
                 .staged
                 .as_ref()
@@ -2528,6 +2550,22 @@ impl SqlSession {
         sets: Vec<(usize, relational::Value)>,
         expected_version: u64,
     ) -> Result<relational::SqlResult, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let result = (|| {
+                if self.aborted {
+                    return Err(CoreError::Sql(relational::SqlError::Aborted));
+                }
+                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
+                state.sql.epoch = 0;
+                let mut prepared = relational::Prepared::update_engine(
+                    table, key, sets, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], Some(expected_version))
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::update_engine(table, key, sets, domain, state),
