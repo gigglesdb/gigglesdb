@@ -369,6 +369,33 @@ impl Catalog {
         self.snapshot_locked(&mut cache, txn, ts)
     }
 
+    /// Acquire the served version and image under the same cache lock.
+    /// None marks the old-snapshot fallback, whose version is unknown.
+    pub(crate) fn binding_snapshot(
+        &self,
+        txn: &Transaction,
+    ) -> Result<(Arc<CatalogSnapshot>, Option<Ts>), CoreError> {
+        self.check().map_err(CoreError::from)?;
+        let pin;
+        let ts = match txn.current_snapshot_ts() {
+            Some(ts) => ts,
+            None => {
+                pin = self.sequencer.snapshot();
+                pin.ts()
+            }
+        };
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| corrupt("catalog cache mutex poisoned"))?;
+        let snapshot = self.snapshot_locked(&mut cache, txn, ts)?;
+        let end = cache
+            .versions
+            .partition_point(|(version, _)| *version <= ts);
+        let version = end.checked_sub(1).map(|index| cache.versions[index].0);
+        Ok((snapshot, version))
+    }
+
     fn snapshot_locked(
         &self,
         cache: &mut CatalogCache,
@@ -1388,3 +1415,29 @@ mod commit_fast_tests;
 #[cfg(test)]
 #[path = "catalog_snapshot_tests.rs"]
 mod snapshot_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[test]
+fn unknown_binding_fence_fails_closed() {
+    use crate::storage::{Admin, Backend, Engine, Limits};
+    let root = crate::test_artifact_root().join("unknown-binding-fence");
+    let admin = Admin::create_engine(&root, Limits::default(), Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    session.begin_native().unwrap();
+    let Backend::V2(db) = &admin.inner.backend else {
+        unreachable!()
+    };
+    db.catalog().cache.lock().unwrap().versions.clear();
+    assert_eq!(
+        session.snapshot_identity_engine(),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema))
+    );
+    session.rollback_native().unwrap();
+    assert_eq!(
+        admin.inspect_catalog_engine(|_, _, _| ()),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema))
+    );
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(root).unwrap();
+}

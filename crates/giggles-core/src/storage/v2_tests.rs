@@ -342,9 +342,9 @@ fn lifecycle_and_public_refusals() {
     );
     session.begin_engine().unwrap();
     session.commit_engine().unwrap();
-    denied(session.catalog_engine(), SQL_SESSIONS);
+    assert_eq!(session.catalog_engine().unwrap().1.len(), 1);
     denied(session.catalog_empty_engine(), SQL_SESSIONS);
-    denied(session.snapshot_identity_engine(), SQL_SESSIONS);
+    assert_eq!(session.snapshot_identity_engine(), Err(CoreError::Sql(relational::SqlError::Transaction)));
     denied(
         session.create_table_engine(String::new(), vec![], vec![]),
         SQL_SESSIONS,
@@ -415,6 +415,88 @@ fn native_controls_match_sql_without_parsing() {
         drop(native);
         drop(sql);
         drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_binding_metadata_parity() {
+    use crate::operations::{Bindings, Engine as Native, Error, Request};
+    for backend in [Engine::Legacy, Engine::V2] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        admin
+            .sql_session()
+            .execute("CREATE TABLE keyed (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        let request = Request::Read {
+            table: "keyed".into(),
+            filter: None,
+            order: vec![],
+            limit: None,
+            projection: vec!["id".into()],
+        };
+        let native = Native::new(admin.clone());
+        let handle = native.prepare_bound(&request, &Bindings::new()).unwrap();
+        // Binding permits metadata only; v2 business row execution stays refused.
+        if backend == Engine::V2 {
+            assert!(matches!(native.execute_bound(&handle), Err(Error::Core(_))));
+        }
+        let before = admin
+            .inspect_catalog_engine(|domain, fence, tables| (domain, fence, tables.clone()))
+            .unwrap();
+        admin.sql_session().execute("INSERT INTO keyed VALUES (1)", &[], None).unwrap();
+        assert_eq!(admin.inspect_catalog_engine(|d, f, t| (d, f, t.clone())).unwrap(), before);
+        let mut session = admin.sql_session();
+        session.begin_native().unwrap();
+        let identity = session.snapshot_identity_engine().unwrap();
+        assert_eq!(identity, (before.0, before.1));
+        session
+            .execute("CREATE TABLE private (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        assert_ne!(identity, session.snapshot_identity_engine().unwrap());
+        assert_eq!(session.catalog_engine().unwrap().1.len(), 2);
+        assert_eq!(
+            admin
+                .inspect_catalog_engine(|_, _, tables| tables.len())
+                .unwrap(),
+            1
+        );
+        session.rollback_native().unwrap();
+        assert_eq!(
+            admin
+                .inspect_catalog_engine(|d, f, t| (d, f, t.clone()))
+                .unwrap(),
+            before
+        );
+        admin
+            .sql_session()
+            .execute("CREATE TABLE changed (id BIGINT PRIMARY KEY)", &[], None)
+            .unwrap();
+        let stale = Error::Core(CoreError::Sql(relational::SqlError::StaleSchema).to_string());
+        assert_eq!(native.execute_bound(&handle), Err(stale.clone()));
+        let other_path = directory();
+        let other = Admin::create_engine(&other_path, Limits::default(), backend).unwrap();
+        assert_eq!(
+            Native::new(other.clone()).execute_bound(&handle),
+            Err(stale)
+        );
+        drop(other);
+        fs::remove_dir_all(other_path).unwrap();
+        let fence = admin.inspect_catalog_engine(|_, fence, _| fence).unwrap();
+        drop(session);
+        drop(native);
+        drop(admin);
+        let reopened = Admin::open(&path, Limits::default()).unwrap();
+        let (new_fence, tables) = reopened
+            .inspect_catalog_engine(|_, fence, tables| (fence, tables.len()))
+            .unwrap();
+        assert_eq!(tables, 2);
+        if backend == Engine::V2 {
+            assert_ne!(fence, new_fence);
+        }
+        drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
 }

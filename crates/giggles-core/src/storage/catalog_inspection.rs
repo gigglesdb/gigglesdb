@@ -14,6 +14,10 @@ impl Admin {
         &self,
         inspect: impl FnOnce(u128, u64, &BTreeMap<String, TableDef>) -> T,
     ) -> Result<T, CoreError> {
+        if let super::Backend::V2(db) = &self.inner.backend {
+            let _ticket = self.inner.enter()?;
+            return db.inspect_binding(None, inspect);
+        }
         self.inner.inspect(|state| {
             crate::cancellation::check()?;
             let result = inspect(state.view.domain, state.sql.epoch, &state.sql.tables);

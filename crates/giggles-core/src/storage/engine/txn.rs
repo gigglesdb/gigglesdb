@@ -142,6 +142,7 @@ pub(crate) struct Transaction {
     isolation: Isolation,
     snapshot: Option<SnapshotHandle>,
     writes: BTreeMap<(Keyspace, Vec<u8>), Option<Vec<u8>>>,
+    catalog_generation: u64,
     features_or: u64,
     pub(crate) reclaim_after_commit: bool,
     raw: Vec<RawOp>,
@@ -170,6 +171,7 @@ impl Transaction {
             snapshot: None,
             writes: BTreeMap::new(),
             features_or: 0,
+            catalog_generation: 0,
             reclaim_after_commit: false,
             raw: Vec::new(),
             write_bytes: 0,
@@ -225,6 +227,12 @@ impl Transaction {
         let index = self.savepoint_index(mark)?;
         while self.undo.len() > mark.undo_len {
             let undo = self.undo.pop().unwrap();
+            if undo.key.0 == Keyspace::Catalog {
+                self.catalog_generation = self
+                    .catalog_generation
+                    .checked_add(1)
+                    .expect("catalog generation exhausted");
+            }
             match undo.previous {
                 Some(value) => {
                     self.writes.insert(undo.key, value);
@@ -276,6 +284,9 @@ impl Transaction {
     }
     pub(crate) fn id(&self) -> TxnId {
         self.id
+    }
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
     }
     pub(crate) fn catalog_own(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
         self.writes.get(&(Keyspace::Catalog, key.to_vec()))
@@ -412,6 +423,12 @@ impl Transaction {
             && !self.locked.contains(&(ks, key.clone()))
         {
             return Err(TxnError::Misuse);
+        }
+        if ks == Keyspace::Catalog {
+            self.catalog_generation = self
+                .catalog_generation
+                .checked_add(1)
+                .expect("catalog generation exhausted");
         }
         let write_key = (ks, key);
         let previous = self.writes.get(&write_key);

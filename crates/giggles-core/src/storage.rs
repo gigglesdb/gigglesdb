@@ -2353,12 +2353,17 @@ impl SqlSession {
     }
     /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
     pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
             crate::cancellation::check()?;
+            if let Backend::V2(db) = &self.admin.inner.backend {
+                let _ticket = self.admin.inner.enter()?;
+                return db.inspect_binding(self.v2_transaction.as_ref(), |_, fence, tables| {
+                    (fence, tables.values().cloned().collect())
+                });
+            }
             let catalog = |s: &State| Ok((s.sql.epoch, s.sql.tables.values().cloned().collect()));
             if let Some(s) = &self.staged {
                 catalog(s)
@@ -2416,10 +2421,17 @@ impl SqlSession {
     }
     /// Identity for binding against an active transaction's catalog snapshot.
     pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            if let Backend::V2(db) = &self.admin.inner.backend {
+                let _ticket = self.admin.inner.enter()?;
+                let txn = self
+                    .v2_transaction
+                    .as_ref()
+                    .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+                return db.inspect_binding(Some(txn), |domain, fence, _| (domain, fence));
             }
             let staged = self
                 .staged

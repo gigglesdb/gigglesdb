@@ -22,6 +22,7 @@ pub(crate) struct V2Db {
         std::sync::Mutex<std::collections::BTreeMap<u64, super::sequences::SeqCounter>>,
     reclaim: std::sync::Mutex<reclaim::Registry>,
     pub(super) reclaim_errors: AtomicU64,
+    binding_fences: std::sync::Mutex<std::collections::BTreeMap<(u64, u64, u64), u64>>,
     next_txn: AtomicU64,
 }
 pub(super) fn format_error(error: engine::meta::FormatError) -> CoreError {
@@ -104,6 +105,7 @@ impl V2Db {
             sql_counters: Default::default(),
             reclaim: Default::default(),
             reclaim_errors: AtomicU64::new(0),
+            binding_fences: Default::default(),
             next_txn: AtomicU64::new(1),
         };
         db.reclaim_background()?;
@@ -129,6 +131,49 @@ impl V2Db {
     #[allow(dead_code)]
     pub(crate) fn catalog(&self) -> &engine::catalog::Catalog {
         &self.catalog
+    }
+
+    /// Opaque in-process identities. Global allocation prevents reuse after reopen.
+    pub(super) fn inspect_binding<T>(
+        &self,
+        txn: Option<&engine::txn::Transaction>,
+        inspect: impl FnOnce(
+            u128,
+            u64,
+            &std::collections::BTreeMap<String, crate::relational::TableDef>,
+        ) -> T,
+    ) -> Result<T, CoreError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let committed;
+        let txn = match txn {
+            Some(txn) => txn,
+            None => {
+                committed = self.begin(engine::txn::Isolation::ReadCommitted);
+                &committed
+            }
+        };
+        let (catalog, version) = self.catalog.binding_snapshot(txn)?;
+        let version = version.ok_or(CoreError::Sql(crate::relational::SqlError::StaleSchema))?;
+        let generation = txn.catalog_generation();
+        let key = (
+            version.0,
+            if generation == 0 { 0 } else { txn.id().0 },
+            generation,
+        );
+        let fence = *self
+            .binding_fences
+            .lock()
+            .map_err(|_| CoreError::Corrupt("binding fence mutex poisoned".into()))?
+            .entry(key)
+            .or_insert_with(|| {
+                NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .expect("binding fence exhausted")
+            });
+        let image = catalog.image().map_err(CoreError::Sql)?;
+        crate::cancellation::check()?;
+        let result = inspect(u128::from_be_bytes(self.meta.domain), fence, &image.tables);
+        crate::cancellation::check()?;
+        Ok(result)
     }
 
     /// Rows-free image used only by catalog/authority metadata helpers.
