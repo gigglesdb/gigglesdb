@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 mod aggregate_filter;
 mod functions;
+pub(super) mod typed_read;
 pub(super) use functions::assignment;
 pub(super) mod conflict;
 mod grouping;
@@ -178,6 +179,11 @@ pub(super) struct Query {
     filter: Option<Filter>,
     order: Vec<(Scalar, bool, bool)>,
     limit: Option<Expr>,
+}
+impl Query {
+    pub(super) fn from_single_source_read(read: typed_read::SingleSourceRead) -> R<Self> {
+        typed_read::lower(read)
+    }
 }
 
 #[derive(Debug, Clone, Default)]

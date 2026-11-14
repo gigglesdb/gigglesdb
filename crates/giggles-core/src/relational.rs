@@ -36,6 +36,7 @@ mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
+pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare};
 use query::{TypmodSource, result_typmod};
 pub(crate) mod cursor;
 mod returning;
@@ -1773,6 +1774,13 @@ impl Prepared {
             unbound_statement: None,
             warnings: vec![],
         }
+    }
+    /// Construct an unbound read; callers still perform their normal authorization.
+    pub fn from_single_source_read(domain: u128, epoch: u64, read: SingleSourceRead) -> R<Self> {
+        let table = read.table.clone();
+        let mut prepared = Self::engine(Statement::Query(query::Query::from_single_source_read(read)?), domain, epoch);
+        prepared.relations.push(schemas::Reference::read(table, None));
+        Ok(prepared)
     }
     pub(crate) fn create_engine(
         name: String,

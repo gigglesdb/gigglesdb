@@ -2207,6 +2207,12 @@ impl SqlSession {
         p: &relational::Prepared,
     ) -> Result<relational::Description, CoreError> {
         relational::assert_sql_frontend_allowed();
+        self.describe_bound_engine(p)
+    }
+    fn describe_bound_engine(
+        &mut self,
+        p: &relational::Prepared,
+    ) -> Result<relational::Description, CoreError> {
         let result = (|| {
             if self.aborted && !p.allows_aborted_transaction() {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
@@ -2921,6 +2927,36 @@ impl SqlSession {
     ) -> Result<relational::SqlResult, CoreError> {
         relational::assert_sql_frontend_allowed();
         self.execute_bound_engine(p, params, expected_version)
+    }
+    /// Trusted Admin entry point. Gateways must authorize the typed source first.
+    pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
+        let p = self.prepare_typed_read(read)?;
+        self.describe_bound_engine(&p)
+    }
+    /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
+    pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        let p = self.prepare_typed_read(read)?;
+        self.execute_bound_engine(&p, &[], expected_version)
+    }
+    fn prepare_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Prepared, CoreError> {
+        let make = |s: &MetadataState<'_>| {
+            if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
+            let table = read.table.clone();
+            let epoch = if matches!(self.admin.inner.backend, Backend::V2(_)) { 0 } else { s.sql.epoch };
+            let mut p = relational::Prepared::from_single_source_read(s.view.domain, epoch, read).map_err(CoreError::Sql)?;
+            p.transaction = self.transaction_id;
+            p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+            // Views can introduce dependencies beyond the sole authorized source.
+            let key = s.sql.resolve_relation_key(&table, &self.search_path);
+            if !s.sql.tables.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
+            p.bind_schemas(&s.sql).map_err(CoreError::Sql)
+        };
+        let result = match &self.staged {
+            Some(s) => make(&MetadataState::borrow(s)),
+            None => self.inspect_metadata(make),
+        };
+        if result.is_err() { self.abort(); }
+        result
     }
     // Both frontends enter this kernel after constructing typed operations.
     // Keep SQL's public prepared-call boundary separate so native execution
