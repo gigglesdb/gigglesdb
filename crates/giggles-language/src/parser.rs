@@ -393,7 +393,8 @@ impl Parser {
             | LanguageVersion::Embedded011
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
-            | LanguageVersion::Embedded014 => self.sum(d),
+            | LanguageVersion::Embedded014
+            | LanguageVersion::Embedded015 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {

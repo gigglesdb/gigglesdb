@@ -600,3 +600,51 @@ fn v2_native_block_matches_sql_transaction() {
     assert_eq!(result.summaries.len(), 2);
     assert_eq!(snapshot(&left), snapshot(&right));
 }
+
+#[test]
+fn numeric_parameters_match_sql() {
+    use giggles_core::relational::Numeric;
+    for storage in [StorageEngine::Legacy, StorageEngine::V2] {
+    let (_left_db, left) = Database::fresh(storage);
+    let (_right_db, right) = Database::fresh(storage);
+    for admin in [&left, &right] {
+        admin.sql_session().execute("create table amounts(id bigint primary key, n numeric(12,4), label text)", &[], None).unwrap();
+    }
+    let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded015);
+    for (id, text) in [(1, Some("12345.6789")), (2, None), (3, Some("1.23456"))] {
+        let value = text.map(|s| Value::Numeric(Numeric::parse(s).unwrap())).unwrap_or(Value::Null);
+        let bindings = Bindings::from([("n".into(), value.clone())]);
+        let result = with_sql_parser_forbidden(|| engine.execute_text(&format!("insert amounts set id={id},n=$n"), &bindings)).unwrap();
+        let expected = right.sql_session().execute(&format!("insert into amounts(id,n) values({id},$1)"), &[value], None).unwrap();
+        assert_eq!(result.affected as u64, expected.affected);
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
+    let rows = left.sql_session().execute("select n from amounts where id=1", &[], None).unwrap().rows;
+    assert_eq!(rows[0].values, vec![Value::Numeric(Numeric::parse("12345.6789").unwrap())]);
+    for (statement, sql_text) in [
+        ("update amounts where id=1 set n=$n", "update amounts set n=$1 where id=1"),
+        ("insert amounts set id=4,n=$n", "insert into amounts(id,n) values(4,$1)"),
+    ] {
+        let value = Value::Numeric(Numeric::parse("999999999.99999").unwrap());
+        let actual = engine.execute_text(statement, &Bindings::from([("n".into(), value.clone())])).unwrap_err();
+        let expected = right.sql_session().execute(sql_text, &[value], None).unwrap_err();
+        let CoreError::Sql(expected) = expected else { panic!("unexpected SQL error") };
+        assert_eq!(actual.sqlstate(), Some("22003"));
+        let expected_code = match expected { SqlError::Overflow => Some("22003"), other => panic!("unexpected SQL error: {other:?}") };
+        assert_eq!(actual.sqlstate(), expected_code);
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
+    let bindings = Bindings::from([("n".into(), Value::Numeric(Numeric::parse("2.34565").unwrap()))]);
+    let bound = engine.prepare_bound_text("update amounts where id=1 set n=$n", &bindings).unwrap();
+    engine.execute_bound(&bound).unwrap();
+    right.sql_session().execute("update amounts set n=$1 where id=1", &[bindings["n"].clone()], None).unwrap();
+    assert_eq!(snapshot(&left), snapshot(&right));
+    for minor in 1..=14 {
+        let version = serde_json::from_str(&format!("\"0.{minor}\"")).unwrap();
+        assert_eq!(Engine::with_version(left.clone(), version).execute_text("update amounts where id=1 set n=$n", &bindings), Err(Error::Unsupported));
+    }
+    for text in ["update amounts where id=1 set label=$n", "update amounts where id=1 set n=$n+1", "amounts select $n"] {
+        assert!(engine.execute_text(text, &bindings).is_err());
+    }
+}
+}

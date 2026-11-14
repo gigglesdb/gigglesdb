@@ -194,6 +194,20 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
+    if version == LanguageVersion::Embedded015 {
+        add(
+            CapabilityInterface::RustText,
+            "numeric_parameters",
+            CapabilityState::Implemented,
+            "Numeric parameters for existing SQL-provisioned NUMERIC columns; shared core typmod coercion. No numeric literals, DDL, arithmetic or functions.",
+            vec![evidence(
+                "crates/giggles-language/tests/native_parity.rs",
+                "numeric_parameters_match_sql",
+            )],
+            vec![],
+        );
+    }
+
     for interface in [
         CapabilityInterface::RustText,
         CapabilityInterface::RustTree,
@@ -1709,6 +1723,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded015 => (
+            "crates/giggles-language/tests/native_parity.rs",
+            "numeric_parameters_match_sql",
         ),
         LanguageVersion::Embedded014 => (
             "crates/giggles-language/tests/native_parity.rs",

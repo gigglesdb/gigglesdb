@@ -435,6 +435,7 @@ fn core(e: CoreError) -> Error {
     match e {
         CoreError::Sql(SqlError::Conflict) => Error::Conflict,
         CoreError::Sql(SqlError::Duplicate) => Error::Duplicate,
+        CoreError::Sql(SqlError::Overflow) => Error::Overflow,
         _ => Error::Core(e.to_string()),
     }
 }

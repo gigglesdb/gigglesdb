@@ -94,7 +94,7 @@ impl Engine {
         self.execute(&parse_with_version(text, self.version)?, bindings)
     }
     pub fn execute(&self, stmt: &Statement, bindings: &Bindings) -> Result<Outcome> {
-        validate_numeric_bindings(bindings)?;
+        validate_parameter_admission(stmt, bindings, self.version)?;
         let request = lower_checked(stmt, self.version)?;
         self.inner
             .execute(&request, bindings)
@@ -115,7 +115,7 @@ impl Engine {
     /// require preparing another handle. The existing [`Engine::execute`] API
     /// continues binding and executing in a single transaction.
     pub fn prepare_bound(&self, stmt: &Statement, bindings: &Bindings) -> Result<BoundOperation> {
-        validate_numeric_bindings(bindings)?;
+        validate_parameter_admission(stmt, bindings, self.version)?;
         let request = lower_checked(stmt, self.version)?;
         let inner = self
             .inner
@@ -160,7 +160,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
-        validate_numeric_bindings(bindings)?;
+        validate_transaction_parameters(transaction, bindings, self.version)?;
         let transaction = lower_transaction_checked(transaction, self.version)?;
         self.inner
             .execute_transaction(&transaction, bindings)
@@ -181,7 +181,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<BoundTransaction> {
-        validate_numeric_bindings(bindings)?;
+        validate_transaction_parameters(transaction, bindings, self.version)?;
         let transaction = lower_transaction_checked(transaction, self.version)?;
         Ok(BoundTransaction {
             inner: self
@@ -1252,6 +1252,123 @@ pub(crate) fn error(error: operations::Error) -> Error {
     }
 }
 
+// Only direct column assignments admit Numeric. Core binding then checks that
+// each destination is NUMERIC and applies the shared SQL column coercion.
+fn validate_parameter_admission(
+    stmt: &Statement,
+    bindings: &Bindings,
+    version: LanguageVersion,
+) -> Result<()> {
+    if version != LanguageVersion::Embedded015
+        || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
+    {
+        return validate_numeric_bindings(bindings);
+    }
+    let mut remaining = stmt.clone();
+    fn value(v: &mut ValueExpr, bindings: &Bindings) {
+        if let ValueExpr::Parameter(name) = v
+            && matches!(bindings.get(name), Some(Value::Numeric(_)))
+        {
+            *v = ValueExpr::Literal(Value::Null);
+        }
+    }
+    fn scrub(stmt: &mut Statement, bindings: &Bindings) {
+        match stmt {
+            Statement::Insert { values, .. } | Statement::Update { values, .. } => {
+                for (_, v) in values {
+                    value(v, bindings);
+                }
+            }
+            Statement::InsertExpressions { values, .. }
+            | Statement::UpdateExpressions { values, .. } => {
+                for (_, e) in values {
+                    if let Expr::Value(v) = e {
+                        value(v, bindings);
+                    }
+                }
+            }
+            Statement::InsertMany { rows, .. } => {
+                for row in rows {
+                    for e in row {
+                        if let Expr::Value(v) = e {
+                            value(v, bindings);
+                        }
+                    }
+                }
+            }
+            Statement::Returning { statement, .. } => scrub(statement, bindings),
+            Statement::OnConflict {
+                statement, action, ..
+            } => {
+                scrub(statement, bindings);
+                if let ConflictAction::Update { values, .. } = action {
+                    for (_, e) in values {
+                        if let Expr::Value(v) = e {
+                            value(v, bindings);
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    scrub(&mut remaining, bindings);
+    reject_numeric_references(&remaining, bindings)?;
+    let other: Bindings = bindings
+        .iter()
+        .filter(|(_, v)| !matches!(v, Value::Numeric(_)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    validate_numeric_bindings(&other)
+}
+
+// Inspect the public tree encoding after removing permitted assignment slots.
+// This catches every other occurrence, including nested functions and emits.
+fn reject_numeric_references(tree: &impl serde::Serialize, bindings: &Bindings) -> Result<()> {
+    fn visit(v: &serde_json::Value, bindings: &Bindings) -> bool {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.get("Parameter")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|name| matches!(bindings.get(name), Some(Value::Numeric(_))))
+                    || map.values().any(|v| visit(v, bindings))
+            }
+            serde_json::Value::Array(values) => values.iter().any(|v| visit(v, bindings)),
+            _ => false,
+        }
+    }
+    if visit(
+        &serde_json::to_value(tree).map_err(|_| Error::Unsupported)?,
+        bindings,
+    ) {
+        Err(Error::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_transaction_parameters(
+    transaction: &Transaction,
+    bindings: &Bindings,
+    version: LanguageVersion,
+) -> Result<()> {
+    if version != LanguageVersion::Embedded015
+        || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
+    {
+        return validate_numeric_bindings(bindings);
+    }
+    for step in &transaction.steps {
+        match step {
+            TransactionStep::Execute(stmt)
+            | TransactionStep::Let {
+                statement: stmt, ..
+            } => validate_parameter_admission(stmt, bindings, version)?,
+            TransactionStep::Require(expr) => reject_numeric_references(expr, bindings)?,
+        }
+    }
+    reject_numeric_references(&transaction.emit, bindings)
+}
+
 pub(crate) fn validate_numeric_bindings(bindings: &Bindings) -> Result<()> {
     for v in bindings.values() {
         match v {
@@ -1274,6 +1391,20 @@ pub(crate) fn validate_numeric_bindings(bindings: &Bindings) -> Result<()> {
 #[cfg(test)]
 mod numeric_profile_tests {
     use super::*;
+    #[test]
+    fn numeric_admission_is_limited_to_direct_assignments() {
+        let bindings = Bindings::from([("n".into(), Value::Numeric(
+            giggles_core::relational::Numeric::parse("1.25").unwrap()))]);
+        for (text, allowed) in [
+            ("insert t set n=$n", true),
+            ("update t where id=1 set n=$n", true),
+            ("update t where n=$n set n=1", false),
+            ("update t where id=1 set n=abs($n)", false),
+        ] {
+            let stmt = parse_with_version(text, LanguageVersion::Embedded015).unwrap();
+            assert_eq!(validate_parameter_admission(&stmt, &bindings, LanguageVersion::Embedded015).is_ok(), allowed);
+        }
+    }
     #[test]
     fn old_profiles_reject_new_inputs_but_transport_is_lossless() {
         use giggles_core::relational::{Float4, Float8, Numeric};
