@@ -1247,3 +1247,48 @@ mod async_planner_tests;
 
 #[path = "live_readiness_tests.rs"]
 pub(crate) mod live_readiness_tests;
+
+#[tokio::test]
+async fn engine_futures_stay_within_stack_budget() {
+    // Check the real PG installation type without opening a live connection.
+    fn check_install<F: Future>(_: impl FnOnce(&'static Engine, &'static mut PgInstaller) -> F) {
+        assert!(std::mem::size_of::<F>() <= 1024);
+    }
+    check_install(|engine, installer| engine.start(installer));
+    let f = Fixture::new().await;
+    let (tx, rx) = mpsc::channel(32);
+    let mut capture = f.capture(rx, 10).await;
+    let mut applier = f.applier(Arc::new(AtomicU64::new(0)), ReaderCheckpoint::default());
+    let mut database = f.database(tx, Arc::new(AtomicU64::new(0)));
+    let (_pause, paused) = watch::channel(false);
+    let mut budget = budget();
+    {
+        let future = f.engine.run(
+            &mut capture,
+            &mut database,
+            &mut applier,
+            config(),
+            &mut budget,
+            paused.clone(),
+        );
+        assert!(std::mem::size_of_val(&future) <= 1024);
+    }
+    let future = f.engine.run_admitted_until(
+        &mut capture,
+        &mut database,
+        &mut applier,
+        config(),
+        &mut budget,
+        paused,
+        StopAt::UntilPaused,
+        false,
+    );
+    assert!(std::mem::size_of_val(&future) <= 1024);
+    drop(future);
+    drop(capture);
+    drop(applier);
+    let root = f.root.clone();
+    drop(database);
+    drop(f);
+    std::fs::remove_dir_all(root).unwrap();
+}

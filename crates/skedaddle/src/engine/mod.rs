@@ -275,52 +275,58 @@ impl Engine {
     pub fn runtime(&self) -> Runtime {
         self.runtime.clone()
     }
-    pub async fn start(&self, installer: &mut impl Installer) -> Result<()> {
-        self.require_coverage()?;
-        if self.runtime.state().await.lifecycle.state != State::Assessed {
-            return Err(coordinator::Error::Rejected(
-                "engine start requires assessed".into(),
-            ));
-        }
-        for step in [
-            Installation::Publication,
-            Installation::DdlTrigger,
-            Installation::Slot,
-            Installation::ProgressTables,
-        ] {
-            let payload = format!("{}:{}", step.name(), installer.identity());
-            let mut coordinator = self.runtime.0.lock().await;
-            let outcome = coordinator
-                .effect(EffectKind::BufferPublication, payload, |_| {
-                    installer.install(step)
-                })
-                .await;
-            *self.runtime.1.write().expect("engine snapshot poisoned") =
-                coordinator.state().clone();
-            drop(coordinator);
-            outcome?;
-            if step == Installation::Slot
-                && let Some(baseline) = installer.schema_baseline()
-            {
-                self.runtime
-                    .marker(
-                        crate::pg::ddl::BASELINE_STREAM,
-                        baseline,
-                        "slot-double-sample".into(),
-                    )
-                    .await?;
+    // A small returned handle prevents installer state from inflating callers.
+    pub fn start(
+        &self,
+        installer: &mut impl Installer,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        Box::pin(async move {
+            self.require_coverage()?;
+            if self.runtime.state().await.lifecycle.state != State::Assessed {
+                return Err(coordinator::Error::Rejected(
+                    "engine start requires assessed".into(),
+                ));
             }
-            if step == Installation::Slot
-                && let Some(marker) = installer.slot_marker()?
-            {
-                self.runtime
-                    .marker("source-slot", marker, "installed".into())
-                    .await?;
+            for step in [
+                Installation::Publication,
+                Installation::DdlTrigger,
+                Installation::Slot,
+                Installation::ProgressTables,
+            ] {
+                let payload = format!("{}:{}", step.name(), installer.identity());
+                let mut coordinator = self.runtime.0.lock().await;
+                let outcome = coordinator
+                    .effect(EffectKind::BufferPublication, payload, |_| {
+                        installer.install(step)
+                    })
+                    .await;
+                *self.runtime.1.write().expect("engine snapshot poisoned") =
+                    coordinator.state().clone();
+                drop(coordinator);
+                outcome?;
+                if step == Installation::Slot
+                    && let Some(baseline) = installer.schema_baseline()
+                {
+                    self.runtime
+                        .marker(
+                            crate::pg::ddl::BASELINE_STREAM,
+                            baseline,
+                            "slot-double-sample".into(),
+                        )
+                        .await?;
+                }
+                if step == Installation::Slot
+                    && let Some(marker) = installer.slot_marker()?
+                {
+                    self.runtime
+                        .marker("source-slot", marker, "installed".into())
+                        .await?;
+                }
             }
-        }
-        self.runtime
-            .lifecycle(Event::Advance { to: State::Copying })
-            .await
+            self.runtime
+                .lifecycle(Event::Advance { to: State::Copying })
+                .await
+        })
     }
     pub async fn resume(&self) -> Result<()> {
         self.require_coverage()?;
@@ -410,8 +416,10 @@ impl Engine {
         ))
         .await
     }
+    // The joined worker state was about 60 KiB inline on Windows. Keep its
+    // construction and polling behind a heap boundary, including each worker.
     #[allow(clippy::too_many_arguments)]
-    async fn run_admitted_until(
+    fn run_admitted_until(
         &self,
         capture: &mut impl Capture,
         chunks: &mut impl ChunkDatabase,
@@ -421,301 +429,305 @@ impl Engine {
         mut pause: watch::Receiver<bool>,
         stop_at: StopAt,
         fenced_resume: bool,
-    ) -> Result<Reached> {
-        {
-            // Authenticate lifecycle/receipts and detect promotion before any
-            // schema restoration or worker admission on either run path.
-            let mut coordinator = self.runtime.0.lock().await;
-            let result = Box::pin(coordinator.refresh()).await;
-            *self.runtime.1.write().expect("engine snapshot poisoned") =
-                coordinator.state().clone();
-            result?;
-            if !coordinator.is_owner() {
+    ) -> impl std::future::Future<Output = Result<Reached>> {
+        Box::pin(async move {
+            {
+                // Authenticate lifecycle/receipts and detect promotion before any
+                // schema restoration or worker admission on either run path.
+                let mut coordinator = self.runtime.0.lock().await;
+                let result = Box::pin(coordinator.refresh()).await;
+                *self.runtime.1.write().expect("engine snapshot poisoned") =
+                    coordinator.state().clone();
+                result?;
+                if !coordinator.is_owner() {
+                    return Err(coordinator::Error::Observer);
+                }
+            }
+            self.require_coverage()?;
+            let state = self.runtime.snapshot().lifecycle.state;
+            let admitted = if fenced_resume {
+                fenced(state)
+            } else {
+                matches!(
+                    state,
+                    State::Copying | State::CatchingUp | State::VerifiedReady
+                )
+            };
+            if !admitted {
+                return Err(coordinator::Error::Rejected(
+                    if fenced_resume {
+                        "engine fenced run requires source-fenced/final-boundary-applied"
+                    } else {
+                        "engine run requires copying/catching-up/verified-ready"
+                    }
+                    .into(),
+                ));
+            }
+            if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(recovery("engine is already running"));
+            }
+            let _running = RunGuard(&self.running);
+            let mut owner = self
+                .pause_control
+                .as_ref()
+                .map(PauseControl::activate)
+                .transpose()?;
+            *self.runtime.2.write().expect("engine health poisoned") = false;
+            if !self.runtime.0.lock().await.is_owner() {
                 return Err(coordinator::Error::Observer);
             }
-        }
-        self.require_coverage()?;
-        let state = self.runtime.snapshot().lifecycle.state;
-        let admitted = if fenced_resume {
-            fenced(state)
-        } else {
-            matches!(
-                state,
-                State::Copying | State::CatchingUp | State::VerifiedReady
-            )
-        };
-        if !admitted {
-            return Err(coordinator::Error::Rejected(
-                if fenced_resume {
-                    "engine fenced run requires source-fenced/final-boundary-applied"
-                } else {
-                    "engine run requires copying/catching-up/verified-ready"
-                }
-                .into(),
-            ));
-        }
-        if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Err(recovery("engine is already running"));
-        }
-        let _running = RunGuard(&self.running);
-        let mut owner = self
-            .pause_control
-            .as_ref()
-            .map(PauseControl::activate)
-            .transpose()?;
-        *self.runtime.2.write().expect("engine health poisoned") = false;
-        if !self.runtime.0.lock().await.is_owner() {
-            return Err(coordinator::Error::Observer);
-        }
-        Box::pin(capture.prepare_schema(&self.journal, &self.runtime)).await?;
-        self.runtime
-            .6
-            .markers
-            .begin(
-                self.journal.migration_id(),
+            Box::pin(capture.prepare_schema(&self.journal, &self.runtime)).await?;
+            self.runtime
+                .6
+                .markers
+                .begin(
+                    self.journal.migration_id(),
+                    config.source.clone(),
+                    config.order_domain.clone(),
+                    &self.runtime.snapshot(),
+                )
+                .map_err(recovery)?;
+            let _markers = final_marker::RunGuard(self.runtime.6.markers.clone());
+            self.runtime
+                .6
+                .begin(config.source.clone(), config.order_domain.clone());
+            self.runtime.7.begin(
                 config.source.clone(),
                 config.order_domain.clone(),
-                &self.runtime.snapshot(),
-            )
-            .map_err(recovery)?;
-        let _markers = final_marker::RunGuard(self.runtime.6.markers.clone());
-        self.runtime
-            .6
-            .begin(config.source.clone(), config.order_domain.clone());
-        self.runtime.7.begin(
-            config.source.clone(),
-            config.order_domain.clone(),
-            capture.writer_checkpoint()?,
+                capture.writer_checkpoint()?,
+                self.runtime
+                    .snapshot()
+                    .progress
+                    .get("applied")
+                    .and_then(|(marker, _)| decode_reader_checkpoint(marker).ok()),
+            );
             self.runtime
-                .snapshot()
-                .progress
-                .get("applied")
-                .and_then(|(marker, _)| decode_reader_checkpoint(marker).ok()),
-        );
-        self.runtime
-            .7
-            .owner_generation(owner.as_ref().map(|owner| owner.generation().to_string()));
-        let _live = LiveReadinessGuard(self.runtime.7.clone());
-        let _verification = VerificationRunGuard(self.runtime.6.clone());
-        let (cancel, stopped) = watch::channel(*pause.borrow());
-        let (send, receive) = mpsc::channel(2);
-        let capture_loop = cancel_on_exit(
-            capture_loop(capture, receive, stopped.clone(), &self.runtime, &config),
-            cancel.clone(),
-        );
-        let copy_loop = cancel_on_exit(
-            copy_loop(
-                chunks,
-                send,
-                stopped.clone(),
-                &self.runtime,
-                &self.journal,
-                &config,
-                budget,
-            ),
-            cancel.clone(),
-        );
-        let apply_loop = cancel_on_exit(
-            apply_loop(applier, stopped.clone(), &self.runtime),
-            cancel.clone(),
-        );
-        let supervision_cancel = cancel.clone();
-        let supervision = async {
-            let result = self
-                .supervision_loop(stopped.clone(), cancel.clone(), stop_at)
-                .await;
-            supervision_cancel.send_replace(true);
-            result
-        };
-        let control = async {
-            let mut stopped = stopped.clone();
-            loop {
-                let requested = owner.as_ref().map(|o| o.requested()).transpose();
-                let requested = match requested {
-                    Ok(requested) => requested.unwrap_or(false),
-                    Err(error) => {
+                .7
+                .owner_generation(owner.as_ref().map(|owner| owner.generation().to_string()));
+            let _live = LiveReadinessGuard(self.runtime.7.clone());
+            let _verification = VerificationRunGuard(self.runtime.6.clone());
+            let (cancel, stopped) = watch::channel(*pause.borrow());
+            let (send, receive) = mpsc::channel(2);
+            let capture_loop = cancel_on_exit(
+                capture_loop(capture, receive, stopped.clone(), &self.runtime, &config),
+                cancel.clone(),
+            );
+            let copy_loop = cancel_on_exit(
+                copy_loop(
+                    chunks,
+                    send,
+                    stopped.clone(),
+                    &self.runtime,
+                    &self.journal,
+                    &config,
+                    budget,
+                ),
+                cancel.clone(),
+            );
+            let apply_loop = cancel_on_exit(
+                apply_loop(applier, stopped.clone(), &self.runtime),
+                cancel.clone(),
+            );
+            let supervision_cancel = cancel.clone();
+            let supervision = async {
+                let result = self
+                    .supervision_loop(stopped.clone(), cancel.clone(), stop_at)
+                    .await;
+                supervision_cancel.send_replace(true);
+                result
+            };
+            let control = async {
+                let mut stopped = stopped.clone();
+                loop {
+                    let requested = owner.as_ref().map(|o| o.requested()).transpose();
+                    let requested = match requested {
+                        Ok(requested) => requested.unwrap_or(false),
+                        Err(error) => {
+                            cancel.send_replace(true);
+                            return Err(error);
+                        }
+                    };
+                    if *pause.borrow_and_update()
+                        || requested
+                        || self.runtime.pause_reason().is_some()
+                    {
                         cancel.send_replace(true);
-                        return Err(error);
+                        break;
                     }
-                };
-                if *pause.borrow_and_update() || requested || self.runtime.pause_reason().is_some()
+                    tokio::select! {
+                        _ = cancelled(&mut stopped) => break,
+                        changed = pause.changed() => if changed.is_err() {
+                            cancel.send_replace(true); break;
+                        },
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                    }
+                }
+                Ok(())
+            };
+            let (capture, copy, apply, control, supervision) =
+                tokio::join!(capture_loop, copy_loop, apply_loop, control, supervision);
+            *self.runtime.2.write().expect("engine health poisoned") = false;
+            let retirement = owner.as_mut().map(|o| o.retire()).transpose();
+            let pause_requested = *pause.borrow()
+                || pause.has_changed().is_err()
+                || retirement.as_ref().is_ok_and(|r| r == &Some(true));
+            let (decision, target, supervision_fault) = match supervision {
+                Ok(SupervisedStop::Wal(decision)) => (Some(decision), None, None),
+                Ok(SupervisedStop::Target(wal)) => (None, Some(wal), None),
+                Ok(SupervisedStop::Cancelled) => (None, None, None),
+                Err(error) => (None, None, Some(error)),
+            };
+            let mut faults = [
+                capture.err().map(|e| ("capture", e)),
+                copy.err().map(|e| ("copy", e)),
+                apply.err().map(|e| ("apply", e)),
+                control.err().map(|e| ("control", e)),
+                retirement.err().map(|e| ("control retirement", e)),
+                supervision_fault.map(|e| ("supervision", e)),
+            ];
+            // Genuine integrity/authority failures outrank a separate outage. The
+            // PgApplier checkpoint wrapper preserves the typed outage before here.
+            let priority = faults
+                .iter()
+                .position(|f| matches!(f, Some((_, coordinator::Error::RecoveryRequired(_)))));
+            let fault = priority
+                .and_then(|i| faults[i].take())
+                .or_else(|| faults.into_iter().flatten().next());
+            // Retention can expose a local recovery state on failure. The journal
+            // remains authoritative: never turn a durable fence into a local pause
+            // or recovery lifecycle, including on the first run's mid-run fence.
+            let durable = self.runtime.0.lock().await.state().clone();
+            if fenced(durable.lifecycle.state) {
+                *self.runtime.1.write().expect("engine snapshot poisoned") = durable;
+                if let Some(decision) = &decision {
+                    self.enforce_run_wal(decision).await?;
+                }
+                if let Some((component, error)) = fault {
+                    if self.runtime.0.lock().await.is_owner() {
+                        self.runtime
+                            .marker(
+                                "engine-stop-fault-v1",
+                                format!("{component}: {error}"),
+                                "fenced".into(),
+                            )
+                            .await?;
+                    }
+                    return Err(error);
+                }
+                if let Some(reason) = self.runtime.pause_reason() {
+                    return Err(reason.error());
+                }
+                return self.reached(stop_at, false).await;
+            }
+            let aborting = decision
+                .as_ref()
+                .is_some_and(|d| d.level == WalLevel::Abort);
+            if !aborting && let Some((_, coordinator::Error::RecoveryRequired(reason))) = &fault {
+                if !self.runtime.0.lock().await.is_owner() {
+                    return Err(self.runtime.local_recovery(reason));
+                }
+                *self.runtime.4.write().expect("engine stop reason poisoned") = None;
+            }
+            if self.runtime.pause_reason().is_some() && !aborting {
+                return self.finish_journal_pause(stop_at).await;
+            }
+            if let Some(decision) = decision.as_ref().filter(|d| d.level == WalLevel::Abort) {
+                if self.runtime.pause_reason().is_some()
+                    && let Err(error) = self.reacquire_after_journal_pause().await
                 {
-                    cancel.send_replace(true);
-                    break;
+                    // The journal may be unavailable, but observed coverage loss
+                    // must still prevent this live engine from resuming locally.
+                    let mut state = self.runtime.1.write().expect("engine snapshot poisoned");
+                    state.progress.insert(
+                        readiness::COVERAGE_LOSS.into(),
+                        (
+                            serde_json::to_string(decision)?,
+                            "abort-with-coverage-loss".into(),
+                        ),
+                    );
+                    state.lifecycle.state = State::Failed;
+                    return Err(error);
                 }
-                tokio::select! {
-                    _ = cancelled(&mut stopped) => break,
-                    changed = pause.changed() => if changed.is_err() {
-                        cancel.send_replace(true); break;
-                    },
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-                }
-            }
-            Ok(())
-        };
-        let (capture, copy, apply, control, supervision) =
-            tokio::join!(capture_loop, copy_loop, apply_loop, control, supervision);
-        *self.runtime.2.write().expect("engine health poisoned") = false;
-        let retirement = owner.as_mut().map(|o| o.retire()).transpose();
-        let pause_requested = *pause.borrow()
-            || pause.has_changed().is_err()
-            || retirement.as_ref().is_ok_and(|r| r == &Some(true));
-        let (decision, target, supervision_fault) = match supervision {
-            Ok(SupervisedStop::Wal(decision)) => (Some(decision), None, None),
-            Ok(SupervisedStop::Target(wal)) => (None, Some(wal), None),
-            Ok(SupervisedStop::Cancelled) => (None, None, None),
-            Err(error) => (None, None, Some(error)),
-        };
-        let mut faults = [
-            capture.err().map(|e| ("capture", e)),
-            copy.err().map(|e| ("copy", e)),
-            apply.err().map(|e| ("apply", e)),
-            control.err().map(|e| ("control", e)),
-            retirement.err().map(|e| ("control retirement", e)),
-            supervision_fault.map(|e| ("supervision", e)),
-        ];
-        // Genuine integrity/authority failures outrank a separate outage. The
-        // PgApplier checkpoint wrapper preserves the typed outage before here.
-        let priority = faults
-            .iter()
-            .position(|f| matches!(f, Some((_, coordinator::Error::RecoveryRequired(_)))));
-        let fault = priority
-            .and_then(|i| faults[i].take())
-            .or_else(|| faults.into_iter().flatten().next());
-        // Retention can expose a local recovery state on failure. The journal
-        // remains authoritative: never turn a durable fence into a local pause
-        // or recovery lifecycle, including on the first run's mid-run fence.
-        let durable = self.runtime.0.lock().await.state().clone();
-        if fenced(durable.lifecycle.state) {
-            *self.runtime.1.write().expect("engine snapshot poisoned") = durable;
-            if let Some(decision) = &decision {
-                self.enforce_run_wal(decision).await?;
-            }
-            if let Some((component, error)) = fault {
-                if self.runtime.0.lock().await.is_owner() {
+                // A simultaneous worker fault must not erase an already observed
+                // coverage-loss boundary. Workers are joined; return its real error
+                // after durably recording both the failure and the abort.
+                if let Some((component, error)) = &fault {
                     self.runtime
                         .marker(
                             "engine-stop-fault-v1",
                             format!("{component}: {error}"),
-                            "fenced".into(),
+                            "stopped".into(),
                         )
                         .await?;
                 }
+                self.evaluate_readiness().await?;
+                self.enforce_run_wal(decision).await?;
+                if let Some((_, error)) = fault {
+                    return Err(error);
+                }
+                return self.reached(stop_at, false).await;
+            }
+            if let Some((component, error)) = fault {
+                if !self.runtime.0.lock().await.is_owner() {
+                    return Err(self.runtime.local_recovery(error));
+                }
+                if self.runtime.snapshot().lifecycle.state == State::VerifiedReady {
+                    // Capture workers have joined and health is false, so the fresh
+                    // observation demotes readiness before the failure interrupt.
+                    self.evaluate_readiness().await?;
+                }
+                // Authority is retained by the C2 reducer and included in the reason.
+                let authority = self.runtime.state().await.lifecycle.authority;
+                self.interrupt_run(
+                    State::RecoveryRequired,
+                    format!("{component} failed; authority={authority:?}; {error}"),
+                )
+                .await?;
                 return Err(error);
             }
-            if let Some(reason) = self.runtime.pause_reason() {
-                return Err(reason.error());
-            }
-            return self.reached(stop_at, false).await;
-        }
-        let aborting = decision
-            .as_ref()
-            .is_some_and(|d| d.level == WalLevel::Abort);
-        if !aborting && let Some((_, coordinator::Error::RecoveryRequired(reason))) = &fault {
-            if !self.runtime.0.lock().await.is_owner() {
-                return Err(self.runtime.local_recovery(reason));
-            }
-            *self.runtime.4.write().expect("engine stop reason poisoned") = None;
-        }
-        if self.runtime.pause_reason().is_some() && !aborting {
-            return self.finish_journal_pause(stop_at).await;
-        }
-        if let Some(decision) = decision.as_ref().filter(|d| d.level == WalLevel::Abort) {
-            if self.runtime.pause_reason().is_some()
-                && let Err(error) = self.reacquire_after_journal_pause().await
-            {
-                // The journal may be unavailable, but observed coverage loss
-                // must still prevent this live engine from resuming locally.
-                let mut state = self.runtime.1.write().expect("engine snapshot poisoned");
-                state.progress.insert(
-                    readiness::COVERAGE_LOSS.into(),
-                    (
-                        serde_json::to_string(decision)?,
-                        "abort-with-coverage-loss".into(),
-                    ),
-                );
-                state.lifecycle.state = State::Failed;
-                return Err(error);
-            }
-            // A simultaneous worker fault must not erase an already observed
-            // coverage-loss boundary. Workers are joined; return its real error
-            // after durably recording both the failure and the abort.
-            if let Some((component, error)) = &fault {
-                self.runtime
-                    .marker(
-                        "engine-stop-fault-v1",
-                        format!("{component}: {error}"),
-                        "stopped".into(),
-                    )
-                    .await?;
+            if let Some(mut wal) = target {
+                // The lifecycle records a live pre-stop observation. Recheck all
+                // external producers and authenticated journal state after draining;
+                // intentional worker shutdown alone does not erase that boundary.
+                let sample = self
+                    .readiness_source
+                    .as_ref()
+                    .map_or_else(ComponentSnapshot::default, |s| s.sample());
+                if let Some(observation) = &sample.wal {
+                    let decision = wal.sample(observation)?;
+                    if matches!(decision.level, WalLevel::Blocker | WalLevel::Abort) {
+                        self.evaluate_sample(&sample).await?;
+                        self.enforce_run_wal(&decision).await?;
+                        return self.reached(stop_at, false).await;
+                    }
+                }
+                if !pause_requested {
+                    let facts = readiness::assemble(&self.runtime, &self.journal, &sample).await?;
+                    let boundary_holds = sample.capture.as_ref().is_some_and(|c| c.healthy)
+                        && facts.blockers().iter().all(|b| b == "capture-unhealthy");
+                    if self.runtime.snapshot().lifecycle.state != State::VerifiedReady
+                        || !boundary_holds
+                    {
+                        self.evaluate_sample(&sample).await?;
+                    }
+                    let mut reached = self.reached_with_facts(stop_at, true, &facts);
+                    if let Some(status) = self.runtime.retention_status().await
+                        && let Some(reason) = status.blocked_reason
+                    {
+                        reached.blockers.push(reason);
+                    }
+                    return Ok(reached);
+                }
             }
             self.evaluate_readiness().await?;
-            self.enforce_run_wal(decision).await?;
-            if let Some((_, error)) = fault {
-                return Err(error);
+            if let Some(decision) = decision {
+                self.enforce_run_wal(&decision).await?;
+                return self.reached(stop_at, false).await;
             }
-            return self.reached(stop_at, false).await;
-        }
-        if let Some((component, error)) = fault {
-            if !self.runtime.0.lock().await.is_owner() {
-                return Err(self.runtime.local_recovery(error));
-            }
-            if self.runtime.snapshot().lifecycle.state == State::VerifiedReady {
-                // Capture workers have joined and health is false, so the fresh
-                // observation demotes readiness before the failure interrupt.
-                self.evaluate_readiness().await?;
-            }
-            // Authority is retained by the C2 reducer and included in the reason.
-            let authority = self.runtime.state().await.lifecycle.authority;
-            self.interrupt_run(
-                State::RecoveryRequired,
-                format!("{component} failed; authority={authority:?}; {error}"),
-            )
-            .await?;
-            return Err(error);
-        }
-        if let Some(mut wal) = target {
-            // The lifecycle records a live pre-stop observation. Recheck all
-            // external producers and authenticated journal state after draining;
-            // intentional worker shutdown alone does not erase that boundary.
-            let sample = self
-                .readiness_source
-                .as_ref()
-                .map_or_else(ComponentSnapshot::default, |s| s.sample());
-            if let Some(observation) = &sample.wal {
-                let decision = wal.sample(observation)?;
-                if matches!(decision.level, WalLevel::Blocker | WalLevel::Abort) {
-                    self.evaluate_sample(&sample).await?;
-                    self.enforce_run_wal(&decision).await?;
-                    return self.reached(stop_at, false).await;
-                }
-            }
-            if !pause_requested {
-                let facts = readiness::assemble(&self.runtime, &self.journal, &sample).await?;
-                let boundary_holds = sample.capture.as_ref().is_some_and(|c| c.healthy)
-                    && facts.blockers().iter().all(|b| b == "capture-unhealthy");
-                if self.runtime.snapshot().lifecycle.state != State::VerifiedReady
-                    || !boundary_holds
-                {
-                    self.evaluate_sample(&sample).await?;
-                }
-                let mut reached = self.reached_with_facts(stop_at, true, &facts);
-                if let Some(status) = self.runtime.retention_status().await
-                    && let Some(reason) = status.blocked_reason
-                {
-                    reached.blockers.push(reason);
-                }
-                return Ok(reached);
-            }
-        }
-        self.evaluate_readiness().await?;
-        if let Some(decision) = decision {
-            self.enforce_run_wal(&decision).await?;
-            return self.reached(stop_at, false).await;
-        }
-        self.interrupt_run(State::Paused, "engine pause requested".into())
-            .await?;
-        self.reached(stop_at, false).await
+            self.interrupt_run(State::Paused, "engine pause requested".into())
+                .await?;
+            self.reached(stop_at, false).await
+        })
     }
     async fn interrupt_run(&self, to: State, reason: String) -> Result<()> {
         let mut coordinator = self.runtime.0.lock().await;
@@ -912,133 +924,135 @@ impl Active {
         Ok(high)
     }
 }
-async fn capture_loop(
+fn capture_loop(
     capture: &mut impl Capture,
     mut commands: mpsc::Receiver<Command>,
     mut cancel: watch::Receiver<bool>,
     runtime: &Runtime,
     config: &CopyConfig,
-) -> Result<()> {
-    // Clear health before the worker's exit cancels peers, including when this
-    // future is dropped while an uninterruptible apply step is still draining.
-    let _health = CaptureHealthGuard(runtime.2.clone());
-    let _verification = VerificationCaptureGuard(runtime.6.clone());
-    let _live = LiveReadinessGuard(runtime.7.clone());
-    let mut schema_tick = tokio::time::interval(Duration::from_millis(50));
-    let mut active: Option<Active> = None;
-    loop {
-        // Supervise the last completed capture boundary while the next step
-        // owns capture. In particular, an unclassified DDL stays unknown until
-        // its commit publication completes; a tick cannot clear that blocker.
-        let schema = capture.schema_state();
-        let batch = {
-            // One boxed future survives every schema tick and copy command.
-            // Only worker shutdown may drop an unfinished step.
-            let mut step = Box::pin(capture.step());
-            loop {
+) -> impl std::future::Future<Output = Result<()>> {
+    Box::pin(async move {
+        // Clear health before the worker's exit cancels peers, including when this
+        // future is dropped while an uninterruptible apply step is still draining.
+        let _health = CaptureHealthGuard(runtime.2.clone());
+        let _verification = VerificationCaptureGuard(runtime.6.clone());
+        let _live = LiveReadinessGuard(runtime.7.clone());
+        let mut schema_tick = tokio::time::interval(Duration::from_millis(50));
+        let mut active: Option<Active> = None;
+        loop {
+            // Supervise the last completed capture boundary while the next step
+            // owns capture. In particular, an unclassified DDL stays unknown until
+            // its commit publication completes; a tick cannot clear that blocker.
+            let schema = capture.schema_state();
+            let batch = {
+                // One boxed future survives every schema tick and copy command.
+                // Only worker shutdown may drop an unfinished step.
+                let mut step = Box::pin(capture.step());
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled(&mut cancel) => break None,
+                        _ = schema_tick.tick() => runtime.7.schema(schema.clone()),
+                        command = commands.recv() => match command {
+                            Some(Command::Begin { plan, chunk, attempt, complete, journaled, ready }) => {
+                                if active.is_some() { return Err(recovery("overlapping copy windows")); }
+                                active = Some(Active { plan, chunk, attempt, window: None,
+                                    backlog: VecDeque::new(), bytes: 0, complete, journaled });
+                                let _ = ready.send(());
+                            },
+                            Some(Command::Rows { rows, ready }) => {
+                                let current = active.as_mut().ok_or_else(|| recovery("rows without Started"))?;
+                                current.window = Some(Window::new(current.plan.table.clone(), current.chunk.clone(),
+                                    rows, current.attempt).map_err(recovery)?);
+                                while let Some(batch) = current.backlog.pop_front() { current.feed(&batch)?; }
+                                let _ = ready.send(());
+                            },
+                            None => break None,
+                        },
+                        batch = &mut step => break Some(batch),
+                    }
+                }
+            };
+            // Shutdown can race a durable publication consumed by another worker.
+            // Once the step's borrow is released, retain its latest schema boundary
+            // even when that step did not return to us before peer cancellation.
+            runtime.7.schema(capture.schema_state());
+            let Some(batch) = batch else {
+                return Ok(());
+            };
+            let batch = match batch {
+                Ok(batch) => {
+                    *runtime.2.write().expect("engine health poisoned") = true;
+                    batch
+                }
+                Err(error) => {
+                    *runtime.2.write().expect("engine health poisoned") = false;
+                    runtime.invalidate_final_marker_capture_gap();
+                    return Err(error);
+                }
+            };
+            runtime.6.observe(&batch);
+            runtime.7.observe(&batch);
+            let checkpoint = capture.writer_checkpoint()?;
+            Box::pin(runtime.capture_final_marker(&batch, checkpoint.as_ref())).await?;
+            runtime.queue_writer(checkpoint).await;
+            if let Some(lsn) = batch.durable_lsn {
+                runtime
+                    .marker("buffered", "manifest-durable".into(), lsn.to_string())
+                    .await?;
+            }
+            if batch.stop {
+                return Err(recovery("capture reached unsupported DDL safe boundary"));
+            }
+            let Some(current) = active.as_mut() else {
+                continue;
+            };
+            if current.window.is_none() {
+                current.bytes = current
+                    .bytes
+                    .checked_add(
+                        batch
+                            .transaction
+                            .as_ref()
+                            .map(|t| t.canonical_bytes().map(|b| b.len()))
+                            .transpose()
+                            .map_err(recovery)?
+                            .unwrap_or(0),
+                    )
+                    .and_then(|n| n.checked_add(64))
+                    .ok_or_else(|| recovery("window size overflow"))?;
+                if current.bytes > config.window_bytes {
+                    return Err(recovery("copy window backlog limit"));
+                }
+                current.backlog.push_back(batch);
+            } else if let Some(high) = current.feed(&batch)? {
+                let current = active.take().expect("active high");
+                let SegmentRecord::ChunkRows(rows) = current
+                    .window
+                    .expect("window")
+                    .finish(
+                        config.source.clone(),
+                        &config.order_domain,
+                        config.schema_version,
+                    )
+                    .map_err(recovery)?
+                else {
+                    unreachable!()
+                };
+                // No next capture step can pass H until this durable hook returns.
+                let reference = capture.publish(high, rows).await?;
+                runtime.queue_writer(capture.writer_checkpoint()?).await;
+                let _ = current.complete.send(Ok((high, reference)));
+                // Do not publish post-H WAL until Done is visible to the
+                // applier's synchronous, current-state range classifier.
                 tokio::select! {
                     biased;
-                    _ = cancelled(&mut cancel) => break None,
-                    _ = schema_tick.tick() => runtime.7.schema(schema.clone()),
-                    command = commands.recv() => match command {
-                        Some(Command::Begin { plan, chunk, attempt, complete, journaled, ready }) => {
-                            if active.is_some() { return Err(recovery("overlapping copy windows")); }
-                            active = Some(Active { plan, chunk, attempt, window: None,
-                                backlog: VecDeque::new(), bytes: 0, complete, journaled });
-                            let _ = ready.send(());
-                        },
-                        Some(Command::Rows { rows, ready }) => {
-                            let current = active.as_mut().ok_or_else(|| recovery("rows without Started"))?;
-                            current.window = Some(Window::new(current.plan.table.clone(), current.chunk.clone(),
-                                rows, current.attempt).map_err(recovery)?);
-                            while let Some(batch) = current.backlog.pop_front() { current.feed(&batch)?; }
-                            let _ = ready.send(());
-                        },
-                        None => break None,
-                    },
-                    batch = &mut step => break Some(batch),
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    done = current.journaled => if done.is_err() { return Ok(()); },
                 }
             }
-        };
-        // Shutdown can race a durable publication consumed by another worker.
-        // Once the step's borrow is released, retain its latest schema boundary
-        // even when that step did not return to us before peer cancellation.
-        runtime.7.schema(capture.schema_state());
-        let Some(batch) = batch else {
-            return Ok(());
-        };
-        let batch = match batch {
-            Ok(batch) => {
-                *runtime.2.write().expect("engine health poisoned") = true;
-                batch
-            }
-            Err(error) => {
-                *runtime.2.write().expect("engine health poisoned") = false;
-                runtime.invalidate_final_marker_capture_gap();
-                return Err(error);
-            }
-        };
-        runtime.6.observe(&batch);
-        runtime.7.observe(&batch);
-        let checkpoint = capture.writer_checkpoint()?;
-        Box::pin(runtime.capture_final_marker(&batch, checkpoint.as_ref())).await?;
-        runtime.queue_writer(checkpoint).await;
-        if let Some(lsn) = batch.durable_lsn {
-            runtime
-                .marker("buffered", "manifest-durable".into(), lsn.to_string())
-                .await?;
         }
-        if batch.stop {
-            return Err(recovery("capture reached unsupported DDL safe boundary"));
-        }
-        let Some(current) = active.as_mut() else {
-            continue;
-        };
-        if current.window.is_none() {
-            current.bytes = current
-                .bytes
-                .checked_add(
-                    batch
-                        .transaction
-                        .as_ref()
-                        .map(|t| t.canonical_bytes().map(|b| b.len()))
-                        .transpose()
-                        .map_err(recovery)?
-                        .unwrap_or(0),
-                )
-                .and_then(|n| n.checked_add(64))
-                .ok_or_else(|| recovery("window size overflow"))?;
-            if current.bytes > config.window_bytes {
-                return Err(recovery("copy window backlog limit"));
-            }
-            current.backlog.push_back(batch);
-        } else if let Some(high) = current.feed(&batch)? {
-            let current = active.take().expect("active high");
-            let SegmentRecord::ChunkRows(rows) = current
-                .window
-                .expect("window")
-                .finish(
-                    config.source.clone(),
-                    &config.order_domain,
-                    config.schema_version,
-                )
-                .map_err(recovery)?
-            else {
-                unreachable!()
-            };
-            // No next capture step can pass H until this durable hook returns.
-            let reference = capture.publish(high, rows).await?;
-            runtime.queue_writer(capture.writer_checkpoint()?).await;
-            let _ = current.complete.send(Ok((high, reference)));
-            // Do not publish post-H WAL until Done is visible to the
-            // applier's synchronous, current-state range classifier.
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                done = current.journaled => if done.is_err() { return Ok(()); },
-            }
-        }
-    }
+    })
 }
 
 struct VerificationCaptureGuard(Arc<verification::Hub>);
@@ -1049,7 +1063,7 @@ impl Drop for VerificationCaptureGuard {
     }
 }
 
-async fn copy_loop(
+fn copy_loop(
     database: &mut impl ChunkDatabase,
     commands: mpsc::Sender<Command>,
     mut cancel: watch::Receiver<bool>,
@@ -1057,196 +1071,201 @@ async fn copy_loop(
     journal: &Journal,
     config: &CopyConfig,
     budget: &mut ThroughputBudget,
-) -> Result<()> {
-    // Keep the command sender alive while capture/apply continue. Dropping it
-    // would make capture exit and cancel the entire borrowed worker scope.
-    if runtime.snapshot().lifecycle.state != State::Copying {
-        cancelled(&mut cancel).await;
-        return Ok(());
-    }
-    let references = runtime.state().await.chunk_plans;
-    if references.is_empty() {
-        return Err(recovery("no durable chunk plans"));
-    }
-    for reference in references.values() {
-        let plan = journal.chunk_plan(reference).await?;
-        for chunk in runtime.state().await.unfinished_chunks(&plan)? {
-            if fenced(runtime.snapshot().lifecycle.state) {
-                cancelled(&mut cancel).await;
-                return Ok(());
-            }
-            loop {
+) -> impl std::future::Future<Output = Result<()>> {
+    Box::pin(async move {
+        // Keep the command sender alive while capture/apply continue. Dropping it
+        // would make capture exit and cancel the entire borrowed worker scope.
+        if runtime.snapshot().lifecycle.state != State::Copying {
+            cancelled(&mut cancel).await;
+            return Ok(());
+        }
+        let references = runtime.state().await.chunk_plans;
+        if references.is_empty() {
+            return Err(recovery("no durable chunk plans"));
+        }
+        for reference in references.values() {
+            let plan = journal.chunk_plan(reference).await?;
+            for chunk in runtime.state().await.unfinished_chunks(&plan)? {
+                if fenced(runtime.snapshot().lifecycle.state) {
+                    cancelled(&mut cancel).await;
+                    return Ok(());
+                }
+                loop {
+                    if *cancel.borrow() {
+                        return Ok(());
+                    }
+                    match budget.try_chunk_read(config.read_rows, config.read_bytes) {
+                        Ok(()) => break,
+                        Err(budget::Error::Throttled { retry_after }) => tokio::select! {
+                            biased;
+                            _ = cancelled(&mut cancel) => return Ok(()),
+                            _ = tokio::time::sleep(retry_after) => {},
+                        },
+                        Err(error) => return Err(recovery(error)),
+                    }
+                }
+                let key = serde_json::to_string(&chunk.id)?;
+                let attempt =
+                    runtime
+                        .state()
+                        .await
+                        .chunk_attempts
+                        .get(&key)
+                        .map_or(Ok(1), |a| {
+                            a.attempt
+                                .checked_add(1)
+                                .ok_or_else(|| recovery("chunk attempts exhausted"))
+                        })?;
+                let mut coordinator = runtime.0.lock().await;
+                if fenced(coordinator.state().lifecycle.state) {
+                    drop(coordinator);
+                    cancelled(&mut cancel).await;
+                    return Ok(());
+                }
+                let result = coordinator
+                    .commit(Transition::ChunkStarted {
+                        chunk: chunk.clone(),
+                        attempt,
+                    })
+                    .await;
+                runtime.observe_journal_error(&coordinator, &result);
+                *runtime.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+                drop(coordinator);
+                result?;
+                let (complete, completion) = oneshot::channel();
+                let (journaled, acknowledged) = oneshot::channel();
+                let (ready, installed) = oneshot::channel();
+                // Closed handshakes mean capture stopped: leave Started without
+                // Done so resume retries with a new attempt. Engine::run retains
+                // any actual capture error; shutdown ordering is not a copy fault.
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    sent = commands.send(Command::Begin {
+                        plan: Box::new(plan.clone()),
+                        chunk: chunk.clone(),
+                        attempt,
+                        complete,
+                        journaled: acknowledged,
+                        ready,
+                    }) => if sent.is_err() { return Ok(()); },
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    ready = installed => if ready.is_err() { return Ok(()); },
+                }
+                database
+                    .emit(Watermark {
+                        wm: WatermarkKind::Low,
+                        chunk: chunk.id.clone(),
+                        attempt,
+                    })
+                    .await?;
+                let rows = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    rows = database.read(&plan, &chunk) => rows?,
+                };
+                let bytes: usize = rows
+                    .iter()
+                    .flat_map(|r| r.values())
+                    .map(|v| v.bytes.as_ref().map_or(0, Vec::len) + v.type_id.len())
+                    .sum();
+                if rows.len() as u64 > config.read_rows || bytes as u64 > config.read_bytes {
+                    return Err(recovery(
+                        "chunk result exceeds its admitted read reservation",
+                    ));
+                }
                 if *cancel.borrow() {
                     return Ok(());
                 }
-                match budget.try_chunk_read(config.read_rows, config.read_bytes) {
-                    Ok(()) => break,
-                    Err(budget::Error::Throttled { retry_after }) => tokio::select! {
-                        biased;
-                        _ = cancelled(&mut cancel) => return Ok(()),
-                        _ = tokio::time::sleep(retry_after) => {},
-                    },
-                    Err(error) => return Err(recovery(error)),
+                let (ready, installed) = oneshot::channel();
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    sent = commands.send(Command::Rows { rows, ready }) => if sent.is_err() { return Ok(()); },
                 }
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    ready = installed => if ready.is_err() { return Ok(()); },
+                }
+                database
+                    .emit(Watermark {
+                        wm: WatermarkKind::High,
+                        chunk: chunk.id.clone(),
+                        attempt,
+                    })
+                    .await?;
+                let (high_lsn, reference) = tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    done = completion => match done {
+                        Ok(completion) => completion?,
+                        Err(_) => return Ok(()),
+                    },
+                };
+                runtime
+                    .commit(Transition::ChunkDone {
+                        chunk,
+                        attempt,
+                        high_lsn,
+                        chunk_rows: ChunkRowsRef {
+                            mseq: reference.mseq,
+                            manifest_digest: reference.manifest_digest,
+                        },
+                    })
+                    .await?;
+                let _ = journaled.send(());
             }
-            let key = serde_json::to_string(&chunk.id)?;
-            let attempt = runtime
-                .state()
-                .await
-                .chunk_attempts
-                .get(&key)
-                .map_or(Ok(1), |a| {
-                    a.attempt
-                        .checked_add(1)
-                        .ok_or_else(|| recovery("chunk attempts exhausted"))
-                })?;
+        }
+        if !*cancel.borrow() {
             let mut coordinator = runtime.0.lock().await;
-            if fenced(coordinator.state().lifecycle.state) {
-                drop(coordinator);
-                cancelled(&mut cancel).await;
-                return Ok(());
+            if coordinator.state().lifecycle.state == State::Copying {
+                let result = coordinator
+                    .commit(Transition::Lifecycle {
+                        event: Event::Advance {
+                            to: State::CatchingUp,
+                        },
+                    })
+                    .await;
+                runtime.observe_journal_error(&coordinator, &result);
+                *runtime.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+                result?;
             }
-            let result = coordinator
-                .commit(Transition::ChunkStarted {
-                    chunk: chunk.clone(),
-                    attempt,
-                })
-                .await;
-            runtime.observe_journal_error(&coordinator, &result);
-            *runtime.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
-            drop(coordinator);
-            result?;
-            let (complete, completion) = oneshot::channel();
-            let (journaled, acknowledged) = oneshot::channel();
-            let (ready, installed) = oneshot::channel();
-            // Closed handshakes mean capture stopped: leave Started without
-            // Done so resume retries with a new attempt. Engine::run retains
-            // any actual capture error; shutdown ordering is not a copy fault.
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                sent = commands.send(Command::Begin {
-                    plan: Box::new(plan.clone()),
-                    chunk: chunk.clone(),
-                    attempt,
-                    complete,
-                    journaled: acknowledged,
-                    ready,
-                }) => if sent.is_err() { return Ok(()); },
-            }
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                ready = installed => if ready.is_err() { return Ok(()); },
-            }
-            database
-                .emit(Watermark {
-                    wm: WatermarkKind::Low,
-                    chunk: chunk.id.clone(),
-                    attempt,
-                })
-                .await?;
-            let rows = tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                rows = database.read(&plan, &chunk) => rows?,
-            };
-            let bytes: usize = rows
-                .iter()
-                .flat_map(|r| r.values())
-                .map(|v| v.bytes.as_ref().map_or(0, Vec::len) + v.type_id.len())
-                .sum();
-            if rows.len() as u64 > config.read_rows || bytes as u64 > config.read_bytes {
-                return Err(recovery(
-                    "chunk result exceeds its admitted read reservation",
-                ));
-            }
-            if *cancel.borrow() {
-                return Ok(());
-            }
-            let (ready, installed) = oneshot::channel();
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                sent = commands.send(Command::Rows { rows, ready }) => if sent.is_err() { return Ok(()); },
-            }
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                ready = installed => if ready.is_err() { return Ok(()); },
-            }
-            database
-                .emit(Watermark {
-                    wm: WatermarkKind::High,
-                    chunk: chunk.id.clone(),
-                    attempt,
-                })
-                .await?;
-            let (high_lsn, reference) = tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                done = completion => match done {
-                    Ok(completion) => completion?,
-                    Err(_) => return Ok(()),
-                },
-            };
-            runtime
-                .commit(Transition::ChunkDone {
-                    chunk,
-                    attempt,
-                    high_lsn,
-                    chunk_rows: ChunkRowsRef {
-                        mseq: reference.mseq,
-                        manifest_digest: reference.manifest_digest,
-                    },
-                })
-                .await?;
-            let _ = journaled.send(());
         }
-    }
-    if !*cancel.borrow() {
-        let mut coordinator = runtime.0.lock().await;
-        if coordinator.state().lifecycle.state == State::Copying {
-            let result = coordinator
-                .commit(Transition::Lifecycle {
-                    event: Event::Advance {
-                        to: State::CatchingUp,
-                    },
-                })
-                .await;
-            runtime.observe_journal_error(&coordinator, &result);
-            *runtime.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
-            result?;
-        }
-    }
-    cancelled(&mut cancel).await;
-    Ok(())
+        cancelled(&mut cancel).await;
+        Ok(())
+    })
 }
-async fn apply_loop(
+fn apply_loop(
     applier: &mut impl Applier,
     mut cancel: watch::Receiver<bool>,
     runtime: &Runtime,
-) -> Result<()> {
-    let _verification = VerificationRunGuard(runtime.6.clone());
-    let _live = LiveReadinessGuard(runtime.7.clone());
-    loop {
-        if *cancel.borrow() {
-            return Ok(());
-        }
-        runtime
-            .snapshot()
-            .operational_schema
-            .require_clear()
-            .map_err(recovery)?;
-        runtime.retention_tick().await?;
-        if !applier.controlled_step(runtime, cancel.clone()).await? {
-            tokio::select! {
-                biased;
-                _ = cancelled(&mut cancel) => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+) -> impl std::future::Future<Output = Result<()>> {
+    Box::pin(async move {
+        let _verification = VerificationRunGuard(runtime.6.clone());
+        let _live = LiveReadinessGuard(runtime.7.clone());
+        loop {
+            if *cancel.borrow() {
+                return Ok(());
+            }
+            runtime
+                .snapshot()
+                .operational_schema
+                .require_clear()
+                .map_err(recovery)?;
+            runtime.retention_tick().await?;
+            if !applier.controlled_step(runtime, cancel.clone()).await? {
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                }
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]

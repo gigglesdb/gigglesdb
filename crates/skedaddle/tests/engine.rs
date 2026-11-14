@@ -544,70 +544,71 @@ enum MarkerEmitter {
     NativeRestart,
 }
 
-async fn copy_table(
+fn copy_table(
     partial: bool,
     verification: bool,
     readiness: bool,
     final_marker: Option<MarkerEmitter>,
-) -> TestResult {
-    let Some(path) = std::env::var_os("SKEDADDLE_TEST_CONFIG") else {
-        skip("SKEDADDLE_TEST_CONFIG absent");
-        return Ok(());
-    };
-    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let Some(source_dsn) = cfg["engine"]["source"].as_str() else {
-        skip("H1 config lacks engine.source");
-        return Ok(());
-    };
-    let destination_dsn = cfg["engine"]["destination"]
-        .as_str()
-        .ok_or("H1 engine.destination absent")?;
-    let ca = cfg["ca_pem"].as_str().ok_or("H1 ca_pem absent")?;
-    // Operational engine DSNs are fixture owners. Event-trigger installation
-    // needs H1's explicit pg_ddl admin and progress/origin setup uses pg_apply.
-    let source_admin = cfg["pg_ddl"].as_str().ok_or("H1 pg_ddl setup DSN absent")?;
-    let destination_admin = cfg["pg_apply"]
-        .as_str()
-        .ok_or("H1 pg_apply setup DSN absent")?;
-    let source = connect(source_dsn, ca).await?;
-    let destination = connect(destination_dsn, ca).await?;
-    let cleanup_source = connect(source_admin, ca).await?;
-    let cleanup_destination = connect(destination_admin, ca).await?;
-    let id = format!("e{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
-    let publication = format!("{id}_pub");
-    let slot = format!("{id}_slot");
-    let origin = format!("{id}_origin");
-    let application = format!("{id}_app");
-    source.batch_execute(&format!("CREATE SCHEMA {id};CREATE TABLE {id}.rows(id integer PRIMARY KEY,body text NOT NULL);INSERT INTO {id}.rows SELECT i,'before-'||i FROM generate_series(1,100) i")).await?;
-    destination
+) -> impl std::future::Future<Output = TestResult> {
+    Box::pin(async move {
+        let Some(path) = std::env::var_os("SKEDADDLE_TEST_CONFIG") else {
+            skip("SKEDADDLE_TEST_CONFIG absent");
+            return Ok(());
+        };
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let Some(source_dsn) = cfg["engine"]["source"].as_str() else {
+            skip("H1 config lacks engine.source");
+            return Ok(());
+        };
+        let destination_dsn = cfg["engine"]["destination"]
+            .as_str()
+            .ok_or("H1 engine.destination absent")?;
+        let ca = cfg["ca_pem"].as_str().ok_or("H1 ca_pem absent")?;
+        // Operational engine DSNs are fixture owners. Event-trigger installation
+        // needs H1's explicit pg_ddl admin and progress/origin setup uses pg_apply.
+        let source_admin = cfg["pg_ddl"].as_str().ok_or("H1 pg_ddl setup DSN absent")?;
+        let destination_admin = cfg["pg_apply"]
+            .as_str()
+            .ok_or("H1 pg_apply setup DSN absent")?;
+        let source = connect(source_dsn, ca).await?;
+        let destination = connect(destination_dsn, ca).await?;
+        let cleanup_source = connect(source_admin, ca).await?;
+        let cleanup_destination = connect(destination_admin, ca).await?;
+        let id = format!("e{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+        let publication = format!("{id}_pub");
+        let slot = format!("{id}_slot");
+        let origin = format!("{id}_origin");
+        let application = format!("{id}_app");
+        source.batch_execute(&format!("CREATE SCHEMA {id};CREATE TABLE {id}.rows(id integer PRIMARY KEY,body text NOT NULL);INSERT INTO {id}.rows SELECT i,'before-'||i FROM generate_series(1,100) i")).await?;
+        destination
         .batch_execute(&format!(
             "CREATE SCHEMA {id};CREATE TABLE {id}.rows(id integer PRIMARY KEY,body text NOT NULL)"
         ))
         .await?;
-    if partial {
-        source
+        if partial {
+            source
             .batch_execute(&format!(
                 "ALTER TABLE {id}.rows ADD COLUMN excluded text NOT NULL DEFAULT '{EXCLUDED_SENTINEL}'"
             ))
             .await?;
-        destination
+            destination
             .batch_execute(&format!(
                 "ALTER TABLE {id}.rows ADD COLUMN excluded text NOT NULL DEFAULT 'destination-default'"
             ))
             .await?;
-    }
-    if matches!(
-        final_marker,
-        Some(MarkerEmitter::Native | MarkerEmitter::NativeRestart)
-    ) {
-        cleanup_source.batch_execute(&format!("CREATE ROLE {application} LOGIN; GRANT USAGE ON SCHEMA {id} TO {application}; GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON {id}.rows TO {application}")).await?;
-        cleanup_destination.batch_execute(&format!("CREATE ROLE {id}_rev_app NOLOGIN; GRANT USAGE ON SCHEMA {id} TO {id}_rev_app; GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON {id}.rows TO {id}_rev_app")).await?;
-    }
-    cleanup_destination
-        .query_one("SELECT pg_replication_origin_create($1)", &[&origin])
-        .await?;
-    let repl = replication(&cfg)?;
-    let result = AssertUnwindSafe(async {
+        }
+        if matches!(
+            final_marker,
+            Some(MarkerEmitter::Native | MarkerEmitter::NativeRestart)
+        ) {
+            cleanup_source.batch_execute(&format!("CREATE ROLE {application} LOGIN; GRANT USAGE ON SCHEMA {id} TO {application}; GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON {id}.rows TO {application}")).await?;
+            cleanup_destination.batch_execute(&format!("CREATE ROLE {id}_rev_app NOLOGIN; GRANT USAGE ON SCHEMA {id} TO {id}_rev_app; GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON {id}.rows TO {id}_rev_app")).await?;
+        }
+        cleanup_destination
+            .query_one("SELECT pg_replication_origin_create($1)", &[&origin])
+            .await?;
+        let repl = replication(&cfg)?;
+        let result = AssertUnwindSafe(Box::pin(async {
         let root =
             PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").ok_or("task test root absent")?)
                 .join(&id);
@@ -1181,16 +1182,16 @@ async fn copy_table(
         }
         applier.inner.destination.destination.close().await?;
         TestResult::Ok(())
-    })
+    }))
     .catch_unwind()
     .await;
-    // Remove the trigger before other source DDL, after dropping capture's slot
-    // connection. Only this UUID's resources are removed, including on failure.
-    let sql = TriggerSql::new(
-        &id,
-        cfg["pg_version"].as_u64().ok_or("H1 pg_version")? as u32 * 10000,
-    )?;
-    let cleanup=async {
+        // Remove the trigger before other source DDL, after dropping capture's slot
+        // connection. Only this UUID's resources are removed, including on failure.
+        let sql = TriggerSql::new(
+            &id,
+            cfg["pg_version"].as_u64().ok_or("H1 pg_version")? as u32 * 10000,
+        )?;
+        let cleanup=async {
         cleanup_source.batch_execute(&sql.remove).await?;
         if matches!(final_marker, Some(MarkerEmitter::Native | MarkerEmitter::NativeRestart)) {
             cleanup_destination.batch_execute(&sql.remove).await?;
@@ -1215,13 +1216,14 @@ async fn copy_table(
         }
         TestResult::Ok(())
     }.await;
-    match result {
-        Ok(r) => {
-            r?;
-            cleanup
+        match result {
+            Ok(r) => {
+                r?;
+                cleanup
+            }
+            Err(p) => std::panic::resume_unwind(p),
         }
-        Err(p) => std::panic::resume_unwind(p),
-    }
+    })
 }
 
 async fn qualify_live_readiness(
@@ -1662,7 +1664,7 @@ async fn operational_runner_restart_restores_schema_before_reconnect_live() -> T
     }
     let definition = skedaddle::MigrationDefinition::from_json(&value.to_string())?;
     let id = definition.canonical_digest()?[..24].to_owned();
-    let result = AssertUnwindSafe(async {
+    let result = AssertUnwindSafe(Box::pin(async {
         let journal = Journal::new(Arc::new(skedaddle::coordinator::journal::local_store(&root)?), "skedaddle", &id, Duration::from_secs(5))?;
         let mut owner = Coordinator::observer(journal, Local::create(root.join(format!("{id}.local")))?, "runner-schema-fixture")?;
         owner.acquire().await?;
@@ -1708,7 +1710,7 @@ async fn operational_runner_restart_restores_schema_before_reconnect_live() -> T
         }
         assert_eq!(rows(&source, &schema).await?, rows(&destination, &schema).await?);
         TestResult::Ok(())
-    }).catch_unwind().await;
+    })).catch_unwind().await;
     let cleanup = async {
         let trigger = TriggerSql::new(&id, cfg["pg_version"].as_u64().ok_or("PG version absent")? as u32 * 10000)?;
         source.batch_execute(&trigger.remove).await?;
@@ -1754,4 +1756,11 @@ async fn runner_schema(
         Sha256::digest(stream.as_bytes())
     ));
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+// Construction must also be safe on the ordinary libtest stack, without PG.
+#[test]
+fn copy_table_future_stays_within_stack_budget() {
+    let future = copy_table(false, false, false, None);
+    assert!(std::mem::size_of_val(&future) <= 1024);
 }

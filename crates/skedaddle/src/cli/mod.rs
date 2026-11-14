@@ -345,290 +345,293 @@ async fn stop_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
-async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
-    if let Some(override_path) = &cli.definition_override {
-        let positional = match &cli.command {
-            Command::Check { definition } | Command::Init { definition } => Some(definition),
-            _ => None,
-        };
-        if let Some(path) = positional
-            && definition(path)? != definition(override_path)?
-        {
-            return Err(fail(
-                Outcome::InvalidInput,
-                "--definition differs from positional definition",
-                "Two different migration contracts were supplied.",
-                "Use one matching definition for both arguments, or omit --definition for check/init.",
-            ));
-        }
-    }
-    if let Command::Check { definition: path } = &cli.command {
-        let report = CapabilityReport::from_definition(&definition(path)?).map_err(|e| {
-            fail(
-                Outcome::InvalidInput,
-                e.to_string(),
-                "Capability validation failed.",
-                "Correct the definition and retry check.",
-            )
-        })?;
-        return capability(report);
-    }
-    let root = cli.state_root.as_ref().ok_or_else(|| {
-        fail(
-            Outcome::InvalidInput,
-            "--state-root is required",
-            "Durable state needs an explicit storage location.",
-            "Pass --state-root <absolute directory> to this command.",
-        )
-    })?;
-    if !root.is_absolute() {
-        return Err(fail(
-            Outcome::InvalidInput,
-            "--state-root must be absolute",
-            "A relative location can select a different migration after changing directories.",
-            "Pass an absolute --state-root path.",
-        ));
-    }
-    if let Command::Init { definition: path } = &cli.command {
-        let def = definition(path)?;
-        let digest = def.canonical_digest().map_err(|e| {
-            fail(
-                Outcome::Internal,
-                e.to_string(),
-                "Definition serialization failed.",
-                "Preserve the definition and report this serialization failure.",
-            )
-        })?;
-        let id = &digest[..24];
-        std::fs::create_dir_all(root)?;
-        let _lock = lock(root, id)?;
-        let state = journal(root, id).await?.load(true).await?;
-        if state.definition.is_some() {
-            return Err(fail(
-                Outcome::IllegalTransition,
-                "Migration already initialized",
-                "Reinitialization must not overwrite durable history.",
-                &format!("Run status {id} with the same --state-root."),
-            ));
-        }
-        let data = mutate(
-            root,
-            id,
-            Transition::Define {
-                definition: Box::new(def),
-            },
-        )
-        .await?;
-        return Ok((Outcome::Success, json!({"id":id,"state":data})));
-    }
-    let id = match &cli.command {
-        Command::Assess { id, .. }
-        | Command::Start { id, .. }
-        | Command::Resume { id, .. }
-        | Command::Pause { id }
-        | Command::Status { id, .. }
-        | Command::Verify { id, .. }
-        | Command::Cutover { id, .. }
-        | Command::Rollback { id, .. }
-        | Command::Finalize { id, .. }
-        | Command::Abort { id }
-        | Command::Report { id } => id,
-        Command::Buffer {
-            command: BufferCommand::Gc { id },
-        } => id,
-        _ => unreachable!(),
-    };
-    valid_id(id)?;
-    // Control remains usable while authoritative journal/buffer reads fail.
-    // Only the owner can publish Paused; this acknowledges the request alone.
-    if matches!(cli.command, Command::Pause { .. }) && cli.definition_override.is_none() {
-        let control = root.join(format!("{id}.control"));
-        if control.is_dir() && crate::engine::PauseControl::new(control)?.request_pause()? {
-            return Ok((
-                Outcome::Success,
-                json!({"id":id,"pause_requested":true,"final_state":null,"note":"Pause requested from the active owner; inspect status for its joined Paused boundary."}),
-            ));
-        }
-    }
-    let _lock = if matches!(
-        cli.command,
-        Command::Status { .. }
-            | Command::Report { .. }
-            | Command::Assess { .. }
-            | Command::Pause { .. }
-            | Command::Verify { .. }
-            | Command::Cutover { .. }
-            | Command::Rollback { .. }
-            | Command::Finalize { .. }
-            | Command::Buffer { .. }
-    ) {
-        None
-    } else {
-        Some(lock(root, id)?)
-    };
-    let state = journal(root, id).await?.load(true).await?;
-    let def = state_definition(&state)?;
-    if let Some(path) = &cli.definition_override {
-        let supplied = definition(path)?;
-        if &supplied != def {
-            return Err(fail(
-                Outcome::InvalidInput,
-                "--definition differs from committed definition",
-                "Executing against a different contract would invalidate journal evidence.",
-                "Use the definition originally committed by init.",
-            ));
-        }
-    }
-    match &cli.command {
-        Command::Status { .. } | Command::Report { .. } => {
-            let trust = json!({
-                "source": crate::capability::tls_trust(&def.source),
-                "destination": crate::capability::tls_trust(&def.destination),
-            });
-            let mut visible_state = serde_json::to_value(&state).map_err(|_| {
-                fail(
-                    Outcome::Internal,
-                    "State serialization failed",
-                    "The observer response could not be prepared.",
-                    "Preserve --state-root and report this serialization failure.",
-                )
-            })?;
-            for side in ["source", "destination"] {
-                if let Some(connection) = visible_state["definition"][side].as_object_mut() {
-                    connection.remove("tls_ca_ref");
-                }
+// Keep the command dispatcher out of its caller's inline future.
+fn run(cli: &Cli) -> impl std::future::Future<Output = Result<(Outcome, Value)>> {
+    Box::pin(async move {
+        if let Some(override_path) = &cli.definition_override {
+            let positional = match &cli.command {
+                Command::Check { definition } | Command::Init { definition } => Some(definition),
+                _ => None,
+            };
+            if let Some(path) = positional
+                && definition(path)? != definition(override_path)?
+            {
+                return Err(fail(
+                    Outcome::InvalidInput,
+                    "--definition differs from positional definition",
+                    "Two different migration contracts were supplied.",
+                    "Use one matching definition for both arguments, or omit --definition for check/init.",
+                ));
             }
-            Ok((
-                Outcome::Success,
-                json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state),"rollback":crate::runner::rollback_status(&state)}),
-            ))
         }
-        Command::Assess { sample, .. } => {
-            let report = CapabilityReport::from_definition(def).map_err(|e| {
+        if let Command::Check { definition: path } = &cli.command {
+            let report = CapabilityReport::from_definition(&definition(path)?).map_err(|e| {
                 fail(
                     Outcome::InvalidInput,
                     e.to_string(),
-                    "Assessment cannot validate its contract.",
-                    "Run check on the committed definition.",
+                    "Capability validation failed.",
+                    "Correct the definition and retry check.",
                 )
             })?;
-            if sample.is_some() {
-                let mut error = unwired("assess --sample");
-                error.2 = json!({"offline_report":report,"requested_sample":sample,"sampling_performed":false});
-                return Err(error);
-            }
-            capability(report)
+            return capability(report);
         }
-        Command::Pause { .. } => {
-            let requested = crate::engine::PauseControl::new(root.join(format!("{id}.control")))?
-                .request_pause()?;
-            Ok((
-                Outcome::Success,
-                json!({"id":id,"pause_requested":requested,"final_state":state.lifecycle.state,"note":if requested {"Pause requested from the active owner; inspect status for its joined Paused boundary."} else {"No active engine owner; no lifecycle change was made."}}),
-            ))
+        let root = cli.state_root.as_ref().ok_or_else(|| {
+            fail(
+                Outcome::InvalidInput,
+                "--state-root is required",
+                "Durable state needs an explicit storage location.",
+                "Pass --state-root <absolute directory> to this command.",
+            )
+        })?;
+        if !root.is_absolute() {
+            return Err(fail(
+                Outcome::InvalidInput,
+                "--state-root must be absolute",
+                "A relative location can select a different migration after changing directories.",
+                "Pass an absolute --state-root path.",
+            ));
         }
-        Command::Abort { .. } => {
-            coordinator::next_lifecycle(
-                &state.lifecycle,
-                &Event::Advance {
-                    to: State::AbortedToSource,
-                },
-                state.applied_seq + 1,
-            )?;
-            let journal = journal(root, id).await?;
-            let mut after = 0;
-            while after < state.applied_seq {
-                let page = journal
-                    .history_page_through(after, 128, state.applied_seq)
-                    .await?;
-                if page.is_empty() {
-                    return Err(fail(
-                        Outcome::RecoveryRequired,
-                        "Abort history is incomplete",
-                        "Cleanup safety cannot be established from an incomplete journal.",
-                        "Preserve --state-root and restore the missing journal entries before abort.",
-                    ));
-                }
-                for entry in page {
-                    if matches!(
-                        entry.transition,
-                        Transition::FenceState { .. }
-                            | Transition::Intent { .. }
-                            | Transition::ResumeEffect { .. }
-                            | Transition::EffectCompleted { .. }
-                    ) {
-                        return Err(unwired(
-                            "abort (recorded external effects require source fence restoration)",
-                        ));
-                    }
-                    after = entry.seq;
-                }
+        if let Command::Init { definition: path } = &cli.command {
+            let def = definition(path)?;
+            let digest = def.canonical_digest().map_err(|e| {
+                fail(
+                    Outcome::Internal,
+                    e.to_string(),
+                    "Definition serialization failed.",
+                    "Preserve the definition and report this serialization failure.",
+                )
+            })?;
+            let id = &digest[..24];
+            std::fs::create_dir_all(root)?;
+            let _lock = lock(root, id)?;
+            let state = journal(root, id).await?.load(true).await?;
+            if state.definition.is_some() {
+                return Err(fail(
+                    Outcome::IllegalTransition,
+                    "Migration already initialized",
+                    "Reinitialization must not overwrite durable history.",
+                    &format!("Run status {id} with the same --state-root."),
+                ));
             }
-            let updated = mutate(
+            let data = mutate(
                 root,
                 id,
-                Transition::Lifecycle {
-                    event: Event::Advance {
-                        to: State::AbortedToSource,
-                    },
+                Transition::Define {
+                    definition: Box::new(def),
                 },
             )
             .await?;
-            Ok((
-                Outcome::Success,
-                json!({"state":updated,"operation_scope":"coordinator-only: verified journal contains no recorded external effects; no database restoration performed","external_effects_performed":false}),
-            ))
+            return Ok((Outcome::Success, json!({"id":id,"state":data})));
         }
-        Command::Start { until, .. } | Command::Resume { until, .. } => {
-            // Preserve the existing unassessed boundary. Preparation cannot
-            // silently assess a definition or manufacture runtime evidence.
-            if state.lifecycle.state == State::Defined {
-                return Err(unwired(if matches!(cli.command, Command::Start { .. }) {
-                    "start"
+        let id = match &cli.command {
+            Command::Assess { id, .. }
+            | Command::Start { id, .. }
+            | Command::Resume { id, .. }
+            | Command::Pause { id }
+            | Command::Status { id, .. }
+            | Command::Verify { id, .. }
+            | Command::Cutover { id, .. }
+            | Command::Rollback { id, .. }
+            | Command::Finalize { id, .. }
+            | Command::Abort { id }
+            | Command::Report { id } => id,
+            Command::Buffer {
+                command: BufferCommand::Gc { id },
+            } => id,
+            _ => unreachable!(),
+        };
+        valid_id(id)?;
+        // Control remains usable while authoritative journal/buffer reads fail.
+        // Only the owner can publish Paused; this acknowledges the request alone.
+        if matches!(cli.command, Command::Pause { .. }) && cli.definition_override.is_none() {
+            let control = root.join(format!("{id}.control"));
+            if control.is_dir() && crate::engine::PauseControl::new(control)?.request_pause()? {
+                return Ok((
+                    Outcome::Success,
+                    json!({"id":id,"pause_requested":true,"final_state":null,"note":"Pause requested from the active owner; inspect status for its joined Paused boundary."}),
+                ));
+            }
+        }
+        let _lock = if matches!(
+            cli.command,
+            Command::Status { .. }
+                | Command::Report { .. }
+                | Command::Assess { .. }
+                | Command::Pause { .. }
+                | Command::Verify { .. }
+                | Command::Cutover { .. }
+                | Command::Rollback { .. }
+                | Command::Finalize { .. }
+                | Command::Buffer { .. }
+        ) {
+            None
+        } else {
+            Some(lock(root, id)?)
+        };
+        let state = journal(root, id).await?.load(true).await?;
+        let def = state_definition(&state)?;
+        if let Some(path) = &cli.definition_override {
+            let supplied = definition(path)?;
+            if &supplied != def {
+                return Err(fail(
+                    Outcome::InvalidInput,
+                    "--definition differs from committed definition",
+                    "Executing against a different contract would invalidate journal evidence.",
+                    "Use the definition originally committed by init.",
+                ));
+            }
+        }
+        match &cli.command {
+            Command::Status { .. } | Command::Report { .. } => {
+                let trust = json!({
+                    "source": crate::capability::tls_trust(&def.source),
+                    "destination": crate::capability::tls_trust(&def.destination),
+                });
+                let mut visible_state = serde_json::to_value(&state).map_err(|_| {
+                    fail(
+                        Outcome::Internal,
+                        "State serialization failed",
+                        "The observer response could not be prepared.",
+                        "Preserve --state-root and report this serialization failure.",
+                    )
+                })?;
+                for side in ["source", "destination"] {
+                    if let Some(connection) = visible_state["definition"][side].as_object_mut() {
+                        connection.remove("tls_ca_ref");
+                    }
+                }
+                Ok((
+                    Outcome::Success,
+                    json!({"id":id,"observer":true,"state":visible_state,"tls_trust":trust,"verification":crate::runner::verification_status(root,id,&state),"reverse":crate::runner::reverse_status(&state),"rollback":crate::runner::rollback_status(&state)}),
+                ))
+            }
+            Command::Assess { sample, .. } => {
+                let report = CapabilityReport::from_definition(def).map_err(|e| {
+                    fail(
+                        Outcome::InvalidInput,
+                        e.to_string(),
+                        "Assessment cannot validate its contract.",
+                        "Run check on the committed definition.",
+                    )
+                })?;
+                if sample.is_some() {
+                    let mut error = unwired("assess --sample");
+                    error.2 = json!({"offline_report":report,"requested_sample":sample,"sampling_performed":false});
+                    return Err(error);
+                }
+                capability(report)
+            }
+            Command::Pause { .. } => {
+                let requested =
+                    crate::engine::PauseControl::new(root.join(format!("{id}.control")))?
+                        .request_pause()?;
+                Ok((
+                    Outcome::Success,
+                    json!({"id":id,"pause_requested":requested,"final_state":state.lifecycle.state,"note":if requested {"Pause requested from the active owner; inspect status for its joined Paused boundary."} else {"No active engine owner; no lifecycle change was made."}}),
+                ))
+            }
+            Command::Abort { .. } => {
+                coordinator::next_lifecycle(
+                    &state.lifecycle,
+                    &Event::Advance {
+                        to: State::AbortedToSource,
+                    },
+                    state.applied_seq + 1,
+                )?;
+                let journal = journal(root, id).await?;
+                let mut after = 0;
+                while after < state.applied_seq {
+                    let page = journal
+                        .history_page_through(after, 128, state.applied_seq)
+                        .await?;
+                    if page.is_empty() {
+                        return Err(fail(
+                            Outcome::RecoveryRequired,
+                            "Abort history is incomplete",
+                            "Cleanup safety cannot be established from an incomplete journal.",
+                            "Preserve --state-root and restore the missing journal entries before abort.",
+                        ));
+                    }
+                    for entry in page {
+                        if matches!(
+                            entry.transition,
+                            Transition::FenceState { .. }
+                                | Transition::Intent { .. }
+                                | Transition::ResumeEffect { .. }
+                                | Transition::EffectCompleted { .. }
+                        ) {
+                            return Err(unwired(
+                                "abort (recorded external effects require source fence restoration)",
+                            ));
+                        }
+                        after = entry.seq;
+                    }
+                }
+                let updated = mutate(
+                    root,
+                    id,
+                    Transition::Lifecycle {
+                        event: Event::Advance {
+                            to: State::AbortedToSource,
+                        },
+                    },
+                )
+                .await?;
+                Ok((
+                    Outcome::Success,
+                    json!({"state":updated,"operation_scope":"coordinator-only: verified journal contains no recorded external effects; no database restoration performed","external_effects_performed":false}),
+                ))
+            }
+            Command::Start { until, .. } | Command::Resume { until, .. } => {
+                // Preserve the existing unassessed boundary. Preparation cannot
+                // silently assess a definition or manufacture runtime evidence.
+                if state.lifecycle.state == State::Defined {
+                    return Err(unwired(if matches!(cli.command, Command::Start { .. }) {
+                        "start"
+                    } else {
+                        "resume"
+                    }));
+                }
+                let event = if matches!(cli.command, Command::Start { .. }) {
+                    if state.lifecycle.state != State::Assessed {
+                        return Err(fail(
+                            Outcome::IllegalTransition,
+                            "Start preparation requires assessed state",
+                            "Installation must begin from a committed assessed lifecycle.",
+                            "Inspect status and complete a live assessment before start.",
+                        ));
+                    }
+                    Some(Event::Advance { to: State::Copying })
+                } else if matches!(
+                    state.lifecycle.state,
+                    State::Copying | State::CatchingUp | State::VerifiedReady
+                ) {
+                    None
                 } else {
-                    "resume"
-                }));
-            }
-            let event = if matches!(cli.command, Command::Start { .. }) {
-                if state.lifecycle.state != State::Assessed {
-                    return Err(fail(
-                        Outcome::IllegalTransition,
-                        "Start preparation requires assessed state",
-                        "Installation must begin from a committed assessed lifecycle.",
-                        "Inspect status and complete a live assessment before start.",
-                    ));
+                    Some(Event::Resume)
+                };
+                if let Some(event) = event {
+                    coordinator::next_lifecycle(&state.lifecycle, &event, state.applied_seq + 1)?;
                 }
-                Some(Event::Advance { to: State::Copying })
-            } else if matches!(
-                state.lifecycle.state,
-                State::Copying | State::CatchingUp | State::VerifiedReady
-            ) {
-                None
-            } else {
-                Some(Event::Resume)
-            };
-            if let Some(event) = event {
-                coordinator::next_lifecycle(&state.lifecycle, &event, state.applied_seq + 1)?;
-            }
-            let (pause, paused) = tokio::sync::watch::channel(false);
-            let mut operation = Box::pin(crate::runner::run(
-                root,
-                id,
-                def,
-                matches!(cli.command, Command::Resume { .. }),
-                (*until).into(),
-                paused,
-            ));
-            let result = tokio::select! {
-                result = &mut operation => result,
-                signal = stop_signal() => {
-                    pause.send_replace(true);
-                    let result = operation.await;
-                    signal?;
-                    result
-                }
-            };
-            let reached = result.map_err(|error| {
+                let (pause, paused) = tokio::sync::watch::channel(false);
+                let mut operation = Box::pin(crate::runner::run(
+                    root,
+                    id,
+                    def,
+                    matches!(cli.command, Command::Resume { .. }),
+                    (*until).into(),
+                    paused,
+                ));
+                let result = tokio::select! {
+                    result = &mut operation => result,
+                    signal = stop_signal() => {
+                        pause.send_replace(true);
+                        let result = operation.await;
+                        signal?;
+                        result
+                    }
+                };
+                let reached = result.map_err(|error| {
                 let crate::runner::RunError::Preparation(error) = error else {
                     let crate::runner::RunError::Engine(error) = error else { unreachable!() };
                     let mut failure = Failure::from(error);
@@ -651,176 +654,178 @@ async fn run(cli: &Cli) -> Result<(Outcome, Value)> {
                 failure.2 = json!({"id":id,"final_state":state.lifecycle,"blocker":error,"external_effects_performed":false});
                 failure
             });
-            match reached {
-                Ok(reached) => {
-                    let data = json!({"id":id,"reached_state":reached.state,"blockers":reached.blockers,"target_reached":reached.target_reached});
-                    if reached.target_reached || reached.state == State::Paused {
-                        Ok((Outcome::Success, data))
-                    } else {
-                        let mut failure = fail(
-                            Outcome::Blocked,
-                            "Migration stopped before the requested boundary",
-                            "The joined engine reported unresolved blockers.",
-                            "Inspect status and the returned blockers; restore their prerequisites before resuming.",
-                        );
-                        failure.2 = data;
-                        Err(failure)
-                    }
-                }
-                Err(mut error) => {
-                    if error.2["installation_may_have_started"] == true {
-                        if let Ok(journal) = journal(root, id).await
-                            && let Ok(latest) = journal.load(true).await
-                        {
-                            error.2["final_state"] = json!(latest.lifecycle.state);
+                match reached {
+                    Ok(reached) => {
+                        let data = json!({"id":id,"reached_state":reached.state,"blockers":reached.blockers,"target_reached":reached.target_reached});
+                        if reached.target_reached || reached.state == State::Paused {
+                            Ok((Outcome::Success, data))
                         } else {
-                            error.2["final_state"] = Value::Null;
-                            error.2["state_reload_unavailable"] = json!(true);
+                            let mut failure = fail(
+                                Outcome::Blocked,
+                                "Migration stopped before the requested boundary",
+                                "The joined engine reported unresolved blockers.",
+                                "Inspect status and the returned blockers; restore their prerequisites before resuming.",
+                            );
+                            failure.2 = data;
+                            Err(failure)
                         }
                     }
+                    Err(mut error) => {
+                        if error.2["installation_may_have_started"] == true {
+                            if let Ok(journal) = journal(root, id).await
+                                && let Ok(latest) = journal.load(true).await
+                            {
+                                error.2["final_state"] = json!(latest.lifecycle.state);
+                            } else {
+                                error.2["final_state"] = Value::Null;
+                                error.2["state_reload_unavailable"] = json!(true);
+                            }
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Command::Verify { tables, .. } => {
+                let response = Box::pin(crate::runner::request_verification(root, id, def, tables))
+                    .await
+                    .map_err(|error| {
+                        let outcome = match error.kind {
+                            crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
+                            crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
+                            crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                        };
+                        fail(
+                            outcome,
+                            &error.what,
+                            "Independent verification could not run.",
+                            &error.next_step,
+                        )
+                    })?;
+                let outcome = match response.exit_code {
+                    0 => Outcome::Success,
+                    2 => Outcome::Blocked,
+                    _ => Outcome::Infrastructure,
+                };
+                if outcome == Outcome::Success {
+                    Ok((outcome, response.data))
+                } else {
+                    let mut error = fail(
+                        outcome,
+                        "Verification did not establish complete matching scope",
+                        "Inspect per-table coverage and range details.",
+                        "Restore active capture/apply and repair mismatches before verifying again.",
+                    );
+                    error.2 = response.data;
                     Err(error)
                 }
             }
-        }
-        Command::Verify { tables, .. } => {
-            let response = Box::pin(crate::runner::request_verification(root, id, def, tables))
-                .await
-                .map_err(|error| {
-                    let outcome = match error.kind {
-                        crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
-                        crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
-                        crate::runner::FailureKind::Blocked => Outcome::Blocked,
-                    };
-                    fail(
+            Command::Cutover { deadline, .. } => {
+                let deadline = cutover_deadline(deadline.as_deref())?;
+                let response = crate::runner::request_cutover(root, id, deadline)
+                    .await
+                    .map_err(|error| {
+                        let outcome = match error.kind {
+                            crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
+                            crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
+                            crate::runner::FailureKind::Blocked => Outcome::Blocked,
+                        };
+                        fail(
+                            outcome,
+                            &error.what,
+                            "The cutover request could not reach the owner.",
+                            &error.next_step,
+                        )
+                    })?;
+                cutover_result(response)
+            }
+            Command::Rollback { deadline, .. } => {
+                let configured_deadline = format!("{}s", def.budgets.max_downtime_seconds);
+                let deadline =
+                    cutover_deadline(Some(deadline.as_deref().unwrap_or(&configured_deadline)))?;
+                if state.lifecycle.state != State::RollbackWindow
+                    || state.rollback_eligibility_ended.is_some()
+                {
+                    return Err(fail(
+                        Outcome::InvalidInput,
+                        "Invalid rollback state",
+                        "Rollback requires an eligible rollback window.",
+                        "Inspect migration status.",
+                    ));
+                }
+                let response = crate::runner::request_rollback(root, id, deadline).await;
+                let outcome = match response.exit_code {
+                    0 => Outcome::Success,
+                    2 => Outcome::Blocked,
+                    3 => Outcome::InvalidInput,
+                    5 => Outcome::RecoveryRequired,
+                    8 => Outcome::NonOwner,
+                    _ => Outcome::Infrastructure,
+                };
+                if response.exit_code == 0 {
+                    Ok((outcome, response.data))
+                } else {
+                    let mut error = fail(
                         outcome,
-                        &error.what,
-                        "Independent verification could not run.",
-                        &error.next_step,
-                    )
-                })?;
-            let outcome = match response.exit_code {
-                0 => Outcome::Success,
-                2 => Outcome::Blocked,
-                _ => Outcome::Infrastructure,
-            };
-            if outcome == Outcome::Success {
-                Ok((outcome, response.data))
-            } else {
-                let mut error = fail(
-                    outcome,
-                    "Verification did not establish complete matching scope",
-                    "Inspect per-table coverage and range details.",
-                    "Restore active capture/apply and repair mismatches before verifying again.",
-                );
-                error.2 = response.data;
-                Err(error)
+                        "Rollback request could not complete",
+                        "Inspect data.error.kind for the owner decision.",
+                        "Inspect migration status before retrying.",
+                    );
+                    error.2 = response.data;
+                    Err(error)
+                }
             }
-        }
-        Command::Cutover { deadline, .. } => {
-            let deadline = cutover_deadline(deadline.as_deref())?;
-            let response = crate::runner::request_cutover(root, id, deadline)
-                .await
-                .map_err(|error| {
-                    let outcome = match error.kind {
-                        crate::runner::FailureKind::Infrastructure => Outcome::Infrastructure,
-                        crate::runner::FailureKind::InvalidInput => Outcome::InvalidInput,
-                        crate::runner::FailureKind::Blocked => Outcome::Blocked,
-                    };
-                    fail(
+            Command::Finalize { drop_objects, .. } => {
+                if !crate::runner::finalize_allowed(&state) {
+                    return Err(fail(
+                        Outcome::InvalidInput,
+                        "Invalid finalize state",
+                        "Finalize requires a rollback window or ended eligibility.",
+                        "Inspect migration status.",
+                    ));
+                }
+                let response =
+                    crate::runner::request_finalize_objects(root, id, *drop_objects).await;
+                if response.exit_code == 0 {
+                    Ok((Outcome::Success, response.data))
+                } else {
+                    let mut error = fail(
+                        match response.exit_code {
+                            3 => Outcome::InvalidInput,
+                            8 => Outcome::NonOwner,
+                            _ => Outcome::Infrastructure,
+                        },
+                        "Finalization could not reach the active owner",
+                        "Inspect durable progress; an admitted cleanup retries under the owner.",
+                        "Resume the post-activation owner and inspect status.",
+                    );
+                    error.2 = response.data;
+                    Err(error)
+                }
+            }
+            Command::Buffer { .. } => {
+                let response = crate::runner::request_gc(root, id).await;
+                let outcome = match response.exit_code {
+                    0 => Outcome::Success,
+                    3 => Outcome::InvalidInput,
+                    8 => Outcome::NonOwner,
+                    _ => Outcome::Infrastructure,
+                };
+                if response.exit_code == 0 {
+                    Ok((outcome, response.data))
+                } else {
+                    let mut error = fail(
                         outcome,
-                        &error.what,
-                        "The cutover request could not reach the owner.",
-                        &error.next_step,
-                    )
-                })?;
-            cutover_result(response)
+                        "Buffer GC request failed",
+                        "Inspect data.error.kind.",
+                        "Restore the active owner and retry.",
+                    );
+                    error.2 = response.data;
+                    Err(error)
+                }
+            }
+            _ => unreachable!(),
         }
-        Command::Rollback { deadline, .. } => {
-            let configured_deadline = format!("{}s", def.budgets.max_downtime_seconds);
-            let deadline =
-                cutover_deadline(Some(deadline.as_deref().unwrap_or(&configured_deadline)))?;
-            if state.lifecycle.state != State::RollbackWindow
-                || state.rollback_eligibility_ended.is_some()
-            {
-                return Err(fail(
-                    Outcome::InvalidInput,
-                    "Invalid rollback state",
-                    "Rollback requires an eligible rollback window.",
-                    "Inspect migration status.",
-                ));
-            }
-            let response = crate::runner::request_rollback(root, id, deadline).await;
-            let outcome = match response.exit_code {
-                0 => Outcome::Success,
-                2 => Outcome::Blocked,
-                3 => Outcome::InvalidInput,
-                5 => Outcome::RecoveryRequired,
-                8 => Outcome::NonOwner,
-                _ => Outcome::Infrastructure,
-            };
-            if response.exit_code == 0 {
-                Ok((outcome, response.data))
-            } else {
-                let mut error = fail(
-                    outcome,
-                    "Rollback request could not complete",
-                    "Inspect data.error.kind for the owner decision.",
-                    "Inspect migration status before retrying.",
-                );
-                error.2 = response.data;
-                Err(error)
-            }
-        }
-        Command::Finalize { drop_objects, .. } => {
-            if !crate::runner::finalize_allowed(&state) {
-                return Err(fail(
-                    Outcome::InvalidInput,
-                    "Invalid finalize state",
-                    "Finalize requires a rollback window or ended eligibility.",
-                    "Inspect migration status.",
-                ));
-            }
-            let response = crate::runner::request_finalize_objects(root, id, *drop_objects).await;
-            if response.exit_code == 0 {
-                Ok((Outcome::Success, response.data))
-            } else {
-                let mut error = fail(
-                    match response.exit_code {
-                        3 => Outcome::InvalidInput,
-                        8 => Outcome::NonOwner,
-                        _ => Outcome::Infrastructure,
-                    },
-                    "Finalization could not reach the active owner",
-                    "Inspect durable progress; an admitted cleanup retries under the owner.",
-                    "Resume the post-activation owner and inspect status.",
-                );
-                error.2 = response.data;
-                Err(error)
-            }
-        }
-        Command::Buffer { .. } => {
-            let response = crate::runner::request_gc(root, id).await;
-            let outcome = match response.exit_code {
-                0 => Outcome::Success,
-                3 => Outcome::InvalidInput,
-                8 => Outcome::NonOwner,
-                _ => Outcome::Infrastructure,
-            };
-            if response.exit_code == 0 {
-                Ok((outcome, response.data))
-            } else {
-                let mut error = fail(
-                    outcome,
-                    "Buffer GC request failed",
-                    "Inspect data.error.kind.",
-                    "Restore the active owner and retry.",
-                );
-                error.2 = response.data;
-                Err(error)
-            }
-        }
-        _ => unreachable!(),
-    }
+    })
 }
 /// Parse `--deadline`: a positive integer with an optional `ms`, `s`, `m` or
 /// `h` unit (bare numbers are seconds).
@@ -953,7 +958,26 @@ fn contextualize(cli: &Cli, mut failure: Failure) -> Failure {
     failure
 }
 /// Parse without clap's process exit so even usage failures have a JSON envelope.
+// Root futures are polled by block_on's caller, not a Tokio worker. Windows
+// gives main only 1 MiB. Reserve 8 MiB for both the entry and runtime workers,
+// including transient construction/poll frames of database/TLS dependencies.
+const ASYNC_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn main_entry() -> u8 {
+    match std::thread::Builder::new()
+        .name("skedaddle-cli".into())
+        .stack_size(ASYNC_STACK_BYTES)
+        .spawn(main_entry_on_stack)
+    {
+        Ok(thread) => match thread.join() {
+            Ok(code) => code,
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        Err(error) => emit("runtime", Err(error.into())),
+    }
+}
+
+fn main_entry_on_stack() -> u8 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -979,7 +1003,11 @@ pub fn main_entry() -> u8 {
             };
         }
     };
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(ASYNC_STACK_BYTES)
+        .build()
+    {
         Ok(r) => r,
         Err(e) => return emit("runtime", Err(e.into())),
     };
@@ -1010,5 +1038,37 @@ pub fn main_entry() -> u8 {
             return code;
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    #[test]
+    fn cli_and_runner_futures_stay_within_stack_budget() {
+        let cli = Cli::try_parse_from(["skedaddle", "start", "size-guard"]).unwrap();
+        let future = run(&cli);
+        assert!(std::mem::size_of_val(&future) <= 1024);
+        // Infer the real runner future without needing database credentials.
+        fn check<F: std::future::Future>(
+            _: impl FnOnce(
+                &'static Path,
+                &'static str,
+                &'static MigrationDefinition,
+                tokio::sync::watch::Receiver<bool>,
+            ) -> F,
+        ) {
+            assert!(std::mem::size_of::<F>() <= 1024);
+        }
+        check(|root, id, definition, pause| {
+            crate::runner::run(
+                root,
+                id,
+                definition,
+                false,
+                crate::engine::StopAt::CatchingUp,
+                pause,
+            )
+        });
     }
 }
