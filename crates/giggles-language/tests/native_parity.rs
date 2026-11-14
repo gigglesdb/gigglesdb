@@ -579,3 +579,24 @@ fn v2_native_delete_matches_sql() {
         assert_eq!(snapshot(&left), snapshot(&right));
     }
 }
+
+#[test]
+fn v2_native_block_matches_sql_transaction() {
+    let (_left_db, left) = Database::fresh(StorageEngine::V2);
+    let (_right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, label text)");
+    }
+    let result = with_sql_parser_forbidden(|| Engine::with_version(left.clone(), LanguageVersion::Embedded07)
+        .execute_transaction_text("transaction { insert items set id=1,label=\"ready\"; update items where id=1 set label=\"done\"; }", &Bindings::new())).unwrap();
+    let mut session = right.sql_session();
+    session.execute("BEGIN", &[], None).unwrap();
+    for (summary, statement) in result.summaries.iter().zip([
+        "insert into items values(1,'ready')", "update items set label='done' where id=1",
+    ]) {
+        assert_eq!(u64::try_from(summary.affected).unwrap(), session.execute(statement, &[], None).unwrap().affected);
+    }
+    session.execute("COMMIT", &[], None).unwrap();
+    assert_eq!(result.summaries.len(), 2);
+    assert_eq!(snapshot(&left), snapshot(&right));
+}

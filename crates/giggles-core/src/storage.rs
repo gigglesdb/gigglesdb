@@ -2358,6 +2358,17 @@ impl SqlSession {
             relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
         self.execute_bound_engine(&prepared, &[], None).map(|_| ())
     }
+    /// Native block steps are separate RC statements; legacy keeps its block snapshot.
+    pub(crate) fn begin_native_step(&mut self) -> Result<(), CoreError> {
+        crate::cancellation::check()?;
+        #[cfg(feature = "engine-rocksdb")]
+        if self.is_v2_engine() {
+            self.v2_transaction.as_mut()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?
+                .begin_statement();
+        }
+        Ok(())
+    }
     /// Catalog binding sees exactly the staged snapshot used for typed reads/writes.
     pub(crate) fn catalog_engine(&mut self) -> Result<(u64, Vec<relational::TableDef>), CoreError> {
         let result = (|| {

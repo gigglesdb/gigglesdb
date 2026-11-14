@@ -27,6 +27,8 @@ impl SqlSession {
 
     /// A block stages as a unit into an outer transaction. Failure aborts that
     /// transaction; this API does not introduce nested commits or savepoints.
+    /// V2 binds all steps upfront, then runs each with a fresh READ COMMITTED
+    /// snapshot plus its own writes. Legacy retains one snapshot for the block.
     pub fn execute_native_transaction(
         &mut self,
         block: &Transaction,

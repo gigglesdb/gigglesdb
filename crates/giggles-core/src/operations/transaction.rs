@@ -700,7 +700,10 @@ pub(super) fn run_transaction(
     for (item_index, step) in plan.steps.iter().enumerate() {
         #[cfg(test)]
         tests::before_step(item_index);
+        #[cfg(all(test, feature = "engine-rocksdb"))]
+        block_boundary_tests::before_step(item_index);
         crate::cancellation::check().map_err(core)?;
+        session.begin_native_step().map_err(core)?;
         match step {
             BoundStep::Require(expression) => {
                 let mut expression = expression.clone();
@@ -810,3 +813,219 @@ pub(super) fn run_transaction(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+mod block_boundary_tests {
+    use super::*;
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnMut(usize)>;
+    thread_local! { static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) }; }
+    pub(super) fn before_step(index: usize) {
+        HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(index);
+            }
+        });
+    }
+    fn hooked<T>(hook: impl FnMut(usize) + 'static, run: impl FnOnce() -> T) -> T {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                HOOK.with_borrow_mut(|hook| *hook = None);
+            }
+        }
+        HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        let _clear = Clear;
+        run()
+    }
+    fn fixture(engine: crate::Engine) -> (std::path::PathBuf, Admin) {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "block-boundary-{:032x}",
+            u128::from_le_bytes(nonce)
+        ));
+        let admin = Admin::create_engine(&path, crate::Limits::default(), engine).unwrap();
+        admin
+            .sql_session()
+            .execute(
+                "CREATE TABLE items(id BIGINT PRIMARY KEY, value BIGINT)",
+                &[],
+                None,
+            )
+            .unwrap();
+        (path, admin)
+    }
+    fn read() -> Request {
+        Request::Read {
+            table: "items".into(),
+            filter: None,
+            order: vec![],
+            limit: Some(ValueExpr::Literal(Value::Int(10))),
+            projection: vec!["value".into()],
+        }
+    }
+    fn insert(id: i64) -> TransactionStep {
+        TransactionStep::Execute(Request::Insert {
+            table: "items".into(),
+            values: vec![
+                ("id".into(), ValueExpr::Literal(Value::Int(id))),
+                ("value".into(), ValueExpr::Literal(Value::Int(7))),
+            ],
+        })
+    }
+    fn block(steps: Vec<TransactionStep>) -> Transaction {
+        Transaction {
+            read_only: false,
+            steps,
+            emit: None,
+        }
+    }
+    fn rows(admin: &Admin) -> Vec<SqlRow> {
+        admin
+            .sql_session()
+            .execute("SELECT * FROM items ORDER BY id", &[], None)
+            .unwrap()
+            .rows
+    }
+    #[test]
+    fn rc_steps_refresh_only_v2_and_keep_earlier_results() {
+        for engine in [crate::Engine::Legacy, crate::Engine::V2] {
+            let (path, admin) = fixture(engine);
+            admin
+                .sql_session()
+                .execute("INSERT INTO items VALUES(1,0)", &[], None)
+                .unwrap();
+            let outside = admin.clone();
+            let plan = Transaction {
+                read_only: true,
+                steps: vec![
+                    TransactionStep::Let {
+                        name: "first".into(),
+                        request: read(),
+                    },
+                    TransactionStep::Let {
+                        name: "second".into(),
+                        request: read(),
+                    },
+                ],
+                emit: Some(vec![
+                    EmitExpr::Rows("first".into()),
+                    EmitExpr::Rows("second".into()),
+                ]),
+            };
+            let result = hooked(
+                move |index| {
+                    if index == 1 {
+                        std::thread::scope(|scope| {
+                            scope
+                                .spawn(|| {
+                                    outside
+                                        .sql_session()
+                                        .execute("UPDATE items SET value=1 WHERE id=1", &[], None)
+                                        .unwrap();
+                                })
+                                .join()
+                                .unwrap()
+                        });
+                    }
+                },
+                || Engine::new(admin.clone()).execute_transaction(&plan, &Bindings::new()),
+            )
+            .unwrap();
+            for (index, value) in result.emitted.iter().enumerate() {
+                let EmittedValue::Rows { rows, .. } = value else {
+                    panic!("rows");
+                };
+                let expected = if engine == crate::Engine::V2 && index == 1 {
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(rows[0].values, vec![Value::Int(expected)]);
+            }
+            drop(admin);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+    #[test]
+    fn own_writes_require_failure_and_outer_sql_commit_or_rollback() {
+        let (path, admin) = fixture(crate::Engine::V2);
+        let mut session = admin.sql_session();
+        for commit in [false, true] {
+            session.begin_native().unwrap();
+            session
+                .execute("INSERT INTO items VALUES(1,3)", &[], None)
+                .unwrap();
+            let mut plan = block(vec![
+                insert(2),
+                TransactionStep::Let {
+                    name: "saved".into(),
+                    request: read(),
+                },
+            ]);
+            plan.emit = Some(vec![EmitExpr::Rows("saved".into())]);
+            let result = session
+                .execute_native_transaction(&plan, &Bindings::new())
+                .unwrap();
+            let EmittedValue::Rows { rows, .. } = &result.emitted[0] else {
+                panic!("rows");
+            };
+            assert_eq!(rows.len(), 2);
+            assert_eq!(result.summaries[0].affected, 1);
+            assert!(self::rows(&admin).is_empty());
+            if commit {
+                session.commit_native().unwrap();
+            } else {
+                session.rollback_native().unwrap();
+            }
+            assert_eq!(self::rows(&admin).len(), if commit { 2 } else { 0 });
+        }
+        let plan = block(vec![
+            insert(3),
+            TransactionStep::Require(Expr::Value(ValueExpr::Literal(Value::Bool(false)))),
+        ]);
+        assert_eq!(
+            session.execute_native_transaction(&plan, &Bindings::new()),
+            Err(Error::RequirementFailed)
+        );
+        assert_eq!(rows(&admin).len(), 2);
+        session.begin_native().unwrap();
+        session
+            .execute("INSERT INTO items VALUES(4,3)", &[], None)
+            .unwrap();
+        assert_eq!(
+            session.execute_native_transaction(&plan, &Bindings::new()),
+            Err(Error::RequirementFailed)
+        );
+        assert!(session.is_aborted());
+        session.rollback_native().unwrap();
+        assert_eq!(rows(&admin).len(), 2);
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn cancellation_between_steps_rolls_back_staged_write() {
+        let (path, admin) = fixture(crate::Engine::V2);
+        let cancellation = crate::Cancellation::default();
+        let cancel = cancellation.clone();
+        let result = cancellation.scope(|| {
+            hooked(
+                move |index| {
+                    if index == 1 {
+                        assert!(cancel.cancel());
+                    }
+                },
+                || {
+                    Engine::new(admin.clone())
+                        .execute_transaction(&block(vec![insert(1), insert(2)]), &Bindings::new())
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert!(rows(&admin).is_empty());
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
