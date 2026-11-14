@@ -2483,6 +2483,10 @@ impl SqlSession {
         column: &relational::ColumnDef,
         value: relational::Value,
     ) -> Result<relational::Value, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let state = db.metadata_state(self.v2_transaction.as_ref())?;
+            return relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql);
+        }
         let state = self
             .staged
             .as_ref()
@@ -2494,6 +2498,23 @@ impl SqlSession {
         table: &relational::TableDef,
         values: Vec<relational::Value>,
     ) -> Result<relational::SqlResult, CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let result = (|| {
+                if self.aborted {
+                    return Err(CoreError::Sql(relational::SqlError::Aborted));
+                }
+                let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
+                // V2 binds durable metadata at execution; prepared epochs use zero.
+                state.sql.epoch = 0;
+                let mut prepared = relational::Prepared::insert_engine(
+                    table, values, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], None)
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
             |domain, state| relational::Prepared::insert_engine(table, values, domain, state),

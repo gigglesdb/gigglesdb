@@ -528,3 +528,17 @@ fn v2_native_read_matches_sql() {
     assert_eq!(native(&admin, "items order by id limit 1024", false),
         sql(&admin, "select * from items order by id"));
 }
+
+#[test]
+fn v2_native_insert_matches_sql() {
+    let (left_db, left) = Database::fresh(StorageEngine::V2);
+    let (right_db, right) = Database::fresh(StorageEngine::V2);
+    for admin in [&left, &right] {
+        sql(admin, "create table items(id bigint primary key, label text)");
+    }
+    assert_eq!(native(&left, "insert items set id=1,label=\"ready\"", false),
+        sql(&right, "insert into items values(1,'ready')"));
+    assert_eq!(snapshot(&left), snapshot(&right));
+    drop(left); drop(right);
+    assert!(parity(&reopen_observation(&left_db), &reopen_observation(&right_db)));
+}

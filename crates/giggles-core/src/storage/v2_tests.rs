@@ -357,7 +357,8 @@ fn lifecycle_and_public_refusals() {
         .unwrap();
     let table = legacy.catalog().unwrap().1.remove(0);
     denied(session.row_version_engine(&table, &[]), SQL_SESSIONS);
-    denied(session.insert_engine(&table, vec![]), SQL_SESSIONS);
+    assert_eq!(session.insert_engine(&table, vec![]),
+        Err(CoreError::Sql(relational::SqlError::StaleSchema)));
     denied(
         session.update_engine(&table, vec![], vec![], 0),
         SQL_SESSIONS,
@@ -568,5 +569,57 @@ fn bounded_native_complete_reads() {
             drop(reader); drop(writer); drop(admin);
             fs::remove_dir_all(path).unwrap();
         }
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn typed_keyed_insert_parity() {
+    use crate::relational::{Value as V, with_sql_parser_forbidden};
+    for backend in [Engine::Legacy, Engine::V2] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        let mut session = admin.sql_session();
+        for ddl in [
+            "CREATE TABLE parent (id BIGINT PRIMARY KEY)",
+            "INSERT INTO parent VALUES (1)",
+            "CREATE TABLE child (id BIGINT PRIMARY KEY, p BIGINT NOT NULL REFERENCES parent(id), n BIGINT CHECK(n > 0))",
+        ] { session.execute(ddl, &[], None).unwrap(); }
+        let table = session.catalog_engine().unwrap().1.into_iter().find(|t| t.name == "child").unwrap();
+        let row = |id, p, n| vec![V::Int(id), p, V::Int(n)];
+        session.begin_native().unwrap();
+        assert_eq!(with_sql_parser_forbidden(|| session.insert_engine(&table, row(1, V::Int(1), 1))).unwrap().affected, 1);
+        session.commit_native().unwrap();
+        for (values, sql, error) in [
+            (row(1, V::Int(1), 1), "INSERT INTO child VALUES (1,1,1)", relational::SqlError::Duplicate), // 23505
+            (row(2, V::Null, 1), "INSERT INTO child VALUES (2,NULL,1)", relational::SqlError::Null), // 23502
+            (row(2, V::Int(1), -1), "INSERT INTO child VALUES (2,1,-1)", relational::SqlError::CheckViolation), // 23514
+            (row(2, V::Int(9), 1), "INSERT INTO child VALUES (2,9,1)", relational::SqlError::ForeignKeyViolation), // 23503
+        ] {
+            let expected = session.execute(sql, &[], None).unwrap_err();
+            assert_eq!(expected, CoreError::Sql(error));
+            session.begin_native().unwrap();
+            session.execute("INSERT INTO child VALUES (99,1,1)", &[], None).unwrap();
+            let actual = with_sql_parser_forbidden(|| session.insert_engine(&table, values)).unwrap_err();
+            assert_eq!(std::mem::discriminant(&actual), std::mem::discriminant(&expected));
+            if let (CoreError::Sql(a), CoreError::Sql(b)) = (actual, expected) {
+                assert_eq!(a, b);
+            } else { panic!("expected structured SQL errors"); }
+            assert!(session.is_aborted());
+            session.rollback_native().unwrap();
+            assert_eq!(session.execute("SELECT * FROM child", &[], None).unwrap().rows.len(), 1);
+        }
+        for commit in [false, true] {
+            session.begin_native().unwrap();
+            let sql_count = session.execute("INSERT INTO child VALUES (2,1,1)", &[], None).unwrap().affected;
+            assert_eq!(with_sql_parser_forbidden(|| session.insert_engine(&table, row(3, V::Int(1), 1))).unwrap().affected, sql_count);
+            if commit { session.commit_native().unwrap(); } else { session.rollback_native().unwrap(); }
+            assert_eq!(session.execute("SELECT * FROM child", &[], None).unwrap().rows.len(), if commit { 3 } else { 1 });
+        }
+        drop(session); drop(admin);
+        let admin = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(admin.sql_session().execute("SELECT * FROM child", &[], None).unwrap().rows.len(), 3);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
     }
 }
