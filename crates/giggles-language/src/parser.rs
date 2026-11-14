@@ -394,7 +394,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1139,6 +1139,8 @@ impl Parser {
                     CatalogType::Int64
                 } else if self.word("text") {
                     CatalogType::Text
+                } else if self.version == LanguageVersion::Embedded016 && self.word("numeric") {
+                    CatalogType::Numeric
                 } else if self.word("bytes") {
                     CatalogType::Bytes
                 } else {

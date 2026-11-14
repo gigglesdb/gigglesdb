@@ -194,18 +194,26 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if version == LanguageVersion::Embedded015 {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
             CapabilityState::Implemented,
-            "Numeric parameters for existing SQL-provisioned NUMERIC columns; shared core typmod coercion. No numeric literals, DDL, arithmetic or functions.",
+            "Numeric parameters for existing SQL-provisioned NUMERIC columns; shared core typmod coercion. No numeric literals, arithmetic or functions.",
             vec![evidence(
                 "crates/giggles-language/tests/native_parity.rs",
                 "numeric_parameters_match_sql",
             )],
             vec![],
         );
+    }
+
+    if version == LanguageVersion::Embedded016 {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "numeric_column_declaration", CapabilityState::Implemented,
+                "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
+                vec![evidence("crates/giggles-language/tests/native_parity.rs", "numeric_native_catalog_matches_sql")], vec![]);
+        }
     }
 
     for interface in [
@@ -1723,6 +1731,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded016 => (
+            "crates/giggles-language/tests/native_parity.rs",
+            "numeric_native_catalog_matches_sql",
         ),
         LanguageVersion::Embedded015 => (
             "crates/giggles-language/tests/native_parity.rs",

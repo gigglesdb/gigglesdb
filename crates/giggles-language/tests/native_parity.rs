@@ -648,3 +648,76 @@ fn numeric_parameters_match_sql() {
     }
 }
 }
+
+
+#[test]
+fn numeric_native_catalog_matches_sql() {
+    use giggles_core::relational::Numeric;
+    use giggles_language::{CatalogStatement, CatalogType, ColumnSpec, parse_catalog_with_version};
+    let text = "create table amounts(id int64,n numeric,opt nullable numeric,primary key(id))";
+    let tree = CatalogStatement::CreateTable {
+        table: "amounts".into(),
+        columns: vec![
+            ColumnSpec { name: "id".into(), data_type: CatalogType::Int64, nullable: false },
+            ColumnSpec { name: "n".into(), data_type: CatalogType::Numeric, nullable: false },
+            ColumnSpec { name: "opt".into(), data_type: CatalogType::Numeric, nullable: true },
+        ],
+        primary_key: vec!["id".into()],
+    };
+    let v = LanguageVersion::Embedded016;
+    assert_eq!(parse_catalog_with_version(text, v).unwrap(), tree);
+    let (left_db, left) = Database::fresh(StorageEngine::Legacy);
+    let (right_db, right) = Database::fresh(StorageEngine::Legacy);
+    let (tree_db, typed) = Database::fresh(StorageEngine::Legacy);
+    for minor in 1..=15 {
+        let old = serde_json::from_str(&format!("\"0.{minor}\"")).unwrap();
+        assert!(parse_catalog_with_version(text, old).is_err());
+        assert_eq!(Engine::with_version(left.clone(), old).execute_catalog(&tree), Err(Error::Unsupported));
+    }
+    for unsupported in ["numeric(10,2)", "float", "date"] {
+        assert!(parse_catalog_with_version(&text.replace("n numeric", &format!("n {unsupported}")), v).is_err());
+    }
+    with_sql_parser_forbidden(|| {
+        Engine::with_version(left.clone(), v).execute_catalog_text(text).unwrap();
+        Engine::with_version(typed.clone(), v).execute_catalog(&tree).unwrap();
+    });
+    right.sql_session().execute("create table amounts(id bigint primary key,n numeric not null,opt numeric)", &[], None).unwrap();
+    assert_eq!(snapshot(&left), snapshot(&right));
+    assert_eq!(snapshot(&typed), snapshot(&right));
+    let catalog = snapshot(&left);
+    assert_eq!(catalog[0].columns[1], ("n".into(), DataType::Numeric, false));
+    assert_eq!(catalog[0].columns[2], ("opt".into(), DataType::Numeric, true));
+    for (id, number) in [(1, "9007199254740993.00100"), (2, "-0.00000000001")] {
+        let value = Value::Numeric(Numeric::parse(number).unwrap());
+        let bindings = Bindings::from([("n".into(), value.clone())]);
+        for admin in [&left, &typed] {
+            let result = with_sql_parser_forbidden(|| Engine::with_version(admin.clone(), LanguageVersion::Embedded015)
+                .execute_text(&format!("insert amounts set id={id},n=$n"), &bindings)).unwrap();
+            assert_eq!(result.affected, 1);
+        }
+        right.sql_session().execute(&format!("insert into amounts(id,n) values({id},$1)"), &[value], None).unwrap();
+    }
+    // The new profile retains the prior numeric parameter admission.
+    for admin in [&left, &typed] {
+        with_sql_parser_forbidden(|| Engine::with_version(admin.clone(), v).execute_text(
+            "update amounts where id=1 set opt=$n",
+            &Bindings::from([("n".into(), Value::Numeric(Numeric::parse("1.25").unwrap()))]),
+        )).unwrap();
+    }
+    right.sql_session().execute("update amounts set opt=1.25 where id=1", &[], None).unwrap();
+    assert_eq!(snapshot(&left), snapshot(&right));
+    assert_eq!(snapshot(&typed), snapshot(&right));
+    drop(left); drop(right); drop(typed);
+    let expected = reopen_observation(&right_db);
+    assert!(parity(&reopen_observation(&left_db), &expected));
+    assert!(parity(&reopen_observation(&tree_db), &expected));
+    let (_db, v2) = Database::fresh(StorageEngine::V2);
+    let engine = Engine::with_version(v2.clone(), v);
+    with_sql_parser_forbidden(|| {
+        for result in [engine.execute_catalog_text(text), engine.execute_catalog(&tree)] {
+            assert!(matches!(result, Err(Error::Core(message))
+                if message.contains("EngineUnsupported") && message.contains("v2")));
+        }
+    });
+    assert!(snapshot(&v2).is_empty());
+}

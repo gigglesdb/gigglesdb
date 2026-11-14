@@ -277,6 +277,11 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
+    if version != LanguageVersion::Embedded016
+        && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
+    {
+        return Err(Error::Unsupported);
+    }
     // Every name is checked before any definition strings are cloned.
     if !parser::semantic_identifier(table, version)
         || columns
@@ -331,6 +336,7 @@ fn lower_catalog_checked(
                     CatalogType::Int64 => giggles_core::relational::DataType::BigInt,
                     CatalogType::Text => giggles_core::relational::DataType::Text,
                     CatalogType::Bytes => giggles_core::relational::DataType::Bytes,
+                    CatalogType::Numeric => giggles_core::relational::DataType::Numeric,
                 },
                 not_null: !column.nullable,
             })
@@ -1259,7 +1265,7 @@ fn validate_parameter_admission(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if version != LanguageVersion::Embedded015
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);
@@ -1352,7 +1358,7 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if version != LanguageVersion::Embedded015
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);
