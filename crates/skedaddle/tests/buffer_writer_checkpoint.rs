@@ -628,3 +628,23 @@ async fn process_exit_after_h_recovers_and_admits_its_single_chunk_rows() {
     );
     assert!(writer.is_blocked());
 }
+
+#[tokio::test]
+async fn redelivery_export_is_stable_across_permuted_checkpoint_resume() {
+    let store = local();
+    let c = config();
+    let mut writer = open(store.clone(), c.clone()).await;
+    append(&mut writer, 1).await;
+    append(&mut writer, 2).await;
+    let canonical = writer.checkpoint().unwrap();
+    assert_eq!(canonical.redelivery.len(), 2);
+    drop(writer);
+    let mut legacy = canonical.clone();
+    legacy.redelivery.reverse();
+    for _ in 0..8 {
+        let (writer, _) = resume(store.clone(), c.clone(), legacy.clone())
+            .await
+            .unwrap();
+        assert_eq!(writer.checkpoint().unwrap(), canonical);
+    }
+}

@@ -336,7 +336,10 @@ struct RealStatus {
 }
 impl Status for RealStatus {
     fn readiness(&mut self, _: &Key) -> Result<()> {
-        assert_eq!(self.pg.sql("SELECT pg_is_in_recovery()::text")[0][0], "f");
+        assert_eq!(
+            self.pg.sql("SELECT pg_is_in_recovery()::text")[0][0],
+            "false"
+        );
         Ok(())
     }
     fn breached(&mut self, _: &Key) -> Result<bool> {
@@ -487,7 +490,7 @@ fn restore_without_journaled_reverse_proof_keeps_destination_fenced() {
             "SELECT rolcanlogin::text FROM pg_roles WHERE rolname={}",
             lit(&f.destination_role)
         ))[0][0],
-        "f"
+        "false"
     );
 }
 
@@ -565,7 +568,7 @@ fn abort_before_activation_restores_source() {
             "SELECT rolcanlogin::text FROM pg_roles WHERE rolname={}",
             lit(&f.source_role)
         ))[0][0],
-        "f"
+        "false"
     );
     f.target
         .connection

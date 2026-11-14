@@ -8,15 +8,9 @@ use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 const EXCLUDED_SENTINEL: &str = "D6_PRIVATE_SENTINEL_f4792cb08a954cfa";
 static LIVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct ChildGuard(Option<std::process::Child>);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+#[path = "support/child_capture.rs"]
+mod child_capture;
+use child_capture::CapturedChild as ChildGuard;
 async fn child_result(child: &mut ChildGuard) -> (i32, Value) {
     tokio::time::timeout(Duration::from_secs(60), async {
         while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
@@ -25,7 +19,7 @@ async fn child_result(child: &mut ChildGuard) -> (i32, Value) {
     })
     .await
     .expect("runner child did not join within 60s");
-    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    let output = child.output();
     assert_no_sentinel(&output.stdout);
     assert_no_sentinel(&output.stderr);
     let envelope = serde_json::from_slice(&output.stdout).expect("runner child envelope absent");
@@ -65,7 +59,7 @@ async fn cli_pause_requests_real_locked_owner_generation_in_second_process() {
     let id = initialize(&root, definition(&root), State::Copying).await;
     let control = root.join(format!("{id}.control"));
     fs::create_dir_all(&control).unwrap();
-    let mut child = ChildGuard(Some(
+    let mut child = ChildGuard::new(Some(
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -174,7 +168,7 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
         )
     }
     fn spawn(root: &std::path::Path, id: &str, command: &str, until: &str) -> ChildGuard {
-        ChildGuard(Some(
+        ChildGuard::new(Some(
             Command::new(env!("CARGO_BIN_EXE_skedaddle"))
                 .arg("--state-root")
                 .arg(root)
@@ -218,7 +212,7 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
             loop {
                 let state = invoke(&root, "status", &id).1;
                 if state["data"]["state"]["chunk_attempts"].as_object().is_some_and(|attempts| !attempts.is_empty()) { break; }
-                assert!(first.0.as_mut().unwrap().try_wait().unwrap().is_none(), "start exited before copy window");
+                first.assert_running("start exited before copy window");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
@@ -244,7 +238,7 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
                         previous = applied.clone();
                         break;
                     }
-                    assert!(running.0.as_mut().unwrap().try_wait().unwrap().is_none(), "resume exited before catchup");
+                    running.assert_running("resume exited before catchup");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }).await.unwrap();

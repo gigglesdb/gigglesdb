@@ -786,6 +786,19 @@ mod real_pg {
                     owner,
                 });
             }
+            // Match the runner prerequisite before either endpoint is fenced.
+            // The destination identity is also used by reverse setup; finalize's
+            // installation inventory owns both hooks and their shared schemas.
+            source.sql(
+                &skedaddle::pg::ddl::TriggerSql::new(&format!("{id}_forward"), 160000)
+                    .unwrap()
+                    .install,
+            );
+            destination.sql(
+                &skedaddle::pg::ddl::TriggerSql::new(&id, 160000)
+                    .unwrap()
+                    .install,
+            );
             let mut source_fence =
                 fence::Fence::new(fence_config(&source_role, tables[0].clone())).unwrap();
             source_fence

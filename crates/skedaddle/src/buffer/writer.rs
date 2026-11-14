@@ -879,6 +879,21 @@ impl BufferWriter {
                 }
             }
         }
+        // Canonical export only: stored checkpoints retain their original byte
+        // digests and readers continue accepting every prior vector order.
+        redelivery.sort_by(|a, b| {
+            let key = |r: &RetainedRedelivery| {
+                (
+                    r.source.engine.clone(),
+                    r.source.system_id.clone(),
+                    r.source.lineage.clone(),
+                    r.source.db_name.clone(),
+                    r.source.slot.clone(),
+                    r.txn.0.clone(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
         Ok(WriterCheckpoint {
             version: format::CHECKPOINT_VERSION,
             next_mseq: self.next_mseq,

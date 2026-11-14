@@ -105,15 +105,9 @@ async fn verify_real_unreachable_endpoint_returns_sanitized_infrastructure_six()
     assert!(status["data"]["state"]["verification"].is_null());
 }
 
-struct Child(Option<std::process::Child>);
-impl Drop for Child {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+#[path = "support/child_capture.rs"]
+mod child_capture;
+use child_capture::CapturedChild as Child;
 #[test]
 fn control_owner_process_fixture() {
     let Some(path) = std::env::var_os("SKEDADDLE_VERIFY_CONTROL_FIXTURE") else {
@@ -173,7 +167,7 @@ async fn real_owner_lock_verify_request_and_pause_round_trip_preserves_journal()
     let id = initialize(&root, definition(&root)).await;
     let control = root.join(format!("{id}.control"));
     fs::create_dir_all(&control).unwrap();
-    let mut child = Child(Some(
+    let mut child = Child::new(Some(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "control_owner_process_fixture", "--nocapture"])
             .env("SKEDADDLE_VERIFY_CONTROL_FIXTURE", &control)
@@ -264,7 +258,7 @@ async fn live_owner_verifies_then_reports_direct_destination_corruption_and_paus
     }
     let id = initialize(&root, value).await;
     let proof = AssertUnwindSafe(async {
-        let mut owner = Child(Some(
+        let mut owner = Child::new(Some(
             Command::new(env!("CARGO_BIN_EXE_skedaddle"))
                 .arg("--state-root")
                 .arg(&root)
@@ -280,10 +274,7 @@ async fn live_owner_verifies_then_reports_direct_destination_corruption_and_paus
                 if status["data"]["state"]["lifecycle"]["state"] == "catching-up" {
                     break;
                 }
-                assert!(
-                    owner.0.as_mut().unwrap().try_wait().unwrap().is_none(),
-                    "owner exited before CatchingUp"
-                );
+                owner.assert_running("owner exited before CatchingUp");
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -333,7 +324,7 @@ async fn live_owner_verifies_then_reports_direct_destination_corruption_and_paus
         })
         .await
         .expect("pause did not join owner");
-        let output = owner.0.take().unwrap().wait_with_output().unwrap();
+        let output = owner.output();
         assert!(output.status.success());
     })
     .catch_unwind()

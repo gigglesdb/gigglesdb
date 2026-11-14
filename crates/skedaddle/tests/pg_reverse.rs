@@ -853,11 +853,15 @@ fn no_replication_loop_either_direction() {
     // production option is asserted on both START_REPLICATION commands above.
     for reverse in [false, true] {
         let (pg, slot, origin) = if reverse {
-            (&mut f.source, format!("{}_fwd", f.id), f.config.origin())
+            (
+                &mut f.source,
+                format!("{}_fwd_filter", f.id),
+                f.config.origin(),
+            )
         } else {
             (
                 &mut f.destination,
-                f.config.slot(),
+                format!("{}_rev_filter", f.id),
                 format!("skedaddle_{}", f.id),
             )
         };
@@ -866,11 +870,10 @@ fn no_replication_loop_either_direction() {
             "CREATE PUBLICATION {publication} FOR TABLE {}.rows",
             f.id
         ));
-        if reverse {
-            pg.sql(&format!(
-                "SELECT pg_create_logical_replication_slot('{slot}','pgoutput')"
-            ));
-        }
+        // The filter publication must precede this probe slot's historic snapshot.
+        pg.sql(&format!(
+            "SELECT pg_create_logical_replication_slot('{slot}','pgoutput')"
+        ));
         if !reverse {
             pg.sql(&format!("SELECT pg_replication_origin_create('{origin}')"));
         }
@@ -878,9 +881,8 @@ fn no_replication_loop_either_direction() {
         let rows = pg.sql(&format!("SELECT count(*)::text FROM pg_logical_slot_get_binary_changes('{slot}',NULL,NULL,'proto_version','1','publication_names','{publication}','origin','none') WHERE get_byte(data,0)=73"));
         assert_eq!(rows[0][0], "1");
         pg.sql(&format!("DROP PUBLICATION {publication}"));
-        if reverse {
-            pg.sql(&format!("SELECT pg_drop_replication_slot('{slot}')"));
-        } else {
+        pg.sql(&format!("SELECT pg_drop_replication_slot('{slot}')"));
+        if !reverse {
             pg.sql(&format!("SELECT pg_replication_origin_drop('{origin}')"));
         }
     }

@@ -181,6 +181,42 @@ impl Drop for ConstructionGuard {
     }
 }
 
+struct Probe {
+    client: tokio_postgres::Client,
+    runtime: tokio::runtime::Runtime,
+}
+impl Probe {
+    fn connect(dsn: &str) -> Self {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (client, connection) = runtime.block_on(tls_connect(dsn)).unwrap();
+        runtime.spawn(async move {
+            let _ = connection.await;
+        });
+        Self { client, runtime }
+    }
+}
+impl Connection for Probe {
+    fn query(&mut self, sql: &str, timeout: Duration) -> Result<Rows, String> {
+        self.runtime.block_on(async {
+            let messages = tokio::time::timeout(timeout, self.client.simple_query(sql))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            Ok(messages
+                .into_iter()
+                .filter_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|i| row.get(i).unwrap_or("").to_owned())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect())
+        })
+    }
+}
+
 struct Fixture {
     db: Psql,
     fence: Fence,
@@ -427,7 +463,16 @@ fn in_flight_txn_drained_or_blocks() {
     // Deliberately delay termination to prove the drain independently blocks.
     f.fence.next = Step::Drain;
     f.fence.config.deadline_ms = 500;
-    assert!(matches!(f.step(), Err(FenceError::DrainBlocked(_))));
+    let mut probe = Probe::connect(&f.db.dsn);
+    f.wait_for_app_transaction();
+    let result = f
+        .fence
+        .execute_next(&mut probe, &mut |_| Ok(()), &mut || Ok(()));
+    eprintln!("in-flight persistent drain: {result:?}");
+    assert!(
+        matches!(result, Err(FenceError::DrainBlocked(_))),
+        "{result:?}"
+    );
     assert!(f.fence.drain_lsn.is_none());
     f.fence.next = Step::Terminate;
     f.fence.config.deadline_ms = 5_000;
@@ -451,7 +496,11 @@ fn prepared_xact_blocks() {
     f.db.sql(&format!("BEGIN; SET LOCAL ROLE {}; INSERT INTO {}.items VALUES(1,'prepared'); PREPARE TRANSACTION '{gid}';", f.app, f.schema));
     f.through(Step::Drain);
     f.fence.config.deadline_ms = 500;
-    let result = f.step();
+    let mut probe = Probe::connect(&f.db.dsn);
+    let result = f
+        .fence
+        .execute_next(&mut probe, &mut |_| Ok(()), &mut || Ok(()));
+    eprintln!("prepared persistent drain: {result:?}");
     assert!(
         matches!(result, Err(FenceError::DrainBlocked(ref rows)) if rows.iter().any(|r| r.get(1) == Some(&gid))),
         "{result:?}"
