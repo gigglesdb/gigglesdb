@@ -42,6 +42,24 @@ fn outcome(
         .map_err(|e| StateError(e.to_string()))
 }
 impl StateMachine for gr::ReplicaStore {
+    fn checkpoint(&self, target: &Path) -> Result<AppliedPosition, StateError> {
+        let before = self.applied().map_err(|e| StateError(e.to_string()))?;
+        gr::ReplicaStore::checkpoint(self, target).map_err(|e| StateError(e.to_string()))?;
+        if self.applied().map_err(|e| StateError(e.to_string()))? != before {
+            return Err(StateError(
+                "applied position changed during checkpoint".into(),
+            ));
+        }
+        Ok(before
+            .map(Into::into)
+            .unwrap_or(AppliedPosition { index: 0, term: 0 }))
+    }
+    fn install(&self, _: &Path) -> Result<AppliedPosition, StateError> {
+        Err(StateError("install needs a StoreSlot".into()))
+    }
+    fn flush(&self) -> Result<(), StateError> {
+        gr::ReplicaStore::flush(self).map_err(|e| StateError(e.to_string()))
+    }
     fn applied(&self) -> Result<Option<AppliedPosition>, StateError> {
         self.applied()
             .map(|p| p.map(Into::into))
@@ -150,6 +168,24 @@ pub fn engine_opener(
     Box::new(move |term| {
         let sink = Arc::new(TermSink::new(handle.clone(), term));
         let admin = store
+            .open_admin(sink.clone(), limits, write_set_bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(ReplicatedEngine { admin, sink, term })
+    })
+}
+
+/// Open each leadership engine on the store currently installed in the slot.
+pub fn slot_engine_opener(
+    slot: Arc<crate::store_slot::StoreSlot>,
+    handle: ReplicaHandle,
+    limits: giggles_core::Limits,
+    write_set_bytes: usize,
+) -> Box<dyn FnMut(u64) -> Result<ReplicatedEngine, String> + Send> {
+    Box::new(move |term| {
+        let sink = Arc::new(TermSink::new(handle.clone(), term));
+        let admin = slot
+            .current()
+            .map_err(|e| e.to_string())?
             .open_admin(sink.clone(), limits, write_set_bytes)
             .map_err(|e| e.to_string())?;
         Ok(ReplicatedEngine { admin, sink, term })

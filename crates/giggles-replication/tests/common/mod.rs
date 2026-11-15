@@ -1,9 +1,15 @@
+pub mod certs;
 use giggles_replication::{
-    error::Result, log_store::LogStore, node::Replica, state::MemStateMachine,
+    error::Result,
+    log_store::LogStore,
+    node::Replica,
+    snapshot::{Manifest, SnapshotStore},
+    state::MemStateMachine,
 };
 use raft::{StateRole, eraftpb::Message};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
@@ -110,9 +116,43 @@ impl Cluster {
             }
             // Deliver duplicates directly: never recursively duplicate a queued duplicate.
             let copies = 1 + usize::from(self.rand() % 100 < self.faults.1);
+            let snapshot = !m.get_snapshot().is_empty();
+            if snapshot {
+                let manifest = Manifest::from_raft(CLUSTER, m.get_snapshot()).unwrap();
+                let sender = self.nodes[&m.from].log().snapshots().unwrap();
+                let dir = sender.built_data_dir(&manifest);
+                let receiver = self.nodes[&m.to].log().snapshots().unwrap();
+                // A duplicate message may refer to data already transferred.
+                if receiver
+                    .take_incoming(manifest.index, manifest.term)
+                    .is_none()
+                {
+                    let mut writer = receiver.incoming(&manifest).unwrap();
+                    for (i, f) in manifest.files.iter().enumerate() {
+                        let mut file = std::fs::File::open(dir.join(&f.name)).unwrap();
+                        let mut buf = [0; 65536];
+                        let mut offset = 0;
+                        loop {
+                            let n = file.read(&mut buf).unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            writer.write_chunk(i as u32, offset, &buf[..n]).unwrap();
+                            offset += n as u64;
+                        }
+                    }
+                    writer.finish().unwrap();
+                }
+            }
             let node = self.nodes.get_mut(&m.to).unwrap();
             for _ in 0..copies {
                 node.step(m.from, m.clone()).expect("step");
+            }
+            if snapshot {
+                self.nodes
+                    .get_mut(&m.from)
+                    .unwrap()
+                    .report_snapshot(m.to, true);
             }
         }
         panic!("message schedule did not quiesce");
@@ -177,10 +217,37 @@ impl Cluster {
     }
     pub fn restart(&mut self, id: u64) {
         assert!(!self.nodes.contains_key(&id));
-        let log = LogStore::open(&self.root.join(id.to_string()), CLUSTER, id).unwrap();
+        let mut log = LogStore::open(&self.root.join(id.to_string()), CLUSTER, id).unwrap();
+        log.attach_snapshots(Arc::new(
+            SnapshotStore::open(&self.root.join(format!("{id}-snap")), CLUSTER).unwrap(),
+        ));
         let mut node = Replica::new(log, self.states[&id].clone(), &self.voters).unwrap();
         node.set_election_timeout(10 + id as usize);
         self.nodes.insert(id, node);
+    }
+    #[allow(dead_code)]
+    pub fn snapshot(&mut self, id: u64) -> Manifest {
+        self.nodes
+            .get_mut(&id)
+            .unwrap()
+            .build_snapshot()
+            .unwrap()
+            .unwrap()
+    }
+    #[allow(dead_code)]
+    pub fn compact(&mut self, id: u64, margin: u64) -> Option<u64> {
+        self.nodes
+            .get_mut(&id)
+            .unwrap()
+            .compact_log(margin)
+            .unwrap()
+    }
+    #[allow(dead_code)]
+    pub fn wipe(&mut self, id: u64) {
+        self.crash(id);
+        std::fs::remove_dir_all(self.root.join(id.to_string())).unwrap();
+        std::fs::remove_dir_all(self.root.join(format!("{id}-snap"))).unwrap();
+        self.states.insert(id, Arc::new(MemStateMachine::new()));
     }
     pub fn assert_equal(&mut self) {
         self.pump();

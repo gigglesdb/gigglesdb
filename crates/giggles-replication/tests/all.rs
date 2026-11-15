@@ -52,3 +52,22 @@ mod node;
 mod role;
 #[path = "sink.rs"]
 mod sink;
+#[path = "snapshot.rs"]
+mod snapshot;
+#[path = "store_slot.rs"]
+mod store_slot;
+
+#[path = "snapshot_node.rs"]
+mod snapshot_node;
+
+#[path = "snapshot_policy.rs"]
+mod snapshot_policy;
+#[path = "transport_frame.rs"]
+mod transport_frame;
+#[path = "transport_runtime.rs"]
+mod transport_runtime;
+#[path = "transport_snapshot.rs"]
+mod transport_snapshot;
+
+#[path = "cluster_net.rs"]
+mod cluster_net;

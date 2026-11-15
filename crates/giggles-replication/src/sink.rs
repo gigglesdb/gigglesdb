@@ -4,7 +4,7 @@ use crate::{
     error::Error,
     node::{Replica, RoleInfo},
 };
-use raft::{StateRole, eraftpb::Message};
+use raft::{StateRole, Storage, eraftpb::Message};
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
@@ -41,6 +41,7 @@ enum Command {
     Propose(Vec<u8>, Reply<()>),
     Read(Reply<u64>),
     Step(u64, Message),
+    ReportSnapshot(u64, bool),
     Shutdown,
 }
 #[derive(Clone)]
@@ -68,6 +69,9 @@ impl ReplicaHandle {
     pub fn step(&self, from: u64, m: Message) {
         let _ = self.tx.send(Command::Step(from, m));
     }
+    pub fn report_snapshot(&self, to: u64, ok: bool) {
+        let _ = self.tx.send(Command::ReportSnapshot(to, ok));
+    }
     pub fn role(&self) -> RoleInfo {
         *self.role.lock().expect("role mutex poisoned")
     }
@@ -82,10 +86,34 @@ impl ReplicaHandle {
     }
 }
 
+/// Snapshot cadence and retained log entries for followers close behind.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapshotPolicy {
+    pub every_entries: u64,
+    pub margin: u64,
+}
+impl Default for SnapshotPolicy {
+    fn default() -> Self {
+        Self {
+            every_entries: 10_000,
+            margin: 1_000,
+        }
+    }
+}
+
 pub fn spawn(
+    replica: Replica,
+    outbox: Box<dyn Outbox>,
+    tick: Duration,
+) -> (ReplicaHandle, thread::JoinHandle<()>) {
+    spawn_with_policy(replica, outbox, tick, None)
+}
+
+pub fn spawn_with_policy(
     mut replica: Replica,
     mut outbox: Box<dyn Outbox>,
     tick: Duration,
+    policy: Option<SnapshotPolicy>,
 ) -> (ReplicaHandle, thread::JoinHandle<()>) {
     assert!(!tick.is_zero(), "tick interval must be positive");
     let (tx, rx) = mpsc::channel();
@@ -99,6 +127,9 @@ pub fn spawn(
     let rounds = handle.rounds.clone();
     let stopped = handle.stopped.clone();
     let join = thread::spawn(move || {
+        let mut build: Option<thread::JoinHandle<crate::error::Result<crate::snapshot::Manifest>>> =
+            None;
+        let mut compacted_snapshot = 0;
         let mut barrier = ReadBarrier::new(replica.node_id(), 5);
         let mut pending: HashMap<u64, Reply<()>> = HashMap::new();
         let mut read_indexes = BTreeSet::new();
@@ -125,6 +156,7 @@ pub fn spawn(
                     Ok(Command::Step(from, m)) => {
                         let _ = replica.step(from, m);
                     }
+                    Ok(Command::ReportSnapshot(to, ok)) => replica.report_snapshot(to, ok),
                     Ok(Command::Propose(batch, reply)) => {
                         seq = seq.checked_add(1).expect("proposal sequence exhausted");
                         match replica.propose(&batch, seq) {
@@ -189,6 +221,59 @@ pub fn spawn(
                     }
                 }
             }
+            if let Some(policy) = policy {
+                if build.as_ref().is_some_and(|job| job.is_finished()) {
+                    match build.take().unwrap().join() {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => eprintln!("snapshot build failed: {e}"),
+                        Err(_) => eprintln!("snapshot build thread panicked"),
+                    }
+                }
+                if let Some(snapshots) = replica.log().snapshots().cloned() {
+                    let last = snapshots.latest().map_or(0, |m| m.index);
+                    if last > compacted_snapshot {
+                        match replica.compact_log(policy.margin) {
+                            Ok(_) => compacted_snapshot = last,
+                            Err(e) => eprintln!("snapshot compaction failed: {e}"),
+                        }
+                    }
+                    if build.is_none()
+                        && replica.applied_index() != 0
+                        && replica.applied_index().saturating_sub(last) >= policy.every_entries
+                    {
+                        let result = (|| -> crate::error::Result<_> {
+                            let index = replica.applied_index();
+                            let term = replica.log().term(index).map_err(Error::Raft)?;
+                            let stage = snapshots.staging_dir(index, term);
+                            let prepared = replica.prepare_snapshot(&stage);
+                            match prepared {
+                                Ok(Some((index, term, voters))) => {
+                                    Ok(Some(thread::spawn(move || {
+                                        let result = snapshots.build(index, term, &voters, |dir| {
+                                            std::fs::rename(&stage, dir)?;
+                                            Ok(())
+                                        });
+                                        if stage.exists() {
+                                            let _ = std::fs::remove_dir_all(stage);
+                                        }
+                                        result
+                                    })))
+                                }
+                                other => {
+                                    if stage.exists() {
+                                        let _ = std::fs::remove_dir_all(stage);
+                                    }
+                                    other.map(|_| None)
+                                }
+                            }
+                        })();
+                        match result {
+                            Ok(job) => build = job,
+                            Err(e) => eprintln!("snapshot preparation failed: {e}"),
+                        }
+                    }
+                }
+            }
             published = out.role;
             *role.lock().expect("role mutex poisoned") = published;
         }
@@ -204,7 +289,24 @@ pub fn spawn(
         for reply in barrier.fail_all() {
             let _ = reply.send(Err(ReplicateError::Stopped));
         }
+        if let Some(job) = build {
+            match job.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("snapshot build failed: {e}"),
+                Err(_) => eprintln!("snapshot build thread panicked"),
+            }
+        }
         // Dropping rx also drops replies on commands still queued at shutdown.
     });
     (handle, join)
+}
+
+impl crate::transport::PeerSink for ReplicaHandle {
+    fn deliver(&self, from: u64, message: Message) {
+        self.step(from, message);
+    }
+
+    fn snapshot_status(&self, to: u64, ok: bool) {
+        self.report_snapshot(to, ok);
+    }
 }

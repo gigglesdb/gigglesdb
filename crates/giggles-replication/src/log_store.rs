@@ -1,8 +1,9 @@
 use crate::error::{Error, Result};
+use crate::snapshot::SnapshotStore;
 use protobuf::Message;
 use raft::{GetEntriesContext, RaftState, Storage, StorageError, eraftpb::*};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
@@ -12,6 +13,7 @@ type EntriesTable = redb::ReadOnlyTable<u64, &'static [u8]>;
 pub struct LogStore {
     db: Database,
     identity: ([u8; 16], u64),
+    snapshots: Option<Arc<SnapshotStore>>,
 }
 fn decode<T: Message + Default>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -54,7 +56,14 @@ impl LogStore {
         Ok(Self {
             db,
             identity: (cluster, node_id),
+            snapshots: None,
         })
+    }
+    pub fn attach_snapshots(&mut self, s: Arc<SnapshotStore>) {
+        self.snapshots = Some(s);
+    }
+    pub fn snapshots(&self) -> Option<&Arc<SnapshotStore>> {
+        self.snapshots.as_ref()
     }
     fn view(&self) -> Result<(EntriesTable, StateTable)> {
         let tx = self.db.begin_read()?;
@@ -276,7 +285,11 @@ impl Storage for LogStore {
         })()
         .map_err(raft_error)
     }
-    fn snapshot(&self, _: u64, _: u64) -> raft::Result<Snapshot> {
-        Err(StorageError::SnapshotTemporarilyUnavailable.into())
+    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
+        self.snapshots
+            .as_ref()
+            .and_then(|s| s.latest_snapshot())
+            .filter(|s| s.get_metadata().index >= request_index)
+            .ok_or_else(|| StorageError::SnapshotTemporarilyUnavailable.into())
     }
 }
