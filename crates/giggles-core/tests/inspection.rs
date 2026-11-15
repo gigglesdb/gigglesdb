@@ -64,6 +64,7 @@ fn inspection_reports_shared_metadata_without_sql_or_generation_changes() {
                 name: "id".into(),
                 data_type: DataType::Integer,
                 not_null: true,
+                default: None, generated: None,
             }],
             primary_key: vec!["id".into()],
         })

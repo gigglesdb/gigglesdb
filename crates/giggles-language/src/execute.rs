@@ -755,6 +755,8 @@ fn lower_column(column: &ColumnSpec) -> operations::ColumnSpec {
             CatalogType::Numeric => giggles_core::relational::DataType::Numeric,
         },
         not_null: !column.nullable,
+        default: None,
+        generated: None,
     }
 }
 

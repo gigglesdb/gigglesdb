@@ -2508,18 +2508,30 @@ impl SqlSession {
         }
         result
     }
+    #[cfg(all(test, feature = "engine-rocksdb"))]
     pub(crate) fn create_table_engine(
         &mut self,
         name: String,
         columns: Vec<relational::ColumnDef>,
         keys: Vec<String>,
     ) -> Result<(), CoreError> {
+        let len = columns.len();
+        self.create_table_defaults_engine(name, columns, keys, vec![None; len], vec![None; len])
+    }
+    pub(crate) fn create_table_defaults_engine(
+        &mut self,
+        name: String,
+        columns: Vec<relational::ColumnDef>,
+        keys: Vec<String>,
+        defaults: Vec<Option<String>>,
+        sequences: Vec<Option<relational::defaults::SequenceSpec>>,
+    ) -> Result<(), CoreError> {
         if let Backend::V2(db) = &self.admin.inner.backend {
             let domain = u128::from_be_bytes(db.meta.domain);
             let result = (|| {
                 self.catalog_empty_engine()?;
-                let mut prepared = relational::Prepared::create_engine(
-                    name, columns, keys, domain, &relational::Relational::default(),
+                let mut prepared = relational::Prepared::create_defaults_engine(
+                    name, columns, keys, defaults, sequences, domain, &relational::Relational::default(),
                 ).map_err(CoreError::Sql)?;
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None).map(|_| ())
@@ -2532,7 +2544,7 @@ impl SqlSession {
         // caller's eligibility/definition snapshot and final decision fence.
         self.snapshot_identity_engine()?;
         self.execute_engine(
-            |domain, state| relational::Prepared::create_engine(name, columns, keys, domain, state),
+            |domain, state| relational::Prepared::create_defaults_engine(name, columns, keys, defaults, sequences, domain, state),
             None,
         )
         .map(|_| ())

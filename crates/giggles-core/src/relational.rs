@@ -22,7 +22,7 @@ mod user_types;
 pub use user_types::{
     TypeDef, UserTypeCatalog, take_sql_error_message, take_sql_notices, type_oid,
 };
-mod defaults;
+pub(crate) mod defaults;
 pub use clock::StatementClock;
 #[allow(dead_code)]
 pub(crate) mod catalog_ext;
@@ -1888,6 +1888,14 @@ impl Prepared {
         domain: u128,
         state: &Relational,
     ) -> R<Self> {
+        let len = columns.len();
+        Self::create_defaults_engine(name, columns, keys, vec![None; len], vec![None; len], domain, state)
+    }
+    pub(crate) fn create_defaults_engine(
+        name: String, columns: Vec<ColumnDef>, keys: Vec<String>,
+        defaults: Vec<Option<String>>, sequences: Vec<Option<defaults::SequenceSpec>>,
+        domain: u128, state: &Relational,
+    ) -> R<Self> {
         // These names did not pass through a text parser. Require canonical
         // spelling before applying the shared reserved/definition checks.
         let native_name = |value: &str| {
@@ -1945,8 +1953,8 @@ impl Prepared {
                 optional: false,
                 user_types: vec![None; columns.len()],
                 typmods: vec![None; columns.len()],
-                defaults: vec![None; columns.len()],
-                sequences: vec![None; columns.len()],
+                defaults,
+                sequences,
                 columns,
                 keys,
                 constraints: vec![],

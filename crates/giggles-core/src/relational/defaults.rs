@@ -557,7 +557,7 @@ pub(super) fn execute_sequence(state: &mut Relational, ddl: &SequenceDdl) -> R<u
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct SequenceSpec {
+pub(crate) struct SequenceSpec {
     pub identity: Option<bool>,
     data_type: Option<DataType>,
     start: Option<i64>,
@@ -573,6 +573,11 @@ pub(super) struct SequenceSpec {
     owned_by_error: Option<SqlError>,
 }
 impl SequenceSpec {
+    pub(crate) fn serial() -> Self { Self::default() }
+    pub(crate) fn identity_default(always: bool) -> Self {
+        Self { identity: Some(always), ..Self::default() }
+    }
+
     fn rewrites_counter(&self) -> bool {
         self.data_type.is_some()
             || self.start.is_some()
@@ -1181,6 +1186,60 @@ fn expression(p: &mut Parser, depth: usize) -> R<Expression> {
         value = Expression::Cast(Box::new(value), cast_type(p)?);
     }
     Ok(value)
+}
+
+/// Lower a typed native default through the SQL default validator and canonicalizer.
+pub(crate) fn native_default(default: &crate::operations::ColumnDefault, target: &DataType) -> R<String> {
+    use crate::operations::{ColumnDefault, ClockDefault};
+    let number = |text: String| {
+        if let Some(positive) = text.strip_prefix('-') {
+            Expression::Negative(Box::new(Expression::Number(positive.into())))
+        } else { Expression::Number(text) }
+    };
+    let cast = |text: String, ty| Expression::Cast(Box::new(Expression::String(text)), ty);
+    let value = match default {
+        ColumnDefault::Nextval(name) => Expression::Sequence(name.clone()),
+        ColumnDefault::Value(value) => match value {
+            Value::Null => Expression::Null,
+            Value::Bool(b) => Expression::Boolean(*b),
+            Value::Int(n) => number(n.to_string()),
+            Value::Numeric(n) => {
+                let text = n.to_string();
+                if matches!(text.as_str(), "NaN" | "Infinity" | "-Infinity") { cast(text, DataType::Numeric) }
+                else { number(text) }
+            }
+            Value::Text(v) => cast(v.clone(), DataType::Text),
+            Value::Bytes(v) => {
+                let mut text = String::from("\\x");
+                for byte in v { text.push_str(&format!("{byte:02x}")); }
+                cast(text, DataType::Bytes)
+            }
+            Value::Float4(v) => cast(v.to_text(), DataType::Real),
+            Value::Float8(v) => cast(v.to_text(), DataType::DoublePrecision),
+            Value::Date(v) => cast(v.to_string(), DataType::Date),
+            Value::Time(v) => cast(v.to_string(), DataType::Time),
+            Value::TimeTz(v) => cast(v.to_string(), DataType::TimeTz),
+            Value::Timestamp(v) => cast(v.to_string(), DataType::Timestamp),
+            Value::TimestampTz(v) => cast(v.to_string(), DataType::TimestampTz),
+            Value::Interval(v) => cast(v.to_string(), DataType::Interval),
+        },
+        ColumnDefault::Clock(clock) => {
+            let (name, ty, precision) = match clock {
+                ClockDefault::Now => ("now()", DataType::TimestampTz, None),
+                ClockDefault::TransactionTimestamp => ("transaction_timestamp()", DataType::TimestampTz, None),
+                ClockDefault::StatementTimestamp => ("statement_timestamp()", DataType::TimestampTz, None),
+                ClockDefault::ClockTimestamp => ("clock_timestamp()", DataType::TimestampTz, None),
+                ClockDefault::CurrentDate => ("CURRENT_DATE", DataType::Date, None),
+                ClockDefault::CurrentTime(p) => ("CURRENT_TIME", DataType::TimeTz, *p),
+                ClockDefault::CurrentTimestamp(p) => ("CURRENT_TIMESTAMP", DataType::TimestampTz, *p),
+                ClockDefault::LocalTime(p) => ("LOCALTIME", DataType::Time, *p),
+                ClockDefault::LocalTimestamp(p) => ("LOCALTIMESTAMP", DataType::Timestamp, *p),
+            };
+            Expression::Clock(precision.map_or_else(|| name.into(), |p| format!("{name}({})", p.min(6))), ty)
+        }
+    };
+    query::InsertExpressions::default_value(&value.sql(), target, None, false)?;
+    value.canonical(target)
 }
 
 pub(super) fn parse(p: &mut Parser, target: &DataType) -> R<String> {

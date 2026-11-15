@@ -435,3 +435,5 @@ mod native_views;
 
 #[path = "typed_read_qualified.rs"] mod typed_read_qualified;
 #[path = "native_numeric_assignment.rs"] mod native_numeric_assignment;
+
+#[path = "native_create_defaults.rs"] mod native_create_defaults;

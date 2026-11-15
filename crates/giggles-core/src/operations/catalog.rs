@@ -22,6 +22,18 @@ pub struct ColumnSpec {
     pub name: String,
     pub data_type: DataType,
     pub not_null: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<ColumnDefault>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<Generated>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColumnDefault { Value(Value), Clock(ClockDefault), Nextval(String) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClockDefault {
+    Now, TransactionTimestamp, StatementTimestamp, ClockTimestamp, CurrentDate,
+    CurrentTime(Option<u32>), CurrentTimestamp(Option<u32>),
+    LocalTime(Option<u32>), LocalTimestamp(Option<u32>),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,8 +48,10 @@ fn strict_alter_column<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::R
     #[serde(deny_unknown_fields)]
     struct Column { name: String, data_type: DataType, not_null: bool }
     let Column { name, data_type, not_null } = Column::deserialize(d)?;
-    Ok(ColumnSpec { name, data_type, not_null })
+    Ok(ColumnSpec { name, data_type, not_null, default: None, generated: None })
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Generated { IdentityAlways, IdentityByDefault, Serial }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum CatalogRequest {
     CreateTable {
@@ -175,7 +189,7 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
             id: 0,
             name: column.name.clone(),
             data_type: column.data_type.clone(),
-            not_null: column.not_null,
+            not_null: column.not_null || column.generated.is_some(),
         })
         .collect()
 }
@@ -303,11 +317,32 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
             .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))?;
         // This explicit catalog intent rejects nullable PK annotations. SQL's
         // parsed CREATE continues to strengthen primary-key columns itself.
-        if !column.not_null {
+        if !column.not_null && column.generated.is_none() {
             return Err(Error::Type);
         }
     }
+    native_options(columns)?;
     Ok(())
+}
+fn native_options(columns: &[ColumnSpec]) -> Result<(Vec<Option<String>>, Vec<Option<crate::relational::defaults::SequenceSpec>>)> {
+    use crate::relational::defaults::{native_default, SequenceSpec};
+    let mut defaults = Vec::with_capacity(columns.len());
+    let mut sequences = Vec::with_capacity(columns.len());
+    for column in columns {
+        if column.default.is_some() && column.generated.is_some() {
+            return Err(core(CoreError::Sql(SqlError::Syntax)));
+        }
+        if column.generated.is_some() && !matches!(column.data_type, DataType::SmallInt | DataType::Integer | DataType::BigInt) {
+            return Err(core(CoreError::Sql(SqlError::InvalidParameterValue)));
+        }
+        defaults.push(column.default.as_ref().map(|d| native_default(d, &column.data_type)).transpose().map_err(|e| core(CoreError::Sql(e)))?);
+        sequences.push(column.generated.map(|g| match g {
+            Generated::Serial => SequenceSpec::serial(),
+            Generated::IdentityAlways => SequenceSpec::identity_default(true),
+            Generated::IdentityByDefault => SequenceSpec::identity_default(false),
+        }));
+    }
+    Ok((defaults, sequences))
 }
 fn bind_catalog(
     session: &mut SqlSession,
@@ -502,11 +537,13 @@ impl Engine {
                 else {
                     unreachable!()
                 };
+                let (defaults, sequences) = native_options(columns)?;
                 session
-                    .create_table_engine(
+                    .create_table_defaults_engine(
                         session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?,
                         columns_for_create(columns),
                         primary_key.clone(),
+                        defaults, sequences,
                     )
                     .map_err(core)?;
                 table_name = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;

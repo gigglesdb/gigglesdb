@@ -5,7 +5,7 @@ fn request(table: &str, action: A) -> CatalogRequest {
     CatalogRequest::AlterTable { table: table.into(), action }
 }
 fn add(name: &str) -> A {
-    A::AddColumn { column: ColumnSpec { name: name.into(), data_type: DataType::Integer, not_null: false } }
+    A::AddColumn { column: ColumnSpec { name: name.into(), data_type: DataType::Integer, not_null: false, default: None, generated: None } }
 }
 fn snapshot(admin: &Admin) -> String {
     let mut p = admin.catalog_presentation().unwrap();

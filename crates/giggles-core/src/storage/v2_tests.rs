@@ -1033,7 +1033,7 @@ fn native_catalog_publication_and_fences() {
     use relational::{DataType, with_sql_parser_forbidden};
     let create = |name: &str| CatalogRequest::CreateTable {
         table: name.into(),
-        columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true }],
+        columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true, default: None, generated: None }],
         primary_key: vec!["id".into()],
     };
     for backend in [Engine::Legacy, Engine::V2] {

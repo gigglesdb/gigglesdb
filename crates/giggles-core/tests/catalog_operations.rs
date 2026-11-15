@@ -21,6 +21,7 @@ fn column(name: &str, data_type: DataType, not_null: bool) -> ColumnSpec {
         name: name.into(),
         data_type,
         not_null,
+                default: None, generated: None,
     }
 }
 fn create(name: &str) -> CatalogRequest {

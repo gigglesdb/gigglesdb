@@ -20,7 +20,7 @@ fn key(id: i64) -> Expr {
 }
 fn create(table: &str) -> CatalogRequest {
     CatalogRequest::CreateTable { table: table.into(),
-        columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true }],
+        columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true, default: None, generated: None }],
         primary_key: vec!["id".into()] }
 }
 fn ids(engine: &Engine, table: &str) -> Vec<V> {

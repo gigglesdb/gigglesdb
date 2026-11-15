@@ -53,11 +53,13 @@ fn request() -> CatalogRequest {
                 name: "id".into(),
                 data_type: DataType::BigInt,
                 not_null: true,
+                default: None, generated: None,
             },
             ColumnSpec {
                 name: "label".into(),
                 data_type: DataType::Text,
                 not_null: false,
+                default: None, generated: None,
             },
         ],
         primary_key: vec!["id".into()],
