@@ -413,3 +413,8 @@ mod native_typed_params;
 #[path = "native_savepoints.rs"] mod native_savepoints;
 #[path = "typed_subquery_read.rs"] mod typed_subquery_read;
 #[path = "typed_insert_select.rs"] mod typed_insert_select;
+#[path = "alter_drop_column_views.rs"]
+mod alter_drop_column_views;
+
+#[path = "native_alter_table.rs"]
+mod native_alter_table;

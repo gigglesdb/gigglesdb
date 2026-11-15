@@ -10,7 +10,7 @@ pub(super) struct AlterTable {
 #[derive(Debug, Clone)]
 pub(super) enum Action {
     Add(ColumnDef, Option<i32>, Option<String>, Option<SqlError>),
-    Drop(String, bool),
+    Drop(String, bool, bool),
     RenameColumn(String, String),
     RenameTable(String),
     Default(String, Option<String>),
@@ -138,7 +138,10 @@ pub(super) fn parse(p: &mut Parser) -> R<AlterTable> {
                 if optional {
                     p.need("exists")?;
                 }
-                Action::Drop(raw_name(p)?, optional)
+                let name = raw_name(p)?;
+                let cascade = p.word("cascade");
+                if !cascade { p.word("restrict"); }
+                Action::Drop(name, optional, cascade)
             }
         } else if p.word("rename") {
             if p.word("to") {
@@ -354,12 +357,13 @@ pub(super) fn execute(
                 }
                 candidate.rows.insert(table.id, rows);
             }
-            Action::Drop(column, optional) => {
+            Action::Drop(column, optional, cascade) => {
                 let at = match position(&table, column) {
                     Ok(at) => at,
                     Err(SqlError::UnknownColumn) if *optional => continue,
                     Err(error) => return Err(error),
                 };
+                views::drop_column_views(&mut candidate, table.columns[at].id, *cascade)?;
                 if table.logical_columns().count() <= 1 || table.primary_key.contains(&at) {
                     return Err(SqlError::Unsupported);
                 }

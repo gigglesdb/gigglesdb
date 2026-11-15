@@ -1952,6 +1952,25 @@ impl Prepared {
             name, table, optional: false, cascade,
         }), domain, epoch)
     }
+    pub(crate) fn alter_table_engine(table: String, action: crate::operations::AlterTableAction, domain: u128, epoch: u64) -> R<Self> {
+        use crate::operations::AlterTableAction as A;
+        use alter_table::Action;
+        ident(split_key(&table).0)?;
+        ident(split_key(&table).1)?;
+        let action = match action {
+            A::AddColumn { column } => Action::Add(ColumnDef {
+                id: 0, name: column.name, data_type: column.data_type, not_null: column.not_null,
+            }, None, None, None),
+            A::DropColumn { name, cascade } => Action::Drop(name, false, cascade),
+            A::RenameColumn { from, to } => Action::RenameColumn(from, to),
+            A::RenameTable { to } => Action::RenameTable(to),
+        };
+        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable {
+            table: table.clone(), actions: vec![action], resolution_error: None,
+        }), domain, epoch);
+        prepared.relations.push(schemas::Reference::read(table, None));
+        Ok(prepared)
+    }
     pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Begin, domain, epoch)
     }

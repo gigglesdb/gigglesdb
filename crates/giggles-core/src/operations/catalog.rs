@@ -10,6 +10,21 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub not_null: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum AlterTableAction {
+    AddColumn { #[serde(deserialize_with = "strict_alter_column")] column: ColumnSpec },
+    DropColumn { name: String, cascade: bool },
+    RenameColumn { from: String, to: String },
+    RenameTable { to: String },
+}
+fn strict_alter_column<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ColumnSpec, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Column { name: String, data_type: DataType, not_null: bool }
+    let Column { name, data_type, not_null } = Column::deserialize(d)?;
+    Ok(ColumnSpec { name, data_type, not_null })
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum CatalogRequest {
     CreateTable {
@@ -25,6 +40,7 @@ pub enum CatalogRequest {
     },
     DropTable { table: String, cascade: bool },
     DropIndex { name: String, cascade: bool },
+    AlterTable { table: String, action: AlterTableAction },
 }
 // Preserve the legacy CreateTable decoder while requiring exact new catalog
 // requests. Unknown options must never disappear during raw request decoding.
@@ -44,6 +60,9 @@ impl<'de> Deserialize<'de> for CatalogRequest {
         #[serde(deny_unknown_fields)]
         struct DropIndex { name: String, cascade: bool }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AlterTable { table: String, action: AlterTableAction }
+        #[derive(Deserialize)]
         enum Wire {
             CreateTable {
                 table: String,
@@ -53,8 +72,10 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             CreateIndex(Index),
             DropTable(DropTable),
             DropIndex(DropIndex),
+            AlterTable(AlterTable),
         }
         Ok(match Wire::deserialize(d)? {
+            Wire::AlterTable(AlterTable { table, action }) => Self::AlterTable { table, action },
             Wire::DropTable(DropTable { table, cascade }) => Self::DropTable { table, cascade },
             Wire::DropIndex(DropIndex { name, cascade }) => Self::DropIndex { name, cascade },
             Wire::CreateTable {
@@ -79,7 +100,7 @@ impl<'de> Deserialize<'de> for CatalogRequest {
     }
 }
 /// DROP TABLE returns the table's preimage and no index ID. DROP INDEX returns
-/// its owning table's postimage and the dropped index ID; creates return postimages.
+/// its owning table's postimage and the dropped index ID; creates and ALTER return postimages.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogOutcome {
     pub catalog_epoch: u64,
@@ -124,6 +145,18 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
         .collect()
 }
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
+    if let CatalogRequest::AlterTable { table, action } = request {
+        let names = match action {
+            AlterTableAction::AddColumn { column } => vec![&column.name],
+            AlterTableAction::DropColumn { name, .. } => vec![name],
+            AlterTableAction::RenameColumn { from, to } => vec![from, to],
+            AlterTableAction::RenameTable { to } => vec![to],
+        };
+        if !relation_identifier(table) || names.into_iter().any(|n| !identifier(n)) {
+            return Err(Error::Bind("identifier".into()));
+        }
+        return validate_size(request);
+    }
     if let CatalogRequest::DropTable { table: name, .. } | CatalogRequest::DropIndex { name, .. } = request {
         if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
         return validate_size(request);
@@ -194,7 +227,7 @@ fn bind_catalog(
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
     let (_, tables) = session.catalog_engine().map_err(core)?;
-    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. }) {
+    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. }) {
         return Ok(BoundCatalogOperation {
             description: BoundCatalogDescription {
                 contract_version: ENGINE_CONTRACT_VERSION,
@@ -325,6 +358,11 @@ impl Engine {
                 let (table, index_id) = session.drop_catalog_engine(native_relation_key(name), *cascade, is_index).map_err(core)?;
                 let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
                 return Ok(CatalogOutcome { catalog_epoch, table, index_id });
+            }
+            if let CatalogRequest::AlterTable { table, action } = &prepared.description.request {
+                let table = session.alter_table_engine(native_relation_key(table), action.clone()).map_err(core)?;
+                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
             }
             let index_id;
             let table_name;

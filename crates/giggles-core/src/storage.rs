@@ -2566,6 +2566,25 @@ impl SqlSession {
         if result.is_err() { self.abort(); }
         result
     }
+    /// Typed ALTER shares SQL's execution, rollback and publication path.
+    pub(crate) fn alter_table_engine(&mut self, name: String, action: crate::operations::AlterTableAction) -> Result<relational::TableDef, CoreError> {
+        let result = (|| {
+            let (domain, epoch) = self.snapshot_identity_engine()?;
+            let id = self.inspect_metadata(|s| {
+                let key = s.sql.resolve_relation_key(&name, &self.search_path);
+                Ok(s.sql.tables.get(&key).map(|t| t.id))
+            })?;
+            let epoch = if self.is_v2_engine() { 0 } else { epoch };
+            let mut prepared = relational::Prepared::alter_table_engine(name, action, domain, epoch)
+                .map_err(CoreError::Sql)?;
+            prepared.transaction = self.transaction_id;
+            self.execute_bound_engine(&prepared, &[], None)?;
+            self.catalog_engine()?.1.into_iter().find(|t| Some(t.id) == id)
+                .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     /// Identity for binding against an active transaction's catalog snapshot.
     pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
         let result = (|| {

@@ -45,6 +45,26 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     if p.at != p.tokens.len() { return Err(SqlError::Syntax); }
     Ok(Ddl { names, query, columns, optional, cascade, replace })
 }
+// Runtime projections retain stable base-column IDs, including through aliases.
+// Retire their bindings between ALTER actions so a later RESTRICT sees CASCADE's
+// earlier removals. Persisted definitions/comments are removed at publication.
+pub(super) fn drop_column_views(state: &mut Relational, column: u64, cascade: bool) -> R<()> {
+    let mut dropped = state.view_names.iter().filter(|(_, (_, p))|
+        p.as_ref().is_ok_and(|p| p.columns.iter().any(|(c, _)| c.id == column)))
+        .map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
+    loop {
+        let before = dropped.len();
+        for (name, (_, projection)) in &state.view_names {
+            if projection.as_ref().is_ok_and(|p| p.reads.iter().any(|n| dropped.contains(n))) {
+                dropped.insert(name.clone());
+            }
+        }
+        if before == dropped.len() { break; }
+    }
+    if !cascade && !dropped.is_empty() { return Err(SqlError::DependentObjects); }
+    state.view_names.retain(|name, _| !dropped.contains(name));
+    Ok(())
+}
 fn oid(ty: &DataType) -> u32 {
     match ty {
         DataType::Boolean => 16, DataType::SmallInt => 21, DataType::Integer => 23,
@@ -83,10 +103,18 @@ impl Prepared {
         Ok(())
     }
     pub(crate) fn apply_view(&self, state: &Relational, parts: &mut CatalogParts, mut next: u64) -> R<()> {
-        if let Statement::DropTable { cascade, .. } = &self.statement {
+        let cascade = match &self.statement {
+            Statement::DropTable { cascade, .. } => Some(*cascade),
+            Statement::AlterTable(alter) => Some(alter.actions.iter().any(|a|
+                matches!(a, alter_table::Action::Drop(_, _, true)))),
+            _ => None,
+        };
+        if let Some(cascade) = cascade {
             loop {
                 let alive = parts.tables.values().map(|t| t.id).chain(parts.sql_views.keys().copied()).collect::<BTreeSet<_>>();
-                let dropped = parts.sql_views.iter().filter(|(_, v)| v.dependencies.iter().any(|d| !alive.contains(&d.relation))).map(|(id, _)| *id).collect::<BTreeSet<_>>();
+                let dropped = parts.sql_views.iter().filter(|(_, v)| v.dependencies.iter().any(|d|
+                    !alive.contains(&d.relation) || parts.tables.values().find(|t| t.id == d.relation)
+                        .is_some_and(|t| d.columns.iter().any(|id| !t.columns.iter().any(|c| c.id == *id))))).map(|(id, _)| *id).collect::<BTreeSet<_>>();
                 if dropped.is_empty() { break; }
                 if !cascade { return Err(SqlError::DependentObjects); }
                 parts.sql_views.retain(|id, _| !dropped.contains(id));
