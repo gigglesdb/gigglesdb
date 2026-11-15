@@ -134,6 +134,22 @@ fn name(value: &str) -> R<()> {
     }
     Ok(())
 }
+// Qualified table names use the same internal key as SQL FROM sources.
+fn table_name(value: &str) -> R<String> {
+    match value.split_once('.') {
+        Some((schema, table)) => {
+            for component in [schema, table] {
+                ident(component)?;
+                if !component.as_bytes()[0].is_ascii_alphabetic()
+                    || !component.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+                    return Err(SqlError::Syntax);
+                }
+            }
+            Ok(format!("{schema}\0{table}"))
+        }
+        None => { name(value)?; Ok(value.into()) }
+    }
+}
 struct Budget {
     nodes: usize,
     bytes: usize,
@@ -232,7 +248,7 @@ pub(super) fn lower(read: SingleSourceRead) -> R<Query> {
     lower_single(read, &mut Budget { nodes: 0, bytes: 0 }, 0)
 }
 fn lower_single(read: SingleSourceRead, budget: &mut Budget, depth: usize) -> R<Query> {
-    lower_sources(budget, depth, vec![Source { alias: read.table.clone(), name: read.table }],
+    lower_sources(budget, depth, vec![Source { alias: read.table.rsplit('.').next().unwrap().into(), name: read.table }],
         None, vec![], read.projection, read.filter)
 }
 pub(in crate::relational) fn lower_join(read: TwoSourceRead) -> R<Query> {
@@ -243,12 +259,12 @@ pub(in crate::relational) fn lower_join(read: TwoSourceRead) -> R<Query> {
     lower_sources(&mut Budget { nodes: 0, bytes: 0 }, 0, sources, Some((matches!(read.kind, ReadJoinKind::Left), read.on)),
         read.group_by, read.projection, read.filter)
 }
-fn lower_sources(budget: &mut Budget, depth: usize, sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
+fn lower_sources(budget: &mut Budget, depth: usize, mut sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
     group_by: Vec<ReadExpr>, projection: Vec<ReadProjection>, filter: Option<ReadPredicate>) -> R<Query> {
     budget.add(0, depth)?;
-    for source in &sources {
-        name(&source.name)?;
+    for source in &mut sources {
         budget.add(source.name.len() + source.alias.len(), depth)?;
+        source.name = table_name(&source.name)?;
     }
     let joins = join.map(|(left, on)| -> R<Join> {
         Ok(Join { left, on: budget.predicate(on, depth)? })

@@ -3167,24 +3167,24 @@ impl SqlSession {
     }
     /// Trusted Admin entry point. Gateways must authorize the typed source first.
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
-        let p = self.prepare_typed_read(vec![read.table.clone()], |domain, epoch|
+        let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         self.describe_bound_engine(&p)
     }
     /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
-        let p = self.prepare_typed_read(vec![read.table.clone()], |domain, epoch|
+        let p = self.prepare_typed_read(vec![read.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_single_source_read(domain, epoch, read))?;
         self.execute_bound_engine(&p, &[], expected_version)
     }
     /// Trusted Admin entry point; gateways must authorize both source tables first.
     pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
-        let p = self.prepare_typed_read(vec![read.left.table.clone(), read.right.table.clone()], |domain, epoch|
+        let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
         self.describe_bound_engine(&p)
     }
     pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
-        let p = self.prepare_typed_read(vec![read.left.table.clone(), read.right.table.clone()], |domain, epoch|
+        let p = self.prepare_typed_read(vec![read.left.table.replace('.', "\0"), read.right.table.replace('.', "\0")], |domain, epoch|
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
         self.execute_bound_engine(&p, &[], expected_version)
     }

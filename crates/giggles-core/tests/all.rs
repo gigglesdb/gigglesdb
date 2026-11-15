@@ -432,3 +432,5 @@ mod native_views;
 #[path = "having_subqueries.rs"] mod having_subqueries;
 
 #[path = "join_on_subqueries.rs"] mod join_on_subqueries;
+
+#[path = "typed_read_qualified.rs"] mod typed_read_qualified;

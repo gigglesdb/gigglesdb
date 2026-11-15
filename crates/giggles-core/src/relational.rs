@@ -1810,7 +1810,10 @@ impl Prepared {
         let query = query::Query::from_single_source_read(read)?;
         let tables = query.authorization_tables()?;
         let mut prepared = Self::engine(Statement::Query(query), domain, epoch);
-        for table in tables { prepared.relations.push(schemas::Reference::read(table, None)); }
+        for table in tables {
+            let (schema, name) = split_key(&table);
+            prepared.relations.push(schemas::Reference::read(name.into(), table.contains('\0').then(|| schema.into())));
+        }
         Ok(prepared)
     }
     /// Construct an unbound join; gateways must authorize both source tables.
@@ -1818,7 +1821,10 @@ impl Prepared {
         let query = query::typed_read::lower_join(read)?;
         let tables = query.authorization_tables()?;
         let mut prepared = Self::engine(Statement::Query(query), domain, epoch);
-        for table in tables { prepared.relations.push(schemas::Reference::read(table, None)); }
+        for table in tables {
+            let (schema, name) = split_key(&table);
+            prepared.relations.push(schemas::Reference::read(name.into(), table.contains('\0').then(|| schema.into())));
+        }
         Ok(prepared)
     }
     /// Construct an ordinary INSERT from a typed query, without parsing SQL.
