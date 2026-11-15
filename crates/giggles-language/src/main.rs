@@ -114,6 +114,7 @@ fn language_version(version: &str) -> std::result::Result<LanguageVersion, Error
         "0.17" => Ok(LanguageVersion::Embedded017),
         "0.18" => Ok(LanguageVersion::Embedded018),
         "0.19" => Ok(LanguageVersion::Embedded019),
+        "0.20" => Ok(LanguageVersion::Embedded020),
         _ => Err(Error::Unsupported),
     }
 }
@@ -160,7 +161,10 @@ fn execute(
             if !bindings.is_empty() {
                 return Err(Error::Bind("catalog bindings".into()));
             }
-            serde_json::to_value(engine.execute_catalog(&statement)?)
+            match engine.execute_catalog_optional(&statement)? {
+                Some(outcome) => serde_json::to_value(outcome),
+                None => Ok(serde_json::json!({"message": "nothing to drop"})),
+            }
         }
         ParsedInput::Once(_) | ParsedInput::Outcome(_) => return Err(Error::Unsupported),
         ParsedInput::Inspection(statement) => serde_json::to_value(engine.inspect(&statement)?),

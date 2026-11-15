@@ -79,7 +79,7 @@ fn selected_version(actual: LanguageVersion, selected: LanguageVersion) -> Resul
     }
     Ok(())
 }
-fn parameter_name(name: &str) -> Result<()> {
+pub(crate) fn parameter_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 63
         || !(name.as_bytes()[0].is_ascii_alphabetic() || name.starts_with('_'))

@@ -421,3 +421,56 @@ fn cli_manifest_is_separate_from_legacy_capabilities() {
             .any(|entry| entry["state"] == "unverified")
     );
 }
+
+#[test]
+fn qualified_rejection_examples_fail() {
+    use giggles_core::relational::with_sql_parser_forbidden;
+
+    let path = fixture();
+    let admin = Admin::open(&path, Limits::default()).unwrap();
+    for sql in [
+        "create schema app",
+        "create table app.items(id bigint primary key)",
+        "insert into app.items values(1)",
+    ] {
+        admin.sql_session().execute(sql, &[], None).unwrap();
+    }
+    let snapshot = || {
+        let mut session = admin.sql_session();
+        let m = session.catalog_metadata().unwrap();
+        let catalog = format!("{:?}", (&m.tables, &m.indexes, &m.schemas,
+            &m.presentation, &m.types, &m.typmods, m.generation));
+        let rows = ["items", "app.items"].map(|table| {
+            session.execute(&format!("select * from {table} order by id"), &[], None)
+                .unwrap().rows.into_iter().map(|row| row.values)
+                .collect::<Vec<_>>()
+        });
+        (catalog, rows)
+    };
+    let before = snapshot();
+    for (version, offset) in [
+        (LanguageVersion::Embedded018, 18),
+        (LanguageVersion::Embedded019, 26),
+        (LanguageVersion::Embedded020, 26),
+    ] {
+        let engine = Engine::with_version(admin.clone(), version);
+        let entries = capability_manifest_for(version).capabilities.into_iter()
+            .filter(|entry| entry.feature == "general_qualified_names")
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            assert_eq!(entry.state, CapabilityState::Rejected);
+            assert!(!entry.rejection_examples.is_empty());
+            for text in entry.rejection_examples {
+                let expected = Error::Syntax { offset };
+                assert_eq!(with_sql_parser_forbidden(|| parse_input_with_version(text, version))
+                    .unwrap_err(), expected, "{version:?}: {text}");
+                assert_eq!(with_sql_parser_forbidden(|| engine.execute_text(text, &Bindings::new())),
+                    Err(expected), "{version:?}: {text}");
+                assert_eq!(snapshot(), before, "effects from {version:?}: {text}");
+            }
+        }
+    }
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}

@@ -410,7 +410,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -876,7 +876,7 @@ impl Parser {
             let many = self.version.supports_insert_many() && self.word("many");
             let into = if many { self.need("into")?; true } else { self.word("into") };
             let table = self.relation_name()?;
-            if !many && self.version == LanguageVersion::Embedded019 {
+            if !many && self.version.supports_r2_native() {
                 let start = self.pos;
                 let mut columns = Vec::new();
                 if self.symbol('(') {
@@ -1015,7 +1015,7 @@ impl Parser {
                 Intent::Claim { order },
             ));
         }
-        if self.version == LanguageVersion::Embedded019 {
+        if self.version.supports_r2_native() {
             let start = self.pos;
             if let Ok(read) = self.legacy_read() && self.query_end() { return Ok(read); }
             self.pos = start;
@@ -1029,6 +1029,9 @@ impl Parser {
         matches!(self.peek(), None | Some(Token::Symbol(';' | '}' | ')')))
     }
     fn legacy_read(&mut self) -> Result<Statement> {
+        self.page_read(false).map(|(read, _)| read)
+    }
+    fn page_read(&mut self, page: bool) -> Result<(Statement, Option<Vec<ValueExpr>>)> {
         // A read clause disambiguates SHOW only when the profile permits its identifier.
         let table = if semantic_identifier("show", self.version)
             && matches!(self.peek(), Some(Token::Word(word)) if word == "show")
@@ -1046,21 +1049,21 @@ impl Parser {
         } else {
             None
         };
-        let projection = if self.word("select") {
-            self.projection()?
-        } else {
-            Vec::new()
-        };
+        let after = if page && self.word("after") {
+            if !self.symbol('(') { return Err(self.error()); }
+            let mut values = vec![self.value()?];
+            while self.symbol(',') { values.push(self.value()?); }
+            if !self.symbol(')') { return Err(self.error()); }
+            Some(values)
+        } else { None };
+        let projection = if self.word("select") { self.projection()? } else { Vec::new() };
+        if page && projection.iter().any(|p| p.alias.is_some()) { return Err(Error::Unsupported); }
         if projection.iter().any(|p| p.alias.is_some()) {
-            return Ok(Statement::ReadExpressions {
-                table,
-                filter,
-                order,
-                limit,
-                projection,
-            });
+            return Ok((Statement::ReadExpressions {
+                table, filter, order, limit, projection,
+            }, after));
         }
-        Ok(Statement::Read {
+        Ok((Statement::Read {
             table,
             filter,
             order,
@@ -1072,7 +1075,7 @@ impl Parser {
                     _ => unreachable!("unaliased field projections"),
                 })
                 .collect(),
-        })
+        }, after))
     }
     fn query_source(&mut self) -> Result<QuerySource> {
         let table = self.relation_name()?;
@@ -1219,7 +1222,7 @@ impl Parser {
             CatalogType::Int64
         } else if self.word("text") {
             CatalogType::Text
-        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) && self.word("numeric") {
+        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) && self.word("numeric") {
             CatalogType::Numeric
         } else if self.word("bytes") {
             CatalogType::Bytes
@@ -1230,14 +1233,22 @@ impl Parser {
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019)))
-                && (table == "table" || table == "index"))
+            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020)))
+                && (table == "table" || table == "index" || (table == "view" && self.version.supports_r2_wave2())))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
-        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) && self.word("drop") {
+        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) && self.word("drop") {
+            if self.version.supports_r2_wave2() && self.word("view") {
+                let if_exists = self.word("if");
+                if if_exists { self.need("exists")?; }
+                let name = self.relation_name()?;
+                let cascade = self.word("cascade");
+                if !cascade { self.word("restrict"); }
+                return Ok(CatalogStatement::DropView { name, if_exists, cascade });
+            }
             let index = if self.word("index") { true } else { self.need("table")?; false };
             let name = self.relation_name()?;
             let cascade = self.word("cascade");
@@ -1252,9 +1263,21 @@ impl Parser {
             self.need("table")?;
             let table = self.relation_name()?;
             let action = if self.word("add") {
-                self.word("column");
-                AlterTableAction::AddColumn(self.catalog_column()?)
+                let explicit_column = self.word("column");
+                if self.version.supports_r2_wave2() && !explicit_column
+                    && matches!(self.tokens.get(self.pos), Some((Token::Word(w), _)) if matches!(w.as_str(), "constraint" | "unique" | "check" | "foreign")) {
+                    let name = if self.word("constraint") { Some(self.name()?) } else { None };
+                    AlterTableAction::AddConstraint { name, constraint: self.catalog_constraint()? }
+                } else { AlterTableAction::AddColumn(self.catalog_column()?) }
             } else if self.word("drop") {
+                if self.version.supports_r2_wave2() && self.word("constraint") {
+                    let if_exists = self.word("if");
+                    if if_exists { self.need("exists")?; }
+                    let name = self.name()?;
+                    let cascade = self.word("cascade");
+                    if !cascade { self.word("restrict"); }
+                    return Ok(CatalogStatement::AlterTable { table, action: AlterTableAction::DropConstraint { name, if_exists, cascade } });
+                }
                 self.word("column");
                 let name = self.name()?;
                 let cascade = self.word("cascade");
@@ -1273,6 +1296,11 @@ impl Parser {
             return Ok(CatalogStatement::AlterTable { table, action });
         }
         self.need("create")?;
+        if self.version.supports_r2_wave2() && self.word("view") {
+            let name = self.relation_name()?;
+            self.need("as")?;
+            return Ok(CatalogStatement::CreateView { name, query: Box::new(self.query()?) });
+        }
         if self.word("index") {
             if !self.version.supports_indexes() {
                 return Err(Error::Unsupported);
@@ -1348,6 +1376,47 @@ impl Parser {
             primary_key: primary_key.ok_or_else(|| self.error())?,
         })
     }
+    fn constraint_columns(&mut self) -> Result<Vec<String>> {
+        if !self.symbol('(') { return Err(self.error()); }
+        let mut columns = vec![self.name()?];
+        while self.symbol(',') {
+            if columns.len() >= giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
+            columns.push(self.name()?);
+        }
+        if !self.symbol(')') { return Err(self.error()); }
+        Ok(columns)
+    }
+    fn foreign_key_action(&mut self) -> Result<ForeignKeyAction> {
+        Ok(if self.word("no") { self.need("action")?; ForeignKeyAction::NoAction }
+        else if self.word("restrict") { ForeignKeyAction::Restrict }
+        else if self.word("cascade") { ForeignKeyAction::Cascade }
+        else { self.need("set")?;
+            if self.word("null") { ForeignKeyAction::SetNull }
+            else { self.need("default")?; ForeignKeyAction::SetDefault }
+        })
+    }
+    fn catalog_constraint(&mut self) -> Result<ConstraintSpec> {
+        if self.word("unique") { return Ok(ConstraintSpec::Unique { columns: self.constraint_columns()? }); }
+        if self.word("check") {
+            if !self.symbol('(') { return Err(self.error()); }
+            let expression = self.expr(0)?;
+            if !self.symbol(')') { return Err(self.error()); }
+            return Ok(ConstraintSpec::Check(expression));
+        }
+        self.need("foreign")?; self.need("key")?;
+        let columns = self.constraint_columns()?;
+        self.need("references")?;
+        let ref_table = self.relation_name()?;
+        let ref_columns = if matches!(self.tokens.get(self.pos), Some((Token::Symbol('('), _))) { Some(self.constraint_columns()?) } else { None };
+        let (mut on_delete, mut on_update) = (None, None);
+        while self.word("on") {
+            let target = if self.word("delete") { &mut on_delete } else { self.need("update")?; &mut on_update };
+            if target.is_some() { return Err(self.error()); }
+            *target = Some(self.foreign_key_action()?);
+        }
+        Ok(ConstraintSpec::ForeignKey { columns, ref_table, ref_columns,
+            on_delete: on_delete.unwrap_or(ForeignKeyAction::NoAction), on_update: on_update.unwrap_or(ForeignKeyAction::NoAction) })
+    }
     fn transaction_prefix(&self) -> bool {
         let tokens = &self.tokens[self.pos..];
         matches!(tokens, [(Token::Word(word), _), (Token::Symbol('{'), _), ..] if word == "transaction")
@@ -1357,7 +1426,7 @@ impl Parser {
                     || matches!(tokens, [(Token::Word(word), _), (Token::Word(read), _), (Token::Word(only), _), (Token::Word(once), _), ..] if word == "transaction" && read == "read" && only == "only" && once == "once")))
     }
     fn item_word(&mut self, word: &str) -> bool {
-        if self.version == LanguageVersion::Embedded019
+        if self.version.supports_r2_native()
             && matches!(self.tokens.get(self.pos + 1), Some((Token::Word(next), _)) if matches!(next.as_str(), "group" | "having" | "join" | "inner" | "left"))
             && matches!(self.tokens.get(self.pos + 2), Some((token, _)) if !matches!(token, Token::Op(Compare::Eq) | Token::Symbol(';' | '}' | ')'))) { return false; }
         // A read clause disambiguates keyword-named tables inside blocks too.
@@ -1625,7 +1694,9 @@ pub fn parse_input_with_version(s: &str, version: LanguageVersion) -> Result<Par
         let statement = ExplainStatement {
             read: p.statement()?,
         };
-        explain::lower(&statement, version)?;
+        if !(version.supports_r2_wave2() && matches!(statement.read, Statement::Query(_))) {
+            explain::lower(&statement, version)?;
+        }
         ParsedInput::Explain(statement)
     } else if version.supports_inspection() && p.inspection_prefix() {
         let statement = p.inspection()?;
@@ -1658,4 +1729,18 @@ pub fn parse_explain_with_version(s: &str, version: LanguageVersion) -> Result<E
         ParsedInput::Explain(statement) => Ok(statement),
         _ => Err(Error::Unsupported),
     }
+}
+
+/// Parse a standalone simple read page in explicit 0.20.
+pub fn parse_page_with_version(s: &str, version: LanguageVersion) -> Result<PageStatement> {
+    if !version.supports_r2_wave2() { return Err(Error::Unsupported); }
+    let mut p = Parser { tokens: lex(s, version)?, pos: 0, end: s.len(), version };
+    p.need("page")?;
+    let (read, after) = p.page_read(true)?;
+    p.symbol(';');
+    if p.peek().is_some() { return Err(p.error()); }
+    let statement = PageStatement { read, after };
+    execute::lower_checked(&statement.read, version)?;
+    execute::validate_size(&statement)?;
+    Ok(statement)
 }

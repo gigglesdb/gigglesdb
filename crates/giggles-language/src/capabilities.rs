@@ -194,7 +194,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
@@ -208,7 +208,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         );
     }
 
-    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
+    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "numeric_column_declaration", CapabilityState::Implemented,
                 "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
@@ -224,19 +224,35 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
     }
 
+    if version.supports_r2_wave2() {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree] {
+            add(interface, "keyset_paging", CapabilityState::Implemented,
+                "page READ [after (key values)] reads one page in an explicit order ending in the full primary key and returns the exclusive continuation key. Page size is the read's limit (default 100, max 1024). Bad order or key arity is Error::Bind; every page is a full scan.",
+                vec![evidence("crates/giggles-language/tests/native_paging_parity.rs", "paging_round_trips_match_sql")], vec![]);
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "catalog_constraints", CapabilityState::Implemented,
+                "ALTER TABLE ADD [CONSTRAINT name] UNIQUE/CHECK/FOREIGN KEY (with ON DELETE/ON UPDATE actions) and DROP CONSTRAINT [IF EXISTS] name through SQL's DDL executor. CHECK is a column compared with an int, text, bool or NULL literal. Legacy requires empty business state. DROP CONSTRAINT CASCADE currently returns SQL's 42601.",
+                vec![evidence("crates/giggles-language/tests/native_constraint_parity.rs", "constraint_matrix_matches_sql")], vec![]);
+            add(interface, "catalog_views", CapabilityState::Implemented,
+                "CREATE VIEW name AS <typed read> and DROP VIEW [IF EXISTS] name [CASCADE|RESTRICT] through SQL's view executor. RESTRICT is the default; dependent views give 2BP01 unless CASCADE. Legacy returns SQL's 0A000; two-source views return SQL's 0A000.",
+                vec![evidence("crates/giggles-language/tests/native_view_parity.rs", "view_matrix_matches_sql")], vec![]);
+        }
+    }
+
     if version.supports_r2_native() {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             for (feature, test, detail) in [
-                ("subquery_predicates", "subquery_predicates_match_sql", "IN/NOT IN/EXISTS/NOT EXISTS with uncorrelated single-source subqueries and SQL NULL semantics; standalone queries only. IN/EXISTS inside JOIN ON or HAVING returns SQL's 0A000."),
+                ("subquery_predicates", "subquery_predicates_match_sql", "IN/NOT IN/EXISTS/NOT EXISTS with uncorrelated single-source subqueries and SQL NULL semantics; standalone queries only. IN/EXISTS inside JOIN ON or HAVING matches SQL."),
                 ("insert_select", "insert_select_matches_sql", "Standalone INSERT FROM typed queries with SQL defaults, constraints and affected-row counts; omitted columns target all logical columns.") ] {
                 add(interface, feature, CapabilityState::Implemented,
-                    detail,
+                    if version.supports_r2_wave2() && feature == "insert_select" { "INSERT FROM typed queries with SQL defaults, constraints and affected-row counts; omitted columns target all logical columns. Supported in blocks and frozen prepared handles in 0.20." } else { detail },
                     vec![evidence("crates/giggles-language/tests/native_subquery_parity.rs", test)], vec![]);
             }
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "typed_reads", CapabilityState::Implemented,
-                "Aggregates (count/sum/min/max/avg), GROUP BY/HAVING, ORDER BY/LIMIT and two-source INNER/LEFT joins with aliases, executed as core typed reads with SQL semantics. Bare table names only; select is required; standalone statements only (not in blocks, bound handles, explain or once).",
+                if version.supports_r2_wave2() { "Aggregates, GROUP BY/HAVING, ORDER BY/LIMIT and INNER/LEFT joins with aliases and SQL semantics. Schema-qualified sources work; select required. 0.20 supports blocks, frozen prepared handles and nonexecuting explain_query; once remains unsupported." } else { "Aggregates (count/sum/min/max/avg), GROUP BY/HAVING, ORDER BY/LIMIT and two-source INNER/LEFT joins with aliases, executed as core typed reads with SQL semantics. Bare table names only; select is required; standalone statements only (not in blocks, bound handles, explain or once)." },
                 vec![evidence("crates/giggles-language/tests/native_typed_read_parity.rs", "typed_reads_match_sql")], vec![]);
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
@@ -256,7 +272,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
     }
 
-    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
+    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 | LanguageVersion::Embedded020) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_drop", CapabilityState::Implemented,
                 "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE remains Unsupported. Legacy requires empty business state; v2 permits populated state.",
@@ -787,7 +803,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             interface,
             "immutable_bound_operations",
             CapabilityState::Implemented,
-            "Preparation freezes real values and catalog/output metadata without executing; each execution checks identity and uses fresh rows. Local handles carry no authority credential or serialization format.",
+            if version.supports_r2_wave2() { "Preparation freezes real values and catalog/output metadata, including typed Query and INSERT FROM in 0.20, without executing; execution checks identity and uses fresh rows. Handles carry no authority credential or serialization format." } else { "Preparation freezes real values and catalog/output metadata without executing; each execution checks identity and uses fresh rows. Local handles carry no authority credential or serialization format." },
             vec![
                 evidence(
                     "crates/giggles-language/tests/bound_operations.rs",
@@ -1243,7 +1259,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
                 continue;
             }
             let example = if version.supports_r2_native() && feature == "qualified_names" {
-                "app.items where id = 1 select id"
+                "app.items select app.items.id"
             } else if version.supports_schema_names() && feature == "qualified_names" {
                 "items select items.id"
             } else { example };
@@ -1784,6 +1800,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded020 => (
+            "crates/giggles-language/tests/native_view_parity.rs",
+            "view_profile_is_opt_in_and_inherits_nineteen",
         ),
         LanguageVersion::Embedded019 => (
             "crates/giggles-language/tests/native_alter_parity.rs",

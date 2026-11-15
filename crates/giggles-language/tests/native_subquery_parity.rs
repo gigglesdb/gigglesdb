@@ -60,21 +60,10 @@ fn subquery_predicates_match_sql() {
             ("t a join u b on a.n=b.n and a.n in (u select n) select a.id", "select a.id from t a join u b on a.n=b.n and a.n in (select n from u)"),
             ("t group by n having n in (u select n) select n,count(*)", "select n,count(*) from t group by n having n in (select n from u)"),
         ] {
-            // PostgreSQL 18.6 accepts both; 0A000 is a shared GigglesDB SQL gap.
-            let actual = with_sql_parser_forbidden(|| native.execute_text(text, &Bindings::new()));
-            let expected = admin.sql_session().execute(sql, &[], None);
-            match expected {
-                Ok(expected) => {
-                    let actual = actual.unwrap_or_else(|e| panic!("SQL succeeds but native fails: {text}: {e:?}"));
-                    assert_eq!((actual.matched,actual.affected,actual.changed,actual.complete), (expected.rows.len(),0,0,true));
-                    assert_eq!((actual.columns, actual.rows), (expected.columns, expected.rows));
-                }
-                Err(expected) => {
-                    let state = giggles_core::sqlstate(&expected);
-                    assert_eq!(state, "0A000", "{sql}");
-                    assert_eq!(actual.unwrap_err(), Error::Sql { sqlstate: state.into() }, "{text}");
-                }
-            }
+            let actual = with_sql_parser_forbidden(|| native.execute_text(text, &Bindings::new())).unwrap();
+            let expected = sqladmin.sql_session().execute(sql, &[], None).unwrap();
+            assert_eq!((actual.matched,actual.affected,actual.changed,actual.complete), (expected.rows.len(),0,0,true));
+            assert_eq!((actual.columns, actual.rows), (expected.columns, expected.rows), "{text}");
         }
         let error = with_sql_parser_forbidden(|| native.execute_text("t where exists (missing) select id", &Bindings::new())).unwrap_err();
         assert_eq!(error, Error::Sql { sqlstate: "42P01".into() });

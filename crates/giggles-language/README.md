@@ -54,7 +54,7 @@ adding, each checked against the same SQL on legacy and v2:
   `select` required, standalone statements only);
 - subquery predicates `n [not] in (u where ... select n)` and `[not] exists (u ...)`
   over uncorrelated single-source reads, and `insert into dst(id, v) from src where
-  v > 1 select id, v`. Like SQL, a subquery inside JOIN ON or HAVING returns 0A000;
+  v > 1 select id, v`. Subqueries inside JOIN ON and HAVING also match SQL;
 - `alter table t add [column] c [nullable] int64`, `drop [column] c [cascade|restrict]`,
   `rename [column] a to b` and `rename to t2` (legacy requires empty business state);
 - `savepoint a`, `rollback to [savepoint] a` and `release [savepoint] a` inside a
@@ -64,6 +64,66 @@ adding, each checked against the same SQL on legacy and v2:
   parameters wherever parameters are accepted; uuid/jsonb text parameters use SQL
   coercion. Numeric parameters remain assignment-only.
 Views, constraints and paged reads are not in 0.19.
+Profile 0.20 selects `embedded-trusted-native-0.20`, inheriting 0.19:
+- views through `execute_catalog_text("create view v as orders select id,qty")`,
+  then `execute_text("v where qty > 1 select id", &bindings)` on V2.
+  `execute_catalog_optional_text("drop view if exists v")` returns `None` for an
+  absent view; `execute_catalog_optional(&statement)` is the corresponding tree API.
+- constraints: `alter table child add constraint uq unique(code)`,
+  `alter table child add check(qty > 0)` and `alter table child add constraint fk
+  foreign key(parent_id) references parent(id) on delete cascade` through catalog
+  execution. Use `alter table child drop constraint uq`, or the optional catalog
+  API for `alter table child drop constraint if exists uq`.
+- keyset paging through `read_page_text("page orders order by id limit 10 after
+  ($last) select id", &bindings)`. Feed the returned `next` values into the next
+  page; ordering must end in the primary key. Paging uses its dedicated API.
+- savepoint recovery: `transaction { insert into t(id) values(1); savepoint a;
+  insert into t(id) values(1); rollback to a; insert into t(id) values(2) }`
+  commits IDs 1 and 2. A failing step must be immediately followed by a valid
+  `rollback to` for recovery; rolled-back steps disappear from summaries.
+- typed reads and INSERT FROM inside blocks: `transaction { let g=(orders group
+  by item select item,count(*) as n); insert into dst from orders where qty > 1
+  select id,item,qty; emit @g.rows }`. Typed row results are emitted as `@g.rows`;
+  typed blocks cannot be prepared or used with once.
+- frozen handles: `let bound = engine.prepare_bound_text("orders select count(*)",
+  &bindings)?; engine.execute_bound(&bound)?;` and `prepare_bound_text("insert into
+  dst from orders select id,item,qty", &bindings)`. Preparation freezes arguments
+  and catalog identity, describes columns without scanning rows, and execution
+  observes fresh rows. Foreign databases, changed catalogs and older profiles
+  reject the handle. Plain projected view reads can also be prepared on V2.
+- typed explanations through `explain_query_text("explain orders group by item
+  select item,count(*) as n", &bindings)` return sources and columns without
+  executing. The simple-read `explain_text` API keeps its prior shape.
+- qualified typed statements support `app.orders group by item select item,count(*)`,
+  `app.orders o join orders p on o.id=p.id select o.id`, and
+  `orders where item in (app.orders select item) select id`, matching SQL for
+  schema-qualified sources, including V2 views.
+  Qualified targets work: `insert into app.dst from orders select id,item,qty`,
+  with explicit or omitted target columns and frozen handles. Aliases and
+  `alias.column` remain supported; `schema.table.column` is outside this grammar.
+
+Asserted native/SQL differences and shared limits in 0.20:
+- V2 plain view reads require supported explicit projections. Arithmetic view
+  projections (`v select qty*2 as d`) and omitted projections (`v`) return native
+  42P01 while SQL succeeds.
+  Legacy view DDL returns 0A000 in both frontends. Filtered and joined views are
+  also a shared 0A000 gap versus PostgreSQL 18.6.
+- Legacy constraint mutation on populated business state returns native
+  `PlanRequired` while SQL succeeds; native cross-column CHECK (`qty > id`)
+  returns `Unsupported` while SQL succeeds. Native DML retains `Duplicate` for
+  SQLSTATE 23505. DROP CONSTRAINT CASCADE returns shared 42601.
+- Paging `matched` counts eligible rows before LIMIT; SQL exposes returned rows.
+  Native tuple keyset paging works where core SQL row-value comparison returns
+  0A000; equivalent scalar disjunctions match its rows.
+- Without immediate valid recovery, native returns the original failure and
+  rolls back the block. SQL can first report 25P02 on a later statement or 3B001
+  on an unknown savepoint, then recover later with a valid ROLLBACK TO. Version
+  0.19 always rolls back on the original failure.
+- Typed block rows require `emit @name.rows`; scalar/row emits, read-only typed
+  writes, prepared typed blocks, once and generic `lower_text` stay unsupported.
+  Typed explanation uses `explain_query_text`; typed INSERT FROM explanations
+  remain unsupported. Bound handles are local native APIs, with no SQL handle
+  equivalence claimed.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:
