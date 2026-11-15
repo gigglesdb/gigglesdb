@@ -265,9 +265,10 @@ and per machine hour). The rules below cap what anyone starts.
 - Only coordinators start or delete boxes. SOL workers never run `boat`.
 - Boxes run landing gates only (see "When to gate"). No worker iteration,
   focused tests, exploration or agent prompts on boxes.
-- At most 2 gate boxes run at once, account-wide, across all coordinators.
-  Take a slot with an atomic
-  `mkdir J:/gigglesdb-work/boat/slots/slot-<1|2>`, release it after
+- At most 10 gate boxes run at once, account-wide, across all coordinators
+  (the plan allows 100; 10 is enough that a finished feature never waits, and
+  raising it is `max_boxes` in the script). Take a slot with an atomic
+  `mkdir J:/gigglesdb-work/boat/slots/slot-<n>`, release it after
   `boat delete`, and write the box id into the slot's `owner` file.
 - At most 200 box starts per day (the plan's included starts), all agents together. Append one line per start to
   `J:/gigglesdb-work/boat/usage.log` (UTC time, coordinator, box id, type,

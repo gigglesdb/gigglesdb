@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a landing gate on a boat.dev Linux box, following the AGENTS.md
-# "When to gate" and "Remote gates on boat.dev" rules: daily start cap, one of
-# two account-wide slots, a box from the gigglesdb-gate-base snapshot with a
+# "When to gate" and "Remote gates on boat.dev" rules: daily start cap, one
+# of max_boxes account-wide slots, a box from the gigglesdb-gate-base snapshot with a
 # TTL, the stack sent as a git bundle, results copied back, box deleted.
 #
 # Usage:
@@ -30,6 +30,7 @@ boatdir=J:/gigglesdb-work/boat
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-gate-base
 max_starts=200   # plan-included starts per day; above this is overage
+max_boxes=${GATE_MAX_BOXES:-10}   # concurrent gate boxes, account-wide (plan allows 100)
 tip='' who='' type=large ttl=7200 slot_wait=1800 clippy=1
 steps=()
 while [ $# -gt 0 ]; do
@@ -95,7 +96,7 @@ trap cleanup EXIT
 trap 'exit 5' INT TERM
 deadline=$(( $(date +%s) + slot_wait ))
 while [ -z "$slot" ]; do
-  for s in slot-1 slot-2; do
+  for n in $(seq 1 "$max_boxes"); do s=slot-$n
     if mkdir "$boatdir/slots/$s" 2>/dev/null; then slot=$s; break; fi
   done
   [ -n "$slot" ] && break
