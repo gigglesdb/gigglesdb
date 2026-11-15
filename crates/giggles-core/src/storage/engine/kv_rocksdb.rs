@@ -95,6 +95,34 @@ impl RocksKv {
         Self::open_locked(path, cache_bytes, WriterLock::acquire(path)?)
     }
 
+    /// Capture an atomic, reopenable view of every column family.
+    #[allow(dead_code)] // Replication snapshot caller is added in a later item.
+    pub(crate) fn checkpoint(&self, target: &Path) -> Result<Vec<(String, u64)>, KvError> {
+        let io_error = |error: std::io::Error| KvError::Io(error.to_string());
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => return Err(KvError::Io("checkpoint target already exists".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        rocksdb::checkpoint::Checkpoint::new(&self.db.db)
+            .map_err(map_error)?
+            .create_checkpoint(native_path(target))
+            .map_err(map_error)?;
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(target).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if entry.file_type().map_err(io_error)?.is_file() {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| KvError::Io("checkpoint file name is not valid UTF-8".into()))?;
+                files.push((name, entry.metadata().map_err(io_error)?.len()));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(files)
+    }
+
     pub(crate) fn open_locked(
         path: &Path,
         cache_bytes: usize,
@@ -558,6 +586,125 @@ mod tests {
         drop((forward, reverse));
         drop(snapshot);
         RocksKv::open(&dir.0, 8 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_concurrent_batches_are_consistent() {
+        let dir = TestDir::new();
+        let db = Arc::new(RocksKv::open(&dir.0.join("source"), 8 * 1024 * 1024).unwrap());
+        let (milestone, reached) = mpsc::sync_channel(0);
+        let (resume, proceed) = mpsc::sync_channel(0);
+        let writer_db = Arc::clone(&db);
+        let writer = thread::spawn(move || {
+            for i in 1..=3000u64 {
+                let value = i.to_be_bytes().to_vec();
+                let mut batch = WriteBatch::default();
+                batch.put(Keyspace::Meta, b"counter".to_vec(), value.clone());
+                batch.put(Keyspace::Rows, value.clone(), value.clone());
+                batch.put(Keyspace::Index, value.clone(), value);
+                let durability = if i % 50 == 0 {
+                    Durability::Sync
+                } else {
+                    Durability::NoSync
+                };
+                writer_db.write(batch, durability).unwrap();
+                if i % 500 == 0 {
+                    milestone.send(()).unwrap();
+                    proceed.recv().unwrap();
+                }
+            }
+        });
+        let mut copies = Vec::new();
+        for i in 0..6 {
+            reached.recv().unwrap();
+            // Release the next group of writes before copying the live store.
+            resume.send(()).unwrap();
+            let target = dir.0.join(format!("checkpoint-{i}"));
+            db.checkpoint(&target).unwrap();
+            copies.push(target);
+        }
+        writer.join().unwrap();
+        let mut counters = Vec::new();
+        for target in copies {
+            let copy = RocksKv::open(&target, 8 * 1024 * 1024).unwrap();
+            let value = copy.get(Keyspace::Meta, b"counter").unwrap().unwrap();
+            let counter = u64::from_be_bytes(value.try_into().unwrap());
+            counters.push(counter);
+            for ks in [Keyspace::Rows, Keyspace::Index] {
+                let mut entries = copy
+                    .range(ks, Bound::Unbounded, Bound::Unbounded, Direction::Forward)
+                    .unwrap();
+                for i in 1..=counter {
+                    let value = i.to_be_bytes().to_vec();
+                    assert_eq!(
+                        entries.next().transpose().unwrap(),
+                        Some((value.clone(), value)),
+                        "inconsistent checkpoint {target:?}: counter={counter}, {ks:?} key={i}"
+                    );
+                }
+                assert!(
+                    entries.next().is_none(),
+                    "checkpoint {target:?}: {ks:?} has keys beyond counter={counter}"
+                );
+            }
+        }
+        println!("checkpoint counters: {counters:?}");
+        assert!(counters.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn checkpoint_rejects_existing_target_and_lists_files() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0.join("source"), 8 * 1024 * 1024).unwrap();
+        db.write(single(), Durability::Sync).unwrap();
+        assert!(matches!(db.checkpoint(&dir.0), Err(KvError::Io(_))));
+        let target = dir.0.join("copy");
+        let files = db.checkpoint(&target).unwrap();
+        let mut expected: Vec<_> = std::fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                (
+                    entry.file_name().into_string().unwrap(),
+                    entry.metadata().unwrap().len(),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(!files.is_empty());
+        assert_eq!(files, expected);
+        assert!(matches!(db.checkpoint(&target), Err(KvError::Io(_))));
+    }
+
+    #[test]
+    #[ignore = "writes 1 GiB to measure live checkpoint cost"]
+    fn checkpoint_cost_1gb() {
+        let dir = TestDir::new();
+        let db = RocksKv::open(&dir.0.join("source"), 8 * 1024 * 1024).unwrap();
+        const VALUE_BYTES: usize = 64 * 1024;
+        const TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+        for group in 0..TOTAL_BYTES / VALUE_BYTES / 16 {
+            let mut batch = WriteBatch::default();
+            for offset in 0..16 {
+                let mut value = vec![0; VALUE_BYTES];
+                getrandom::fill(&mut value).unwrap();
+                batch.put(
+                    Keyspace::Rows,
+                    ((group * 16 + offset) as u64).to_be_bytes().to_vec(),
+                    value,
+                );
+            }
+            db.write(batch, Durability::NoSync).unwrap();
+        }
+        db.flush_barrier().unwrap();
+        let started = std::time::Instant::now();
+        let files = db.checkpoint(&dir.0.join("copy")).unwrap();
+        let elapsed = started.elapsed();
+        let listed_bytes: u64 = files.iter().map(|(_, bytes)| bytes).sum();
+        println!(
+            "checkpoint_cost_1gb: payload_bytes={TOTAL_BYTES}, elapsed={elapsed:?}, total_listed_bytes={listed_bytes} (logical bytes; hard-link identity unavailable via portable stable std)"
+        );
     }
 
     #[cfg(windows)]
