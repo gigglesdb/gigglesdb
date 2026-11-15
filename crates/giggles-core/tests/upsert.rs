@@ -405,7 +405,7 @@ fn upsert_caps_incoming_constraints_and_duplicate_identities_precede_conflicts()
     let (_, admin, engine) =
         database("CREATE TABLE items(id BIGINT PRIMARY KEY,n SMALLINT NOT NULL,txt TEXT)");
     seed(&admin, 1, 1, "present");
-    for bad in [value(V::Null), int(32768)] {
+    for (bad, error) in [(value(V::Null), Error::Sql { sqlstate: "23502".into() }), (int(32768), Error::Overflow)] {
         runtime_failure(
             &admin,
             &engine,
@@ -415,7 +415,7 @@ fn upsert_caps_incoming_constraints_and_duplicate_identities_precede_conflicts()
                 2,
             )),
             &Bindings::new(),
-            Error::Type,
+            error,
         );
     }
     runtime_failure(
@@ -674,13 +674,13 @@ fn upsert_all_guards_old_images_and_return_errors_are_atomic() {
     let (_, admin, engine) =
         database("CREATE TABLE items(id BIGINT PRIMARY KEY,n SMALLINT NOT NULL,txt TEXT)");
     seed(&admin, 1, 1, "");
-    for expression in [int(32768), value(V::Null)] {
+    for (expression, error) in [(int(32768), Error::Overflow), (value(V::Null), Error::Sql { sqlstate: "23502".into() })] {
         runtime_failure(
             &admin,
             &engine,
             &updating(insert(1, int(1)), None, vec![("n", expression)]),
             &Bindings::new(),
-            Error::Type,
+            error,
         );
     }
 }

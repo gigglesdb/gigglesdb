@@ -832,7 +832,7 @@ fn sql_pk_arbiter_do_update_and_do_nothing() {
                 Semantics::Sql
             )
             .unwrap_err(),
-            Error::Type
+            Error::Sql { sqlstate: "23502".into() }
         );
         assert!(session.is_aborted());
     }

@@ -126,7 +126,7 @@ fn insert_many_binding_and_shape_checks_precede_execution() {
                 vec![vec![int(1), int(2)], vec![int(2), value(V::Bool(true))]],
                 0,
             ),
-            Error::Type,
+            Error::Sql { sqlstate: "42804".into() },
         ),
     ] {
         static_failure(&admin, &engine, &request, Some(expected));
@@ -349,7 +349,7 @@ fn insert_many_canonical_keys_and_existing_conflicts_are_atomic() {
         ],
         2,
     );
-    runtime_failure(&admin, &engine, &invalid, &Bindings::new(), Error::Type);
+    runtime_failure(&admin, &engine, &invalid, &Bindings::new(), Error::Sql { sqlstate: "23502".into() });
     let existing = Request::Insert {
         table: "items".into(),
         values: vec![

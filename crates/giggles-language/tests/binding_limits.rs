@@ -347,7 +347,7 @@ fn under_budget_exact_binding_and_type_errors_are_preserved() {
         let unused = Bindings::from([("unused".into(), Value::Null)]);
         assert_refusal(&engine, "items", &unused, Error::Bind("parameters".into()));
         let wrong_type = Bindings::from([("id".into(), Value::Text("one".into()))]);
-        assert_refusal(&engine, "items where id=$id", &wrong_type, Error::Type);
+        assert_refusal(&engine, "items where id=$id", &wrong_type, Error::Sql { sqlstate: "42883".into() });
         assert_refusal(
             &engine,
             "missing",

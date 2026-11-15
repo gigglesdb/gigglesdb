@@ -245,7 +245,7 @@ fn computed_native_text_tree_and_bound_requests_match_without_sql() {
             "update items where id=1 when false set x=1/0",
             Error::ConditionFailed,
         ),
-        ("update items where id=1 set narrow=narrow+1", Error::Type),
+        ("update items where id=1 set narrow=narrow+1", Error::Overflow),
         (
             "claim items where 10/x>0 order by id set x=x-x",
             Error::DivisionByZero,

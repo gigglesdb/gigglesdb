@@ -1,6 +1,6 @@
 //! Bounded trusted catalog inspection, separate from data and catalog mutations.
 use super::{ENGINE_CONTRACT_VERSION, Engine, Error, Result, core, identifier, validate_size};
-use crate::relational::{MAX_COLUMNS, MAX_TABLES, TableDef};
+use crate::{CoreError, relational::{MAX_COLUMNS, MAX_TABLES, SqlError, TableDef}};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -126,7 +126,7 @@ fn admit(
         InspectionRequest::Table { table } => {
             let table = tables
                 .get(table)
-                .ok_or_else(|| Error::Bind("table".into()))?;
+                .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
             check_table_shape(table)?;
             // Table ID and the lengths of its columns and primary-key vectors.
             budget.charge(8 + 8 + 8)?;
@@ -188,7 +188,7 @@ impl Engine {
                     InspectionRequest::Table { table } => {
                         let table = tables
                             .get(table)
-                            .ok_or_else(|| Error::Bind("table".into()))?;
+                            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
                         InspectionResult::Table(TableDef {
                             id: table.id,
                             name: table.name.clone(),

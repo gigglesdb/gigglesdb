@@ -973,9 +973,14 @@ fn colty(c: &ColumnDef) -> Ty {
         DataType::Interval => Ty::Interval,
     }
 }
+fn assignment_error(source: Option<Ty>, column: &ColumnDef) -> Error {
+    if matches!((source, colty(column)), (Some(Ty::Text), Ty::Int | Ty::Numeric) | (Some(Ty::Bool), Ty::Int)) {
+        core(CoreError::Sql(SqlError::Type))
+    } else { Error::Type }
+}
 fn check(v: &Value, c: &ColumnDef) -> Result<()> {
     if *v == Value::Null {
-        return if c.not_null { Err(Error::Type) } else { Ok(()) };
+        return if c.not_null { Err(core(CoreError::Sql(SqlError::Null))) } else { Ok(()) };
     }
     if ty(v)
         != Some(if c.data_type == DataType::Bpchar {
@@ -984,12 +989,12 @@ fn check(v: &Value, c: &ColumnDef) -> Result<()> {
             colty(c)
         })
     {
-        return Err(Error::Type);
+        return Err(assignment_error(ty(v), c));
     }
     if let Value::Int(n) = v {
         match c.data_type {
-            DataType::SmallInt if i16::try_from(*n).is_err() => return Err(Error::Type),
-            DataType::Integer if i32::try_from(*n).is_err() => return Err(Error::Type),
+            DataType::SmallInt if i16::try_from(*n).is_err() => return Err(Error::Overflow),
+            DataType::Integer if i32::try_from(*n).is_err() => return Err(Error::Overflow),
             _ => (),
         }
     }
@@ -1254,7 +1259,9 @@ impl Binder<'_> {
                     return Err(Error::Unsupported);
                 }
                 if ta.is_some() && tb.is_some() && ta != tb {
-                    return Err(Error::Type);
+                    return Err(if matches!((ta, tb), (Some(Ty::Int), Some(Ty::Text | Ty::Bool)) | (Some(Ty::Text | Ty::Bool), Some(Ty::Int))) {
+                        core(CoreError::Sql(SqlError::UndefinedFunction))
+                    } else { Error::Type });
                 }
                 (
                     Bound::Compare(Box::new(a), *op, Box::new(b)),
@@ -1334,21 +1341,29 @@ impl Binder<'_> {
             return Err(Error::Bind("assignments".into()));
         }
         let mut seen = BTreeSet::new();
+        let mut duplicate = false;
         let mut out = vec![];
+        let mut deferred = None;
         for (n, e) in v {
             let i = self.field(n)?;
             if !seen.insert(i) {
-                return Err(Error::Bind("duplicate assignment".into()));
+                if insert { return Err(Error::Bind("duplicate assignment".into())); }
+                duplicate = true;
             }
             if !insert && self.table()?.primary_key.contains(&i) {
                 return Err(Error::Unsupported);
             }
             let v = assign_number(self.value(e)?, &self.table()?.columns[i])?;
-            if !insert || v != Value::Null {
-                check(&v, &self.table()?.columns[i])?;
+            if (!insert || v != Value::Null)
+                && let Err(error) = check(&v, &self.table()?.columns[i]) {
+                if !insert && (error == Error::Overflow || error.sqlstate() == Some("23502")) {
+                    if deferred.is_none() { deferred = Some(error); }
+                } else { return Err(error); }
             }
             out.push((i, v))
         }
+        if duplicate { return Err(core(CoreError::Sql(SqlError::Syntax))); }
+        if let Some(error) = deferred { return Err(error); }
         Ok(out)
     }
     fn expression_assignments(&mut self, values: &[(String, Expr)]) -> Result<Vec<(usize, Bound)>> {
@@ -1356,12 +1371,11 @@ impl Binder<'_> {
             return Err(Error::Bind("assignments".into()));
         }
         let mut seen = BTreeSet::new();
+        let mut duplicate = false;
         let mut assignments = Vec::new();
         for (name, expression) in values {
             let index = self.field(name)?;
-            if !seen.insert(index) {
-                return Err(Error::Bind("duplicate assignment".into()));
-            }
+            duplicate |= !seen.insert(index);
             if self.table()?.primary_key.contains(&index) {
                 return Err(Error::Unsupported);
             }
@@ -1377,12 +1391,13 @@ impl Binder<'_> {
                         },
                     )
             {
-                return Err(Error::Type);
+                return Err(assignment_error(ty, &self.table()?.columns[index]));
             }
             // Column width and nullability depend on the selected postimages.
             // The legacy value-only request retains its eager checks above.
             assignments.push((index, expression));
         }
+        if duplicate { return Err(core(CoreError::Sql(SqlError::Syntax))); }
         Ok(assignments)
     }
     fn projections(&mut self, items: &[Projection]) -> Result<Vec<BoundProjection>> {
@@ -1535,7 +1550,7 @@ impl Binder<'_> {
                                     },
                                 )
                         {
-                            return Err(Error::Type);
+                            return Err(assignment_error(ty, &self.table()?.columns[*index]));
                         }
                         bound_row.push(expression);
                     }
@@ -1574,7 +1589,7 @@ impl Binder<'_> {
                                 },
                             )
                     {
-                        return Err(Error::Type);
+                        return Err(assignment_error(ty, &self.table()?.columns[index]));
                     }
                     expressions[index] = expression;
                 }
@@ -2627,10 +2642,11 @@ fn normalize_insert(
         .map(|(index, value)| assign_number(value, &table.columns[*index]))
         .collect::<Result<Vec<_>>>()?;
     let invalid_supplied = columns.iter().zip(&values)
-        .any(|(index, value)| check(value, &table.columns[*index]).is_err());
+        .filter_map(|(index, value)| check(value, &table.columns[*index]).err())
+        .max_by_key(|error| usize::from(*error == Error::Overflow));
     session.normalize_insert_engine(table, columns, values).map_err(|error| match error {
         CoreError::Sql(SqlError::Limit) => Error::Limit,
-        CoreError::Sql(SqlError::Null | SqlError::Type) if invalid_supplied => Error::Type,
+        error @ CoreError::Sql(SqlError::Null | SqlError::Type) => invalid_supplied.unwrap_or_else(|| core(error)),
         error => core(error),
     })
 }

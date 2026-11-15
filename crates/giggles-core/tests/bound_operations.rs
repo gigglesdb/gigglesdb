@@ -123,7 +123,7 @@ fn preparation_binds_actual_values_without_any_durable_decision() {
                 ("id".into(), V::Int(1)),
                 ("value".into(), V::Text("not an integer".into())),
             ]),
-            Error::Type,
+            Error::Sql { sqlstate: "42804".into() },
         ),
     ] {
         assert_eq!(

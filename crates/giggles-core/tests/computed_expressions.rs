@@ -210,15 +210,15 @@ fn computed_assignment_binding_and_runtime_destination_checks_are_distinct() {
         (
             "narrow",
             binary(field("narrow"), Arithmetic::Add, int(1)),
-            Error::Type,
+            Error::Overflow,
         ),
         (
             "medium",
             binary(field("medium"), Arithmetic::Add, int(1)),
-            Error::Type,
+            Error::Overflow,
         ),
-        ("required", field("src"), Error::Type),
-        ("required", value(V::Null), Error::Type),
+        ("required", field("src"), Error::Sql { sqlstate: "23502".into() }),
+        ("required", value(V::Null), Error::Sql { sqlstate: "23502".into() }),
         (
             "narrow",
             binary(int(i64::MAX), Arithmetic::Add, int(1)),
@@ -306,7 +306,7 @@ fn computed_write_cardinality_guards_and_late_errors_are_atomic() {
         yes(),
         many(2),
     );
-    runtime_failure(&admin, &engine, &late_width, Error::Type);
+    runtime_failure(&admin, &engine, &late_width, Error::Overflow);
     // The common engine now admits guarded bulk mutations; claims remain
     // outside that guard contract.
     let mut request = update(

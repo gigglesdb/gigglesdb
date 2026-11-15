@@ -308,7 +308,7 @@ fn binding_rejects_missing_extra_wrong_type_and_invalid_empty_mutations() {
             &request,
             &Bindings::from([("id".into(), V::Text("wrong".into()))])
         ),
-        Err(Error::Type)
+        Err(Error::Sql { sqlstate: "42883".into() })
     );
     assert_eq!(
         engine.execute(
@@ -325,8 +325,8 @@ fn binding_rejects_missing_extra_wrong_type_and_invalid_empty_mutations() {
         0
     );
     for (name, value, expected) in [
-        ("n", V::Int(i64::MAX), Error::Type),
-        ("state", V::Null, Error::Type),
+        ("n", V::Int(i64::MAX), Error::Overflow),
+        ("state", V::Null, Error::Sql { sqlstate: "23502".into() }),
         ("absent", V::Int(1), Error::Sql { sqlstate: "42703".into() }),
     ] {
         let invalid = Request::Update {

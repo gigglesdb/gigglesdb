@@ -403,7 +403,7 @@ fn returning_projection_failures_and_write_constraints_are_atomic() {
         ("required", field("optional")),
     ] {
         let request = returning(update(yes(), Intent::One, vec![(column, rhs)]), vec![]);
-        rejects_atomically(&admin, &engine, &request, &Bindings::new(), Error::Type);
+        rejects_atomically(&admin, &engine, &request, &Bindings::new(), if column == "n" { Error::Overflow } else { Error::Sql { sqlstate: "23502".into() } });
     }
 }
 

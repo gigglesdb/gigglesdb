@@ -439,3 +439,4 @@ mod native_views;
 #[path = "native_create_defaults.rs"] mod native_create_defaults;
 
 #[path = "native_sequences.rs"] mod native_sequences;
+#[path = "native_error_splits.rs"] mod native_error_splits;

@@ -287,7 +287,7 @@ fn preparation_checks_exact_arguments_and_native_tree_admission() {
         ]);
         assert_eq!(
             engine.prepare_bound_text(text, &wrong).err(),
-            Some(Error::Type)
+            Some(Error::Sql { sqlstate: "42883".into() })
         );
         let extra = Bindings::from([
             ("id".into(), Value::Int(1)),
@@ -304,7 +304,7 @@ fn preparation_checks_exact_arguments_and_native_tree_admission() {
         ]);
         assert_eq!(
             engine.prepare_bound_text(text, &range).err(),
-            Some(Error::Type)
+            Some(Error::Overflow)
         );
         let malformed = Statement::Read {
             table: "items".into(),

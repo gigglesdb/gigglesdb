@@ -199,7 +199,7 @@ fn inspection_cli_catalog_and_version_selection_are_explicit() {
     assert_eq!(json(&run(&database, "describe table `items`")), described);
     assert_eq!(
         error(&run(&database, "describe table missing")),
-        Error::Bind("table".into())
+        Error::Sql { sqlstate: "42P01".into() }
     );
     let admin = Admin::open(&database, Limits::default()).unwrap();
     assert_eq!(digest(&admin), before);

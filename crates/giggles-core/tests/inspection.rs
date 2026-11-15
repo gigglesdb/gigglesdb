@@ -144,7 +144,7 @@ fn inspection_reads_only_committed_metadata_and_ignores_business_row_bounds() {
     let before = digest(&admin);
     assert_eq!(
         trap(|| engine.inspect(&describe("staged"))),
-        Err(Error::Bind("table".into()))
+        Err(Error::Sql { sqlstate: "42P01".into() })
     );
     assert_eq!(
         summaries(trap(|| engine.inspect(&InspectionRequest::Tables)).unwrap()).len(),
@@ -264,13 +264,13 @@ fn inspection_metadata_bounds_and_name_admission_are_explicit() {
     }
     assert_eq!(
         engine.inspect(&describe("missing")),
-        Err(Error::Bind("table".into()))
+        Err(Error::Sql { sqlstate: "42P01".into() })
     );
     // A valid but absent reserved name has the same missing-table diagnostic;
     // this surface grants no access to built-in repair or policy state.
     assert_eq!(
         engine.inspect(&describe("deliveries")),
-        Err(Error::Bind("table".into()))
+        Err(Error::Sql { sqlstate: "42P01".into() })
     );
     assert_eq!(digest(&admin), before);
 }
@@ -333,7 +333,7 @@ fn inspection_uses_no_sql_transaction_slot() {
     assert!(summaries(trap(|| engine.inspect(&InspectionRequest::Tables)).unwrap()).is_empty());
     assert_eq!(
         engine.inspect(&describe("missing")),
-        Err(Error::Bind("table".into()))
+        Err(Error::Sql { sqlstate: "42P01".into() })
     );
     assert_eq!(digest(&admin), before);
     drop(sessions);

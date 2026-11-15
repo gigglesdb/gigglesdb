@@ -254,7 +254,7 @@ fn under_budget_missing_extra_and_type_errors_keep_their_existing_meaning() {
         (Bindings::new(), Error::Bind("parameter missing".into())),
         (
             Bindings::from([("id".into(), V::Text("wrong type".into()))]),
-            Error::Type,
+            Error::Sql { sqlstate: "42883".into() },
         ),
         (
             Bindings::from([("id".into(), V::Int(1)), ("extra".into(), V::Bool(true))]),

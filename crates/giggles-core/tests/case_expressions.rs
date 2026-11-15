@@ -399,7 +399,7 @@ fn case_metadata_and_omitted_else_preserve_static_types() {
     if let Request::UpdateExpressions { values, .. } = &mut small {
         values[0].1 = searched(vec![(no(), int(1))], Some(int(40000)));
     }
-    runtime_failure(&admin, &engine, &small, Error::Type);
+    runtime_failure(&admin, &engine, &small, Error::Overflow);
     engine
         .execute(&update(unknown, Intent::One), &Bindings::new())
         .unwrap();
@@ -407,7 +407,7 @@ fn case_metadata_and_omitted_else_preserve_static_types() {
     if let Request::UpdateExpressions { values, .. } = &mut required {
         values[0].0 = "required".into();
     }
-    runtime_failure(&admin, &engine, &required, Error::Type);
+    runtime_failure(&admin, &engine, &required, Error::Sql { sqlstate: "23502".into() });
 }
 
 fn balanced(mut expressions: Vec<Expr>) -> Expr {

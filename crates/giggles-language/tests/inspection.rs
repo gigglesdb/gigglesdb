@@ -292,7 +292,7 @@ fn inspection_catalog_text_and_tree_match_without_sql_or_effects() {
     sql.execute("CREATE TABLE pending(id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();
     assert!(
-        matches!(with_sql_parser_forbidden(|| engine.inspect_text("describe table pending")), Err(Error::Bind(message)) if message == "table")
+        matches!(with_sql_parser_forbidden(|| engine.inspect_text("describe table pending")), Err(Error::Sql { sqlstate }) if sqlstate == "42P01")
     );
     assert_eq!(
         catalog(engine.inspect_text("show tables").unwrap()).catalog_epoch,
@@ -356,7 +356,7 @@ fn inspection_rejections_and_identifier_bounds_are_explicit() {
             ));
         }
         assert!(
-            matches!(engine.inspect_text("describe table missing"), Err(Error::Bind(message)) if message == "table")
+            matches!(engine.inspect_text("describe table missing"), Err(Error::Sql { sqlstate }) if sqlstate == "42P01")
         );
         assert!(matches!(
             engine.inspect_text(&" ".repeat(MAX_INPUT + 1)),

@@ -431,7 +431,7 @@ fn scalar_function_metadata_keeps_typed_and_untyped_nulls() {
     if let Request::UpdateExpressions { values, .. } = &mut required {
         values[0].0 = "required".into();
     }
-    runtime_failure(&admin, &engine, &required, Error::Type);
+    runtime_failure(&admin, &engine, &required, Error::Sql { sqlstate: "23502".into() });
 }
 
 fn balanced_boolean(mut expressions: Vec<Expr>) -> Expr {

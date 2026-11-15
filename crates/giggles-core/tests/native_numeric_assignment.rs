@@ -188,14 +188,16 @@ fn exercise(admin: Admin) {
         sql.execute("SELECT v FROM conflict_reference", &[], None).unwrap().rows[0].values
     );
     sql.execute("CREATE TABLE mismatch(id int PRIMARY KEY,v numeric)", &[], None).unwrap();
-    assert_eq!(engine.execute(&insert("mismatch", V::Text("7".into())), &Bindings::new()), Err(Error::Type));
+    assert_eq!(engine.execute(&insert("mismatch", V::Text("7".into())), &Bindings::new()), Err(Error::Sql { sqlstate: "42804".into() }));
+    assert_eq!(giggles_core::sqlstate(&sql.execute("INSERT INTO mismatch VALUES(1,'7'::text)", &[], None).unwrap_err()), "42804");
     sql.execute("CREATE TABLE int_range(id int PRIMARY KEY,v int)", &[], None).unwrap();
     sql.execute("CREATE TABLE small_range(id int PRIMARY KEY,v smallint)", &[], None).unwrap();
-    assert_eq!(engine.execute(&insert("small_range", V::Int(32768)), &Bindings::new()), Err(Error::Type));
+    assert_eq!(engine.execute(&insert("small_range", V::Int(32768)), &Bindings::new()), Err(Error::Overflow));
     sql.execute("CREATE TABLE text_boundary(id int PRIMARY KEY,v text)", &[], None).unwrap();
     assert_eq!(engine.execute(&insert("text_boundary", num("7")), &Bindings::new()), Err(Error::Type));
-    // Native integer-family range admission intentionally remains Error::Type.
-    assert_eq!(engine.execute(&insert("int_range", V::Int(2147483648)), &Bindings::new()), Err(Error::Type));
+    sql.execute("INSERT INTO text_boundary VALUES(1,7::numeric)", &[], None).unwrap();
+    // Native integer-family overflow preserves SQLSTATE 22003.
+    assert_eq!(engine.execute(&insert("int_range", V::Int(2147483648)), &Bindings::new()), Err(Error::Overflow));
     assert_eq!(
         giggles_core::sqlstate(
             &sql.execute("INSERT INTO int_range VALUES(1,2147483648::int8)", &[], None).unwrap_err()

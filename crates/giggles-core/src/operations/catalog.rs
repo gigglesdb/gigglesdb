@@ -339,7 +339,8 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     native_options(columns)?;
     Ok(())
 }
-fn native_options(columns: &[ColumnSpec]) -> Result<(Vec<Option<String>>, Vec<Option<crate::relational::defaults::SequenceSpec>>)> {
+type NativeOptions = (Vec<Option<String>>, Vec<Option<crate::relational::defaults::SequenceSpec>>);
+fn native_options(columns: &[ColumnSpec]) -> Result<NativeOptions> {
     use crate::relational::defaults::{native_default, SequenceSpec};
     let mut defaults = Vec::with_capacity(columns.len());
     let mut sequences = Vec::with_capacity(columns.len());

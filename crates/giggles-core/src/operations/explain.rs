@@ -119,7 +119,7 @@ impl Engine {
             .inspect_secondary_catalog_engine(|domain, epoch, tables, descriptors| {
                 let table = tables
                     .get(table)
-                    .ok_or_else(|| Error::Bind("table".into()))?;
+                    .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
                 if table.hidden_rowid().is_some() {
                     return Err(Error::Unsupported);
                 }
