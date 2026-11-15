@@ -238,6 +238,49 @@ Build slots. Every cargo command in a worker or gate is wrapped in
 heavy slots, plus a third slot for check-only `cargo check` and
 `cargo clippy`, which link nothing. CARGO_BUILD_JOBS stays 4.
 
+## When to gate
+
+Agreed with the user on 2026-11-15. A landing gate is for finished work only.
+- Gate when a feature, or a stack of features, is complete: the worker
+  lanes pass, the review is done, and it would land if the gate passed.
+  Never gate to explore, to see how far along something is, or to check a
+  partial feature.
+- Batch. If another feature in the same track will be ready within about an
+  hour, wait and gate the two together as one stack.
+- A failed gate gets a fix in a worker lane, checked in that lane. Rerun the
+  gate only once the fix is done, not after each attempt.
+
+## Remote gates on boat.dev
+
+Landing gates may run on boat.dev Linux boxes (user account, paid per start
+and per machine hour). The rules below cap what anyone starts.
+- Only coordinators start or delete boxes. SOL workers never run `boat`.
+- Boxes run landing gates only (see "When to gate"). No worker iteration,
+  focused tests, exploration or agent prompts on boxes.
+- At most 2 gate boxes run at once, account-wide, across all coordinators.
+  Take a slot with an atomic
+  `mkdir J:/gigglesdb-work/boat/slots/slot-<1|2>`, release it after
+  `boat delete`, and write the box id into the slot's `owner` file.
+- At most 15 box starts per day, all agents together. Append one line per start to
+  `J:/gigglesdb-work/boat/usage.log` (UTC time, coordinator, box id, type,
+  stack tip, and later the result and minutes). Check the day's count before
+  starting. If the limit is reached, gate locally and tell the user.
+- Every box starts from the saved snapshot `gigglesdb-gate-base` with
+  `--no-env` and a `--ttl` of 2 hours at most. Never use `--no-auto-stop` or
+  `--count`.
+- One box per gate. A flake rerun (out-of-memory, lost connection) reuses the
+  same box, without a new start.
+- Delete the box (`boat delete <id>`) as soon as the results are copied back.
+  Never leave a box running or stopped. Once a day, check `boat list` and
+  delete any box with no slot owner.
+- Size: `default` unless the user approves `large` for gates. `xlarge` is
+  not allowed.
+- Code goes up only as a git bundle of the stack's commits. Never push
+  secrets, `.env` files or K: working copies.
+- Only one coordinator, named by the user, rebuilds and re-saves
+  `gigglesdb-gate-base`, and at most once a day, or when the toolchain or
+  native dependencies change.
+
 ## Landing with scripts/land-commit.sh
 
 `scripts/land-commit.sh` performs the steps of "Committing in the shared
