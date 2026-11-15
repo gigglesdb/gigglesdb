@@ -115,3 +115,44 @@ pub(crate) fn run(
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Binding, Service, clock::Clock};
+    use giggles_core::{Admin, Limits, roles};
+
+    #[test]
+    fn database_binding_refuses_native_operations_and_controls_before_binding() {
+        let path = crate::test_support::fixture_root().join(format!(
+            "database-native-binding-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        admin.sql_session().execute("CREATE TABLE app(id BIGINT PRIMARY KEY)", &[], None).unwrap();
+        admin.roles().create(roles::NewRole {
+            name: "bound".into(), login: true, superuser: true,
+            ..roles::NewRole::default()
+        }).unwrap();
+        let fingerprint = "11".repeat(32);
+        let service = Service::new(admin, vec![Binding {
+            fingerprint: fingerprint.clone(), role: Role::Database { name: "bound".into() }
+        }], Clock::new(0, 3600).unwrap()).unwrap();
+        let mut session = service.session(&fingerprint).unwrap();
+        for table in ["app", "missing"] {
+            let invocation = Invocation::Operation {
+                request: ops::Request::Read {
+                    table: table.into(), filter: None, order: vec![], limit: None, projection: vec![]
+                },
+                bindings: ops::Bindings::new(),
+            };
+            assert!(matches!(run(&mut session, invocation), Err(CoreError::Policy(Error::Scope))));
+        }
+        for invocation in [Invocation::Begin, Invocation::Commit, Invocation::Rollback] {
+            assert!(matches!(run(&mut session, invocation), Err(CoreError::Policy(Error::Scope))));
+        }
+        service.reload_bindings(vec![]).unwrap();
+        assert!(matches!(run(&mut session, Invocation::Begin), Err(CoreError::Policy(Error::Authentication))));
+    }
+}

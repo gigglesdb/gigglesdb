@@ -40,6 +40,21 @@ check every referenced table, including wrappers and later block steps, against
 the application binding before any step runs. Task identities cannot invoke
 native data operations, atomic blocks or native transaction controls.
 
+Operators may also provision an existing SQL LOGIN role in the same binding
+configuration: `{"fingerprint":"<64 lowercase SHA256 hex characters>",
+"role":{"role":"Database","name":"app_user"}}`. The role name comes only from
+this configuration. Unknown roles and roles without LOGIN reject validation and
+session opening. These identities can open sessions, but typed native operations,
+transaction controls and SQL requests currently return Scope (`42501`). Native
+SQL-role privilege enforcement will be enabled separately.
+
+A certificate-bound Database session checks both its fingerprint binding epoch
+and its SQL role generation on every request. Removing or replacing the binding,
+dropping/recreating the role, or revoking LOGIN invalidates existing sessions
+(`28000`). Unchanged configuration reloads preserve bindings; removing and
+readding one never revives old sessions. Password-only SQL changes use the same
+generation aliases as authenticated PostgreSQL sessions.
+
 ## Persistent sessions
 
 | Operation | HTTP | gRPC method |

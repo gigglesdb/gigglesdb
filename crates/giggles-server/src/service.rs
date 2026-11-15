@@ -23,7 +23,6 @@ pub enum Role {
         domain: String,
         tables: BTreeSet<String>,
     },
-    #[serde(skip)]
     Database { name: String },
 }
 impl Role {
@@ -180,9 +179,6 @@ impl Service {
         let mut map = BTreeMap::new();
         let mut owners: BTreeMap<String, Role> = BTreeMap::new();
         for b in bindings {
-            if matches!(&b.role, Role::Database { .. }) {
-                return Err(CoreError::Policy(Error::Authentication));
-            }
             if b.fingerprint.len() != 64
                 || !b
                     .fingerprint
@@ -191,12 +187,19 @@ impl Service {
             {
                 return Err(CoreError::Limit);
             }
-            let bound = match &b.role {
-                Role::Task { domain, .. } | Role::Application { domain, .. } => domain,
-                Role::Database { .. } => return Err(CoreError::Policy(Error::Authentication)),
-            };
-            if bound != &domain {
-                return Err(CoreError::Policy(Error::Authentication));
+            match &b.role {
+                Role::Task { domain: bound, .. } | Role::Application { domain: bound, .. }
+                    if bound != &domain =>
+                {
+                    return Err(CoreError::Policy(Error::Authentication));
+                }
+                Role::Database { name } => {
+                    admin.roles().get(name)
+                        .map_err(|_| CoreError::Policy(Error::Authentication))?
+                        .filter(|role| role.login)
+                        .ok_or(CoreError::Policy(Error::Authentication))?;
+                }
+                _ => {}
             }
             if let Role::Application { tables, .. } = &b.role {
                 if tables.is_empty() || tables.len() > 128 {
@@ -284,6 +287,7 @@ impl Service {
             fingerprint: format!("pgrole:{}", role.name),
             role: Role::Database { name: role.name },
             epoch: role.generation,
+            role_fence: None,
             scoped: false,
             connection: None,
             database: None,
@@ -306,6 +310,15 @@ impl Service {
             .get(fingerprint)
             .cloned()
             .ok_or(CoreError::Policy(Error::Authentication))?;
+        let role_fence = if let Role::Database { name } = &role {
+            let role = self.admin.roles().get(name)
+                .map_err(|_| CoreError::Policy(Error::Authentication))?
+                .filter(|role| role.login)
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            Some((role.oid, role.generation))
+        } else {
+            None
+        };
         Ok(Session {
             surface: Surface::Native,
             backend_pid: 0,
@@ -314,6 +327,7 @@ impl Service {
             service: self.clone(),
             role,
             epoch,
+            role_fence,
             scoped: false,
             connection: None,
             database: None,
@@ -345,7 +359,10 @@ pub struct Session {
     pub(crate) role: Role,
     pub(crate) database: Option<String>,
     pub(crate) fingerprint: String,
+    // Fingerprint binding epoch, or the role generation for trusted pgwire sessions.
     pub(crate) epoch: u64,
+    // Certificate-bound Database role OID and generation, independent of the binding epoch.
+    pub(crate) role_fence: Option<(u32, u64)>,
     scoped: bool,
     pub(crate) connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) sql: SqlSession,
@@ -420,17 +437,27 @@ impl Session {
             SessionZone::named(name).ok()
         };
     }
+    fn role_epoch(&self) -> u64 {
+        self.role_fence.map_or(self.epoch, |(_, generation)| generation)
+    }
     pub(crate) fn check_binding(&self) -> Result<(), CoreError> {
         if let Role::Database { name } = &self.role {
-            return self
-                .service
+            self.service
                 .admin
                 .roles()
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+                .filter(|role| {
+                    role.login
+                        && self.role_fence.is_none_or(|(oid, _)| role.oid == oid)
+                        && self.service.role_generation_matches(role, self.role_epoch())
+                })
                 .map(|_| ())
-                .ok_or(CoreError::Policy(Error::Authentication));
+                .ok_or(CoreError::Policy(Error::Authentication))?;
+            // Trusted pgwire sessions have no fingerprint binding to fence.
+            if self.role_fence.is_none() {
+                return Ok(());
+            }
         }
         let credentials = self
             .service
@@ -518,7 +545,7 @@ impl Session {
             .roles()
             .get(name)
             .map_err(|_| "28000")?
-            .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
             .ok_or("28000")?;
         // Serialize SQL password rotations and publish aliases before returning to wire checks.
         let mut aliases = self
@@ -615,7 +642,7 @@ impl Session {
                         .map_err(|_| CoreError::Policy(Error::Authentication))?
                         .filter(|role| {
                             role.login
-                                && session.service.role_generation_matches(role, session.epoch)
+                                && session.service.role_generation_matches(role, session.role_epoch())
                         })
                         .ok_or(CoreError::Policy(Error::Authentication))?;
                     if role.superuser {
@@ -879,7 +906,7 @@ impl Session {
             let role = roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             role.superuser
                 || roles
@@ -919,7 +946,7 @@ impl Session {
             roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {
@@ -974,7 +1001,7 @@ impl Session {
             let role = roles
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             if role.superuser {
                 true
@@ -1078,7 +1105,7 @@ impl Session {
             .roles()
             .get(name)
             .map_err(|_| CoreError::Policy(Error::Authentication))?
-            .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+            .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
             .map(|role| role.superuser)
             .ok_or(CoreError::Policy(Error::Authentication))
     }
@@ -1130,7 +1157,7 @@ impl Session {
                 let role = roles
                     .get(name)
                     .map_err(|_| CoreError::Policy(Error::Authentication))?
-                    .filter(|r| r.login && self.service.role_generation_matches(r, self.epoch))
+                    .filter(|r| r.login && self.service.role_generation_matches(r, self.role_epoch()))
                     .ok_or(CoreError::Policy(Error::Authentication))?;
                 if let Some(owner) = owner
                     && roles
@@ -1306,7 +1333,7 @@ impl Session {
                 .roles()
                 .get(name)
                 .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+                .filter(|role| role.login && self.service.role_generation_matches(role, self.role_epoch()))
                 .ok_or(CoreError::Policy(Error::Authentication))?
                 .superuser
         } else {
@@ -1778,6 +1805,11 @@ impl Session {
             match request {
                 Request::Deadline { .. } => unreachable!(),
                 Request::Ping => Ok(Response::code("ok")),
+                // Certificate-bound SQL roles are provisioned for future native
+                // privilege enforcement; this does not expose the SQL interface.
+                Request::Sql { .. } if self.role_fence.is_some() => {
+                    Err(CoreError::Policy(Error::Scope))
+                }
                 Request::Sql { sql, params } => Ok(Response {
                     sql: Some(self.execute_sql(&sql, &params)?),
                     ..Response::code("ok")
@@ -2310,19 +2342,129 @@ mod lifecycle_tests {
         assert!(!session.is_aborted());
         assert!(session.transaction_us.is_none());
     }
-    #[test]
-    fn database_role_cannot_be_installed_as_a_fingerprint_binding() {
+    fn database_binding_fixture() -> (Arc<Service>, Vec<Binding>) {
         let (service, mut bindings) = fixture();
-        bindings[0].role = Role::Database {
-            name: "owner".into(),
-        };
-        assert!(matches!(
-            Service::validate(&service.admin, bindings.clone()),
-            Err(CoreError::Policy(Error::Authentication))
-        ));
-        assert!(service.reload_bindings(bindings.clone()).is_err());
-        assert!(serde_json::to_value(&bindings[0]).is_err());
-        assert!(serde_json::from_str::<Role>(r#"{"role":"Database","name":"owner"}"#).is_err());
+        service.admin.roles().create(roles::NewRole {
+            name: "bound".into(), login: true, superuser: true,
+            ..roles::NewRole::default()
+        }).unwrap();
+        // Make the binding counter deliberately independent of the role counter.
+        service.reload_bindings(vec![]).unwrap();
+        bindings[0].role = Role::Database { name: "bound".into() };
+        service.reload_bindings(bindings.clone()).unwrap();
+        (service, bindings)
+    }
+    #[test]
+    fn database_fingerprint_binding_requires_existing_login_role() {
+        let (service, mut bindings) = database_binding_fixture();
+        let encoded = serde_json::to_string(&bindings[0]).unwrap();
+        assert_eq!(serde_json::from_str::<Binding>(&encoded).unwrap(), bindings[0]);
+        Service::validate(&service.admin, bindings.clone()).unwrap();
+        let session = service.session(&bindings[0].fingerprint).unwrap();
+        assert_ne!(session.epoch, session.role_epoch());
+        session.check_binding().unwrap();
+        service.admin.roles().create(roles::NewRole {
+            name: "no_login".into(), ..roles::NewRole::default()
+        }).unwrap();
+        for name in ["missing", "no_login"] {
+            bindings[0].role = Role::Database { name: name.into() };
+            assert!(matches!(Service::validate(&service.admin, bindings.clone()),
+                Err(CoreError::Policy(Error::Authentication))));
+            assert!(matches!(service.reload_bindings(bindings.clone()),
+                Err(CoreError::Policy(Error::Authentication))));
+            session.check_binding().unwrap();
+        }
+    }
+    #[test]
+    fn database_fingerprint_binding_fences_role_lifetime_and_login() {
+        for change in ["drop", "recreate", "nologin", "login_again", "alter"] {
+            let (service, bindings) = database_binding_fixture();
+            let session = service.session(&bindings[0].fingerprint).unwrap();
+            let pgwire = service.role_session("bound").unwrap();
+            let roles = service.admin.roles();
+            match change {
+                "drop" | "recreate" => {
+                    roles.drop("bound").unwrap();
+                    assert!(matches!(service.session(&bindings[0].fingerprint),
+                        Err(CoreError::Policy(Error::Authentication))));
+                    if change == "recreate" {
+                        roles.create(roles::NewRole {
+                            name: "bound".into(), login: true,
+                            ..roles::NewRole::default()
+                        }).unwrap();
+                    }
+                }
+                "nologin" | "login_again" => {
+                    roles.alter("bound", roles::RoleChanges {
+                        login: Some(false), ..roles::RoleChanges::default()
+                    }).unwrap();
+                    assert!(matches!(service.session(&bindings[0].fingerprint),
+                        Err(CoreError::Policy(Error::Authentication))));
+                    if change == "login_again" {
+                        roles.alter("bound", roles::RoleChanges {
+                            login: Some(true), ..roles::RoleChanges::default()
+                        }).unwrap();
+                    }
+                }
+                _ => { roles.alter("bound", roles::RoleChanges {
+                    superuser: Some(false), ..roles::RoleChanges::default()
+                }).unwrap(); }
+            }
+            assert!(matches!(session.check_binding(),
+                Err(CoreError::Policy(Error::Authentication))), "{change}");
+            if change != "recreate" {
+                assert!(matches!(pgwire.check_binding(),
+                    Err(CoreError::Policy(Error::Authentication))), "{change}");
+            }
+        }
+    }
+    #[test]
+    fn database_fingerprint_binding_fences_reload_replace_and_readdition() {
+        let (service, bindings) = database_binding_fixture();
+        let old = service.session(&bindings[0].fingerprint).unwrap();
+        let pgwire = service.role_session("bound").unwrap();
+        service.reload_bindings(bindings.clone()).unwrap();
+        old.check_binding().unwrap(); // An unchanged reload preserves the binding.
+        service.admin.roles().create(roles::NewRole {
+            name: "other".into(), login: true, ..roles::NewRole::default()
+        }).unwrap();
+        let mut replaced = bindings.clone();
+        replaced[0].role = Role::Database { name: "other".into() };
+        service.reload_bindings(replaced).unwrap();
+        assert!(matches!(old.check_binding(), Err(CoreError::Policy(Error::Authentication))));
+        service.reload_bindings(bindings.clone()).unwrap();
+        assert!(matches!(old.check_binding(), Err(CoreError::Policy(Error::Authentication))));
+        let fresh = service.session(&bindings[0].fingerprint).unwrap();
+        fresh.check_binding().unwrap();
+        service.reload_bindings(vec![]).unwrap();
+        assert!(matches!(fresh.check_binding(), Err(CoreError::Policy(Error::Authentication))));
+        service.reload_bindings(bindings).unwrap();
+        assert!(matches!(fresh.check_binding(), Err(CoreError::Policy(Error::Authentication))));
+        pgwire.check_binding().unwrap();
+    }
+    #[test]
+    fn database_fingerprint_binding_preserves_password_aliases_without_exposing_sql() {
+        let (service, bindings) = database_binding_fixture();
+        let mut session = service.session(&bindings[0].fingerprint).unwrap();
+        let pgwire = service.role_session("bound").unwrap();
+        let identity = crate::api::ConnectionIdentity::verified(&service, &bindings[0].fingerprint).unwrap();
+        for _ in 0..2 {
+            let stmt = crate::auth::statements::parse("ALTER ROLE bound PASSWORD NULL").unwrap();
+            session.execute_admin(&stmt).unwrap();
+            session.check_binding().unwrap();
+            pgwire.check_binding().unwrap();
+            identity.check(&service).unwrap();
+            assert_eq!(identity, crate::api::ConnectionIdentity::verified(
+                &service, &bindings[0].fingerprint).unwrap());
+        }
+        assert_eq!(session.handle(Request::Sql {
+            sql: "SELECT 1".into(), params: vec![]
+        }).code, "42501");
+        service.admin.roles().drop("bound").unwrap();
+        service.admin.roles().create(roles::NewRole {
+            name: "bound".into(), login: true, ..roles::NewRole::default()
+        }).unwrap();
+        assert!(identity.check(&service).is_err());
     }
     #[test]
     fn drop_index_requires_table_ownership_even_with_schema_create() {

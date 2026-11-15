@@ -224,19 +224,16 @@ fn application_binding_keeps_its_existing_sql_scope() {
 }
 
 #[test]
-fn database_role_is_not_a_serializable_certificate_binding() {
-    let binding = serde_json::json!({
+fn database_role_is_a_serializable_provisioned_certificate_binding() {
+    let value = serde_json::json!({
         "fingerprint": APP_FP,
         "role": {"role": "Database", "name": "owner"}
     });
-    assert!(serde_json::from_str::<Binding>(&binding.to_string()).is_err());
-    let binding = Binding {
-        fingerprint: APP_FP.into(),
-        role: Role::Database {
-            name: "owner".into(),
-        },
-    };
-    assert!(serde_json::to_value(binding).is_err());
+    let binding = serde_json::from_value::<Binding>(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&binding).unwrap(), value);
+    let f = Fixture::new();
+    f.service.reload_bindings(vec![binding]).unwrap();
+    assert_eq!(f.service.session(APP_FP).unwrap().handle(Request::Ping).code, "ok");
 }
 
 #[test]
