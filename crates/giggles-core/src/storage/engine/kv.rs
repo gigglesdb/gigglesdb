@@ -62,12 +62,104 @@ pub(crate) enum Op {
 }
 
 /// Operations execute in insertion order as one atomic batch.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(crate) struct WriteBatch {
     ops: Vec<Op>,
 }
 
+const BATCH_WIRE_VERSION: u8 = 1;
+
 impl WriteBatch {
+    pub(crate) fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
+    /// Versioned replication payload; does not change the storage format.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+            let len = u32::try_from(bytes.len()).expect("batch field exceeds u32 length");
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+        let mut out = vec![BATCH_WIRE_VERSION];
+        let count = u32::try_from(self.ops.len()).expect("batch exceeds u32 operation count");
+        out.extend_from_slice(&count.to_be_bytes());
+        for op in self.ops() {
+            let (tag, ks, first, second) = match op {
+                Op::Put { ks, key, value } => (1, ks, key, Some(value)),
+                Op::Delete { ks, key } => (2, ks, key, None),
+                Op::DeleteRange { ks, start, end } => (3, ks, start, Some(end)),
+            };
+            out.push(tag);
+            out.push(Keyspace::ALL.iter().position(|item| item == ks).unwrap() as u8);
+            field(&mut out, first);
+            if let Some(bytes) = second {
+                field(&mut out, bytes);
+            }
+        }
+        let checksum = super::crc32c::crc32c(&out);
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, KvError> {
+        fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], KvError> {
+            if len > input.len() {
+                return Err(KvError::Corrupt("truncated batch".into()));
+            }
+            let (value, rest) = input.split_at(len);
+            *input = rest;
+            Ok(value)
+        }
+        fn number(input: &mut &[u8]) -> Result<u32, KvError> {
+            Ok(u32::from_be_bytes(take(input, 4)?.try_into().unwrap()))
+        }
+        fn field(input: &mut &[u8]) -> Result<Vec<u8>, KvError> {
+            let len = number(input)? as usize;
+            // Validate the slice before allocating from an untrusted length.
+            Ok(take(input, len)?.to_vec())
+        }
+        let Some(&version) = bytes.first() else {
+            return Err(KvError::Corrupt("empty batch".into()));
+        };
+        if version != BATCH_WIRE_VERSION {
+            return Err(KvError::Corrupt(format!("unknown batch version {version}")));
+        }
+        if bytes.len() < 9 {
+            return Err(KvError::Corrupt("truncated batch".into()));
+        }
+        let (payload, mut trailer) = bytes.split_at(bytes.len() - 4);
+        if super::crc32c::crc32c(payload) != number(&mut trailer)? {
+            return Err(KvError::Corrupt("batch checksum mismatch".into()));
+        }
+        let mut input = &payload[1..];
+        let count = number(&mut input)? as usize;
+        // Even an empty-key Delete needs six bytes; never reserve by count.
+        if count > input.len() / 6 {
+            return Err(KvError::Corrupt("batch operation count mismatch".into()));
+        }
+        let mut batch = Self::default();
+        for _ in 0..count {
+            let tag = take(&mut input, 1)?[0];
+            let index = take(&mut input, 1)?[0] as usize;
+            let ks = *Keyspace::ALL
+                .get(index)
+                .ok_or_else(|| KvError::Corrupt("unknown batch keyspace".into()))?;
+            match tag {
+                1 => batch.put(ks, field(&mut input)?, field(&mut input)?),
+                2 => batch.delete(ks, field(&mut input)?),
+                3 => batch.delete_range(ks, field(&mut input)?, field(&mut input)?),
+                _ => return Err(KvError::Corrupt("unknown batch operation tag".into())),
+            }
+        }
+        if !input.is_empty() {
+            return Err(KvError::Corrupt(
+                "trailing batch bytes or operation count mismatch".into(),
+            ));
+        }
+        Ok(batch)
+    }
+
     pub(crate) fn put(&mut self, ks: Keyspace, key: Vec<u8>, value: Vec<u8>) {
         self.ops.push(Op::Put { ks, key, value });
     }
@@ -260,3 +352,7 @@ impl KvRead for Kv {
         Kv::seek_ge(self, ks, key)
     }
 }
+
+#[cfg(test)]
+#[path = "kv_codec_tests.rs"]
+mod codec_tests;
