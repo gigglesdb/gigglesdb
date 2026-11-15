@@ -478,3 +478,25 @@ guard is a planned follow-up, and is not installed in milestone 1.
 The operational fingerprint excludes roles, ownership, ACLs, publications and
 Skedaddle administration. Relation OIDs intentionally bind table identity so
 that drop/recreate blocks; storage rewrites alone do not change the hash.
+
+### Refresh security and residual risk
+
+Ordinary coordinator refresh uses a boxed, process-local authenticated snapshot,
+never the local SQL projection, bound to the journal namespace, epoch, sequence,
+head digest and checkpoint-index identity. It rereads the cached anchor and index
+head and authenticates the suffix (including semantic and object checks) before
+syncing locally. A failed sync never publishes the candidate snapshot. Offset
+listing detects gaps without reading historical entries; backends may implement
+that listing by scanning metadata internally.
+
+Tampering with an old already-verified immutable entry is **not** detected on
+every refresh. Acquisition/takeover, checkpoint publication/rebase, recovery,
+reverse-authority producer verification and discontinuities retain full loads.
+Every five minutes of refresh activity a full load plus raw-history scrub runs;
+`Coordinator::with_full_refresh_interval(Duration)` configures this bound (zero
+scrubs on every refresh). No background timer runs while
+idle. Explicit `Journal::scrub` retains its full-history integrity check.
+Periodic scrubbing requires retained raw history; archiving/removing that history
+will fail closed at the next periodic scrub. Checkpoint recovery itself retains
+its existing ability to recover an archived prefix. No journal wire format or
+persisted state layout changes.

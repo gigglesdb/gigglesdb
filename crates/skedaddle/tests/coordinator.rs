@@ -3460,3 +3460,152 @@ async fn tls_connect(
     assert!(transport.warnings.is_empty());
     Ok((client, driver))
 }
+
+#[tokio::test]
+async fn incremental_refresh_reads_only_anchor_and_suffix_and_matches_full_replay() {
+    let counted = Arc::new(support::counting::CountingStore::new(fs_store(scratch(
+        "refresh-io",
+    ))));
+    let j = journal(counted.clone(), "migration");
+    let mut c = coordinator(j.clone(), "owner")
+        .with_checkpoint_interval(100_000)
+        .unwrap();
+    c.acquire().await.unwrap();
+    let mut state = c.state().clone();
+    let mut random = 17u64;
+    for n in 0..512 {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let e = Entry::new(&state, support::progress(random), c.instance_id()).unwrap();
+        j.put(&e).await.unwrap();
+        state.apply(&e).unwrap();
+        if n % 31 == 0 {
+            c.refresh().await.unwrap();
+            assert_eq!(c.state(), &j.load(true).await.unwrap());
+        }
+    }
+    c.refresh().await.unwrap();
+    counted.reset();
+    c.refresh().await.unwrap();
+    assert_eq!(counted.counts(), (2, 1)); // anchor + absent first checkpoint index
+    let e = Entry::new(&state, support::progress(513), c.instance_id()).unwrap();
+    j.put(&e).await.unwrap();
+    counted.reset();
+    c.refresh().await.unwrap();
+    assert_eq!(counted.counts(), (4, 1)); // anchor, index, suffix, Local anchor
+    assert_eq!(c.state(), &j.load(true).await.unwrap());
+}
+
+#[tokio::test]
+async fn incremental_refresh_rejects_missing_anchor_gap_and_bad_digest() {
+    use object_store::ObjectStoreExt;
+    for fault in ["anchor", "gap", "digest", "checkpoint"] {
+        let store = fs_store(scratch(fault));
+        let j = journal(store.clone(), "migration");
+        let mut c = coordinator(j.clone(), "owner");
+        c.acquire().await.unwrap();
+        c.commit(support::progress(2)).await.unwrap();
+        c.refresh().await.unwrap();
+        let e = Entry::new(c.state(), support::progress(3), c.instance_id()).unwrap();
+        j.put(&e).await.unwrap();
+        match fault {
+            "anchor" => store.delete(&j.entry_key(2)).await.unwrap(),
+            "gap" => {
+                let mut state = c.state().clone();
+                state.apply(&e).unwrap();
+                let next = Entry::new(&state, support::progress(4), c.instance_id()).unwrap();
+                j.put(&next).await.unwrap();
+                store.delete(&j.entry_key(3)).await.unwrap();
+            }
+            "digest" => {
+                let mut bad = e.clone();
+                bad.digest = "bad".into();
+                store
+                    .put(&j.entry_key(3), serde_json::to_vec(&bad).unwrap().into())
+                    .await
+                    .unwrap();
+            }
+            "checkpoint" => {
+                j.checkpoint(c.state()).await.unwrap();
+                store
+                    .put(&j.checkpoint_index_key(1), b"corrupt".to_vec().into())
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(c.refresh().await.is_err(), "{fault}");
+        assert!(!c.is_owner(), "{fault}");
+    }
+}
+
+#[tokio::test]
+async fn incremental_refresh_rebases_checkpoint_and_fences_takeover() {
+    let j = fresh_journal("refresh-rebase");
+    let mut c = coordinator(j.clone(), "owner");
+    c.acquire().await.unwrap();
+    c.commit(support::progress(2)).await.unwrap();
+    c.refresh().await.unwrap();
+    j.checkpoint(c.state()).await.unwrap();
+    c.refresh().await.unwrap();
+    assert_eq!(c.state(), &j.load(true).await.unwrap());
+    let mut other = coordinator(j.clone(), "other");
+    other.acquire().await.unwrap();
+    c.refresh().await.unwrap();
+    assert!(!c.is_owner());
+    assert_eq!(c.state(), other.state());
+}
+
+#[tokio::test]
+#[ignore = "local refresh scalability measurement; run explicitly with --nocapture"]
+async fn incremental_refresh_scalability() {
+    use std::time::Instant;
+    for count in [250, 2000, 10000] {
+        let j = fresh_journal("refresh-bench");
+        let mut c = coordinator(j.clone(), "owner")
+            .with_checkpoint_interval(100_000)
+            .unwrap();
+        c.acquire().await.unwrap();
+        let mut state = c.state().clone();
+        for n in 1..count {
+            let e = Entry::new(&state, support::progress(n), c.instance_id()).unwrap();
+            j.put(&e).await.unwrap();
+            state.apply(&e).unwrap();
+        }
+        c.refresh().await.unwrap();
+        // A fresh observer has no process cache: this is the original
+        // full-load + sync_verified refresh path, with setup outside timing.
+        let mut baseline = Coordinator::observer(
+            j.clone(),
+            Local::rebuild(scratch("refresh-baseline").join("db"), c.state()).unwrap(),
+            "baseline",
+        )
+        .unwrap();
+        let start = Instant::now();
+        baseline.refresh().await.unwrap();
+        let full_empty = start.elapsed();
+        let start = Instant::now();
+        c.refresh().await.unwrap();
+        let incremental_empty = start.elapsed();
+        for n in count..count + 3 {
+            let e = Entry::new(&state, support::progress(n), c.instance_id()).unwrap();
+            j.put(&e).await.unwrap();
+            state.apply(&e).unwrap();
+        }
+        let mut baseline = Coordinator::observer(
+            j.clone(),
+            Local::rebuild(scratch("refresh-baseline-tail").join("db"), c.state()).unwrap(),
+            "baseline",
+        )
+        .unwrap();
+        let start = Instant::now();
+        baseline.refresh().await.unwrap();
+        let full_tail = start.elapsed();
+        let start = Instant::now();
+        c.refresh().await.unwrap();
+        println!(
+            "refresh {count}: full_no_tail={full_empty:?} incremental_no_tail={incremental_empty:?} full_3_tail={full_tail:?} incremental_3_tail={:?}",
+            start.elapsed()
+        );
+        assert_eq!(c.state(), &state);
+    }
+}

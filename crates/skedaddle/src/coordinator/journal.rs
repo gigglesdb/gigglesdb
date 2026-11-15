@@ -192,7 +192,7 @@ impl Checkpoint {
 
 /// Immutable dense discovery index. It is outside the journal prefix, so finding
 /// the newest checkpoint uses O(log checkpoints) GETs and never lists history.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointHead {
     ordinal: u64,
@@ -229,6 +229,13 @@ impl CheckpointHead {
         }
         Ok(())
     }
+}
+
+/// Process-local authority only: never deserialize or seed from Local.
+pub(super) struct VerifiedRefresh {
+    pub state: Materialized,
+    namespace: String,
+    index: Option<CheckpointHead>,
 }
 
 pub struct Recovery {
@@ -756,6 +763,109 @@ impl Journal {
         }
         Ok(cp)
     }
+    pub(super) async fn full_refresh(&self, scrub: bool) -> Result<Box<VerifiedRefresh>> {
+        let before = self.latest_head().await?;
+        let state = self.load(true).await?;
+        // Periodic activity also scrubs retained raw history. load(true) alone
+        // may start at a checkpoint and cannot detect tampering before it.
+        if scrub && self.scrub().await? != state {
+            return Err(Error::RecoveryRequired(
+                "journal advanced during full scrub".into(),
+            ));
+        }
+        let index = self.latest_head().await?;
+        if before != index {
+            return Err(Error::RecoveryRequired(
+                "checkpoint changed during refresh".into(),
+            ));
+        }
+        Ok(Box::new(VerifiedRefresh {
+            state,
+            namespace: self.namespace().into(),
+            index,
+        }))
+    }
+
+    pub(super) async fn refresh_suffix(
+        &self,
+        cached: &VerifiedRefresh,
+    ) -> Result<Box<VerifiedRefresh>> {
+        let result = self.try_refresh_suffix(cached).await;
+        // Any discontinuity requires the original authentication boundary.
+        match result {
+            Ok(Some(next)) => Ok(next),
+            Ok(None) => self.full_refresh(false).await,
+            Err(error) => {
+                // Reauthenticate for diagnostics, but never turn a witnessed
+                // corrupt suffix/gap into a successful truncated refresh.
+                self.full_refresh(false).await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn try_refresh_suffix(
+        &self,
+        cached: &VerifiedRefresh,
+    ) -> Result<Option<Box<VerifiedRefresh>>> {
+        if cached.namespace != self.namespace() {
+            return Ok(None);
+        }
+        let ordinal = cached.index.as_ref().map_or(0, |head| head.ordinal);
+        if (ordinal > 0 && self.index_head(ordinal).await? != cached.index)
+            || self.index_head(ordinal + 1).await?.is_some()
+        {
+            return Ok(None);
+        }
+        if cached.state.applied_seq > 0 {
+            let anchor = self.entry(cached.state.applied_seq).await?;
+            if cached.state.audit.get(&anchor.seq) != Some(&anchor) {
+                return Ok(None);
+            }
+        }
+        let mut state = cached.state.clone();
+        // LIST only after the verified anchor: unlike stopping at NotFound,
+        // this detects a missing sequence followed by a later immutable entry.
+        // Sorting is required: ObjectStore listing order is unspecified.
+        let offset = self.entry_key(state.applied_seq);
+        let mut listing = self.store.list_with_offset(Some(&self.root), &offset);
+        let mut suffix = std::collections::BTreeMap::new();
+        while let Some(meta) = listing.try_next().await? {
+            let name = meta.location.filename().unwrap_or_default();
+            if name.starts_with("checkpoint-") {
+                continue;
+            }
+            let seq = parse_seq(
+                name.strip_suffix(".json")
+                    .ok_or_else(|| Error::RecoveryRequired("unexpected suffix object".into()))?,
+            )?;
+            if meta.location != self.entry_key(seq) || seq <= cached.state.applied_seq {
+                return Err(Error::RecoveryRequired("noncanonical suffix key".into()));
+            }
+            suffix.insert(seq, meta.location);
+        }
+        for (seq, _) in suffix {
+            if seq != state.applied_seq + 1 {
+                return Err(Error::RecoveryRequired("journal suffix gap".into()));
+            }
+            let entry = self.entry(seq).await?;
+            if entry.epoch != state.epoch {
+                return Ok(None);
+            }
+            // Includes sequence, digest, prev_digest, owner, semantic, chunk
+            // and reverse-authority checks; never use Local as a replay seed.
+            self.apply_entry(&mut state, &entry).await?;
+        }
+        if state.verification.reverse.is_some() {
+            return Ok(None); // Producer authority always requires full history.
+        }
+        Ok(Some(Box::new(VerifiedRefresh {
+            state,
+            namespace: cached.namespace.clone(),
+            index: cached.index.clone(),
+        })))
+    }
+
     pub async fn load(&self, use_checkpoint: bool) -> Result<Materialized> {
         // Recovery is a large state machine. Keep it heap-bound so optional
         // verification metadata cannot amplify nested coordinator future stacks.

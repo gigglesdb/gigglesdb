@@ -6,7 +6,7 @@ use super::exclusion::{self, ExclusionGuard, MigrationExclusion};
 
 use super::{
     EffectKind, Error, Materialized, Result, Transition,
-    journal::{Entry, Journal},
+    journal::{Entry, Journal, VerifiedRefresh},
     local::Local,
 };
 
@@ -48,13 +48,22 @@ impl EffectToken {
     }
 }
 
+// Replace the old inline checkpoint interval with one pointer, preserving the
+// Coordinator layout budget as well as Materialized and Transition layouts.
+struct RefreshState {
+    checkpoint_every: u64,
+    verified: Option<Box<VerifiedRefresh>>,
+    full_refresh_interval: std::time::Duration,
+    last_scrub: std::time::Instant,
+}
+
 pub struct Coordinator {
     pub(super) journal: Journal,
     local: Local,
     instance: Box<str>,
     exclusion: Option<Arc<MigrationExclusion>>,
     owns: bool,
-    checkpoint_every: u64,
+    refresh_state: Box<RefreshState>,
     #[cfg(feature = "test-crash")]
     crash: Option<super::CrashSeam>,
 }
@@ -72,7 +81,12 @@ impl Coordinator {
             instance: format!("{instance}/{}", uuid::Uuid::new_v4()).into_boxed_str(),
             exclusion: None,
             owns: false,
-            checkpoint_every: 1000,
+            refresh_state: Box::new(RefreshState {
+                checkpoint_every: 1000,
+                verified: None,
+                full_refresh_interval: std::time::Duration::from_secs(300),
+                last_scrub: std::time::Instant::now(),
+            }),
             #[cfg(feature = "test-crash")]
             crash: None,
         })
@@ -98,17 +112,26 @@ impl Coordinator {
                 "checkpoint interval must be positive".into(),
             ));
         }
-        self.checkpoint_every = transitions;
+        self.refresh_state.checkpoint_every = transitions;
         Ok(self)
     }
+    /// Maximum time between full authentications during refresh activity.
+    /// Zero forces a full scrub on every refresh (also useful for diagnostics).
+    pub fn with_full_refresh_interval(mut self, interval: std::time::Duration) -> Self {
+        self.refresh_state.full_refresh_interval = interval;
+        self
+    }
+
     pub async fn checkpoint(&mut self) -> Result<()> {
         if !self.owns {
             return Err(Error::Observer);
         }
+        self.refresh_state.verified = None;
         self.refresh().await?;
         if !self.owns {
             return Err(Error::LostOwnership);
         }
+        self.refresh_state.verified = None;
         let result = self.local.checkpoint(&self.journal).await;
         if result.is_err() {
             self.owns = false;
@@ -116,19 +139,48 @@ impl Coordinator {
         result
     }
     pub async fn refresh(&mut self) -> Result<()> {
+        Box::pin(self.refresh_at(std::time::Instant::now())).await
+    }
+
+    async fn refresh_at(&mut self, now: std::time::Instant) -> Result<()> {
         let epoch = self.state().epoch;
-        let verified = match self.journal.load(true).await {
+        // Historical immutable objects before the cached head are rechecked
+        // at full boundaries, not on each refresh. Never seed from Local.
+        // Keep this deadline independent of checkpoint/acquisition refreshes:
+        // frequent rebases must not postpone old-prefix tampering detection.
+        let periodic = now.saturating_duration_since(self.refresh_state.last_scrub)
+            >= self.refresh_state.full_refresh_interval;
+        let candidate = if periodic {
+            self.journal.full_refresh(true).await
+        } else if let Some(cached) = &self.refresh_state.verified {
+            self.journal.refresh_suffix(cached).await
+        } else {
+            self.journal.full_refresh(false).await
+        };
+        let verified = match candidate {
             Ok(state) => state,
             Err(error) => {
                 self.owns = false;
+                self.refresh_state.verified = None;
                 return Err(error);
             }
         };
-        let result = self.local.sync_verified(&verified, &self.journal).await;
+        let result = self
+            .local
+            .sync_verified(&verified.state, &self.journal)
+            .await;
         if result.is_err()
             || (self.owns && (self.state().owner != *self.instance || self.state().epoch != epoch))
         {
             self.owns = false;
+        }
+        if result.is_ok() {
+            if periodic {
+                self.refresh_state.last_scrub = now;
+            }
+            self.refresh_state.verified = Some(verified);
+        } else {
+            self.refresh_state.verified = None;
         }
         result
     }
@@ -189,6 +241,7 @@ impl Coordinator {
     }
 
     async fn acquire_inner(&mut self, guard: Option<&ExclusionGuard>) -> Result<u64> {
+        self.refresh_state.verified = None;
         if let Some(guard) = guard {
             guard.check_alive().await.map_err(exclusion_error)?;
         }
@@ -230,11 +283,17 @@ impl Coordinator {
         }
         #[cfg(feature = "test-crash")]
         self.crash_at(super::CrashSeam::AfterLocalApply);
-        if entry.seq.is_multiple_of(self.checkpoint_every)
-            && let Err(error) = self.local.checkpoint(&self.journal).await
+        if entry
+            .seq
+            .is_multiple_of(self.refresh_state.checkpoint_every)
         {
-            self.owns = false;
-            return Err(error);
+            self.refresh_state.verified = None;
+            self.refresh().await?;
+            if let Err(error) = self.local.checkpoint(&self.journal).await {
+                self.owns = false;
+                return Err(error);
+            }
+            self.refresh_state.verified = None;
         }
         Ok(entry)
     }
@@ -593,6 +652,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn poisoned_local_sync_never_publishes_trusted_candidate() {
+        use std::time::Duration;
+        let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
+            .join(format!("refresh-poison-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
+        let j = Journal::new(store, "p2", "poison", Duration::from_secs(2)).unwrap();
+        let mut c =
+            Coordinator::observer(j.clone(), Local::create(root.join("db")).unwrap(), "owner")
+                .unwrap();
+        c.acquire().await.unwrap();
+        c.refresh().await.unwrap();
+        let progress = |position: &str| Transition::Progress {
+            stream: "s".into(),
+            marker: "m".into(),
+            position: position.into(),
+        };
+        let real = Entry::new(c.state(), progress("real"), c.instance_id()).unwrap();
+        let forged = Entry::new(c.state(), progress("poison"), c.instance_id()).unwrap();
+        j.put(&real).await.unwrap();
+        c.local.apply(&forged).unwrap();
+        assert!(c.refresh().await.is_err());
+        assert!(c.refresh_state.verified.is_none());
+        assert!(!c.is_owner());
+        assert_ne!(c.state(), &j.load(true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_clock_detects_old_tampering_even_behind_checkpoint() {
+        use object_store::ObjectStoreExt;
+        use std::time::{Duration, Instant};
+        let root = std::path::PathBuf::from(std::env::var_os("TEMP").unwrap())
+            .join(format!("refresh-clock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
+        let j = Journal::new(store.clone(), "p2", "periodic", Duration::from_secs(2)).unwrap();
+        let mut c =
+            Coordinator::observer(j.clone(), Local::create(root.join("db")).unwrap(), "owner")
+                .unwrap();
+        c.acquire().await.unwrap();
+        c.commit(Transition::Progress {
+            stream: "s".into(),
+            marker: "m".into(),
+            position: "2".into(),
+        })
+        .await
+        .unwrap();
+        c.checkpoint().await.unwrap();
+        c.refresh().await.unwrap();
+        store
+            .put(&j.entry_key(1), b"corrupt".to_vec().into())
+            .await
+            .unwrap();
+        c.refresh().await.unwrap(); // Old immutable object is outside the suffix.
+        assert!(
+            c.refresh_at(Instant::now() + Duration::from_secs(301))
+                .await
+                .is_err()
+        );
+        assert!(!c.is_owner());
+        assert!(c.refresh_state.verified.is_none());
+    }
+
     #[tokio::test]
     async fn intent_executor_rejects_each_stale_capability_field() {
         use std::{
