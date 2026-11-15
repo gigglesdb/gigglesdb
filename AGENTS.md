@@ -201,11 +201,10 @@ Worker lanes. SOL workers do not run the landing gate.
   changed (`cargo test --test all <file>::` or `cargo test --lib <module>::`).
   Never a crate's full suite or clippy per change or per sub-task (user,
   2026-11-15).
-- Once, as a sanity check when the whole feature is done (the coordinator
-  marks that brief FINAL): `cargo test --no-fail-fast` and
-  `cargo clippy --all-targets -- -D warnings`, default features only, in each
-  crate whose `src/` or `tests/` they changed. Add the `--no-default-features`
-  pair only when the change touches `cfg(feature = ...)` code.
+- Workers never run a crate's full suite or clippy locally, not even at the
+  end of a feature. The full run is the coordinator's remote landing gate
+  once the whole feature is done (user, 2026-11-15: local machine time is for
+  scoped runs; a 20-minute remote gate at the end is fine).
 - Workers report totals and failing test names, not logs.
 - Workers reuse a fixed lane (one stable worktree plus one stable
   CARGO_TARGET_DIR per lane, reset between tasks), never a fresh per-task
@@ -213,7 +212,9 @@ Worker lanes. SOL workers do not run the landing gate.
   build cold every time.
 
 Landing gate. The coordinator runs it once on the tip of the stack it lands
-(see batching below), sized by what the stack changes:
+(see batching below), remotely with `scripts/gate-remote.sh` on a large boat
+box by default, and locally only when the script exits 3 (daily cap) or
+4 (no slot). It is sized by what the stack changes:
 - Code in a crate's `src/`: full `cargo test --no-fail-fast` plus clippy for
   that crate, in default mode and, for crates with optional features
   (giggles-core, giggles-server, giggles-language), also in
@@ -283,8 +284,8 @@ and per machine hour). The rules below cap what anyone starts.
 - Delete the box (`boat delete <id>`) as soon as the results are copied back.
   Never leave a box running or stopped. Once a day, check `boat list` and
   delete any box with no slot owner.
-- Size: `default` unless the user approves `large` for gates. `xlarge` is
-  not allowed.
+- Size: `large` for gates (user approved 2026-11-15; the script's
+  default). `xlarge` is not allowed.
 - Code goes up only as a git bundle of the stack's commits. Never push
   secrets, `.env` files or K: working copies.
 - Only one coordinator, named by the user, rebuilds and re-saves

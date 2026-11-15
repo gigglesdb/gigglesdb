@@ -13,7 +13,7 @@
 #   <crate>:tests=<f1>,<f2>    test-only stack: cargo test --test all <f>:: for
 #                              each file, plus clippy --all-targets (default)
 # Options:
-#   --type default|large       box size (large needs user approval; default: default)
+#   --type default|large       box size (default: large, user-approved for gates)
 #   --ttl <seconds>            box lifetime, at most 7200 (default 7200)
 #   --slot-wait <seconds>      how long to wait for a free slot (default 1800)
 #   --no-clippy                skip clippy (only when the stack has no Rust changes)
@@ -30,7 +30,7 @@ boatdir=J:/gigglesdb-work/boat
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-gate-base
 max_starts=15
-tip='' who='' type=default ttl=7200 slot_wait=1800 clippy=1
+tip='' who='' type=large ttl=7200 slot_wait=1800 clippy=1
 steps=()
 while [ $# -gt 0 ]; do
   case "$1" in
