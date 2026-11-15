@@ -271,20 +271,72 @@ fn unsupported_native_construct_cannot_pass() {
 }
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-fn native_on_v2_still_refuses_catalog_writes() {
-    // V2 coverage requires giggles-language's engine-rocksdb feature.
-    let (_db, admin) = Database::fresh(StorageEngine::V2);
-    // R2 item 2: typed BEGIN/ROLLBACK run on v2 without the SQL parser.
-    with_sql_parser_forbidden(|| {
-        let mut session = admin.sql_session();
-        session.begin_native().unwrap();
-        session.rollback_native().unwrap();
-    });
-    // Native catalog writes remain refused; keyed reads and writes are supported.
-    assert!(matches!(
-        native(&admin, "create table items(id int64,primary key(id))", true),
-        Step::Native(Error::Core(_))
-    ));
+fn v2_native_catalog_matches_sql_on_populated_database() {
+    let (left_db, left) = Database::fresh(StorageEngine::V2);
+    let (right_db, right) = Database::fresh(StorageEngine::V2);
+    let engine = Engine::with_version(right.clone(), LanguageVersion::Embedded016);
+    for (statement, text) in [
+        ("create table items(id bigint primary key, a bigint not null)",
+         "create table items(id int64,a int64,primary key(id))"),
+        ("insert into items values(1,10)", "insert items set id=1,a=10"),
+        ("create index items_a on items(a)", "create index items_a on items(a)"),
+        // SQL v2 permits CREATE TABLE after business rows already exist.
+        ("create table second(id bigint primary key)", "create table second(id int64,primary key(id))"),
+    ] {
+        let expected = left.sql_session().execute(statement, &[], None).unwrap();
+        with_sql_parser_forbidden(|| {
+            if text.starts_with("create") {
+                engine.execute_catalog_text(text).unwrap();
+                assert_eq!(expected.affected, 0);
+            } else {
+                let actual = engine.execute_text(text, &Bindings::new()).unwrap();
+                assert_eq!(actual.affected as u64, expected.affected);
+            }
+        });
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
+    assert_eq!(native(&right, "items order by id limit 1024", false),
+        sql(&left, "select * from items order by id"));
+    // Both SQL reads use the newly backfilled secondary index, including after reopen.
+    let indexed_read = "select * from items where a=10";
+    let expected = Step::Success(vec![vec![Value::Int(1), Value::Int(10)]]);
+    for admin in [&left, &right] {
+        assert_eq!(sql(admin, indexed_read), expected);
+    }
+    assert_eq!(native(&right, "items where a=10 order by id limit 1024", false), expected);
+    for (statement, text, kind, code) in [
+        ("create table items(id bigint primary key)", "create table items(id int64,primary key(id))", SqlError::DuplicateTable, "42P07"),
+        ("create index items_a on items(a)", "create index items_a on items(a)", SqlError::Duplicate, "23505"),
+        ("create index missing on items(absent)", "create index missing on items(absent)", SqlError::UnknownColumn, "42703"),
+    ] {
+        assert_eq!(sql(&left, statement), Step::Sql(kind.clone()));
+        let actual = with_sql_parser_forbidden(|| engine.execute_catalog_text(text)).unwrap_err();
+        if kind == SqlError::DuplicateTable {
+            // Known difference: native CREATE TABLE still exposes 23505 vs SQL 42P07.
+            assert_eq!(actual, Error::Duplicate);
+            assert_eq!(actual.sqlstate(), Some("23505"));
+            assert_ne!(actual.sqlstate(), Some(code));
+        } else if kind == SqlError::UnknownColumn {
+            // Existing string forwarding retains the cause but exposes no SQLSTATE.
+            assert_eq!(actual, Error::Core(CoreError::Sql(kind).to_string()));
+            assert_eq!(actual.sqlstate(), None);
+            assert_eq!(code, "42703");
+        } else {
+            assert_eq!(actual, Error::Duplicate);
+            assert_eq!(actual.sqlstate(), Some(code));
+        }
+        assert_eq!(snapshot(&left), snapshot(&right));
+    }
+    let before = snapshot(&left);
+    drop(engine); drop(left); drop(right);
+    let left = Admin::open(&left_db.0, Limits::default()).unwrap();
+    let right = Admin::open(&right_db.0, Limits::default()).unwrap();
+    assert_eq!(snapshot(&left), before);
+    assert_eq!(snapshot(&right), before);
+    for admin in [&left, &right] {
+        assert_eq!(sql(admin, indexed_read), expected);
+    }
+    assert_eq!(native(&right, "items where a=10 order by id limit 1024", false), expected);
 }
 #[test]
 fn parser_trap_positive_control_covers_text_and_prepared_entry() {
@@ -725,12 +777,10 @@ fn numeric_native_catalog_matches_sql() {
         let (_db, v2) = Database::fresh(StorageEngine::V2);
         let engine = Engine::with_version(v2.clone(), v);
         with_sql_parser_forbidden(|| {
-            for result in [engine.execute_catalog_text(text), engine.execute_catalog(&tree)] {
-                assert!(matches!(result, Err(Error::Core(message))
-                    if message.contains("EngineUnsupported") && message.contains("v2")));
-            }
+            engine.execute_catalog_text(text).unwrap();
+            assert_eq!(engine.execute_catalog(&tree), Err(Error::Duplicate));
         });
-        assert!(snapshot(&v2).is_empty());
+        assert_eq!(snapshot(&v2)[0].columns, expected.state[0].columns);
     }
 }
 

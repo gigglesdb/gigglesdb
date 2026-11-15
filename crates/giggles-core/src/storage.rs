@@ -2401,15 +2401,33 @@ impl SqlSession {
         }
         result
     }
-    /// Eligibility for synchronous safe catalog creates, from the exact active
-    /// snapshot that will stage the definition. Empty existing tables are fine;
-    /// business and retained task/decision state require the migration path.
+    /// Eligibility from the active definition snapshot. Legacy requires empty
+    /// business/task state; v2 uses SQL's synchronous populated-database DDL.
     pub(crate) fn catalog_empty_engine(&mut self) -> Result<bool, CoreError> {
-        self.admin.inner.db(SQL_SESSIONS)?;
         let result = (|| {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
+            if self.is_v2_engine() {
+                // SQL v2 DDL is synchronous even on populated databases. Hold its
+                // catalog barrier through the native commit, and reject drift
+                // while waiting rather than silently rebinding a frozen request.
+                let before = self.snapshot_identity_engine()?;
+                let txn = self.v2_transaction.as_mut()
+                    .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+                txn.acquire_lock(
+                    engine::locks::LockKey::Table(0),
+                    engine::locks::LockMode::AccessExclusive,
+                    None,
+                    &|| crate::cancellation::check().is_err(),
+                )?;
+                txn.begin_statement();
+                if self.snapshot_identity_engine()? != before {
+                    return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                }
+                return Ok(true);
+            }
+            self.admin.inner.db(SQL_SESSIONS)?;
             let staged = self
                 .staged
                 .as_ref()
@@ -2434,6 +2452,19 @@ impl SqlSession {
         columns: Vec<relational::ColumnDef>,
         keys: Vec<String>,
     ) -> Result<(), CoreError> {
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let domain = u128::from_be_bytes(db.meta.domain);
+            let result = (|| {
+                self.catalog_empty_engine()?;
+                let mut prepared = relational::Prepared::create_engine(
+                    name, columns, keys, domain, &relational::Relational::default(),
+                ).map_err(CoreError::Sql)?;
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], None).map(|_| ())
+            })();
+            if result.is_err() { self.abort(); }
+            return result;
+        }
         self.admin.inner.db(SQL_SESSIONS)?;
         // Do not permit this entry to accidentally autocommit outside the
         // caller's eligibility/definition snapshot and final decision fence.

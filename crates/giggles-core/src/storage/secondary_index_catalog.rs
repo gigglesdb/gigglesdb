@@ -62,6 +62,35 @@ impl SqlSession {
             return Err(CoreError::Unsupported);
         }
         let result = (|| {
+            if let Backend::V2(db) = &self.admin.inner.backend {
+                if unique {
+                    return Err(CoreError::Unsupported);
+                }
+                let (domain, current) = db.inspect_binding(
+                    self.v2_transaction.as_ref(),
+                    |domain, _, tables| (domain, tables.get(&table.name) == Some(table)),
+                )?;
+                if !current {
+                    return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+                }
+                if table.hidden_rowid().is_some() {
+                    return Err(CoreError::Sql(relational::SqlError::Unsupported));
+                }
+                let names = columns.iter().map(|id| {
+                    table.columns.iter().find(|column| column.id == *id)
+                        .map(|column| column.name.clone())
+                        .ok_or(CoreError::Sql(relational::SqlError::UnknownColumn))
+                }).collect::<Result<Vec<_>, _>>()?;
+                let mut prepared = relational::Prepared::create_index_engine(
+                    table.name.clone(), name.into(), names, domain, 0,
+                );
+                prepared.transaction = self.transaction_id;
+                self.execute_bound_engine(&prepared, &[], None)?;
+                return self.catalog_metadata()?.indexes.into_iter()
+                    .find(|index| index.table == table.id && index.name == name)
+                    .map(|index| index.id)
+                    .ok_or(CoreError::Sql(relational::SqlError::UnknownTable));
+            }
             let revision = self
                 .staged_revision
                 .checked_add(1)

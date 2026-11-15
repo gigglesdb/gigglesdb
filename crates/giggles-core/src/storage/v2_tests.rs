@@ -343,11 +343,11 @@ fn lifecycle_and_public_refusals() {
     session.begin_engine().unwrap();
     session.commit_engine().unwrap();
     assert_eq!(session.catalog_engine().unwrap().1.len(), 1);
-    denied(session.catalog_empty_engine(), SQL_SESSIONS);
+    assert_eq!(session.catalog_empty_engine(), Err(CoreError::Sql(relational::SqlError::Transaction)));
     assert_eq!(session.snapshot_identity_engine(), Err(CoreError::Sql(relational::SqlError::Transaction)));
-    denied(
+    assert_eq!(
         session.create_table_engine(String::new(), vec![], vec![]),
-        SQL_SESSIONS,
+        Err(CoreError::Sql(relational::SqlError::Transaction)),
     );
     let legacy_path = directory();
     let legacy = Admin::create(&legacy_path, Limits::default()).unwrap();
@@ -853,4 +853,92 @@ fn native_filtered_reads_fall_back_with_and_without_secondary_index() {
         drop(admin);
         fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_catalog_publication_and_fences() {
+    use crate::operations::{CatalogRequest, ColumnSpec, Engine as Native, Error};
+    use relational::{DataType, SqlError, with_sql_parser_forbidden};
+    let create = |name: &str| CatalogRequest::CreateTable {
+        table: name.into(),
+        columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true }],
+        primary_key: vec!["id".into()],
+    };
+    for backend in [Engine::Legacy, Engine::V2] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        let native = Native::new(admin.clone());
+        let stale = Error::Core(CoreError::Sql(SqlError::StaleSchema).to_string());
+        with_sql_parser_forbidden(|| {
+            let bound = native.prepare_catalog_bound(&create("items")).unwrap();
+            native.execute_catalog_bound(&bound).unwrap();
+            assert_eq!(native.execute_catalog_bound(&bound), Err(stale.clone()));
+        });
+        admin.sql_session().execute("INSERT INTO items VALUES (1)", &[], None).unwrap();
+        let index = CatalogRequest::CreateIndex {
+            table: "items".into(), name: "items_id".into(), columns: vec!["id".into()],
+        };
+        with_sql_parser_forbidden(|| {
+            let bound = native.prepare_catalog_bound(&index).unwrap();
+            if backend == Engine::Legacy {
+                // Explicit eligibility difference: legacy retains its empty-state rule.
+                assert_eq!(native.execute_catalog_bound(&bound), Err(Error::PlanRequired));
+                assert_eq!(native.execute_catalog(&create("second")), Err(Error::PlanRequired));
+            } else {
+                let outcome = native.execute_catalog_bound(&bound).unwrap();
+                assert_eq!(Some(admin.sql_session().catalog_metadata().unwrap().indexes[0].id), outcome.index_id);
+                assert_eq!(native.execute_catalog_bound(&bound), Err(stale.clone()));
+                native.execute_catalog(&create("second")).unwrap();
+                let bound = native.prepare_catalog_bound(&create("never")).unwrap();
+                native.execute_catalog(&create("drift")).unwrap();
+                assert_eq!(native.execute_catalog_bound(&bound), Err(stale.clone()));
+            }
+        });
+        if backend == Engine::Legacy {
+            assert!(admin.sql_session().catalog_metadata().unwrap().indexes.is_empty());
+            admin.sql_session().execute("CREATE INDEX items_id ON items(id)", &[], None).unwrap();
+        }
+        drop(native);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_v2_catalog_rollback_and_waiting_fence() {
+    use relational::{ColumnDef, DataType, SqlError, with_sql_parser_forbidden};
+    let path = directory();
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+    admin.sql_session().execute("CREATE TABLE items(id BIGINT PRIMARY KEY)", &[], None).unwrap();
+    let mut session = admin.sql_session();
+    with_sql_parser_forbidden(|| {
+        session.begin_native().unwrap();
+        session.create_table_engine("private".into(), vec![ColumnDef {
+            id: 0, name: "id".into(), data_type: DataType::BigInt, not_null: true,
+        }], vec!["id".into()]).unwrap();
+        let table = session.catalog_engine().unwrap().1.into_iter().find(|t| t.name == "items").unwrap();
+        session.create_index_engine(&table, "private_index", &[table.columns[0].id]).unwrap();
+        assert_eq!(session.catalog_metadata().unwrap().tables.len(), 2);
+        assert_eq!(session.catalog_metadata().unwrap().indexes.len(), 1);
+        assert_eq!(admin.sql_session().catalog_metadata().unwrap().tables.len(), 1);
+        assert!(admin.sql_session().catalog_metadata().unwrap().indexes.is_empty());
+        session.rollback_native().unwrap();
+    });
+    assert_eq!(session.catalog_metadata().unwrap().tables.len(), 1);
+    assert!(session.catalog_metadata().unwrap().indexes.is_empty());
+    session.begin_native().unwrap();
+    let before = session.snapshot_identity_engine().unwrap();
+    admin.sql_session().execute("CREATE TABLE drift(id BIGINT PRIMARY KEY)", &[], None).unwrap();
+    assert_eq!(session.snapshot_identity_engine().unwrap(), before);
+    assert_eq!(session.catalog_empty_engine(), Err(CoreError::Sql(SqlError::StaleSchema)));
+    session.rollback_native().unwrap();
+    drop(session);
+    drop(admin);
+    let reopened = Admin::open(&path, Limits::default()).unwrap();
+    assert_eq!(reopened.sql_session().catalog_metadata().unwrap().tables.len(), 2);
+    assert!(reopened.sql_session().catalog_metadata().unwrap().indexes.is_empty());
+    drop(reopened);
+    fs::remove_dir_all(path).unwrap();
 }

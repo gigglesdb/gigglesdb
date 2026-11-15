@@ -1860,6 +1860,25 @@ impl Prepared {
             state.epoch,
         ))
     }
+    pub(crate) fn create_index_engine(
+        table: String,
+        name: String,
+        columns: Vec<String>,
+        domain: u128,
+        epoch: u64,
+    ) -> Self {
+        Self::engine(
+            Statement::CreateIndex(sql_index::CreateIndex {
+                name,
+                table,
+                columns,
+                unique: false,
+                if_not_exists: false,
+            }),
+            domain,
+            epoch,
+        )
+    }
     pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Begin, domain, epoch)
     }
