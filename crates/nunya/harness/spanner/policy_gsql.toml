@@ -1,0 +1,19 @@
+snapshot_max_age_ms = 60000
+[readlog]
+sink = "stdout"
+[domains.email]
+tokenize = "on"
+tokenize_limit_per_task = 20
+[[column]]
+table = ".Customers"
+name = "Email"
+blind = "email"
+[[column]]
+table = ".Outbox"
+name = "ToAddress"
+blind = "email"
+[[column]]
+table = ".Customers"
+name = "Phone"
+masked = true
+placeholder = "[hidden]"

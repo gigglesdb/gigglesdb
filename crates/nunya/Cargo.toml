@@ -1,0 +1,58 @@
+[package]
+name = "nunya"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autotests = false
+description = "Tokenizing database gateway: AI agents use data they never see"
+
+[workspace]
+
+[[bin]]
+name = "nunya"
+path = "src/main.rs"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+bytes = "1"
+futures = "0.3"
+postgres-protocol = "=0.6.12"
+tokio-postgres = "=0.7.15"
+tokio-postgres-rustls = { version = "0.13", default-features = false }
+pg_query = "=18.1.0"
+sqlparser = { version = "=0.53.0", features = ["visitor"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.2.1"
+clap = { version = "4", features = ["derive"] }
+aes = "0.9.4"
+aes-siv = "0.8.0"
+fpe = "0.7.0"
+hkdf = "0.13.0"
+sha2 = "0.11.1"
+hmac = "0.13.0"
+stringprep = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.4.3"
+data-encoding = "2.11.1"
+uuid = "1"
+thiserror = "2"
+# Match the pre-generated Spanner client, rather than introducing another tonic.
+tonic = { version = "0.12", features = ["tls-webpki-roots"] }
+http = "1"
+tower = "0.4"
+prost = "0.13"
+prost-types = "0.13"
+google-cloud-googleapis = { version = "0.16.1", features = ["spanner"] }
+gcp_auth = "0.12.7"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+proptest = "1"

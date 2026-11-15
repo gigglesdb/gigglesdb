@@ -1,0 +1,210 @@
+[[case]]
+sql = "SELECT email FROM customers WHERE email LIKE 'a%'"
+expect = "NY002"
+note = "worked step 5 pattern"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email ILIKE 'a%'"
+expect = "NY002"
+note = "case insensitive pattern"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email SIMILAR TO 'a%'"
+expect = "NY002"
+note = "similar pattern"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email ~ 'a'"
+expect = "NY002"
+note = "regex"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email !~ 'a'"
+expect = "NY002"
+note = "negative regex"
+
+[[case]]
+sql = "SELECT email FROM customers ORDER BY email"
+expect = "NY002"
+note = "blind ordering"
+
+[[case]]
+sql = "SELECT email FROM customers ORDER BY 1"
+expect = "NY002"
+note = "ordinal ordering"
+
+[[case]]
+sql = "SELECT email AS x FROM customers ORDER BY x"
+expect = "NY002"
+note = "alias ordering"
+
+[[case]]
+sql = "SELECT upper(email) FROM customers"
+expect = "NY002"
+note = "blind function"
+
+[[case]]
+sql = "SELECT email::text FROM customers"
+expect = "NY002"
+note = "blind cast"
+
+[[case]]
+sql = "SELECT length(email) FROM customers"
+expect = "NY002"
+note = "blind length leak"
+
+[[case]]
+sql = "SELECT min(email) FROM customers"
+expect = "NY002"
+note = "minimum leaks order"
+
+[[case]]
+sql = "SELECT max(email) FROM customers"
+expect = "NY002"
+note = "maximum leaks order"
+
+[[case]]
+sql = "SELECT string_agg(email,',') FROM customers"
+expect = "NY002"
+note = "blind aggregate"
+
+[[case]]
+sql = "SELECT array_agg(email) FROM customers"
+expect = "NY002"
+note = "blind array aggregate"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email <> $1"
+expect = "NY002"
+note = "inequality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email > $1"
+expect = "NY002"
+note = "range comparison"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email BETWEEN 'a' AND 'z'"
+expect = "NY002"
+note = "between blind"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IS DISTINCT FROM $1"
+expect = "NY002"
+note = "distinct predicate"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=country"
+expect = "NY002"
+note = "blind plain equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=upper($1)"
+expect = "NY002"
+note = "computed equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=NULL"
+expect = "NY002"
+note = "null equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=$1 AND id=$1"
+expect = "NY002"
+note = "param decrypted and plain"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=$1 LIMIT $1"
+expect = "NY002"
+note = "param shared limit"
+
+[[case]]
+sql = "SELECT email=$1 FROM customers"
+expect = "NY002"
+note = "equality select context"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE phone='x'"
+expect = "NY005"
+note = "masked predicate"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE phone IS NULL"
+expect = "NY005"
+note = "masked nullness"
+
+[[case]]
+sql = "SELECT phone FROM customers ORDER BY phone"
+expect = "NY005"
+note = "masked order"
+
+[[case]]
+sql = "SELECT phone,count(*) FROM customers GROUP BY phone"
+expect = "NY005"
+note = "masked group"
+
+[[case]]
+sql = "SELECT count(phone) FROM customers"
+expect = "NY005"
+note = "masked count"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=phone"
+expect = "NY002"
+note = "blind masked equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email NOT IN ($1,$2)"
+expect = "NY002"
+note = "negative membership"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=ANY(ARRAY[$1,$2])"
+expect = "NY002"
+note = "any array blind"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=ALL(ARRAY[$1,$2])"
+expect = "NY002"
+note = "all array blind"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=E'x'"
+expect = "NY004"
+note = "unsupported escaped literal"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=B'101'"
+expect = "NY004"
+note = "unsupported bit literal"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=X'ff'"
+expect = "NY004"
+note = "unsupported hex literal"
+
+[[case]]
+sql = "SELECT missing FROM customers"
+expect = "NY004"
+note = "unknown column"
+
+[[case]]
+sql = "SELECT email FROM missing"
+expect = "NY004"
+note = "unknown relation"
+
+[[case]]
+sql = "SELECT c.id FROM customers c JOIN notes n ON true WHERE id=1"
+expect = "NY004"
+note = "ambiguous column"
+
+[[case]]
+sql = "SELECT nunya_tokenize('unknown',$1)"
+expect = "NY006"
+note = "unknown tokenize domain"
+
+[[case]]
+sql = "SELECT nunya_tokenize('email',$1),1"
+expect = "NY004"
+note = "tokenize extra target"
+

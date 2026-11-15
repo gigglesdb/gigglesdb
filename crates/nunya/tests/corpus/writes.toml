@@ -1,0 +1,169 @@
+[[case]]
+sql = "INSERT INTO outbox(to_address,template) VALUES ('tok_email_x','reminder')"
+plan = { inputs = ["literal:email"], outputs = [] }
+expect = "allow"
+note = "worked step 2 literal input"
+
+[[case]]
+sql = "UPDATE notes SET body='tok_email_x' WHERE id=3"
+plan = { inputs = [], outputs = [] }
+expect = "allow"
+note = "worked step 4 checker plain literal allowed session must detect token"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) VALUES ($1)"
+expect = "allow"
+note = "blind param write"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) VALUES (NULL)"
+expect = "allow"
+note = "blind null write"
+
+[[case]]
+sql = "UPDATE customers SET email=$1 WHERE id=1"
+expect = "allow"
+note = "blind update"
+
+[[case]]
+sql = "UPDATE customers SET email=NULL"
+expect = "allow"
+note = "blind null update"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) SELECT email FROM customers"
+expect = "allow"
+note = "same domain insert select"
+
+[[case]]
+sql = "UPDATE outbox SET to_address=c.email FROM customers c WHERE c.id=outbox.id"
+expect = "allow"
+note = "same domain update from"
+
+[[case]]
+sql = "INSERT INTO notes(id,body) VALUES (1,'hello')"
+expect = "allow"
+note = "plain literal insert"
+
+[[case]]
+sql = "INSERT INTO notes(body) VALUES ($1)"
+expect = "allow"
+note = "plain parameter insert"
+
+[[case]]
+sql = "UPDATE notes SET body=upper(body)"
+expect = "allow"
+note = "plain computed update"
+
+[[case]]
+sql = "UPDATE customers SET phone='new'"
+expect = "allow"
+note = "masked literal write"
+
+[[case]]
+sql = "UPDATE customers SET phone=$1"
+expect = "allow"
+note = "masked param write"
+
+[[case]]
+sql = "UPDATE customers SET phone=NULL"
+expect = "allow"
+note = "masked null write"
+
+[[case]]
+sql = "UPDATE customers SET phone=country"
+expect = "allow"
+note = "masked plain column write"
+
+[[case]]
+sql = "UPDATE customers SET phone=upper(country)"
+expect = "allow"
+note = "masked computed plain write"
+
+[[case]]
+sql = "UPDATE notes SET body=c.email FROM customers c WHERE notes.id=c.id"
+expect = "NY001"
+note = "blind into plain"
+
+[[case]]
+sql = "UPDATE customers SET phone=email"
+expect = "NY005"
+note = "blind into masked"
+
+[[case]]
+sql = "UPDATE notes SET body=c.phone FROM customers c WHERE notes.id=c.id"
+expect = "NY005"
+note = "masked into plain"
+
+[[case]]
+sql = "UPDATE customers SET email=country"
+expect = "NY002"
+note = "plain into blind"
+
+[[case]]
+sql = "UPDATE customers SET email=upper(country)"
+expect = "NY002"
+note = "computed into blind"
+
+[[case]]
+sql = "UPDATE customers SET email=upper(email)"
+expect = "NY002"
+note = "tainted blind update"
+
+[[case]]
+sql = "UPDATE notes SET body=upper(c.email) FROM customers c"
+expect = "NY002"
+note = "tainted into plain"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address,template) VALUES ($1,$1)"
+expect = "NY002"
+note = "write parameter mixed treatment"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) VALUES ($2),($1)"
+plan = { inputs = ["param:1:email", "param:2:email"], outputs = [] }
+expect = "allow"
+note = "ordered inputs"
+
+[[case]]
+sql = "INSERT INTO customers(id,email) VALUES (1,$1) ON CONFLICT(email) DO UPDATE SET email=excluded.email"
+expect = "allow"
+note = "conflict same domain"
+
+[[case]]
+sql = "DELETE FROM customers WHERE email=$1 RETURNING id,email"
+expect = "allow"
+note = "delete returning"
+
+[[case]]
+sql = "UPDATE customers SET email=$1 RETURNING email,phone"
+plan = { inputs = ["param:1:email"], outputs = ["tokenize:email", "mask"] }
+expect = "allow"
+note = "update returning token and mask"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) VALUES ($1) RETURNING to_address"
+expect = "allow"
+note = "insert returning"
+
+[[case]]
+sql = "DELETE FROM notes USING customers c WHERE notes.id=c.id RETURNING notes.id"
+expect = "allow"
+note = "delete using"
+
+[[case]]
+sql = "INSERT INTO notes DEFAULT VALUES RETURNING *"
+expect = "allow"
+note = "default plain insert"
+
+[[case]]
+sql = "INSERT INTO outbox(to_address) VALUES (DEFAULT)"
+expect = "NY004"
+note = "blind default unknown"
+
+[[case]]
+sql = "INSERT INTO v_emails VALUES (1,'x')"
+expect = "NY004"
+note = "view writes refused"
+

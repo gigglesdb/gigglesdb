@@ -1,0 +1,12 @@
+# Harness-only credential: agent / standing-test. Native CLI dispatch is pending.
+policy = "policy_gsql.toml"
+state_dir = "state"
+root_key_file = "root.key"
+allow_plaintext = true
+[[standing]]
+name = "agent"
+verifier = "SCRAM-SHA-256$4096:c3Bhbm5lci1oYXJuZXNz$8c6enPZ83GyrQegOxgg2cgZVqyQ7SWJLNNUmNNPel/g=:8SrHm6USSMvggTijzzUGcURgyO0M4UnCmEINiZOtcbc="
+[spanner_native]
+listen = "127.0.0.1:6433"
+database = "projects/test-project/instances/test-instance/databases/gsql"
+emulator_endpoint = "http://localhost:9010"

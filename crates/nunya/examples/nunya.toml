@@ -1,0 +1,26 @@
+listen = "127.0.0.1:6432"
+admin_listen = "127.0.0.1:6480"
+policy = "policy.toml"
+state_dir = "state"
+schemas = ["public"]
+search_path = ["public"]
+snapshot_refresh_ms = 30000
+max_connections = 256
+allow_plaintext = true
+# Supply NUNYA_ROOT_KEY and NUNYA_UPSTREAM_PASSWORD in the environment.
+[upstream]
+dialect = "postgres" # Use "spanner-pg" for Google PGAdapter.
+host = "127.0.0.1"
+port = 16432
+user = "nunya"
+dbname = "app"
+tls = "disable"
+connect_timeout_ms = 5000
+application_name = "nunya"
+
+# Optional native GoogleSQL route; omit the upstream section and top-level listen for native only.
+# [spanner_native]
+# listen = "127.0.0.1:6433"
+# database = "projects/my-project/instances/my-instance/databases/my-database"
+# emulator_endpoint = "http://127.0.0.1:9010" # Trusted local emulator only.
+# snapshot_refresh_ms = 30000

@@ -1,0 +1,9 @@
+services:
+  emulator:
+    image: gcr.io/cloud-spanner-emulator/emulator:1.5.41
+    ports: ["127.0.0.1:9010:9010", "127.0.0.1:9020:9020"]
+  pgadapter:
+    image: gcr.io/cloud-spanner-pg-adapter/pgadapter:0.56.1
+    depends_on: [emulator]
+    command: ["-p", "test-project", "-i", "test-instance", "-r", "autoConfigEmulator=true", "-e", "emulator:9010", "-c", "", "-x"]
+    ports: ["127.0.0.1:5432:5432"]

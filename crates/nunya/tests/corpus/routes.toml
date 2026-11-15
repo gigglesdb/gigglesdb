@@ -1,0 +1,230 @@
+[[case]]
+sql = "SELECT * FROM (SELECT id,email FROM customers) d"
+expect = "allow"
+note = "derived passthrough"
+
+[[case]]
+sql = "WITH x AS (SELECT email FROM customers) SELECT email FROM x"
+expect = "allow"
+note = "CTE passthrough"
+
+[[case]]
+sql = "WITH x(e) AS MATERIALIZED (SELECT email FROM customers) SELECT e FROM x"
+expect = "allow"
+note = "materialized CTE alias"
+
+[[case]]
+sql = "SELECT * FROM v_emails"
+expect = "allow"
+note = "view provenance"
+
+[[case]]
+sql = "SELECT email FROM customers UNION SELECT to_address FROM outbox"
+expect = "allow"
+note = "same domain union"
+
+[[case]]
+sql = "SELECT email FROM customers UNION ALL SELECT to_address FROM outbox"
+expect = "allow"
+note = "same domain union all"
+
+[[case]]
+sql = "SELECT email FROM customers INTERSECT SELECT to_address FROM outbox"
+expect = "allow"
+note = "same domain intersect"
+
+[[case]]
+sql = "SELECT email FROM customers EXCEPT SELECT to_address FROM outbox"
+expect = "allow"
+note = "same domain except"
+
+[[case]]
+sql = "SELECT email FROM customers UNION SELECT body FROM notes"
+expect = "NY002"
+note = "mixed union taint"
+
+[[case]]
+sql = "SELECT (SELECT email FROM customers WHERE id=1)"
+expect = "allow"
+note = "scalar passthrough"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE EXISTS(SELECT 1 FROM outbox o WHERE o.to_address=customers.email)"
+expect = "allow"
+note = "correlated exists"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IN (SELECT to_address FROM outbox)"
+expect = "allow"
+note = "same domain subquery membership"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email NOT IN (SELECT to_address FROM outbox)"
+expect = "NY002"
+note = "negative subquery membership"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=ANY(SELECT to_address FROM outbox)"
+expect = "allow"
+note = "same domain any subquery"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=ALL(SELECT to_address FROM outbox)"
+expect = "NY004"
+note = "all subquery unsupported"
+
+[[case]]
+sql = "SELECT CASE WHEN id=1 THEN email ELSE 'x' END FROM customers"
+expect = "NY002"
+note = "case tainted"
+
+[[case]]
+sql = "SELECT CASE WHEN email=$1 THEN 1 ELSE 0 END FROM customers"
+expect = "NY002"
+note = "case blind condition"
+
+[[case]]
+sql = "SELECT coalesce(email,'x') FROM customers"
+expect = "NY002"
+note = "coalesce blind"
+
+[[case]]
+sql = "SELECT nullif(email,'x') FROM customers"
+expect = "NY002"
+note = "nullif blind"
+
+[[case]]
+sql = "SELECT greatest(email,'x') FROM customers"
+expect = "NY002"
+note = "greatest blind"
+
+[[case]]
+sql = "SELECT ROW(email,id) FROM customers"
+expect = "NY002"
+note = "row blind"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE ROW(email,id)=ROW($1,1)"
+expect = "NY002"
+note = "row comparison"
+
+[[case]]
+sql = "SELECT DISTINCT ON(email) email FROM customers"
+expect = "NY002"
+note = "distinct on blind"
+
+[[case]]
+sql = "SELECT DISTINCT ON(id) email FROM customers"
+expect = "allow"
+note = "distinct on plain"
+
+[[case]]
+sql = "SELECT email,count(*) FROM customers GROUP BY ROLLUP(email)"
+expect = "NY004"
+note = "rollup"
+
+[[case]]
+sql = "SELECT count(email) FILTER(WHERE id>1) FROM customers"
+expect = "NY004"
+note = "aggregate filter"
+
+[[case]]
+sql = "SELECT count(email) OVER() FROM customers"
+expect = "NY004"
+note = "window function"
+
+[[case]]
+sql = "SELECT c.email FROM customers c,LATERAL(SELECT c.id) d"
+expect = "NY004"
+note = "lateral"
+
+[[case]]
+sql = "SELECT * FROM generate_series(1,3)"
+expect = "NY004"
+note = "set returning function"
+
+[[case]]
+sql = "WITH RECURSIVE x AS(SELECT 1) SELECT * FROM x"
+expect = "NY004"
+note = "recursive CTE"
+
+[[case]]
+sql = "WITH x AS(DELETE FROM notes RETURNING id) SELECT * FROM x"
+expect = "NY006"
+note = "writable CTE"
+
+[[case]]
+sql = "EXPLAIN SELECT email FROM customers"
+expect = "NY006"
+note = "explain"
+
+[[case]]
+sql = "MERGE INTO notes n USING customers c ON n.id=c.id WHEN MATCHED THEN DELETE"
+expect = "NY006"
+note = "merge"
+
+[[case]]
+sql = "COPY customers TO STDOUT"
+expect = "NY006"
+note = "copy out"
+
+[[case]]
+sql = "COPY notes FROM STDIN"
+expect = "NY006"
+note = "copy in"
+
+[[case]]
+sql = "DO $$BEGIN END$$"
+expect = "NY006"
+note = "do"
+
+[[case]]
+sql = "PREPARE x AS SELECT email FROM customers"
+expect = "NY006"
+note = "prepare"
+
+[[case]]
+sql = "EXECUTE x"
+expect = "NY006"
+note = "execute"
+
+[[case]]
+sql = "SET search_path=public"
+expect = "NY006"
+note = "search path"
+
+[[case]]
+sql = "CALL proc()"
+expect = "NY006"
+note = "call"
+
+[[case]]
+sql = "SELECT \"email\" FROM \"public\".\"customers\""
+expect = "allow"
+note = "quoted identifiers"
+
+[[case]]
+sql = "SELECT EMAIL FROM CUSTOMERS"
+expect = "allow"
+note = "unquoted mixed case folds"
+
+[[case]]
+sql = "SELECT \"Email\" FROM customers"
+expect = "NY004"
+note = "quoted case preserved"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=CAST($1 AS varchar(40))"
+expect = "allow"
+note = "implicit compatible cast"
+
+[[case]]
+sql = "CREATE TABLE x(id int)"
+expect = "NY006"
+note = "ddl"
+
+[[case]]
+sql = "SELECT email INTO x FROM customers"
+expect = "NY006"
+note = "select into"
+

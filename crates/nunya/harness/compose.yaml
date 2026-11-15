@@ -1,0 +1,36 @@
+x-pg: &pg
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: harness-postgres-only
+    POSTGRES_DB: app
+  volumes:
+    - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+  healthcheck:
+    test: [CMD-SHELL, pg_isready -U postgres -d app]
+    interval: 2s
+    timeout: 3s
+    retries: 60
+services:
+  pg16:
+    <<: *pg
+    image: postgres:16-alpine
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./data/pg16:/var/lib/postgresql
+      - ./data/pg16/data:/var/lib/postgresql/data
+    ports: ["127.0.0.1:16432:5432"]
+  pg17:
+    <<: *pg
+    image: postgres:17-alpine
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./data/pg17:/var/lib/postgresql
+      - ./data/pg17/data:/var/lib/postgresql/data
+    ports: ["127.0.0.1:17432:5432"]
+  pg18:
+    <<: *pg
+    image: postgres:18-alpine
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./data/pg18:/var/lib/postgresql
+    ports: ["127.0.0.1:18432:5432"]

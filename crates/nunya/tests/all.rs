@@ -1,0 +1,36 @@
+//! Combined integration test registration guard.
+#[test]
+fn every_test_file_is_registered() {
+    let source = include_str!("all.rs");
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    for entry in std::fs::read_dir(tests).expect("read tests directory") {
+        let path = entry.expect("read test entry").path();
+        if path.extension().is_some_and(|ext| ext == "rs")
+            && path.file_name().is_some_and(|name| name != "all.rs")
+        {
+            let name = path
+                .file_name()
+                .expect("test filename")
+                .to_str()
+                .expect("UTF-8 test filename");
+            assert!(
+                source.contains(&format!(r#"#[path = "{name}"]"#)),
+                "unregistered test file: {name}"
+            );
+        }
+    }
+}
+
+#[path = "common/mod.rs"]
+mod common;
+#[path = "corpus.rs"]
+mod corpus;
+#[path = "noninterference.rs"]
+mod noninterference;
+#[path = "serve_pg.rs"]
+mod serve_pg;
+
+#[path = "spanner_native.rs"]
+mod spanner_native;
+#[path = "spanner_pg.rs"]
+mod spanner_pg;

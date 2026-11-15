@@ -50,7 +50,7 @@ usage() { sed -n '2,26p' "$0" >&2; exit 2; }
 case "$type" in default|large) ;; *) echo "--type must be default or large" >&2; exit 2 ;; esac
 [ "$ttl" -le 7200 ] 2>/dev/null || { echo "--ttl must be at most 7200" >&2; exit 2; }
 for s in "${steps[@]}"; do
-  [[ "$s" =~ ^giggles-[a-z0-9-]+(:nodef|:tests=[A-Za-z0-9_,]+)?$ ]] || { echo "bad step: $s" >&2; exit 2; }
+  [[ "$s" =~ ^(giggles-[a-z0-9-]+(:nodef|:tests=[A-Za-z0-9_,]+)?|nunya(:tests=[A-Za-z0-9_,]+)?|skedaddle)$ ]] || { echo "bad step: $s" >&2; exit 2; }
 done
 [ -x "$B" ] || { echo "boat CLI not found at $B (set BOAT)" >&2; exit 5; }
 

@@ -1,0 +1,225 @@
+[[case]]
+sql = "SELECT id, email FROM customers WHERE failed_payments >= 2"
+plan = { inputs = [], outputs = ["pass", "tokenize:email"] }
+expect = "allow"
+note = "worked step 1"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email = $1"
+plan = { inputs = ["param:1:email"], outputs = ["pass"] }
+expect = "allow"
+note = "token parameter equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE $1 = email"
+expect = "allow"
+note = "reversed equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email = 'tok_email_x'"
+expect = "allow"
+note = "token literal equality"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email = $$tok_email_x$$"
+expect = "allow"
+note = "dollar literal"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email = $1::text"
+expect = "allow"
+note = "transparent parameter cast"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email = CAST($1 AS text)"
+expect = "allow"
+note = "explicit cast parameter"
+
+[[case]]
+sql = "SELECT email FROM customers"
+expect = "allow"
+note = "bare blind output"
+
+[[case]]
+sql = "SELECT phone FROM customers"
+plan = { inputs = [], outputs = ["mask"] }
+expect = "allow"
+note = "masked output"
+
+[[case]]
+sql = "SELECT country FROM customers WHERE id = 17"
+plan = { inputs = [], outputs = ["pass"] }
+expect = "allow"
+note = "worked step 7 country is plain in actual harness policy"
+
+[[case]]
+sql = "SELECT to_address FROM outbox"
+plan = { inputs = [], outputs = ["tokenize:email"] }
+expect = "allow"
+note = "worked step 3"
+
+[[case]]
+sql = "SELECT email, count(*) FROM customers GROUP BY email"
+expect = "allow"
+note = "blind grouping"
+
+[[case]]
+sql = "SELECT count(email) FROM customers"
+expect = "allow"
+note = "blind count"
+
+[[case]]
+sql = "SELECT count(DISTINCT email) FROM customers"
+expect = "allow"
+note = "blind count distinct"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IS NULL"
+expect = "allow"
+note = "blind nullness"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IS NOT NULL"
+expect = "allow"
+note = "blind not null"
+
+[[case]]
+sql = "SELECT c.id FROM customers c JOIN outbox o ON c.email=o.to_address"
+expect = "allow"
+note = "same domain join"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IN ($1,$2)"
+expect = "allow"
+note = "parameter membership"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email IN ('tok_email_x','tok_email_y')"
+expect = "allow"
+note = "literal membership"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=$1 OR email=$2"
+expect = "allow"
+note = "boolean alternatives"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE NOT (email=$1)"
+expect = "allow"
+note = "boolean negation"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE email=$1 AND email=$1"
+expect = "allow"
+note = "deduplicated parameter"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE id > $1 ORDER BY id LIMIT 2"
+expect = "allow"
+note = "plain ordering"
+
+[[case]]
+sql = "SELECT DISTINCT email FROM customers"
+expect = "allow"
+note = "equality distinct"
+
+[[case]]
+sql = "SELECT email FROM customers GROUP BY 1"
+expect = "allow"
+note = "group ordinal"
+
+[[case]]
+sql = "SELECT email AS e FROM customers GROUP BY e"
+expect = "allow"
+note = "group alias"
+
+[[case]]
+sql = "SELECT count(*) FROM customers HAVING count(email)>1"
+expect = "allow"
+note = "count in having"
+
+[[case]]
+sql = "SELECT * FROM customers"
+expect = "allow"
+note = "star includes blind and masked"
+
+[[case]]
+sql = "SELECT c.* FROM customers c"
+expect = "allow"
+note = "qualified star"
+
+[[case]]
+sql = "SELECT 1"
+expect = "allow"
+note = "constant projection"
+
+[[case]]
+sql = "SELECT upper(country) FROM customers"
+expect = "allow"
+note = "plain function"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE country='US'"
+expect = "allow"
+note = "plain country predicate"
+
+[[case]]
+sql = "SELECT id FROM customers ORDER BY country"
+expect = "allow"
+note = "plain country order"
+
+[[case]]
+sql = "SELECT id FROM customers WHERE id BETWEEN 1 AND 3"
+expect = "allow"
+note = "plain between"
+
+[[case]]
+sql = "SELECT id FROM customers FOR UPDATE"
+expect = "allow"
+note = "row lock"
+
+[[case]]
+sql = "SELECT nunya_tokenize('email',$1)"
+expect = "allow"
+note = "local tokenize param"
+
+[[case]]
+sql = "SELECT nunya_tokenize('email','new@example.test')"
+expect = "allow"
+note = "local tokenize literal"
+
+[[case]]
+sql = "BEGIN"
+expect = "allow"
+note = "transaction begin"
+
+[[case]]
+sql = "START TRANSACTION READ ONLY"
+expect = "allow"
+note = "transaction options"
+
+[[case]]
+sql = "COMMIT"
+expect = "allow"
+note = "transaction commit"
+
+[[case]]
+sql = "ROLLBACK"
+expect = "allow"
+note = "transaction rollback"
+
+[[case]]
+sql = "SAVEPOINT x"
+expect = "allow"
+note = "savepoint"
+
+[[case]]
+sql = "RELEASE SAVEPOINT x"
+expect = "allow"
+note = "release"
+
+[[case]]
+sql = "ROLLBACK TO SAVEPOINT x"
+expect = "allow"
+note = "rollback savepoint"
+

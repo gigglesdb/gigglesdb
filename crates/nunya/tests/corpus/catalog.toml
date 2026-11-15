@@ -1,0 +1,85 @@
+[[case]]
+sql = "SELECT * FROM pg_stats"
+expect = "NY004"
+note = "unqualified stats"
+
+[[case]]
+sql = "SELECT * FROM pg_catalog.pg_stats"
+expect = "NY004"
+note = "qualified stats"
+
+[[case]]
+sql = "SELECT * FROM pg_statistic"
+expect = "NY004"
+note = "statistics"
+
+[[case]]
+sql = "SELECT * FROM pg_catalog.pg_statistic"
+expect = "NY004"
+note = "qualified statistics"
+
+[[case]]
+sql = "SELECT * FROM information_schema.columns"
+expect = "NY004"
+note = "information schema columns"
+
+[[case]]
+sql = "SELECT * FROM information_schema.tables"
+expect = "NY004"
+note = "information schema tables"
+
+[[case]]
+sql = "SELECT current_setting('search_path')"
+expect = "NY004"
+note = "setting read"
+
+[[case]]
+sql = "SELECT set_config('search_path','public',false)"
+expect = "NY004"
+note = "setting write"
+
+[[case]]
+sql = "SELECT pg_read_file('x')"
+expect = "NY004"
+note = "file read"
+
+[[case]]
+sql = "SELECT pg_catalog.pg_read_file('x')"
+expect = "NY004"
+note = "qualified file read"
+
+[[case]]
+sql = "SELECT dblink('x','SELECT 1')"
+expect = "NY004"
+note = "dblink"
+
+[[case]]
+sql = "SELECT lo_import('x')"
+expect = "NY004"
+note = "large object import"
+
+[[case]]
+sql = "SELECT lo_export(1,'x')"
+expect = "NY004"
+note = "large object export"
+
+[[case]]
+sql = "SELECT lo_get(1)"
+expect = "NY004"
+note = "large object get"
+
+[[case]]
+sql = "SELECT lo_put(1,0,'x')"
+expect = "NY004"
+note = "large object put"
+
+[[case]]
+sql = "SELECT pg_catalog.current_setting('x')"
+expect = "NY004"
+note = "qualified setting read"
+
+[[case]]
+sql = "SELECT * FROM pg_catalog.pg_class"
+expect = "NY004"
+note = "catalog relation"
+
