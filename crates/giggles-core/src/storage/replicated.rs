@@ -257,6 +257,11 @@ impl ReplicaStore {
         Ok(files)
     }
 
+    /// True when no Admin opened from this store is still alive.
+    pub fn is_exclusive(&self) -> bool {
+        Arc::strong_count(&self.kv) == 1
+    }
+
     /// Attach the SQL engine using the supplied replication sink for writes.
     pub fn open_admin(
         &self,

@@ -144,6 +144,28 @@ fn assert_equal(stores: &[Arc<ReplicaStore>; 3]) {
 }
 
 #[test]
+fn exclusive_after_admin_and_sessions_drop() {
+    let dirs = [Dir::new(), Dir::new(), Dir::new()];
+    let stores = dirs
+        .each_ref()
+        .map(|d| Arc::new(ReplicaStore::create(&d.0, [9; 16]).unwrap()));
+    assert!(stores[0].is_exclusive());
+    let sink = Arc::new(Fanout {
+        stores: stores.clone(),
+        next: Mutex::new(1),
+    });
+    let admin = stores[0]
+        .open_admin(sink, Limits::default(), v2::DEFAULT_WRITE_SET_BYTES)
+        .unwrap();
+    assert!(!stores[0].is_exclusive());
+    let session = admin.sql_session();
+    drop(admin);
+    assert!(!stores[0].is_exclusive());
+    drop(session);
+    assert!(stores[0].is_exclusive());
+}
+
+#[test]
 fn sql_leader_handoff_and_checkpoint() {
     let dirs = [Dir::new(), Dir::new(), Dir::new()];
     let stores = dirs
