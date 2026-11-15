@@ -885,11 +885,15 @@ mod real_pg {
                         });
                     }
                 }
-                objects.insert(Object {
-                    side,
-                    kind: ObjectKind::Schema,
-                    name: "_skedaddle".into(),
-                });
+                if db.sql("SELECT (to_regnamespace('_skedaddle') IS NOT NULL)::text")[0][0]
+                    == "true"
+                {
+                    objects.insert(Object {
+                        side,
+                        kind: ObjectKind::Schema,
+                        name: "_skedaddle".into(),
+                    });
+                }
             }
             objects
         }
@@ -965,6 +969,7 @@ mod real_pg {
             let mut records = Vec::new();
             let mut crashed = false;
             let mut proof_recorded = false;
+            let mut last_result = String::new();
             for _ in 0..30 {
                 if state.transfer.next == cutover::Step::Complete {
                     break;
@@ -1028,8 +1033,10 @@ mod real_pg {
                         let version = target.connection.sql("SHOW server_version_num")[0][0]
                             .parse()
                             .unwrap();
+                        // Reuse the original source endpoint's DDL installation.
+                        // A second hook makes administrative-origin lookup ambiguous.
                         let config = reverse::Config::new(
-                            &format!("{}_return", self.id),
+                            &format!("{}_forward", self.id),
                             version,
                             vec![("public".into(), self.table.clone())],
                         )
@@ -1079,8 +1086,16 @@ mod real_pg {
                         Ok(())
                     },
                 );
+                last_result = format!(
+                    "step={at:?}, result={result:?}, next={:?}",
+                    state.transfer.next
+                );
                 if result.is_err() {
-                    assert!(crashed, "unexpected real-PG rollback error: {result:?}");
+                    assert!(
+                        matches!(&result, Err(cutover::Error::Journal(message))
+                            if message == "lost process after committed effect"),
+                        "unexpected real-PG rollback error: {result:?}"
+                    );
                     state = recover(&initial, &records);
                     // Replay native journal records, discarding volatile adapters.
                     fencer.state = self.destination_fence.clone();
@@ -1106,9 +1121,13 @@ mod real_pg {
             }
             assert!(
                 proof_recorded,
-                "normal Restore must succeed after P11a setup"
+                "normal Restore must succeed after P11a setup: {last_result}"
             );
-            assert_eq!(state.transfer.next, cutover::Step::Complete);
+            assert_eq!(
+                state.transfer.next,
+                cutover::Step::Complete,
+                "{last_result}"
+            );
             assert_eq!(crashed, crash.is_some());
             assert_eq!(
                 self.source.sql(&format!(
@@ -1144,17 +1163,21 @@ mod real_pg {
             // Remove only this fixture's manifest; an active capture prevents slot
             // deletion, which is intentionally a hard error in finalize.
             let manifest = self.installed();
-            let mut f =
-                Finalize::new(key(&format!("{}_cleanup", self.id)), true, manifest).unwrap();
-            while f.next != rollback::FinalizeStep::Complete {
-                f.execute_next(
-                    &mut Guard,
-                    &mut self.source,
-                    &mut self.destination,
-                    &mut |_| Ok(()),
-                    &mut |_| Ok(()),
-                )
-                .unwrap();
+            // The finalize test may already have removed the whole installation.
+            // Do not ask the product to finalize an empty slot inventory twice.
+            if !manifest.is_empty() {
+                let mut f =
+                    Finalize::new(key(&format!("{}_cleanup", self.id)), true, manifest).unwrap();
+                while f.next != rollback::FinalizeStep::Complete {
+                    f.execute_next(
+                        &mut Guard,
+                        &mut self.source,
+                        &mut self.destination,
+                        &mut |_| Ok(()),
+                        &mut |_| Ok(()),
+                    )
+                    .unwrap();
+                }
             }
             for (db, role) in [
                 (&mut self.source, &self.source_role),
@@ -1220,7 +1243,7 @@ mod real_pg {
                         let len =
                             u32::from_be_bytes(data[end + 1..end + 5].try_into().unwrap()) as usize;
                         let body = &data[end + 5..end + 5 + len];
-                        if &data[10..end] == b"skedaddle"
+                        if &data[10..end] == skedaddle::pg::chunk::MESSAGE_PREFIX.as_bytes()
                             && body == marker.payload().as_bytes()
                             && lsn == marker.lsn
                         {
@@ -1322,7 +1345,9 @@ mod real_pg {
         let Some((s, d)) = urls("rollback_preserves_destination_writes") else {
             return;
         };
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Fixture::new(&s, &d).run(None);
     }
     #[test]
@@ -1330,7 +1355,9 @@ mod real_pg {
         let Some((s, d)) = urls("rollback_restores_source_privileges_exactly") else {
             return;
         };
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut fixture = Fixture::new(&s, &d);
         fixture.run(None);
         // Exercise the new final-step PG adapter with the authenticated ORIGINAL
@@ -1379,7 +1406,9 @@ mod real_pg {
         let Some((s, d)) = urls("crash_during_rollback_recovers") else {
             return;
         };
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for step in [
             cutover::Step::Fence,
             cutover::Step::FinalMarker,
@@ -1393,11 +1422,13 @@ mod real_pg {
         let Some((s, d)) = urls("finalize_drops_all_installed_objects") else {
             return;
         };
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut fixture = Fixture::new(&s, &d);
         // Install capture objects on the other endpoint as well.
         let forward = reverse::Config::new(
-            &format!("{}_f", fixture.id),
+            &format!("{}_forward", fixture.id),
             160000,
             vec![("public".into(), fixture.table.clone())],
         )
@@ -1450,7 +1481,11 @@ mod real_pg {
                 },
             );
             if result.is_err() {
-                assert!(fault);
+                assert!(
+                    matches!(&result, Err(cutover::Error::Journal(message))
+                        if message == "crash before drop"),
+                    "unexpected real-PG finalize error: {result:?}"
+                );
             }
         }
         assert!(fault && !records.is_empty());

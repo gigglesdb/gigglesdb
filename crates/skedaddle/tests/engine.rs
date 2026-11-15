@@ -1097,6 +1097,15 @@ fn copy_table(
             assert_eq!(serde_json::to_value(raw.schema_snapshot())?, saved_schema);
             let mut checkpoint = checkpoint.clone();
             checkpoint.durable_lsn = raw.durable_lsn();
+            // Preserve the server floors alongside the authenticated restart
+            // boundary; PositionUnavailable deliberately does not weaken them.
+            let slot_position = source.query_one(
+                "SELECT restart_lsn::text, confirmed_flush_lsn::text, pg_current_wal_lsn()::text FROM pg_replication_slots WHERE slot_name=$1",
+                &[&checkpoint.slot],
+            ).await?;
+            eprintln!("native restart requested={} buffered={:?} restart_lsn={:?} confirmed_flush_lsn={:?} current_wal_lsn={}",
+                checkpoint.durable_lsn, state.progress.get("buffered").map(|(_, end)| end),
+                slot_position.get::<_, Option<String>>(0), slot_position.get::<_, Option<String>>(1), slot_position.get::<_, String>(2));
             let transport = Box::pin(source::reconnect(&repl, &checkpoint, std::slice::from_ref(&publication))).await?;
             let (_gate, admission) = tokio::sync::watch::channel(false);
             let mut capture = PgCapture::new(raw, transport, admission, journal_objects, serde_json::json!(["engine", id, "wal"]).to_string());
