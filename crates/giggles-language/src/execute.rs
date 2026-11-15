@@ -2,6 +2,46 @@ use crate::*;
 use giggles_core::{Admin, operations};
 use std::io::{self, Write};
 
+/// Pure native data operation, ready for authorization before catalog binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lowered {
+    Operation {
+        request: operations::Request,
+        bindings: Bindings,
+    },
+    Transaction {
+        transaction: operations::Transaction,
+        bindings: Bindings,
+    },
+}
+
+/// Parse and lower native data text without database access or Admin authority.
+///
+/// Uses the same profile validation and lowering as [`Engine`]. Bindings are
+/// copied without substitution; catalog-dependent name and type binding remains
+/// the operation engine's responsibility. Callers must authorize every lowered
+/// table before passing the result to that engine. Catalog, inspection, explain,
+/// and receipt/once requests are not admitted by this API.
+pub fn lower_text(text: &str, bindings: &Bindings, version: LanguageVersion) -> Result<Lowered> {
+    match parse_input_with_version(text, version)? {
+        ParsedInput::Statement(statement) => {
+            validate_parameter_admission(&statement, bindings, version)?;
+            Ok(Lowered::Operation {
+                request: lower_checked(&statement, version)?,
+                bindings: bindings.clone(),
+            })
+        }
+        ParsedInput::Transaction(transaction) => {
+            validate_transaction_parameters(&transaction, bindings, version)?;
+            Ok(Lowered::Transaction {
+                transaction: lower_transaction_checked(&transaction, version)?,
+                bindings: bindings.clone(),
+            })
+        }
+        _ => Err(Error::Unsupported),
+    }
+}
+
 /// Trusted embedded native frontend for the common typed operation engine.
 /// Independent Admin holders retain unrestricted SQL authority.
 #[derive(Clone)]
@@ -1394,6 +1434,90 @@ pub(crate) fn validate_numeric_bindings(bindings: &Bindings) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
+mod lowering_tests {
+    use super::*;
+
+    #[test]
+    fn operation_preserves_unbound_parameters_and_copies_values() {
+        let mut bindings = Bindings::from([("id".into(), Value::Int(7))]);
+        let lowered = lower_text(
+            "insert missing set id=$id",
+            &bindings,
+            LanguageVersion::Embedded016,
+        )
+        .unwrap();
+        bindings.insert("id".into(), Value::Int(8));
+        assert_eq!(
+            lowered,
+            Lowered::Operation {
+                request: operations::Request::Insert {
+                    table: "missing".into(),
+                    values: vec![("id".into(), operations::ValueExpr::Parameter("id".into()))],
+                },
+                bindings: Bindings::from([("id".into(), Value::Int(7))]),
+            }
+        );
+    }
+
+    #[test]
+    fn transaction_lowers_all_steps_without_catalog_access() {
+        let lowered = lower_text(
+            "transaction { insert missing set id=1; delete missing where id=1 }",
+            &Bindings::new(),
+            LanguageVersion::Embedded016,
+        )
+        .unwrap();
+        let Lowered::Transaction {
+            transaction,
+            bindings,
+        } = lowered else {
+            panic!("expected a transaction");
+        };
+        assert!(!transaction.read_only);
+        assert!(bindings.is_empty());
+        assert_eq!(transaction.steps.len(), 2);
+        assert!(matches!(&transaction.steps[0], operations::TransactionStep::Execute(
+            operations::Request::Insert { table, .. }) if table == "missing"));
+        assert!(matches!(&transaction.steps[1], operations::TransactionStep::Execute(
+            operations::Request::Delete { table, .. }) if table == "missing"));
+    }
+
+    #[test]
+    fn non_data_requests_are_unsupported_and_syntax_keeps_offset() {
+        for text in [
+            "create table t (id int64,primary key(id))",
+            "show tables",
+            "describe table t",
+            "explain t where id=1",
+        ] {
+            assert_eq!(
+                lower_text(text, &Bindings::new(), LanguageVersion::Embedded016),
+                Err(Error::Unsupported),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            lower_text(
+                "insert t set id=",
+                &Bindings::new(),
+                LanguageVersion::Embedded016,
+            ),
+            Err(Error::Syntax { offset: 16 })
+        );
+        let bindings = Bindings::from([(
+            "n".into(),
+            Value::Numeric(giggles_core::relational::Numeric::parse("1.25").unwrap()),
+        )]);
+        for text in ["t where id=$n", "transaction { t where id=$n }"] {
+            assert_eq!(
+                lower_text(text, &bindings, LanguageVersion::Embedded016),
+                Err(Error::Unsupported)
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod numeric_profile_tests {
     use super::*;

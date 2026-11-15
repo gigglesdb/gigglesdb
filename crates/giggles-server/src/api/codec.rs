@@ -16,9 +16,41 @@ pub enum Invocation {
         transaction: giggles_core::operations::Transaction,
         bindings: giggles_core::operations::Bindings,
     },
+    Text {
+        text: String,
+        bindings: giggles_core::operations::Bindings,
+        language_version: giggles_language::LanguageVersion,
+    },
     Begin,
     Commit,
     Rollback,
+}
+
+impl Invocation {
+    fn lower(self) -> Result<Self, ApiError> {
+        let Self::Text {
+            text,
+            bindings,
+            language_version,
+        } = self
+        else {
+            return Ok(self);
+        };
+        match giggles_language::lower_text(&text, &bindings, language_version)
+            .map_err(|_| ApiError::InvalidArgument)?
+        {
+            giggles_language::Lowered::Operation { request, bindings } => {
+                Ok(Self::Operation { request, bindings })
+            }
+            giggles_language::Lowered::Transaction {
+                transaction,
+                bindings,
+            } => Ok(Self::Transaction {
+                transaction,
+                bindings,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -39,6 +71,25 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
     use proto::execute_request::Request as P;
     let input = input.request.ok_or(ApiError::InvalidArgument)?;
     let request = match input {
+        P::Text(v) => {
+            let language_version = v
+                .language_version
+                .map(|v| {
+                    serde_json::from_value(serde_json::Value::String(v))
+                        .map_err(|_| ApiError::InvalidArgument)
+                })
+                .transpose()?
+                .unwrap_or(giggles_language::LanguageVersion::Embedded01);
+            return Ok(DecodedExecute {
+                request: Invocation::Text {
+                    text: v.text,
+                    bindings: super::native_codec::bindings(v.bindings)?,
+                    language_version,
+                }
+                .lower()?,
+                budget_ms,
+            });
+        }
         P::Operation(v) => {
             return Ok(DecodedExecute {
                 request: Invocation::Operation {

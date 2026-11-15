@@ -31,7 +31,7 @@ pub use capabilities::{
     DeploymentProfile, ReferenceRevision, TestEvidence, capability_manifest,
     capability_manifest_for,
 };
-pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine};
+pub use execute::{BoundCatalogOperation, BoundOperation, BoundTransaction, Engine, Lowered, lower_text};
 pub use giggles_core::operations::ReadExplainOutcome;
 pub use inspection::InspectionOutcome;
 pub use once::{OnceError, OnceResult, OnceScope};

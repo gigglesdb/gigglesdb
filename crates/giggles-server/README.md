@@ -266,3 +266,11 @@ For SCRAM, connect as the role or an authorized administrator and run
 `ALTER ROLE role_name PASSWORD 'new-password'`. New connections must use the
 new password; already authenticated sessions continue. Role privilege or login
 changes still invalidate sessions.
+
+HTTP/gRPC also accept native language text through the `text` request arm, for
+example `{"text":{"text":"app where id=7 select id","languageVersion":"0.16"}}`.
+Optional named `bindings` use the structured operation value format. The omitted
+version defaults to CLI profile `0.1`; supported versions are `0.1`?`0.16`.
+Lowered data statements and blocks share application table authorization,
+results, and retained transactions with structured operations. Catalog and
+inspection text are refused. See [API.md](API.md) for errors and wire details.

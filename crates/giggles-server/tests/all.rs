@@ -186,3 +186,6 @@ mod many_params_network;
 #[path = "select_points_network.rs"] mod select_points_network;
 
 #[path = "deadlock_network.rs"] mod deadlock_network;
+
+#[path = "api_text.rs"]
+mod api_text;

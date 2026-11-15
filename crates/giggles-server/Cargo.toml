@@ -6,9 +6,10 @@ autotests = false
 
 [features]
 default = ["engine-rocksdb"]
-engine-rocksdb = ["giggles-core/engine-rocksdb"]
+engine-rocksdb = ["giggles-core/engine-rocksdb", "giggles-language/engine-rocksdb"]
 
 [dependencies]
+giggles-language = { path = "../giggles-language", default-features = false }
 giggles-pg-types = { path = "../giggles-pg-types" }
 giggles-pg-catalog = { path = "../giggles-pg-catalog" }
 giggles-core = { path = "../giggles-core", default-features = false }

@@ -65,7 +65,7 @@ pub(crate) fn run(
                 }
             }
             Invocation::Begin | Invocation::Commit | Invocation::Rollback => {}
-            Invocation::Legacy(_) => return Err(CoreError::Unsupported),
+            Invocation::Legacy(_) | Invocation::Text { .. } => return Err(CoreError::Unsupported),
         }
         if session.service.admin.authority_metadata()?.0.to_string() != *domain {
             return Err(CoreError::Policy(Error::Authentication));
@@ -97,7 +97,7 @@ pub(crate) fn run(
                 session.sql.rollback_native()?;
                 return Ok(NativeResult::Control);
             }
-            Invocation::Legacy(_) => unreachable!(),
+            Invocation::Legacy(_) | Invocation::Text { .. } => unreachable!(),
         };
         match result {
             Ok(outcome) => Ok(outcome),

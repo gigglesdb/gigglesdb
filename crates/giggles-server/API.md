@@ -1,7 +1,7 @@
 # HTTP and gRPC interfaces
 
 The optional interfaces expose `giggles_core::operations` as typed requests and
-atomic blocks. Clients send structured operations and expressions directly; SQL
+atomic blocks. Clients send structured operations, expressions, or native language text; SQL
 is an additional interface. Both use the same database, persistent transaction,
 mTLS certificate bindings, task accounting and admission limits as the native
 and PostgreSQL listeners. HTTP supports HTTP/1.1 and HTTP/2 over TLS. gRPC requires
@@ -95,7 +95,25 @@ insert an application row with typed parameters:
 
 `{"begin":{}}`, `{"commit":{}}` and `{"rollback":{}}` use the same Execute
 endpoint and handle. These are typed controls and do not invoke the SQL parser.
-Native requests contain actual operation ASTs, never operation-language strings.
+Alternatively send native language text over HTTP or gRPC:
+
+```json
+{"text":{"text":"insert app set id=$id","bindings":[{"name":"id","value":{"intValue":"7"}}],"languageVersion":"0.16"}}
+```
+
+The `text` arm (protobuf field 12, `NativeTextRequest`) accepts `text`, optional
+`bindings` in the same format as structured operations, and optional
+`languageVersion` (`language_version` in protobuf). Versions `0.1` through `0.16`
+are accepted; omission uses `0.1`, matching the CLI default. Text is limited to
+65,536 UTF-8 bytes and lowered without catalog access. Every lowered table is
+allowlist-authorized before catalog binding or execution, including every block
+step. Data statements and atomic blocks use the same outcomes and retained
+session transaction as their structured equivalents; use the existing `begin`,
+`commit`, and `rollback` arms around text calls. Catalog, inspection, explain,
+and once/receipt text are refused. Unknown versions, parse/lowering failures,
+and invalid wire bindings yield HTTP 400 / gRPC InvalidArgument before session
+leasing; diagnostics retain the fixed `invalid request` message. Engine binding
+and evaluation errors retain the structured operation's existing result path.
 The request variants are:
 
 | Variant | Data |

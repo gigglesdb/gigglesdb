@@ -30,8 +30,14 @@ message ExecuteRequest {
     BeginRequest begin = 9;
     CommitRequest commit = 10;
     RollbackRequest rollback = 11;
+    NativeTextRequest text = 12;
   }
   optional uint32 budget_ms = 20;
+}
+message NativeTextRequest {
+  string text = 1;
+  repeated NativeBinding bindings = 2;
+  optional string language_version = 3;
 }
 message PingRequest {}
 message SqlRequest {

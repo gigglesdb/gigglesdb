@@ -522,6 +522,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "giggles-language"
+version = "0.1.0"
+dependencies = [
+ "giggles-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "giggles-pg-catalog"
 version = "0.1.0"
 dependencies = [
@@ -549,6 +558,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "giggles-core",
+ "giggles-language",
  "giggles-pg-catalog",
  "giggles-pg-types",
  "hex",

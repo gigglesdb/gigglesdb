@@ -176,6 +176,21 @@ impl Decoder {
         empty(v)?;
         Ok(p::NativeEmpty {})
     }
+    pub(super) fn native_text_request(&mut self, v: Json) -> R<p::NativeTextRequest> {
+        let mut f = Object::new(v)?;
+        let language_version = f.optional("languageVersion").map(text).transpose()?;
+        let text = text(f.required("text")?)?;
+        let bindings = items(f.optional("bindings"), 256)?
+            .into_iter()
+            .map(|v| self.native_binding(v))
+            .collect::<R<Vec<_>>>()?;
+        f.finish()?;
+        Ok(p::NativeTextRequest {
+            text,
+            bindings,
+            language_version,
+        })
+    }
     pub(super) fn native_operation_request(&mut self, v: Json) -> R<p::NativeOperationRequest> {
         let mut f = Object::new(v)?;
         let request = Some(self.native_request(f.required("request")?)?);
