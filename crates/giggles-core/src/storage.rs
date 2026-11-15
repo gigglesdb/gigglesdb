@@ -2931,25 +2931,40 @@ impl SqlSession {
     }
     /// Trusted Admin entry point. Gateways must authorize the typed source first.
     pub fn describe_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Description, CoreError> {
-        let p = self.prepare_typed_read(read)?;
+        let p = self.prepare_typed_read(vec![read.table.clone()], |domain, epoch|
+            relational::Prepared::from_single_source_read(domain, epoch, read))?;
         self.describe_bound_engine(&p)
     }
     /// Typed leaf reads use the same transaction/snapshot kernel as prepared SQL.
     pub fn execute_typed_read(&mut self, read: relational::SingleSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
-        let p = self.prepare_typed_read(read)?;
+        let p = self.prepare_typed_read(vec![read.table.clone()], |domain, epoch|
+            relational::Prepared::from_single_source_read(domain, epoch, read))?;
         self.execute_bound_engine(&p, &[], expected_version)
     }
-    fn prepare_typed_read(&mut self, read: relational::SingleSourceRead) -> Result<relational::Prepared, CoreError> {
+    /// Trusted Admin entry point; gateways must authorize both source tables first.
+    pub fn describe_typed_join(&mut self, read: relational::TwoSourceRead) -> Result<relational::Description, CoreError> {
+        let p = self.prepare_typed_read(vec![read.left.table.clone(), read.right.table.clone()], |domain, epoch|
+            relational::Prepared::from_two_source_read(domain, epoch, read))?;
+        self.describe_bound_engine(&p)
+    }
+    pub fn execute_typed_join(&mut self, read: relational::TwoSourceRead, expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        let p = self.prepare_typed_read(vec![read.left.table.clone(), read.right.table.clone()], |domain, epoch|
+            relational::Prepared::from_two_source_read(domain, epoch, read))?;
+        self.execute_bound_engine(&p, &[], expected_version)
+    }
+    fn prepare_typed_read(&mut self, tables: Vec<String>,
+        prepare: impl FnOnce(u128, u64) -> Result<relational::Prepared, relational::SqlError>) -> Result<relational::Prepared, CoreError> {
         let make = |s: &MetadataState<'_>| {
             if self.aborted { return Err(CoreError::Sql(relational::SqlError::Aborted)); }
-            let table = read.table.clone();
             let epoch = if matches!(self.admin.inner.backend, Backend::V2(_)) { 0 } else { s.sql.epoch };
-            let mut p = relational::Prepared::from_single_source_read(s.view.domain, epoch, read).map_err(CoreError::Sql)?;
+            let mut p = prepare(s.view.domain, epoch).map_err(CoreError::Sql)?;
             p.transaction = self.transaction_id;
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            // Views can introduce dependencies beyond the sole authorized source.
-            let key = s.sql.resolve_relation_key(&table, &self.search_path);
-            if !s.sql.tables.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
+            // Views can introduce dependencies beyond the authorized sources.
+            for table in tables {
+                let key = s.sql.resolve_relation_key(&table, &self.search_path);
+                if !s.sql.tables.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
+            }
             p.bind_schemas(&s.sql).map_err(CoreError::Sql)
         };
         let result = match &self.staged {

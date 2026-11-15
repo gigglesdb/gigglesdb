@@ -37,7 +37,7 @@ mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
 pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare,
-    ReadAggregate, ReadClauses, ReadOrder};
+    ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead};
 use query::{TypmodSource, result_typmod};
 pub(crate) mod cursor;
 mod returning;
@@ -1781,6 +1781,13 @@ impl Prepared {
         let table = read.table.clone();
         let mut prepared = Self::engine(Statement::Query(query::Query::from_single_source_read(read)?), domain, epoch);
         prepared.relations.push(schemas::Reference::read(table, None));
+        Ok(prepared)
+    }
+    /// Construct an unbound join; gateways must authorize both source tables.
+    pub fn from_two_source_read(domain: u128, epoch: u64, read: TwoSourceRead) -> R<Self> {
+        let tables = [read.left.table.clone(), read.right.table.clone()];
+        let mut prepared = Self::engine(Statement::Query(query::typed_read::lower_join(read)?), domain, epoch);
+        for table in tables { prepared.relations.push(schemas::Reference::read(table, None)); }
         Ok(prepared)
     }
     pub(crate) fn create_engine(

@@ -398,3 +398,6 @@ mod view_ddl;
 mod many_params;
 #[path = "typed_aggregate_read.rs"]
 mod typed_aggregate_read;
+
+#[path = "typed_join_read.rs"]
+mod typed_join_read;
