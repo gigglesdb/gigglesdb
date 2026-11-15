@@ -2501,6 +2501,7 @@ impl Compiler {
                             return Err(Error::Unsupported);
                         };
                         let value = match name.to_ascii_lowercase().as_str() {
+                            "server_encoding" => "UTF8",
                             "server_version" => "18.0",
                             "server_version_num" => "180000",
                             "max_identifier_length" => "63",

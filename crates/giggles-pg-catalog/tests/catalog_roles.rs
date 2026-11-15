@@ -368,3 +368,19 @@ fn role_count_and_name_bytes_share_catalog_limits() {
     snapshot.roles[0].name = "x".repeat(65537);
     assert_eq!(execute(&p, &snapshot, &[]), Err(Error::Limit));
 }
+
+#[test]
+fn server_encoding_is_an_immutable_utf8_setting_in_catalog_queries() {
+    let snapshot = CatalogSnapshot::default();
+    for sql in [
+        "SELECT current_setting('server_encoding') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('server_encoding') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT current_setting('SeRvEr_EnCoDiNg') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('SeRvEr_EnCoDiNg') FROM pg_catalog.pg_roles LIMIT 1",
+    ] {
+        let result = run(&snapshot, sql);
+        assert_eq!(result.fields.len(), 1, "{sql}");
+        assert_eq!(result.fields[0].data_type, PgType::Text, "{sql}");
+        assert_eq!(result.rows, vec![vec![s("UTF8")]], "{sql}");
+    }
+}

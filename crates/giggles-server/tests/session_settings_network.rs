@@ -193,6 +193,42 @@ fn code(error: tokio_postgres::Error) -> String {
 }
 
 #[tokio::test]
+async fn server_encoding_is_utf8_and_read_only_across_protocol_surfaces() {
+    let fixture = Fixture::new().await;
+    let client = fixture.client().await;
+    for sql in [
+        "SHOW server_encoding",
+        "SHOW SeRvEr_EnCoDiNg",
+        "SELECT current_setting('server_encoding')",
+        "SELECT pg_catalog.current_setting('server_encoding')",
+        "SELECT current_setting('server_encoding', true)",
+        "SELECT pg_catalog.current_setting('SeRvEr_EnCoDiNg', true)",
+        "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'server_encoding'",
+        "SELECT current_setting('server_encoding') FROM pg_catalog.pg_roles LIMIT 1",
+        "SELECT pg_catalog.current_setting('SeRvEr_EnCoDiNg') FROM pg_catalog.pg_roles LIMIT 1",
+    ] {
+        assert_eq!(values(&client.simple_query(sql).await.unwrap()), ["UTF8"], "{sql}");
+        assert_eq!(client.query_one(sql, &[]).await.unwrap().get::<_, String>(0), "UTF8", "{sql}");
+    }
+    for (version_sql, encoding_sql) in [
+        ("SET server_version = '1'", "SET server_encoding = 'LATIN1'"),
+        ("SET server_version = '1'", "SET SeRvEr_EnCoDiNg = 'UTF8'"),
+        ("SELECT set_config('server_version', '1', false)", "SELECT set_config('server_encoding', 'LATIN1', false)"),
+        ("SELECT set_config('server_version', '1', true)", "SELECT pg_catalog.set_config('SeRvEr_EnCoDiNg', 'UTF8', true)"),
+    ] {
+        let expected = code(client.simple_query(version_sql).await.unwrap_err());
+        assert_eq!(expected, "22023");
+        assert_eq!(code(client.simple_query(encoding_sql).await.unwrap_err()), expected, "{encoding_sql}");
+        let expected = code(client.query(version_sql, &[]).await.unwrap_err());
+        assert_eq!(expected, "22023");
+        assert_eq!(code(client.query(encoding_sql, &[]).await.unwrap_err()), expected, "{encoding_sql}");
+    }
+    assert_eq!(values(&client.simple_query("SHOW server_encoding").await.unwrap()), ["UTF8"]);
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn postgres_18_version_settings_agree_across_protocol_surfaces() {
     let fixture = Fixture::new().await;
     let client = fixture.client().await;

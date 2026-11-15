@@ -171,6 +171,7 @@ pub(crate) fn lookup_name(name: &str) -> Result<Show> {
         "default_tablespace" => Ok(Show::DefaultTablespace),
         "default_table_access_method" => Ok(Show::DefaultTableAccessMethod),
         "server_version" => Ok(Show::ServerVersion),
+        "server_encoding" => Ok(Show::ServerEncoding),
         "server_version_num" => Ok(Show::ServerVersionNum),
         "max_identifier_length" => Ok(Show::MaxIdentifierLength),
         "block_size" => Ok(Show::BlockSize),
@@ -230,6 +231,7 @@ pub(crate) fn parse_database(sql: &str) -> Result<Option<Vec<Setting>>> {
     if matches!(
         name,
         Show::ServerVersion
+            | Show::ServerEncoding
             | Show::ServerVersionNum
             | Show::MaxIndexKeys
             | Show::TransactionIsolation
@@ -458,6 +460,7 @@ pub(crate) fn function_assignment(name: &str, value: &str, local: bool) -> Resul
     if matches!(
         name,
         Show::ServerVersion
+            | Show::ServerEncoding
             | Show::ServerVersionNum
             | Show::MaxIndexKeys
             | Show::TransactionIsolation
