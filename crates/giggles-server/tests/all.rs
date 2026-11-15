@@ -190,3 +190,6 @@ mod many_params_network;
 
 #[path = "api_text.rs"]
 mod api_text;
+
+#[path = "write_fence_network.rs"]
+mod write_fence_network;
