@@ -721,3 +721,49 @@ fn numeric_native_catalog_matches_sql() {
     });
     assert!(snapshot(&v2).is_empty());
 }
+
+#[test]
+fn arithmetic_zero_divisor_sqlstate_matches_on_both_engines() {
+    // PG 18.6: both bigint division and remainder by zero report 22012.
+    for storage in [StorageEngine::Legacy, StorageEngine::V2] {
+        let (_left_db, left) = Database::fresh(storage);
+        let (_right_db, right) = Database::fresh(storage);
+        for admin in [&left, &right] {
+            admin.sql_session().execute(
+                "create table items(id bigint primary key,n bigint not null)", &[], None,
+            ).unwrap();
+            admin.sql_session().execute("insert into items values(1,7)", &[], None).unwrap();
+        }
+        let engine = Engine::with_version(left.clone(), LanguageVersion::Embedded016);
+        let before = snapshot(&left);
+        for operator in ["/", "%"] {
+            let native_text = format!("update items where id=1 set n=n{operator}$zero");
+            let sql_text = format!("update items set n=n{operator}$1 where id=1");
+            let bindings = Bindings::from([("zero".into(), Value::Int(0))]);
+            let bound = with_sql_parser_forbidden(|| {
+                engine.prepare_bound_text(&native_text, &bindings)
+            }).unwrap();
+            for prepared in [false, true] {
+                let actual = with_sql_parser_forbidden(|| {
+                    if prepared {
+                        engine.execute_bound(&bound)
+                    } else {
+                        engine.execute_text(&native_text, &bindings)
+                    }
+                }).unwrap_err();
+                let expected = right.sql_session().execute(
+                    &sql_text, &[Value::Int(0)], None,
+                ).unwrap_err();
+                assert_eq!(actual, Error::DivisionByZero, "{storage:?}: {native_text}");
+                let expected_code = match expected {
+                    // SQL wire mapping, independently verified against PG 18.6.
+                    CoreError::Sql(SqlError::DivisionByZero) => "22012",
+                    other => panic!("unexpected SQL error: {other:?}"),
+                };
+                assert_eq!(actual.sqlstate(), Some(expected_code));
+                assert_eq!(snapshot(&left), before, "failed native update is atomic");
+                assert_eq!(snapshot(&right), before, "failed SQL update is atomic");
+            }
+        }
+    }
+}

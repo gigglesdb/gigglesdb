@@ -330,11 +330,12 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl Error {
-    /// SQLSTATE for the duplicate-key identity preserved by native execution.
+    /// SQLSTATE for selected native error identities.
     pub fn sqlstate(&self) -> Option<&'static str> {
         match self {
             Self::Duplicate => Some("23505"),
             Self::Overflow => Some("22003"),
+            Self::DivisionByZero => Some("22012"),
             _ => None,
         }
     }
