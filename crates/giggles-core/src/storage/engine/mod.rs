@@ -34,3 +34,7 @@ mod history_tests;
 
 pub(crate) mod kernel;
 pub(crate) mod meta;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "write_tripwire_tests.rs"]
+mod write_tripwire_tests;
