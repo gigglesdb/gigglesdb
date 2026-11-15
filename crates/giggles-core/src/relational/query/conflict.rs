@@ -51,6 +51,11 @@ impl Expression {
             b.0,
         ))))
     }
+    /// Lock admission never evaluates general scalar expressions.
+    pub(in crate::relational) fn lock_input(&self, target: &DataType) -> bool {
+        matches!(&self.0, Scalar::Cast(value, ty)
+            if ty == target && matches!(value.as_ref(), Scalar::Literal(_) | Scalar::Param(_)))
+    }
     pub(in crate::relational) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         let mut dependencies = vec![];
         self.0.sequence_dependencies(&mut dependencies);

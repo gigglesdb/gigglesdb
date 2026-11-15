@@ -473,8 +473,40 @@ impl Insert {
                 .unwrap_or_default(),
         })
     }
+    /// Static VALUES admission plus the executor's exact assignment/coercion.
+    /// None cells are omitted fresh PK defaults; no default is evaluated here.
+    pub(super) fn lock_values(&self, state: &Relational, target: &[u64],
+        params: &[Value], declared: &[Option<DataType>],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> Option<Vec<Vec<Option<Value>>>> {
+        let table = state.tables.get(&self.table)?;
+        let indexes = indexes(self, table).ok()?;
+        if self.overriding.is_some() { return None; }
+        let needed = table.primary_key.iter().copied().chain(table.columns.iter()
+            .enumerate().filter(|(_, c)| target.contains(&c.id)).map(|(i, _)| i))
+            .collect::<BTreeSet<_>>();
+        self.rows.iter().enumerate().map(|(row_index, row)| {
+            let mut values = vec![None; table.columns.len()];
+            for index in &needed {
+                let column = &table.columns[*index];
+                if let Some(slot) = indexes.iter().position(|i| i == index) {
+                    if *self.defaults.get(row_index)?.get(slot)? { return None; }
+                    if self.casts.get(&(row_index, slot))
+                        .is_some_and(|cast| !cast.lock_input(&column.data_type)) { return None; }
+                    let value = input_value(state, table, self, row_index, slot, *index,
+                        row.get(slot)?, params, declared, clock).ok()?;
+                    values[*index] = Some(coerce_to_column(state, column, value).ok()?);
+                } else if target.contains(&column.id) {
+                    if defaults::default_sql(state, column).is_some() { return None; }
+                    values[*index] = Some(Value::Null);
+                }
+            }
+            Some(values)
+        }).collect()
+    }
     pub(super) fn lock_supplies(&self, name: &str) -> bool {
-        self.columns.iter().any(|column| column == name)
+        !self.default_values && self.columns.is_empty()
+            || self.columns.iter().any(|column| column == name)
     }
     /// Probe classification only; the conflict planner still validates the target.
     pub(super) fn conflict_arbiter_columns(&self, state: &Relational,
@@ -852,6 +884,25 @@ fn materialize_source(
         types,
     })
 }
+/// The executor and pre-lock probe share input assignment, without defaults.
+#[allow(clippy::too_many_arguments)]
+fn input_value(
+    state: &Relational, table: &TableDef, insert: &Insert, row_index: usize,
+    slot: usize, index: usize, expression: &Expr, params: &[Value],
+    declared: &[Option<DataType>], clock: Option<&clock::ExecutionClock>,
+) -> R<Value> {
+    if let Some(expression) = insert.casts.get(&(row_index, slot)) {
+        let parameters = insert.describe(state, params.len(), declared)?.parameters
+            .into_iter().map(Some).collect::<Vec<_>>();
+        expression.bind(table, None, &table.columns[index].data_type, &parameters, clock)?
+            .evaluate(&SqlRow { values: vec![], version: 0 }, &[], params, &mut 0)
+    } else if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some)) {
+        assign::plain_value(state, expression, &table.columns[index], declared, params, clock)
+    } else {
+        resolved_value(expression, params, &table.columns[index].data_type, clock)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "shared INSERT row normalization inputs"
@@ -895,42 +946,9 @@ fn normalize_row(
                     &table.columns[*index].data_type,
                     clock,
                 )?
-            } else if let Some(expression) = insert.casts.get(&(row_index, slot)) {
-                let parameters = insert
-                    .describe(state, params.len(), declared)?
-                    .parameters
-                    .into_iter()
-                    .map(Some)
-                    .collect::<Vec<_>>();
-                expression
-                    .bind(
-                        table,
-                        None,
-                        &table.columns[*index].data_type,
-                        &parameters,
-                        clock,
-                    )?
-                    .evaluate(
-                        &SqlRow {
-                            values: vec![],
-                            version: 0,
-                        },
-                        &[],
-                        params,
-                        &mut 0,
-                    )?
-            } else if matches!(expression, Expr::Param(n) if declared.get(n - 1).is_some_and(Option::is_some))
-            {
-                assign::plain_value(
-                    state,
-                    expression,
-                    &table.columns[*index],
-                    declared,
-                    params,
-                    clock,
-                )?
             } else {
-                resolved_value(expression, params, &table.columns[*index].data_type, clock)?
+                input_value(state, table, insert, row_index, slot, *index,
+                    expression, params, declared, clock)?
             };
         }
     }

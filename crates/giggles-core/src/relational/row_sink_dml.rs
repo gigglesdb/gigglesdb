@@ -74,15 +74,49 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
 
 /// Statically resolved conflict witness; the caller supplies runtime lock policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Classifier is integrated with locking in the next item.
 pub(crate) enum Arbiter { PrimaryKey, Unique(u64) }
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct UpsertLockPlan { pub(crate) arbiter: Arbiter, pub(crate) rows: usize }
 
+/// Only proposed explicit primary keys and non-NULL UNIQUE target rows.
+pub(crate) struct UpsertLockRows {
+    pub(crate) primary_keys: Vec<Vec<Value>>,
+    pub(crate) unique: Option<(secondary_index::Descriptor, Vec<SqlRow>)>,
+}
+
 impl Prepared {
+    pub(crate) fn upsert_lock_rows(&self, state: &Relational,
+        indexes: &[secondary_index::Descriptor], params: &[Value],
+        clock: Option<&clock::ExecutionClock>,
+    ) -> Option<UpsertLockRows> {
+        let plan = self.upsert_lock_plan(state, indexes)?;
+        let Statement::InsertMulti(insert) = &self.statement else { return None; };
+        let table = state.tables.get(&insert.table)?;
+        let descriptor = match plan.arbiter {
+            Arbiter::PrimaryKey => None,
+            Arbiter::Unique(id) => Some(indexes.iter().find(|d| d.id == id)?.clone()),
+        };
+        let target = descriptor.as_ref().map(|d| d.columns.clone()).unwrap_or_else(||
+            table.primary_key.iter().map(|i| table.columns[*i].id).collect());
+        let rows = insert.lock_values(state, &target, params, &self.parameter_types, clock)?;
+        let mut primary_keys = Vec::new();
+        let mut witnesses = Vec::new();
+        for row in rows {
+            if let Some(key) = table.primary_key.iter().map(|i| row[*i].clone())
+                .collect::<Option<Vec<_>>>() {
+                if key.contains(&Value::Null) { return None; }
+                primary_keys.push(key);
+            }
+            if descriptor.is_some() && !table.columns.iter().enumerate()
+                .any(|(i, c)| target.contains(&c.id) && row[i] == Some(Value::Null)) {
+                witnesses.push(SqlRow { values: row.into_iter()
+                    .map(|v| v.unwrap_or(Value::Null)).collect(), version: 0 });
+            }
+        }
+        Some(UpsertLockRows { primary_keys, unique: descriptor.map(|d| (d, witnesses)) })
+    }
+
     /// Conservative static admission only; no isolation or storage decisions.
-    #[allow(dead_code)] // Locking caller is added in the next item.
     pub(crate) fn upsert_lock_plan(&self, state: &Relational,
         indexes: &[secondary_index::Descriptor]) -> Option<UpsertLockPlan> {
         let Statement::InsertMulti(insert) = &self.statement else { return None; };

@@ -18,6 +18,8 @@ mod comment_tests;
 
 #[cfg(test)]
 thread_local! {
+    static UPSERT_SHARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UPSERT_UPGRADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FK_DELETE_RETENTION: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static FK_DELETE_SHARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FK_DELETE_UPGRADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -417,8 +419,8 @@ impl SqlSession {
                             && let Some(table) =
                                 target_name.as_ref().and_then(|name| parts.tables.get(name))
                         {
-                            // Shared point/append writers still exclude every paged,
-                            // conflict/action, COPY and fixed-snapshot writer. Actual
+                            // Shared bounded writers still exclude every paged,
+                            // unsupported conflict/action, COPY and fixed-snapshot writer. Actual
                             // target rows are locked in physical order BEFORE refreshing.
                             let candidates = (expected_version.is_none()
                                 && self.copy_input.is_none()
@@ -436,7 +438,32 @@ impl SqlSession {
                             if candidates.is_some() && bound.fk_delete_lock_keys(&binding, params).is_some() {
                                 FK_DELETE_SHARED.set(FK_DELETE_SHARED.get() + 1);
                             }
-                            let shared = append || candidates.is_some();
+                            let upsert = (expected_version.is_none()
+                                && self.copy_input.is_none()
+                                && txn.isolation() == Isolation::ReadCommitted).then(|| {
+                                let rows = bound.upsert_lock_rows(&binding, &parts.indexes, params, clock)?;
+                                let physical = rows.primary_keys.iter().map(|key| {
+                                    let mut physical = table.id.to_be_bytes().to_vec();
+                                    physical.extend(codec::pk_bytes(key).ok()?);
+                                    Some(physical)
+                                }).collect::<Option<BTreeSet<_>>>()?;
+                                let witnesses = if let Some((descriptor, rows)) = rows.unique {
+                                    // UNIQUE non-NULL keys do not include the PK. Use the
+                                    // occupancy encoder with a PK-free projection so fresh
+                                    // defaults stay unevaluated; discard its owner values.
+                                    let mut projection = table.clone();
+                                    projection.primary_key.clear();
+                                    let mut keys = BTreeSet::new();
+                                    for row in rows {
+                                        let rows = BTreeMap::from([(Vec::new(), row)]);
+                                        keys.extend(engine::indexes::entries(&projection, &rows,
+                                            std::slice::from_ref(&descriptor)).ok()?.into_keys());
+                                    }
+                                    keys
+                                } else { BTreeSet::new() };
+                                Some((physical, witnesses))
+                            }).flatten();
+                            let shared = append || candidates.is_some() || upsert.is_some();
                             txn.lock_sql_sentinel(table.id,
                                 if shared { LockMode::Shared } else { LockMode::Exclusive },
                                 &|| crate::cancellation::check().is_err())?;
@@ -476,6 +503,39 @@ impl SqlSession {
                                     }
                                     // The point publisher would scan pages. Upgrade
                                     // before taking its snapshot; never refresh mid-scan.
+                                    txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
+                                        &|| crate::cancellation::check().is_err())?;
+                                }
+                            }
+                            if let Some((mut physical, witnesses)) = upsert {
+                                #[cfg(test)]
+                                UPSERT_SHARED.set(UPSERT_SHARED.get() + 1);
+                                // Peek owners at a provisional snapshot, without staging.
+                                txn.begin_statement();
+                                for key in &witnesses {
+                                    if let Some(owner) = txn.get(Keyspace::Index, key)? {
+                                        let mut row = table.id.to_be_bytes().to_vec();
+                                        row.extend(owner);
+                                        physical.insert(row);
+                                    }
+                                }
+                                for key in &physical {
+                                    txn.lock_for_write(Keyspace::Rows, key, None,
+                                        &|| crate::cancellation::check().is_err())?;
+                                }
+                                let mut upgrade = false;
+                                for key in witnesses {
+                                    let target = txn.lock_for_write(Keyspace::Index, &key, None,
+                                        &|| crate::cancellation::check().is_err())?;
+                                    if let Some(owner) = target.current {
+                                        let mut row = table.id.to_be_bytes().to_vec();
+                                        row.extend(owner);
+                                        upgrade |= !physical.contains(&row);
+                                    }
+                                }
+                                if upgrade {
+                                    #[cfg(test)]
+                                    UPSERT_UPGRADE.set(UPSERT_UPGRADE.get() + 1);
                                     txn.lock_sql_sentinel(table.id, LockMode::Exclusive,
                                         &|| crate::cancellation::check().is_err())?;
                                 }
@@ -832,6 +892,9 @@ mod writer_lock_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_fk_delete_lock_tests.rs"]
 mod fk_delete_lock_tests;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_upsert_lock_tests.rs"]
+mod upsert_lock_tests;
 
 /// Transient statement images use legacy keys. Only this sink translates them
 /// into the existing v2 key/row codec; it never persists relational image bytes.
