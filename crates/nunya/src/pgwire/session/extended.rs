@@ -51,6 +51,11 @@ fn oid_type(oid: u32) -> Option<ColumnType> {
         _ => return None,
     })
 }
+impl Prepared {
+    fn local(&self) -> bool {
+        self.plan.tokenize.is_some() || matches!(self.kind, StatementKind::SessionNoop { .. })
+    }
+}
 impl Session {
     fn drain_local(&mut self, out: &mut Actions) {
         while matches!(self.pending.front(), Some(Pending::Local(_))) {
@@ -108,14 +113,18 @@ impl Session {
             return Err(failure(NyCode::StatementNotAllowed));
         }
         let plan = ir::check::check(statement, &policy, &snapshot)?;
-        let rewritten = rewrite_literals(
-            sql,
-            &statements,
-            std::slice::from_ref(&plan),
-            &policy,
-            &self.keys,
-            &self.ctx.codec,
-        )?;
+        let rewritten = if matches!(statement.kind, StatementKind::SessionNoop { .. }) {
+            String::new()
+        } else {
+            rewrite_literals(
+                sql,
+                &statements,
+                std::slice::from_ref(&plan),
+                &policy,
+                &self.keys,
+                &self.ctx.codec,
+            )?
+        };
         let token_ty = plan.tokenize.as_ref().and_then(|(domain, _)| {
             policy.columns.iter().find_map(|(c, t)| match t {
                 crate::policy::Treatment::Blind { domain: d } if d == domain => {
@@ -214,7 +223,7 @@ impl Session {
                         Ok(p) => p,
                         Err(e) => return Err(e),
                     };
-                    if p.plan.tokenize.is_some() {
+                    if p.local() {
                         self.prepared.insert(name, p);
                         out = self.local(Actions {
                             client: vec![Backend::ParseComplete],
@@ -293,7 +302,7 @@ impl Session {
                     } else {
                         None
                     };
-                    let local = p.plan.tokenize.is_some();
+                    let local = p.local();
                     let generation = random::<16>()?;
                     self.portals.insert(
                         portal.clone(),
@@ -340,14 +349,18 @@ impl Session {
                         }
                         _ => return Err(protocol()),
                     };
-                    if p.plan.tokenize.is_some() {
+                    if p.local() {
                         let mut client = vec![];
                         if kind == b'S' {
                             client.push(Backend::ParameterDescription(p.param_types.clone()));
                         }
-                        client.push(Backend::RowDescription(vec![
-                            self.tokenize_field(&p, &formats)?,
-                        ]));
+                        if matches!(p.kind, StatementKind::SessionNoop { .. }) {
+                            client.push(Backend::NoData);
+                        } else {
+                            client.push(Backend::RowDescription(vec![
+                                self.tokenize_field(&p, &formats)?,
+                            ]));
+                        }
                         out = self.local(Actions {
                             client,
                             ..Actions::default()
@@ -375,7 +388,20 @@ impl Session {
                     if self.aborted && !recovery(&p.kind) {
                         return Err(failure(NyCode::StatementNotAllowed));
                     }
-                    if p.plan.tokenize.is_some() {
+                    if let StatementKind::SessionNoop { tag } = p.kind {
+                        // No ParameterStatus change: application_name remains the startup value.
+                        self.ctx
+                            .readlog
+                            .write(&self.record(&p.sql, Outcome::Allowed))?;
+                        self.ctx
+                            .metrics
+                            .statements_allowed
+                            .fetch_add(1, Ordering::Relaxed);
+                        out = self.local(Actions {
+                            client: vec![Backend::CommandComplete(tag.into())],
+                            ..Actions::default()
+                        });
+                    } else if p.plan.tokenize.is_some() {
                         if portal_state.exhausted {
                             out = self.local(Actions {
                                 client: vec![Backend::CommandComplete("SELECT 0".into())],
@@ -503,14 +529,11 @@ impl Session {
                 }
                 Frontend::Close { kind, name } => {
                     let local = match kind {
-                        b'S' => self
-                            .prepared
-                            .remove(&name)
-                            .is_some_and(|p| p.plan.tokenize.is_some()),
+                        b'S' => self.prepared.remove(&name).is_some_and(|p| p.local()),
                         b'P' => self
                             .portals
                             .remove(&name)
-                            .is_some_and(|p| p.prepared.plan.tokenize.is_some()),
+                            .is_some_and(|p| p.prepared.local()),
                         _ => return Err(protocol()),
                     };
                     if local {

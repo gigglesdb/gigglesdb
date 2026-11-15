@@ -826,6 +826,7 @@ impl SpannerService for NunyaSpanner {
                 | StatementKind::Savepoint
                 | StatementKind::ReleaseSavepoint
                 | StatementKind::RollbackToSavepoint
+                | StatementKind::SessionNoop { .. }
                 | StatementKind::Tokenize { .. }
                 | StatementKind::Refused(_) => return Err(denied()),
             }

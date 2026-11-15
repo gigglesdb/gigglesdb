@@ -37,7 +37,8 @@ for dialect in gsql pgdb; do
   if [[ $dialect == pgdb ]]; then wait_operation "$(curl --fail --silent --show-error -X PATCH -H 'Content-Type: application/json' -d '{"statements":'"$ddl"'}' "$base/$db/ddl")"; fi
   session=$(post "$db/sessions" '{}' | python -c 'import json,sys; print(json.load(sys.stdin)["name"])')
   tx=$(post "$session:beginTransaction" '{"options":{"readWrite":{}}}' | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
-  if [[ $dialect == gsql ]]; then table='Customers'; else table='customers'; fi
+  # GoogleSQL requires an explicit INSERT column list.
+  if [[ $dialect == gsql ]]; then table='Customers (Id, Email, Country, Phone, FailedPayments)'; else table='customers (id, email, country, phone, failed_payments)'; fi
   sql="INSERT INTO $table VALUES (1,'alice@example.test','US','555-0101',0),(2,'bob@example.test','GB','555-0102',1),(3,'carol@example.test','US','555-0103',2),(4,'dave@example.test','CA','555-0104',0),(5,'eve@example.test','GB','555-0105',3)"
   post "$session:executeSql" '{"sql":'"$(json "$sql")"',"transaction":{"id":'"$(json "$tx")"'},"seqno":"1"}' >/dev/null
   post "$session:commit" '{"transactionId":'"$(json "$tx")"'}' >/dev/null

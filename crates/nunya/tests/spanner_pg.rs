@@ -23,7 +23,7 @@ fn port() -> u16 {
 #[ignore = "requires NUNYA_TEST_SPANNER_PGADAPTER pointing at harness/spanner"]
 async fn standing_worked_example() {
     let Ok(endpoint) = std::env::var("NUNYA_TEST_SPANNER_PGADAPTER") else {
-        return;
+        panic!("missing required environment variable NUNYA_TEST_SPANNER_PGADAPTER");
     };
     let url = format!("postgresql://nunya:emulator-only@{endpoint}/pgdb?sslmode=disable");
     let pg: tokio_postgres::Config = url.parse().unwrap();

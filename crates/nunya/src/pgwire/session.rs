@@ -225,7 +225,16 @@ impl Session {
             if plans.iter().any(|p| p.tokenize.is_some()) && plans.len() != 1 {
                 return Err(failure(NyCode::StatementNotAllowed));
             }
-            let rewritten = if self.aborted
+            let noops = statements
+                .iter()
+                .filter(|s| matches!(s.kind, StatementKind::SessionNoop { .. }))
+                .count();
+            if noops != 0 && noops != statements.len() {
+                return Err(failure(NyCode::StatementNotAllowed));
+            }
+            let rewritten = if noops != 0 {
+                String::new()
+            } else if self.aborted
                 && matches!(
                     statements.first().map(|s| &s.kind),
                     Some(StatementKind::Commit)
@@ -254,6 +263,23 @@ impl Session {
                 .metrics
                 .statements_allowed
                 .fetch_add(statements.len() as u64, Ordering::Relaxed);
+            if noops != 0 {
+                // application_name is deliberately local: ParameterStatus stays unchanged.
+                let mut client = Vec::new();
+                for statement in &statements {
+                    match statement.kind {
+                        StatementKind::SessionNoop { tag } => {
+                            client.push(Backend::CommandComplete(tag.into()))
+                        }
+                        _ => return Err(failure(NyCode::StatementNotAllowed)),
+                    }
+                }
+                client.push(self.ready());
+                return Ok(Some(Actions {
+                    client,
+                    ..Actions::default()
+                }));
+            }
             if let Some((domain, arg)) = plans.first().and_then(|p| p.tokenize.as_ref()) {
                 let ty = policy
                     .columns
@@ -1220,6 +1246,115 @@ mod tests {
             )
         }
     }
+    #[test]
+    fn session_settings_simple_are_local_and_mixes_refused() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        let out = session.frontend(Frontend::Query(
+            "SET extra_float_digits = 3; SET application_name = 'tok_secret_a'".into(),
+        ));
+        assert!(out.upstream.is_empty());
+        assert!(
+            matches!(out.client.as_slice(), [Backend::CommandComplete(a), Backend::CommandComplete(b), Backend::ReadyForQuery(b'I')] if a == "SET" && b == "SET")
+        );
+        assert_eq!(*f.records.lock().unwrap(), vec![(0, 0), (0, 0)]);
+        assert_eq!(f.allowed_records.load(Ordering::Relaxed), 2);
+        let mixed = session.frontend(Frontend::Query(
+            "SET extra_float_digits = 3; SELECT value FROM items".into(),
+        ));
+        assert!(mixed.upstream.is_empty());
+        assert_eq!(code(&mixed), "NY006");
+        let transaction = session.frontend(Frontend::Query("SET TRANSACTION READ ONLY".into()));
+        assert!(
+            matches!(transaction.upstream.as_slice(), [Frontend::Query(q)] if q == "SET TRANSACTION READ ONLY")
+        );
+    }
+    #[test]
+    fn session_setting_pipeline_preserves_upstream_order() {
+        let f = Fixture::new();
+        let mut session = f.session();
+        let first = session.frontend(Frontend::Parse {
+            name: "remote".into(),
+            query: "SELECT value FROM items".into(),
+            param_types: vec![],
+        });
+        assert_eq!(first.upstream.len(), 1);
+        let local = session.frontend(Frontend::Parse {
+            name: "local".into(),
+            query: "SET extra_float_digits = 3".into(),
+            param_types: vec![],
+        });
+        assert!(local.client.is_empty());
+        assert!(local.upstream.is_empty());
+        assert!(matches!(
+            session.backend(Backend::ParseComplete).client.as_slice(),
+            [Backend::ParseComplete, Backend::ParseComplete]
+        ));
+    }
+    #[test]
+    fn session_settings_extended_are_local() {
+        for query in [
+            "SET extra_float_digits = 3",
+            "SET application_name = 'tok_secret_a'",
+        ] {
+            let f = Fixture::new();
+            let mut session = f.session();
+            let out = session.frontend(Frontend::Parse {
+                name: "s".into(),
+                query: query.into(),
+                param_types: vec![],
+            });
+            assert!(out.upstream.is_empty());
+            assert!(matches!(out.client.as_slice(), [Backend::ParseComplete]));
+            let out = session.frontend(Frontend::Bind {
+                portal: "p".into(),
+                statement: "s".into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            });
+            assert!(out.upstream.is_empty());
+            assert!(matches!(out.client.as_slice(), [Backend::BindComplete]));
+            for kind in *b"SP" {
+                let out = session.frontend(Frontend::Describe {
+                    kind,
+                    name: if kind == b'S' { "s" } else { "p" }.into(),
+                });
+                assert!(out.upstream.is_empty());
+                assert!(matches!(out.client.last(), Some(Backend::NoData)));
+            }
+            let out = session.frontend(Frontend::Execute {
+                portal: "p".into(),
+                max_rows: 0,
+            });
+            assert!(out.upstream.is_empty());
+            assert!(
+                matches!(out.client.as_slice(), [Backend::CommandComplete(tag)] if tag == "SET")
+            );
+            assert_eq!(*f.records.lock().unwrap(), vec![(0, 0)]);
+            assert_eq!(f.allowed_records.load(Ordering::Relaxed), 1);
+            for (kind, name) in [(b'P', "p"), (b'S', "s")] {
+                let out = session.frontend(Frontend::Close {
+                    kind,
+                    name: name.into(),
+                });
+                assert!(out.upstream.is_empty());
+                assert!(matches!(out.client.as_slice(), [Backend::CloseComplete]));
+            }
+            // Sync retains the local-tokenize path's upstream synchronization.
+            assert!(matches!(
+                session.frontend(Frontend::Sync).upstream.as_slice(),
+                [Frontend::Sync]
+            ));
+            assert!(matches!(
+                session
+                    .backend(Backend::ReadyForQuery(b'I'))
+                    .client
+                    .as_slice(),
+                [Backend::ReadyForQuery(b'I')]
+            ));
+        }
+    }
     fn code(actions: &Actions) -> &str {
         let Backend::ErrorResponse(fields) = &actions.client[0] else {
             panic!("expected error")
@@ -1313,9 +1448,18 @@ mod tests {
         )));
         assert!(!out.upstream.is_empty());
         let out = f.session().frontend(Frontend::Query(
-            "SELECT nunya_tokenize('secret', 'tok_secret_a')".into()));
-        assert!(out.client.iter().any(|msg| matches!(msg, Backend::DataRow(_))));
-        assert!(!out.client.iter().any(|msg| matches!(msg, Backend::ErrorResponse(_))));
+            "SELECT nunya_tokenize('secret', 'tok_secret_a')".into(),
+        ));
+        assert!(
+            out.client
+                .iter()
+                .any(|msg| matches!(msg, Backend::DataRow(_)))
+        );
+        assert!(
+            !out.client
+                .iter()
+                .any(|msg| matches!(msg, Backend::ErrorResponse(_)))
+        );
     }
     #[test]
     fn token_shaped_plain_bind_is_refused_in_text_and_binary() {
@@ -1980,7 +2124,11 @@ mod tests {
     }
     #[test]
     fn local_parameter_tokenize_infers_types_and_exhausts_portal() {
-        for cell in [Some(b"private".to_vec()), Some(b"tok_secret_a".to_vec()), None] {
+        for cell in [
+            Some(b"private".to_vec()),
+            Some(b"tok_secret_a".to_vec()),
+            None,
+        ] {
             let f = Fixture::new();
             let mut s = f.session();
             let parse = s.frontend(Frontend::Parse {

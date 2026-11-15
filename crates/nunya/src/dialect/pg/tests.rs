@@ -1264,3 +1264,71 @@ fn shadowed_between_comparisons_are_refused() {
         );
     }
 }
+
+#[test]
+fn driver_session_settings_are_exact_and_fail_closed() {
+    let (snapshot, policy) = fixture();
+    for sql in [
+        "SET extra_float_digits = 3",
+        "SET extra_float_digits = '3'",
+        "SET application_name = 'PostgreSQL JDBC Driver'",
+        "SET SESSION client_encoding = 'UTF-8'",
+        "SET LOCAL timezone = ' Etc/UTC '",
+        "SET datestyle = ISO, MDY",
+        "SET datestyle = 'ISO, MDY'",
+        "SET datestyle = 'ISO'",
+        "SET intervalstyle = postgres",
+        "SET standard_conforming_strings = on",
+    ] {
+        let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+        assert_eq!(
+            statements[0].kind,
+            StatementKind::SessionNoop { tag: "SET" },
+            "{sql}"
+        );
+    }
+    for name in ["x".repeat(64), "\u{e9}".repeat(32)] {
+        let sql = format!("SET application_name = '{name}'");
+        assert_eq!(
+            PgLowering.lower(&sql, &snapshot, &policy, &[]).unwrap()[0].kind,
+            StatementKind::SessionNoop { tag: "SET" }
+        );
+    }
+    let long_name = format!("SET application_name = '{}'", "x".repeat(65));
+    let multibyte_long = format!("SET application_name = '{}'", "\u{e9}".repeat(33));
+    for sql in [
+        &multibyte_long,
+        "SET extra_float_digits = 2",
+        "SET search_path = x",
+        "SET ROLE x",
+        "RESET ALL",
+        "SET timezone = 'Europe/London'",
+        "SET client_encoding = 'LATIN1'",
+        "SET datestyle = SQL",
+        "SET standard_conforming_strings = off",
+        "SET application_name = 3",
+        "SET timezone FROM CURRENT",
+        "SET SESSION AUTHORIZATION x",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+        "SET TRANSACTION DEFERRABLE",
+        "SET extra_float_digits = 3, 3",
+        &long_name,
+    ] {
+        let statements = PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap();
+        assert_eq!(
+            statements[0].kind,
+            StatementKind::Refused(NyCode::StatementNotAllowed),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET TRANSACTION READ ONLY",
+        "SET TRANSACTION READ WRITE",
+    ] {
+        assert_eq!(
+            PgLowering.lower(sql, &snapshot, &policy, &[]).unwrap()[0].kind,
+            StatementKind::Savepoint
+        );
+    }
+}

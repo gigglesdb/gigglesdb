@@ -180,6 +180,11 @@ pub enum StatementKind {
     ReleaseSavepoint,
     /// RollbackToSavepoint.
     RollbackToSavepoint,
+    /// A harmless session setting answered locally.
+    SessionNoop {
+        /// Command completion tag.
+        tag: &'static str,
+    },
     /// Explicit tokenization in the named domain.
     Tokenize {
         /// Domain.

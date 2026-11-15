@@ -45,6 +45,97 @@ fn empty(span: Span) -> ResolvedStatement {
         source_span: span,
     }
 }
+
+fn setting_string(n: &p::Node) -> Option<&str> {
+    match n.node.as_ref()? {
+        NodeEnum::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            p::a_const::Val::Sval(s) => Some(&s.sval),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+fn setting_integer(n: &p::Node) -> Option<i32> {
+    match n.node.as_ref()? {
+        NodeEnum::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            p::a_const::Val::Ival(i) => Some(i.ival),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+fn session_setting(s: &p::VariableSetStmt) -> StatementKind {
+    let denied = StatementKind::Refused(NyCode::StatementNotAllowed);
+    let name = s.name.to_ascii_lowercase();
+    if s.kind == p::VariableSetKind::VarSetMulti as i32 && name == "transaction" {
+        let valid = !s.args.is_empty()
+            && s.args.iter().all(|n| match n.node.as_ref() {
+                Some(NodeEnum::DefElem(d)) => match (d.defname.as_str(), d.arg.as_deref()) {
+                    ("transaction_isolation", Some(arg)) => matches!(
+                        setting_string(arg),
+                        Some(
+                            "serializable"
+                                | "repeatable read"
+                                | "read committed"
+                                | "read uncommitted"
+                        )
+                    ),
+                    ("transaction_read_only", Some(arg)) => {
+                        matches!(setting_integer(arg), Some(0 | 1))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            });
+        // Reuse the non-recovery transaction path without Begin's status transition.
+        return if valid {
+            StatementKind::Savepoint
+        } else {
+            denied
+        };
+    }
+    if s.kind != p::VariableSetKind::VarSetValue as i32 {
+        return denied;
+    }
+    let values = s
+        .args
+        .iter()
+        .map(setting_string)
+        .collect::<Option<Vec<_>>>();
+    let normalized = values.as_ref().map(|v| {
+        v.iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    let one = normalized.as_ref().and_then(|v| {
+        if v.len() == 1 {
+            Some(v[0].as_str())
+        } else {
+            None
+        }
+    });
+    let allowed = match name.as_str() {
+        "extra_float_digits" => {
+            one == Some("3") || (s.args.len() == 1 && setting_integer(&s.args[0]) == Some(3))
+        }
+        "application_name" => matches!(values.as_deref(), Some([value]) if value.len() <= 64),
+        "client_encoding" => matches!(one, Some("utf8" | "utf-8" | "unicode")),
+        "timezone" => matches!(one, Some("utc" | "etc/utc")),
+        "datestyle" => {
+            matches!(one, Some("iso, mdy" | "iso"))
+                || matches!(normalized.as_deref(), Some([a, b]) if a == "iso" && b == "mdy")
+        }
+        "intervalstyle" => one == Some("postgres"),
+        "standard_conforming_strings" => one == Some("on"),
+        _ => false,
+    };
+    if allowed {
+        StatementKind::SessionNoop { tag: "SET" }
+    } else {
+        denied
+    }
+}
+
 struct State<'a> {
     sql: String,
     snapshot: &'a Snapshot,
@@ -148,6 +239,7 @@ impl Lowering for PgLowering {
                         }
                     }
                 }
+                NodeEnum::VariableSetStmt(s) => state.statement.kind = session_setting(s),
                 NodeEnum::TransactionStmt(t) => {
                     state.statement.kind = match p::TransactionStmtKind::try_from(t.kind)
                         .map_err(|_| refuse())?

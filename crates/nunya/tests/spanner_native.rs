@@ -48,12 +48,12 @@ fn parameter(request: &mut ExecuteSqlRequest, token: &str) {
 #[tokio::test]
 #[ignore = "requires NUNYA_TEST_SPANNER_EMULATOR and NUNYA_TEST_SPANNER_DB"]
 async fn standing_worked_example() {
-    let (Ok(endpoint), Ok(database)) = (
-        std::env::var("NUNYA_TEST_SPANNER_EMULATOR"),
-        std::env::var("NUNYA_TEST_SPANNER_DB"),
-    ) else {
-        return;
-    };
+    let endpoint = std::env::var("NUNYA_TEST_SPANNER_EMULATOR").unwrap_or_else(|_| {
+        panic!("missing required environment variable NUNYA_TEST_SPANNER_EMULATOR")
+    });
+    let database = std::env::var("NUNYA_TEST_SPANNER_DB")
+        .unwrap_or_else(|_| panic!("missing required environment variable NUNYA_TEST_SPANNER_DB"));
+
     assert_eq!(
         database,
         "projects/test-project/instances/test-instance/databases/gsql"
@@ -225,10 +225,7 @@ async fn standing_worked_example() {
     );
     let mut update = sql(&session, "UPDATE Notes SET Body = @email WHERE Id = 1");
     parameter(&mut update, &token);
-    let Err(error) = agent
-        .execute_sql(update)
-        .await
-    else {
+    let Err(error) = agent.execute_sql(update).await else {
         panic!("token into clear column refused");
     };
     assert!(

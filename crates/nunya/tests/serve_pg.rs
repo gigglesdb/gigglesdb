@@ -23,7 +23,7 @@ fn port() -> u16 {
 #[ignore = "requires NUNYA_TEST_PG pointing at harness/seed.sql database"]
 async fn standing_worked_example() {
     let Ok(url) = std::env::var("NUNYA_TEST_PG") else {
-        return;
+        panic!("missing required environment variable NUNYA_TEST_PG");
     };
     let pg: tokio_postgres::Config = url.parse().unwrap();
     let host = match pg.get_hosts().first() {

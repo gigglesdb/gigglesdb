@@ -86,7 +86,8 @@ pub fn check(
         | StatementKind::Rollback
         | StatementKind::Savepoint
         | StatementKind::ReleaseSavepoint
-        | StatementKind::RollbackToSavepoint => {
+        | StatementKind::RollbackToSavepoint
+        | StatementKind::SessionNoop { .. } => {
             if !stmt.uses.is_empty() || !stmt.writes.is_empty() || !stmt.outputs.is_empty() {
                 return Err(refusal(NyCode::NotAnalysable));
             }
@@ -96,13 +97,13 @@ pub fn check(
             match policy.domains.get(domain).map(|s| &s.tokenize) {
                 Some(TokenizeSetting::On { .. }) => {}
                 Some(TokenizeSetting::Off) | None => {
-                    return Err(refusal(NyCode::StatementNotAllowed))
+                    return Err(refusal(NyCode::StatementNotAllowed));
                 }
             }
             match arg {
                 ValueSource::Param(_) | ValueSource::Literal { .. } => {}
                 ValueSource::Column { .. } | ValueSource::Null | ValueSource::Computed(_) => {
-                    return Err(refusal(NyCode::NotAnalysable))
+                    return Err(refusal(NyCode::NotAnalysable));
                 }
             }
             if !stmt.uses.is_empty() || !stmt.writes.is_empty() || !stmt.outputs.is_empty() {
@@ -289,7 +290,7 @@ pub fn check(
                         placeholder: placeholder.clone(),
                     },
                     Some(Treatment::Blind { .. }) | None => {
-                        return Err(refusal(NyCode::NotAnalysable))
+                        return Err(refusal(NyCode::NotAnalysable));
                     }
                 }
             }
@@ -477,6 +478,7 @@ mod tests {
             StatementKind::Savepoint,
             StatementKind::ReleaseSavepoint,
             StatementKind::RollbackToSavepoint,
+            StatementKind::SessionNoop { tag: "SET" },
         ] {
             let mut s = stmt();
             s.kind = kind;

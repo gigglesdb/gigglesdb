@@ -299,13 +299,11 @@ impl Generator {
 #[tokio::test]
 #[ignore = "requires two independently seeded PostgreSQL databases; never run in the normal suite"]
 async fn gateway_preserves_noninterference() -> TestResult<()> {
-    let (Ok(a_url), Ok(b_url)) = (
-        std::env::var("NUNYA_TEST_PG_A"),
-        std::env::var("NUNYA_TEST_PG_B"),
-    ) else {
-        eprintln!("NI skipped: set both NUNYA_TEST_PG_A and NUNYA_TEST_PG_B");
-        return Ok(());
-    };
+    let a_url = std::env::var("NUNYA_TEST_PG_A")
+        .unwrap_or_else(|_| panic!("missing required environment variable NUNYA_TEST_PG_A"));
+    let b_url = std::env::var("NUNYA_TEST_PG_B")
+        .unwrap_or_else(|_| panic!("missing required environment variable NUNYA_TEST_PG_B"));
+
     let seed = std::env::var("NUNYA_NI_SEED")
         .unwrap_or_else(|_| "1".into())
         .parse::<u64>()?;
