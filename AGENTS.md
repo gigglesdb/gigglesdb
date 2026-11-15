@@ -63,6 +63,8 @@ plus `cargo clippy --all-targets -- -D warnings`. Pass `--no-fail-fast` to
 `cargo test` and report the totals from every test binary; without it, cargo
 stops at the first failing binary and hides the rest. Run them on an exact archive of
 HEAD with the staged changes applied. `cargo check` alone is not enough.
+Which crates and modes the gate covers is set by "Tiered verification" below;
+the gate runs once per landed stack, not once per commit or per worker.
 
 Committed blobs must be LF. K: copies are CRLF (core.autocrlf=true), so never
 `git hash-object -w` a K: file with autocrlf disabled. Hash from an LF worktree
@@ -187,6 +189,54 @@ shrank from 21G to 1.7G and 4.6G to 1.3G (GD-0001 E135-E137).
 - Test names in the merged binary carry the file as a module prefix, so run
   one file with `cargo test --test all <file>::` and use
   `<file>::<test>` with `--exact`.
+
+## Tiered verification
+
+Agreed with the user on 2026-11-14 to raise throughput. Compile time, not
+test run time, dominates, so verification is split into lanes and each
+expensive pass runs once.
+
+Worker lanes. SOL workers do not run the landing gate.
+- While iterating: `cargo check` and the focused tests
+  (`cargo test --test all <file>::`).
+- Once, before reporting: `cargo test --no-fail-fast` and
+  `cargo clippy --all-targets -- -D warnings`, default features only, in each
+  crate whose `src/` or `tests/` they changed. Add the `--no-default-features`
+  pair only when the change touches `cfg(feature = ...)` code.
+- Workers report totals and failing test names, not logs.
+- Workers reuse a fixed lane (one stable worktree plus one stable
+  CARGO_TARGET_DIR per lane, reset between tasks), never a fresh per-task
+  worktree: sccache misses on every new source path, so per-task worktrees
+  build cold every time.
+
+Landing gate. The coordinator runs it once on the tip of the stack it lands
+(see batching below), sized by what the stack changes:
+- Code in a crate's `src/`: full `cargo test --no-fail-fast` plus clippy for
+  that crate, in default mode and, for crates with optional features
+  (giggles-core, giggles-server, giggles-language), also in
+  `--no-default-features` mode. Add dependent crates only where behaviour
+  crosses: SQL parsing or semantics in giggles-core also gates
+  giggles-language and giggles-server; public API changes gate the crates
+  that call the changed items.
+- Only new or changed `tests/` files (registered in `tests/all.rs`): build
+  that crate's test binary, run `cargo test --test all <file>::` for each
+  changed file, plus clippy `--all-targets` for that crate. No dependent sweep.
+- Docs, `compat/` Python, `scripts/` and other non-Rust files only: no cargo
+  gate; run that tooling's own tests if it has any (for example
+  `python -I -m pytest compat/tests`).
+- Clippy runs once per crate per mode, and clippy with `--no-default-features`
+  only for crates whose change touches feature-gated code.
+
+Rebase after main moves. The disjoint-rebase rule applies to every track:
+if the commits that moved main touch none of the stack's paths and nothing
+they depend on, run `git apply --check`, `cargo check` of the affected
+crates and any test binary the new commits added, then land without a new
+gate. Otherwise rebase and re-gate.
+
+Build slots. Every cargo command in a worker or gate is wrapped in
+`bash J:/gigglesdb-work/r2/buildslot2.sh cargo ...`. That gives two shared
+heavy slots, plus a third slot for check-only `cargo check` and
+`cargo clippy`, which link nothing. CARGO_BUILD_JOBS stays 4.
 
 ## Landing with scripts/land-commit.sh
 
