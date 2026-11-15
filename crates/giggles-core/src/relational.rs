@@ -2377,6 +2377,33 @@ impl Prepared {
         }
     }
 
+    fn authorization_reads_target(&self) -> bool {
+        self.returning().is_some_and(Returning::reads_columns)
+            || searched::target(self).is_some_and(query::Query::mutation_filter_reads_columns)
+            || match &self.statement {
+                Statement::UpdateExpressions { sets, predicates, .. } => {
+                    !predicates.is_empty() || sets.iter().any(|(_, value)| {
+                        matches!(value, assign::Value::Scalar(q) if q.projection_reads_columns())
+                    })
+                }
+                Statement::Update { predicates, .. } | Statement::Delete { predicates, .. } => {
+                    !predicates.is_empty()
+                }
+                Statement::InsertMulti(insert) => insert.lock_conflict().is_some_and(|conflict| {
+                    conflict.columns.is_some() || conflict.constraint.is_some()
+                }),
+                _ => false,
+            }
+    }
+
+    /// Additional command privilege for syntactic ON CONFLICT DO UPDATE.
+    pub fn authorization_update_table(&self) -> Option<&str> {
+        match &self.statement {
+            Statement::InsertMulti(insert) if insert.updates_conflicts() => Some(&insert.table),
+            _ => None,
+        }
+    }
+
     /// Complete syntactic reads, collected before gateway classification or binding.
     pub fn authorization_tables(&self) -> R<Vec<String>> {
         let query = match &self.statement {
@@ -2385,18 +2412,24 @@ impl Prepared {
             Statement::InsertMulti(insert) => insert.source.as_deref(),
             _ => searched::target(self).filter(|query| query.has_in_subquery()),
         };
-        match query {
+        let mut tables = match query {
             Some(query) => {
                 let mut tables = query.authorization_tables()?;
                 if searched::target(self).is_some() {
-                    // The target keeps its command privilege; child reads need SELECT.
+                    // Retain child reads, then add target-column reads below.
                     let children = query.subquery_tables();
                     tables.retain(|table| children.contains(table));
                 }
-                Ok(tables)
+                tables
             }
-            None => Ok(self.read_tables()),
+            None => self.read_tables(),
+        };
+        if self.authorization_reads_target() && let Some(table) = self.table()
+            && !tables.iter().any(|read| read == table)
+        {
+            tables.push(table.to_owned());
         }
+        Ok(tables)
     }
 
     pub fn is_ddl(&self) -> bool {

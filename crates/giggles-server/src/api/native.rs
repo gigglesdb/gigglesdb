@@ -39,35 +39,73 @@ fn authorize_request(
     Err(CoreError::Limit)
 }
 
-// Match Session::authorize / Prepared::authorization_tables: native expressions
-// cannot read child tables. SQL currently adds no target SELECT for WHERE or
-// RETURNING, nor UPDATE for ON CONFLICT; keep both surfaces in lockstep.
-fn table_requirement(
+// Collect syntactic reads before binding, at the same step as SQL authorization.
+fn reads_columns(expr: &ops::Expr, depth: usize) -> Result<bool, CoreError> {
+    if depth > ops::MAX_DEPTH { return Err(CoreError::Limit); }
+    let read = |expr: &ops::Expr| reads_columns(expr, depth + 1);
+    Ok(match expr {
+        ops::Expr::Field(_) | ops::Expr::ConflictField { .. } => true,
+        ops::Expr::Value(_) | ops::Expr::Local(_) => false,
+        ops::Expr::Compare(a, _, b) | ops::Expr::And(a, b) | ops::Expr::Or(a, b)
+        | ops::Expr::Arithmetic(a, _, b) => read(a)? | read(b)?,
+        ops::Expr::IsNull(a, _) | ops::Expr::Not(a) | ops::Expr::Negate(a) => read(a)?,
+        ops::Expr::Call { arguments, .. } => {
+            let mut found = false;
+            for arg in arguments { found |= read(arg)?; }
+            found
+        }
+        ops::Expr::Case { operand, arms, else_expr } => {
+            let mut found = operand.as_deref().map(read).transpose()?.unwrap_or(false);
+            for (condition, value) in arms { found |= read(condition)? | read(value)?; }
+            found | else_expr.as_deref().map(read).transpose()?.unwrap_or(false)
+        }
+    })
+}
+
+fn table_requirements(
     request: &ops::Request,
-) -> Result<(String, giggles_core::roles::TablePrivilege), CoreError> {
+) -> Result<Vec<(String, giggles_core::roles::TablePrivilege)>, CoreError> {
     use giggles_core::roles::TablePrivilege::{Delete, Insert, Select, Update};
     let mut request = request;
+    let (mut select, mut update) = (false, false);
     for _ in 0..=2 {
         let (table, privilege) = match request {
-            ops::Request::Returning { request: inner, .. }
-            | ops::Request::OnConflict { request: inner, .. } => {
+            ops::Request::Returning { request: inner, projection } => {
+                select |= projection.is_empty();
+                for item in projection { select |= reads_columns(&item.expression, 0)?; }
+                request = inner;
+                continue;
+            }
+            ops::Request::OnConflict { request: inner, target, action } => {
+                select |= !target.is_empty();
+                if let ops::ConflictAction::Update { guard, values } = action {
+                    update = true;
+                    if let Some(guard) = guard { select |= reads_columns(guard, 0)?; }
+                    for (_, value) in values { select |= reads_columns(value, 0)?; }
+                }
                 request = inner;
                 continue;
             }
             ops::Request::Read { table, .. } | ops::Request::ReadExpressions { table, .. } => {
                 (table, Select)
             }
-            ops::Request::Insert { table, .. }
-            | ops::Request::InsertMany { table, .. }
+            ops::Request::Insert { table, .. } | ops::Request::InsertMany { table, .. }
             | ops::Request::InsertExpressions { table, .. } => (table, Insert),
-            ops::Request::Update { table, .. } | ops::Request::UpdateExpressions { table, .. } => {
-                (table, Update)
+            ops::Request::Update { table, filter, guard, .. }
+            | ops::Request::UpdateExpressions { table, filter, guard, .. }
+            | ops::Request::Delete { table, filter, guard, .. } => {
+                select |= reads_columns(filter, 0)?;
+                if let Some(guard) = guard { select |= reads_columns(guard, 0)?; }
+                if let ops::Request::UpdateExpressions { values, .. } = request {
+                    for (_, value) in values { select |= reads_columns(value, 0)?; }
+                }
+                (table, if matches!(request, ops::Request::Delete { .. }) { Delete } else { Update })
             }
-            ops::Request::Delete { table, .. } => (table, Delete),
         };
-        // Native targets already use SQL authority keys (public tables are bare
-        // names); do not bind the catalog to resolve them before authorization.
-        return Ok((table.clone(), privilege));
+        let mut reqs = vec![(table.clone(), privilege)];
+        if select && privilege != Select { reqs.push((table.clone(), Select)); }
+        if update { reqs.push((table.clone(), Update)); }
+        return Ok(reqs);
     }
     Err(CoreError::Limit)
 }
@@ -81,7 +119,7 @@ pub(crate) fn run(
         if matches!(&session.role, Role::Database { .. }) {
             let mut reqs = Vec::new();
             match &invocation {
-                Invocation::Operation { request, .. } => reqs.push(table_requirement(request)?),
+                Invocation::Operation { request, .. } => reqs.extend(table_requirements(request)?),
                 Invocation::Transaction { transaction, .. } => {
                     if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
                         return Err(CoreError::Limit);
@@ -90,7 +128,7 @@ pub(crate) fn run(
                         if let ops::TransactionStep::Execute(request)
                         | ops::TransactionStep::Let { request, .. } = step
                         {
-                            reqs.push(table_requirement(request)?);
+                            reqs.extend(table_requirements(request)?);
                         }
                     }
                 }
@@ -176,6 +214,60 @@ mod tests {
     use super::*;
     use crate::{Binding, Service, clock::Clock};
     use giggles_core::{Admin, Limits, roles};
+
+    #[test]
+    fn native_ast_collects_column_reads_and_conflict_updates() {
+        use giggles_core::roles::TablePrivilege::{Delete, Insert, Select, Update};
+        let path = crate::test_support::fixture_root().join(format!("native-grant-reads-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let admin = Admin::create(path.join("db.redb"), Limits::default()).unwrap();
+        admin.sql_session().execute("CREATE TABLE app(id BIGINT PRIMARY KEY, body BIGINT)", &[], None).unwrap();
+        admin.sql_session().execute("INSERT INTO app VALUES(1,1)", &[], None).unwrap();
+        admin.roles().create(roles::NewRole {
+            name: "bound".into(), login: true, ..roles::NewRole::default()
+        }).unwrap();
+        let fingerprint = "22".repeat(32);
+        let service = Service::new(admin, vec![Binding {
+            fingerprint: fingerprint.clone(), role: Role::Database { name: "bound".into() }
+        }], Clock::new(0, 3600).unwrap()).unwrap();
+        for (source, expected) in [
+            ("update app where true set body=1+1", vec![Update]),
+            ("update app where id=1 set body=1", vec![Update, Select]),
+            ("update app where true set body=body+1", vec![Update, Select]),
+            ("delete app where true", vec![Delete]),
+            ("delete app where id=1", vec![Delete, Select]),
+            ("insert app set id=2 return 1 as n", vec![Insert]),
+            ("update app where true set body=1 return 1 as n", vec![Update]),
+            ("delete app where true return 1 as n", vec![Delete]),
+            ("insert app set id=2 return id", vec![Insert, Select]),
+            ("update app where true set body=1 return body", vec![Update, Select]),
+            ("delete app where true return *", vec![Delete, Select]),
+            ("insert into app(id) values(2) on conflict(id) do nothing", vec![Insert, Select]),
+            ("insert into app(id) values(2) on conflict(id) do update set body=1", vec![Insert, Select, Update]),
+            ("insert into app(id) values(2) on conflict(id) do update set body=incoming.body", vec![Insert, Select, Update]),
+            ("update app where true when body=1 set body=2", vec![Update, Select]),
+        ] {
+            let giggles_language::Lowered::Operation { request, .. } = giggles_language::lower_text(
+                source, &ops::Bindings::new(), giggles_language::LanguageVersion::Embedded016,
+            ).unwrap_or_else(|error| panic!("{source}: {error:?}")) else { panic!("operation expected") };
+            assert_eq!(table_requirements(&request).unwrap(), expected.iter().copied()
+                .map(|privilege| ("app".into(), privilege)).collect::<Vec<_>>(), "{source}");
+            let roles = service.admin.roles();
+            roles.grant_table("app", "bound", &expected).unwrap();
+            let invocation = || Invocation::Operation { request: request.clone(), bindings: ops::Bindings::new() };
+            for missing in &expected {
+                roles.revoke_table("app", "bound", &[*missing]).unwrap();
+                let mut session = service.session(&fingerprint).unwrap();
+                assert!(matches!(run(&mut session, invocation()), Err(CoreError::Policy(Error::Scope))), "{source}: {missing:?}");
+                roles.grant_table("app", "bound", &[*missing]).unwrap();
+            }
+            let mut session = service.session(&fingerprint).unwrap();
+            run(&mut session, Invocation::Begin).unwrap();
+            assert!(matches!(run(&mut session, invocation()).unwrap(), NativeResult::Operation(_)), "{source}");
+            run(&mut session, Invocation::Rollback).unwrap();
+            roles.revoke_table("app", "bound", &expected).unwrap();
+        }
+    }
 
     #[test]
     fn database_binding_checks_fences_before_native_access() {

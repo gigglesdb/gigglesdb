@@ -1212,6 +1212,7 @@ impl Session {
         // E939: collect every child dependency before table-free/routine classification.
         // Routine/sequence authority and classification keep their existing gates.
         let read_tables = p.authorization_tables().map_err(CoreError::Sql)?;
+        let update_table = p.authorization_update_table();
         let joined_read = !read_tables.is_empty()
             && matches!(p.command(), "SELECT" | "EXPLAIN")
             && p.table() == Some("giggles_join");
@@ -1294,9 +1295,12 @@ impl Session {
                 && p.deferred_routine_only());
         let mut allowed = allowed;
         if allowed && !superuser {
-            let reqs: Vec<_> = read_tables.into_iter()
+            let mut reqs: Vec<_> = read_tables.into_iter()
                 .map(|table| (table, roles::TablePrivilege::Select))
                 .collect();
+            if let Some(table) = update_table {
+                reqs.push((table.to_owned(), roles::TablePrivilege::Update));
+            }
             allowed = self.table_requirements_allowed(&reqs, false)?;
         }
         if !allowed {

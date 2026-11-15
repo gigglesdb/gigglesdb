@@ -1890,6 +1890,32 @@ impl Query {
         }
         out
     }
+    /// Projection reads only: mutation_target's synthetic star is never inspected.
+    pub(super) fn projection_reads_columns(&self) -> bool {
+        self.items.iter().any(|(item, _)| match item {
+            Item::Star | Item::QualifiedStar { .. } => true,
+            Item::Scalar(s) | Item::Aggregate(_, Some(s)) => {
+                let mut found = false;
+                let _ = walk_scalar(s, &mut |s| {
+                    found |= matches!(s, Scalar::Column(_));
+                    Ok(())
+                });
+                found
+            }
+            _ => false,
+        })
+    }
+    /// Only outer WHERE scalars; child-query reads have their own requirements.
+    pub(super) fn mutation_filter_reads_columns(&self) -> bool {
+        let mut found = false;
+        if let Some(filter) = &self.filter {
+            let _ = filter.visit_scalars(&mut |s| walk_scalar(s, &mut |s| {
+                found |= matches!(s, Scalar::Column(_));
+                Ok(())
+            }));
+        }
+        found
+    }
     pub(super) fn authorization_tables(&self) -> R<Vec<String>> {
         Ok(self.dependencies()?.relations.into_iter().collect())
     }

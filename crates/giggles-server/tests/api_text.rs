@@ -121,7 +121,7 @@ async fn text_syntax_catalog_version_and_binding_rejections_are_invalid_argument
     f.stop().await;
 }
 
-// Native authority must track GigglesDB SQL, including its present PG gaps.
+// Native authority tracks the PG18.6-qualified SQL table requirements.
 #[tokio::test]
 async fn database_native_grants_match_sql_on_http_and_grpc() {
     use giggles_core::roles::{NewRole, TablePrivilege::{Select, Insert, Update, Delete}};
@@ -170,25 +170,47 @@ async fn database_native_grants_match_sql_on_http_and_grpc() {
             let error = sql.prepare(&format!("SELECT absent FROM {table}")).unwrap_err();
             assert_eq!(execute(&f, &token, text(&format!("{table} select absent")), grpc).await["code"], sqlstate(&error));
         }
-        // Each case has only its command grant: WHERE, RETURNING and conflict
-        // updates intentionally follow SQL's current policy, not PG's policy.
+        // PG18.6: constants do not read target columns; WHERE/SET/RETURNING
+        // column reads and explicit conflict targets require SELECT.
         roles.revoke_table("app", "bound", &[Select, Insert]).unwrap();
-        for (privilege, source, statement) in [
-            (Select, "app select id", "SELECT id FROM app"),
-            (Select, "app select id+1 as n", "SELECT id+1 AS n FROM app"),
-            (Insert, "insert app set id=3", "INSERT INTO app(id) VALUES (3)"),
-            (Insert, "insert into app(id) values(3+0)", "INSERT INTO app(id) VALUES (3+0)"),
-            (Insert, "insert many into app(id) values(3),(4) at most 2", "INSERT INTO app(id) VALUES (3),(4)"),
-            (Insert, "insert app set id=3 return id", "INSERT INTO app(id) VALUES (3) RETURNING id"),
-            (Insert, "insert into app(id) values(2) on conflict(id) do nothing", "INSERT INTO app(id) VALUES (2) ON CONFLICT(id) DO NOTHING"),
-            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update set body=incoming.body return id", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT(id) DO UPDATE SET body=excluded.body RETURNING id"),
-            (Update, "update app where id=2 set body=\"changed\"", "UPDATE app SET body='changed' WHERE id=2"),
-            (Update, "update app where id=2 set body=body return id", "UPDATE app SET body=body WHERE id=2 RETURNING id"),
-            (Delete, "delete app where id=2 return id", "DELETE FROM app WHERE id=2 RETURNING id"),
+        for (privilege, source, statement, extra) in [
+            (Select, "app select id", "SELECT id FROM app", &[][..]),
+            (Select, "app select id+1 as n", "SELECT id+1 AS n FROM app", &[]),
+            (Insert, "insert app set id=3", "INSERT INTO app(id) VALUES (3)", &[]),
+            (Insert, "insert into app(id) values(3+0)", "INSERT INTO app(id) VALUES (3+0)", &[]),
+            (Insert, "insert many into app(id) values(3),(4) at most 2", "INSERT INTO app(id) VALUES (3),(4)", &[]),
+            (Insert, "insert app set id=3 return 1 as n", "INSERT INTO app(id) VALUES (3) RETURNING 1 AS n", &[]),
+            (Update, "update app where true set body=\"changed\"", "UPDATE app SET body='changed'", &[]),
+            (Update, "update app where true set body=\"changed\" return 1 as n", "UPDATE app SET body='changed' WHERE true RETURNING 1 AS n", &[]),
+            (Delete, "delete app where true", "DELETE FROM app WHERE true", &[]),
+            (Delete, "delete app where true return 1 as n", "DELETE FROM app RETURNING 1 AS n", &[]),
+            (Insert, "insert app set id=3 return id", "INSERT INTO app(id) VALUES (3) RETURNING id", &[Select]),
+            (Update, "update app where true set body=body", "UPDATE app SET body=body", &[Select]),
+            (Update, "update app where id=2 set body=\"changed\"", "UPDATE app SET body='changed' WHERE id=2", &[Select]),
+            (Update, "update app where true set body=\"changed\" return body", "UPDATE app SET body='changed' RETURNING body", &[Select]),
+            (Update, "update app where id=2 set body=body return id", "UPDATE app SET body=body WHERE id=2 RETURNING id", &[Select]),
+            (Delete, "delete app where id=2", "DELETE FROM app WHERE id=2", &[Select]),
+            (Delete, "delete app where true return id", "DELETE FROM app RETURNING id", &[Select]),
+            (Delete, "delete app where id=2 return id", "DELETE FROM app WHERE id=2 RETURNING id", &[Select]),
+            (Insert, "insert into app(id) values(2) on conflict(id) do nothing", "INSERT INTO app(id) VALUES (2) ON CONFLICT(id) DO NOTHING", &[Select]),
+            (Insert, "insert into app(id) values(2) on conflict(id) do nothing", "INSERT INTO app(id) VALUES (2) ON CONFLICT ON CONSTRAINT app_pkey DO NOTHING", &[Select]),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update set body=\"upsert\"", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT(id) DO UPDATE SET body='upsert'", &[Select, Update]),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update set body=incoming.body return id", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT(id) DO UPDATE SET body=excluded.body RETURNING id", &[Select, Update]),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update set body=existing.body", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=app.body", &[Select, Update]),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update when existing.id=2 set body=\"upsert\"", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body='upsert' WHERE app.id=2", &[Select, Update]),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update when incoming.body=\"upsert\" set body=\"upsert\"", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body='upsert' WHERE excluded.body='upsert'", &[Select, Update]),
         ] {
             let expected = sql.prepare(statement).map(|_| ()).unwrap_err();
             assert_eq!(execute(&f, &token, text(source), grpc).await["code"], sqlstate(&expected), "{source}");
             roles.grant_table("app", "bound", &[privilege]).unwrap();
+            roles.grant_table("app", "bound", extra).unwrap();
+            for missing in extra {
+                roles.revoke_table("app", "bound", &[*missing]).unwrap();
+                let expected = sql.prepare(statement).unwrap_err();
+                assert_eq!(sqlstate(&expected), "42501", "{statement}: {missing:?}");
+                assert_eq!(execute(&f, &token, text(source), grpc).await["code"], "42501", "{source}: {missing:?}");
+                roles.grant_table("app", "bound", &[*missing]).unwrap();
+            }
             let prepared = sql.prepare(statement).unwrap();
             assert!(prepared.authorization_tables().unwrap().iter().all(|t| t == "app"));
             assert_eq!(execute(&f, &token, json!({"begin":{}}), grpc).await["code"], "ok");
@@ -196,6 +218,7 @@ async fn database_native_grants_match_sql_on_http_and_grpc() {
             assert_eq!(reply["code"], "ok", "{source}: {reply}");
             execute(&f, &token, json!({"rollback":{}}), grpc).await;
             roles.revoke_table("app", "bound", &[privilege]).unwrap();
+            roles.revoke_table("app", "bound", extra).unwrap();
         }
         roles.set_table_owner("app", "bound").unwrap();
         assert_eq!(execute(&f, &token, text("app select id"), grpc).await["code"], "ok");

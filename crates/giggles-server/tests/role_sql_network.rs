@@ -286,6 +286,57 @@ async fn privileges(protocol: Protocol) {
     f.pg.shutdown().await.unwrap();
 }
 
+// The saved PG18.6 qualification supplies each minimal initial grant.
+#[tokio::test]
+async fn mutation_column_privileges_match_pg18_simple_and_extended() {
+    for protocol in [Protocol::Simple, Protocol::Extended] {
+        let f = Fixture::new().await;
+        let owner = f.connect("owner", "owner-pw").await;
+        protocol.ok(&owner, "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'").await;
+        protocol.ok(&owner, "CREATE TABLE app(id BIGINT PRIMARY KEY, body BIGINT)").await;
+        protocol.ok(&owner, "INSERT INTO app VALUES(1,1)").await;
+        let alice = f.connect("alice", "alice-pw").await;
+        for (statement, initial, added) in [
+            ("UPDATE app SET body=1", "UPDATE", ""),
+            ("UPDATE app SET body=1+1", "UPDATE", ""),
+            ("UPDATE app SET body=1 WHERE true", "UPDATE", ""),
+            ("UPDATE app SET body=1 WHERE id=1", "UPDATE", "SELECT"),
+            ("UPDATE app SET body=body+1", "UPDATE", "SELECT"),
+            ("DELETE FROM app WHERE true", "DELETE", ""),
+            ("DELETE FROM app WHERE id=1", "DELETE", "SELECT"),
+            ("INSERT INTO app VALUES (2,1) RETURNING 1", "INSERT", ""),
+            ("UPDATE app SET body=1 RETURNING 1", "UPDATE", ""),
+            ("DELETE FROM app RETURNING 1", "DELETE", ""),
+            ("INSERT INTO app VALUES (2,1) RETURNING id", "INSERT", "SELECT"),
+            ("UPDATE app SET body=1 RETURNING body", "UPDATE", "SELECT"),
+            ("DELETE FROM app RETURNING id", "DELETE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT(id) DO NOTHING", "INSERT", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT DO NOTHING", "INSERT", ""),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO NOTHING", "INSERT", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT(id) DO UPDATE SET body=1", "INSERT,SELECT", "UPDATE"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT(id) DO UPDATE SET body=1", "INSERT,UPDATE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=app.body+1", "INSERT,UPDATE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=excluded.body", "INSERT,UPDATE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=1 WHERE app.body=1", "INSERT,UPDATE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=1 WHERE excluded.body=1", "INSERT,UPDATE", "SELECT"),
+            ("INSERT INTO app VALUES (1,1) ON CONFLICT ON CONSTRAINT app_pkey DO UPDATE SET body=1", "INSERT,UPDATE", "SELECT"),
+        ] {
+            protocol.ok(&owner, "REVOKE SELECT,INSERT,UPDATE,DELETE ON app FROM alice").await;
+            protocol.ok(&owner, &format!("GRANT {initial} ON app TO alice")).await;
+            if !added.is_empty() {
+                protocol.error(&alice, statement, "42501").await;
+                protocol.ok(&owner, &format!("GRANT {added} ON app TO alice")).await;
+            }
+            protocol.ok(&alice, "BEGIN").await;
+            protocol.ok(&alice, statement).await;
+            protocol.ok(&alice, "ROLLBACK").await;
+        }
+        drop(alice);
+        drop(owner);
+        f.pg.shutdown().await.unwrap();
+    }
+}
+
 async fn passwords_and_authority(protocol: Protocol) {
     let f = Fixture::new().await;
     let owner = f.connect("owner", "owner-pw").await;

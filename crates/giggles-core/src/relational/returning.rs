@@ -16,6 +16,10 @@ impl Returning {
         self.query.bind_schema_names(bind, state, path);
     }
 
+    pub(super) fn reads_columns(&self) -> bool {
+        self.query.projection_reads_columns()
+    }
+
     pub(super) fn sequence_dependencies(&self) -> Vec<Option<String>> {
         self.query.sequence_dependencies()
     }

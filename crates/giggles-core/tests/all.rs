@@ -403,3 +403,6 @@ mod typed_aggregate_read;
 
 #[path = "typed_join_read.rs"]
 mod typed_join_read;
+
+#[path = "authorization_reads.rs"]
+mod authorization_reads;
