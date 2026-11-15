@@ -384,3 +384,10 @@ fn create_inner(
 #[cfg(test)]
 #[path = "meta_tests.rs"]
 mod meta_tests;
+
+/// Write and sync the v2 marker for an already-created checkpoint.
+pub(crate) fn write_marker(dir: &Path) -> Result<(), FormatError> {
+    let mut file = fs::File::create(dir.join(MARKER)).map_err(corrupt)?;
+    file.write_all(V2).map_err(corrupt)?;
+    file.sync_all().map_err(corrupt)
+}

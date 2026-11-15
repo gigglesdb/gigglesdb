@@ -10,6 +10,8 @@ mod legacy_open;
 pub(crate) mod native_once;
 pub(crate) mod operation_adapter;
 pub mod replica;
+#[cfg(feature = "engine-rocksdb")]
+pub mod replicated;
 pub mod roles;
 mod secondary_index;
 mod secondary_index_catalog;
@@ -1097,7 +1099,6 @@ impl Admin {
         })
     }
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code)] // Entry point for replicated backends.
     pub(crate) fn attach_v2_backend(
         backend: Arc<dyn engine::kv::KvBackend>,
         limits: Limits,

@@ -8,6 +8,8 @@ mod policy;
 mod scalar;
 mod storage;
 pub use storage::replica;
+#[cfg(feature = "engine-rocksdb")]
+pub use storage::replicated;
 pub use storage::roles;
 pub use storage::{
     Admin, CoreError, CrashPoint, DecisionPoint, Engine, Executor, IndexInfo, Limits, ReclaimStats,

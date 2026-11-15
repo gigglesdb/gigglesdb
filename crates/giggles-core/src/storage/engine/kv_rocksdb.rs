@@ -96,7 +96,6 @@ impl RocksKv {
     }
 
     /// Capture an atomic, reopenable view of every column family.
-    #[allow(dead_code)] // Replication snapshot caller is added in a later item.
     pub(crate) fn checkpoint(&self, target: &Path) -> Result<Vec<(String, u64)>, KvError> {
         let io_error = |error: std::io::Error| KvError::Io(error.to_string());
         match std::fs::symlink_metadata(target) {

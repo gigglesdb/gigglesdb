@@ -75,7 +75,6 @@ impl V2Db {
         Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false)
     }
     #[cfg(feature = "engine-rocksdb")]
-    #[allow(dead_code)] // Entry point for replicated backends.
     pub(crate) fn from_backend(
         backend: Arc<dyn engine::kv::KvBackend>,
         write_set_bytes: usize,
