@@ -147,6 +147,7 @@ pub(crate) struct CommitRequest {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum RawOp {
+    XactCommitted { xid: u64 },
     DeleteCounter { key: Vec<u8> },
     PutCounter { key: Vec<u8>, value: Vec<u8> },
 }
@@ -351,6 +352,7 @@ fn request_bytes(request: &CommitRequest) -> usize {
             .raw
             .iter()
             .map(|op| match op {
+                RawOp::XactCommitted { .. } => 17,
                 RawOp::DeleteCounter { key } => key.len(),
                 RawOp::PutCounter { key, value } => key.len() + value.len(),
             })
@@ -563,6 +565,7 @@ fn process_group(
                     .map_or(true, |required| required & !next_features != 0)
             })
             || request.raw.iter().any(|op| match op {
+                RawOp::XactCommitted { .. } => false,
                 RawOp::DeleteCounter { key } => !valid_counter_key(key),
                 RawOp::PutCounter { key, value } => {
                     if !valid_counter_key(key) || next_features & 256 == 0 {
@@ -621,6 +624,11 @@ fn process_group(
         }
         for op in &request.raw {
             match op {
+                RawOp::XactCommitted { xid } => batch.put(
+                    Keyspace::Seq,
+                    super::xact::marker_key(*xid),
+                    ts.0.to_be_bytes().to_vec(),
+                ),
                 RawOp::DeleteCounter { key } => batch.delete(Keyspace::Seq, key.clone()),
                 RawOp::PutCounter { key, value } => {
                     batch.put(Keyspace::Seq, key.clone(), value.clone())

@@ -18,6 +18,7 @@ pub(crate) struct V2Db {
     catalog: engine::catalog::Catalog,
     pub(crate) rows: engine::rows::RowStore,
     pub(crate) sequences: Arc<engine::seq::SequenceAllocator>,
+    pub(crate) xacts: engine::xact::XactIds,
     pub(crate) sql_counters:
         std::sync::Mutex<std::collections::BTreeMap<u64, super::sequences::SeqCounter>>,
     reclaim: std::sync::Mutex<reclaim::Registry>,
@@ -117,6 +118,7 @@ impl V2Db {
             ..Default::default()
         }));
         let sequences = Arc::new(engine::seq::SequenceAllocator::new(kv.clone(), 0));
+        let xacts = engine::xact::XactIds::new(kv.clone(), sequences.clone());
         let catalog =
             engine::catalog::Catalog::open(sequencer.clone(), locks.clone(), sequences.clone())?;
         let db = Self {
@@ -127,6 +129,7 @@ impl V2Db {
             catalog,
             rows: engine::rows::RowStore::new(sequences.clone()),
             sequences,
+            xacts,
             sql_counters: Default::default(),
             reclaim: Default::default(),
             reclaim_errors: AtomicU64::new(0),

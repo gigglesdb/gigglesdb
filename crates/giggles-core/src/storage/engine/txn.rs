@@ -147,6 +147,7 @@ pub(crate) struct Transaction {
     features_or: u64,
     pub(crate) reclaim_after_commit: bool,
     raw: Vec<RawOp>,
+    xact: Option<super::xact::XactGuard>,
     write_bytes: usize,
     savepoint_owner: Arc<()>,
     savepoint_sequence: u64,
@@ -175,6 +176,7 @@ impl Transaction {
             catalog_generation: 0,
             reclaim_after_commit: false,
             raw: Vec::new(),
+            xact: None,
             write_bytes: 0,
             savepoint_owner: Arc::new(()),
             savepoint_sequence: 0,
@@ -189,6 +191,16 @@ impl Transaction {
             txn.begin_statement();
         }
         txn
+    }
+    pub(crate) fn attach_xact(&mut self, guard: super::xact::XactGuard) -> Result<(), TxnError> {
+        if self.xact_id().is_some_and(|id| id != guard.id()) {
+            return Err(TxnError::Misuse);
+        }
+        self.xact = Some(guard);
+        Ok(())
+    }
+    pub(crate) fn xact_id(&self) -> Option<u64> {
+        self.xact.as_ref().map(super::xact::XactGuard::id)
     }
     pub(crate) fn lifetime(&self) -> std::sync::Weak<()> {
         Arc::downgrade(&self.savepoint_owner)
@@ -575,6 +587,9 @@ impl Transaction {
         mut self,
         publish: F,
     ) -> Result<Ts, TxnError> {
+        if let Some(xid) = self.xact_id() {
+            self.raw.push(RawOp::XactCommitted { xid });
+        }
         if self.writes.is_empty()
             && self.raw.is_empty()
             && self.features_or == 0

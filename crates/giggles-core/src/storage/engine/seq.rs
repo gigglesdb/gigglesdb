@@ -65,6 +65,19 @@ impl SequenceAllocator {
         Ok(value)
     }
 
+    /// Returns the next value without reserving or consuming it.
+    pub(crate) fn peek(&self, kind: u8, id: u64) -> Result<u64, TxnError> {
+        let key = sequence_key(kind, id);
+        let slot = self.slot(key)?;
+        let block = slot.lock().map_err(|_| TxnError::Misuse)?;
+        self.check_live()?;
+        if block.cur < block.end {
+            Ok(block.cur)
+        } else {
+            self.highwater(&key)
+        }
+    }
+
     /// Reserves `n` contiguous values from a durable cached block when possible.
     /// Otherwise abandon its remainder and synchronously reserve a new chunk.
     /// next() and ranges consume the same cursor under the same sequence lock.
