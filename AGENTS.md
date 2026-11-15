@@ -197,9 +197,12 @@ test run time, dominates, so verification is split into lanes and each
 expensive pass runs once.
 
 Worker lanes. SOL workers do not run the landing gate.
-- While iterating: `cargo check` and the focused tests
-  (`cargo test --test all <file>::`).
-- Once, before reporting: `cargo test --no-fail-fast` and
+- On every change: `cargo check` and only the tests for the code they
+  changed (`cargo test --test all <file>::` or `cargo test --lib <module>::`).
+  Never a crate's full suite or clippy per change or per sub-task (user,
+  2026-11-15).
+- Once, as a sanity check when the whole feature is done (the coordinator
+  marks that brief FINAL): `cargo test --no-fail-fast` and
   `cargo clippy --all-targets -- -D warnings`, default features only, in each
   crate whose `src/` or `tests/` they changed. Add the `--no-default-features`
   pair only when the change touches `cfg(feature = ...)` code.
@@ -265,6 +268,13 @@ and per machine hour). The rules below cap what anyone starts.
   `J:/gigglesdb-work/boat/usage.log` (UTC time, coordinator, box id, type,
   stack tip, and later the result and minutes). Check the day's count before
   starting. If the limit is reached, gate locally and tell the user.
+- Use `scripts/gate-remote.sh`, which enforces these rules (cap, slot, TTL,
+  bundle, expected Linux failures, delete, log). For example:
+  `scripts/gate-remote.sh --tip <stack tip> --who <track> -- giggles-core
+  giggles-core:nodef giggles-language`. Exit 3 (cap reached) or 4 (no slot)
+  means run the gate locally. Tests that fail on Linux by design are listed,
+  with reasons, in `scripts/gate-linux-expected-failures.txt`; any other
+  failure fails the gate.
 - Every box starts from the saved snapshot `gigglesdb-gate-base` with
   `--no-env` and a `--ttl` of 2 hours at most. Never use `--no-auto-stop` or
   `--count`.
