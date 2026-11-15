@@ -29,7 +29,7 @@ repo=K:/Projects/gigglesdb
 boatdir=J:/gigglesdb-work/boat
 B=${BOAT:-$HOME/.ascii/bin/boat.exe}
 snapshot=gigglesdb-gate-base
-max_starts=15
+max_starts=200   # plan-included starts per day; above this is overage
 tip='' who='' type=large ttl=7200 slot_wait=1800 clippy=1
 steps=()
 while [ $# -gt 0 ]; do

@@ -201,10 +201,14 @@ Worker lanes. SOL workers do not run the landing gate.
   changed (`cargo test --test all <file>::` or `cargo test --lib <module>::`).
   Never a crate's full suite or clippy per change or per sub-task (user,
   2026-11-15).
-- Workers never run a crate's full suite or clippy locally, not even at the
-  end of a feature. The full run is the coordinator's remote landing gate
-  once the whole feature is done (user, 2026-11-15: local machine time is for
+- Workers never run a crate's full test suite locally, not even at the end
+  of a feature. The full run is the coordinator's remote landing gate once
+  the whole feature is done (user, 2026-11-15: local machine time is for
   scoped runs; a 20-minute remote gate at the end is fine).
+- On the FINAL brief, workers run
+  `cargo clippy --all-targets -- -D warnings` once, on each crate they
+  changed. Clippy doesn't link, so it is cheap, and it keeps lint failures out
+  of the remote gate.
 - Workers report totals and failing test names, not logs.
 - Workers reuse a fixed lane (one stable worktree plus one stable
   CARGO_TARGET_DIR per lane, reset between tasks), never a fresh per-task
@@ -265,7 +269,7 @@ and per machine hour). The rules below cap what anyone starts.
   Take a slot with an atomic
   `mkdir J:/gigglesdb-work/boat/slots/slot-<1|2>`, release it after
   `boat delete`, and write the box id into the slot's `owner` file.
-- At most 15 box starts per day, all agents together. Append one line per start to
+- At most 200 box starts per day (the plan's included starts), all agents together. Append one line per start to
   `J:/gigglesdb-work/boat/usage.log` (UTC time, coordinator, box id, type,
   stack tip, and later the result and minutes). Check the day's count before
   starting. If the limit is reached, gate locally and tell the user.
