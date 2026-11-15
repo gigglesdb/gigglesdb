@@ -484,7 +484,10 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Only this fixture's named objects. Errors are loud, never broad cleanup.
-        let trigger = ddl::TriggerSql::new(&self.id, 160000).unwrap();
+        let version = self.destination.sql("SHOW server_version_num")[0][0]
+            .parse()
+            .unwrap();
+        let trigger = ddl::TriggerSql::new(&self.id, version).unwrap();
         let dest = format!(
             "{} SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name='{}'; DROP PUBLICATION IF EXISTS {}; DROP SCHEMA IF EXISTS {} CASCADE; DROP ROLE IF EXISTS {}_app;",
             trigger.remove,

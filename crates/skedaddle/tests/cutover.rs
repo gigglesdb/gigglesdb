@@ -286,17 +286,26 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Only this fixture's objects; the databases and other owners survive.
         if self.reverse_owner.is_some() {
+            let destination_version = self.target.connection.sql("SHOW server_version_num")[0][0]
+                .parse()
+                .unwrap();
             let config = skedaddle::pg::reverse::Config::new(
                 &self.installation,
-                160000,
+                destination_version,
                 vec![(self.schema.clone(), "items".into())],
             )
             .unwrap();
-            let trigger = skedaddle::pg::ddl::TriggerSql::new(&self.installation, 160000).unwrap();
+            let trigger =
+                skedaddle::pg::ddl::TriggerSql::new(&self.installation, destination_version)
+                    .unwrap();
             self.target.connection.sql(&format!("{} SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name={}; DROP PUBLICATION IF EXISTS {};", trigger.remove, lit(&config.slot()), config.publication()));
             self.source.connection.sql(&format!("SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin WHERE roname={}", lit(&config.origin())));
         }
-        let trigger = skedaddle::pg::ddl::TriggerSql::new(&self.installation, 160000).unwrap();
+        let source_version = self.source.connection.sql("SHOW server_version_num")[0][0]
+            .parse()
+            .unwrap();
+        let trigger =
+            skedaddle::pg::ddl::TriggerSql::new(&self.installation, source_version).unwrap();
         self.source.connection.sql(&trigger.remove);
         if let Some(slot) = &self.slot {
             self.source

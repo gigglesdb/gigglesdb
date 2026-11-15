@@ -789,13 +789,17 @@ mod real_pg {
             // Match the runner prerequisite before either endpoint is fenced.
             // The destination identity is also used by reverse setup; finalize's
             // installation inventory owns both hooks and their shared schemas.
+            let source_version = source.sql("SHOW server_version_num")[0][0].parse().unwrap();
+            let destination_version = destination.sql("SHOW server_version_num")[0][0]
+                .parse()
+                .unwrap();
             source.sql(
-                &skedaddle::pg::ddl::TriggerSql::new(&format!("{id}_forward"), 160000)
+                &skedaddle::pg::ddl::TriggerSql::new(&format!("{id}_forward"), source_version)
                     .unwrap()
                     .install,
             );
             destination.sql(
-                &skedaddle::pg::ddl::TriggerSql::new(&id, 160000)
+                &skedaddle::pg::ddl::TriggerSql::new(&id, destination_version)
                     .unwrap()
                     .install,
             );
@@ -822,8 +826,12 @@ mod real_pg {
                     .unwrap();
                 acknowledge_admins(&mut destination_fence);
             }
-            let config =
-                reverse::Config::new(&id, 160000, vec![("public".into(), table.clone())]).unwrap();
+            let config = reverse::Config::new(
+                &id,
+                destination_version,
+                vec![("public".into(), table.clone())],
+            )
+            .unwrap();
             config
                 .setup(
                     &mut destination,
@@ -1427,9 +1435,12 @@ mod real_pg {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut fixture = Fixture::new(&s, &d);
         // Install capture objects on the other endpoint as well.
+        let source_version = fixture.source.sql("SHOW server_version_num")[0][0]
+            .parse()
+            .unwrap();
         let forward = reverse::Config::new(
             &format!("{}_forward", fixture.id),
-            160000,
+            source_version,
             vec![("public".into(), fixture.table.clone())],
         )
         .unwrap();
