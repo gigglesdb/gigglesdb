@@ -310,12 +310,14 @@ fn public_schema_is_accepted_through_every_statement_and_other_schemas_rejected(
             [V::Text("SCALAR".into())]
         );
         error(s, "CREATE TABLE foo.t (id BIGINT PRIMARY KEY)", E::InvalidSchema);
+        // PG18.6: DDL on a missing schema is 3F000 (invalid_schema_name); DML/SELECT stay 42P01
+        // (GD-0001 R2 SQL-FIXES, J:/gigglesdb-work/r2/sql-fixes/w2/matrix.tsv).
+        error(s, "CREATE INDEX bad ON other.t0 (name)", E::InvalidSchema);
         for sql in [
             "INSERT INTO other.t0 VALUES (2,'x')",
             "SELECT * FROM other.t0 LIMIT 1",
             "UPDATE other.t0 SET name='x' WHERE id=1",
             "DELETE FROM other.t0 WHERE id=1",
-            "CREATE INDEX bad ON other.t0 (name)",
             "SELECT other.t0.id FROM t0 LIMIT 1",
             "SELECT * FROM \"Public\".t0 LIMIT 1",
         ] {

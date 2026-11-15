@@ -7,7 +7,7 @@ pub(super) struct Ddl {
     pub names: Vec<String>,
     pub query: Option<query::Query>,
     columns: Vec<String>,
-    optional: bool,
+    pub(super) optional: bool,
     cascade: bool,
     replace: bool,
 }
@@ -127,6 +127,7 @@ impl Prepared {
             }
         }
         let Statement::View(ddl) = &self.statement else { return Ok(()); };
+        self.validate_schemas(state)?;
         if let Some(query) = &ddl.query {
             let name = &ddl.names[0];
             let existing = state.view_names.get(name).map(|v| v.0);

@@ -425,3 +425,5 @@ mod native_alter_table;
 mod native_views;
 
 #[path = "qualified_dml_targets.rs"] mod qualified_dml_targets;
+
+#[path = "missing_schema_ddl.rs"] mod missing_schema_ddl;

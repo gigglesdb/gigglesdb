@@ -44,6 +44,7 @@ impl Prepared {
     }
     pub(crate) fn apply_comment(&self, state: &Relational, parts: &mut crate::storage::CatalogParts) -> R<()> {
         let Statement::Comment(comment) = &self.statement else { return Ok(()); };
+        self.validate_schemas(state)?;
         let (id, columns) = if let Some(table) = parts.tables.get(&comment.table) {
             if comment.view { return Err(SqlError::WrongObjectType); }
             (table.id, table.logical_columns().map(|c| (c.id, c.name.as_str())).collect::<Vec<_>>())

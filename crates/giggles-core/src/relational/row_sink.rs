@@ -257,6 +257,7 @@ impl Relational {
     ) -> Result<SqlResult, CoreError> {
         let bound = prepared.bind_schemas(self).map_err(CoreError::Sql)?;
         let prepared = &bound;
+        prepared.validate_schemas(self).map_err(CoreError::Sql)?;
         if let Statement::Truncate { restart, .. } = &prepared.statement {
             if !params.is_empty() || expected.is_some() {
                 return Err(CoreError::Sql(SqlError::Parameters));

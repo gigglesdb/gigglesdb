@@ -2045,6 +2045,10 @@ impl SqlSession {
         }
     }
 
+    pub(crate) fn require_ddl_schema_engine(&self, name: &str) -> Result<(), CoreError> {
+        self.inspect_metadata(|s| s.sql.require_relation_schema(name).map_err(CoreError::Sql))
+    }
+
     pub fn resolve_relation_reference(&self, name: &str) -> Result<String, CoreError> {
         let resolve = |s: &MetadataState<'_>| Ok(s.sql.resolve_relation_key(name, &self.search_path));
         match &self.staged {

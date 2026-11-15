@@ -155,8 +155,8 @@ fn qualified_native_views_match_sql() {
             for (request, statement) in [(create("nope.v", "t"), "CREATE VIEW nope.v AS SELECT id FROM t"),
                 (drop_view("nope.v", false), "DROP VIEW nope.v")] {
                 let error = ss.execute(statement, &[], None).unwrap_err();
-                // PG18.6 gives 3F000 for both; GigglesDB SQL DROP VIEW gives 42P01 (known SQL gap), and native follows SQL.
-                assert_eq!(giggles_core::sqlstate(&error), if statement.starts_with("DROP") { "42P01" } else { "3F000" });
+                // PG18.6: CREATE and DROP VIEW both reject a missing schema with 3F000.
+                assert_eq!(giggles_core::sqlstate(&error), "3F000");
                 assert_eq!(engine.execute_catalog(&request), Err(state(giggles_core::sqlstate(&error))));
                 assert_eq!(format!("{:?}", native.catalog_presentation().unwrap()), before);
             }

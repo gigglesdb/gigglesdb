@@ -72,6 +72,15 @@ pub(super) fn parse(p: &mut Parser) -> R<Ddl> {
     })
 }
 impl Relational {
+    // Explicit DDL schemas use 3F000; unresolved search-path sentinels are not schemas.
+    pub(crate) fn require_relation_schema(&self, name: &str) -> R<()> {
+        if let Some((schema, _)) = name.split_once('\0')
+            && !schema.is_empty() && schema != "public" && !self.ext.schemas.contains_key(schema)
+        {
+            return Err(SqlError::InvalidSchema);
+        }
+        Ok(())
+    }
     pub(crate) fn table_schema(&self, id: u64) -> &str {
         self.ext
             .table_schemas
@@ -247,16 +256,30 @@ impl Prepared {
         self.schema_user = user;
     }
     pub(crate) fn validate_schemas(&self, state: &Relational) -> R<()> {
+        // Typed index operations can carry their target without parser references.
+        if let Statement::DropIndex(index) = &self.statement && !index.optional {
+            state.require_relation_schema(&index.name)?;
+        }
         for r in &self.relations {
             if r.create {
                 self.creation_schema(state)?;
                 continue;
             }
-            if r.schema
-                .as_deref()
-                .is_some_and(|schema| schema != "public" && !state.ext.schemas.contains_key(schema))
-            {
-                return Err(SqlError::UnknownTable);
+            let key = r.schema.as_ref().map_or_else(|| r.name.clone(), |s| relation_key(s, &r.name));
+            if state.require_relation_schema(&key).is_err() {
+                // A view's SELECT still resolves relations with DML semantics.
+                let error = match &self.statement {
+                    Statement::DropTable { optional: true, .. } => continue,
+                    Statement::DropIndex(index) if index.optional => continue,
+                    Statement::View(ddl) if ddl.query.is_none() && ddl.optional => continue,
+                    Statement::View(ddl) if ddl.query.is_some() => SqlError::UnknownTable,
+                    Statement::Create { .. } | Statement::AlterTable(_)
+                    | Statement::CreateIndex(_) | Statement::DropIndex(_)
+                    | Statement::DropTable { .. } | Statement::Truncate { .. }
+                    | Statement::Comment(_) | Statement::View(_) => SqlError::InvalidSchema,
+                    _ => SqlError::UnknownTable,
+                };
+                return Err(error);
             }
         }
         Ok(())

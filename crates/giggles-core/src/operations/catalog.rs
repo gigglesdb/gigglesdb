@@ -326,6 +326,7 @@ fn bind_catalog(
         });
     }
     if let CatalogRequest::CreateIndex { table, columns, .. } = request {
+        session.require_ddl_schema_engine(&native_relation_key(table)).map_err(core)?;
         let table = session.native_table_engine(&native_relation_key(table)).map_err(core)?;
         if table.hidden_rowid().is_some() {
             return Err(Error::Unsupported);

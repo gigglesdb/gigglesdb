@@ -214,8 +214,8 @@ fn qualified_constraints_match_sql_and_resolve_targets() {
             (missing_parent, "ALTER TABLE app.k ADD CONSTRAINT bad FOREIGN KEY(pid) REFERENCES nope.t(id)")] {
             let before = format!("{:?}", native.catalog_presentation().unwrap());
             let expected = state(sql.sql_session().execute(text, &[], None).unwrap_err());
-            // Known SQL gap: PG18.6 gives 3F000 for a missing schema here; native follows SQL.
-            assert_eq!(expected, "42P01");
+            // PG18.6: missing explicit DDL schemas give 3F000.
+            assert_eq!(expected, "3F000");
             assert_eq!(engine.execute_catalog(&request).unwrap_err().sqlstate(), Some(expected.as_str()));
             assert_eq!(format!("{:?}", native.catalog_presentation().unwrap()), before);
         }

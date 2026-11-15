@@ -14,6 +14,7 @@ impl Prepared {
         let Statement::Truncate { names, cascade, .. } = &self.statement else {
             return Ok(vec![]);
         };
+        self.validate_schemas(state)?;
         let mut ids = BTreeSet::new();
         for name in names {
             let table = state.tables.get(name).ok_or_else(|| {
