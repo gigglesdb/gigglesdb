@@ -209,6 +209,35 @@ fn dropping_nonowning_role_invalidates_existing_session() {
 }
 
 #[test]
+fn recreating_role_invalidates_old_session_and_allows_new_session() {
+    let f = Fixture::new();
+    let mut reader = f.service.role_session("reader").unwrap();
+    execute(&mut reader, "BEGIN");
+    execute(&mut reader, "ROLLBACK");
+    let original = f.admin.roles().get("reader").unwrap().unwrap();
+    f.admin.roles().drop("reader").unwrap();
+    f.admin
+        .roles()
+        .create(NewRole {
+            name: "reader".into(),
+            login: true,
+            ..NewRole::default()
+        })
+        .unwrap();
+    let recreated = f.admin.roles().get("reader").unwrap().unwrap();
+    assert_ne!(original.oid, recreated.oid);
+    assert_eq!(original.generation, recreated.generation);
+    let result = reader.execute_sql("BEGIN", &[]);
+    assert!(
+        matches!(result, Err(CoreError::Policy(Error::Authentication))),
+        "old session survived role recreation: {result:?}"
+    );
+    let mut fresh = f.service.role_session("reader").unwrap();
+    execute(&mut fresh, "BEGIN");
+    execute(&mut fresh, "ROLLBACK");
+}
+
+#[test]
 fn application_binding_keeps_its_existing_sql_scope() {
     let f = Fixture::new();
     let mut app = f.service.session(APP_FP).unwrap();

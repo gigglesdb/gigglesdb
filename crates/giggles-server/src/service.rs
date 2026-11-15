@@ -287,7 +287,8 @@ impl Service {
             fingerprint: format!("pgrole:{}", role.name),
             role: Role::Database { name: role.name },
             epoch: role.generation,
-            role_fence: None,
+            fingerprint_bound: false,
+            role_fence: Some((role.oid, role.generation)),
             scoped: false,
             connection: None,
             database: None,
@@ -327,6 +328,7 @@ impl Service {
             service: self.clone(),
             role,
             epoch,
+            fingerprint_bound: true,
             role_fence,
             scoped: false,
             connection: None,
@@ -361,7 +363,9 @@ pub struct Session {
     pub(crate) fingerprint: String,
     // Fingerprint binding epoch, or the role generation for trusted pgwire sessions.
     pub(crate) epoch: u64,
-    // Certificate-bound Database role OID and generation, independent of the binding epoch.
+    // Trusted pgwire sessions pin role identity without a certificate binding.
+    fingerprint_bound: bool,
+    // Database role OID and generation, independent of any fingerprint binding epoch.
     pub(crate) role_fence: Option<(u32, u64)>,
     scoped: bool,
     pub(crate) connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -455,7 +459,7 @@ impl Session {
                 .map(|_| ())
                 .ok_or(CoreError::Policy(Error::Authentication))?;
             // Trusted pgwire sessions have no fingerprint binding to fence.
-            if self.role_fence.is_none() {
+            if !self.fingerprint_bound {
                 return Ok(());
             }
         }
@@ -1807,7 +1811,7 @@ impl Session {
                 Request::Ping => Ok(Response::code("ok")),
                 // Certificate-bound SQL roles are provisioned for future native
                 // privilege enforcement; this does not expose the SQL interface.
-                Request::Sql { .. } if self.role_fence.is_some() => {
+                Request::Sql { .. } if self.fingerprint_bound && self.role_fence.is_some() => {
                     Err(CoreError::Policy(Error::Scope))
                 }
                 Request::Sql { sql, params } => Ok(Response {
@@ -2412,10 +2416,8 @@ mod lifecycle_tests {
             }
             assert!(matches!(session.check_binding(),
                 Err(CoreError::Policy(Error::Authentication))), "{change}");
-            if change != "recreate" {
-                assert!(matches!(pgwire.check_binding(),
-                    Err(CoreError::Policy(Error::Authentication))), "{change}");
-            }
+            assert!(matches!(pgwire.check_binding(),
+                Err(CoreError::Policy(Error::Authentication))), "{change}");
         }
     }
     #[test]
@@ -2465,6 +2467,8 @@ mod lifecycle_tests {
             name: "bound".into(), login: true, ..roles::NewRole::default()
         }).unwrap();
         assert!(identity.check(&service).is_err());
+        assert!(matches!(pgwire.check_binding(),
+            Err(CoreError::Policy(Error::Authentication))));
     }
     #[test]
     fn drop_index_requires_table_ownership_even_with_schema_create() {
