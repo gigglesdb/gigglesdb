@@ -22,6 +22,43 @@ pub(crate) struct CompleteRelation {
 }
 
 impl SqlSession {
+    /// Stream one statement snapshot without asserting full-table boundedness.
+    pub(crate) fn visit_native_page<E>(
+        &mut self, table: &TableDef,
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
+        map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        let snapshot = self.complete_snapshot(table).map_err(map)?;
+        #[cfg(feature = "engine-rocksdb")]
+        if let super::Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            self.visit_native_page_v2(&db, table, visit, map)?;
+        } else {
+            self.visit_native_page_legacy(table, visit, map)?;
+        }
+        #[cfg(not(feature = "engine-rocksdb"))]
+        self.visit_native_page_legacy(table, visit, map)?;
+        if self.complete_snapshot(table).map_err(map)? != snapshot {
+            return Err(map(CoreError::Sql(SqlError::StaleSchema)));
+        }
+        Ok(())
+    }
+
+    fn visit_native_page_legacy<E>(
+        &self, table: &TableDef, visit: &mut impl FnMut(&SqlRow) -> Result<(), E>,
+        map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        use crate::relational::scan::{Direction, KeyRange, LegacyRows, RowSource};
+        let state = self.staged.as_ref().ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
+        let source = LegacyRows(&state.sql);
+        let range = KeyRange { lo: std::ops::Bound::Unbounded, hi: std::ops::Bound::Unbounded };
+        for row in source.scan(table, &range, Direction::Forward).map_err(|e| map(CoreError::Sql(e)))? {
+            crate::cancellation::check().map_err(map)?;
+            visit(&row.map_err(|e| map(CoreError::Sql(e)))?.row)?;
+        }
+        Ok(())
+    }
+
     fn complete_snapshot(&mut self, table: &TableDef) -> Result<Snapshot, CoreError> {
         if self.aborted {
             return Err(CoreError::Sql(SqlError::Aborted));

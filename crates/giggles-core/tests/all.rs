@@ -1,5 +1,7 @@
 // Each file keeps its own `mod common;`, exactly as when it was its own binary.
 #![allow(clippy::duplicate_mod)]
+#[path = "native_paging.rs"]
+mod native_paging;
 #[path = "typed_leaf_read.rs"]
 mod typed_leaf_read;
 #[path = "view_select.rs"]

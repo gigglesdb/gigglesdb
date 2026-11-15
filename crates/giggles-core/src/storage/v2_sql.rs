@@ -26,6 +26,24 @@ thread_local! {
 }
 
 impl SqlSession {
+    #[cfg(feature = "engine-rocksdb")]
+    pub(super) fn visit_native_page_v2<E>(
+        &mut self, db: &Arc<v2::V2Db>, table: &TableDef,
+        visit: &mut impl FnMut(&SqlRow) -> Result<(), E>, map: fn(CoreError) -> E,
+    ) -> Result<(), E> {
+        let _ticket = self.admin.inner.enter_sql().map_err(map)?;
+        let txn = self.v2_transaction.as_mut()
+            .ok_or_else(|| map(CoreError::Sql(SqlError::Transaction)))?;
+        let entry = TableEntry { def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
+        for pair in db.rows.scan(txn, &entry, Bound::Unbounded, Bound::Unbounded,
+            engine::kv::Direction::Forward, None).map_err(map)? {
+            crate::cancellation::check().map_err(map)?;
+            let (_, row) = pair.map_err(map)?;
+            visit(&SqlRow { values: row.values, version: row.version })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn insert_sequence_callback(
         &self,
         db: &Arc<v2::V2Db>,

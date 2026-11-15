@@ -400,6 +400,13 @@ impl Default for Outcome {
     }
 }
 
+/// One bounded native read, with an exclusive ORDER BY continuation key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page {
+    pub outcome: Outcome,
+    pub next: Option<Vec<Value>>,
+}
+
 /// Stable metadata for an immutable, value-bound operation. This is not authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundDescription {
@@ -451,6 +458,10 @@ fn core(e: CoreError) -> Error {
 impl Engine {
     pub fn new(admin: Admin) -> Self {
         Self { admin }
+    }
+    /// Read a page using an explicit total order ending in the full primary key.
+    pub fn read_page(&self, request: &Request, after: Option<&[Value]>, bindings: &Bindings) -> Result<Page> {
+        self.admin.sql_session().read_page(request, after, bindings)
     }
     /// Bind and execute one bounded request in its own transaction.
     pub fn execute(&self, request: &Request, bindings: &Bindings) -> Result<Outcome> {
@@ -544,6 +555,107 @@ impl Engine {
                 })
             }
         }
+    }
+}
+impl SqlSession {
+    /// Read within the current transaction, or a temporary read-only snapshot.
+    /// `limit` is the page size (default 100); a zero size has no continuation.
+    /// `matched` counts eligible rows after the key; `complete` means no more rows.
+    pub fn read_page(&mut self, request: &Request, after: Option<&[Value]>, bindings: &Bindings) -> Result<Page> {
+        if self.is_aborted() { return Err(core(CoreError::Sql(SqlError::Aborted))); }
+        let owned = !self.in_transaction();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_request(request)?;
+            validate_bindings(bindings)?;
+            if !matches!(request, Request::Read { .. }) { return Err(Error::Unsupported); }
+            if owned { self.begin_engine().map_err(core)?; }
+            self.begin_native_step().map_err(core)?;
+            read_page(self, request, after, bindings)
+        }));
+        if owned { self.rollback(); }
+        match result {
+            Ok(result) => {
+                if result.is_err() && !owned { self.abort(); }
+                result
+            }
+            Err(panic) => {
+                if !owned { self.abort(); }
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+}
+
+fn read_page(session: &mut SqlSession, request: &Request, after: Option<&[Value]>, bindings: &Bindings) -> Result<Page> {
+    let (table, operation) = bind_request(session, request, bindings)?;
+    let Request::Read { order: requested, .. } = request else { return Err(Error::Unsupported); };
+    let Operation::Read { filter, order, limit, projection } = operation else { return Err(Error::Unsupported); };
+    if requested.len() < table.primary_key.len()
+        || !requested[requested.len() - table.primary_key.len()..].iter()
+            .zip(&table.primary_key).all(|(sort, index)| sort.field == table.columns[*index].name)
+    {
+        return Err(Error::Bind("paging order must end in the full primary key".into()));
+    }
+    if let Some(key) = after {
+        if key.len() != order.len() { return Err(Error::Bind("paging key length".into())); }
+        let mut remaining = MAX_BOUND_VALUE_BYTES;
+        for (value, (index, _)) in key.iter().zip(&order) {
+            check(value, &table.columns[*index])?;
+            charge_value(&mut remaining, value)?;
+        }
+    }
+    let cmp_key = |row: &SqlRow, key: &[Value]| {
+        order.iter().zip(key).map(|((index, desc), value)| {
+            let cmp = page_compare(&row.values[*index], value);
+            if *desc { cmp.reverse() } else { cmp }
+        }).find(|cmp| *cmp != Ordering::Equal).unwrap_or(Ordering::Equal)
+    };
+    let key = |row: &SqlRow| order.iter().map(|(i, _)| row.values[*i].clone()).collect::<Vec<_>>();
+    let mut rows: Vec<SqlRow> = Vec::new();
+    let mut matched = 0;
+    let mut retained = 0;
+    session.visit_native_page(&table, &mut |row| {
+        if after.is_some_and(|after| cmp_key(row, after) != Ordering::Greater)
+            || !filter.accepts(row)? { return Ok(()); }
+        matched += 1;
+        if limit == 0 { return Ok(()); }
+        let position = rows.binary_search_by(|other| order.iter().map(|(index, desc)| {
+            let cmp = page_compare(&other.values[*index], &row.values[*index]);
+            if *desc { cmp.reverse() } else { cmp }
+        }).find(|cmp| *cmp != Ordering::Equal).unwrap_or(Ordering::Equal)).unwrap_err();
+        if position >= limit { return Ok(()); }
+        if rows.len() == limit {
+            retained -= rows.pop().unwrap().values.iter().map(value_bytes).sum::<usize>();
+        }
+        let bytes = row.values.iter().map(value_bytes).sum::<usize>();
+        retained += bytes;
+        if retained > crate::relational::scan::MAX_RETAINED_BYTES { return Err(Error::Limit); }
+        rows.insert(position, row.clone());
+        Ok(())
+    }, core)?;
+    crate::cancellation::check().map_err(core)?;
+    let complete = matched <= limit;
+    let next = if complete { None } else { rows.last().map(key) };
+    let mut remaining = crate::relational::MAX_RESULT_BYTES;
+    for row in &rows {
+        for index in &projection { charge_value(&mut remaining, &row.values[*index])?; }
+    }
+    Ok(Page { next, outcome: Outcome {
+        columns: projection.iter().map(|i| table.columns[*i].name.clone()).collect(),
+        rows: rows.into_iter().map(|row| SqlRow { version: row.version,
+            values: projection.iter().map(|i| row.values[*i].clone()).collect() }).collect(),
+        matched, complete, ..Outcome::default()
+    } })
+}
+fn page_compare(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::TimeTz(a), Value::TimeTz(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
+        (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+        _ => compare(a, b),
     }
 }
 fn validate_request(request: &Request) -> Result<()> {
