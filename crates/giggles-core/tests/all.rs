@@ -408,3 +408,5 @@ mod typed_join_read;
 mod authorization_reads;
 #[path = "native_schema_resolution.rs"]
 mod native_schema_resolution;
+#[path = "native_typed_params.rs"]
+mod native_typed_params;

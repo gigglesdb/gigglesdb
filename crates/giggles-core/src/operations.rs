@@ -1711,6 +1711,12 @@ fn compare(a: &Value, b: &Value) -> Ordering {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::TimeTz(a), Value::TimeTz(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
+        (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
         _ => unreachable!("bound comparable types"),
     }
 }
@@ -1731,6 +1737,47 @@ fn arithmetic_error(error: crate::scalar::IntegerError) -> Error {
     }
 }
 impl Bound {
+    fn coerce_equality(&mut self, context: &impl Context, table: &TableDef) -> Result<()> {
+        match self {
+            Self::Compare(left, Compare::Eq, right) => {
+                let pair = match (left.as_mut(), right.as_mut()) {
+                    (Self::Field(index), Self::Value(value))
+                    | (Self::Value(value), Self::Field(index)) => Some((*index, value)),
+                    _ => None,
+                };
+                if let Some((index, value)) = pair
+                    && matches!(table.columns[index].data_type, DataType::Uuid | DataType::Jsonb)
+                {
+                    // Logical text types require the same canonical form as SQL.
+                    // Temporal comparison operands retain their original precision.
+                    *value = context.coerce_column(&table.columns[index], value.clone())?;
+                }
+                left.coerce_equality(context, table)?;
+                right.coerce_equality(context, table)?;
+            }
+            Self::Compare(left, _, right) | Self::Arithmetic(left, _, right)
+            | Self::And(left, right) | Self::Or(left, right) => {
+                left.coerce_equality(context, table)?;
+                right.coerce_equality(context, table)?;
+            }
+            Self::Not(value) | Self::IsNull(value, _) | Self::Negate(value) => {
+                value.coerce_equality(context, table)?;
+            }
+            Self::Call { arguments, .. } => {
+                for value in arguments { value.coerce_equality(context, table)?; }
+            }
+            Self::Case { operand, arms, else_expr } => {
+                if let Some(value) = operand { value.coerce_equality(context, table)?; }
+                for (when, then) in arms {
+                    when.coerce_equality(context, table)?;
+                    then.coerce_equality(context, table)?;
+                }
+                if let Some(value) = else_expr { value.coerce_equality(context, table)?; }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     fn nullable(&self, table: Option<&TableDef>) -> bool {
         match self {
             Self::Value(value) => *value == Value::Null,
@@ -1970,10 +2017,27 @@ fn project_returning<'a>(
 fn run<C: Context>(
     s: &mut C,
     t: &TableDef,
-    op: Operation,
+    mut op: Operation,
     input: C::Input,
     mut retained: Option<&mut usize>,
 ) -> Result<Outcome> {
+    match &mut op {
+        Operation::Read { filter, .. } | Operation::ReadExpressions { filter, .. } => {
+            filter.coerce_equality(s, t)?;
+        }
+        Operation::Mutate { filter, guard, sets, .. } => {
+            filter.coerce_equality(s, t)?;
+            guard.coerce_equality(s, t)?;
+            if let Some(Assignments::Values(values)) = sets {
+                for (index, value) in values {
+                    if matches!(t.columns[*index].data_type, DataType::Uuid | DataType::Jsonb) {
+                        *value = s.coerce_column(&t.columns[*index], value.clone())?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
     op.check_input_cap()?;
     // A presentation page cannot enter cardinality or cap evaluation. The
     // certificate also rejects data captured before a staged write or rollback.
