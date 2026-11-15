@@ -585,7 +585,7 @@ fn residual_superuser_reported_and_detected() {
                             system_id: "fixture".into(),
                             lineage: "fixture".into(),
                             db_name: f.schema.clone(),
-                            slot: slot.clone(),
+                            stream: slot.clone(),
                         },
                         TxnId(commit.to_be_bytes().to_vec()),
                         Position::new(PgOrder.domain(), commit.to_be_bytes()),

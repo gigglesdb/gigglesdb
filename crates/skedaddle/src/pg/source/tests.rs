@@ -79,7 +79,7 @@ async fn setup() -> (Capture<Resolver>, Arc<ObjectBufferStore>, PathBuf) {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     };
     let capture = Capture::new(
         source,
@@ -895,7 +895,7 @@ async fn configuration_requires_the_exact_chunk_prefix() {
                     system_id: "1".into(),
                     lineage: "1".into(),
                     db_name: "db".into(),
-                    slot: "slot".into(),
+                    stream: "slot".into(),
                 },
                 "pg-test".into(),
                 10,
@@ -1201,7 +1201,7 @@ async fn manifest_failure_after_segment_put_never_acknowledges_and_replays() {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     };
     let mut replay = Capture::new(
         source,

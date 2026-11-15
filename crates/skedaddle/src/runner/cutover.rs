@@ -352,6 +352,9 @@ pub(super) struct Observed<C> {
     origin: String,
 }
 impl<C: Capture> Capture for Observed<C> {
+    fn position_order(&self) -> Arc<dyn crate::event::PositionOrder + Send + Sync> {
+        self.capture.position_order()
+    }
     async fn prepare_schema(
         &mut self,
         journal: &coordinator::journal::Journal,
@@ -373,12 +376,10 @@ impl<C: Capture> Capture for Observed<C> {
     async fn step(&mut self) -> coordinator::Result<engine::Captured> {
         let batch = self.capture.step().await?;
         if let Some(txn) = &batch.transaction {
-            let lsn = u64::from_be_bytes(
-                txn.commit_position
-                    .bytes()
-                    .try_into()
-                    .map_err(|_| invalid())?,
-            );
+            let lsn = engine::pg_position_lsn(
+                &txn.commit_position,
+                self.capture.position_order().domain(),
+            )?;
             if application_write(txn, &self.installation, &self.origin) {
                 self.runtime
                     .marker(WRITES, lsn.to_string(), "captured-data-or-ddl".into())
@@ -387,7 +388,8 @@ impl<C: Capture> Capture for Observed<C> {
             }
             self.monitor.captured.fetch_max(lsn, Ordering::SeqCst);
         }
-        if let Some(lsn) = batch.durable_lsn {
+        if let Some(position) = &batch.durable_position {
+            let lsn = engine::pg_position_lsn(position, self.capture.position_order().domain())?;
             self.runtime
                 .marker(
                     "source-capture-durable-v1",
@@ -400,7 +402,7 @@ impl<C: Capture> Capture for Observed<C> {
     }
     async fn publish(
         &mut self,
-        high: u64,
+        high: crate::event::Position,
         rows: AssembledTxn,
     ) -> coordinator::Result<crate::buffer::writer::DurableManifestRef> {
         self.capture.publish(high, rows).await
@@ -1774,7 +1776,7 @@ mod tests {
                 system_id: "1".into(),
                 lineage: "1".into(),
                 db_name: "db".into(),
-                slot: "slot".into(),
+                stream: "slot".into(),
             },
             pause,
             joined,
@@ -1920,7 +1922,7 @@ mod tests {
             system_id: "1".into(),
             lineage: "1".into(),
             db_name: "db".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         };
         let txn = TxnId(
             [

@@ -1,4 +1,4 @@
-//! Engine-neutral events and canonical version 2 binary records.
+//! Engine-neutral events and canonical version 3 binary records.
 //!
 //! Integers and lengths are big-endian (lengths/counts are u32). A record is
 //! `SKEV | version:u16 | kind:u8 | fields | SHA-256(prefix)`. Kinds 1 and 2
@@ -9,7 +9,9 @@
 //! excluded from its own preimage. Decoders reject noncanonical representations.
 //! Version 2 adds grouped TRUNCATE payloads and optional transaction source
 //! origins. Like the buffer's canonical-record writer, readers accept only the
-//! current version: v1 records fail explicitly with UnsupportedVersion(1).
+//! current version: v1 and v2 records fail explicitly with UnsupportedVersion.
+//! Version 3 names the fifth source identity component stream, preserving field
+//! order while changing the header and therefore canonical digests.
 //! TRUNCATE tag 3 is followed by a u32 relation count, length-prefixed table
 //! identities in source order, then cascade and restart_identity boolean bytes.
 //! Transaction origin is an option after commit_time: name string then u64 LSN.
@@ -22,9 +24,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const ENCODING_VERSION: u16 = 2;
+pub const ENCODING_VERSION: u16 = 3;
 pub type ContentDigest = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -33,7 +36,7 @@ pub struct SourceIdentity {
     pub system_id: String,
     pub lineage: String,
     pub db_name: String,
-    pub slot: String,
+    pub stream: String,
 }
 
 /// Connector bytes and their ordering domain. Deliberately has no Ord or
@@ -42,6 +45,57 @@ pub struct SourceIdentity {
 pub struct Position {
     order_domain: String,
     bytes: Vec<u8>,
+}
+
+/// Version 1 JSON representation of an opaque position: domain and lowercase
+/// hex bytes. The enclosing format supplies its version; no version field is
+/// inserted here, preserving existing manifest bytes and digest preimages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PositionWireV1 {
+    order_domain: String,
+    bytes: String,
+}
+
+impl From<&Position> for PositionWireV1 {
+    fn from(position: &Position) -> Self {
+        const DIGITS: &[u8] = b"0123456789abcdef";
+        let mut bytes = String::new();
+        for byte in position.bytes() {
+            bytes.push(DIGITS[(byte >> 4) as usize] as char);
+            bytes.push(DIGITS[(byte & 15) as usize] as char);
+        }
+        Self {
+            order_domain: position.order_domain().into(),
+            bytes,
+        }
+    }
+}
+
+impl TryFrom<PositionWireV1> for Position {
+    type Error = &'static str;
+
+    fn try_from(wire: PositionWireV1) -> Result<Self, Self::Error> {
+        if !wire.bytes.len().is_multiple_of(2) {
+            return Err("hex length");
+        }
+        fn nibble(byte: u8) -> Result<u8, &'static str> {
+            match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err("lowercase hex"),
+            }
+        }
+        let bytes: Result<Vec<_>, Self::Error> = wire
+            .bytes
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| Ok(nibble(pair[0])? * 16 + nibble(pair[1])?))
+            .collect();
+        Ok(Self::new(wire.order_domain, bytes?))
+    }
 }
 
 /// A connector defines both the total order and the domain in which it applies.
@@ -812,7 +866,7 @@ fn put_source(out: &mut impl Write, source: &SourceIdentity) -> Result<(), Event
         &source.system_id,
         &source.lineage,
         &source.db_name,
-        &source.slot,
+        &source.stream,
     ] {
         put_bytes(out, field.as_bytes())?;
     }
@@ -966,7 +1020,7 @@ impl<R: Read> Reader<R> {
             system_id: self.string()?,
             lineage: self.string()?,
             db_name: self.string()?,
-            slot: self.string()?,
+            stream: self.string()?,
         })
     }
 

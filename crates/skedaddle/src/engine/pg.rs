@@ -253,23 +253,69 @@ pub(super) struct DurableFeedbackTransport<'a, T> {
     inner: &'a mut T,
     runtime: Option<&'a Runtime>,
     restored_floor: u64,
+    source: &'a SourceIdentity,
+    domain: &'a str,
 }
 impl<'a, T> DurableFeedbackTransport<'a, T> {
-    pub(super) fn new(inner: &'a mut T, runtime: Option<&'a Runtime>, restored_floor: u64) -> Self {
+    pub(super) fn new(
+        inner: &'a mut T,
+        runtime: Option<&'a Runtime>,
+        restored_floor: u64,
+        source: &'a SourceIdentity,
+        domain: &'a str,
+    ) -> Self {
         Self {
             inner,
             runtime,
             restored_floor,
+            source,
+            domain,
         }
     }
 }
 impl<T: source::Transport> source::Transport for DurableFeedbackTransport<'_, T> {
     async fn next(&mut self, captured: u64) -> source::Result<Vec<u8>> {
         let durable = self.runtime.map_or(Ok(captured), |r| {
-            r.durable_feedback_lsn(captured, self.restored_floor)
+            durable_feedback_lsn(r, captured, self.restored_floor, self.source, self.domain)
         })?;
         self.inner.next(durable).await
     }
+}
+
+// Only the PG adapter interprets opaque END bytes or performs WAL arithmetic.
+// Read the journal-durable snapshot, never the coalesced pending markers.
+pub(super) fn durable_feedback_lsn(
+    runtime: &Runtime,
+    captured: u64,
+    restored_floor: u64,
+    source: &SourceIdentity,
+    domain: &str,
+) -> source::Result<u64> {
+    let state = runtime.1.read().expect("engine snapshot poisoned");
+    let durable = if let Some((_, payload)) = state.progress.get("buffered") {
+        let position = decode_buffered_position(payload, source, domain)
+            .map_err(|e| source::Error::SchemaJournal(e.into()))?;
+        pg_position_lsn(&position, domain).map_err(source::Error::SchemaJournal)?
+    } else if let Some((marker, _)) = state.progress.get("source-slot") {
+        decode_source_checkpoint(marker)
+            .map_err(source::Error::SchemaJournal)?
+            .durable_lsn
+    } else {
+        0
+    };
+    Ok(captured.min(durable.max(restored_floor)))
+}
+
+/// Checked bridge for PG-only observations and native adapter calls.
+pub fn pg_position_lsn(position: &Position, domain: &str) -> Result<u64> {
+    if position.order_domain() != domain {
+        return Err(recovery("PostgreSQL position order domain mismatch"));
+    }
+    let bytes = position
+        .bytes()
+        .try_into()
+        .map_err(|_| recovery("PostgreSQL position must be an eight-byte LSN"))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 pub struct PgCapture<R, T> {
@@ -284,6 +330,8 @@ pub struct PgCapture<R, T> {
     schema_owner: Option<(String, u64, String)>,
     feedback_runtime: Option<Box<Runtime>>,
     feedback_floor: u64,
+    order: Arc<dyn PositionOrder + Send + Sync>,
+    source: SourceIdentity,
 }
 impl<R, T> PgCapture<R, T> {
     pub fn new(
@@ -292,6 +340,8 @@ impl<R, T> PgCapture<R, T> {
         buffer_paused: watch::Receiver<bool>,
         schema_objects: Arc<dyn object_store::ObjectStore>,
         schema_stream: String,
+        order: Arc<dyn PositionOrder + Send + Sync>,
+        source: SourceIdentity,
     ) -> Self {
         Self {
             capture,
@@ -304,6 +354,8 @@ impl<R, T> PgCapture<R, T> {
             schema_owner: None,
             feedback_runtime: None,
             feedback_floor: 0,
+            order,
+            source,
         }
     }
 }
@@ -317,6 +369,9 @@ impl<R, T> PgCapture<R, T> {
     }
 }
 impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> {
+    fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
+        self.order.clone()
+    }
     async fn prepare_schema(&mut self, journal: &Journal, runtime: &Runtime) -> Result<()> {
         let state = runtime.snapshot();
         let owner = (journal.namespace().to_owned(), state.epoch, state.owner);
@@ -358,8 +413,10 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
             .as_ref()
             .ok_or_else(|| recovery("buffered END missing transaction"))?;
         let end = batch
-            .durable_lsn
+            .durable_position
+            .as_ref()
             .ok_or_else(|| recovery("buffered END missing END"))?;
+        let end = pg_position_lsn(end, self.order.domain())?;
         self.capture.buffered_marker(txn, end).map_err(recovery)
     }
     fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
@@ -382,6 +439,8 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
             &mut self.transport,
             self.feedback_runtime.as_deref(),
             self.feedback_floor,
+            &self.source,
+            self.order.domain(),
         );
         let step = self
             .capture
@@ -390,14 +449,19 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
             .map_err(recovery)?;
         let mut captured = std::mem::take(&mut self.sink.0);
         if let source::Step::Durable { end_lsn, stop } = step {
-            captured.durable_lsn = Some(end_lsn);
+            captured.durable_position =
+                Some(Position::new(self.order.domain(), end_lsn.to_be_bytes()));
             captured.stop = stop.is_some();
         }
         Ok(captured)
     }
-    async fn publish(&mut self, high: u64, rows: AssembledTxn) -> Result<DurableManifestRef> {
+    async fn publish(&mut self, high: Position, rows: AssembledTxn) -> Result<DurableManifestRef> {
+        let high_lsn = pg_position_lsn(&high, self.order.domain())?;
+        if rows.commit_position != high {
+            return Err(recovery("chunk rows do not match publication position"));
+        }
         self.capture
-            .append_chunk_rows(high, rows)
+            .append_chunk_rows(high_lsn, rows)
             .await
             .map_err(recovery)
     }
@@ -781,7 +845,7 @@ impl<D: Destination, P: PgTransactionPlanner> Destination for PlanningDestinatio
     }
 }
 
-// ReaderCheckpoint deliberately has no serde contract. This engine-owned v2
+// ReaderCheckpoint deliberately has no serde contract. This engine-owned v3
 // marker keeps its entire predecessor boundary (including equal-H consumption),
 // and BufferReader::new performs the existing semantic validation on recovery.
 #[derive(Serialize, Deserialize)]
@@ -810,7 +874,7 @@ pub fn encode_reader_checkpoint(c: &ReaderCheckpoint) -> Result<String> {
                 r.source.system_id.clone(),
                 r.source.lineage.clone(),
                 r.source.db_name.clone(),
-                r.source.slot.clone(),
+                r.source.stream.clone(),
                 r.chunk_rows,
             )
         }),
@@ -827,20 +891,18 @@ pub fn decode_reader_checkpoint(marker: &str) -> Result<ReaderCheckpoint> {
         prev_digest: m.prev_digest,
         last_epoch: m.last_epoch,
         last_position: m.position.map(|(d, b)| Position::new(d, b)),
-        last_record: m
-            .source
-            .map(|(engine, system_id, lineage, db_name, slot, chunk_rows)| {
-                format::RecordBoundary {
-                    source: SourceIdentity {
-                        engine,
-                        system_id,
-                        lineage,
-                        db_name,
-                        slot,
-                    },
-                    chunk_rows,
-                }
-            }),
+        last_record: m.source.map(
+            |(engine, system_id, lineage, db_name, stream, chunk_rows)| format::RecordBoundary {
+                source: SourceIdentity {
+                    engine,
+                    system_id,
+                    lineage,
+                    db_name,
+                    stream,
+                },
+                chunk_rows,
+            },
+        ),
     })
 }
 

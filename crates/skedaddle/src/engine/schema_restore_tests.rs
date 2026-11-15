@@ -34,7 +34,7 @@ fn source_id() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 type Resolver = fn(&Relation<'_>, &RelationColumn<'_>) -> source::Result<ColumnMapping>;
@@ -299,6 +299,8 @@ impl Fixture {
                 paused,
                 self.objects.clone(),
                 STREAM.into(),
+                Arc::new(Order),
+                source_id(),
             ),
             tx,
             waiting,
@@ -478,15 +480,60 @@ async fn buffered_feedback_never_passes_durable_marker() {
     let engine = fixture.owner().await;
     let runtime = engine.runtime();
     runtime
-        .marker("buffered", "manifest-durable".into(), "100".into())
+        .marker(
+            "buffered",
+            "manifest-durable".into(),
+            encode_buffered_position(&source_id(), &Position::new(DOMAIN, 100u64.to_be_bytes()))
+                .unwrap(),
+        )
         .await
         .unwrap();
     runtime
-        .progress_marker("buffered", "manifest-durable".into(), "200".into())
+        .progress_marker(
+            "buffered",
+            "manifest-durable".into(),
+            encode_buffered_position(&source_id(), &Position::new(DOMAIN, 200u64.to_be_bytes()))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(runtime.durable_feedback_lsn(250, 0).unwrap(), 100);
+    assert_eq!(
+        super::pg::durable_feedback_lsn(&runtime, 250, 0, &source_id(), DOMAIN).unwrap(),
+        100
+    );
     runtime.flush_progress().await.unwrap();
-    assert_eq!(runtime.durable_feedback_lsn(250, 0).unwrap(), 200);
-    assert_eq!(runtime.durable_feedback_lsn(150, 0).unwrap(), 150);
+    assert_eq!(
+        super::pg::durable_feedback_lsn(&runtime, 250, 0, &source_id(), DOMAIN).unwrap(),
+        200
+    );
+    assert_eq!(
+        super::pg::durable_feedback_lsn(&runtime, 150, 0, &source_id(), DOMAIN).unwrap(),
+        150
+    );
+}
+
+#[tokio::test]
+async fn schema_restore_rejects_obsolete_or_wrong_domain_buffered_progress() {
+    let wrong = encode_buffered_position(&source_id(), &Position::new("foreign", [0; 8])).unwrap();
+    for payload in [
+        "123".to_string(),
+        "{}".into(),
+        r#"{"version":2}"#.into(),
+        wrong,
+    ] {
+        let fixture = Fixture::new();
+        let engine = fixture.owner().await;
+        engine
+            .runtime()
+            .marker("buffered", "manifest-durable".into(), payload)
+            .await
+            .unwrap();
+        let (mut capture, _tx, _) = fixture.capture(&engine, WriterCheckpoint::default()).await;
+        assert!(matches!(
+            capture
+                .prepare_schema(&fixture.journal, &engine.runtime())
+                .await,
+            Err(coordinator::Error::RecoveryRequired(_))
+        ));
+    }
 }

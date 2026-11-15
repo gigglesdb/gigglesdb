@@ -141,7 +141,7 @@ async fn chunk_manifest(
             system_id: "source".into(),
             lineage: "lineage".into(),
             db_name: "test".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         },
         TxnId(hash.finalize().to_vec()),
         position.clone(),
@@ -540,6 +540,7 @@ async fn upstream_local_store_and_core_checkpoints_leave_no_scratch() {
     let mut conflict = j.entry(1).await.unwrap();
     conflict.coordinator_instance = "competitor".into();
     conflict.digest = independent_json_hash(serde_json::json!([
+        conflict.version,
         conflict.seq,
         conflict.epoch,
         conflict.prev_digest,
@@ -662,7 +663,7 @@ fn crash_staging_is_identifiable_and_reported_on_restart() {
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, path::Path};
 use skedaddle::coordinator::{
     epoch::*,
-    journal::{Entry, Journal},
+    journal::{Entry, JOURNAL_FORMAT_VERSION, Journal},
     local::Local,
     *,
 };
@@ -1626,6 +1627,11 @@ async fn ownership_observers_and_intents() {
 fn coordinator_errors_name_an_action() {
     for error in [
         Error::RecoveryRequired("gap".into()),
+        Error::UnsupportedFormatVersion {
+            format: "journal-entry",
+            found: None,
+            expected: JOURNAL_FORMAT_VERSION,
+        },
         Error::LostOwnership,
         Error::Observer,
         Error::UnknownOutcome("timeout".into()),
@@ -1640,6 +1646,7 @@ fn coordinator_errors_name_an_action() {
 fn independent_seal(entry: &mut Entry) {
     use sha2::{Digest, Sha256};
     let json = serde_json::json!([
+        entry.version,
         entry.seq,
         entry.epoch,
         entry.prev_digest,
@@ -2718,19 +2725,26 @@ fn independent_json_hash(value: serde_json::Value) -> String {
 }
 fn seal_checkpoint_json(cp: &mut serde_json::Value) {
     let fields = if let Some(archive) = cp.get("local_archive") {
-        serde_json::json!([cp["seq"], cp["journal_digest"], cp["state"], archive])
+        serde_json::json!([
+            cp["version"],
+            cp["seq"],
+            cp["journal_digest"],
+            cp["state"],
+            archive
+        ])
     } else {
-        serde_json::json!([cp["seq"], cp["journal_digest"], cp["state"]])
+        serde_json::json!([cp["version"], cp["seq"], cp["journal_digest"], cp["state"]])
     };
     cp["digest"] = independent_json_hash(fields).into();
 }
 fn checkpoint_index_json(cp: &serde_json::Value, ordinal: u64) -> serde_json::Value {
-    let mut head = serde_json::json!({"ordinal":ordinal,"seq":cp["seq"],"checkpoint_digest":cp["digest"],"journal_digest":cp["journal_digest"]});
+    let mut head = serde_json::json!({"version":JOURNAL_FORMAT_VERSION,"ordinal":ordinal,"seq":cp["seq"],"checkpoint_digest":cp["digest"],"journal_digest":cp["journal_digest"]});
     seal_checkpoint_index_json(&mut head);
     head
 }
 fn seal_checkpoint_index_json(head: &mut serde_json::Value) {
     head["digest"] = independent_json_hash(serde_json::json!([
+        head["version"],
         head["ordinal"],
         head["seq"],
         head["checkpoint_digest"],
@@ -2926,6 +2940,212 @@ async fn put_json(store: &Arc<dyn ObjectStore>, key: &Path, value: &serde_json::
         )
         .await
         .unwrap();
+}
+
+fn assert_unsupported_version(error: Error, format: &str, found: Option<u16>) {
+    assert!(
+        matches!(&error, Error::UnsupportedFormatVersion {
+            format: actual, found: actual_found, expected: JOURNAL_FORMAT_VERSION,
+        } if *actual == format && *actual_found == found),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn journal_versions_are_rejected_before_payload_decode_and_raw_rebuild() {
+    let original = fresh_journal("version-original");
+    let state = history(&original, 1).await;
+    original.checkpoint(&state).await.unwrap();
+    let cp =
+        serde_json::to_value(original.recover(true).await.unwrap().checkpoint.unwrap()).unwrap();
+    let head = checkpoint_index_json(&cp, 1);
+    let entry = serde_json::to_value(&state.audit[&1]).unwrap();
+    for format in [
+        "journal-entry",
+        "journal-checkpoint",
+        "journal-checkpoint-head",
+    ] {
+        for found in [None, Some(1), Some(3)] {
+            for minimal in [false, true] {
+                let store = fs_store(scratch("unsupported-journal-version"));
+                let j = journal(store.clone(), "migration");
+                let mut objects = [entry.clone(), cp.clone(), head.clone()];
+                let index = match format {
+                    "journal-entry" => 0,
+                    "journal-checkpoint" => 1,
+                    _ => 2,
+                };
+                let object = &mut objects[index];
+                if minimal {
+                    *object = serde_json::json!({});
+                }
+                match found {
+                    Some(version) => object["version"] = version.into(),
+                    None => {
+                        object.as_object_mut().unwrap().remove("version");
+                    }
+                }
+                for (key, object) in [
+                    j.entry_key(1),
+                    j.checkpoint_key(1),
+                    j.checkpoint_index_key(1),
+                ]
+                .iter()
+                .zip(&objects)
+                {
+                    put_json(&store, key, object).await;
+                }
+                assert_unsupported_version(j.load(true).await.unwrap_err(), format, found);
+                assert_unsupported_version(j.scrub().await.unwrap_err(), format, found);
+                if index == 0 {
+                    assert_unsupported_version(j.entry(1).await.unwrap_err(), format, found);
+                    // Rebuild deliberately skips derived checkpoints, but must
+                    // reject an old raw entry before copying any of its bytes.
+                    let destination = fresh_journal("unsupported-version-rebuild");
+                    assert_unsupported_version(
+                        j.copy_entries_for_rebuild(&destination).await.unwrap_err(),
+                        format,
+                        found,
+                    );
+                    assert!(destination.entry(1).await.is_err());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn journal_version_is_authenticated_by_each_digest() {
+    let original = fresh_journal("version-digests");
+    let state = history(&original, 1).await;
+    original.checkpoint(&state).await.unwrap();
+    let cp =
+        serde_json::to_value(original.recover(true).await.unwrap().checkpoint.unwrap()).unwrap();
+    let head = checkpoint_index_json(&cp, 1);
+    let entry = serde_json::to_value(&state.audit[&1]).unwrap();
+    for index in 0..3 {
+        let store = fs_store(scratch("tampered-journal-version"));
+        let j = journal(store.clone(), "migration");
+        let mut objects = [entry.clone(), cp.clone(), head.clone()];
+        let object = &mut objects[index];
+        // Seal a different version, then change only the version to the
+        // supported envelope. Version admission passes; integrity must fail.
+        object["version"] = 1.into();
+        match index {
+            0 => {
+                let mut entry: Entry = serde_json::from_value(object.clone()).unwrap();
+                independent_seal(&mut entry);
+                *object = serde_json::to_value(entry).unwrap();
+            }
+            1 => seal_checkpoint_json(object),
+            _ => seal_checkpoint_index_json(object),
+        }
+        object["version"] = JOURNAL_FORMAT_VERSION.into();
+        for (key, object) in [
+            j.entry_key(1),
+            j.checkpoint_key(1),
+            j.checkpoint_index_key(1),
+        ]
+        .iter()
+        .zip(&objects)
+        {
+            put_json(&store, key, object).await;
+        }
+        let error = j.load(true).await.unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired(_)), "{error:?}");
+        assert!(
+            error.to_string().contains(match index {
+                0 => "invalid entry/digest",
+                1 => "checkpoint digest/state mismatch",
+                _ => "checkpoint discovery record is corrupt",
+            }),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffer_version_error_survives_chunk_publication_and_journal_replay() {
+    for format in ["manifest", "segment", "chunk-rows"] {
+        let store = fs_store(scratch("buffer-version-journal"));
+        let (_, config) = chunk_buffer();
+        let root = scratch("obsolete-buffer-object");
+        let buffer: Arc<dyn skedaddle::buffer::backends::BufferStore> = Arc::new(
+            skedaddle::buffer::backends::ObjectBufferStore::local(&root, Duration::from_secs(3))
+                .unwrap(),
+        );
+        let j = journal(store.clone(), "migration").with_chunk_buffer(
+            buffer.clone(),
+            config.clone(),
+            Arc::new(ChunkOrder),
+        );
+        let mut c = coordinator(j.clone(), "buffer-version");
+        c.acquire().await.unwrap();
+        let plan = typed_plan();
+        c.commit(Transition::ChunkPlanned {
+            plan: j.publish_chunk_plan(&plan).await.unwrap(),
+        })
+        .await
+        .unwrap();
+        let chunk = plan.ranges[0].clone();
+        c.commit(Transition::ChunkStarted {
+            chunk: chunk.clone(),
+            attempt: 1,
+        })
+        .await
+        .unwrap();
+        j.checkpoint(c.state()).await.unwrap();
+        let rows = chunk_manifest(
+            buffer.as_ref(),
+            &config,
+            &chunk,
+            1,
+            100,
+            format != "manifest",
+            false,
+        )
+        .await;
+        if format == "manifest" {
+            buffer
+                .put_create_only(&config.manifest_key(rows.mseq), br#"{"version":1}"#)
+                .await
+                .unwrap();
+        } else {
+            let manifest = skedaddle::buffer::format::ManifestEntry::from_canonical_json(
+                &buffer
+                    .get(&config.manifest_key(rows.mseq))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut bytes = buffer.get(&manifest.segment_key).await.unwrap().unwrap();
+            let version_at = if format == "segment" {
+                8
+            } else {
+                bytes.windows(4).position(|part| part == b"SKCR").unwrap() + 4
+            };
+            bytes[version_at..version_at + 2].copy_from_slice(&1_u16.to_be_bytes());
+            std::fs::write(root.join(&manifest.segment_key), bytes).unwrap();
+        }
+        let done = Transition::ChunkDone {
+            chunk,
+            attempt: 1,
+            high_lsn: 100,
+            chunk_rows: rows,
+        };
+        assert_unsupported_version(c.commit(done.clone()).await.unwrap_err(), format, Some(1));
+        let entry = Entry::new(c.state(), done, c.instance_id()).unwrap();
+        put_json(
+            &store,
+            &j.entry_key(entry.seq),
+            &serde_json::to_value(entry).unwrap(),
+        )
+        .await;
+        for checkpoint in [false, true] {
+            assert_unsupported_version(j.load(checkpoint).await.unwrap_err(), format, Some(1));
+        }
+    }
 }
 
 #[tokio::test]
@@ -3308,8 +3528,7 @@ async fn p2_legacy_fixture(
     }
     legacy["audit"] = serde_json::to_value(audit).unwrap();
     assert_eq!(legacy.as_object().unwrap().len(), 10);
-    let mut cp =
-        serde_json::json!({"seq":state.applied_seq,"journal_digest":state.digest,"state":legacy});
+    let mut cp = serde_json::json!({"version":JOURNAL_FORMAT_VERSION,"seq":state.applied_seq,"journal_digest":state.digest,"state":legacy});
     seal_checkpoint_json(&mut cp);
     let digest = cp["digest"].clone();
     seal_checkpoint_json(&mut cp);

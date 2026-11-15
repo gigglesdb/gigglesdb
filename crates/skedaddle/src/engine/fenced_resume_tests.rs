@@ -38,7 +38,7 @@ fn source() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn marker() -> Marker {
@@ -64,7 +64,7 @@ fn transaction() -> AssembledTxn {
 fn batch() -> Captured {
     Captured {
         transaction: Some(transaction()),
-        durable_lsn: Some(21),
+        durable_position: Some(Position::new(Order.domain(), 21u64.to_be_bytes())),
         ..Default::default()
     }
 }
@@ -153,6 +153,9 @@ struct CaptureInput {
     calls: Arc<AtomicUsize>,
 }
 impl Capture for CaptureInput {
+    fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
+        Arc::new(Order)
+    }
     fn writer_checkpoint(&self) -> Result<Option<WriterCheckpoint>> {
         Ok(Some(self.checkpoint.clone()))
     }
@@ -163,7 +166,7 @@ impl Capture for CaptureInput {
             .await
             .unwrap_or_else(|| Err(recovery("injected capture disconnect")))
     }
-    async fn publish(&mut self, _: u64, _: AssembledTxn) -> Result<DurableManifestRef> {
+    async fn publish(&mut self, _: Position, _: AssembledTxn) -> Result<DurableManifestRef> {
         panic!("copy publication while fenced")
     }
 }

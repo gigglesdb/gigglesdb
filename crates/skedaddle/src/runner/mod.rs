@@ -94,7 +94,14 @@ fn config(connection: &Connection, redactor: &mut Redactor) -> Result<tls::Confi
             "Select qualified PostgreSQL source and destination connectors.",
         ));
     }
-    let secret = security::resolve(&connection.connection_ref).map_err(|_| {
+    let reference = connection.connection_ref.as_ref().ok_or_else(|| {
+        failure(
+            FailureKind::InvalidInput,
+            "PostgreSQL connection reference missing",
+            "Set connection_ref to an environment variable or UTF-8 secret file reference and retry.",
+        )
+    })?;
+    let secret = security::resolve(reference).map_err(|_| {
         failure(
             FailureKind::Infrastructure,
             "Connection secret unavailable",

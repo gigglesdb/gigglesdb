@@ -14,8 +14,8 @@ use crate::{
     },
     definition::BufferBackend,
     engine::{
-        self, CopyConfig, PauseControl, PgApplier, PgCapture, PgChunks, PgInstaller, Reached,
-        StopAt,
+        self, Capture as _, CopyConfig, PauseControl, PgApplier, PgCapture, PgChunks, PgInstaller,
+        Reached, StopAt,
     },
     event::{AssembledTxn, EventError, PositionOrder, Row, SourceIdentity},
     mapping::Value,
@@ -502,7 +502,7 @@ pub fn run(
             system_id: checkpoint.lineage.system_id.to_string(),
             lineage: checkpoint.lineage.timeline.to_string(),
             db_name: checkpoint.lineage.database.clone(),
-            slot,
+            stream: slot,
         };
         let scratch = root.join(format!("{id}.scratch"));
         std::fs::create_dir_all(&scratch)?;
@@ -578,7 +578,16 @@ pub fn run(
             .await
             .map_err(recovery)?;
         let (_admission, admitted) = watch::channel(false);
-        let capture = PgCapture::new(capture, transport, admitted, journal_objects, schema_stream);
+        let capture = PgCapture::new(
+            capture,
+            transport,
+            admitted,
+            journal_objects,
+            schema_stream,
+            order.clone(),
+            identity.clone(),
+        );
+        let order = capture.position_order();
         let monitor = super::cutover::Monitor::new(&engine.runtime().state().await)?;
         let capture = monitor.capture(
             capture,
@@ -858,7 +867,7 @@ mod exclusion_tests {
                     system_id: "1".into(),
                     lineage: "1".into(),
                     db_name: "db".into(),
-                    slot: "slot".into(),
+                    stream: "slot".into(),
                 },
                 chunk_rows: false,
             }),

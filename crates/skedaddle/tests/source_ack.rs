@@ -88,7 +88,7 @@ mod crash {
             system_id: "test".into(),
             lineage: "1".into(),
             db_name: "test".into(),
-            slot: "test".into(),
+            stream: "test".into(),
         }
     }
     fn txn(n: u64) -> AssembledTxn {
@@ -373,7 +373,7 @@ mod crash {
             let c = config(&format!("f4/{id}"));
             let (writer, progress) = open(store.clone(), c.clone(), root()).await;
             let resolver = |_: &Relation<'_>, _: &RelationColumn<'_>| -> source::Result<ColumnMapping> { Err(source::Error::RecoveryRequired("watermark fixture has no columns")) };
-            let identity = SourceIdentity { engine: "postgres".into(), system_id: lineage.system_id.to_string(), lineage: lineage.timeline.to_string(), db_name: lineage.database.clone(), slot: slot.clone() };
+            let identity = SourceIdentity { engine: "postgres".into(), system_id: lineage.system_id.to_string(), lineage: lineage.timeline.to_string(), db_name: lineage.database.clone(), stream: slot.clone() };
             let mut capture = Capture::new(identity.clone(), "source-ack".into(), created.consistent_point, writer, resolver, "f4".into(), SchemaVersions::new("f4".into(), 0, [])?, skedaddle::pg::chunk::MESSAGE_PREFIX.into())?;
             admin.query_one("SELECT pg_logical_emit_message(true, $1::text, $2::text)", &[&skedaddle::pg::chunk::MESSAGE_PREFIX, &id]).await?;
             let (_paused_tx, mut paused) = tokio::sync::watch::channel(false);

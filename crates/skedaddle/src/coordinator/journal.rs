@@ -9,6 +9,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub const JOURNAL_FORMAT_VERSION: u16 = 2;
+
+fn validate_version(format: &'static str, found: Option<u16>) -> Result<()> {
+    if found != Some(JOURNAL_FORMAT_VERSION) {
+        return Err(Error::UnsupportedFormatVersion {
+            format,
+            found,
+            expected: JOURNAL_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn hash(value: &impl Serialize) -> Result<String> {
     Ok(format!(
         "{:x}",
@@ -19,6 +32,7 @@ fn hash(value: &impl Serialize) -> Result<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    pub version: u16,
     pub seq: u64,
     pub epoch: u64,
     pub prev_digest: String,
@@ -35,6 +49,7 @@ impl Entry {
             _ => state.epoch,
         };
         let mut entry = Self {
+            version: JOURNAL_FORMAT_VERSION,
             seq: state
                 .applied_seq
                 .checked_add(1)
@@ -56,6 +71,7 @@ impl Entry {
     }
     fn computed_digest(&self) -> Result<String> {
         hash(&(
+            self.version,
             self.seq,
             self.epoch,
             &self.prev_digest,
@@ -65,6 +81,7 @@ impl Entry {
         ))
     }
     pub fn validate(&self) -> Result<()> {
+        validate_version("journal-entry", Some(self.version))?;
         if self.seq == 0
             || self.epoch == 0
             || self.coordinator_instance.is_empty()
@@ -82,6 +99,7 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
+    pub version: u16,
     pub seq: u64,
     pub journal_digest: String,
     pub state: Materialized,
@@ -92,6 +110,7 @@ pub struct Checkpoint {
 impl Checkpoint {
     fn new(state: &Materialized, local_archive: Option<String>) -> Result<Self> {
         let mut cp = Self {
+            version: JOURNAL_FORMAT_VERSION,
             seq: state.applied_seq,
             journal_digest: state.digest.clone(),
             state: state.clone(),
@@ -103,11 +122,18 @@ impl Checkpoint {
     }
     fn computed_digest(&self) -> Result<String> {
         match &self.local_archive {
-            Some(archive) => hash(&(self.seq, &self.journal_digest, &self.state, archive)),
-            None => hash(&(self.seq, &self.journal_digest, &self.state)),
+            Some(archive) => hash(&(
+                self.version,
+                self.seq,
+                &self.journal_digest,
+                &self.state,
+                archive,
+            )),
+            None => hash(&(self.version, self.seq, &self.journal_digest, &self.state)),
         }
     }
     fn validate(&self) -> Result<()> {
+        validate_version("journal-checkpoint", Some(self.version))?;
         if self.seq == 0
             || self.seq != self.state.applied_seq
             || self.journal_digest != self.state.digest
@@ -195,6 +221,7 @@ impl Checkpoint {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointHead {
+    version: u16,
     ordinal: u64,
     seq: u64,
     checkpoint_digest: String,
@@ -204,6 +231,7 @@ struct CheckpointHead {
 impl CheckpointHead {
     fn new(ordinal: u64, cp: &Checkpoint) -> Result<Self> {
         let mut head = Self {
+            version: JOURNAL_FORMAT_VERSION,
             ordinal,
             seq: cp.seq,
             checkpoint_digest: cp.digest.clone(),
@@ -215,6 +243,7 @@ impl CheckpointHead {
     }
     fn computed_digest(&self) -> Result<String> {
         hash(&(
+            self.version,
             self.ordinal,
             self.seq,
             &self.checkpoint_digest,
@@ -222,6 +251,7 @@ impl CheckpointHead {
         ))
     }
     fn validate(&self, ordinal: u64) -> Result<()> {
+        validate_version("journal-checkpoint-head", Some(self.version))?;
         if self.ordinal != ordinal || self.seq == 0 || self.digest != self.computed_digest()? {
             return Err(Error::RecoveryRequired(
                 "checkpoint discovery record is corrupt".into(),
@@ -994,7 +1024,10 @@ impl Journal {
                 }
                 self.apply_entry(&mut state, &entry)
                     .await
-                    .map_err(|e| Error::RecoveryRequired(format!("journal tail at {seq}: {e}")))?;
+                    .map_err(|e| match e {
+                        Error::UnsupportedFormatVersion { .. } => e,
+                        _ => Error::RecoveryRequired(format!("journal tail at {seq}: {e}")),
+                    })?;
             }
             // P11a authority requires its actual producer entries, including
             // after a restart through Local::recover. Never trust injected cache
@@ -1072,7 +1105,10 @@ impl Journal {
             }
             self.apply_entry(&mut state, &entry)
                 .await
-                .map_err(|e| Error::RecoveryRequired(format!("journal replay at {seq}: {e}")))?;
+                .map_err(|e| match e {
+                    Error::UnsupportedFormatVersion { .. } => e,
+                    _ => Error::RecoveryRequired(format!("journal replay at {seq}: {e}")),
+                })?;
             if let Some(key) = checkpoints.remove(seq) {
                 let bytes = self
                     .read(&key)
@@ -1117,7 +1153,26 @@ fn parse_seq(s: &str) -> Result<u64> {
     }
     Ok(seq)
 }
-fn decode<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<T> {
+trait JournalObject: for<'a> Deserialize<'a> {
+    const FORMAT: &'static str;
+}
+impl JournalObject for Entry {
+    const FORMAT: &'static str = "journal-entry";
+}
+impl JournalObject for Checkpoint {
+    const FORMAT: &'static str = "journal-checkpoint";
+}
+impl JournalObject for CheckpointHead {
+    const FORMAT: &'static str = "journal-checkpoint-head";
+}
+fn decode<T: JournalObject>(bytes: &[u8]) -> Result<T> {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        version: Option<u16>,
+    }
+    let probe: VersionProbe = serde_json::from_slice(bytes)
+        .map_err(|e| Error::RecoveryRequired(format!("malformed journal object: {e}")))?;
+    validate_version(T::FORMAT, probe.version)?;
     serde_json::from_slice(bytes)
         .map_err(|e| Error::RecoveryRequired(format!("malformed journal object: {e}")))
 }

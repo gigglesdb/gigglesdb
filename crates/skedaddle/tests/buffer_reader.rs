@@ -45,7 +45,7 @@ fn txn(n: u64) -> AssembledTxn {
             system_id: "s".into(),
             lineage: "l".into(),
             db_name: "d".into(),
-            slot: "s".into(),
+            stream: "s".into(),
         },
         TxnId(n.to_be_bytes().to_vec()),
         pos(n),
@@ -1412,11 +1412,18 @@ async fn reader_equal_h_order(store: Arc<dyn BufferStore>) {
 
 #[test]
 fn reader_rejects_obsolete_or_incomplete_checkpoint_boundaries() {
-    let obsolete = ReaderCheckpoint {
-        version: 1,
-        ..ReaderCheckpoint::default()
-    };
-    assert!(BufferReader::new(local(), config(), obsolete, Arc::new(Order)).is_err());
+    for version in [1, 2] {
+        let obsolete = ReaderCheckpoint {
+            version,
+            ..ReaderCheckpoint::default()
+        };
+        assert!(matches!(
+            BufferReader::new(local(), config(), obsolete, Arc::new(Order)),
+            Err(Error::Format(skedaddle::buffer::format::FormatError::UnsupportedFormatVersion {
+                format: "reader-checkpoint", found: Some(found), expected: 3,
+            })) if found == version
+        ));
+    }
     for with_position in [false, true] {
         let checkpoint = ReaderCheckpoint {
             next_mseq: 1,
@@ -1425,6 +1432,29 @@ fn reader_rejects_obsolete_or_incomplete_checkpoint_boundaries() {
         };
         assert!(BufferReader::new(local(), config(), checkpoint, Arc::new(Order)).is_err());
     }
+}
+
+#[test]
+fn pg_reader_marker_rejects_v2_and_round_trips_v3() {
+    use skedaddle::engine::{decode_reader_checkpoint, encode_reader_checkpoint};
+    // Persisted predecessor marker: retain it as explicit rejection evidence.
+    let v2 = concat!(
+        "{\"version\":2,\"next_mseq\":0,\"prev_digest\":[",
+        "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+        "],\"last_epoch\":0,\"position\":null,\"source\":null}"
+    );
+    assert!(matches!(
+        decode_reader_checkpoint(v2),
+        Err(skedaddle::coordinator::Error::RecoveryRequired(_))
+    ));
+    let checkpoint = ReaderCheckpoint::default();
+    assert_eq!(checkpoint.version, 3);
+    let current = encode_reader_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&current).unwrap()["version"],
+        3
+    );
+    assert_eq!(decode_reader_checkpoint(&current).unwrap(), checkpoint);
 }
 
 // This forwards real emulator traffic. It fabricates no object contents.

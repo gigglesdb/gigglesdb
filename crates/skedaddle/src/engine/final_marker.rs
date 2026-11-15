@@ -131,7 +131,7 @@ fn source_binding(source: &SourceIdentity) -> SourceBinding {
         source.system_id.clone(),
         source.lineage.clone(),
         source.db_name.clone(),
-        source.slot.clone(),
+        source.stream.clone(),
     )
 }
 

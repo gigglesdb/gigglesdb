@@ -77,6 +77,373 @@ fn valid_definition() -> MigrationDefinition {
     parse_value(&example_value()).unwrap()
 }
 
+fn spanner_connection(dialect: &str) -> Value {
+    json!({
+        "engine": "spanner",
+        "spanner": {
+            "project": "unresolved-project", "instance": "instance", "database": "database",
+            "dialect": dialect, "change_stream": "changes",
+            "credentials": "file:/unread/spanner-credentials", "emulator": false
+        }
+    })
+}
+
+fn assert_spanner_blockers(report: &CapabilityReport, side: &str) {
+    assert!(!report.blocking().is_empty());
+    for capability in [
+        "connector_cdc_ordering",
+        "snapshot_consistency",
+        "schema_type_mapping",
+        "fence_cutover_reverse",
+    ] {
+        let id = format!("{side}.spanner.{capability}");
+        let entry = report.items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(entry.status, ItemStatus::Unverified);
+        assert_eq!(entry.criticality, Criticality::Critical);
+        assert!(entry.remediation.contains("not yet built or qualified"));
+        assert!(report.blocking().contains(&entry));
+    }
+    assert!(report.items.iter().all(|item| {
+        item.id != format!("{side}.version")
+            && item.id != format!("{side}.tls_trust")
+            && item.id != "postgresql.preflight"
+            && !(item.id.starts_with("selected_objects[")
+                && item.remediation.contains("PostgreSQL connector"))
+    }));
+    for entry in report
+        .items
+        .iter()
+        .filter(|item| item.id.starts_with(&format!("{side}.")))
+    {
+        assert!(entry.object.is_none());
+        assert_eq!(entry.status, ItemStatus::Unverified);
+        let text = serde_json::to_string(entry).unwrap();
+        assert!(!text.contains("PostgreSQL"));
+        assert!(!text.contains("PEM"));
+    }
+}
+
+#[test]
+fn spanner_capabilities_block_both_dialects_on_either_side_without_pg_claims() {
+    for dialect in ["google-sql", "postgresql"] {
+        for (side, pg_side) in [("source", "destination"), ("destination", "source")] {
+            let mut value = example_value();
+            value[side] = spanner_connection(dialect);
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            assert_spanner_blockers(&report, side);
+            assert_eq!(report.blocking().len(), 4);
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .all(|item| item.status != ItemStatus::Unsupported)
+            );
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .any(|item| item.id == format!("{pg_side}.tls_trust"))
+            );
+
+            // The opposite PostgreSQL endpoint is classified independently.
+            value[pg_side]["version"] = json!("15.8");
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            assert_spanner_blockers(&report, side);
+            assert!(report.blocking().iter().any(|item| {
+                item.id == format!("{pg_side}.version") && item.status == ItemStatus::Unsupported
+            }));
+        }
+    }
+}
+
+#[test]
+fn spanner_emulator_adds_a_critical_unverified_item_without_promoting_results() {
+    for dialect in ["google-sql", "postgresql"] {
+        for side in ["source", "destination"] {
+            let mut value = example_value();
+            value[side] = spanner_connection(dialect);
+            let baseline =
+                CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            value[side]["spanner"]["emulator"] = json!(true);
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            assert_spanner_blockers(&report, side);
+            assert_eq!(report.blocking().len(), 5);
+            assert_eq!(report.items.len(), baseline.items.len() + 1);
+            assert!(
+                baseline
+                    .items
+                    .iter()
+                    .all(|item| report.items.contains(item))
+            );
+            let entry = report
+                .items
+                .iter()
+                .find(|item| item.id == format!("{side}.spanner.emulator"))
+                .unwrap();
+            assert_eq!(entry.status, ItemStatus::Unverified);
+            assert_eq!(entry.criticality, Criticality::Critical);
+            assert!(
+                entry
+                    .remediation
+                    .contains("emulator results stay unverified")
+            );
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .all(|item| item.status != ItemStatus::Unsupported)
+            );
+        }
+    }
+}
+
+#[test]
+fn spanner_and_gigglesdb_are_independently_unverified_and_unsupported() {
+    for dialect in ["google-sql", "postgresql"] {
+        for (side, unsupported_side) in [("source", "destination"), ("destination", "source")] {
+            let mut value = example_value();
+            value[side] = spanner_connection(dialect);
+            value[unsupported_side]["engine"] = json!("gigglesdb");
+            let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+            assert_spanner_blockers(&report, side);
+            assert_eq!(report.blocking().len(), 5);
+            let unsupported: Vec<_> = report
+                .items
+                .iter()
+                .filter(|item| item.status == ItemStatus::Unsupported)
+                .collect();
+            assert_eq!(unsupported.len(), 1);
+            assert_eq!(unsupported[0].id, "connector.unsupported");
+            assert_eq!(unsupported[0].criticality, Criticality::Critical);
+            let evidence = &unsupported[0].evidence[0].description;
+            assert!(evidence.contains(&format!("{unsupported_side}: gigglesdb")));
+            assert!(!evidence.contains("spanner"));
+        }
+    }
+}
+
+#[test]
+fn both_spanner_sides_have_their_own_critical_unverified_blockers() {
+    let mut value = example_value();
+    value["source"] = spanner_connection("google-sql");
+    value["destination"] = spanner_connection("postgresql");
+    let report = CapabilityReport::from_definition(&parse_value(&value).unwrap()).unwrap();
+    for side in ["source", "destination"] {
+        assert_spanner_blockers(&report, side);
+    }
+    assert_eq!(report.blocking().len(), 8);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|item| item.status != ItemStatus::Unsupported)
+    );
+}
+
+#[test]
+fn spanner_dialects_validate_without_pg_connection_version_or_pem_trust() {
+    use skedaddle::definition::{DEFINITION_VERSION, Engine, SpannerDialect};
+    assert_eq!(DEFINITION_VERSION, 1);
+    for (dialect, expected) in [
+        ("google-sql", SpannerDialect::GoogleSql),
+        ("postgresql", SpannerDialect::Postgresql),
+    ] {
+        for side in ["source", "destination"] {
+            let mut value = example_value();
+            value[side] = spanner_connection(dialect);
+            let definition = parse_value(&value).unwrap();
+            let connection = if side == "source" {
+                &definition.source
+            } else {
+                &definition.destination
+            };
+            assert_eq!(connection.engine, Engine::Spanner);
+            assert_eq!(connection.engine.to_string(), "spanner");
+            assert!(connection.connection_ref.is_none());
+            assert!(connection.version.is_empty());
+            assert!(connection.tls_ca_ref.is_none());
+            assert_eq!(connection.tls, TlsPolicy::Required);
+            assert_eq!(connection.spanner.as_ref().unwrap().dialect, expected);
+            let serialized = serde_json::to_value(&definition).unwrap();
+            assert!(serialized[side].get("connection_ref").is_none());
+            assert_eq!(serialized[side]["spanner"]["dialect"], json!(dialect));
+            assert_eq!(parse_value(&serialized).unwrap(), definition);
+            value[side]["spanner"]["emulator"] = json!(true);
+            value[side]["spanner"]["credentials"] = json!("env:UNRESOLVED_SPANNER_CREDENTIALS");
+            value[side]["connection_ref"] = json!("env:OPTIONAL_SPANNER_CONNECTION");
+            assert!(parse_value(&value).is_ok());
+        }
+    }
+}
+
+#[test]
+fn spanner_blocks_must_match_the_engine() {
+    for side in ["source", "destination"] {
+        let mut value = example_value();
+        value[side]["engine"] = json!("spanner");
+        let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+            panic!("Spanner must require an endpoint block");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == format!("{side}.spanner"))
+        );
+        value[side]["spanner"] = spanner_connection("google-sql")["spanner"].clone();
+        for engine in [
+            "postgresql",
+            "mysql",
+            "mariadb",
+            "sqlite",
+            "sql-server",
+            "oracle",
+            "mongodb",
+            "gigglesdb",
+        ] {
+            value[side]["engine"] = json!(engine);
+            let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+                panic!("{engine} must forbid a Spanner endpoint block");
+            };
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.path == format!("{side}.spanner"))
+            );
+        }
+    }
+}
+
+#[test]
+fn spanner_identifiers_are_nonempty_trimmed_and_control_free() {
+    for side in ["source", "destination"] {
+        for field in ["project", "instance", "database", "change_stream"] {
+            for invalid in ["", " ", " padded", "padded ", "a\nb", "a\0b", "a\u{7f}b"] {
+                let mut value = example_value();
+                value[side] = spanner_connection("google-sql");
+                value[side]["spanner"][field] = json!(invalid);
+                let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+                    panic!("accepted invalid {side} {field}: {invalid:?}");
+                };
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, format!("{side}.spanner.{field}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn spanner_structure_dialect_and_credentials_are_strict() {
+    let endpoint = spanner_connection("google-sql")["spanner"].clone();
+    for (field, invalid) in [
+        ("typo", json!(true)),
+        ("dialect", json!("GoogleSQL")),
+        ("dialect", json!("google_sql")),
+        ("dialect", json!("POSTGRESQL")),
+        ("credentials", json!("private-inline-credential")),
+        (
+            "credentials",
+            json!({"private_key": "private-inline-credential"}),
+        ),
+    ] {
+        let mut value = example_value();
+        value["source"] = spanner_connection("google-sql");
+        value["source"]["spanner"][field] = invalid;
+        let Err(DefinitionError::Json(error)) = parse_value(&value) else {
+            panic!("Spanner {field} must reject invalid structure");
+        };
+        assert!(!error.to_string().contains("private-inline-credential"));
+    }
+    for field in endpoint.as_object().unwrap().keys() {
+        let mut value = example_value();
+        value["source"] = spanner_connection("google-sql");
+        value["source"]["spanner"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(matches!(parse_value(&value), Err(DefinitionError::Json(_))));
+    }
+}
+
+#[test]
+fn non_spanner_endpoints_still_require_connection_references_and_versions() {
+    for engine in [
+        "postgresql",
+        "mysql",
+        "mariadb",
+        "sqlite",
+        "sql-server",
+        "oracle",
+        "mongodb",
+        "gigglesdb",
+    ] {
+        for side in ["source", "destination"] {
+            for field in ["connection_ref", "version"] {
+                let mut value = example_value();
+                value[side]["engine"] = json!(engine);
+                value[side].as_object_mut().unwrap().remove(field);
+                let Err(DefinitionError::Validation(errors)) = parse_value(&value) else {
+                    panic!("{engine} must require {field}");
+                };
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.path == format!("{side}.{field}"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gigglesdb_is_declared_and_preflight_remains_unsupported() {
+    let mut value = example_value();
+    value["source"]["engine"] = json!("gigglesdb");
+    let definition = parse_value(&value).unwrap();
+    assert_eq!(
+        definition.source.engine,
+        skedaddle::definition::Engine::Gigglesdb
+    );
+    assert_eq!(definition.source.engine.to_string(), "gigglesdb");
+    assert_eq!(
+        serde_json::to_value(&definition).unwrap()["source"]["engine"],
+        json!("gigglesdb")
+    );
+    let report = CapabilityReport::from_definition(&definition).unwrap();
+    assert!(
+        report.blocking().iter().any(
+            |item| item.id == "connector.unsupported" && item.status == ItemStatus::Unsupported
+        )
+    );
+}
+
+#[test]
+fn pg_connection_serialization_preserves_existing_bytes_and_digest() {
+    use sha2::{Digest, Sha256};
+    let definition = valid_definition();
+    for connection in [&definition.source, &definition.destination] {
+        let old_json = format!(
+            "{{\"connection_ref\":{},\"engine\":{},\"tls\":{},\"tls_ca_ref\":{},\"version\":{}}}",
+            serde_json::to_string(connection.connection_ref.as_ref().unwrap()).unwrap(),
+            serde_json::to_string(&connection.engine).unwrap(),
+            serde_json::to_string(&connection.tls).unwrap(),
+            serde_json::to_string(connection.tls_ca_ref.as_ref().unwrap()).unwrap(),
+            serde_json::to_string(&connection.version).unwrap(),
+        );
+        assert_eq!(serde_json::to_string(connection).unwrap(), old_json);
+    }
+    let mut legacy = example_value();
+    for side in ["source", "destination"] {
+        legacy[side]["tls"] = json!("require");
+    }
+    // The existing hook alias serializes to its canonical phase name.
+    legacy["hooks"][0]["phase"] = json!("pre-fence");
+    assert_eq!(serde_json::to_value(&definition).unwrap(), legacy);
+    assert_eq!(
+        definition.canonical_digest().unwrap(),
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy).unwrap()))
+    );
+}
+
 fn s3_backend() -> Value {
     json!({"type": "s3-compatible", "options": {
         "endpoint": "https://s3.example.test", "bucket": "migration-buffer",

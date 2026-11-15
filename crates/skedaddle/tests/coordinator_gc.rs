@@ -25,6 +25,24 @@ use skedaddle::{
 use std::sync::mpsc;
 use tokio::sync::Mutex;
 
+#[test]
+fn unsupported_coordinator_format_blocks_gc_with_recovery_required() {
+    use skedaddle::{
+        buffer::reader,
+        coordinator::{Error, gc_authority::coordinator_gc_error},
+    };
+    for found in [None, Some(1), Some(3)] {
+        assert!(matches!(
+            coordinator_gc_error(Error::UnsupportedFormatVersion {
+                format: "journal-entry",
+                found,
+                expected: 2,
+            }),
+            reader::Error::RecoveryRequired(_)
+        ));
+    }
+}
+
 struct Order;
 impl PositionOrder for Order {
     fn domain(&self) -> &str {
@@ -44,7 +62,7 @@ fn txn(n: u64) -> AssembledTxn {
             system_id: "system".into(),
             lineage: "lineage".into(),
             db_name: "db".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         },
         TxnId(n.to_be_bytes().to_vec()),
         pos(n),
@@ -408,14 +426,16 @@ async fn checkpoint_and_apply_regressions_are_refused() {
             .is_err()
     );
     assert!(f.authority.persist_applied_through(&pos(10)).await.is_err());
-    let mut old_version = f.writer.clone();
-    old_version.version = 1;
-    assert!(
-        f.authority
-            .persist_writer_checkpoint(&old_version)
-            .await
-            .is_err()
-    );
+    for version in [1, 2] {
+        let mut old_version = f.writer.clone();
+        old_version.version = version;
+        assert!(
+            f.authority
+                .persist_writer_checkpoint(&old_version)
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tokio::test]

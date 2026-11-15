@@ -246,7 +246,7 @@ fn breach_detection_checks_boundary_exact_origin_and_window() {
             system_id: "1".into(),
             lineage: "1".into(),
             db_name: "test".into(),
-            slot: "test".into(),
+            stream: "test".into(),
         },
         TxnId(vec![1]),
         Position::new("pg:test", 11_u64.to_be_bytes()),

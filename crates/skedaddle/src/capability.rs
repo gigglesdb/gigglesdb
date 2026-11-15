@@ -87,7 +87,9 @@ impl CapabilityReport {
             ("destination", &definition.destination),
         ]
         .into_iter()
-        .filter(|(_, connection)| connection.engine != Engine::Postgresql)
+        .filter(|(_, connection)| {
+            !matches!(connection.engine, Engine::Postgresql | Engine::Spanner)
+        })
         .map(|(side, connection)| format!("{side}: {}", connection.engine))
         .collect();
 
@@ -101,12 +103,15 @@ impl CapabilityReport {
                 "Use PostgreSQL on both endpoints for M1, or implement and qualify the required connector.",
                 format!("M1 declares only a PostgreSQL connector; no connector for {}.", unsupported.join(", ")),
             ));
-        } else {
-            for (side, connection) in [
-                ("source", &definition.source),
-                ("destination", &definition.destination),
-            ] {
-                if !matches!(postgres_major(&connection.version), Some(16..=18)) {
+        }
+        for (side, connection) in [
+            ("source", &definition.source),
+            ("destination", &definition.destination),
+        ] {
+            match connection.engine {
+                Engine::Postgresql
+                    if !matches!(postgres_major(&connection.version), Some(16..=18)) =>
+                {
                     items.push(item(
                         &format!("{side}.version"),
                         ItemStatus::Unsupported,
@@ -118,7 +123,54 @@ impl CapabilityReport {
                         ),
                     ));
                 }
+                Engine::Spanner => {
+                    for (capability, remediation) in [
+                        (
+                            "connector_cdc_ordering",
+                            "The Spanner connector and CDC ordering are not yet built or qualified; implement and qualify connector-defined ordering before migration.",
+                        ),
+                        (
+                            "snapshot_consistency",
+                            "Spanner snapshot consistency is not yet built or qualified; implement and qualify consistent snapshot capture before migration.",
+                        ),
+                        (
+                            "schema_type_mapping",
+                            "Spanner schema/type mapping is not yet built or qualified; implement and qualify schema and type translation before migration.",
+                        ),
+                        (
+                            "fence_cutover_reverse",
+                            "Spanner fence/cutover/reverse qualification is not yet built or qualified; implement and qualify these protocols before migration.",
+                        ),
+                    ] {
+                        items.push(item(
+                            &format!("{side}.spanner.{capability}"),
+                            ItemStatus::Unverified,
+                            Criticality::Critical,
+                            remediation,
+                            format!("Declared {side} Spanner endpoint; no connector qualification evidence has been collected."),
+                        ));
+                    }
+                    if connection
+                        .spanner
+                        .as_ref()
+                        .is_some_and(|endpoint| endpoint.emulator)
+                    {
+                        items.push(item(
+                            &format!("{side}.spanner.emulator"),
+                            ItemStatus::Unverified,
+                            Criticality::Critical,
+                            "Spanner production qualification is not yet built or qualified; emulator results stay unverified and cannot promote a capability status.",
+                            format!("Declared {side} Spanner emulator; emulator results do not qualify production behavior."),
+                        ));
+                    }
+                }
+                _ => {}
             }
+        }
+        // These legacy claims apply only to a PostgreSQL-to-PostgreSQL migration.
+        if definition.source.engine == Engine::Postgresql
+            && definition.destination.engine == Engine::Postgresql
+        {
             items.push(item(
                 "postgresql.preflight",
                 ItemStatus::Unverified,
@@ -162,6 +214,9 @@ impl CapabilityReport {
             ("source", &definition.source),
             ("destination", &definition.destination),
         ] {
+            if connection.engine == Engine::Spanner {
+                continue;
+            }
             let trust = tls_trust(connection);
             items.push(item(
                 &format!("{side}.tls_trust"),

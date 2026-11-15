@@ -63,14 +63,20 @@ fn now_ms() -> Option<u64> {
         .try_into()
         .ok()
 }
-fn readiness_status(root: &Path, state: &Materialized) -> super::readiness::Facts {
+fn readiness_status(root: &Path, id: &str, state: &Materialized) -> super::readiness::Facts {
     let valid = (|| -> Option<super::readiness::Facts> {
         let generation = active(root).ok()??;
         let status: ReadinessStatus =
             serde_json::from_slice(&std::fs::read(root.join("readiness-status.json")).ok()?)
                 .ok()?;
+        let captured_end = state
+            .progress
+            .get("buffered")
+            .map(|_| buffered_end(state, &format!("skedaddle-postgres:{id}")))
+            .transpose()
+            .ok()?;
         if status.report != state.verification.report
-            || status.captured_end != buffered_end(state).ok()
+            || status.captured_end != captured_end
             || status.terminal
             || status.generation != generation
             || status.epoch != state.epoch
@@ -122,7 +128,8 @@ pub fn verification_status(root: &Path, id: &str, state: &Materialized) -> Json 
             || status.epoch != state.epoch
             || status.invalidation_generation != state.verification.generation
             || status.report != state.verification.report
-            || status.capture_end != buffered_end(state).ok()?
+            || status.capture_end
+                != buffered_end(state, &format!("skedaddle-postgres:{id}")).ok()?
             || status.capture_lsn > status.capture_end
             || status.capture_lsn == 0
         {
@@ -130,7 +137,7 @@ pub fn verification_status(root: &Path, id: &str, state: &Materialized) -> Json 
         }
         Some(status.verification)
     })();
-    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run),"operational_schema":state.operational_schema,"schema_remediation":crate::pg::ddl::SCHEMA_REMEDIATION,"readiness":readiness_status(&control, state)})
+    json!({"verification":valid.unwrap_or(false),"live_owner_observation":valid.is_some(),"completed_report":state.verification.report.as_ref().map(|r|&r.summary.run),"operational_schema":state.operational_schema,"schema_remediation":crate::pg::ddl::SCHEMA_REMEDIATION,"readiness":readiness_status(&control, id, state)})
 }
 
 fn control_file(root: &Path, name: &str) -> std::io::Result<File> {
@@ -391,14 +398,20 @@ fn lineage(state: &Materialized) -> coordinator::Result<durable::Lineage> {
         timeline: checkpoint.lineage.timeline,
     })
 }
-fn buffered_end(state: &Materialized) -> coordinator::Result<u64> {
-    state
-        .progress
-        .get("buffered")
-        .ok_or_else(invalid)?
-        .1
-        .parse()
-        .map_err(|_| invalid())
+fn buffered_end(state: &Materialized, domain: &str) -> coordinator::Result<u64> {
+    let checkpoint = engine::decode_source_checkpoint(
+        &state.progress.get("source-slot").ok_or_else(invalid)?.0,
+    )?;
+    let source = crate::event::SourceIdentity {
+        engine: "postgres".into(),
+        system_id: checkpoint.lineage.system_id.to_string(),
+        lineage: checkpoint.lineage.timeline.to_string(),
+        db_name: checkpoint.lineage.database,
+        stream: checkpoint.slot,
+    };
+    let payload = &state.progress.get("buffered").ok_or_else(invalid)?.1;
+    let position = engine::decode_buffered_position(payload, &source, domain)?;
+    engine::pg_position_lsn(&position, domain)
 }
 
 #[derive(Clone)]
@@ -420,6 +433,9 @@ impl<C> Drop for LiveCapture<C> {
     }
 }
 impl<C: engine::Capture> engine::Capture for LiveCapture<C> {
+    fn position_order(&self) -> Arc<dyn crate::event::PositionOrder + Send + Sync> {
+        self.capture.position_order()
+    }
     async fn prepare_schema(
         &mut self,
         journal: &coordinator::journal::Journal,
@@ -446,16 +462,22 @@ impl<C: engine::Capture> engine::Capture for LiveCapture<C> {
                 return Err(error);
             }
         };
-        if let Some(end) = batch.durable_lsn {
+        if let Some(position) = &batch.durable_position {
             let mut observed = self.observed.lock().expect("capture observation poisoned");
+            let end = match engine::pg_position_lsn(position, &self.domain) {
+                Ok(end) => end,
+                Err(error) => {
+                    *observed = None;
+                    return Err(error);
+                }
+            };
             let next = batch
                 .transaction
                 .as_ref()
                 .filter(|txn| {
                     txn.source == self.source && txn.commit_position.order_domain() == self.domain
                 })
-                .and_then(|txn| <[u8; 8]>::try_from(txn.commit_position.bytes()).ok())
-                .map(u64::from_be_bytes)
+                .and_then(|txn| engine::pg_position_lsn(&txn.commit_position, &self.domain).ok())
                 .filter(|commit| *commit > 0 && *commit <= end);
             match next {
                 Some(commit)
@@ -483,7 +505,7 @@ impl<C: engine::Capture> engine::Capture for LiveCapture<C> {
     }
     async fn publish(
         &mut self,
-        high: u64,
+        high: crate::event::Position,
         rows: crate::event::AssembledTxn,
     ) -> coordinator::Result<crate::buffer::writer::DurableManifestRef> {
         self.capture.publish(high, rows).await
@@ -644,11 +666,11 @@ impl Readiness {
         let checkpoint = engine::decode_source_checkpoint(
             &state.progress.get("source-slot").ok_or_else(invalid)?.0,
         )?;
-        if live.end != buffered_end(state)?
+        if live.end != buffered_end(state, &self.domain)?
             || live.source.system_id != checkpoint.lineage.system_id.to_string()
             || live.source.lineage != checkpoint.lineage.timeline.to_string()
             || live.source.db_name != checkpoint.lineage.database
-            || live.source.slot != checkpoint.slot
+            || live.source.stream != checkpoint.slot
             || live.source.engine != "postgres"
             || live.domain != self.domain
         {
@@ -867,7 +889,7 @@ impl Service {
             &self.root.join("readiness-status.json"),
             &ReadinessStatus {
                 report: state.verification.report.clone(),
-                captured_end: buffered_end(&state).ok(),
+                captured_end: buffered_end(&state, &self.readiness.domain).ok(),
                 terminal: true,
                 generation,
                 epoch: state.epoch,
@@ -889,7 +911,7 @@ impl Service {
                         &self.root.join("readiness-status.json"),
                         &ReadinessStatus {
                             report: state.verification.report.clone(),
-                            captured_end: buffered_end(&state).ok(),
+                            captured_end: buffered_end(&state, &self.readiness.domain).ok(),
                             terminal: false,
                             generation,
                             epoch: state.epoch,
@@ -1063,7 +1085,7 @@ impl Service {
                         &self.root.join("readiness-status.json"),
                         &ReadinessStatus {
                             report: state.verification.report.clone(),
-                            captured_end: buffered_end(&state).ok(),
+                            captured_end: buffered_end(&state, &self.readiness.domain).ok(),
                             terminal: false,
                             generation: generation.clone(),
                             epoch: state.epoch,
@@ -1686,7 +1708,7 @@ mod tests {
             });
         let mut status = ReadinessStatus {
             report: state.verification.report.clone(),
-            captured_end: buffered_end(&state).ok(),
+            captured_end: buffered_end(&state, "skedaddle-postgres:m").ok(),
             terminal: false,
             generation: generation.clone(),
             epoch: state.epoch,
@@ -1702,29 +1724,34 @@ mod tests {
         };
         let path = root.join("readiness-status.json");
         write_json(&path, &status).unwrap();
-        assert!(readiness_status(&root, &state).buffer_contract.ready);
+        assert!(readiness_status(&root, "m", &state).buffer_contract.ready);
+        state
+            .progress
+            .insert("buffered".into(), ("manifest-durable".into(), "123".into()));
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
+        state.progress.remove("buffered");
         status.captured_end = Some(999);
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
-        status.captured_end = buffered_end(&state).ok();
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
+        status.captured_end = buffered_end(&state, "skedaddle-postgres:m").ok();
         status.report = None;
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.report = state.verification.report.clone();
         status.facts.destination_expires_at_ms = Some(now_ms().unwrap().saturating_sub(1));
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.facts.destination_expires_at_ms = None;
         status.observed_at_ms = now_ms().unwrap().saturating_sub(251);
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.observed_at_ms = now_ms().unwrap() + 60_000;
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.observed_at_ms = now_ms().unwrap();
         status.definition_digest = "0".repeat(64);
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.definition_digest = state
             .definition
             .as_ref()
@@ -1733,21 +1760,21 @@ mod tests {
             .unwrap();
         status.epoch += 1;
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.epoch = state.epoch;
         status.invalidation_generation += 1;
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.invalidation_generation = state.verification.generation;
         status.generation = uuid::Uuid::new_v4().to_string();
         write_json(&path, &status).unwrap();
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
         status.generation = generation;
         status.observed_at_ms = now_ms().unwrap();
         write_json(&path, &status).unwrap();
-        assert!(readiness_status(&root, &state).buffer_contract.ready);
+        assert!(readiness_status(&root, "m", &state).buffer_contract.ready);
         drop(owner);
-        assert!(!readiness_status(&root, &state).buffer_contract.ready);
+        assert!(!readiness_status(&root, "m", &state).buffer_contract.ready);
     }
 
     #[tokio::test]

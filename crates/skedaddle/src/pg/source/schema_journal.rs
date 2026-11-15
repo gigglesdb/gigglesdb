@@ -38,7 +38,7 @@ fn source(s: &SourceIdentity) -> [String; 5] {
         s.system_id.clone(),
         s.lineage.clone(),
         s.db_name.clone(),
-        s.slot.clone(),
+        s.stream.clone(),
     ]
 }
 
@@ -324,10 +324,23 @@ impl SchemaJournal {
         let Some((marker, position)) = state.progress.get("buffered") else {
             return Ok(fallback);
         };
+        let [engine, system_id, lineage, db_name, stream] = self.identity.source.clone();
+        let source = SourceIdentity {
+            engine,
+            system_id,
+            lineage,
+            db_name,
+            stream,
+        };
+        let position =
+            crate::engine::decode_buffered_position(position, &source, &self.identity.domain)
+                .map_err(|e| Error::SchemaJournal(e.into()))?;
+        let end = crate::engine::pg_position_lsn(&position, &self.identity.domain)
+            .map_err(Error::SchemaJournal)?;
         let Some(value) = BufferedEnd::decode(marker)? else {
             return Ok(fallback);
         };
-        if position != &value.end.to_string() {
+        if end != value.end {
             return Err(invalid("buffered END progress position mismatch"));
         }
         // A cancelled step can promote a newer DDL snapshot before its
@@ -864,7 +877,7 @@ mod buffered_end_tests {
                     system_id: "system".into(),
                     lineage: "timeline".into(),
                     db_name: "database".into(),
-                    slot: "slot".into(),
+                    stream: "slot".into(),
                 },
                 txn: TxnId(vec![7]),
                 position: Position::new("domain", 100u64.to_be_bytes()),

@@ -22,17 +22,25 @@ pub enum Error {
     Store(super::backends::Error),
     RecoveryRequired(&'static str),
     Invalid(&'static str),
+    Format(format::FormatError),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(e) => e.fmt(f),
+            Self::Format(e) => e.fmt(f),
             Self::RecoveryRequired(s) => write!(f, "buffer recovery-required: {s}"),
             Self::Invalid(s) => write!(f, "invalid buffer reader configuration: {s}"),
         }
     }
 }
 impl std::error::Error for Error {}
+fn format_recovery(error: format::FormatError, reason: &'static str) -> Error {
+    match error {
+        format::FormatError::UnsupportedFormatVersion { .. } => Error::Format(error),
+        _ => Error::RecoveryRequired(reason),
+    }
+}
 impl From<super::backends::Error> for Error {
     fn from(e: super::backends::Error) -> Self {
         Self::Store(e)
@@ -66,7 +74,7 @@ impl ReaderConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReaderCheckpoint {
-    /// Version 2 includes the kind/source boundary needed for an equal-H pair.
+    /// Version 3 preserves the kind/source boundary needed for an equal-H pair.
     pub version: u16,
     pub next_mseq: u64,
     pub prev_digest: ContentDigest,
@@ -129,9 +137,17 @@ impl BufferReader {
         checkpoint: ReaderCheckpoint,
         order: Arc<dyn PositionOrder + Send + Sync>,
     ) -> Result<Self> {
+        if checkpoint.version != format::CHECKPOINT_VERSION {
+            return Err(Error::Format(
+                format::FormatError::UnsupportedFormatVersion {
+                    format: "reader-checkpoint",
+                    found: Some(checkpoint.version),
+                    expected: format::CHECKPOINT_VERSION,
+                },
+            ));
+        }
         if config.migration_id.is_empty()
             || config.stream.is_empty()
-            || checkpoint.version != format::CHECKPOINT_VERSION
             || (checkpoint.next_mseq == 0 && checkpoint != ReaderCheckpoint::default())
             || (checkpoint.next_mseq != 0
                 && (checkpoint.last_position.is_none() || checkpoint.last_record.is_none()))
@@ -221,7 +237,7 @@ impl BufferReader {
         let record = active
             .decoder
             .next_record()
-            .map_err(|_| Error::RecoveryRequired("segment changed after validation"))?
+            .map_err(|error| format_recovery(error, "segment changed after validation"))?
             .ok_or(Error::RecoveryRequired("empty segment"))?;
         active.remaining -= 1;
         if active.remaining == 0 {
@@ -240,7 +256,7 @@ pub(crate) fn parse_manifest(
     bytes: &[u8],
 ) -> Result<ManifestEntry> {
     let entry = ManifestEntry::from_canonical_json(bytes)
-        .map_err(|_| Error::RecoveryRequired("invalid manifest"))?;
+        .map_err(|error| format_recovery(error, "invalid manifest"))?;
     if entry.mseq != checkpoint.next_mseq
         || entry.prev_digest != checkpoint.prev_digest
         || entry.epoch < checkpoint.last_epoch
@@ -282,7 +298,7 @@ pub(crate) async fn verify_segment(
         .await?
         .ok_or(Error::RecoveryRequired("missing segment"))?;
     let mut decoder = SegmentDecoder::new(Cursor::new(bytes), config.limits)
-        .map_err(|_| Error::RecoveryRequired("segment header"))?;
+        .map_err(|error| format_recovery(error, "segment header"))?;
     let h = decoder.header();
     if h.migration_id != config.migration_id
         || h.stream != config.stream
@@ -296,7 +312,7 @@ pub(crate) async fn verify_segment(
     let mut last = previous.map(|(position, boundary)| (position.clone(), boundary.clone()));
     while let Some(record) = decoder
         .next_record()
-        .map_err(|_| Error::RecoveryRequired("segment record or trailer"))?
+        .map_err(|error| format_recovery(error, "segment record or trailer"))?
     {
         let pos = record.position();
         let (source, chunk_rows) = match &record {
@@ -324,7 +340,7 @@ pub(crate) async fn verify_segment(
     }
     let (mut cursor, summary) = decoder
         .finish()
-        .map_err(|_| Error::RecoveryRequired("segment trailer"))?;
+        .map_err(|error| format_recovery(error, "segment trailer"))?;
     if summary.digest != entry.segment_digest
         || summary.bytes != entry.bytes
         || entry.txn_count == 0
@@ -335,7 +351,7 @@ pub(crate) async fn verify_segment(
     let (last_position, last_record) = last.ok_or(Error::RecoveryRequired("empty segment"))?;
     Ok((
         SegmentDecoder::new(cursor, config.limits)
-            .map_err(|_| Error::RecoveryRequired("segment header"))?,
+            .map_err(|error| format_recovery(error, "segment header"))?,
         (last_position, last_record),
     ))
 }

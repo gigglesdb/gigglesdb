@@ -13,7 +13,7 @@ fn source() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn limits() -> VerificationLimits {
@@ -170,7 +170,7 @@ fn adapter_binding_rejects_lineage_slot_domain_and_restart() {
         let mut actual = source();
         match reason {
             EvidenceInvalidation::LineageChanged => actual.lineage = "2".into(),
-            EvidenceInvalidation::SlotChanged => actual.slot = "other".into(),
+            EvidenceInvalidation::SlotChanged => actual.stream = "other".into(),
             _ => {}
         }
         hub.begin(actual, binding.domain.clone());

@@ -194,7 +194,7 @@ async fn seeded_committed_history_matches_local_buffer() -> Result<(), Box<dyn E
             system_id: lineage.system_id.to_string(),
             lineage: lineage.timeline.to_string(),
             db_name: lineage.database.clone(),
-            slot: slot.clone(),
+            stream: slot.clone(),
         };
         let resolver =
             |_: &skedaddle::pg::pgoutput::Relation<'_>,

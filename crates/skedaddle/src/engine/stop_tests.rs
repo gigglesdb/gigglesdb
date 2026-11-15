@@ -163,9 +163,13 @@ async fn external_pause_retries_interrupted_copy_and_idle_pause_is_harmless() {
     let mut capture = f
         .capture(
             rx,
-            old.progress
-                .get("buffered")
-                .map_or(10, |(_, p)| p.parse().unwrap()),
+            old.progress.get("buffered").map_or(10, |(_, p)| {
+                pg_position_lsn(
+                    &decode_buffered_position(p, &source(), Order.domain()).unwrap(),
+                    Order.domain(),
+                )
+                .unwrap()
+            }),
         )
         .await;
     let checkpoint = old

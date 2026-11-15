@@ -56,7 +56,7 @@ fn txn(n: u64, marker: bool) -> AssembledTxn {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "d".into(),
-        slot: "s".into(),
+        stream: "s".into(),
     };
     let position = Position::new("m_rev", n.to_be_bytes());
     let events = if marker {

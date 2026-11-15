@@ -52,7 +52,7 @@ impl ApplyLagObservation {
     }
     pub(super) fn matches(&self, checkpoint: &crate::pg::replication::Checkpoint) -> bool {
         source_matches(&self.source, &checkpoint.lineage)
-            && self.source.slot == checkpoint.slot
+            && self.source.stream == checkpoint.slot
             && !self.order_domain.is_empty()
             && self.source_tip_lsn > 0
             && self.applied_source_lsn > 0
@@ -97,11 +97,7 @@ struct Live {
 pub(super) struct Hub(StdMutex<Live>);
 
 fn lsn(position: &Position, domain: &str) -> Option<u64> {
-    (position.order_domain() == domain).then(|| {
-        <[u8; 8]>::try_from(position.bytes())
-            .ok()
-            .map(u64::from_be_bytes)
-    })?
+    pg_position_lsn(position, domain).ok()
 }
 fn source_matches(source: &SourceIdentity, lineage: &Lineage) -> bool {
     source.engine == "postgres"
@@ -177,7 +173,9 @@ impl Hub {
             || position.is_none()
             || txn.commit_time.is_none()
             || batch
-                .durable_lsn
+                .durable_position
+                .as_ref()
+                .and_then(|end| lsn(end, &state.domain))
                 .is_none_or(|end| position.is_none_or(|position| end < position))
             || position < state.last_captured
         {
@@ -323,7 +321,7 @@ impl Hub {
                         healthy: true,
                         checkpoint: crate::pg::replication::Checkpoint {
                             lineage: tip.lineage.clone(),
-                            slot: state.source.as_ref()?.slot.clone(),
+                            slot: state.source.as_ref()?.stream.clone(),
                             durable_lsn: tip.lsn,
                         },
                     })
@@ -479,7 +477,7 @@ mod bounds {
             system_id: "1".into(),
             lineage: "1".into(),
             db_name: "db".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         };
         let hub = Hub::default();
         hub.begin(source.clone(), "pg".into(), None, None);
@@ -501,7 +499,7 @@ mod bounds {
         .unwrap();
         hub.observe(&Captured {
             transaction: Some(txn),
-            durable_lsn: Some(3),
+            durable_position: Some(Position::new("pg", 3u64.to_be_bytes())),
             ..Captured::default()
         });
         let state = hub.0.lock().unwrap();

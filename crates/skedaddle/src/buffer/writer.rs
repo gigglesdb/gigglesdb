@@ -492,7 +492,12 @@ pub struct RetainedRedelivery {
 
 fn validate_checkpoint(checkpoint: &WriterCheckpoint, order: &dyn PositionOrder) -> Result<()> {
     if checkpoint.version != format::CHECKPOINT_VERSION {
-        return Err(Error::Invalid("unsupported writer checkpoint version"));
+        return Err(format::FormatError::UnsupportedFormatVersion {
+            format: "writer-checkpoint",
+            found: Some(checkpoint.version),
+            expected: format::CHECKPOINT_VERSION,
+        }
+        .into());
     }
     if checkpoint.next_mseq == 0 {
         return if checkpoint == &WriterCheckpoint::default() {
@@ -888,7 +893,7 @@ impl BufferWriter {
                     r.source.system_id.clone(),
                     r.source.lineage.clone(),
                     r.source.db_name.clone(),
-                    r.source.slot.clone(),
+                    r.source.stream.clone(),
                     r.txn.0.clone(),
                 )
             };

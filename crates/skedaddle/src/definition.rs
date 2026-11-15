@@ -81,7 +81,8 @@ pub struct MigrationDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
-    pub connection_ref: SecretRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_ref: Option<SecretRef>,
     pub engine: Engine,
     #[serde(default)]
     pub tls: crate::security::TlsPolicy,
@@ -91,7 +92,30 @@ pub struct Connection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_ref: Option<SecretRef>,
     /// Server version to qualify, e.g. "17.2". This is a declaration, not evidence.
+    /// Spanner endpoints do not require a declared server version.
+    #[serde(default)]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spanner: Option<SpannerEndpoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpannerEndpoint {
+    pub project: String,
+    pub instance: String,
+    pub database: String,
+    pub dialect: SpannerDialect,
+    pub change_stream: String,
+    pub credentials: SecretRef,
+    pub emulator: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpannerDialect {
+    GoogleSql,
+    Postgresql,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +128,8 @@ pub enum Engine {
     SqlServer,
     Oracle,
     Mongodb,
+    Spanner,
+    Gigglesdb,
 }
 
 impl fmt::Display for Engine {
@@ -116,6 +142,8 @@ impl fmt::Display for Engine {
             Self::SqlServer => "sql-server",
             Self::Oracle => "oracle",
             Self::Mongodb => "mongodb",
+            Self::Spanner => "spanner",
+            Self::Gigglesdb => "gigglesdb",
         };
         f.write_str(name)
     }
@@ -423,9 +451,12 @@ impl MigrationDefinition {
                 "only version 1 is understood",
             );
         }
+        for (path, connection) in [("source", &self.source), ("destination", &self.destination)] {
+            if connection.engine != Engine::Spanner {
+                nonempty(&mut errors, &format!("{path}.version"), &connection.version);
+            }
+        }
         for (path, value) in [
-            ("source.version", &self.source.version),
-            ("destination.version", &self.destination.version),
             ("mapping_version", &self.mapping_version),
             ("connector_versions.source", &self.connector_versions.source),
             (
@@ -440,6 +471,49 @@ impl MigrationDefinition {
             nonempty(&mut errors, path, value);
         }
         for (path, connection) in [("source", &self.source), ("destination", &self.destination)] {
+            if connection.engine == Engine::Spanner {
+                match &connection.spanner {
+                    Some(endpoint) => {
+                        for (field, value) in [
+                            ("project", &endpoint.project),
+                            ("instance", &endpoint.instance),
+                            ("database", &endpoint.database),
+                            ("change_stream", &endpoint.change_stream),
+                        ] {
+                            if value.is_empty()
+                                || value.trim() != value
+                                || value.chars().any(char::is_control)
+                            {
+                                push_error(
+                                    &mut errors,
+                                    &format!("{path}.spanner.{field}"),
+                                    "must be non-empty, trimmed, and free of control characters",
+                                );
+                            }
+                        }
+                    }
+                    None => push_error(
+                        &mut errors,
+                        &format!("{path}.spanner"),
+                        "Spanner engine requires a spanner endpoint block",
+                    ),
+                }
+                continue;
+            }
+            if connection.spanner.is_some() {
+                push_error(
+                    &mut errors,
+                    &format!("{path}.spanner"),
+                    "spanner endpoint block requires the Spanner engine",
+                );
+            }
+            if connection.connection_ref.is_none() {
+                push_error(
+                    &mut errors,
+                    &format!("{path}.connection_ref"),
+                    "connection_ref is required for non-Spanner endpoints",
+                );
+            }
             match (&connection.tls, &connection.tls_ca_ref) {
                 (crate::security::TlsPolicy::Required, None) => push_error(
                     &mut errors,

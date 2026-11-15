@@ -1,4 +1,4 @@
-//! Immutable version 1 segments and manifest entries.
+//! Immutable version 2 segments and manifest entries.
 //!
 //! All binary integers are big endian. The layout is `MAGIC | version:u16 |
 //! header_len:u32 | header | (record_len:u64 | canonical_record)* | 0:u64 |
@@ -27,16 +27,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::event::{
-    AssembledTxn, ContentDigest, EventError, EventKind, Position, PositionOrder, SourceIdentity,
-    StreamingTxn,
+    AssembledTxn, ContentDigest, EventError, EventKind, Position, PositionOrder, PositionWireV1,
+    SourceIdentity, StreamingTxn,
 };
 
 pub const MAGIC: &[u8; 8] = b"SKEDSEG\0";
 pub const END_MAGIC: &[u8; 8] = b"SKEDEND\0";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
-/// Coordinator checkpoint schema. Version 2 records the consumed equal-H slot.
-pub const CHECKPOINT_VERSION: u16 = 2;
+/// Coordinator checkpoint schema. Version 3 rejects pre-opaque-progress state.
+/// The consumed equal-H slot introduced in version 2 is preserved.
+pub const CHECKPOINT_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordBoundary {
@@ -136,7 +137,11 @@ impl SegmentRecord {
             }
             let version = u16::from_be_bytes([bytes[4], bytes[5]]);
             if version != FORMAT_VERSION {
-                return Err(FormatError::UnsupportedVersion(version));
+                return Err(FormatError::UnsupportedFormatVersion {
+                    format: "chunk-rows",
+                    found: Some(version),
+                    expected: FORMAT_VERSION,
+                });
             }
             let end = bytes.len() - 32;
             if Sha256::digest(&bytes[..end]).as_slice() != &bytes[end..] {
@@ -187,7 +192,11 @@ pub(crate) fn validate_chunk(txn: &AssembledTxn) -> Result<(), FormatError> {
 pub enum FormatError {
     Io(io::Error),
     WrongMagic,
-    UnsupportedVersion(u16),
+    UnsupportedFormatVersion {
+        format: &'static str,
+        found: Option<u16>,
+        expected: u16,
+    },
     Truncated(&'static str),
     LengthLimit {
         field: &'static str,
@@ -214,7 +223,17 @@ impl fmt::Display for FormatError {
         match self {
             Self::Io(e) => write!(f, "segment I/O: {e}"),
             Self::WrongMagic => f.write_str("wrong segment magic"),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported segment version {v}"),
+            Self::UnsupportedFormatVersion {
+                format,
+                found,
+                expected,
+            } => match found {
+                Some(version) => write!(
+                    f,
+                    "unsupported {format} format version {version}; expected {expected}"
+                ),
+                None => write!(f, "missing {format} format version; expected {expected}"),
+            },
             Self::Truncated(part) => write!(f, "truncated {part}"),
             Self::LengthLimit {
                 field,
@@ -520,7 +539,11 @@ impl<R: Read> SegmentDecoder<R> {
         }
         let version = u16::from_be_bytes([preamble[8], preamble[9]]);
         if version != FORMAT_VERSION {
-            return Err(FormatError::UnsupportedVersion(version));
+            return Err(FormatError::UnsupportedFormatVersion {
+                format: "segment",
+                found: Some(version),
+                expected: FORMAT_VERSION,
+            });
         }
         let length =
             u32::from_be_bytes([preamble[10], preamble[11], preamble[12], preamble[13]]) as u64;
@@ -628,7 +651,11 @@ impl<R: Read> SegmentDecoder<R> {
                 }
                 let version = u16::from_be_bytes([envelope[4], envelope[5]]);
                 if version != FORMAT_VERSION {
-                    return Err(FormatError::UnsupportedVersion(version));
+                    return Err(FormatError::UnsupportedFormatVersion {
+                        format: "chunk-rows",
+                        found: Some(version),
+                        expected: FORMAT_VERSION,
+                    });
                 }
                 storage.rewind()?;
                 let mut remaining = length - 32;
@@ -915,7 +942,7 @@ fn decode_header(encoded: &[u8]) -> Result<SegmentHeader, FormatError> {
 }
 
 /// Manifest digest is SHA-256 of compact, recursively key-sorted UTF-8 JSON
-/// containing these nine fields (excluding the self-digest). Serialized entries
+/// containing version 2 and these nine fields (excluding the self-digest). Serialized entries
 /// add `digest`. Digests and opaque position bytes are lowercase hex; positions
 /// also retain their connector domain. No timestamps or global ordering appear.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -933,34 +960,15 @@ pub struct ManifestEntry {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JsonPosition {
-    order_domain: String,
-    bytes: String,
-}
-impl From<&Position> for JsonPosition {
-    fn from(p: &Position) -> Self {
-        Self {
-            order_domain: p.order_domain().into(),
-            bytes: hex(p.bytes()),
-        }
-    }
-}
-impl JsonPosition {
-    fn position(self) -> Result<Position, FormatError> {
-        Ok(Position::new(self.order_domain, unhex(&self.bytes)?))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct JsonManifest {
+    version: u16,
     mseq: u64,
     epoch: u64,
     prev_digest: String,
     segment_key: String,
     segment_digest: String,
-    first_pos: JsonPosition,
-    last_pos: JsonPosition,
+    first_pos: PositionWireV1,
+    last_pos: PositionWireV1,
     txn_count: u64,
     bytes: u64,
     digest: String,
@@ -968,10 +976,10 @@ struct JsonManifest {
 
 impl ManifestEntry {
     fn body(&self) -> serde_json::Value {
-        serde_json::json!({ "mseq": self.mseq, "epoch": self.epoch,
+        serde_json::json!({ "version": FORMAT_VERSION, "mseq": self.mseq, "epoch": self.epoch,
             "prev_digest": hex(&self.prev_digest), "segment_key": self.segment_key,
-            "segment_digest": hex(&self.segment_digest), "first_pos": JsonPosition::from(&self.first_pos),
-            "last_pos": JsonPosition::from(&self.last_pos), "txn_count": self.txn_count, "bytes": self.bytes })
+            "segment_digest": hex(&self.segment_digest), "first_pos": PositionWireV1::from(&self.first_pos),
+            "last_pos": PositionWireV1::from(&self.last_pos), "txn_count": self.txn_count, "bytes": self.bytes })
     }
 
     pub fn digest(&self) -> Result<ContentDigest, FormatError> {
@@ -987,7 +995,22 @@ impl ManifestEntry {
     }
 
     pub fn from_canonical_json(bytes: &[u8]) -> Result<Self, FormatError> {
+        // Inspect only the envelope before the current payload schema: old or
+        // missing versions must not become missing/unknown-field JSON errors.
+        #[derive(Deserialize)]
+        struct Version {
+            version: Option<u16>,
+        }
+        let envelope: Version = serde_json::from_slice(bytes)?;
+        if envelope.version != Some(FORMAT_VERSION) {
+            return Err(FormatError::UnsupportedFormatVersion {
+                format: "manifest",
+                found: envelope.version,
+                expected: FORMAT_VERSION,
+            });
+        }
         let wire: JsonManifest = serde_json::from_slice(bytes)?;
+        debug_assert_eq!(wire.version, FORMAT_VERSION);
         let digest = parse_digest(&wire.digest)?;
         let entry = Self {
             mseq: wire.mseq,
@@ -995,8 +1018,8 @@ impl ManifestEntry {
             prev_digest: parse_digest(&wire.prev_digest)?,
             segment_key: wire.segment_key,
             segment_digest: parse_digest(&wire.segment_digest)?,
-            first_pos: wire.first_pos.position()?,
-            last_pos: wire.last_pos.position()?,
+            first_pos: Position::try_from(wire.first_pos).map_err(FormatError::Invalid)?,
+            last_pos: Position::try_from(wire.last_pos).map_err(FormatError::Invalid)?,
             txn_count: wire.txn_count,
             bytes: wire.bytes,
         };

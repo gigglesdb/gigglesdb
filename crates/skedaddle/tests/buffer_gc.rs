@@ -65,7 +65,7 @@ fn encoded(c: &ReaderConfig, n: u64) -> (Vec<u8>, ManifestEntry) {
             system_id: "s".into(),
             lineage: "l".into(),
             db_name: "d".into(),
-            slot: "s".into(),
+            stream: "s".into(),
         },
         TxnId(n.to_be_bytes().to_vec()),
         pos(n),

@@ -121,7 +121,7 @@ pub(super) fn verification_marker(token: Uuid) -> Watermark {
 }
 
 fn source_change(expected: &SourceIdentity, actual: &SourceIdentity) -> EvidenceInvalidation {
-    if expected.slot != actual.slot {
+    if expected.stream != actual.stream {
         EvidenceInvalidation::SlotChanged
     } else {
         EvidenceInvalidation::LineageChanged

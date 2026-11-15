@@ -318,7 +318,7 @@ impl Workers {
             system_id: checkpoint.lineage.system_id.to_string(),
             lineage: checkpoint.lineage.timeline.to_string(),
             db_name: checkpoint.lineage.database.clone(),
-            slot: checkpoint.slot.clone(),
+            stream: checkpoint.slot.clone(),
         };
         let eligibility = Eligibility::new(|_| Ok(()));
         let mut capture = reverse::Capture::new(
@@ -790,7 +790,7 @@ mod tests {
             system_id: "1".into(),
             lineage: "1".into(),
             db_name: "db".into(),
-            slot: "skedaddle_m_rev".into(),
+            stream: "skedaddle_m_rev".into(),
         }
     }
     async fn writer(

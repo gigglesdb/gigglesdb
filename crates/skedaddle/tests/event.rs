@@ -6,9 +6,54 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use skedaddle::event::{
-    AssembledTxn, Event, EventError, EventKind, OpaqueValue, Position, PositionOrder, Redelivery,
-    RedeliveryCheck, Row, SourceIdentity, SourceOrigin, StreamingTxn, TransactionMetadata, TxnId,
+    AssembledTxn, Event, EventError, EventKind, OpaqueValue, Position, PositionOrder,
+    PositionWireV1, Redelivery, RedeliveryCheck, Row, SourceIdentity, SourceOrigin, StreamingTxn,
+    TransactionMetadata, TxnId,
 };
+
+#[test]
+fn position_wire_v1_roundtrips_opaque_domain_and_bytes() {
+    let position = Position::new("stream/東京/é", vec![0, 15, 128, 254, 255]);
+    let encoded = serde_json::to_string(&PositionWireV1::from(&position)).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"order_domain":"stream/東京/é","bytes":"000f80feff"}"#
+    );
+    let wire: PositionWireV1 = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(Position::try_from(wire).unwrap(), position);
+    let empty = Position::new("", vec![]);
+    let wire = serde_json::to_vec(&PositionWireV1::from(&empty)).unwrap();
+    assert_eq!(
+        Position::try_from(serde_json::from_slice::<PositionWireV1>(&wire).unwrap()).unwrap(),
+        empty
+    );
+}
+
+#[test]
+fn position_wire_v1_rejects_malformed_json_and_noncanonical_hex() {
+    for malformed in [
+        r#"{"bytes":"00"}"#,
+        r#"{"order_domain":"d"}"#,
+        r#"{"order_domain":"d","bytes":[0]}"#,
+        r#"{"order_domain":"d","bytes":"00","extra":1}"#,
+        r#"{"order_domain":"d","bytes":"00","bytes":"01"}"#,
+        r#"{"order_domain":null,"bytes":"00"}"#,
+        r#"{"order_domain":"d","bytes":"00""#,
+    ] {
+        assert!(serde_json::from_str::<PositionWireV1>(malformed).is_err());
+    }
+    for (bytes, reason) in [
+        ("0", "hex length"),
+        ("FF", "lowercase hex"),
+        ("gg", "lowercase hex"),
+        ("é", "lowercase hex"),
+        ("0 ", "lowercase hex"),
+    ] {
+        let json = serde_json::json!({"order_domain": "d", "bytes": bytes});
+        let wire = serde_json::from_value::<PositionWireV1>(json).unwrap();
+        assert_eq!(Position::try_from(wire), Err(reason));
+    }
+}
 
 fn metadata(txn: &AssembledTxn) -> TransactionMetadata {
     TransactionMetadata {
@@ -41,7 +86,7 @@ impl Seek for ShortStorage {
 }
 
 #[test]
-fn streaming_canonical_bytes_and_digests_match_v2_with_short_io() {
+fn streaming_canonical_bytes_and_digests_match_v3_with_short_io() {
     let mut event_bytes = ShortStorage(Cursor::new(Vec::new()));
     sample().write_canonical(&mut event_bytes).unwrap();
     assert_eq!(event_bytes.0.into_inner(), unhex(GOLDEN));
@@ -108,7 +153,7 @@ fn streaming_transactions_reject_membership_order_count_and_storage_errors() {
         Err(EventError::InvalidTransaction(_))
     ));
     let mut bad = sample();
-    bad.source.slot.push('x');
+    bad.source.stream.push('x');
     assert!(matches!(
         make(1, vec![Ok(bad)]),
         Err(EventError::InvalidTransaction(_))
@@ -170,7 +215,7 @@ fn sample() -> Event {
             system_id: "s".into(),
             lineage: "l".into(),
             db_name: "db".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         },
         txn: TxnId(vec![1, 2]),
         ordinal_in_txn: 7,
@@ -201,7 +246,9 @@ fn unhex(hex: &str) -> Vec<u8> {
 // entire record, including its integrity trailer, not a self-derived oracle.
 // Original v1 bytes retained as a compatibility rejection fixture.
 const GOLDEN_V1: &str = "534b45560001010000000270670000000173000000016c00000002646200000004736c6f7400000002010200000000000000070000000e70672f732f6c2f64622f736c6f74000000010900000000000000030101000000087075626c69632e74000000010000000269640000000770672f696e743401000000023432010000000100000001760000000770672f7465787400010000000100000001760000000770672f7465787401000000000000000100000005746f6173747c216845296d9d1350679a590b28fae78f412e4b27e5b49ca9ea034967aaaaad";
-const GOLDEN: &str = "534b45560002010000000270670000000173000000016c00000002646200000004736c6f7400000002010200000000000000070000000e70672f732f6c2f64622f736c6f74000000010900000000000000030101000000087075626c69632e74000000010000000269640000000770672f696e743401000000023432010000000100000001760000000770672f7465787400010000000100000001760000000770672f7465787401000000000000000100000005746f617374d65c365a277a873447b3a7867845dce22956778e52c75f9e2b9d542fad2c8103";
+const GOLDEN_V2: &str = "534b45560002010000000270670000000173000000016c00000002646200000004736c6f7400000002010200000000000000070000000e70672f732f6c2f64622f736c6f74000000010900000000000000030101000000087075626c69632e74000000010000000269640000000770672f696e743401000000023432010000000100000001760000000770672f7465787400010000000100000001760000000770672f7465787401000000000000000100000005746f617374d65c365a277a873447b3a7867845dce22956778e52c75f9e2b9d542fad2c8103";
+const GOLDEN_TXN_V2: &str = "534b45560002020000000270670000000173000000016c00000002646200000004736c6f740000000101000000016400000001090000000000007f080fc05aceac5ed7d42a4a27caf5e76f6db40bfea4ed1305531b6b376ee78b";
+const GOLDEN: &str = "534b45560003010000000270670000000173000000016c00000002646200000004736c6f7400000002010200000000000000070000000e70672f732f6c2f64622f736c6f74000000010900000000000000030101000000087075626c69632e74000000010000000269640000000770672f696e743401000000023432010000000100000001760000000770672f7465787400010000000100000001760000000770672f7465787401000000000000000100000005746f617374c3fe1fc0fb06d3be2f4e0737205ae2350251e904e913db8f62a6bb0565b52a5f";
 
 #[test]
 fn canonical_encoding_is_stable() {
@@ -424,7 +471,7 @@ fn digest_identity() {
     let event = sample();
     assert_eq!(
         event.digest().unwrap().to_vec(),
-        unhex("d65c365a277a873447b3a7867845dce22956778e52c75f9e2b9d542fad2c8103")
+        unhex("c3fe1fc0fb06d3be2f4e0737205ae2350251e904e913db8f62a6bb0565b52a5f")
     );
     let bytes = event.canonical_bytes().unwrap();
     assert_eq!(
@@ -571,7 +618,7 @@ fn transaction_rejects_mismatched_or_repeated_events() {
     for change in 0..4 {
         let mut changed = event.clone();
         match change {
-            0 => changed.source.slot.push('x'),
+            0 => changed.source.stream.push('x'),
             1 => changed.txn.0.push(0),
             2 => changed.position = Position::new("another stream", vec![]),
             _ => {}
@@ -798,5 +845,33 @@ fn v1_records_are_explicitly_rejected_in_owned_streaming_and_buffer_paths() {
     assert!(matches!(
         SegmentRecord::from_canonical_bytes(&txn),
         Err(FormatError::Event(EventError::UnsupportedVersion(1)))
+    ));
+}
+
+#[test]
+fn v2_records_are_explicitly_rejected_in_owned_streaming_and_buffer_paths() {
+    // Captured v2 event and transaction bytes, including their original digests.
+    let event = unhex(GOLDEN_V2);
+    assert_eq!(
+        Event::from_canonical_bytes(&event),
+        Err(EventError::UnsupportedVersion(2))
+    );
+    assert_eq!(
+        Event::read_canonical(Cursor::new(&event), event.len() as u64),
+        Err(EventError::UnsupportedVersion(2))
+    );
+    let txn = unhex(GOLDEN_TXN_V2);
+    assert_eq!(
+        AssembledTxn::from_canonical_bytes(&txn),
+        Err(EventError::UnsupportedVersion(2))
+    );
+    assert!(matches!(
+        StreamingTxn::from_storage(Cursor::new(&txn)),
+        Err(EventError::UnsupportedVersion(2))
+    ));
+    use skedaddle::buffer::format::{FormatError, SegmentRecord};
+    assert!(matches!(
+        SegmentRecord::from_canonical_bytes(&txn),
+        Err(FormatError::Event(EventError::UnsupportedVersion(2)))
     ));
 }

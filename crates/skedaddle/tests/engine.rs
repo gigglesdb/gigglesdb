@@ -623,7 +623,7 @@ fn copy_table(
             system_id: lineage.system_id.to_string(),
             lineage: lineage.timeline.to_string(),
             db_name: lineage.database.clone(),
-            slot: slot.clone(),
+            stream: slot.clone(),
         };
         let store = Arc::new(ObjectBufferStore::local(
             root.join("buffer"),
@@ -750,6 +750,8 @@ fn copy_table(
             admission,
             journal_objects.clone(),
             serde_json::json!(["engine", id, "wal"]).to_string(),
+            order.clone(),
+            identity.clone(),
         );
         let plan = ChunkPlan::new(table(&id), 1000, vec![])?;
         engine.plan(&plan).await?;
@@ -1109,7 +1111,8 @@ fn copy_table(
                 stream: serde_json::json!(["engine", id, "wal"]).to_string(),
             })).await?;
             assert_eq!(serde_json::to_value(raw.schema_snapshot())?, saved_schema);
-            let buffered_end: u64 = state.progress.get("buffered").ok_or("durable buffered END absent")?.1.parse()?;
+            let position = engine::decode_buffered_position(&state.progress.get("buffered").ok_or("durable buffered END absent")?.1, &identity, &domain)?;
+            let buffered_end = engine::pg_position_lsn(&position, &domain)?;
             assert_eq!(raw.durable_lsn(), buffered_end, "restart must retain acknowledged transaction END after later DML");
             let mut checkpoint = checkpoint.clone();
             checkpoint.durable_lsn = raw.durable_lsn();
@@ -1124,7 +1127,7 @@ fn copy_table(
                 slot_position.get::<_, Option<String>>(0), slot_position.get::<_, Option<String>>(1), slot_position.get::<_, String>(2));
             let transport = Box::pin(source::reconnect(&repl, &checkpoint, std::slice::from_ref(&publication))).await?;
             let (_gate, admission) = tokio::sync::watch::channel(false);
-            let mut capture = PgCapture::new(raw, transport, admission, journal_objects, serde_json::json!(["engine", id, "wal"]).to_string());
+            let mut capture = PgCapture::new(raw, transport, admission, journal_objects, serde_json::json!(["engine", id, "wal"]).to_string(), order.clone(), identity.clone());
             let reader_checkpoint = state.progress.get("applied").map(|(m, _)| engine::decode_reader_checkpoint(m)).transpose()?.unwrap_or_default();
             let inner = applier.inner;
             let mut applier = PgApplier::new(BufferReader::new(store, reader_config, reader_checkpoint, order)?, apply_stream.clone(), inner.destination, inner.plan);

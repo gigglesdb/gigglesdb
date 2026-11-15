@@ -27,6 +27,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     BudgetExceeded(budget::Blocker),
     RecoveryRequired(String),
+    UnsupportedFormatVersion {
+        format: &'static str,
+        found: Option<u16>,
+        expected: u16,
+    },
     Rejected(String),
     Lifecycle(TransitionRejection),
     ReverseProof(reverse::ProofError),
@@ -55,6 +60,14 @@ impl fmt::Display for Error {
             Self::RecoveryRequired(s) => write!(
                 f,
                 "recovery-required: {s}; preserve evidence and restore a verified journal before resuming"
+            ),
+            Self::UnsupportedFormatVersion {
+                format,
+                found,
+                expected,
+            } => write!(
+                f,
+                "unsupported {format} format version {found:?}, expected {expected}; preserve evidence and restore a supported journal before resuming"
             ),
             Self::Rejected(s) => write!(
                 f,

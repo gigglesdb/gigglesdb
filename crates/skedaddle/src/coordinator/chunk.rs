@@ -111,6 +111,20 @@ pub struct ChunkCompletion {
 pub(crate) fn invalid(error: impl std::fmt::Display) -> Error {
     Error::RecoveryRequired(format!("chunk: {error}"))
 }
+fn invalid_format(error: format::FormatError) -> Error {
+    match error {
+        format::FormatError::UnsupportedFormatVersion {
+            format,
+            found,
+            expected,
+        } => Error::UnsupportedFormatVersion {
+            format,
+            found,
+            expected,
+        },
+        other => invalid(other),
+    }
+}
 pub(crate) fn id(chunk: &ChunkRange) -> Result<String> {
     Ok(serde_json::to_string(&chunk.id)?)
 }
@@ -308,7 +322,7 @@ impl Journal {
             .await
             .map_err(invalid)?
             .ok_or_else(|| invalid("ChunkRows manifest is not durable"))?;
-        let entry = format::ManifestEntry::from_canonical_json(&bytes).map_err(invalid)?;
+        let entry = format::ManifestEntry::from_canonical_json(&bytes).map_err(invalid_format)?;
         let segment_key = format::segment_key(
             &buffer.config.prefix,
             &buffer.config.migration_id,
@@ -325,7 +339,7 @@ impl Journal {
             Some(&entry.first_pos),
         );
         if entry.mseq != reference.mseq
-            || entry.digest().map_err(invalid)? != reference.manifest_digest
+            || entry.digest().map_err(invalid_format)? != reference.manifest_digest
             || (entry.segment_key != segment_key && entry.segment_key != equal_h_key)
         {
             return Err(invalid("ChunkRows manifest identity/digest"));
@@ -338,7 +352,10 @@ impl Journal {
             buffer.order.as_ref(),
         )
         .await
-        .map_err(invalid)?;
+        .map_err(|error| match error {
+            reader::Error::Format(error) => invalid_format(error),
+            other => invalid(other),
+        })?;
         let mut identity = Sha256::new();
         identity.update(b"skedaddle-chunk-record-v1\0");
         identity.update(serde_json::to_vec(&chunk.id)?);
@@ -347,7 +364,7 @@ impl Journal {
         let expected: Vec<u8> = identity.finalize().to_vec();
         let position = Position::new(buffer.order.domain(), high.to_be_bytes());
         let mut matches = 0;
-        while let Some(record) = decoder.next_record().map_err(invalid)? {
+        while let Some(record) = decoder.next_record().map_err(invalid_format)? {
             if let format::SegmentRecord::ChunkRows(txn) = record
                 && txn.txn.0 == expected
                 && txn.commit_position == position

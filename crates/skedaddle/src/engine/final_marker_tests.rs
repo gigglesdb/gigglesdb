@@ -32,7 +32,7 @@ fn source() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn marker() -> Marker {
@@ -141,7 +141,7 @@ impl Fixture {
     fn batch() -> Captured {
         Captured {
             transaction: Some(transaction()),
-            durable_lsn: Some(21),
+            durable_position: Some(Position::new(Order.domain(), 21u64.to_be_bytes())),
             ..Default::default()
         }
     }

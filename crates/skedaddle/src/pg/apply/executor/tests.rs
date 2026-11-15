@@ -34,7 +34,7 @@ fn txn(n: u64) -> AssembledTxn {
             system_id: "s".into(),
             lineage: "1".into(),
             db_name: "d".into(),
-            slot: "s".into(),
+            stream: "s".into(),
         },
         TxnId(vec![n as u8]),
         position(n),

@@ -20,7 +20,7 @@ fn heartbeat() -> Watermark {
 async fn durable(capture: &mut PgCapture<Resolver, Transport>) -> Captured {
     loop {
         let batch = capture.step().await.unwrap();
-        if batch.durable_lsn.is_some() {
+        if batch.durable_position.is_some() {
             return batch;
         }
     }

@@ -206,7 +206,7 @@ fn source() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn plan() -> ChunkPlan {
@@ -380,6 +380,8 @@ impl Fixture {
             paused,
             self.journal_objects.clone(),
             serde_json::json!(["engine", "test", "wal"]).to_string(),
+            Arc::new(Order),
+            source(),
         )
     }
     fn applier(
@@ -417,6 +419,350 @@ impl Fixture {
 }
 // Admission is false, so source::step never waits on changed(). A dropped sender
 // is legal in that state; no global state or leaked channel is required.
+
+mod opaque_capture {
+    use super::*;
+    use std::time::Instant;
+
+    struct FrontierOrder;
+    impl PositionOrder for FrontierOrder {
+        fn domain(&self) -> &str {
+            "test-frontier"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::result::Result<Ordering, EventError> {
+            Ok(a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        }
+    }
+
+    fn identity() -> SourceIdentity {
+        SourceIdentity {
+            engine: "test-connector".into(),
+            system_id: "source".into(),
+            lineage: "generation".into(),
+            db_name: "database".into(),
+            stream: "frontier".into(),
+        }
+    }
+    fn transaction(bytes: &[u8]) -> AssembledTxn {
+        AssembledTxn::new(
+            identity(),
+            crate::event::TxnId(bytes.to_vec()),
+            Position::new(FrontierOrder.domain(), bytes),
+            None,
+            vec![],
+        )
+        .unwrap()
+    }
+    struct FrontierCapture {
+        writer: BufferWriter,
+        transactions: VecDeque<AssembledTxn>,
+        // Inject shutdown precisely after admission, before durable publication.
+        // All buffer I/O still goes through the real local object store.
+        interrupt: Option<(Position, oneshot::Sender<()>)>,
+    }
+    impl Capture for FrontierCapture {
+        fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
+            Arc::new(FrontierOrder)
+        }
+        fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
+            self.writer.checkpoint().map(Some).map_err(recovery)
+        }
+        async fn step(&mut self) -> Result<Captured> {
+            let Some(txn) = self.transactions.pop_front() else {
+                return std::future::pending().await;
+            };
+            let position = txn.commit_position.clone();
+            self.publish(position.clone(), txn.clone()).await?;
+            Ok(Captured {
+                transaction: Some(txn),
+                durable_position: Some(position),
+                ..Captured::default()
+            })
+        }
+        async fn publish(
+            &mut self,
+            high: Position,
+            rows: AssembledTxn,
+        ) -> Result<DurableManifestRef> {
+            high.compare(&rows.commit_position, self.position_order().as_ref())
+                .map_err(recovery)?;
+            assert_eq!(high, rows.commit_position);
+            self.writer
+                .append(rows, Instant::now())
+                .await
+                .map_err(recovery)?;
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|(position, _)| position == &high)
+            {
+                self.interrupt.take().unwrap().1.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+            self.writer.seal().await.map_err(recovery)?;
+            let checkpoint = self.writer.checkpoint().map_err(recovery)?;
+            Ok(DurableManifestRef {
+                mseq: checkpoint.next_mseq - 1,
+                manifest_digest: checkpoint.prev_digest,
+            })
+        }
+    }
+    struct Seam {
+        root: PathBuf,
+        store: Arc<ObjectBufferStore>,
+        journal: Journal,
+        engine: Engine,
+    }
+    impl Seam {
+        async fn new() -> Self {
+            let root = PathBuf::from(std::env::var_os("SKEDADDLE_TEST_ROOT").unwrap())
+                .join(format!("opaque-capture-{}", uuid::Uuid::new_v4()));
+            for directory in ["buffer", "journal", "scratch"] {
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+            }
+            let store = Arc::new(
+                ObjectBufferStore::local(root.join("buffer"), Duration::from_secs(3)).unwrap(),
+            );
+            let journal = Journal::new(
+                Arc::new(coordinator::journal::local_store(root.join("journal")).unwrap()),
+                "seam",
+                "test",
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            let mut coordinator = Coordinator::observer(
+                journal.clone(),
+                Local::create(root.join("local")).unwrap(),
+                "seam",
+            )
+            .unwrap();
+            coordinator.acquire().await.unwrap();
+            let engine = Engine::new(coordinator, journal.clone());
+            Self {
+                root,
+                store,
+                journal,
+                engine,
+            }
+        }
+        async fn capture(&self, transactions: VecDeque<AssembledTxn>) -> FrontierCapture {
+            let (progress, _) = std::sync::mpsc::channel();
+            let writer = BufferWriter::open_with_scratch(
+                self.store.clone(),
+                WriterConfig {
+                    prefix: "seam".into(),
+                    migration_id: "test".into(),
+                    stream: "frontier".into(),
+                    epoch: 1,
+                    segment_bytes: 1_000_000,
+                    segment_transactions: 100,
+                    segment_age: Duration::from_secs(60),
+                    max_transaction_bytes: 1_000_000,
+                },
+                Arc::new(FrontierOrder),
+                progress,
+                self.root.join("scratch"),
+            )
+            .await
+            .unwrap();
+            FrontierCapture {
+                writer,
+                transactions,
+                interrupt: None,
+            }
+        }
+        async fn manifest(&self, mseq: u64) -> format::ManifestEntry {
+            let key = format::manifest_key("seam", "test", "frontier", mseq);
+            format::ManifestEntry::from_canonical_json(
+                &self.store.get(&key).await.unwrap().unwrap(),
+            )
+            .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn variable_length_positions_publish_and_round_trip_through_durable_progress() {
+        let seam = Seam::new().await;
+        let first = transaction(&[255]);
+        let last = transaction(&[1, 0, 2]);
+        assert_eq!(
+            first
+                .commit_position
+                .compare(&last.commit_position, &FrontierOrder)
+                .unwrap(),
+            Ordering::Less
+        );
+        let mut capture = seam.capture(VecDeque::new()).await;
+        // Retain two distinct opaque positions in the same segment to exercise
+        // both manifest endpoints, with an order different from byte lexicography.
+        capture
+            .writer
+            .append(first.clone(), Instant::now())
+            .await
+            .unwrap();
+        let reference = capture
+            .publish(last.commit_position.clone(), last.clone())
+            .await
+            .unwrap();
+        let manifest = seam.manifest(reference.mseq).await;
+        assert_eq!(manifest.first_pos, first.commit_position);
+        assert_eq!(manifest.last_pos, last.commit_position);
+        assert_eq!(manifest.txn_count, 2);
+        assert_eq!(manifest.digest().unwrap(), reference.manifest_digest);
+        seam.engine
+            .runtime()
+            .progress_marker(
+                "buffered",
+                "manifest-durable".into(),
+                encode_buffered_position(&identity(), &last.commit_position).unwrap(),
+            )
+            .await
+            .unwrap();
+        seam.engine.runtime().flush_progress().await.unwrap();
+        let saved = seam.journal.load(false).await.unwrap();
+        assert_eq!(
+            decode_buffered_position(
+                &saved.progress["buffered"].1,
+                &identity(),
+                FrontierOrder.domain()
+            )
+            .unwrap(),
+            last.commit_position
+        );
+        drop(capture);
+        let resumed = seam.capture(VecDeque::new()).await;
+        assert_eq!(
+            resumed.writer.checkpoint().unwrap().last_position,
+            Some(last.commit_position)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_mid_publish_step_and_restart_uses_only_durable_boundary() {
+        let seam = Seam::new().await;
+        let durable = transaction(&[255]);
+        let interrupted = transaction(&[1, 0, 2]);
+        let mut capture = seam
+            .capture(VecDeque::from([durable.clone(), interrupted.clone()]))
+            .await;
+        let (entered, publishing) = oneshot::channel();
+        capture.interrupt = Some((interrupted.commit_position.clone(), entered));
+        let (_commands, receive) = mpsc::channel(1);
+        let (stop, stopped) = watch::channel(false);
+        let config = CopyConfig {
+            source: identity(),
+            order_domain: FrontierOrder.domain().into(),
+            schema_version: 1,
+            read_rows: 1,
+            read_bytes: 1024,
+            window_bytes: 1024,
+        };
+        let runtime = seam.engine.runtime();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                capture_loop(&mut capture, receive, stopped, &runtime, &config),
+                async {
+                    publishing.await.unwrap();
+                    stop.send_replace(true);
+                },
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert!(
+            capture.interrupt.is_none(),
+            "shutdown reached the in-flight publish"
+        );
+        assert_eq!(capture.writer.pending_transactions(), 1);
+        runtime.flush_progress().await.unwrap();
+        let saved = seam.journal.load(false).await.unwrap();
+        assert_eq!(
+            decode_buffered_position(
+                &saved.progress["buffered"].1,
+                &identity(),
+                FrontierOrder.domain()
+            )
+            .unwrap(),
+            durable.commit_position
+        );
+        drop(capture);
+        // Discard admitted-but-unpublished state; startup discovers only the
+        // manifest-durable transaction, then accepts redelivery of the suffix.
+        let mut resumed = seam.capture(VecDeque::new()).await;
+        let checkpoint = resumed.writer.checkpoint().unwrap();
+        assert_eq!(checkpoint.next_mseq, 1);
+        assert_eq!(checkpoint.last_position, Some(durable.commit_position));
+        let reference = resumed
+            .publish(interrupted.commit_position.clone(), interrupted.clone())
+            .await
+            .unwrap();
+        assert_eq!(reference.mseq, 1);
+        let manifest = seam.manifest(reference.mseq).await;
+        assert_eq!(manifest.first_pos, interrupted.commit_position);
+        assert_eq!(manifest.last_pos, interrupted.commit_position);
+    }
+}
+
+#[tokio::test]
+async fn publish_rejects_capture_order_different_from_writer() {
+    struct ForeignOrder;
+    impl PositionOrder for ForeignOrder {
+        fn domain(&self) -> &str {
+            "foreign"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> std::result::Result<Ordering, EventError> {
+            Ok(a.cmp(b))
+        }
+    }
+    let f = Fixture::new().await;
+    let (tx, rx) = mpsc::channel(8);
+    let mut capture = f.capture(rx, 10).await;
+    capture
+        .prepare_schema(&f.journal, &f.engine.runtime())
+        .await
+        .unwrap();
+    marker(
+        &tx,
+        Watermark {
+            wm: WatermarkKind::High,
+            chunk: plan().ranges[0].id.clone(),
+            attempt: 1,
+        },
+        20,
+    )
+    .await;
+    let batch = loop {
+        let batch = capture.step().await.unwrap();
+        if batch.durable_position.is_some() {
+            break batch;
+        }
+    };
+    assert_eq!(
+        batch.durable_position,
+        Some(Position::new("engine-test", 21u64.to_be_bytes()))
+    );
+    let checkpoint = capture.writer_checkpoint().unwrap();
+    let mut capture = PgCapture::new(
+        capture.capture,
+        capture.transport,
+        capture.buffer_paused,
+        f.journal_objects.clone(),
+        serde_json::json!(["engine", "test", "wal"]).to_string(),
+        Arc::new(ForeignOrder),
+        source(),
+    );
+    let rows = batch.transaction.unwrap();
+    let high = rows.commit_position.clone();
+    let error = capture.publish(high, rows).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("PostgreSQL position order domain mismatch"),
+        "{error}"
+    );
+    assert_eq!(capture.writer_checkpoint().unwrap(), checkpoint);
+}
 
 #[tokio::test]
 async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() {
@@ -518,6 +864,8 @@ async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() 
         admitted,
         f.journal_objects.clone(),
         serde_json::json!(["engine", "test", "wal"]).to_string(),
+        Arc::new(Order),
+        source(),
     );
     // Count dropped steps independently of the writer's retained PUT handles.
     // Shutdown may cancel the final idle transport read; schema ticks may not.
@@ -531,6 +879,9 @@ async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() 
     }
     struct CountedCapture(PgCapture<Resolver, Transport>, Arc<AtomicU64>);
     impl Capture for CountedCapture {
+        fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
+            self.0.position_order()
+        }
         async fn prepare_schema(&mut self, journal: &Journal, runtime: &Runtime) -> Result<()> {
             self.0.prepare_schema(journal, runtime).await
         }
@@ -549,7 +900,11 @@ async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() 
             guard.1 = true;
             result
         }
-        async fn publish(&mut self, high: u64, rows: AssembledTxn) -> Result<DurableManifestRef> {
+        async fn publish(
+            &mut self,
+            high: Position,
+            rows: AssembledTxn,
+        ) -> Result<DurableManifestRef> {
             self.0.publish(high, rows).await
         }
     }
@@ -827,9 +1182,13 @@ async fn pause_resume_keeps_markers_and_restarts_an_unfinished_chunk() {
     let mut capture = f
         .capture(
             rx2,
-            old.progress
-                .get("buffered")
-                .map_or(10, |(_, p)| p.parse().unwrap()),
+            old.progress.get("buffered").map_or(10, |(_, p)| {
+                pg_position_lsn(
+                    &decode_buffered_position(p, &source(), Order.domain()).unwrap(),
+                    Order.domain(),
+                )
+                .unwrap()
+            }),
         )
         .await;
     let checkpoint = old
@@ -963,6 +1322,9 @@ async fn copy_throttle_never_stalls_capture() {
         durable: bool,
     }
     impl<C: Capture> Capture for ProgressCapture<C> {
+        fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync> {
+            self.inner.position_order()
+        }
         async fn prepare_schema(&mut self, journal: &Journal, runtime: &Runtime) -> Result<()> {
             self.inner.prepare_schema(journal, runtime).await
         }
@@ -984,10 +1346,14 @@ async fn copy_throttle_never_stalls_capture() {
                 signal.send(()).expect("buffered observer alive");
             }
             let batch = self.inner.step().await?;
-            self.durable |= batch.durable_lsn.is_some();
+            self.durable |= batch.durable_position.is_some();
             Ok(batch)
         }
-        async fn publish(&mut self, high: u64, rows: AssembledTxn) -> Result<DurableManifestRef> {
+        async fn publish(
+            &mut self,
+            high: Position,
+            rows: AssembledTxn,
+        ) -> Result<DurableManifestRef> {
             self.inner.publish(high, rows).await
         }
     }
@@ -1170,9 +1536,13 @@ async fn abrupt_crash_mid_chunk_replays_started_and_redoes_the_chunk() {
     let mut capture = f
         .capture(
             rx,
-            old.progress
-                .get("buffered")
-                .map_or(10, |(_, p)| p.parse().unwrap()),
+            old.progress.get("buffered").map_or(10, |(_, p)| {
+                pg_position_lsn(
+                    &decode_buffered_position(p, &source(), Order.domain()).unwrap(),
+                    Order.domain(),
+                )
+                .unwrap()
+            }),
         )
         .await;
     let checkpoint = old
@@ -1396,6 +1766,10 @@ async fn source_feedback_waits_for_durable_coalesced_buffered_progress() {
         slot: "slot".into(),
         durable_lsn: 10,
     };
+    assert_eq!(
+        super::pg::durable_feedback_lsn(&runtime, 30, 0, &source(), Order.domain()).unwrap(),
+        0
+    );
     runtime
         .marker(
             "source-slot",
@@ -1404,14 +1778,29 @@ async fn source_feedback_waits_for_durable_coalesced_buffered_progress() {
         )
         .await
         .unwrap();
+    let identity = source();
     let seen = Arc::new(std::sync::Mutex::new(vec![]));
     let mut probe = Probe(seen.clone());
-    let mut transport = super::pg::DurableFeedbackTransport::new(&mut probe, Some(&runtime), 0);
+    let mut transport = super::pg::DurableFeedbackTransport::new(
+        &mut probe,
+        Some(&runtime),
+        0,
+        &identity,
+        Order.domain(),
+    );
     source::Transport::next(&mut transport, 30).await.unwrap();
     runtime.2.persistence.lock().unwrap().last_flush =
         std::time::Instant::now() + Duration::from_secs(60);
     runtime
-        .progress_marker("buffered", "manifest-durable".into(), "20".into())
+        .progress_marker(
+            "buffered",
+            "manifest-durable".into(),
+            encode_buffered_position(
+                &identity,
+                &Position::new(Order.domain(), 20u64.to_be_bytes()),
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     source::Transport::next(&mut transport, 30).await.unwrap();
@@ -1431,18 +1820,109 @@ async fn source_feedback_waits_for_durable_coalesced_buffered_progress() {
     // A recovered prefix is independently durable even when the last batched
     // marker lags it; never send feedback behind this connection's start.
     let mut resumed_probe = Probe(seen.clone());
-    let mut resumed =
-        super::pg::DurableFeedbackTransport::new(&mut resumed_probe, Some(&runtime), 25);
+    let mut resumed = super::pg::DurableFeedbackTransport::new(
+        &mut resumed_probe,
+        Some(&runtime),
+        25,
+        &identity,
+        Order.domain(),
+    );
     source::Transport::next(&mut resumed, 30).await.unwrap();
     assert_eq!(*seen.lock().unwrap(), vec![10, 10, 20, 15, 25]);
-    runtime
-        .marker("buffered", "manifest-durable".into(), "invalid".into())
-        .await
-        .unwrap();
-    assert!(source::Transport::next(&mut transport, 30).await.is_err());
+    for payload in [
+        "invalid".to_string(),
+        "20".into(),
+        "{}".into(),
+        r#"{"version":2}"#.into(),
+        encode_buffered_position(&identity, &Position::new("foreign", [0; 8])).unwrap(),
+    ] {
+        runtime
+            .marker("buffered", "manifest-durable".into(), payload)
+            .await
+            .unwrap();
+        assert!(matches!(
+            source::Transport::next(&mut transport, 30).await,
+            Err(source::Error::SchemaJournal(
+                coordinator::Error::RecoveryRequired(_)
+            ))
+        ));
+    }
     assert_eq!(
         seen.lock().unwrap().len(),
         5,
         "invalid evidence sends no feedback"
     );
+}
+
+#[test]
+fn buffered_progress_round_trip_preserves_opaque_bytes_and_rejects_rebinding() {
+    let position = Position::new(Order.domain(), [1, 2, 3]);
+    let payload = encode_buffered_position(&source(), &position).unwrap();
+    assert_eq!(
+        decode_buffered_position(&payload, &source(), Order.domain()).unwrap(),
+        position
+    );
+    assert_eq!(
+        decode_buffered_position(&payload, &source(), "foreign"),
+        Err(BufferedProgressError::OrderDomainMismatch)
+    );
+    let mut foreign = source();
+    foreign.stream.push('x');
+    assert_eq!(
+        decode_buffered_position(&payload, &foreign, Order.domain()),
+        Err(BufferedProgressError::SourceMismatch)
+    );
+}
+
+#[test]
+fn obsolete_buffered_progress_is_typed_and_requires_recovery() {
+    for (payload, expected) in [
+        ("123", BufferedProgressError::MissingVersion),
+        ("{}", BufferedProgressError::MissingVersion),
+        (
+            r#"{"version":2}"#,
+            BufferedProgressError::UnsupportedVersion(2),
+        ),
+    ] {
+        let error = decode_buffered_position(payload, &source(), Order.domain()).unwrap_err();
+        assert_eq!(error, expected);
+        assert!(matches!(
+            coordinator::Error::from(error),
+            coordinator::Error::RecoveryRequired(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn obsolete_buffered_progress_blocks_worker_admission() {
+    let f = Fixture::new().await;
+    let (tx, rx) = mpsc::channel(32);
+    let mut capture = f.capture(rx, 10).await;
+    let mut applier = f.applier(Arc::new(AtomicU64::new(0)), ReaderCheckpoint::default());
+    let mut database = f.database(tx, Arc::new(AtomicU64::new(0)));
+    let (_pause, paused) = watch::channel(false);
+    let mut budget = budget();
+    for payload in ["123", "{}", r#"{"version":2}"#] {
+        f.engine
+            .runtime()
+            .marker("buffered", "manifest-durable".into(), payload.into())
+            .await
+            .unwrap();
+        let result = f
+            .engine
+            .run(
+                &mut capture,
+                &mut database,
+                &mut applier,
+                config(),
+                &mut budget,
+                paused.clone(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(coordinator::Error::RecoveryRequired(_))
+        ));
+        assert_eq!(capture.capture.writer().checkpoint().unwrap().next_mseq, 0);
+    }
 }

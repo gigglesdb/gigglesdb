@@ -318,7 +318,7 @@ fn scratch_assembler(root: &std::path::Path) -> skedaddle::buffer::writer::Trans
             system_id: "test".into(),
             lineage: "test".into(),
             db_name: "db".into(),
-            slot: "slot".into(),
+            stream: "slot".into(),
         },
         TxnId(vec![1]),
         Position::new("fsconfine", vec![1]),
@@ -428,7 +428,7 @@ async fn writer_and_assembler_pin_scratch_and_refuse_junction_roots() {
                 system_id: "test".into(),
                 lineage: "test".into(),
                 db_name: "db".into(),
-                slot: "slot".into()
+                stream: "slot".into()
             },
             TxnId(vec![1]),
             Position::new("fsconfine", vec![1]),

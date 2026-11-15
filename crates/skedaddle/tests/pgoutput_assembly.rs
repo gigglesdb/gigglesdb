@@ -14,7 +14,7 @@ fn source() -> SourceIdentity {
         system_id: "123".into(),
         lineage: "timeline-1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn assembler(bytes: u64, events: usize) -> TransactionAssembler {

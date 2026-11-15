@@ -1090,7 +1090,7 @@ fn live_reverse_capture_buffers_and_resumes_the_durable_manifest() {
             system_id: "live-fixture".into(),
             lineage: "1".into(),
             db_name: "destination".into(),
-            slot: f.config.slot(),
+            stream: f.config.slot(),
         };
         let resolver = |_: &skedaddle::pg::pgoutput::Relation<'_>,
                         c: &skedaddle::pg::pgoutput::RelationColumn<'_>|

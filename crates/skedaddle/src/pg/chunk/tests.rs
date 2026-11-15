@@ -51,7 +51,7 @@ fn source() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "test".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn event(kind: EventKind, old: i32, new: Option<i32>) -> Event {

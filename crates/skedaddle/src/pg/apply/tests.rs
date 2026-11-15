@@ -56,7 +56,7 @@ fn transaction(kind: EventKind, after: Option<Row>) -> AssembledTxn {
         system_id: "system".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     };
     let event = Event {
         source: source.clone(),

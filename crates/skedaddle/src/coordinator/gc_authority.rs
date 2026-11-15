@@ -16,7 +16,7 @@ use super::{Error, Result, Transition, epoch::Coordinator};
 use crate::{
     buffer::{
         backends::{self, BufferStore},
-        format::{CHECKPOINT_VERSION, ManifestEntry, RecordBoundary},
+        format::{CHECKPOINT_VERSION, FormatError, ManifestEntry, RecordBoundary},
         gc::{GcIntent, GcJournal, GcReason},
         reader::{self, ReaderCheckpoint, ReaderConfig},
         writer::{DurableManifestRef, RetainedRedelivery, WriterCheckpoint},
@@ -40,17 +40,17 @@ fn source(s: &SourceIdentity) -> WireSource {
         s.system_id.clone(),
         s.lineage.clone(),
         s.db_name.clone(),
-        s.slot.clone(),
+        s.stream.clone(),
     ]
 }
 fn restore_source(s: WireSource) -> SourceIdentity {
-    let [engine, system_id, lineage, db_name, slot] = s;
+    let [engine, system_id, lineage, db_name, stream] = s;
     SourceIdentity {
         engine,
         system_id,
         lineage,
         db_name,
-        slot,
+        stream,
     }
 }
 fn rejected(message: &str) -> Error {
@@ -508,8 +508,18 @@ impl CoordinatorGcJournal {
             .await
             .map_err(AuthorizationError::Manifest)?
             .ok_or_else(|| rejected("retained manifest missing"))?;
-        let entry =
-            ManifestEntry::from_canonical_json(&bytes).map_err(|_| rejected("invalid manifest"))?;
+        let entry = ManifestEntry::from_canonical_json(&bytes).map_err(|error| match error {
+            FormatError::UnsupportedFormatVersion {
+                format,
+                found,
+                expected,
+            } => Error::UnsupportedFormatVersion {
+                format,
+                found,
+                expected,
+            },
+            _ => rejected("invalid manifest"),
+        })?;
         if entry.mseq != mseq
             || entry.epoch > self.epoch
             || entry.digest().map_err(|_| rejected("manifest digest"))? != manifest_digest
@@ -606,6 +616,7 @@ pub fn coordinator_gc_error(error: Error) -> reader::Error {
         // Other local-core failures include corrupt/fenced state. Postgres is
         // not used by this authority; fail closed for unexpected variants.
         Error::RecoveryRequired(_)
+        | Error::UnsupportedFormatVersion { .. }
         | Error::Rejected(_)
         | Error::Lifecycle(_)
         | Error::ReverseProof(_)

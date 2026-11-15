@@ -35,7 +35,7 @@ fn txn(n: u64) -> AssembledTxn {
             system_id: "s".into(),
             lineage: "l".into(),
             db_name: "d".into(),
-            slot: "s".into(),
+            stream: "s".into(),
         },
         TxnId(n.to_be_bytes().to_vec()),
         pos(n),
@@ -568,10 +568,19 @@ async fn checkpoint_rejects_obsolete_missing_or_inconsistent_record_boundary() {
     let mut writer = open(store, c.clone()).await;
     append(&mut writer, 5).await;
     let checkpoint = writer.checkpoint().unwrap();
-    for mode in 0..3 {
+    for version in [1, 2] {
+        let mut obsolete = checkpoint.clone();
+        obsolete.version = version;
+        assert!(matches!(
+            resume(local(), c.clone(), obsolete).await,
+            Err(Error::Format(skedaddle::buffer::format::FormatError::UnsupportedFormatVersion {
+                format: "writer-checkpoint", found: Some(found), expected: 3,
+            })) if found == version
+        ));
+    }
+    for mode in 1..3 {
         let mut invalid = checkpoint.clone();
         match mode {
-            0 => invalid.version = 1,
             1 => invalid.last_record = None,
             _ => invalid.last_record.as_mut().unwrap().source.lineage = "foreign".into(),
         }

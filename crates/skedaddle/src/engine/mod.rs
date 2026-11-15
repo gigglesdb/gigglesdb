@@ -34,7 +34,7 @@ use crate::{
         epoch::Coordinator,
         journal::Journal,
     },
-    event::{AssembledTxn, Row, SourceIdentity},
+    event::{AssembledTxn, Position, PositionOrder, Row, SourceIdentity},
     pg::{
         chunk::{ChunkRange, Watermark, WatermarkKind, Window},
         source,
@@ -44,6 +44,75 @@ use crate::{
 pub type Result<T> = coordinator::Result<T>;
 fn recovery(reason: impl std::fmt::Display) -> coordinator::Error {
     coordinator::Error::RecoveryRequired(reason.to_string())
+}
+
+/// Typed rejection of an obsolete or rebound authoritative buffered position.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BufferedProgressError {
+    MissingVersion,
+    UnsupportedVersion(u64),
+    InvalidPayload,
+    SourceMismatch,
+    OrderDomainMismatch,
+}
+impl std::fmt::Display for BufferedProgressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "buffered progress: {self:?}; recovery required")
+    }
+}
+impl std::error::Error for BufferedProgressError {}
+impl From<BufferedProgressError> for coordinator::Error {
+    fn from(error: BufferedProgressError) -> Self {
+        recovery(error)
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BufferedProgress {
+    version: u64,
+    source: [String; 5],
+    position: crate::event::PositionWireV1,
+}
+fn progress_source(source: &SourceIdentity) -> [String; 5] {
+    [
+        source.engine.clone(),
+        source.system_id.clone(),
+        source.lineage.clone(),
+        source.db_name.clone(),
+        source.stream.clone(),
+    ]
+}
+pub fn encode_buffered_position(source: &SourceIdentity, position: &Position) -> Result<String> {
+    Ok(serde_json::to_string(&BufferedProgress {
+        version: 1,
+        source: progress_source(source),
+        position: position.into(),
+    })?)
+}
+pub fn decode_buffered_position(
+    payload: &str,
+    source: &SourceIdentity,
+    domain: &str,
+) -> std::result::Result<Position, BufferedProgressError> {
+    use BufferedProgressError::*;
+    let json: serde_json::Value = serde_json::from_str(payload).map_err(|_| InvalidPayload)?;
+    let version = json
+        .get("version")
+        .ok_or(MissingVersion)?
+        .as_u64()
+        .ok_or(InvalidPayload)?;
+    if version != 1 {
+        return Err(UnsupportedVersion(version));
+    }
+    let value: BufferedProgress = serde_json::from_str(payload).map_err(|_| InvalidPayload)?;
+    if value.source != progress_source(source) {
+        return Err(SourceMismatch);
+    }
+    let position = Position::try_from(value.position).map_err(|_| InvalidPayload)?;
+    if position.order_domain() != domain {
+        return Err(OrderDomainMismatch);
+    }
+    Ok(position)
 }
 
 /// All four effects must be idempotent and verify an existing installation.
@@ -83,10 +152,12 @@ pub trait Installer {
 pub struct Captured {
     pub transaction: Option<AssembledTxn>,
     pub watermarks: Vec<source::Watermark>,
-    pub durable_lsn: Option<u64>,
+    /// Connector-durable restart/ack boundary, which may follow the commit.
+    pub durable_position: Option<Position>,
     pub stop: bool,
 }
 pub trait Capture {
+    fn position_order(&self) -> Arc<dyn PositionOrder + Send + Sync>;
     /// Restore schema state before any worker or marker is admitted. Stateless
     /// adapters may use this default; schema-aware wrappers must forward it.
     fn prepare_schema(
@@ -118,7 +189,7 @@ pub trait Capture {
     fn step(&mut self) -> impl Future<Output = Result<Captured>>;
     fn publish(
         &mut self,
-        high: u64,
+        high: Position,
         rows: AssembledTxn,
     ) -> impl Future<Output = Result<DurableManifestRef>>;
 }
@@ -218,23 +289,6 @@ impl Runtime {
         }
         Ok(())
     }
-    // Source WAL feedback must never acknowledge a volatile buffered marker.
-    // Missing progress conservatively retains WAL at the durable slot baseline.
-    fn durable_feedback_lsn(&self, captured: u64, restored_floor: u64) -> source::Result<u64> {
-        let state = self.1.read().expect("engine snapshot poisoned");
-        let bad = || source::Error::RecoveryRequired("invalid durable capture feedback marker");
-        let durable = if let Some((_, position)) = state.progress.get("buffered") {
-            position.parse::<u64>().map_err(|_| bad())?
-        } else if let Some((marker, _)) = state.progress.get("source-slot") {
-            decode_source_checkpoint(marker)
-                .map_err(|_| bad())?
-                .durable_lsn
-        } else {
-            0
-        };
-        Ok(captured.min(durable.max(restored_floor)))
-    }
-
     async fn progress_marker(&self, stream: &str, marker: String, position: String) -> Result<()> {
         if matches!(stream, "applied" | "buffered") {
             let mut coordinator = self.0.lock().await;
@@ -599,6 +653,16 @@ impl Engine {
             *self.runtime.2.write().expect("engine health poisoned") = false;
             if !self.runtime.0.lock().await.is_owner() {
                 return Err(coordinator::Error::Observer);
+            }
+            let order = capture.position_order();
+            if order.domain() != config.order_domain {
+                return Err(BufferedProgressError::OrderDomainMismatch.into());
+            }
+            if let Some((_, payload)) = self.runtime.snapshot().progress.get("buffered") {
+                let position = decode_buffered_position(payload, &config.source, order.domain())?;
+                position
+                    .compare(&position, order.as_ref())
+                    .map_err(recovery)?;
             }
             Box::pin(capture.prepare_schema(&self.journal, &self.runtime)).await?;
             self.runtime
@@ -1120,12 +1184,23 @@ fn capture_loop(
             runtime.6.observe(&batch);
             runtime.7.observe(&batch);
             let checkpoint = capture.writer_checkpoint()?;
-            if let Some(lsn) = batch.durable_lsn {
+            if let Some(position) = &batch.durable_position {
+                let order = capture.position_order();
+                if batch
+                    .transaction
+                    .as_ref()
+                    .is_none_or(|txn| txn.source != config.source)
+                {
+                    return Err(BufferedProgressError::SourceMismatch.into());
+                }
+                position
+                    .compare(position, order.as_ref())
+                    .map_err(recovery)?;
                 runtime
                     .progress_marker(
                         "buffered",
                         capture.buffered_marker(&batch)?,
-                        lsn.to_string(),
+                        encode_buffered_position(&config.source, position)?,
                     )
                     .await?;
             }
@@ -1179,7 +1254,8 @@ fn capture_loop(
                     unreachable!()
                 };
                 // No next capture step can pass H until this durable hook returns.
-                let reference = capture.publish(high, rows).await?;
+                let position = Position::new(capture.position_order().domain(), high.to_be_bytes());
+                let reference = capture.publish(position, rows).await?;
                 runtime.queue_writer(capture.writer_checkpoint()?).await;
                 let _ = current.complete.send(Ok((high, reference)));
                 // Do not publish post-H WAL until Done is visible to the

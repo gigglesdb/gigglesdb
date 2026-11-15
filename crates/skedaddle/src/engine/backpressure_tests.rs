@@ -118,6 +118,8 @@ async fn capture_backpressure_retains_duplex_input_for_each_independent_bound() 
             paused,
             f.journal_objects.clone(),
             serde_json::json!(["engine", "test", "wal"]).to_string(),
+            Arc::new(Order),
+            source(),
         );
         let mut committed = Vec::new();
         for _ in 0..3 {

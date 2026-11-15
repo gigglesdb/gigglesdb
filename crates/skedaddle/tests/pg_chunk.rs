@@ -174,7 +174,7 @@ impl Fixture {
             system_id: "harness".into(),
             lineage: "harness".into(),
             db_name: self.id.clone(),
-            slot: self.slot.clone(),
+            stream: self.slot.clone(),
         }
     }
     async fn emit(&self, chunk: &ChunkRange, wm: WatermarkKind, attempt: u64) -> TestResult {

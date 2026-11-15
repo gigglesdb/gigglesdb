@@ -21,7 +21,7 @@ use skedaddle::{
         journal::{self, Entry, Journal},
         local::Local,
     },
-    engine::{Engine, Runtime},
+    engine::{Engine, Runtime, encode_buffered_position},
     event::{AssembledTxn, EventError, Position, PositionOrder, SourceIdentity, TxnId},
     pg::{
         chunk,
@@ -252,7 +252,7 @@ fn source_id() -> SourceIdentity {
         system_id: "1".into(),
         lineage: "1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 type Resolver = fn(&Relation<'_>, &RelationColumn<'_>) -> source::Result<ColumnMapping>;
@@ -1091,6 +1091,7 @@ async fn buffered_end_restore_uses_only_durable_matching_writer_evidence() {
     for mode in [
         "bound",
         "legacy",
+        "legacy-position",
         "cancelled",
         "absent",
         "retired",
@@ -1110,8 +1111,14 @@ async fn buffered_end_restore_uses_only_durable_matching_writer_evidence() {
             _ => marker,
         };
         if mode != "cancelled" {
+            let position = if mode == "legacy-position" {
+                "41".into()
+            } else {
+                encode_buffered_position(&source_id(), &Position::new(DOMAIN, 41_u64.to_be_bytes()))
+                    .unwrap()
+            };
             e.runtime()
-                .marker("buffered", marker, "41".into())
+                .marker("buffered", marker, position)
                 .await
                 .unwrap();
         }
@@ -1139,6 +1146,15 @@ async fn buffered_end_restore_uses_only_durable_matching_writer_evidence() {
         let e = f.owner().await;
         let mut c = f.capture(e.runtime().state().await.epoch, saved).await;
         let restored = c.restore_schema(f.binding(e.runtime())).await;
+        if mode == "legacy-position" {
+            assert!(matches!(
+                restored,
+                Err(source::Error::SchemaJournal(
+                    skedaddle::coordinator::Error::RecoveryRequired(reason)
+                )) if reason.contains("MissingVersion")
+            ));
+            continue;
+        }
         if mode == "conflict" {
             assert!(restored.is_err());
             continue;

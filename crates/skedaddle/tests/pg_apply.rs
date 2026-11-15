@@ -31,7 +31,7 @@ fn pgoutput_truncate_and_origin_survive_assembly_canonical_storage_and_planning(
         system_id: "source".into(),
         lineage: "1".into(),
         db_name: "source".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     };
     let mut assembler = TransactionAssembler::new(source, "pg/source", 10000, 10).unwrap();
     assembler
@@ -276,7 +276,7 @@ impl Fixture {
             system_id: "fixture".into(),
             lineage: "1".into(),
             db_name: "harness".into(),
-            slot: self.id.clone(),
+            stream: self.id.clone(),
         };
         let value = |name: &str, value: Value| -> OpaqueValue {
             OpaqueValue {
@@ -667,7 +667,7 @@ async fn digest_mismatch_on_skip_is_error() -> TestResult<()> {
                 system_id: "fixture".into(),
                 lineage: "1".into(),
                 db_name: "harness".into(),
-                slot: fixture.id.clone(),
+                stream: fixture.id.clone(),
             },
             TxnId(vec![2]),
             Position::new(&fixture.id, (plan.progress.lsn + 1).to_be_bytes()),

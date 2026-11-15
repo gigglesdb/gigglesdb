@@ -188,7 +188,7 @@ fn source() -> SourceIdentity {
         system_id: "s".into(),
         lineage: "t1".into(),
         db_name: "db".into(),
-        slot: "slot".into(),
+        stream: "slot".into(),
     }
 }
 fn pos(n: u64) -> Position {
@@ -809,7 +809,7 @@ async fn size_sealing_uses_the_actual_encoded_segment_bytes() {
     }
 }
 
-// Independent decoder for the v1 segment / v2 transaction fixture. It uses
+// Independent decoder for the v2 segment / v3 transaction fixture. It uses
 // no product encoder/decoder, checks every field and payload byte, and hashes
 // both envelopes independently with fixed stack buffers.
 struct Independent<R> {
@@ -858,7 +858,7 @@ fn independently_decode(file: std::fs::File, manifest: &ManifestEntry, expected:
         transaction: None,
     };
     r.expect(b"SKEDSEG\0");
-    r.expect(&1_u16.to_be_bytes());
+    r.expect(&2_u16.to_be_bytes());
     let header_len = u32::from_be_bytes(r.bytes());
     assert_eq!(header_len, 85);
     r.field(b"migration");
@@ -870,13 +870,13 @@ fn independently_decode(file: std::fs::File, manifest: &ManifestEntry, expected:
     let length = u64::from_be_bytes(r.bytes());
     assert!(length >= 300_000_000);
     r.transaction = Some(sha2::Sha256::new());
-    r.expect(b"SKEV\0\x02\x02");
+    r.expect(b"SKEV\0\x03\x02");
     r.source();
     r.field(&5_u64.to_be_bytes());
     r.position();
     r.expect(&[1]);
     r.expect(&42_i64.to_be_bytes());
-    r.expect(&[0]); // v2 transaction source origin is absent in this fixture.
+    r.expect(&[0]); // v3 transaction source origin is absent in this fixture.
     r.expect(&4800_u32.to_be_bytes());
     for ordinal in 0..4800_u64 {
         r.source();

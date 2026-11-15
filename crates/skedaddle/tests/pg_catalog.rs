@@ -899,7 +899,7 @@ async fn live_server_planner_range_and_transaction_qualification() -> TestResult
         }
         // Invoke the actual borrowing async planner with real old/new keys.
         let c=&catalogs[0];let rows=&ordered[0];
-        let identity=SourceIdentity{engine:"pg".into(),system_id:"k2b".into(),lineage:"k2b".into(),db_name:"test".into(),slot:"test".into()};
+        let identity=SourceIdentity{engine:"pg".into(),system_id:"k2b".into(),lineage:"k2b".into(),db_name:"test".into(),stream:"test".into()};
         let txnid=TxnId(b"k2b".to_vec());
         for lsn in [100,101] {
             let event=Event{source:identity.clone(),txn:txnid.clone(),ordinal_in_txn:0,position:pos(lsn),schema_version:7,kind:EventKind::Update,table:Some(c.key.table.clone()),key:rows[0].clone(),before:Some(rows[0].clone()),after:Some(rows[1].clone()),unchanged_cols:Default::default()};
