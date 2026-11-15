@@ -225,6 +225,30 @@ async fn prepare(definition: &MigrationDefinition) -> Result<Prepared, Failure> 
         ))
         .await
         .map_err(|_| infrastructure())?;
+        // Optional early review when the operator supplied destination IDs.
+        // Empty/legacy definitions remain valid; rollback always checks again.
+        if !definition
+            .fence_plan
+            .acknowledged_destination_residual_risks
+            .is_empty()
+        {
+            let scope = definition
+                .selected_objects
+                .iter()
+                .map(|o| format!("{}.{}", cutover::ident(&o.schema), cutover::ident(&o.name)))
+                .collect::<Vec<_>>();
+            let risks = crate::pg::fence::inventory::collect_destination(
+                &destination.client,
+                &scope,
+                &definition.fence_plan.application_roles,
+            )
+            .await
+            .map_err(|_| infrastructure())?;
+            crate::pg::fence::inventory::destination_acknowledgments(
+                &risks, &definition.fence_plan.acknowledged_destination_residual_risks,
+            ).map_err(|error| failure(FailureKind::Blocked, &redactor.redact(&error),
+                "Refresh the destination inventory and review exact destination IDs before rollback."))?;
+        }
         let mut tables = Vec::new();
         for (object, catalog_object) in definition.selected_objects.iter().zip(&catalog_objects) {
             if object.kind != ObjectKind::Table {

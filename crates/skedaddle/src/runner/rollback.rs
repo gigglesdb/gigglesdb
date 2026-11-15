@@ -155,6 +155,23 @@ pub(super) async fn run_with_driver(
             }))
         }
         Err(crate::cutover::Error::LostOwnership) => Err(coordinator::Error::LostOwnership),
+        Err(crate::cutover::Error::Component(reason))
+            if reason.starts_with("fence_plan.acknowledged_destination_residual_risks:") =>
+        {
+            runtime.refresh_owner().await?;
+            runtime
+                .marker(
+                    OPERATOR,
+                    reason.clone(),
+                    state.rollback.as_ref().expect("admitted").request.clone(),
+                )
+                .await?;
+            let state = runtime.state().await;
+            Ok(Some(VerifyResponse {
+                exit_code: 5,
+                data: json!({"complete":false,"error":{"kind":"destination_fence_inventory","message":reason},"rollback":status(&state)}),
+            }))
+        }
         Err(crate::cutover::Error::Component(_) | crate::cutover::Error::Journal(_)) => {
             Err(coordinator::Error::RecoveryRequired(
                 "rollback infrastructure unavailable; retrying durable admission".into(),
@@ -193,10 +210,33 @@ pub fn status(state: &Materialized) -> serde_json::Value {
         }
         _ => "in-progress",
     };
+    let stream = json!(["rollback-driver-v1", checkpoint.request, "destination"]).to_string();
+    let records = state
+        .progress
+        .get(&stream)
+        .and_then(|(value, _)| serde_json::from_str::<Vec<crate::cutover::Record>>(value).ok());
+    let fence = records.as_ref().and_then(|records| {
+        records.iter().rev().find_map(|record| match record {
+            crate::cutover::Record::Source(
+                crate::pg::fence::Intent::Step(fence)
+                | crate::pg::fence::Intent::Save(fence)
+                | crate::pg::fence::Intent::Unfence(fence),
+            ) => Some(fence),
+            _ => None,
+        })
+    });
+    let operator_reason = state
+        .progress
+        .get(OPERATOR)
+        .filter(|(_, request)| request == &checkpoint.request)
+        .map(|(reason, _)| reason);
     json!({"request":checkpoint.request,"step":checkpoint.next,
         "intent":checkpoint.intent,"deadline_at_ms":checkpoint.deadline_at_ms,
         "point_of_no_return":checkpoint.point_of_no_return,
-        "final_marker":checkpoint.final_marker,"outcome":outcome})
+        "final_marker":checkpoint.final_marker,"outcome":outcome,
+        "operator_reason":operator_reason,
+        "destination_fence_acknowledgments":fence.map(|f| &f.config.acknowledged),
+        "destination_fence_residuals":fence.map(|f| &f.residuals)})
 }
 
 #[cfg(test)]
@@ -230,6 +270,44 @@ mod tests {
         assert_eq!(status(&state)["outcome"], "in-progress");
         state.lifecycle.state = State::RollbackWindow;
         assert_eq!(status(&state)["outcome"], "deadline-aborted");
+        let principal = crate::pg::fence::ResidualPrincipal {
+            role: "destination_owner".into(),
+            kind: crate::pg::fence::ResidualKind::TableOwner,
+        };
+        let mut fence = crate::pg::fence::Fence::new(crate::pg::fence::FenceConfig {
+            epoch: 1,
+            applications: ["app".into()].into(),
+            tables: vec![crate::pg::fence::Table {
+                schema: "s".into(),
+                name: "t".into(),
+                owner: "destination_owner".into(),
+            }],
+            acknowledged: [principal.clone()].into(),
+            deadline_ms: 1000,
+        })
+        .unwrap();
+        fence.residuals.push(crate::pg::fence::Residual {
+            principal,
+            acknowledged: true,
+        });
+        state.progress.insert(
+            json!(["rollback-driver-v1", "request", "destination"]).to_string(),
+            (
+                serde_json::to_string(&vec![crate::cutover::Record::Source(
+                    crate::pg::fence::Intent::Step(Box::new(fence)),
+                )])
+                .unwrap(),
+                "native".into(),
+            ),
+        );
+        assert_eq!(
+            status(&state)["destination_fence_residuals"][0]["acknowledged"],
+            true
+        );
+        assert_eq!(
+            status(&state)["destination_fence_acknowledgments"][0]["role"],
+            "destination_owner"
+        );
     }
     #[test]
     fn refuses_every_non_window_state_without_mutating_materialized_state() {

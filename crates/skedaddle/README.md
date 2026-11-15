@@ -223,9 +223,23 @@ parameters or fragments. Definitions alone do not qualify remote runner assembly
 | `buffer_retention.max_seconds` | Retention upper bound, consistent with the minimum. |
 | `buffer_retention.retain_on_failure` | Requested failure-retention policy. |
 | `fence_plan.application_roles` | Nonempty application principals to fence. |
-| `fence_plan.acknowledged_residual_risks` | Acknowledgments, not mitigation by themselves. |
+| `fence_plan.acknowledged_residual_risks` | Exact source inventory IDs. Acknowledgments, not mitigation by themselves. |
+| `fence_plan.acknowledged_destination_residual_risks` | Optional array of exact destination inventory ID strings, independently reviewed for rollback; defaults to empty. |
 
 ### Hooks and rollback
+
+Rollback inventories the live destination before creating its native fence.
+Review its exact inventory IDs (including migration principals) in
+`fence_plan.acknowledged_destination_residual_risks`; source acknowledgments do
+not authorize destination risks. Unknown/stale IDs are rejected with refresh
+instructions; unacknowledged risks block rollback. Omission preserves fail-closed
+behavior and the existing definition digest. Acknowledgments accept residual
+risk, not mitigation; the native destination fence journals and reports each
+principal's acknowledgment like the source fence. Recovery replays that durable
+configuration instead of reclassifying grants already revoked by the fence.
+When a nonempty destination list is supplied, connected `skedaddle check`/
+preparation also validates it. Rollback always checks the live inventory again;
+review again if destination roles, grants or objects change.
 
 The rollback journal contract (`coordinator::rollback`) records admission and
 `rolling-back` atomically, then requires a current-epoch intent before each step

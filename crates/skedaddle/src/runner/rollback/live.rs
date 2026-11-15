@@ -314,20 +314,44 @@ fn run_slice(
     let open_destination = || runner::cutover::Pg::open(rt.clone(), &dc, &definition.destination);
     let mut log = driver::RuntimeJournal::new(runtime, Default::default())?;
     let native_key = destination::destination_key(&key, &cp.request);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(invalid)?
+        .as_millis()
+        .try_into()
+        .map_err(invalid)?;
+    let records = log.destination_records()?;
+    let connection = open_destination()?;
+    // Once native intents exist, replay their authenticated config. Revalidating
+    // after revoking grants would mistake our own fence for stale inventory.
+    let acknowledged = if records.is_empty()
+        && cp.next == coordinator::rollback::Step::FenceDestination
+        && now < cp.deadline_at_ms
+    {
+        connection.destination_acknowledgments(
+            &destination_config.tables,
+            &destination_config.applications,
+            &definition
+                .fence_plan
+                .acknowledged_destination_residual_risks,
+        )?
+    } else {
+        Default::default()
+    };
     let mut destination = cutover::pg::Source {
-        connection: open_destination()?,
+        connection,
         state: fence::Fence::new(fence::FenceConfig {
             epoch: key.epoch,
             applications: destination_config.applications,
             tables: destination_config.tables,
-            acknowledged: Default::default(),
+            acknowledged,
             deadline_ms: 30_000,
         })
         .map_err(invalid)?,
         drained: Default::default(),
         pre_fence: || Ok(()),
     };
-    destination::replay_native(&mut destination, &native_key, &log.destination_records()?)?;
+    destination::replay_native(&mut destination, &native_key, &records)?;
     let mut source = source::Pg {
         source: open_source()?,
         destination: open_destination()?,
@@ -381,12 +405,6 @@ fn run_slice(
         definition,
         request: &cp.request,
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(invalid)?
-        .as_millis()
-        .try_into()
-        .map_err(invalid)?;
     driver::execute_next(
         &key,
         now,

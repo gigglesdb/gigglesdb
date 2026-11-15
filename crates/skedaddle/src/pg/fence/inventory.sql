@@ -30,7 +30,7 @@ capabilities AS (
 ),
 writers AS (SELECT * FROM capabilities WHERE writer),
 direct AS (
-    SELECT * FROM capabilities WHERE rolname<>current_user AND rolname<>session_user
+    SELECT * FROM capabilities WHERE $3::boolean OR (rolname<>current_user AND rolname<>session_user)
 ),
 definers AS (
     SELECT DISTINCT p.oid,pg_get_userbyid(p.proowner) AS principal,

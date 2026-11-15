@@ -1043,3 +1043,48 @@ fn capability_report_lists_column_exclusion_names_per_table() {
     assert!(entry.evidence[0].description.contains("internal_note"));
     assert!(entry.evidence[0].description.contains("No column values"));
 }
+
+#[test]
+fn destination_acknowledgments_are_optional_strict_and_digest_compatible() {
+    let mut value = example_value();
+    let old = parse_value(&value).unwrap();
+    assert!(
+        old.fence_plan
+            .acknowledged_destination_residual_risks
+            .is_empty()
+    );
+    // README fixture predates the field. Its canonical JSON must remain exact.
+    let mut legacy = value.clone();
+    legacy["source"]["tls"] = json!("require");
+    legacy["destination"]["tls"] = json!("require");
+    legacy["hooks"][0]["phase"] = json!("pre-fence");
+    assert_eq!(serde_json::to_value(&old).unwrap(), legacy);
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+    use sha2::{Digest, Sha256};
+    let legacy_digest = format!("{:x}", Sha256::digest(&legacy_bytes));
+    assert_eq!(
+        legacy_digest,
+        "7367b3e1e9642c44fbdaa0a4932f2e68d501646cb3bd520171864bedf19e425a"
+    );
+    assert_eq!(old.canonical_digest().unwrap(), legacy_digest);
+    value["fence_plan"]["acknowledged_destination_residual_risks"] = json!([]);
+    assert_eq!(
+        parse_value(&value).unwrap().canonical_digest().unwrap(),
+        legacy_digest
+    );
+    value["fence_plan"]["acknowledged_destination_residual_risks"] =
+        json!(["fence-v1:table-owner:64657374:732e74"]);
+    let new = parse_value(&value).unwrap();
+    assert_eq!(
+        new.fence_plan.acknowledged_destination_residual_risks.len(),
+        1
+    );
+    assert_ne!(new.canonical_digest().unwrap(), legacy_digest);
+    value["fence_plan"]["acknowledged_destination_residual_risks"] = json!([""]);
+    assert!(parse_value(&value).is_err());
+    value["fence_plan"]["acknowledged_destination_residual_risks"] = json!(null);
+    assert!(parse_value(&value).is_err());
+    value["fence_plan"]["acknowledged_destination_residual_risks"] = json!([]);
+    value["fence_plan"]["unknown_destination_field"] = json!([]);
+    assert!(matches!(parse_value(&value), Err(DefinitionError::Json(_))));
+}

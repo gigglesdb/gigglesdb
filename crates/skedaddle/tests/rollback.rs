@@ -1349,6 +1349,29 @@ mod real_pg {
     }
 
     #[test]
+    fn destination_inventory_acknowledgments_authorize_only_reviewed_rollback_fence() {
+        let Some((s, d)) = urls("destination_inventory_acknowledgments") else {
+            return;
+        };
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let mut fixture = Fixture::new(&s, &d);
+        let risks = fixture
+            .destination
+            .rt
+            .block_on(fence::inventory::collect_destination(
+                &fixture.destination.client,
+                &[format!("public.{}", fixture.table)],
+                std::slice::from_ref(&fixture.destination_role),
+            ))
+            .unwrap();
+        assert!(fence::inventory::destination_acknowledgments(&risks, &[]).is_err());
+        let ids = risks.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        let acknowledged = fence::inventory::destination_acknowledgments(&risks, &ids).unwrap();
+        assert!(!acknowledged.is_empty());
+        fixture.destination_fence.config.acknowledged = acknowledged;
+        fixture.run(None);
+    }
+    #[test]
     fn rollback_preserves_destination_writes() {
         let Some((s, d)) = urls("rollback_preserves_destination_writes") else {
             return;

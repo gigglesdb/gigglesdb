@@ -242,6 +242,9 @@ pub struct BufferRetention {
 pub struct FencePlan {
     pub application_roles: Vec<String>,
     pub acknowledged_residual_risks: Vec<String>,
+    /// Exact destination inventory IDs, independently reviewed for rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged_destination_residual_risks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +593,10 @@ impl MigrationDefinition {
             (
                 "acknowledged_residual_risks",
                 &self.fence_plan.acknowledged_residual_risks,
+            ),
+            (
+                "acknowledged_destination_residual_risks",
+                &self.fence_plan.acknowledged_destination_residual_risks,
             ),
         ] {
             for (index, value) in values.iter().enumerate() {

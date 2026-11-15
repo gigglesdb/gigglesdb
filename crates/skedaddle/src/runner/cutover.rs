@@ -583,6 +583,25 @@ pub(super) struct Pg {
     healthy: bool,
 }
 impl Pg {
+    pub(super) fn destination_acknowledgments(
+        &self,
+        tables: &[fence::Table],
+        applications: &std::collections::BTreeSet<String>,
+        acknowledged: &[String],
+    ) -> driver::Result<std::collections::BTreeSet<fence::ResidualPrincipal>> {
+        let risks = self
+            .rt
+            .block_on(fence::inventory::collect_destination(
+                &self.session.client,
+                &tables
+                    .iter()
+                    .map(|t| format!("{}.{}", ident(&t.schema), ident(&t.name)))
+                    .collect::<Vec<_>>(),
+                &applications.iter().cloned().collect::<Vec<_>>(),
+            ))
+            .map_err(component)?;
+        fence::inventory::destination_acknowledgments(&risks, acknowledged).map_err(component)
+    }
     pub(super) fn open(
         rt: Arc<tokio::runtime::Runtime>,
         config: &tls::Config,
@@ -653,7 +672,7 @@ fn clock(pg: &mut Pg) -> driver::Result<u64> {
     .parse()
     .map_err(component)
 }
-fn ident(name: &str) -> String {
+pub(super) fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 fn literal(value: &str) -> String {
