@@ -194,7 +194,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018) {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
@@ -208,7 +208,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         );
     }
 
-    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018) {
+    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "numeric_column_declaration", CapabilityState::Implemented,
                 "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
@@ -224,7 +224,39 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         }
     }
 
-    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018) {
+    if version.supports_r2_native() {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            for (feature, test, detail) in [
+                ("subquery_predicates", "subquery_predicates_match_sql", "IN/NOT IN/EXISTS/NOT EXISTS with uncorrelated single-source subqueries and SQL NULL semantics; standalone queries only. IN/EXISTS inside JOIN ON or HAVING returns SQL's 0A000."),
+                ("insert_select", "insert_select_matches_sql", "Standalone INSERT FROM typed queries with SQL defaults, constraints and affected-row counts; omitted columns target all logical columns.") ] {
+                add(interface, feature, CapabilityState::Implemented,
+                    detail,
+                    vec![evidence("crates/giggles-language/tests/native_subquery_parity.rs", test)], vec![]);
+            }
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "typed_reads", CapabilityState::Implemented,
+                "Aggregates (count/sum/min/max/avg), GROUP BY/HAVING, ORDER BY/LIMIT and two-source INNER/LEFT joins with aliases, executed as core typed reads with SQL semantics. Bare table names only; select is required; standalone statements only (not in blocks, bound handles, explain or once).",
+                vec![evidence("crates/giggles-language/tests/native_typed_read_parity.rs", "typed_reads_match_sql")], vec![]);
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "block_savepoints", CapabilityState::Implemented,
+                "SAVEPOINT, ROLLBACK TO and RELEASE between plain block statements on one retained session; a failing step still rolls back the whole block. Blocks with savepoints admit no let/require/emit and cannot be prepared, lowered or used as once bodies.",
+                vec![evidence("crates/giggles-language/tests/native_savepoint_parity.rs", "savepoint_blocks_match_sql")], vec![]);
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "typed_parameters", CapabilityState::Implemented,
+                "Float4/Float8/date/time/timetz/timestamp/timestamptz/interval parameters in assignments and predicates; uuid/jsonb as text parameters use SQL coercion. Numeric stays assignment-only.",
+                vec![evidence("crates/giggles-language/tests/native_typed_params_parity.rs", "typed_parameters_match_sql")], vec![]);
+        }
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "catalog_alter", CapabilityState::Implemented,
+                "ALTER TABLE ADD/DROP/RENAME COLUMN and RENAME TO through SQL's ALTER executor. DROP COLUMN defaults to RESTRICT; dependent views give 2BP01 unless CASCADE. Legacy requires empty business state; v2 permits populated state.",
+                vec![evidence("crates/giggles-language/tests/native_alter_parity.rs", "alter_matrix_matches_sql")], vec![]);
+        }
+    }
+
+    if matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "catalog_drop", CapabilityState::Implemented,
                 "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE remains Unsupported. Legacy requires empty business state; v2 permits populated state.",
@@ -1210,7 +1242,9 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             if version.supports_transactions() && feature == "guarded_bulk_writes" {
                 continue;
             }
-            let example = if version.supports_schema_names() && feature == "qualified_names" {
+            let example = if version.supports_r2_native() && feature == "qualified_names" {
+                "app.items where id = 1 select id"
+            } else if version.supports_schema_names() && feature == "qualified_names" {
                 "items select items.id"
             } else { example };
             let feature = if version.supports_upsert() && feature == "upserts" {
@@ -1750,6 +1784,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded019 => (
+            "crates/giggles-language/tests/native_alter_parity.rs",
+            "alter_profile_is_opt_in_and_inherits_eighteen",
         ),
         LanguageVersion::Embedded018 => (
             "crates/giggles-language/tests/native_schema_parity.rs",

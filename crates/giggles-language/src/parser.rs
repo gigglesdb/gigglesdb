@@ -410,7 +410,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -874,12 +874,24 @@ impl Parser {
     fn base_statement(&mut self) -> Result<Statement> {
         if self.word("insert") {
             let many = self.version.supports_insert_many() && self.word("many");
-            if many {
-                self.need("into")?;
-            } else {
-                self.word("into");
-            }
+            let into = if many { self.need("into")?; true } else { self.word("into") };
             let table = self.relation_name()?;
+            if !many && self.version == LanguageVersion::Embedded019 {
+                let start = self.pos;
+                let mut columns = Vec::new();
+                if self.symbol('(') {
+                    columns.push(self.name()?);
+                    while self.symbol(',') { columns.push(self.name()?); }
+                    if !self.symbol(')') { return Err(self.error()); }
+                }
+                if self.word("from") {
+                    if !into { return Err(self.error()); }
+                    let source = Box::new(self.query()?);
+                    if !self.query_end() { return Err(self.error()); }
+                    return Ok(Statement::InsertSelect { table, columns, source });
+                }
+                self.pos = start;
+            }
             if self.version.supports_transactions() && self.symbol('(') {
                 let mut names = vec![self.name()?];
                 while self.symbol(',') {
@@ -1003,6 +1015,20 @@ impl Parser {
                 Intent::Claim { order },
             ));
         }
+        if self.version == LanguageVersion::Embedded019 {
+            let start = self.pos;
+            if let Ok(read) = self.legacy_read() && self.query_end() { return Ok(read); }
+            self.pos = start;
+            let query = self.query()?;
+            if !self.query_end() { return Err(self.error()); }
+            return Ok(Statement::Query(Box::new(query)));
+        }
+        self.legacy_read()
+    }
+    fn query_end(&self) -> bool {
+        matches!(self.peek(), None | Some(Token::Symbol(';' | '}' | ')')))
+    }
+    fn legacy_read(&mut self) -> Result<Statement> {
         // A read clause disambiguates SHOW only when the profile permits its identifier.
         let table = if semantic_identifier("show", self.version)
             && matches!(self.peek(), Some(Token::Word(word)) if word == "show")
@@ -1048,6 +1074,112 @@ impl Parser {
                 .collect(),
         })
     }
+    fn query_source(&mut self) -> Result<QuerySource> {
+        let table = self.relation_name()?;
+        let alias = if matches!(self.peek(), Some(Token::Word(w)) if identifier(w) && !matches!(w.as_str(), "inner" | "left" | "on" | "having")) { Some(self.name()?) } else { None };
+        Ok(QuerySource { table, alias })
+    }
+    fn query_expr(&mut self) -> Result<QueryExpr> {
+        let start = self.pos;
+        if let Ok(value) = self.value() { return Ok(QueryExpr::Value(value)); }
+        self.pos = start;
+        let name = self.name()?;
+        if self.symbol('(') {
+            let function = match name.as_str() {
+                "count" => AggregateFunction::Count, "sum" => AggregateFunction::Sum,
+                "min" => AggregateFunction::Min, "max" => AggregateFunction::Max,
+                "avg" => AggregateFunction::Avg, _ => return Err(self.error()),
+            };
+            let (source, column) = if function == AggregateFunction::Count && self.symbol('*') { (None, None) }
+                else { let (source, column) = self.query_column()?; (source, Some(column)) };
+            if !self.symbol(')') { return Err(self.error()); }
+            return Ok(QueryExpr::Aggregate { function, source, column });
+        }
+        let (source, column) = if self.symbol('.') { (Some(name), self.name()?) } else { (None, name) };
+        Ok(QueryExpr::Column { source, column })
+    }
+    fn query_column(&mut self) -> Result<(Option<String>, String)> {
+        let name = self.name()?;
+        Ok(if self.symbol('.') { (Some(name), self.name()?) } else { (None, name) })
+    }
+    fn query_predicate(&mut self, d: usize, level: u8) -> Result<QueryPredicate> {
+        if d > MAX_DEPTH { return Err(Error::Limit); }
+        if level < 2 {
+            let mut predicate = self.query_predicate(d, level + 1)?;
+            while self.word(if level == 0 { "or" } else { "and" }) {
+                let right = self.query_predicate(d + 1, level + 1)?;
+                predicate = if level == 0 { QueryPredicate::Or(Box::new(predicate), Box::new(right)) }
+                    else { QueryPredicate::And(Box::new(predicate), Box::new(right)) };
+            }
+            return Ok(predicate);
+        }
+        if self.word("exists") { return Ok(QueryPredicate::Exists { negated: false, subquery: Box::new(self.subquery(false, d + 1)?) }); }
+        if self.word("not") {
+            return if self.word("exists") { Ok(QueryPredicate::Exists { negated: true, subquery: Box::new(self.subquery(false, d + 1)?) }) }
+                else { Ok(QueryPredicate::Not(Box::new(self.query_predicate(d + 1, 2)?))) };
+        }
+        if self.symbol('(') {
+            let predicate = self.query_predicate(d + 1, 0)?;
+            if !self.symbol(')') { return Err(self.error()); }
+            return Ok(predicate);
+        }
+        let left = self.query_expr()?;
+        if let Some(Token::Op(op)) = self.peek().cloned() {
+            self.pos += 1;
+            return Ok(QueryPredicate::Compare(left, op, self.query_expr()?));
+        }
+        let negated = self.word("not");
+        if self.word("in") { return Ok(QueryPredicate::In { expr: left, negated, subquery: Box::new(self.subquery(true, d + 1)?) }); }
+        if negated { return Err(self.error()); }
+        self.need("is")?;
+        let negated = self.word("not"); self.need("null")?;
+        Ok(QueryPredicate::IsNull(left, negated))
+    }
+    fn subquery(&mut self, single: bool, d: usize) -> Result<Query> {
+        if !self.symbol('(') { return Err(self.error()); }
+        if d > MAX_DEPTH { return Err(Error::Limit); }
+        let source = QuerySource { table: self.relation_name()?, alias: None };
+        let filter = if self.word("where") { Some(self.query_predicate(d, 0)?) } else { None };
+        let mut projection = Vec::new();
+        if self.word("select") { loop {
+            let expression = self.query_expr()?;
+            let alias = if self.word("as") { Some(self.name()?) } else { None };
+            projection.push(QueryProjection { expression, alias });
+            if !self.symbol(',') { break; }
+        } }
+        if !self.symbol(')') { return Err(self.error()); }
+        if single && projection.len() != 1 { return Err(Error::Unsupported); }
+        Ok(Query { source, join: None, filter, group_by: Vec::new(), having: None,
+            order: Vec::new(), limit: None, projection })
+    }
+    fn query(&mut self) -> Result<Query> {
+        let source = self.query_source()?;
+        let kind = if self.word("inner") { self.need("join")?; Some(JoinKind::Inner) }
+            else if self.word("left") { self.need("join")?; Some(JoinKind::Left) }
+            else if self.word("join") { Some(JoinKind::Inner) } else { None };
+        let join = if let Some(kind) = kind {
+            let source = self.query_source()?; self.need("on")?;
+            Some(QueryJoin { kind, source, on: self.query_predicate(0, 0)? })
+        } else { None };
+        let filter = if self.word("where") { Some(self.query_predicate(0, 0)?) } else { None };
+        let mut group_by = Vec::new();
+        if self.word("group") { self.need("by")?; loop { group_by.push(self.query_expr()?); if !self.symbol(',') { break; } } }
+        let having = if self.word("having") { Some(self.query_predicate(0, 0)?) } else { None };
+        let mut order = Vec::new();
+        if self.word("order") { self.need("by")?; loop {
+            let expression = self.query_expr()?; let descending = self.word("desc");
+            if !descending { self.word("asc"); } order.push(QueryOrder { expression, descending });
+            if !self.symbol(',') { break; }
+        } }
+        let limit = if self.word("limit") { Some(self.value()?) } else { None };
+        let mut projection = Vec::new();
+        if self.word("select") { loop {
+            let expression = self.query_expr()?;
+            let alias = if self.word("as") { Some(self.name()?) } else { None };
+            projection.push(QueryProjection { expression, alias }); if !self.symbol(',') { break; }
+        } }
+        Ok(Query { source, join, filter, group_by, having, order, limit, projection })
+    }
     fn inspection_prefix(&self) -> bool {
         let tokens = &self.tokens[self.pos..];
         matches!(tokens, [(Token::Word(word), _), (Token::Word(target), _), ..]
@@ -1076,16 +1208,36 @@ impl Parser {
             })
         }
     }
+    fn catalog_column(&mut self) -> Result<ColumnSpec> {
+        let name = self.name()?;
+        let nullable = self.word("nullable");
+        let data_type = if self.word("bool") {
+            CatalogType::Bool
+        } else if self.word("int32") {
+            CatalogType::Int32
+        } else if self.word("int64") {
+            CatalogType::Int64
+        } else if self.word("text") {
+            CatalogType::Text
+        } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) && self.word("numeric") {
+            CatalogType::Numeric
+        } else if self.word("bytes") {
+            CatalogType::Bytes
+        } else {
+            return Err(Error::Unsupported);
+        };
+        Ok(ColumnSpec { name, data_type, nullable })
+    }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if (create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018)))
+            if ((create == "alter" && table == "table" && self.version.supports_r2_native()) || create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019)))
                 && (table == "table" || table == "index"))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
-        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018) && self.word("drop") {
+        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) && self.word("drop") {
             let index = if self.word("index") { true } else { self.need("table")?; false };
             let name = self.relation_name()?;
             let cascade = self.word("cascade");
@@ -1095,6 +1247,30 @@ impl Parser {
             } else {
                 CatalogStatement::DropTable { table: name, cascade }
             });
+        }
+        if self.version.supports_r2_native() && self.word("alter") {
+            self.need("table")?;
+            let table = self.relation_name()?;
+            let action = if self.word("add") {
+                self.word("column");
+                AlterTableAction::AddColumn(self.catalog_column()?)
+            } else if self.word("drop") {
+                self.word("column");
+                let name = self.name()?;
+                let cascade = self.word("cascade");
+                if !cascade { self.word("restrict"); }
+                AlterTableAction::DropColumn { name, cascade }
+            } else {
+                self.need("rename")?;
+                if self.word("to") { AlterTableAction::RenameTable { to: self.name()? } }
+                else {
+                    self.word("column");
+                    let from = self.name()?;
+                    self.need("to")?;
+                    AlterTableAction::RenameColumn { from, to: self.name()? }
+                }
+            };
+            return Ok(CatalogStatement::AlterTable { table, action });
         }
         self.need("create")?;
         if self.word("index") {
@@ -1157,28 +1333,7 @@ impl Parser {
                 if columns.len() >= giggles_core::relational::MAX_COLUMNS {
                     return Err(Error::Limit);
                 }
-                let name = self.name()?;
-                let nullable = self.word("nullable");
-                let data_type = if self.word("bool") {
-                    CatalogType::Bool
-                } else if self.word("int32") {
-                    CatalogType::Int32
-                } else if self.word("int64") {
-                    CatalogType::Int64
-                } else if self.word("text") {
-                    CatalogType::Text
-                } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018) && self.word("numeric") {
-                    CatalogType::Numeric
-                } else if self.word("bytes") {
-                    CatalogType::Bytes
-                } else {
-                    return Err(Error::Unsupported);
-                };
-                columns.push(ColumnSpec {
-                    name,
-                    data_type,
-                    nullable,
-                });
+                columns.push(self.catalog_column()?);
             }
             if !self.symbol(',') {
                 break;
@@ -1202,6 +1357,9 @@ impl Parser {
                     || matches!(tokens, [(Token::Word(word), _), (Token::Word(read), _), (Token::Word(only), _), (Token::Word(once), _), ..] if word == "transaction" && read == "read" && only == "only" && once == "once")))
     }
     fn item_word(&mut self, word: &str) -> bool {
+        if self.version == LanguageVersion::Embedded019
+            && matches!(self.tokens.get(self.pos + 1), Some((Token::Word(next), _)) if matches!(next.as_str(), "group" | "having" | "join" | "inner" | "left"))
+            && matches!(self.tokens.get(self.pos + 2), Some((token, _)) if !matches!(token, Token::Op(Compare::Eq) | Token::Symbol(';' | '}' | ')'))) { return false; }
         // A read clause disambiguates keyword-named tables inside blocks too.
         if matches!(self.tokens.get(self.pos + 1), Some((Token::Word(next), _)) if matches!(next.as_str(), "where" | "order" | "limit" | "select"))
         {
@@ -1267,6 +1425,15 @@ impl Parser {
             Ok(ParsedInput::Transaction(transaction))
         }
     }
+    fn savepoint_name(&mut self) -> Result<String> {
+        match self.peek().cloned() {
+            Some(Token::Word(name)) if canonical_identifier(&name) && !reserved_for(&name, self.version) => {
+                self.pos += 1;
+                Ok(name)
+            }
+            _ => Err(self.error()),
+        }
+    }
     fn transaction_body(&mut self, read_only: bool) -> Result<Transaction> {
         if !self.symbol('{') {
             return Err(self.error());
@@ -1292,7 +1459,16 @@ impl Parser {
                 }
                 break;
             }
-            let step = if self.item_word("let") {
+            let step = if self.version.supports_r2_native() && self.item_word("savepoint") {
+                TransactionStep::Savepoint(self.savepoint_name()?)
+            } else if self.version.supports_r2_native() && self.item_word("rollback") {
+                if !self.word("to") { return Err(self.error()); }
+                self.word("savepoint");
+                TransactionStep::RollbackTo(self.savepoint_name()?)
+            } else if self.version.supports_r2_native() && self.item_word("release") {
+                self.word("savepoint");
+                TransactionStep::Release(self.savepoint_name()?)
+            } else if self.item_word("let") {
                 let name = self.variable_name()?;
                 if self.peek() != Some(&Token::Op(Compare::Eq)) {
                     return Err(self.error());

@@ -148,7 +148,7 @@ pub(crate) fn validate_once(envelope: &OnceEnvelope, version: LanguageVersion) -
         }
         OnceBody::Transaction(transaction) => {
             execute::validate_transaction(transaction, version)?;
-            if transaction.read_only {
+            if transaction.read_only || execute::has_savepoints(transaction) {
                 return Err(Error::Unsupported);
             }
         }
@@ -248,6 +248,7 @@ impl<'a> Inputs<'a> {
     }
     fn statement(&mut self, statement: &'a Statement) -> Result<()> {
         match statement {
+            Statement::Query(_) | Statement::InsertSelect { .. } => return Err(Error::Unsupported),
             Statement::Read { filter, limit, .. } => {
                 if let Some(expression) = filter {
                     self.expression(expression)?;
@@ -367,6 +368,7 @@ impl<'a> Inputs<'a> {
                     self.statement(statement)?
                 }
                 TransactionStep::Require(expression) => self.expression(expression)?,
+                TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_) => return Err(Error::Unsupported),
             }
         }
         if let Some(emitted) = &transaction.emit {

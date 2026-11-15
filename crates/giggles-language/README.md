@@ -45,6 +45,25 @@ and accepting `schema.table` in reads, writes, blocks, CREATE TABLE, CREATE
 INDEX targets and DROP TABLE/INDEX. Each component follows the existing
 identifier/backtick rules; bare tables resolve through the default public search
 path. CREATE INDEX names remain unqualified. Create schemas through SQL.
+Explicit version 0.19 selects `embedded-trusted-native-0.19`, inheriting 0.18 and
+adding, each checked against the same SQL on legacy and v2:
+- typed reads: `orders where qty > 1 group by item having count(*) > $n order by item
+  limit 10 select item, count(*) as n, sum(qty)` and two-source joins
+  `items i left join orders o on i.id = o.item select i.id, o.qty`
+  (count/sum/min/max/avg, GROUP BY, HAVING, ORDER BY, LIMIT; bare table names,
+  `select` required, standalone statements only);
+- subquery predicates `n [not] in (u where ... select n)` and `[not] exists (u ...)`
+  over uncorrelated single-source reads, and `insert into dst(id, v) from src where
+  v > 1 select id, v`. Like SQL, a subquery inside JOIN ON or HAVING returns 0A000;
+- `alter table t add [column] c [nullable] int64`, `drop [column] c [cascade|restrict]`,
+  `rename [column] a to b` and `rename to t2` (legacy requires empty business state);
+- `savepoint a`, `rollback to [savepoint] a` and `release [savepoint] a` inside a
+  `transaction { ... }` block of plain statements (no let/require/emit; a failing step
+  rolls back the whole block; such blocks cannot be prepared or used with once);
+- real, double precision, date, time, timetz, timestamp, timestamptz and interval
+  parameters wherever parameters are accepted; uuid/jsonb text parameters use SQL
+  coercion. Numeric parameters remain assignment-only.
+Views, constraints and paged reads are not in 0.19.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:

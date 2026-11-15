@@ -27,6 +27,8 @@ mod insert_many;
 mod inspection;
 #[path = "inspection_capabilities.rs"]
 mod inspection_capabilities;
+#[path = "native_alter_parity.rs"]
+mod native_alter_parity;
 #[path = "native_defaults_parity.rs"]
 mod native_defaults_parity;
 #[path = "native_drop_parity.rs"]
@@ -85,3 +87,12 @@ fn every_test_file_is_registered() {
         "tests/*.rs files not registered in tests/all.rs or Cargo.toml [[test]]: {missing:?}"
     );
 }
+
+#[path = "native_typed_params_parity.rs"] mod native_typed_params_parity;
+
+#[path = "native_savepoint_parity.rs"] mod native_savepoint_parity;
+
+#[path = "typed_read_parser.rs"] mod typed_read_parser;
+#[path = "native_typed_read_parity.rs"] mod native_typed_read_parity;
+
+#[path = "native_subquery_parity.rs"] mod native_subquery_parity;

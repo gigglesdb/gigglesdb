@@ -47,6 +47,7 @@ pub fn lower_text(text: &str, bindings: &Bindings, version: LanguageVersion) -> 
 #[derive(Clone)]
 pub struct Engine {
     pub(crate) inner: operations::Engine,
+    admin: Admin,
     pub(crate) version: LanguageVersion,
 }
 
@@ -126,7 +127,8 @@ impl Engine {
     }
     pub fn with_version(admin: Admin, version: LanguageVersion) -> Self {
         Self {
-            inner: operations::Engine::new(admin),
+            inner: operations::Engine::new(admin.clone()),
+            admin,
             version,
         }
     }
@@ -135,6 +137,38 @@ impl Engine {
     }
     pub fn execute(&self, stmt: &Statement, bindings: &Bindings) -> Result<Outcome> {
         validate_parameter_admission(stmt, bindings, self.version)?;
+        if let Statement::Query(query) = stmt {
+            validate_version(stmt, self.version)?;
+            let mut session = self.admin.sql_session();
+            let result = match lower_query(query, bindings, self.version)? {
+                TypedQuery::Single(read) => session.execute_typed_read(*read, None),
+                TypedQuery::Join(read) => session.execute_typed_join(*read, None),
+            }.map_err(control_error)?;
+            return Ok(Outcome { columns: result.columns, matched: result.rows.len(),
+                rows: result.rows, ..Outcome::default() });
+        }
+        if let Statement::InsertSelect { table, columns, source } = stmt {
+            validate_version(stmt, self.version)?;
+            if table.contains('.') { return Err(Error::Unsupported); }
+            let table = identifier(table, self.version)?;
+            let source = lower_query(source, bindings, self.version)?;
+            let mut session = self.admin.sql_session();
+            let columns = if columns.is_empty() {
+                let metadata = session.catalog_metadata().map_err(control_error)?;
+                let target = metadata.tables.iter().find(|t| t.name == table
+                    && metadata.schemas.tables.get(&t.id).map_or("public", String::as_str) == "public")
+                    .ok_or_else(|| Error::Sql { sqlstate: "42P01".into() })?;
+                target.logical_columns().map(|c| c.name.clone()).collect()
+            } else { columns.iter().map(|c| identifier(c, self.version)).collect::<Result<_>>()? };
+            let result = session.execute_typed_insert_select(giggles_core::relational::TypedInsertSelect {
+                table, columns, source }, None).map_err(|e| match e {
+                    giggles_core::CoreError::Sql(_) => Error::Sql { sqlstate: giggles_core::sqlstate(&e).into() },
+                    other => control_error(other),
+                })?;
+            let affected = usize::try_from(result.affected).map_err(|_| Error::Limit)?;
+            return Ok(Outcome { matched: affected, affected,
+                changed: affected, ..Outcome::default() });
+        }
         let request = lower_checked(stmt, self.version)?;
         self.inner
             .execute(&request, bindings)
@@ -201,10 +235,44 @@ impl Engine {
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
         validate_transaction_parameters(transaction, bindings, self.version)?;
+        if has_savepoints(transaction) {
+            validate_transaction(transaction, self.version)?;
+            return self.execute_savepoint_transaction(transaction, bindings);
+        }
         let transaction = lower_transaction_checked(transaction, self.version)?;
         self.inner
             .execute_transaction(&transaction, bindings)
             .map_err(error)
+    }
+    fn execute_savepoint_transaction(&self, block: &Transaction, bindings: &Bindings) -> Result<TransactionOutcome> {
+        let mut session = self.admin.sql_session();
+        let result = (|| {
+            session.begin_native().map_err(control_error)?;
+            let mut summaries = Vec::new();
+            for (item_index, step) in block.steps.iter().enumerate() {
+                match step {
+                    TransactionStep::Savepoint(name) => session.savepoint(name).map_err(control_error)?,
+                    TransactionStep::RollbackTo(name) => session.rollback_to(name).map_err(control_error)?,
+                    TransactionStep::Release(name) => session.release(name).map_err(control_error)?,
+                    TransactionStep::Execute(statement) => {
+                        let request = lower_checked(statement, self.version)?;
+                        let out = session.execute_native(&request, bindings).map_err(error)?;
+                        summaries.push(operations::StepSummary { item_index, matched: out.matched,
+                            affected: out.affected, changed: out.changed, complete: out.complete,
+                            conflict_results: out.conflict_results });
+                    }
+                    _ => return Err(Error::Unsupported),
+                }
+            }
+            if block.read_only { session.rollback_native().map_err(control_error)?; }
+            else { session.commit_native().map_err(|e| match e {
+                giggles_core::CoreError::Storage(_) => Error::Unknown,
+                other => control_error(other),
+            })?; }
+            Ok(TransactionOutcome { summaries, emitted: Vec::new() })
+        })();
+        if result.is_err() { let _ = session.rollback_native(); }
+        result
     }
     pub fn prepare_transaction_bound_text(
         &self,
@@ -283,8 +351,21 @@ pub(crate) fn validate_catalog(
     statement: &CatalogStatement,
     version: LanguageVersion,
 ) -> Result<()> {
+    if let CatalogStatement::AlterTable { table, action } = statement {
+        if !version.supports_r2_native() { return Err(Error::Unsupported); }
+        let names = match action {
+            AlterTableAction::AddColumn(column) => vec![&column.name],
+            AlterTableAction::DropColumn { name, .. } => vec![name],
+            AlterTableAction::RenameColumn { from, to } => vec![from, to],
+            AlterTableAction::RenameTable { to } => vec![to],
+        };
+        if !parser::semantic_relation(table, version) || names.iter().any(|n| !parser::semantic_identifier(n, version)) {
+            return Err(Error::Bind("identifier".into()));
+        }
+        return validate_size(statement);
+    }
     if let CatalogStatement::DropTable { table: name, .. } | CatalogStatement::DropIndex { name, .. } = statement {
-        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018) { return Err(Error::Unsupported); }
+        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019) { return Err(Error::Unsupported); }
         if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
         return validate_size(statement);
     }
@@ -321,7 +402,7 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
-    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
+    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019)
         && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
     {
         return Err(Error::Unsupported);
@@ -349,6 +430,14 @@ fn lower_catalog_checked(
     }
     validate_catalog(statement, version)?;
     match statement {
+        CatalogStatement::AlterTable { table, action } => return Ok(operations::CatalogRequest::AlterTable {
+            table: table.clone(), action: match action {
+                AlterTableAction::AddColumn(column) => operations::AlterTableAction::AddColumn { column: lower_column(column) },
+                AlterTableAction::DropColumn { name, cascade } => operations::AlterTableAction::DropColumn { name: name.clone(), cascade: *cascade },
+                AlterTableAction::RenameColumn { from, to } => operations::AlterTableAction::RenameColumn { from: from.clone(), to: to.clone() },
+                AlterTableAction::RenameTable { to } => operations::AlterTableAction::RenameTable { to: to.clone() },
+            },
+        }),
         CatalogStatement::DropTable { table, cascade } => return Ok(operations::CatalogRequest::DropTable { table: table.clone(), cascade: *cascade }),
         CatalogStatement::DropIndex { name, cascade } => return Ok(operations::CatalogRequest::DropIndex { name: name.clone(), cascade: *cascade }),
         _ => {}
@@ -377,21 +466,25 @@ fn lower_catalog_checked(
         table: table.clone(),
         columns: columns
             .iter()
-            .map(|column| operations::ColumnSpec {
-                name: column.name.clone(),
-                data_type: match column.data_type {
-                    CatalogType::Bool => giggles_core::relational::DataType::Boolean,
-                    CatalogType::Int32 => giggles_core::relational::DataType::Integer,
-                    CatalogType::Int64 => giggles_core::relational::DataType::BigInt,
-                    CatalogType::Text => giggles_core::relational::DataType::Text,
-                    CatalogType::Bytes => giggles_core::relational::DataType::Bytes,
-                    CatalogType::Numeric => giggles_core::relational::DataType::Numeric,
-                },
-                not_null: !column.nullable,
-            })
+            .map(lower_column)
             .collect(),
         primary_key: primary_key.clone(),
     })
+}
+
+fn lower_column(column: &ColumnSpec) -> operations::ColumnSpec {
+    operations::ColumnSpec {
+        name: column.name.clone(),
+        data_type: match column.data_type {
+            CatalogType::Bool => giggles_core::relational::DataType::Boolean,
+            CatalogType::Int32 => giggles_core::relational::DataType::Integer,
+            CatalogType::Int64 => giggles_core::relational::DataType::BigInt,
+            CatalogType::Text => giggles_core::relational::DataType::Text,
+            CatalogType::Bytes => giggles_core::relational::DataType::Bytes,
+            CatalogType::Numeric => giggles_core::relational::DataType::Numeric,
+        },
+        not_null: !column.nullable,
+    }
 }
 
 pub(crate) fn lower_checked(
@@ -399,14 +492,17 @@ pub(crate) fn lower_checked(
     version: LanguageVersion,
 ) -> Result<operations::Request> {
     // Check caller-supplied trees before serialization or recursive lowering.
-    validate_depth(stmt)?;
+    validate_depth_for(stmt, version)?;
     validate_size(stmt)?;
     validate_version(stmt, version)?;
     lower_statement(stmt, version)
 }
 
 pub(crate) fn validate_depth(stmt: &Statement) -> Result<()> {
-    validate_statement_depth(stmt, &mut 0)
+    validate_depth_for(stmt, LanguageVersion::Embedded018)
+}
+fn validate_depth_for(stmt: &Statement, version: LanguageVersion) -> Result<()> {
+    validate_statement_depth(stmt, &mut 0, version)
 }
 struct StatementParts<'a> {
     statement: &'a Statement,
@@ -477,8 +573,44 @@ fn statement_parts(statement: &Statement) -> Result<StatementParts<'_>> {
         conflict,
     })
 }
-fn validate_statement_depth(stmt: &Statement, nodes: &mut usize) -> Result<()> {
+fn validate_query(query: &Query, nodes: &mut usize, version: LanguageVersion) -> Result<()> {
+    enum Node<'a> { Query(&'a Query), Predicate(&'a QueryPredicate), Expr(&'a QueryExpr), Value(&'a ValueExpr) }
+    let mut pending = vec![(Node::Query(query), 0)];
+    while let Some((node, depth)) = pending.pop() {
+        *nodes += 1;
+        if depth > MAX_DEPTH || *nodes > MAX_EXPRESSION_NODES { return Err(Error::Limit); }
+        let d = depth + 1;
+        match node {
+            Node::Query(q) => {
+                let size = q.group_by.len().saturating_add(q.order.len()).saturating_add(q.projection.len());
+                if size > MAX_EXPRESSION_NODES || pending.len().saturating_add(size) > MAX_EXPRESSION_NODES { return Err(Error::Limit); }
+                *nodes += 1 + 2 * usize::from(q.join.is_some()) + q.order.len() + q.projection.len();
+                if *nodes > MAX_EXPRESSION_NODES { return Err(Error::Limit); }
+                if let Some(join) = &q.join { pending.push((Node::Predicate(&join.on), depth)); }
+                pending.extend(q.filter.iter().chain(q.having.iter()).map(|p| (Node::Predicate(p), depth)));
+                pending.extend(q.group_by.iter().chain(q.order.iter().map(|o| &o.expression)).chain(q.projection.iter().map(|p| &p.expression)).map(|e| (Node::Expr(e), depth)));
+                pending.extend(q.limit.iter().map(|v| (Node::Value(v), depth)));
+            }
+            Node::Predicate(p) => match p {
+                QueryPredicate::Compare(a, _, b) => { pending.push((Node::Expr(a), d)); pending.push((Node::Expr(b), d)); }
+                QueryPredicate::IsNull(e, _) => pending.push((Node::Expr(e), d)),
+                QueryPredicate::Not(p) => pending.push((Node::Predicate(p), d)),
+                QueryPredicate::And(a, b) | QueryPredicate::Or(a, b) => { pending.push((Node::Predicate(a), d)); pending.push((Node::Predicate(b), d)); }
+                QueryPredicate::In { expr, subquery, .. } => { pending.push((Node::Expr(expr), d)); pending.push((Node::Query(subquery), d)); }
+                QueryPredicate::Exists { subquery, .. } => pending.push((Node::Query(subquery), d)),
+            },
+            Node::Expr(QueryExpr::Value(v)) | Node::Value(v) => validate_native_value(v, version)?,
+            Node::Expr(_) => (),
+        }
+    }
+    Ok(())
+}
+fn validate_statement_depth(stmt: &Statement, nodes: &mut usize, version: LanguageVersion) -> Result<()> {
     let parts = statement_parts(stmt)?;
+    match parts.statement {
+        Statement::Query(q) | Statement::InsertSelect { source: q, .. } => return validate_query(q, nodes, version),
+        _ => (),
+    }
     let mut pending = Vec::new();
     if let Some(projection) = parts.projection {
         pending.extend(projection.iter().map(|p| (&p.expression, 0)));
@@ -493,32 +625,33 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize) -> Result<()> {
     match stmt {
         Statement::Insert { values, .. } | Statement::Update { values, .. } => {
             for (_, value) in values {
-                validate_native_value(value)?;
+                validate_native_value(value, version)?;
             }
             if let Statement::Update {
                 intent: Intent::Many { cap },
                 ..
             } = stmt
             {
-                validate_native_value(cap)?;
+                validate_native_value(cap, version)?;
             }
         }
         Statement::Read { limit, .. } | Statement::ReadExpressions { limit, .. } => {
             if let Some(value) = limit {
-                validate_native_value(value)?;
+                validate_native_value(value, version)?;
             }
         }
         Statement::Delete { cap, .. } => {
             if let Some(value) = cap {
-                validate_native_value(value)?;
+                validate_native_value(value, version)?;
             }
         }
         Statement::UpdateExpressions {
             intent: Intent::Many { cap },
             ..
         }
-        | Statement::InsertMany { cap, .. } => validate_native_value(cap)?,
+        | Statement::InsertMany { cap, .. } => validate_native_value(cap, version)?,
         Statement::UpdateExpressions { .. } | Statement::InsertExpressions { .. } => (),
+        Statement::Query(_) | Statement::InsertSelect { .. } => unreachable!(),
         Statement::Returning { .. } | Statement::OnConflict { .. } => unreachable!(),
     }
     match stmt {
@@ -583,7 +716,7 @@ fn validate_statement_depth(stmt: &Statement, nodes: &mut usize) -> Result<()> {
         }
         _ => (),
     }
-    validate_nodes(pending, nodes)
+    validate_nodes(pending, nodes, version)
 }
 pub(crate) fn validate_call(function: ScalarFunction, count: usize) -> Result<()> {
     if count > MAX_FUNCTION_ARGUMENTS {
@@ -606,14 +739,14 @@ pub(crate) fn validate_case(count: usize) -> Result<()> {
     }
     Ok(())
 }
-fn validate_nodes(mut pending: Vec<(&Expr, usize)>, nodes: &mut usize) -> Result<()> {
+fn validate_nodes(mut pending: Vec<(&Expr, usize)>, nodes: &mut usize, version: LanguageVersion) -> Result<()> {
     while let Some((e, d)) = pending.pop() {
         *nodes += 1;
         if d > MAX_DEPTH || *nodes > MAX_EXPRESSION_NODES {
             return Err(Error::Limit);
         }
         match e {
-            Expr::Value(value) => validate_native_value(value)?,
+            Expr::Value(value) => validate_native_value(value, version)?,
             Expr::Compare(a, _, b)
             | Expr::And(a, b)
             | Expr::Or(a, b)
@@ -657,6 +790,9 @@ pub(crate) fn validate_version(stmt: &Statement, version: LanguageVersion) -> Re
         return Err(Error::Unsupported);
     }
     let stmt = parts.statement;
+    if matches!(stmt, Statement::Query(_) | Statement::InsertSelect { .. }) {
+        return if version.supports_r2_native() { Ok(()) } else { Err(Error::Unsupported) };
+    }
     if matches!(stmt, Statement::InsertMany { .. }) && !version.supports_insert_many() {
         return Err(Error::Unsupported);
     }
@@ -702,6 +838,7 @@ pub(crate) fn validate_version(stmt: &Statement, version: LanguageVersion) -> Re
             pending.push(filter);
             pending.extend(guard.iter());
         }
+        Statement::Query(_) | Statement::InsertSelect { .. } => unreachable!(),
         Statement::Insert { .. } => (),
         Statement::ReadExpressions {
             filter, projection, ..
@@ -796,9 +933,10 @@ pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
     serde_json::to_writer(Budget(MAX_INPUT), stmt).map_err(|_| Error::Limit)
 }
 
-fn validate_native_value(value: &ValueExpr) -> Result<()> {
+fn validate_native_value(value: &ValueExpr, version: LanguageVersion) -> Result<()> {
     match value {
         ValueExpr::Parameter(_) => Ok(()),
+        ValueExpr::Literal(value) if version.supports_r2_native() && typed_parameter(value) => Ok(()),
         ValueExpr::Literal(value) => match value {
             Value::Numeric(_)
             | Value::Float4(_)
@@ -847,6 +985,20 @@ fn local_reference(reference: &LocalRef, version: LanguageVersion) -> Result<ope
     })
 }
 
+pub(crate) fn has_savepoints(block: &Transaction) -> bool {
+    block.steps.iter().any(|step| matches!(step,
+        TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_)))
+}
+fn control_error(e: giggles_core::CoreError) -> Error {
+    use giggles_core::{CoreError, relational::SqlError};
+    error(match e {
+        CoreError::Sql(SqlError::Conflict) => operations::Error::Conflict,
+        CoreError::Sql(SqlError::Duplicate) => operations::Error::Duplicate,
+        CoreError::Sql(SqlError::Overflow) => operations::Error::Overflow,
+        CoreError::Sql(_) => operations::Error::Sql { sqlstate: giggles_core::sqlstate(&e).into() },
+        _ => operations::Error::Core(e.to_string()),
+    })
+}
 pub(crate) fn validate_transaction(
     transaction: &Transaction,
     version: LanguageVersion,
@@ -865,12 +1017,17 @@ pub(crate) fn validate_transaction(
     if count > MAX_TRANSACTION_ITEMS {
         return Err(Error::Limit);
     }
+    let savepoints = has_savepoints(transaction);
+    if savepoints && (!version.supports_r2_native() || transaction.emit.is_some()
+        || transaction.steps.iter().any(|step| matches!(step, TransactionStep::Let { .. } | TransactionStep::Require(_)))) {
+        return Err(Error::Unsupported);
+    }
     let mut nodes = 0;
     let mut locals = 0;
     for step in &transaction.steps {
         match step {
             TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. } => {
-                validate_statement_depth(statement, &mut nodes)?;
+                validate_statement_depth(statement, &mut nodes, version)?;
                 validate_version(statement, version)?;
                 let statement = statement_parts(statement)?.statement;
                 if matches!(
@@ -897,8 +1054,11 @@ pub(crate) fn validate_transaction(
                     locals += 1;
                 }
             }
+            TransactionStep::Savepoint(name) | TransactionStep::RollbackTo(name) | TransactionStep::Release(name) => {
+                identifier(name, version)?;
+            }
             TransactionStep::Require(expr) => {
-                validate_nodes(vec![(expr, 0)], &mut nodes)?;
+                validate_nodes(vec![(expr, 0)], &mut nodes, version)?;
                 validate_expression_version(vec![expr], version)?;
             }
         }
@@ -915,7 +1075,7 @@ pub(crate) fn validate_transaction(
         }
         for value in emit {
             if let EmitExpr::Scalar(expr) = value {
-                validate_nodes(vec![(expr, 0)], &mut nodes)?;
+                validate_nodes(vec![(expr, 0)], &mut nodes, version)?;
                 validate_expression_version(vec![expr], version)?;
             }
         }
@@ -927,6 +1087,7 @@ pub(crate) fn lower_transaction_checked(
     version: LanguageVersion,
 ) -> Result<operations::Transaction> {
     validate_transaction(transaction, version)?;
+    if has_savepoints(transaction) { return Err(Error::Unsupported); }
     Ok(operations::Transaction {
         read_only: transaction.read_only,
         steps: transaction
@@ -944,6 +1105,7 @@ pub(crate) fn lower_transaction_checked(
                     TransactionStep::Require(expr) => {
                         operations::TransactionStep::Require(expression(expr, version)?)
                     }
+                    _ => return Err(Error::Unsupported),
                 })
             })
             .collect::<Result<_>>()?,
@@ -1119,6 +1281,7 @@ fn intent(intent: &Intent, version: LanguageVersion) -> Result<operations::Inten
 }
 fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operations::Request> {
     Ok(match stmt {
+        Statement::Query(_) | Statement::InsertSelect { .. } => return Err(Error::Unsupported),
         Statement::Read {
             table,
             filter,
@@ -1270,6 +1433,101 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
         },
     })
 }
+use giggles_core::relational::TypedRead as TypedQuery;
+fn lower_query(query: &Query, bindings: &Bindings, version: LanguageVersion) -> Result<TypedQuery> {
+    use giggles_core::relational as r;
+    if query.projection.is_empty() || query.source.table.contains('.')
+        || query.join.as_ref().is_some_and(|j| j.source.table.contains('.')) { return Err(Error::Unsupported); }
+    let own_alias = if query.join.is_none() { Some(query.source.alias.as_deref().unwrap_or(&query.source.table)) } else { None };
+    let qualifier = |source: &Option<String>| -> Result<Option<String>> {
+        source.as_deref().map(|s| identifier(s, version)).transpose()
+            .map(|s| s.filter(|s| Some(s.as_str()) != own_alias))
+    };
+    let value = |v: &ValueExpr| -> Result<Value> { Ok(match v {
+        ValueExpr::Literal(v) => v.clone(),
+        ValueExpr::Parameter(n) => bindings.get(n).ok_or_else(|| Error::Bind("parameter missing".into()))?.clone(),
+    }) };
+    let expr = |e: &QueryExpr| -> Result<r::ReadExpr> { Ok(match e {
+        QueryExpr::Value(v) => r::ReadExpr::Literal(value(v)?),
+        QueryExpr::Column { source, column } => {
+            let column = identifier(column, version)?;
+            match qualifier(source)? { Some(source) => r::ReadExpr::QualifiedColumn { source, column },
+                None => r::ReadExpr::Column(column) }
+        }
+        QueryExpr::Aggregate { function, source, column } => {
+            let aggregate = match (function, column) {
+                (AggregateFunction::Count, None) => r::ReadAggregate::CountStar,
+                (f, Some(c)) => { let c = identifier(c, version)?; match f {
+                    AggregateFunction::Count => r::ReadAggregate::Count(c), AggregateFunction::Sum => r::ReadAggregate::Sum(c),
+                    AggregateFunction::Min => r::ReadAggregate::Min(c), AggregateFunction::Max => r::ReadAggregate::Max(c),
+                    AggregateFunction::Avg => r::ReadAggregate::Avg(c),
+                } },
+                _ => return Err(Error::Unsupported),
+            };
+            r::ReadExpr::Aggregate(match qualifier(source)? {
+                Some(source) => r::ReadAggregate::Qualified { source, aggregate: Box::new(aggregate) }, None => aggregate,
+            })
+        }
+    }) };
+    fn subquery_read(q: &Query, bindings: &Bindings, version: LanguageVersion) -> Result<Box<r::SingleSourceRead>> {
+        if q.source.alias.is_some() || q.join.is_some() || !q.group_by.is_empty()
+            || q.having.is_some() || !q.order.is_empty() || q.limit.is_some() { return Err(Error::Unsupported); }
+        let mut q = q.clone();
+        if q.projection.is_empty() { q.projection.push(QueryProjection {
+            expression: QueryExpr::Value(ValueExpr::Literal(Value::Int(1))), alias: None }); }
+        let TypedQuery::Single(read) = lower_query(&q, bindings, version)? else { return Err(Error::Unsupported); };
+        Ok(read)
+    }
+    fn predicate(p: &QueryPredicate, expr: &impl Fn(&QueryExpr) -> Result<r::ReadExpr>, bindings: &Bindings, version: LanguageVersion) -> Result<r::ReadPredicate> {
+        Ok(match p {
+            QueryPredicate::Compare(a, op, b) => r::ReadPredicate::Compare(expr(a)?, match op {
+                Compare::Eq => r::ReadCompare::Eq, Compare::Ne => r::ReadCompare::Ne, Compare::Lt => r::ReadCompare::Lt,
+                Compare::Le => r::ReadCompare::Le, Compare::Gt => r::ReadCompare::Gt, Compare::Ge => r::ReadCompare::Ge,
+            }, expr(b)?),
+            QueryPredicate::IsNull(e, n) => r::ReadPredicate::IsNull(expr(e)?, *n),
+            QueryPredicate::Not(p) => r::ReadPredicate::Not(Box::new(predicate(p, expr, bindings, version)?)),
+            QueryPredicate::And(a, b) => r::ReadPredicate::And(Box::new(predicate(a, expr, bindings, version)?), Box::new(predicate(b, expr, bindings, version)?)),
+            QueryPredicate::Or(a, b) => r::ReadPredicate::Or(Box::new(predicate(a, expr, bindings, version)?), Box::new(predicate(b, expr, bindings, version)?)),
+            QueryPredicate::In { expr: e, negated, subquery } => {
+                if subquery.projection.len() != 1 { return Err(Error::Unsupported); }
+                let read = subquery_read(subquery, bindings, version)?;
+                if *negated { r::ReadPredicate::NotIn { expr: expr(e)?, subquery: read } }
+                else { r::ReadPredicate::In { expr: expr(e)?, subquery: read } }
+            }
+            QueryPredicate::Exists { negated, subquery } => {
+                let read = subquery_read(subquery, bindings, version)?;
+                if *negated { r::ReadPredicate::NotExists(read) } else { r::ReadPredicate::Exists(read) }
+            }
+        })
+    }
+    let mut clauses = r::ReadClauses {
+        having: query.having.as_ref().map(|p| predicate(p, &expr, bindings, version)).transpose()?,
+        order_by: query.order.iter().map(|o| Ok(r::ReadOrder { expression: expr(&o.expression)?,
+            descending: o.descending, nulls_first: None })).collect::<Result<_>>()?,
+        limit: query.limit.as_ref().map(|v| match value(v)? { Value::Int(n) => Ok(n), _ => Err(Error::Type) }).transpose()?,
+        ..r::ReadClauses::default()
+    };
+    let projection = query.projection.iter().map(|p| Ok(r::ReadProjection { expression: expr(&p.expression)?,
+        alias: p.alias.as_deref().map(|s| identifier(s, version)).transpose()? })).collect::<Result<_>>()?;
+    let filter = query.filter.as_ref().map(|p| predicate(p, &expr, bindings, version)).transpose()?;
+    let attach = !query.group_by.is_empty() || query.having.is_some() || !query.order.is_empty() || query.limit.is_some();
+    let source = |s: &QuerySource| -> Result<r::ReadSource> { Ok(r::ReadSource {
+        table: identifier(&s.table, version)?, alias: identifier(s.alias.as_deref().unwrap_or(&s.table), version)?,
+    }) };
+    if let Some(join) = &query.join {
+        let read = r::TwoSourceRead { left: source(&query.source)?, right: source(&join.source)?,
+            kind: match join.kind { JoinKind::Inner => r::ReadJoinKind::Inner, JoinKind::Left => r::ReadJoinKind::Left },
+            on: predicate(&join.on, &expr, bindings, version)?, group_by: query.group_by.iter().map(expr).collect::<Result<_>>()?, projection, filter };
+        Ok(TypedQuery::Join(Box::new(if attach { read.with_clauses(clauses) } else { read })))
+    } else {
+        source(&query.source)?;
+        clauses.group_by = query.group_by.iter().map(|e| match expr(e)? {
+            r::ReadExpr::Column(c) => Ok(c), _ => Err(Error::Unsupported),
+        }).collect::<Result<_>>()?;
+        let read = r::SingleSourceRead { table: query.source.table.clone(), projection, filter };
+        Ok(TypedQuery::Single(Box::new(if attach { read.with_clauses(clauses) } else { read })))
+    }
+}
 fn outcome(outcome: operations::Outcome) -> Outcome {
     let operations::Outcome {
         columns,
@@ -1322,10 +1580,15 @@ fn validate_parameter_admission(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
+    if matches!(stmt, Statement::Query(_) | Statement::InsertSelect { .. }) {
+        validate_depth_for(stmt, version)?;
+        validate_size(stmt)?;
+        return Ok(());
+    }
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
-        return validate_numeric_bindings(bindings);
+        return validate_bindings_for(bindings, version);
     }
     let mut remaining = stmt.clone();
     fn value(v: &mut ValueExpr, bindings: &Bindings) {
@@ -1382,7 +1645,7 @@ fn validate_parameter_admission(
         .filter(|(_, v)| !matches!(v, Value::Numeric(_)))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    validate_numeric_bindings(&other)
+    validate_bindings_for(&other, version)
 }
 
 // Inspect the public tree encoding after removing permitted assignment slots.
@@ -1415,10 +1678,10 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 | LanguageVersion::Embedded019)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
-        return validate_numeric_bindings(bindings);
+        return validate_bindings_for(bindings, version);
     }
     for step in &transaction.steps {
         match step {
@@ -1427,13 +1690,22 @@ fn validate_transaction_parameters(
                 statement: stmt, ..
             } => validate_parameter_admission(stmt, bindings, version)?,
             TransactionStep::Require(expr) => reject_numeric_references(expr, bindings)?,
+            TransactionStep::Savepoint(_) | TransactionStep::RollbackTo(_) | TransactionStep::Release(_) => {},
         }
     }
     reject_numeric_references(&transaction.emit, bindings)
 }
 
+fn typed_parameter(value: &Value) -> bool {
+    matches!(value, Value::Float4(_) | Value::Float8(_) | Value::Date(_) | Value::Time(_)
+        | Value::TimeTz(_) | Value::Timestamp(_) | Value::TimestampTz(_) | Value::Interval(_))
+}
 pub(crate) fn validate_numeric_bindings(bindings: &Bindings) -> Result<()> {
+    validate_bindings_for(bindings, LanguageVersion::Embedded018)
+}
+fn validate_bindings_for(bindings: &Bindings, version: LanguageVersion) -> Result<()> {
     for v in bindings.values() {
+        if version.supports_r2_native() && typed_parameter(v) { continue; }
         match v {
             Value::Numeric(_)
             | Value::Float4(_)
@@ -1566,7 +1838,7 @@ mod numeric_profile_tests {
                 Err(Error::Unsupported)
             ));
             assert!(matches!(
-                validate_native_value(&ValueExpr::Literal(v.clone())),
+                validate_native_value(&ValueExpr::Literal(v.clone()), LanguageVersion::Embedded018),
                 Err(Error::Unsupported)
             ));
             let bytes = serde_json::to_vec(&v).unwrap();
