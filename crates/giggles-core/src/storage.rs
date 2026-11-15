@@ -3121,6 +3121,13 @@ impl SqlSession {
             relational::Prepared::from_two_source_read(domain, epoch, read))?;
         self.execute_bound_engine(&p, &[], expected_version)
     }
+    /// Trusted Admin entry point; gateways authorize the target and every source first.
+    pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
+        expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
+        let p = self.prepare_typed_read(vec![insert.table.clone()], |domain, epoch|
+            relational::Prepared::from_typed_insert_select(domain, epoch, insert))?;
+        self.execute_bound_engine(&p, &[], expected_version)
+    }
     fn prepare_typed_read(&mut self, tables: Vec<String>,
         prepare: impl FnOnce(u128, u64) -> Result<relational::Prepared, relational::SqlError>) -> Result<relational::Prepared, CoreError> {
         let make = |s: &MetadataState<'_>| {
@@ -3130,7 +3137,7 @@ impl SqlSession {
             p.transaction = self.transaction_id;
             p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
             // Views can introduce dependencies beyond the authorized sources.
-            for table in tables {
+            for table in tables.into_iter().chain(p.authorization_tables().map_err(CoreError::Sql)?) {
                 let key = s.sql.resolve_relation_key(&table, &self.search_path);
                 if !s.sql.tables.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
             }

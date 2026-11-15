@@ -37,7 +37,7 @@ mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
 pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare,
-    ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead};
+    ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead, TypedRead, TypedInsertSelect};
 use query::{TypmodSource, result_typmod};
 pub(crate) mod cursor;
 mod returning;
@@ -1807,16 +1807,38 @@ impl Prepared {
     }
     /// Construct an unbound read; callers still perform their normal authorization.
     pub fn from_single_source_read(domain: u128, epoch: u64, read: SingleSourceRead) -> R<Self> {
-        let table = read.table.clone();
-        let mut prepared = Self::engine(Statement::Query(query::Query::from_single_source_read(read)?), domain, epoch);
-        prepared.relations.push(schemas::Reference::read(table, None));
+        let query = query::Query::from_single_source_read(read)?;
+        let tables = query.authorization_tables()?;
+        let mut prepared = Self::engine(Statement::Query(query), domain, epoch);
+        for table in tables { prepared.relations.push(schemas::Reference::read(table, None)); }
         Ok(prepared)
     }
     /// Construct an unbound join; gateways must authorize both source tables.
     pub fn from_two_source_read(domain: u128, epoch: u64, read: TwoSourceRead) -> R<Self> {
-        let tables = [read.left.table.clone(), read.right.table.clone()];
-        let mut prepared = Self::engine(Statement::Query(query::typed_read::lower_join(read)?), domain, epoch);
+        let query = query::typed_read::lower_join(read)?;
+        let tables = query.authorization_tables()?;
+        let mut prepared = Self::engine(Statement::Query(query), domain, epoch);
         for table in tables { prepared.relations.push(schemas::Reference::read(table, None)); }
+        Ok(prepared)
+    }
+    /// Construct an ordinary INSERT from a typed query, without parsing SQL.
+    pub fn from_typed_insert_select(domain: u128, epoch: u64, insert: TypedInsertSelect) -> R<Self> {
+        if insert.columns.is_empty() || insert.columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
+        let mut bytes = 0usize;
+        for name in std::iter::once(&insert.table).chain(&insert.columns) {
+            ident(name)?;
+            if name.contains('.') { return Err(SqlError::Syntax); }
+            bytes = bytes.checked_add(name.len()).ok_or(SqlError::Limit)?;
+        }
+        if bytes > MAX_SQL { return Err(SqlError::Limit); }
+        let mut prepared = match insert.source {
+            TypedRead::Single(read) => Self::from_single_source_read(domain, epoch, *read)?,
+            TypedRead::Join(read) => Self::from_two_source_read(domain, epoch, *read)?,
+        };
+        let Statement::Query(source) = prepared.statement else { unreachable!() };
+        prepared.relations.push(schemas::Reference::read(insert.table.clone(), None));
+        prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::from_query(
+            insert.table, insert.columns, source)));
         Ok(prepared)
     }
     pub(crate) fn create_engine(

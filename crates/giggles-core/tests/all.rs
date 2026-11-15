@@ -411,3 +411,5 @@ mod native_schema_resolution;
 #[path = "native_typed_params.rs"]
 mod native_typed_params;
 #[path = "native_savepoints.rs"] mod native_savepoints;
+#[path = "typed_subquery_read.rs"] mod typed_subquery_read;
+#[path = "typed_insert_select.rs"] mod typed_insert_select;

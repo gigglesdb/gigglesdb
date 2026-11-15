@@ -7,6 +7,15 @@ pub struct SingleSourceRead {
     pub projection: Vec<ReadProjection>,
     pub filter: Option<ReadPredicate>,
 }
+/// Source of a typed INSERT ... SELECT.
+#[derive(Debug, Clone)]
+pub enum TypedRead { Single(Box<SingleSourceRead>), Join(Box<TwoSourceRead>) }
+#[derive(Debug, Clone)]
+pub struct TypedInsertSelect {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub source: TypedRead,
+}
 /// A table and its exact, explicit source alias.
 #[derive(Debug, Clone)]
 pub struct ReadSource {
@@ -89,6 +98,10 @@ pub enum ReadCompare {
 pub enum ReadPredicate {
     /// Root-only clause bundle; use the read type's `with_clauses`.
     Clauses { filter: Option<Box<Self>>, clauses: Box<ReadClauses> },
+    In { expr: ReadExpr, subquery: Box<SingleSourceRead> },
+    NotIn { expr: ReadExpr, subquery: Box<SingleSourceRead> },
+    Exists(Box<SingleSourceRead>),
+    NotExists(Box<SingleSourceRead>),
     Compare(ReadExpr, ReadCompare, ReadExpr),
     /// The boolean negates IS NULL (true means IS NOT NULL).
     IsNull(ReadExpr, bool),
@@ -168,8 +181,16 @@ impl Budget {
     }
     fn predicate(&mut self, value: ReadPredicate, depth: usize) -> R<Filter> {
         self.add(0, depth)?;
+        let negated = matches!(&value, ReadPredicate::NotIn { .. } | ReadPredicate::NotExists(_));
         Ok(match value {
             ReadPredicate::Clauses { .. } => return Err(SqlError::Syntax),
+            ReadPredicate::In { expr, subquery } | ReadPredicate::NotIn { expr, subquery } => {
+                Filter::InSubquery { value: self.expr(expr, depth + 1)?,
+                    query: Box::new(lower_single(*subquery, self, depth + 1)?), negated }
+            }
+            ReadPredicate::Exists(subquery) | ReadPredicate::NotExists(subquery) => {
+                Filter::Exists { query: Box::new(lower_single(*subquery, self, depth + 1)?), negated }
+            }
             ReadPredicate::Compare(a, op, b) => {
                 let op = match op {
                     ReadCompare::Eq => "=", ReadCompare::Ne => "<>",
@@ -190,7 +211,10 @@ impl Budget {
     }
 }
 pub(super) fn lower(read: SingleSourceRead) -> R<Query> {
-    lower_sources(vec![Source { alias: read.table.clone(), name: read.table }],
+    lower_single(read, &mut Budget { nodes: 0, bytes: 0 }, 0)
+}
+fn lower_single(read: SingleSourceRead, budget: &mut Budget, depth: usize) -> R<Query> {
+    lower_sources(budget, depth, vec![Source { alias: read.table.clone(), name: read.table }],
         None, vec![], read.projection, read.filter)
 }
 pub(in crate::relational) fn lower_join(read: TwoSourceRead) -> R<Query> {
@@ -198,18 +222,18 @@ pub(in crate::relational) fn lower_join(read: TwoSourceRead) -> R<Query> {
         name(&s.alias)?;
         Ok(Source { name: s.table, alias: s.alias })
     }).collect::<R<Vec<_>>>()?;
-    lower_sources(sources, Some((matches!(read.kind, ReadJoinKind::Left), read.on)),
+    lower_sources(&mut Budget { nodes: 0, bytes: 0 }, 0, sources, Some((matches!(read.kind, ReadJoinKind::Left), read.on)),
         read.group_by, read.projection, read.filter)
 }
-fn lower_sources(sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
+fn lower_sources(budget: &mut Budget, depth: usize, sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
     group_by: Vec<ReadExpr>, projection: Vec<ReadProjection>, filter: Option<ReadPredicate>) -> R<Query> {
-    let mut budget = Budget { nodes: 0, bytes: 0 };
+    budget.add(0, depth)?;
     for source in &sources {
         name(&source.name)?;
-        budget.add(source.name.len() + source.alias.len(), 0)?;
+        budget.add(source.name.len() + source.alias.len(), depth)?;
     }
     let joins = join.map(|(left, on)| -> R<Join> {
-        Ok(Join { left, on: budget.predicate(on, 0)? })
+        Ok(Join { left, on: budget.predicate(on, depth)? })
     }).transpose()?.into_iter().collect();
     if projection.is_empty() || projection.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
@@ -217,14 +241,14 @@ fn lower_sources(sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
     let items = projection.into_iter().map(|p| {
         if let Some(alias) = &p.alias {
             name(alias)?;
-            budget.add(alias.len(), 0)?;
+            budget.add(alias.len(), depth)?;
         }
         let item = match p.expression {
             ReadExpr::Aggregate(value) => {
-                let (kind, argument) = budget.aggregate(value, 0)?;
+                let (kind, argument) = budget.aggregate(value, depth)?;
                 Item::Aggregate(kind, argument)
             }
-            expression => Item::Scalar(budget.expr(expression, 0)?),
+            expression => Item::Scalar(budget.expr(expression, depth)?),
         };
         Ok((item, p.alias))
     }).collect::<R<Vec<_>>>()?;
@@ -235,15 +259,15 @@ fn lower_sources(sources: Vec<Source>, join: Option<(bool, ReadPredicate)>,
     if group_by.len().saturating_add(clauses.group_by.len()) > MAX_COLUMNS || clauses.order_by.len() > MAX_COLUMNS {
         return Err(SqlError::Limit);
     }
-    let filter = filter.map(|f| budget.predicate(f, 0)).transpose()?;
+    let filter = filter.map(|f| budget.predicate(f, depth)).transpose()?;
     let group = group_by.into_iter().chain(clauses.group_by.into_iter().map(ReadExpr::Column))
-        .map(|expression| budget.expr(expression, 0)).collect::<R<Vec<_>>>()?;
-    let having = clauses.having.map(|f| budget.predicate(f, 0)).transpose()?;
+        .map(|expression| budget.expr(expression, depth)).collect::<R<Vec<_>>>()?;
+    let having = clauses.having.map(|f| budget.predicate(f, depth)).transpose()?;
     let order = clauses.order_by.into_iter().map(|o| {
-        Ok((budget.expr(o.expression, 0)?, o.descending, o.nulls_first.unwrap_or(o.descending)))
+        Ok((budget.expr(o.expression, depth)?, o.descending, o.nulls_first.unwrap_or(o.descending)))
     }).collect::<R<Vec<_>>>()?;
     let limit = clauses.limit.map(|n| -> R<Expr> {
-        budget.add(std::mem::size_of::<i64>(), 0)?;
+        budget.add(std::mem::size_of::<i64>(), depth)?;
         Ok(Expr::Literal(Value::Int(n)))
     }).transpose()?;
     let filter = if group.is_empty() && having.is_none() { filter } else {

@@ -604,6 +604,12 @@ impl Insert {
         }
         dependencies
     }
+    pub(super) fn from_query(table: String, columns: Vec<String>, source: query::Query) -> Self {
+        Self { table, columns, source: Some(Box::new(source)), alias: None,
+            copy_input: None, normalized: None, source_types: None, rows: vec![],
+            casts: BTreeMap::new(), defaults: vec![], default_values: false,
+            overriding: None, conflict: None, returning: None }
+    }
     pub(super) fn copy(
         table: String,
         columns: Vec<String>,
