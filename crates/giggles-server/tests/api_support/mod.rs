@@ -122,7 +122,8 @@ impl Fixture {
         resources: giggles_core::TaskResources,
     ) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = PathBuf::from("artifacts").join(format!(
+        let path = std::env::var_os("GIGGLES_TEST_ARTIFACTS")
+            .map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(format!(
             "api-fixture-{}-{}-{}",
             std::process::id(),
             SystemTime::now()

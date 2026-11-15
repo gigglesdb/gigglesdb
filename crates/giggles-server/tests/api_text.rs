@@ -12,7 +12,7 @@ async fn execute(f: &Fixture, token: &str, request: Value, grpc: bool) -> Value 
     } else {
         let (status, bytes) = f.http(&f.app, "POST", "/v1/session/execute", Some(token),
             serde_json::to_vec(&request).unwrap(), false).await.unwrap();
-        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(status, 200, "{request}: {}", String::from_utf8_lossy(&bytes));
         serde_json::from_slice(&bytes).unwrap()
     }
 }
@@ -119,4 +119,86 @@ async fn text_syntax_catalog_version_and_binding_rejections_are_invalid_argument
     })), budget_ms: None }.encode_to_vec();
     assert_eq!(wire[0], (12 << 3) | 2);
     f.stop().await;
+}
+
+// Native authority must track GigglesDB SQL, including its present PG gaps.
+#[tokio::test]
+async fn database_native_grants_match_sql_on_http_and_grpc() {
+    use giggles_core::roles::{NewRole, TablePrivilege::{Select, Insert, Update, Delete}};
+    use giggles_server::{Role, sqlstate};
+    for grpc in [false, true] {
+        let f = Fixture::new().await;
+        let roles = f.admin.roles();
+        roles.create(NewRole { name: "bound".into(), login: true, ..NewRole::default() }).unwrap();
+        let mut bindings = f.bindings.clone();
+        bindings[0].role = Role::Database { name: "bound".into() };
+        f.service.reload_bindings(bindings).unwrap();
+        let token = f.open_http(&f.app, false).await;
+        let mut sql = f.service.role_session("bound").unwrap();
+        let denied = sqlstate(&sql.prepare("INSERT INTO app(id) VALUES (2)").unwrap_err());
+        assert_eq!(denied, "42501");
+        for request in [text("insert app set id=2"), operation(insert())] {
+            assert_eq!(execute(&f, &token, request, grpc).await["code"], denied);
+        }
+        for control in ["begin", "commit", "begin", "rollback"] {
+            assert_eq!(execute(&f, &token, json!({(control):{}}), grpc).await["code"], "ok");
+        }
+        roles.grant_table("app", "bound", &[Select]).unwrap();
+        assert_eq!(execute(&f, &token, operation(insert()), grpc).await["code"],
+            sqlstate(&sql.prepare("INSERT INTO app(id) VALUES (2)").unwrap_err()));
+        let read = operation(json!({"read":{"table":"app","projection":["id"]}}));
+        assert_eq!(execute(&f, &token, text("app select id"), grpc).await,
+            execute(&f, &token, read, grpc).await);
+        assert_eq!(execute(&f, &token, text("app select id"), grpc).await["code"], "ok");
+        roles.grant_table("app", "bound", &[Insert]).unwrap();
+        assert_eq!(execute(&f, &token, operation(insert()), grpc).await["code"], "ok");
+        roles.revoke_table("app", "bound", &[Insert]).unwrap();
+        assert_eq!(execute(&f, &token, text("insert app set id=3"), grpc).await["code"], denied);
+        roles.grant_table("app", "bound", &[Insert]).unwrap();
+        for block in [
+            text("transaction { insert app set id=2; other select absent }"),
+            text("transaction { let first=(insert app set id=3); let later=(other select absent) }"),
+        ] {
+            assert_eq!(execute(&f, &token, json!({"begin":{}}), grpc).await["code"], "ok");
+            let reply = execute(&f, &token, block, grpc).await;
+            assert_eq!(reply["code"], denied);
+            assert_eq!(reply["transactionState"], "TRANSACTION_STATE_ABORTED");
+            execute(&f, &token, json!({"rollback":{}}), grpc).await;
+            assert_eq!(f.admin.sql_session().execute("SELECT id FROM app", &[], None).unwrap().rows.len(), 1);
+        }
+        for table in ["other", "missing"] {
+            let error = sql.prepare(&format!("SELECT absent FROM {table}")).unwrap_err();
+            assert_eq!(execute(&f, &token, text(&format!("{table} select absent")), grpc).await["code"], sqlstate(&error));
+        }
+        // Each case has only its command grant: WHERE, RETURNING and conflict
+        // updates intentionally follow SQL's current policy, not PG's policy.
+        roles.revoke_table("app", "bound", &[Select, Insert]).unwrap();
+        for (privilege, source, statement) in [
+            (Select, "app select id", "SELECT id FROM app"),
+            (Select, "app select id+1 as n", "SELECT id+1 AS n FROM app"),
+            (Insert, "insert app set id=3", "INSERT INTO app(id) VALUES (3)"),
+            (Insert, "insert into app(id) values(3+0)", "INSERT INTO app(id) VALUES (3+0)"),
+            (Insert, "insert many into app(id) values(3),(4) at most 2", "INSERT INTO app(id) VALUES (3),(4)"),
+            (Insert, "insert app set id=3 return id", "INSERT INTO app(id) VALUES (3) RETURNING id"),
+            (Insert, "insert into app(id) values(2) on conflict(id) do nothing", "INSERT INTO app(id) VALUES (2) ON CONFLICT(id) DO NOTHING"),
+            (Insert, "insert into app(id,body) values(2,\"upsert\") on conflict(id) do update set body=incoming.body return id", "INSERT INTO app(id,body) VALUES (2,'upsert') ON CONFLICT(id) DO UPDATE SET body=excluded.body RETURNING id"),
+            (Update, "update app where id=2 set body=\"changed\"", "UPDATE app SET body='changed' WHERE id=2"),
+            (Update, "update app where id=2 set body=body return id", "UPDATE app SET body=body WHERE id=2 RETURNING id"),
+            (Delete, "delete app where id=2 return id", "DELETE FROM app WHERE id=2 RETURNING id"),
+        ] {
+            let expected = sql.prepare(statement).map(|_| ()).unwrap_err();
+            assert_eq!(execute(&f, &token, text(source), grpc).await["code"], sqlstate(&expected), "{source}");
+            roles.grant_table("app", "bound", &[privilege]).unwrap();
+            let prepared = sql.prepare(statement).unwrap();
+            assert!(prepared.authorization_tables().unwrap().iter().all(|t| t == "app"));
+            assert_eq!(execute(&f, &token, json!({"begin":{}}), grpc).await["code"], "ok");
+            let reply = execute(&f, &token, text(source), grpc).await;
+            assert_eq!(reply["code"], "ok", "{source}: {reply}");
+            execute(&f, &token, json!({"rollback":{}}), grpc).await;
+            roles.revoke_table("app", "bound", &[privilege]).unwrap();
+        }
+        roles.set_table_owner("app", "bound").unwrap();
+        assert_eq!(execute(&f, &token, text("app select id"), grpc).await["code"], "ok");
+        f.stop().await;
+    }
 }

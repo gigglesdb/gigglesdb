@@ -44,9 +44,13 @@ Operators may also provision an existing SQL LOGIN role in the same binding
 configuration: `{"fingerprint":"<64 lowercase SHA256 hex characters>",
 "role":{"role":"Database","name":"app_user"}}`. The role name comes only from
 this configuration. Unknown roles and roles without LOGIN reject validation and
-session opening. These identities can open sessions, but typed native operations,
-transaction controls and SQL requests currently return Scope (`42501`). Native
-SQL-role privilege enforcement will be enabled separately.
+session opening. These identities can run typed native operations, native text,
+atomic blocks and transaction controls using the SQL role's live table grants
+(and owner/superuser authority). Every block target is authorized before any step
+runs; GRANT and REVOKE apply on the next request. Native privilege requirements
+match the current GigglesDB SQL policy, including its existing WHERE, RETURNING
+and ON CONFLICT privilege limitations. SQL requests on these API sessions still
+return Scope (`42501`).
 
 A certificate-bound Database session checks both its fingerprint binding epoch
 and its SQL role generation on every request. Removing or replacing the binding,
