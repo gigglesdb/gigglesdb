@@ -588,7 +588,7 @@ impl Filter {
     ) -> R<BoundFilter> {
         Ok(match self {
             Self::Exists { query, negated } => {
-                let key = query.as_ref() as *const Query as usize;
+                let key = subqueries.key(query.as_ref() as *const Query as usize);
                 subqueries.get(key, SubplanMode::Exists)?;
                 BoundFilter::Exists {
                     query: key,
@@ -600,7 +600,7 @@ impl Filter {
                 query,
                 negated,
             } => {
-                let key = query.as_ref() as *const Query as usize;
+                let key = subqueries.key(query.as_ref() as *const Query as usize);
                 let column_type = &subqueries.get(key, SubplanMode::In)?.columns[0].data_type;
                 if *column_type == DataType::Bpchar {
                     return Err(SqlError::Unsupported);
@@ -1828,7 +1828,7 @@ impl Query {
     }
     pub(super) fn has_in_subquery(&self) -> bool {
         let mut found = false;
-        if let Some(f) = &self.filter {
+        for f in self.filter.iter().chain(self.joins.iter().map(|j| &j.on)) {
             let _ = f.visit_subqueries(&mut |_, _| {
                 found = true;
                 Ok(())
@@ -1878,7 +1878,7 @@ impl Query {
     pub(super) fn subquery_tables(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(q) = self.derived() { out.extend(q.read_tables()); }
-        if let Some(f) = &self.filter {
+        for f in self.filter.iter().chain(self.joins.iter().map(|j| &j.on)) {
             let _ = f.visit_subqueries(&mut |_, q| {
                 for name in q.read_tables() {
                     if !out.contains(&name) {
@@ -1952,7 +1952,7 @@ impl Query {
                 out.insert(*n);
             }
         }
-        if let Some(f) = self.where_filter() {
+        for f in self.where_filter().into_iter().chain(self.having()).chain(self.joins.iter().map(|j| &j.on)) {
             let _ = f.visit_subqueries(&mut |_, q| {
                 q.limit_parameters(out);
                 Ok(())
@@ -1976,13 +1976,15 @@ impl Query {
             for n in used { parameters[n - 1] = Some(bound.parameters[n - 1].clone()); }
             out.register(q as *const Query as usize, SubplanMode::Scalar, bound)?;
         }
-        if let Some(f) = self.where_filter() {
+        for (f, visible) in self.where_filter().into_iter().chain(self.having()).map(|f| (f, self.sources.len()))
+            .chain(self.joins.iter().enumerate().map(|(j, join)| (&join.on, j + 2))) {
+            let scoped = |c: &ColumnRef, _: usize| resolve(c, visible);
             f.visit_subqueries(&mut |value, q| {
                 if let Some(value) = value
                     && let [(Item::Scalar(Scalar::Param(n)), _)] = q.items.as_slice()
                     && parameters.get(n - 1).is_some_and(Option::is_none)
                 {
-                    let ty = value.bind(resolve, tables, parameters).ok().map(|v| v.ty).unwrap_or(DataType::Text);
+                    let ty = value.bind(&scoped, tables, parameters).ok().map(|v| v.ty).unwrap_or(DataType::Text);
                     parameters[*n - 1] = Some(ty);
                 }
                 let used = q.used_parameters();
@@ -1997,14 +1999,15 @@ impl Query {
                         }
                     })
                     .collect();
-                let scopes: Vec<_> = std::iter::once(self.sources.as_slice()).chain(outer.iter().copied()).collect();
+                let scopes: Vec<_> = std::iter::once(&self.sources[..visible]).chain(outer.iter().copied()).collect();
                 let bound = q.bind_seeded_inner(state, seed, false, &scopes)?;
                 if value.is_some() && bound.columns.len() != 1 {
                     return Err(SqlError::Syntax);
                 }
                 if let Some(value) = value
-                    && !matches!(value, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some)) {
-                    value.infer(Some(&bound.columns[0].data_type), parameters, resolve, tables)?;
+                    && !matches!(value, Scalar::Param(n) if parameters.get(n - 1).is_some_and(Option::is_some))
+                    && !grouping::contains_aggregate(value) {
+                    value.infer(Some(&bound.columns[0].data_type), parameters, &scoped, tables)?;
                 }
                 for n in used {
                     if let Some(slot) = parameters.get_mut(n - 1) {
@@ -2535,13 +2538,13 @@ impl Query {
             }
         }
         for join in &joins {
-            join.on.admit_subquery_positions(false)?;
+            join.on.admit_subquery_positions(true)?;
         }
         if let Some(f) = &filter {
             f.admit_subquery_positions(true)?;
         }
         if let Some(f) = &having {
-            f.admit_subquery_positions(false)?;
+            f.admit_subquery_positions(true)?;
         }
         for s in &group {
             reject_scalar_subquery(s)?;
@@ -2594,6 +2597,7 @@ impl Query {
         tables: &[&TableDef],
         parameters: &mut [Option<DataType>],
         resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
+        subqueries: &Subplans<'_>,
     ) -> R<Vec<BoundJoin>> {
         let mut joins = vec![];
         for (j, join) in self.joins.iter().enumerate() {
@@ -2604,8 +2608,8 @@ impl Query {
             if filter_contains_aggregate(&join.on) {
                 return Err(SqlError::GroupingError);
             }
-            join.on.infer(parameters, &scoped, tables)?;
-            let on = join.on.bind(parameters, &scoped, tables)?;
+            join.on.infer_with_subqueries(parameters, &scoped, tables, subqueries)?;
+            let on = join.on.bind_with_subqueries(parameters, &scoped, tables, subqueries)?;
             for (a, b) in join.equalities() {
                 let a = resolve(a, right + 1)?;
                 let b = resolve(b, right + 1)?;
@@ -3598,6 +3602,15 @@ impl Query {
         {
             f.infer_outer(&mut parameters, &resolve, &tables)?;
         }
+        for (j, join) in self.joins.iter().enumerate() {
+            let mut has_subquery = false;
+            join.on.visit_subqueries(&mut |_, _| { has_subquery = true; Ok(()) })?;
+            if has_subquery {
+                if filter_contains_aggregate(&join.on) { return Err(SqlError::GroupingError); }
+                let scoped = |c: &ColumnRef, _: usize| resolve(c, j + 2);
+                join.on.infer_outer(&mut parameters, &scoped, &tables)?;
+            }
+        }
         let subqueries = self.bind_subqueries(state, &mut parameters, outer, &resolve, &tables)?;
         if let Some(filter) = self.where_filter() {
             aggregate_filter::validate_filter(filter, &parameters, &resolve, &tables)?;
@@ -3635,7 +3648,7 @@ impl Query {
                 return Err(SqlError::GroupingError);
             }
             aggregate_filter::validate_filter(&join.on, &parameters, &scoped, &tables)?;
-            join.on.infer(&mut parameters, &scoped, &tables)?;
+            join.on.infer_with_subqueries(&mut parameters, &scoped, &tables, &subqueries)?;
         }
         if grouped {
             let mut bound = grouping::bind(self, &tables, parameters, &resolve, subqueries)?;
@@ -3831,7 +3844,7 @@ impl Query {
                 }
             }
         }
-        let joins = self.bind_joins(&tables, &mut parameters, &resolve)?;
+        let joins = self.bind_joins(&tables, &mut parameters, &resolve, &subqueries)?;
         let mut columns = vec![];
         let mut aliases = BTreeSet::new();
         for (item, alias) in &self.items {
@@ -4106,6 +4119,8 @@ fn join_rows<'a>(
     visits: &'a Cell<usize>,
     outer: &'a [Vec<Value>],
     charge_base: bool,
+    state: &'a Relational,
+    execution: &'a Execution<'_>,
 ) -> impl Iterator<Item = R<Tuple>> + 'a {
     // Retain owned point results only for this iterator's lifetime.
     let mut point_cache = std::collections::HashMap::<
@@ -4164,7 +4179,8 @@ fn join_rows<'a>(
                     if depth > 0 {
                         let mut work = 0;
                         if !equality_match
-                            || query.joins[depth - 1].on.eval(&row, params, &mut work)?
+                            || query.joins[depth - 1].on.eval_with_subqueries(
+                                &row, params, &mut work, query, state, source, execution)?
                                 != Some(true)
                         {
                             continue;
@@ -5113,7 +5129,7 @@ impl BoundQuery<'_> {
         } else {
             scan::Meter::new(cancel)
         };
-        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits, &[], false);
+        let joined = join_rows(self, source, input, params, &mut meter, &execution.visits, &[], false, state, execution);
         let filtered = joined.filter_map(|row| {
             let row = match row {
                 Ok(row) => row,
@@ -5868,7 +5884,9 @@ mod join_visit_budget_tests {
                         scan::Direction::Forward,
                     )
                     .unwrap();
-                let result = join_rows(&bound, &source, input, &[], &mut meter, &visits, &[], false)
+                let mut execution_cancel = || false;
+                let execution = Execution::new(&mut execution_cancel, &[]);
+                let result = join_rows(&bound, &source, input, &[], &mut meter, &visits, &[], false, &state, &execution)
                     .collect::<R<Vec<_>>>();
                 if remaining == candidates {
                     assert_eq!(result.unwrap().len(), outputs);

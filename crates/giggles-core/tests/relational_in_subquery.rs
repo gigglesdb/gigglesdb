@@ -297,8 +297,6 @@ fn unsupported_subquery_positions_remain_unsupported() {
         "SELECT NULL::int IN (SELECT id FROM u WHERE false)",
         "SELECT '2' IN (SELECT id FROM u) AS lit",
         "SELECT id FROM t WHERE (id,v) IN (SELECT id,'b' FROM u)",
-        "SELECT t.id FROM t JOIN u ON t.id IN (SELECT id FROM u)",
-        "SELECT id FROM t GROUP BY id HAVING id IN (SELECT id FROM u)",
         "SELECT CASE WHEN id IN (SELECT id FROM u) THEN 1 ELSE 0 END FROM t",
         "SELECT id FROM t WHERE CASE WHEN id IN (SELECT id FROM u) THEN true ELSE false END",
         "SELECT count(*) FILTER (WHERE id IN (SELECT id FROM u)) FROM t",
@@ -309,6 +307,7 @@ fn unsupported_subquery_positions_remain_unsupported() {
     ] {
         error(s, sql, E::Unsupported);
     }
+    assert_eq!(rows(s, "SELECT t.id FROM t JOIN u ON t.id IN (SELECT id FROM u)"), ints(&[2, 2]));
     // PG18.6: 23505.
     error(
         s,

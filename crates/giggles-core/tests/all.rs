@@ -428,3 +428,7 @@ mod native_views;
 
 #[path = "missing_schema_ddl.rs"] mod missing_schema_ddl;
 #[path = "having_parameters.rs"] mod having_parameters;
+
+#[path = "having_subqueries.rs"] mod having_subqueries;
+
+#[path = "join_on_subqueries.rs"] mod join_on_subqueries;

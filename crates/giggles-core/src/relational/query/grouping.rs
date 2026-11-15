@@ -13,6 +13,7 @@ pub(super) struct Grouping {
     output_sources: Vec<Option<BoundColumn>>,
     order_slots: Vec<usize>,
     having: Option<BoundFilter>,
+    having_outer: Vec<(BoundColumn, BoundScalar)>,
     order: Vec<(BoundScalar, bool, bool)>,
 }
 fn aggregate(name: &str) -> Option<Aggregate> {
@@ -275,7 +276,11 @@ impl<F: Fn(&ColumnRef, usize) -> R<BoundColumn>> Lower<'_, F> {
     }
     fn filter(&mut self, f: &Filter) -> R<Filter> {
         Ok(match f {
-            Filter::Clauses(_) | Filter::InSubquery { .. } | Filter::Exists { .. } => return Err(SqlError::Unsupported),
+            Filter::Clauses(_) => return Err(SqlError::Unsupported),
+            Filter::InSubquery { value, query, negated } => Filter::InSubquery {
+                value: self.scalar(value)?, query: query.clone(), negated: *negated,
+            },
+            Filter::Exists { .. } => f.clone(),
             Filter::Scalar(s) => Filter::Scalar(self.scalar(s)?),
             Filter::Compare(a, op, b) => {
                 Filter::Compare(self.scalar(a)?, op.clone(), self.scalar(b)?)
@@ -404,7 +409,7 @@ pub(super) fn bind<'a>(
     tables: &[&'a TableDef],
     mut parameters: Vec<Option<DataType>>,
     resolve: &impl Fn(&ColumnRef, usize) -> R<BoundColumn>,
-    subqueries: Subplans<'a>,
+    mut subqueries: Subplans<'a>,
 ) -> R<BoundQuery<'a>> {
     let projection = projection(q, tables)?;
     if projection.len() > MAX_COLUMNS {
@@ -489,7 +494,31 @@ pub(super) fn bind<'a>(
             }
         })
         .collect::<R<Vec<_>>>()?;
+    // Validate every correlation against the group keys/dependent columns, then
+    // reconstruct the input source shape from post-group values for child frames.
+    let mut having_outer_syntax = vec![];
+    if let Some(f) = q.having() {
+        f.visit_subqueries(&mut |_, child| {
+            for c in subqueries.outer_columns(child as *const Query as usize) {
+                let scalar = Scalar::Column(ColumnRef {
+                    qualifier: Some(q.sources[c.source].alias.clone()),
+                    name: tables[c.source].columns[c.column].name.clone(),
+                });
+                having_outer_syntax.push((c, lower.scalar(&scalar)?));
+            }
+            Ok(())
+        })?;
+    }
     let having_syntax = q.having().map(|f| lower.filter(f)).transpose()?;
+    if let (Some(original), Some(lowered)) = (q.having(), &having_syntax) {
+        let mut keys = vec![];
+        original.visit_subqueries(&mut |_, child| { keys.push(child as *const Query as usize); Ok(()) })?;
+        let mut keys = keys.into_iter();
+        lowered.visit_subqueries(&mut |_, child| {
+            subqueries.alias(child as *const Query as usize, keys.next().ok_or(SqlError::Unsupported)?);
+            Ok(())
+        })?;
+    }
     let order_slots = if q.distinct() {
         q.order
             .iter()
@@ -671,7 +700,7 @@ pub(super) fn bind<'a>(
         s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
     }
     if let Some(f) = &having_syntax {
-        f.infer(&mut parameters, &slot_resolve, &slot_tables)?;
+        f.infer_with_subqueries(&mut parameters, &slot_resolve, &slot_tables, &subqueries)?;
     }
     for (s, _, _) in &order_syntax {
         s.infer(None, &mut parameters, &slot_resolve, &slot_tables)?;
@@ -728,9 +757,19 @@ pub(super) fn bind<'a>(
             column
         })
         .collect();
+    let having_outer = having_outer_syntax.iter().map(|(c, s)|
+        Ok((*c, s.bind(&slot_resolve, &slot_tables, &parameters)?))).collect::<R<Vec<_>>>()?;
+    // HAVING scalar operands use the final tuple slot, after original sources.
+    let having_source = if having_outer.is_empty() { 0 } else { q.sources.len() };
+    let having_tables = std::iter::repeat_n(&slot_table, having_source + 1).collect::<Vec<_>>();
+    let having_resolve = |c: &ColumnRef, scope| {
+        let mut column = slot_resolve(c, scope)?;
+        column.source = having_source;
+        Ok(column)
+    };
     let having = having_syntax
         .as_ref()
-        .map(|f| f.bind(&parameters, &slot_resolve, &slot_tables))
+        .map(|f| f.bind_with_subqueries(&parameters, &having_resolve, &having_tables, &subqueries))
         .transpose()?;
     let order = order_syntax
         .iter()
@@ -740,7 +779,7 @@ pub(super) fn bind<'a>(
         .where_filter()
         .map(|f| f.bind_with_subqueries(&parameters, resolve, tables, &subqueries))
         .transpose()?;
-    let joins = q.bind_joins(tables, &mut parameters, resolve)?;
+    let joins = q.bind_joins(tables, &mut parameters, resolve, &subqueries)?;
     let predicates = q.predicates.iter().filter_map(|(c, op, e)| {
         let c = resolve(c, tables.len()).ok()?;
         let ty = &tables[c.source].columns[c.column].data_type;
@@ -784,6 +823,7 @@ pub(super) fn bind<'a>(
             output_sources,
             order_slots,
             having,
+            having_outer,
             order,
         }),
     })
@@ -972,12 +1012,11 @@ impl Grouping {
                     if exists { query.exists_input(source, params, &outer, &range)? }
                     else { query.input_rows(source, params, &range, empty)? }
                 } else { source.scan(query.tables[0], &range, scan::Direction::Forward)? };
-                for row in join_rows(query, source, input, params, &mut meter, &execution.visits, &outer, exists) {
+                for row in join_rows(query, source, input, params, &mut meter, &execution.visits, &outer, exists, state, execution) {
                     accept(&row?)?;
                 }
             }
         }
-        let mut retention = scope.borrow();
         let mut rows = vec![];
         let mut distinct = std::collections::BTreeSet::new();
         let mut skipped = 0;
@@ -995,11 +1034,32 @@ impl Grouping {
                 version: 0,
             };
             let mut work = 0;
-            if let Some(h) = &self.having
-                && h.eval(&row, params, &mut work)? != Some(true)
-            {
-                continue;
+            if let Some(h) = &self.having {
+                if self.having_outer.is_empty() {
+                    if h.eval_with_subqueries(&row, params, &mut work, query, state, source, execution)? != Some(true) {
+                        continue;
+                    }
+                } else {
+                    let frame_scope = RetentionScope::new(execution);
+                    let frame_bytes = (query.query.sources.len() + 1) * std::mem::size_of::<Vec<Value>>()
+                        + self.having_outer.iter().map(|(c, _)| (c.column + 1) * std::mem::size_of::<Value>()).sum::<usize>()
+                        + retained(&row.values[0]) * (self.having_outer.len() + 1);
+                    frame_scope.borrow().charge(frame_bytes)?;
+                    let mut values = vec![vec![]; query.query.sources.len()];
+                    for (column, scalar) in &self.having_outer {
+                        if values[column.source].len() <= column.column {
+                            values[column.source].resize(column.column + 1, Value::Null);
+                        }
+                        values[column.source][column.column] = scalar.eval(&row, params, &mut work)?;
+                    }
+                    values.push(row.values[0].clone());
+                    let having_row = Tuple { values, version: 0 };
+                    if h.eval_with_subqueries(&having_row, params, &mut work, query, state, source, execution)? != Some(true) {
+                        continue;
+                    }
+                }
             }
+            let mut retention = scope.borrow();
             if exists && (!query.query.distinct() || page.offset == 0) {
                 if skipped == page.offset {
                     result.rows.push(SqlRow { values: vec![], version: 0 });

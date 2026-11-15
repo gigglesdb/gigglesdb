@@ -17,11 +17,27 @@ struct Subplan<'a> {
 #[derive(Default)]
 pub(super) struct Subplans<'a> {
     entries: Vec<Subplan<'a>>,
+    aliases: Vec<(usize, usize)>,
     count: usize,
     depth: usize,
 }
 
 impl<'a> Subplans<'a> {
+    pub(super) fn alias(&mut self, from: usize, to: usize) { self.aliases.push((from, to)); }
+    pub(super) fn key(&self, key: usize) -> usize {
+        self.aliases.iter().find(|(from, _)| *from == key).map_or(key, |(_, to)| *to)
+    }
+    pub(super) fn outer_columns(&self, key: usize) -> Vec<BoundColumn> {
+        fn collect(query: &BoundQuery<'_>, depth: usize, out: &mut Vec<BoundColumn>) {
+            out.extend(query.outer_slots.iter().filter(|s| s.depth == depth)
+                .map(|s| BoundColumn { source: s.source, column: s.column }));
+            for entry in &query.subqueries.entries { collect(&entry.query, depth + 1, out); }
+        }
+        let mut out = vec![];
+        if let Some(entry) = self.entries.iter().find(|e| e.key == key) { collect(&entry.query, 1, &mut out); }
+        out
+    }
+
     pub(super) fn correlated(&self, depth: usize) -> bool {
         self.entries.iter().any(|entry| entry.query.correlated(depth))
     }
@@ -50,7 +66,7 @@ impl<'a> Subplans<'a> {
     pub(super) fn get(&self, key: usize, mode: SubplanMode) -> R<&BoundQuery<'a>> {
         self.entries
             .iter()
-            .find(|entry| entry.key == key && entry.mode == mode)
+            .find(|entry| entry.key == self.key(key) && entry.mode == mode)
             .map(|entry| &entry.query)
             .ok_or(SqlError::Unsupported)
     }
@@ -105,7 +121,7 @@ impl Query {
                 out.routines.insert(aggregate.name().into());
             }
         }
-        if let Some(filter) = &self.filter {
+        for filter in self.filter.iter().chain(self.joins.iter().map(|j| &j.on)) {
             filter.visit_subqueries(&mut |_, child| child.collect_dependencies(out))?;
         }
         Ok(())

@@ -66,7 +66,9 @@ fn subquery_rows_nulls_metadata_and_dependencies_match_sql() {
                 filter: if in_join { None } else { Some(exists) } };
             let sql = if in_join { "SELECT a.n FROM t a JOIN u b ON a.n=b.n AND EXISTS(SELECT n FROM t)" }
                 else { "SELECT a.n FROM t a JOIN u b ON a.n=b.n WHERE EXISTS(SELECT n FROM t)" };
-            assert_eq!(trap(|| s.execute_typed_join(typed, None)), s.execute(sql, &[], None));
+            let actual = trap(|| s.execute_typed_join(typed, None)).unwrap();
+            assert_eq!(actual, s.execute(sql, &[], None).unwrap());
+            assert_eq!(actual.rows.len(), 1);
         }
         let invalid = read("t", Some(Exists(Box::new(read("missing", None)))));
         let sql = s.execute("SELECT n FROM t WHERE EXISTS(SELECT n FROM missing)", &[], None);

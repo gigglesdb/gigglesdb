@@ -181,7 +181,7 @@ impl BoundQuery<'_> {
             if !empty {
                 let range = scan::KeyRange::from_bounds(bounds);
                 let input = self.exists_input(source, params, &outer, &range)?;
-                for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true) {
+                for row in join_rows(self, source, input, params, &mut meter, &execution.visits, &outer, true, state, execution) {
                     if accept(&row?)? && !self.aggregate { return Ok(true); }
                 }
             }
