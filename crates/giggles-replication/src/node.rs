@@ -2,15 +2,17 @@
 use crate::{
     entry::{self, EntryKind, ProposalContext},
     error::{Error, Result},
-    log_store::LogStore,
+    log_store::{LogStore, PendingInstall},
+    membership::{AdminCommand, Membership},
     snapshot::Manifest,
     state::{AppliedPosition, StateMachine},
 };
+use protobuf::Message as _;
 use raft::{
     Config, RawNode, ReadOnlyOption, StateRole,
-    eraftpb::{Entry, EntryType, Message, MessageType},
+    eraftpb::{ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType},
 };
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoleInfo {
@@ -22,6 +24,8 @@ pub struct Output {
     pub messages: Vec<Message>,
     pub applied: Vec<(u64, u64)>,
     pub failed: Vec<u64>,
+    pub refused: Vec<(u64, String)>,
+    pub membership_changed: bool,
     pub read_states: Vec<(Vec<u8>, u64)>,
     pub role: RoleInfo,
 }
@@ -36,16 +40,35 @@ pub struct Replica {
     node_id: u64,
     cluster: [u8; 16],
     pending: Vec<Pending>,
+    membership: Membership,
 }
 impl Replica {
     pub fn new(log: LogStore, state: Arc<dyn StateMachine>, voters: &[u64]) -> Result<Self> {
         let (cluster, node_id) = log.identity();
         log.initialize_voters(voters)?;
+        if let Some(p) = log.pending_install()? {
+            if state.applied().map_err(|e| Error::Apply(e.to_string()))?
+                == Some(AppliedPosition {
+                    index: p.index,
+                    term: p.term,
+                })
+            {
+                log.install_snapshot_meta(p.index, p.term, &p.conf, &p.membership)?;
+            } else {
+                log.clear_pending_install()?;
+            }
+        }
         if let Some(p) = state.applied().map_err(|e| Error::Apply(e.to_string()))?
             && p.index > log.hard_state()?.commit
         {
-            log.install_snapshot_meta(p.index, p.term, &log.conf_state()?)?;
+            log.install_snapshot_meta(
+                p.index,
+                p.term,
+                &log.conf_state()?,
+                &log.membership()?.unwrap_or_default(),
+            )?;
         }
+        let membership = Self::decode_membership(log.membership()?.as_deref())?;
         let config = Config {
             id: node_id,
             election_tick: 10,
@@ -69,7 +92,42 @@ impl Replica {
             node_id,
             cluster,
             pending: Vec::new(),
+            membership,
         })
+    }
+    fn decode_membership(bytes: Option<&[u8]>) -> Result<Membership> {
+        bytes.map_or(Ok(Membership::default()), |b| {
+            Membership::decode(b).map_err(|e| Error::Corrupt(e.to_string()))
+        })
+    }
+    pub fn membership(&self) -> &Membership {
+        &self.membership
+    }
+    pub fn conf_state(&self) -> ConfState {
+        self.raw.raft.prs().conf().to_conf_state()
+    }
+    pub fn last_index(&self) -> u64 {
+        self.raw.raft.raft_log.last_index()
+    }
+    pub fn peer_matched(&self, id: u64) -> Option<u64> {
+        (self.role().state == StateRole::Leader)
+            .then(|| self.raw.raft.prs().get(id).map(|p| p.matched))
+            .flatten()
+    }
+    pub fn reachable_voters(&self) -> BTreeSet<u64> {
+        if self.role().state != StateRole::Leader {
+            return BTreeSet::new();
+        }
+        let cs = self.conf_state();
+        cs.voters
+            .iter()
+            .chain(&cs.voters_outgoing)
+            .chain(std::iter::once(&self.node_id))
+            .copied()
+            .filter(|&id| {
+                id == self.node_id || self.raw.raft.prs().get(id).is_some_and(|p| p.recent_active)
+            })
+            .collect()
     }
     pub fn report_snapshot(&mut self, to: u64, ok: bool) {
         self.raw.report_snapshot(
@@ -82,7 +140,12 @@ impl Replica {
         );
     }
     /// Capture a checkpoint on the applying thread; hashing and publication can run elsewhere.
-    pub fn prepare_snapshot(&mut self, staging: &Path) -> Result<Option<(u64, u64, Vec<u64>)>> {
+    // Keep the checkpoint position, full configuration, and membership together.
+    #[allow(clippy::type_complexity)]
+    pub fn prepare_snapshot(
+        &mut self,
+        staging: &Path,
+    ) -> Result<Option<(u64, u64, ConfState, Vec<u8>)>> {
         if self.log().snapshots().is_none() {
             return Ok(None);
         }
@@ -94,7 +157,11 @@ impl Replica {
         else {
             return Ok(None);
         };
-        let voters = self.log().conf_state()?.voters;
+        if self.log().conf_index()? > p.index {
+            return Ok(None);
+        }
+        let conf = self.log().conf_state()?;
+        let membership = self.log().membership()?.unwrap_or_default();
         let q = self
             .state
             .checkpoint(staging)
@@ -102,7 +169,7 @@ impl Replica {
         if q != p {
             return Err(Error::Corrupt("checkpoint position changed".into()));
         }
-        Ok(Some((p.index, p.term, voters)))
+        Ok(Some((p.index, p.term, conf, membership)))
     }
 
     pub fn build_snapshot(&mut self) -> Result<Option<Manifest>> {
@@ -119,11 +186,11 @@ impl Replica {
         };
         let stage = snapshots.staging_dir(p.index, p.term);
         let result = (|| {
-            let Some((index, term, voters)) = self.prepare_snapshot(&stage)? else {
+            let Some((index, term, conf, membership)) = self.prepare_snapshot(&stage)? else {
                 return Ok(None);
             };
             snapshots
-                .build(index, term, &voters, |dir| {
+                .build(index, term, &conf, &membership, |dir| {
                     std::fs::rename(&stage, dir)?;
                     Ok(())
                 })
@@ -180,8 +247,20 @@ impl Replica {
         self.raw.raft.raft_log.store()
     }
     pub fn step(&mut self, from: u64, mut m: Message) -> Result<()> {
-        let cs = self.log().conf_state()?;
-        if !cs.voters.contains(&from) && !cs.voters_outgoing.contains(&from)
+        let cs = self.conf_state();
+        let empty = cs.voters.is_empty()
+            && cs.voters_outgoing.is_empty()
+            && cs.learners.is_empty()
+            && cs.learners_next.is_empty();
+        let known = cs
+            .voters
+            .iter()
+            .chain(&cs.voters_outgoing)
+            .chain(&cs.learners)
+            .chain(&cs.learners_next)
+            .any(|&id| id == from);
+        if self.membership.is_retired(from)
+            || (!empty && !known)
             || m.from != from
             || m.to != self.node_id
             || raft::raw_node::is_local_msg(m.get_msg_type())
@@ -191,7 +270,7 @@ impl Replica {
             )
             || m.entries
                 .iter()
-                .any(|e| e.get_entry_type() != EntryType::EntryNormal)
+                .any(|e| e.get_entry_type() == EntryType::EntryConfChange)
             || (m.get_msg_type() == MessageType::MsgSnapshot && !self.state.can_install())
             || (!m.get_snapshot().is_empty()
                 && (m.get_msg_type() != MessageType::MsgSnapshot
@@ -230,24 +309,43 @@ impl Replica {
         }
         self.raw.step(m).map_err(Error::Raft)
     }
-    pub fn propose(&mut self, payload: &[u8], waiter: u64) -> Result<()> {
+    fn propose_with(
+        &mut self,
+        waiter: u64,
+        submit: impl FnOnce(&mut RawNode<LogStore>, Vec<u8>) -> raft::Result<()>,
+    ) -> Result<()> {
         if self.role().state != StateRole::Leader {
             return Err(Error::NotLeader);
         }
-        let data = entry::encode(self.cluster, EntryKind::Batch, payload)
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
         let context = ProposalContext {
             proposer: self.node_id,
             seq: waiter,
         }
         .encode();
-        self.raw.propose(context, data).map_err(Error::Raft)?;
+        submit(&mut self.raw, context).map_err(Error::Raft)?;
         self.pending.push(Pending {
             waiter,
-            index: self.raw.raft.raft_log.last_index(),
+            index: self.last_index(),
             term: self.raw.raft.term,
         });
         Ok(())
+    }
+    pub fn propose(&mut self, payload: &[u8], waiter: u64) -> Result<()> {
+        self.propose_payload(EntryKind::Batch, payload, waiter)
+    }
+    fn propose_payload(&mut self, kind: EntryKind, payload: &[u8], waiter: u64) -> Result<()> {
+        if self.role().state != StateRole::Leader {
+            return Err(Error::NotLeader);
+        }
+        let data = entry::encode(self.cluster, kind, payload)
+            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        self.propose_with(waiter, |raw, ctx| raw.propose(ctx, data))
+    }
+    pub fn propose_admin(&mut self, cmd: &AdminCommand, waiter: u64) -> Result<()> {
+        self.propose_payload(EntryKind::Admin, &cmd.encode(), waiter)
+    }
+    pub fn propose_conf_change(&mut self, cc: ConfChangeV2, waiter: u64) -> Result<()> {
+        self.propose_with(waiter, |raw, ctx| raw.propose_conf_change(ctx, cc))
     }
     pub fn read_index(&mut self, ctx: Vec<u8>) -> Result<()> {
         if self.role().state != StateRole::Leader {
@@ -262,14 +360,50 @@ impl Replica {
                 index: e.index,
                 term: e.term,
             };
-            let result = if e.get_entry_type() != EntryType::EntryNormal || e.data.is_empty() {
-                self.state.apply_noop(at)
-            } else {
-                let (kind, payload) = entry::decode(self.cluster, &e.data)
-                    .map_err(|e| Error::Corrupt(e.to_string()))?;
-                match kind {
-                    EntryKind::Batch => self.state.apply(payload, at),
-                    EntryKind::Admin => self.state.apply_noop(at),
+            let mut refused = None;
+            let result = match e.get_entry_type() {
+                EntryType::EntryConfChangeV2 => {
+                    let cc = ConfChangeV2::parse_from_bytes(&e.data)
+                        .map_err(|e| Error::Corrupt(e.to_string()))?;
+                    if e.index > self.log().conf_index()? {
+                        if self.membership.accept_conf_change(&cc, e.index) {
+                            let cs = self.raw.apply_conf_change(&cc).map_err(Error::Raft)?;
+                            self.log()
+                                .apply_conf(&cs, e.index, &self.membership.encode())?;
+                            out.membership_changed = true;
+                        } else {
+                            refused = Some("unexpected membership configuration change".to_owned());
+                        }
+                    }
+                    self.state.apply_noop(at)
+                }
+                EntryType::EntryConfChange => self.state.apply_noop(at),
+                EntryType::EntryNormal if e.data.is_empty() => self.state.apply_noop(at),
+                EntryType::EntryNormal => {
+                    let (kind, payload) = entry::decode(self.cluster, &e.data)
+                        .map_err(|e| Error::Corrupt(e.to_string()))?;
+                    match kind {
+                        EntryKind::Batch => self.state.apply(payload, at),
+                        EntryKind::Admin => {
+                            if e.index > self.log().conf_index()? {
+                                let cs = self.log().conf_state()?;
+                                match AdminCommand::decode(payload)
+                                    .and_then(|cmd| self.membership.apply_admin(&cmd, &cs, e.index))
+                                {
+                                    Ok(()) => {
+                                        self.log().apply_conf(
+                                            &cs,
+                                            e.index,
+                                            &self.membership.encode(),
+                                        )?;
+                                        out.membership_changed = true;
+                                    }
+                                    Err(e) => refused = Some(e.to_string()),
+                                }
+                            }
+                            self.state.apply_noop(at)
+                        }
+                    }
                 }
             };
             result.map_err(|e| Error::Apply(e.to_string()))?;
@@ -284,7 +418,11 @@ impl Replica {
                         seq: p.waiter,
                     })
                 {
-                    out.applied.push((p.waiter, e.index));
+                    if let Some(reason) = &refused {
+                        out.refused.push((p.waiter, reason.clone()));
+                    } else {
+                        out.applied.push((p.waiter, e.index));
+                    }
                 } else {
                     out.failed.push(p.waiter);
                 }
@@ -308,6 +446,8 @@ impl Replica {
             messages: Vec::new(),
             applied: Vec::new(),
             failed: Vec::new(),
+            refused: Vec::new(),
+            membership_changed: false,
             read_states: Vec::new(),
             role: self.role(),
         };
@@ -325,6 +465,12 @@ impl Replica {
                 let dir = snapshots
                     .take_incoming(manifest.index, manifest.term)
                     .ok_or_else(|| Error::Corrupt("snapshot data missing".into()))?;
+                self.log().set_pending_install(&PendingInstall {
+                    index: manifest.index,
+                    term: manifest.term,
+                    conf: snap.get_metadata().get_conf_state().clone(),
+                    membership: manifest.membership.clone(),
+                })?;
                 let pos = self
                     .state
                     .install(&dir)
@@ -341,7 +487,10 @@ impl Replica {
                     pos.index,
                     pos.term,
                     snap.get_metadata().get_conf_state(),
+                    &manifest.membership,
                 )?;
+                self.membership = Self::decode_membership(self.log().membership()?.as_deref())?;
+                out.membership_changed = true;
                 snapshots.discard_incoming_through(pos.index);
             }
             self.log().persist(ready.entries(), ready.hs())?;
@@ -365,6 +514,44 @@ impl Replica {
             self.fail_deposed(&mut out);
         }
         self.fail_deposed(&mut out);
+        if self.role().state == StateRole::Leader {
+            let cs = self.conf_state();
+            out.messages.retain_mut(|m| {
+                if m.get_msg_type() != MessageType::MsgAppend
+                    || m.index != 0
+                    || (!cs.learners.contains(&m.to) && !cs.learners_next.contains(&m.to))
+                {
+                    return true;
+                }
+                let Some(snapshot) = self.log().snapshots().and_then(|s| s.latest_snapshot())
+                else {
+                    return false;
+                };
+                let conf = snapshot.get_metadata().get_conf_state();
+                if !conf
+                    .voters
+                    .iter()
+                    .chain(&conf.learners)
+                    .chain(&conf.voters_outgoing)
+                    .any(|&id| id == m.to)
+                {
+                    return false;
+                }
+                let index = snapshot.get_metadata().index;
+                *m = Message {
+                    msg_type: MessageType::MsgSnapshot,
+                    to: m.to,
+                    from: self.node_id,
+                    term: m.term,
+                    snapshot: Some(snapshot).into(),
+                    ..Default::default()
+                };
+                if let Some(peer) = self.raw.raft.mut_prs().get_mut(m.to) {
+                    peer.become_snapshot(index);
+                }
+                true
+            });
+        }
         out.role = self.role();
         Ok(out)
     }

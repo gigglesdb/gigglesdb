@@ -38,7 +38,7 @@ fn checkpoint(p: &Path) -> giggles_replication::error::Result<()> {
 }
 fn built(root: &Root) -> (SnapshotStore, Manifest) {
     let s = SnapshotStore::open(&root.0.join("built"), CLUSTER).unwrap();
-    let m = s.build(10, 2, &[1, 2, 3], checkpoint).unwrap();
+    let m = s.build(10, 2, &conf(&[1, 2, 3]), &[], checkpoint).unwrap();
     (s, m)
 }
 
@@ -98,9 +98,13 @@ fn build_reopen_prune_and_cleanup() {
     assert_eq!(m.files, hash_dir(&s.built_data_dir(&m)).unwrap());
     assert_eq!(s.latest(), Some(m.clone()));
     assert_eq!(s.latest_snapshot(), Some(m.to_raft()));
-    assert_eq!(s.build(10, 2, &[], |_| panic!("already built")).unwrap(), m);
-    s.build(11, 2, &[1, 2, 3], checkpoint).unwrap();
-    let newest = s.build(12, 2, &[1, 2, 3], checkpoint).unwrap();
+    assert_eq!(
+        s.build(10, 2, &conf(&[]), &[], |_| panic!("already built"))
+            .unwrap(),
+        m
+    );
+    s.build(11, 2, &conf(&[1, 2, 3]), &[], checkpoint).unwrap();
+    let newest = s.build(12, 2, &conf(&[1, 2, 3]), &[], checkpoint).unwrap();
     assert!(!s.built_data_dir(&m).exists());
     fs::create_dir_all(root.0.join("built/tmp-stale/data")).unwrap();
     fs::create_dir_all(root.0.join("built/stage-stale/data")).unwrap();
@@ -108,7 +112,7 @@ fn build_reopen_prune_and_cleanup() {
     assert_eq!(reopened.latest(), Some(newest));
     assert!(!root.0.join("built/tmp-stale").exists());
     assert!(!root.0.join("built/stage-stale").exists());
-    let failed = s.build(20, 3, &[1], |p| {
+    let failed = s.build(20, 3, &conf(&[1]), &[], |p| {
         fs::create_dir_all(p.join("nested"))?;
         Ok(())
     });
@@ -195,7 +199,7 @@ fn readers_and_duplicate_build_remain_responsive_during_checkpoint() {
     let (release_tx, release_rx) = mpsc::channel();
     let builder = store.clone();
     let job = thread::spawn(move || {
-        builder.build(11, 2, &[1, 2, 3], |dir| {
+        builder.build(11, 2, &conf(&[1, 2, 3]), &[], |dir| {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             checkpoint(dir)
@@ -212,7 +216,7 @@ fn readers_and_duplicate_build_remain_responsive_during_checkpoint() {
         drop(incoming);
         // Both builds started before either published the same position.
         read_tx
-            .send(reader.build(11, 2, &[1, 2, 3], checkpoint))
+            .send(reader.build(11, 2, &conf(&[1, 2, 3]), &[], checkpoint))
             .unwrap();
     });
     let observed = read_rx.recv_timeout(Duration::from_secs(5));
@@ -222,4 +226,68 @@ fn readers_and_duplicate_build_remain_responsive_during_checkpoint() {
     read_job.join().unwrap();
     assert_eq!(observed.unwrap().unwrap(), result);
     assert_eq!(store.latest(), Some(result));
+}
+
+fn conf(v: &[u64]) -> raft::eraftpb::ConfState {
+    let mut cs = raft::eraftpb::ConfState::default();
+    cs.set_voters(v.to_vec());
+    cs
+}
+
+#[test]
+fn joint_configuration_manifest_and_bounds() {
+    let root = Root::new();
+    let (_, mut m) = built(&root);
+    m.conf.set_learners(vec![4]);
+    m.conf.set_voters_outgoing(vec![1, 2, 5]);
+    m.conf.set_learners_next(vec![5]);
+    m.conf.auto_leave = true;
+    m.membership = b"opaque membership".to_vec();
+    let b = m.encode();
+    assert_eq!(&b[..8], b"GDSNAP02");
+    assert_eq!(Manifest::decode(CLUSTER, &b).unwrap(), m);
+    assert_eq!(Manifest::from_raft(CLUSTER, &m.to_raft()).unwrap(), m);
+    let mut snap = m.to_raft();
+    snap.mut_metadata().mut_conf_state().set_learners(vec![6]);
+    assert!(Manifest::from_raft(CLUSTER, &snap).is_err());
+    let rehash = |mut b: Vec<u8>| {
+        b.truncate(b.len() - 32);
+        b.extend_from_slice(&Sha256::digest(&b));
+        b
+    };
+    let mut bad = b.clone();
+    bad[..8].copy_from_slice(b"GDSNAP01");
+    assert!(Manifest::decode(CLUSTER, &rehash(bad)).is_err());
+    let mut bad = b;
+    let auto_offset = 40
+        + 16
+        + 8 * (m.conf.voters.len()
+            + m.conf.learners.len()
+            + m.conf.voters_outgoing.len()
+            + m.conf.learners_next.len());
+    bad[auto_offset] = 2;
+    assert!(Manifest::decode(CLUSTER, &rehash(bad)).is_err());
+    m.membership = vec![0; 16384];
+    assert_eq!(Manifest::decode(CLUSTER, &m.encode()).unwrap(), m);
+    m.membership.push(0);
+    assert!(Manifest::decode(CLUSTER, &m.encode()).is_err());
+    m.membership.clear();
+    for field in 0..4 {
+        let mut bad = m.clone();
+        let ids = match field {
+            0 => &mut bad.conf.voters,
+            1 => &mut bad.conf.learners,
+            2 => &mut bad.conf.voters_outgoing,
+            _ => &mut bad.conf.learners_next,
+        };
+        *ids = vec![1; 65];
+        assert!(Manifest::decode(CLUSTER, &bad.encode()).is_err());
+        match field {
+            0 => bad.conf.set_voters(vec![0]),
+            1 => bad.conf.set_learners(vec![0]),
+            2 => bad.conf.set_voters_outgoing(vec![0]),
+            _ => bad.conf.set_learners_next(vec![0]),
+        }
+        assert!(Manifest::decode(CLUSTER, &bad.encode()).is_err());
+    }
 }

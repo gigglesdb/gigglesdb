@@ -72,7 +72,7 @@ fn transfer(resume: bool, corrupt: bool) {
         ("c-last", b"checkpoint tail".to_vec()),
     ];
     let manifest = one_store
-        .build(42, 7, &[1, 2], |dir| {
+        .build(42, 7, &conf(&[1, 2]), &[], |dir| {
             fs::create_dir_all(dir)?;
             for (name, data) in &files {
                 fs::write(dir.join(name), data)?;
@@ -144,4 +144,10 @@ fn resumes_partial_snapshot() {
 #[test]
 fn corrupt_file_rejected_before_raft_delivery() {
     transfer(false, true);
+}
+
+fn conf(v: &[u64]) -> raft::eraftpb::ConfState {
+    let mut cs = raft::eraftpb::ConfState::default();
+    cs.set_voters(v.to_vec());
+    cs
 }

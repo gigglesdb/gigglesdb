@@ -2,11 +2,15 @@ pub mod certs;
 use giggles_replication::{
     error::Result,
     log_store::LogStore,
+    membership::AdminCommand,
     node::Replica,
     snapshot::{Manifest, SnapshotStore},
     state::MemStateMachine,
 };
-use raft::{StateRole, eraftpb::Message};
+use raft::{
+    StateRole,
+    eraftpb::{ConfChangeV2, Message},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -26,6 +30,8 @@ pub struct Cluster {
     pub applied: BTreeMap<u64, u64>,
     pub reads: BTreeMap<u64, Vec<(Vec<u8>, u64)>>,
     failed: BTreeSet<u64>,
+    refused: BTreeMap<u64, String>,
+    joiners: BTreeSet<u64>,
     pending: BTreeMap<u64, u64>,
     voters: Vec<u64>,
     queue: Vec<Message>,
@@ -49,6 +55,8 @@ impl Cluster {
             applied: BTreeMap::new(),
             reads: BTreeMap::new(),
             failed: BTreeSet::new(),
+            refused: BTreeMap::new(),
+            joiners: BTreeSet::new(),
             pending: BTreeMap::new(),
             voters: (1..=voters).collect(),
             queue: Vec::new(),
@@ -93,6 +101,10 @@ impl Cluster {
                 }
                 for waiter in out.failed {
                     self.failed.insert(waiter);
+                    self.pending.remove(&waiter);
+                }
+                for (waiter, reason) in out.refused {
+                    self.refused.insert(waiter, reason);
                     self.pending.remove(&waiter);
                 }
                 self.reads.entry(id).or_default().extend(out.read_states);
@@ -197,6 +209,39 @@ impl Cluster {
         self.pump();
         Ok(self.serial)
     }
+    #[allow(dead_code)]
+    pub fn propose_admin(&mut self, id: u64, cmd: &AdminCommand) -> Result<u64> {
+        self.serial += 1;
+        self.nodes
+            .get_mut(&id)
+            .unwrap()
+            .propose_admin(cmd, self.serial)?;
+        self.pending.insert(self.serial, id);
+        self.pump();
+        Ok(self.serial)
+    }
+    #[allow(dead_code)]
+    pub fn propose_conf_change(&mut self, id: u64, cc: ConfChangeV2) -> Result<u64> {
+        self.serial += 1;
+        self.nodes
+            .get_mut(&id)
+            .unwrap()
+            .propose_conf_change(cc, self.serial)?;
+        self.pending.insert(self.serial, id);
+        self.pump();
+        Ok(self.serial)
+    }
+    #[allow(dead_code)]
+    pub fn refused(&self, waiter: u64) -> Option<String> {
+        self.refused.get(&waiter).cloned()
+    }
+    #[allow(dead_code)]
+    pub fn join(&mut self, id: u64) {
+        assert!(!self.states.contains_key(&id));
+        self.joiners.insert(id);
+        self.states.insert(id, Arc::new(MemStateMachine::new()));
+        self.restart(id);
+    }
     pub fn committed(&self, waiter: u64) -> bool {
         self.applied.contains_key(&waiter)
     }
@@ -221,7 +266,16 @@ impl Cluster {
         log.attach_snapshots(Arc::new(
             SnapshotStore::open(&self.root.join(format!("{id}-snap")), CLUSTER).unwrap(),
         ));
-        let mut node = Replica::new(log, self.states[&id].clone(), &self.voters).unwrap();
+        let mut node = Replica::new(
+            log,
+            self.states[&id].clone(),
+            if self.joiners.contains(&id) {
+                &[]
+            } else {
+                &self.voters
+            },
+        )
+        .unwrap();
         node.set_election_timeout(10 + id as usize);
         self.nodes.insert(id, node);
     }

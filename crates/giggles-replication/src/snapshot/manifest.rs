@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use raft::eraftpb::Snapshot;
+use raft::eraftpb::{ConfState, Snapshot};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path};
 
@@ -10,12 +10,13 @@ pub struct FileEntry {
     pub sha256: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub cluster: [u8; 16],
     pub index: u64,
     pub term: u64,
-    pub voters: Vec<u64>,
+    pub conf: ConfState,
+    pub membership: Vec<u8>,
     pub files: Vec<FileEntry>,
 }
 
@@ -33,14 +34,24 @@ fn valid_name(name: &str) -> bool {
 
 impl Manifest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = b"GDSNAP01".to_vec();
+        let mut b = b"GDSNAP02".to_vec();
         b.extend(self.cluster);
         b.extend(self.index.to_be_bytes());
         b.extend(self.term.to_be_bytes());
-        b.extend((self.voters.len() as u32).to_be_bytes());
-        for v in &self.voters {
-            b.extend(v.to_be_bytes());
+        for ids in [
+            &self.conf.voters,
+            &self.conf.learners,
+            &self.conf.voters_outgoing,
+            &self.conf.learners_next,
+        ] {
+            b.extend((ids.len() as u32).to_be_bytes());
+            for id in ids {
+                b.extend(id.to_be_bytes());
+            }
         }
+        b.push(u8::from(self.conf.auto_leave));
+        b.extend((self.membership.len() as u32).to_be_bytes());
+        b.extend(&self.membership);
         b.extend((self.files.len() as u32).to_be_bytes());
         for f in &self.files {
             b.extend((f.name.len() as u16).to_be_bytes());
@@ -57,7 +68,7 @@ impl Manifest {
             return Err(corrupt());
         }
         let (body, checksum) = bytes.split_at(bytes.len() - 32);
-        if &body[..8] != b"GDSNAP01" || Sha256::digest(body)[..] != *checksum {
+        if &body[..8] != b"GDSNAP02" || Sha256::digest(body)[..] != *checksum {
             return Err(corrupt());
         }
         let mut r = Reader(body);
@@ -67,10 +78,21 @@ impl Manifest {
         }
         let index = r.u64()?;
         let term = r.u64()?;
-        let mut voters = Vec::new();
-        for _ in 0..r.u32()? {
-            voters.push(r.u64()?);
+        let mut conf = ConfState::default();
+        conf.set_voters(r.ids()?);
+        conf.set_learners(r.ids()?);
+        conf.set_voters_outgoing(r.ids()?);
+        conf.set_learners_next(r.ids()?);
+        conf.auto_leave = match r.take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt()),
+        };
+        let len = r.u32()? as usize;
+        if len > 16384 {
+            return Err(corrupt());
         }
+        let membership = r.take(len)?.to_vec();
         let mut files: Vec<FileEntry> = Vec::new();
         for _ in 0..r.u32()? {
             let len = u16::from_be_bytes(r.take(2)?.try_into().unwrap()) as usize;
@@ -93,7 +115,8 @@ impl Manifest {
             cluster,
             index,
             term,
-            voters,
+            conf,
+            membership,
             files,
         })
     }
@@ -102,9 +125,7 @@ impl Manifest {
         let mut s = Snapshot::default();
         s.mut_metadata().set_index(self.index);
         s.mut_metadata().set_term(self.term);
-        s.mut_metadata()
-            .mut_conf_state()
-            .set_voters(self.voters.clone());
+        s.mut_metadata().set_conf_state(self.conf.clone());
         s.set_data(self.encode().into());
         s
     }
@@ -112,7 +133,13 @@ impl Manifest {
     pub fn from_raft(cluster: [u8; 16], s: &Snapshot) -> Result<Self> {
         let m = Self::decode(cluster, s.get_data())?;
         let meta = s.get_metadata();
-        if m.index != meta.index || m.term != meta.term || m.voters != meta.get_conf_state().voters
+        if m.index != meta.index
+            || m.term != meta.term
+            || m.conf.voters != meta.get_conf_state().voters
+            || m.conf.learners != meta.get_conf_state().learners
+            || m.conf.voters_outgoing != meta.get_conf_state().voters_outgoing
+            || m.conf.learners_next != meta.get_conf_state().learners_next
+            || m.conf.auto_leave != meta.get_conf_state().auto_leave
         {
             return Err(corrupt());
         }
@@ -122,6 +149,18 @@ impl Manifest {
 
 struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
+    fn ids(&mut self) -> Result<Vec<u64>> {
+        let count = self.u32()?;
+        if count > 64 {
+            return Err(corrupt());
+        }
+        (0..count)
+            .map(|_| {
+                let id = self.u64()?;
+                if id == 0 { Err(corrupt()) } else { Ok(id) }
+            })
+            .collect()
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if n > self.0.len() {
             return Err(corrupt());

@@ -10,6 +10,22 @@ const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 type StateTable = redb::ReadOnlyTable<&'static str, &'static [u8]>;
 type EntriesTable = redb::ReadOnlyTable<u64, &'static [u8]>;
 
+pub struct PendingInstall {
+    pub index: u64,
+    pub term: u64,
+    pub conf: ConfState,
+    pub membership: Vec<u8>,
+}
+
+fn conf_index(state: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<u64> {
+    state.get("conf_index")?.map_or(Ok(0), |v| {
+        v.value()
+            .try_into()
+            .map(u64::from_be_bytes)
+            .map_err(|_| Error::Corrupt("invalid conf_index".into()))
+    })
+}
+
 pub struct LogStore {
     db: Database,
     identity: ([u8; 16], u64),
@@ -128,6 +144,7 @@ impl LogStore {
         index: u64,
         term: u64,
         conf_state: &ConfState,
+        membership: &[u8],
     ) -> Result<()> {
         let mut tx = self.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -155,6 +172,13 @@ impl LogStore {
             state.insert("snapshot_meta", meta.write_to_bytes()?.as_slice())?;
             state.insert("conf_state", conf_state.write_to_bytes()?.as_slice())?;
             state.insert("hard_state", hs.write_to_bytes()?.as_slice())?;
+            state.insert("conf_index", index.to_be_bytes().as_slice())?;
+            if membership.is_empty() {
+                state.remove("membership")?;
+            } else {
+                state.insert("membership", membership)?;
+            }
+            state.remove("pending_install")?;
         }
         tx.commit()?;
         Ok(())
@@ -175,10 +199,88 @@ impl LogStore {
     pub fn conf_state(&self) -> Result<ConfState> {
         decode(&self.view()?.1, "conf_state")
     }
+    pub fn conf_index(&self) -> Result<u64> {
+        conf_index(&self.view()?.1)
+    }
+    pub fn membership(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .view()?
+            .1
+            .get("membership")?
+            .map(|v| v.value().to_vec()))
+    }
+    pub fn apply_conf(&self, cs: &ConfState, index: u64, membership: &[u8]) -> Result<()> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut state = tx.open_table(STATE)?;
+            if index <= conf_index(&state)? {
+                return Err(Error::Corrupt("stale configuration".into()));
+            }
+            state.insert("conf_state", cs.write_to_bytes()?.as_slice())?;
+            state.insert("conf_index", index.to_be_bytes().as_slice())?;
+            if membership.is_empty() {
+                state.remove("membership")?;
+            } else {
+                state.insert("membership", membership)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn set_pending_install(&self, p: &PendingInstall) -> Result<()> {
+        let conf = p.conf.write_to_bytes()?;
+        let mut bytes = p.index.to_be_bytes().to_vec();
+        bytes.extend(p.term.to_be_bytes());
+        bytes.extend((conf.len() as u32).to_be_bytes());
+        bytes.extend(conf);
+        bytes.extend(&p.membership);
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            tx.open_table(STATE)?
+                .insert("pending_install", bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn pending_install(&self) -> Result<Option<PendingInstall>> {
+        let state = self.view()?.1;
+        let Some(bytes) = state.get("pending_install")? else {
+            return Ok(None);
+        };
+        let b = bytes.value();
+        if b.len() < 20 {
+            return Err(Error::Corrupt("truncated pending install".into()));
+        }
+        let len = u32::from_be_bytes(b[16..20].try_into().unwrap()) as usize;
+        if len > b.len() - 20 {
+            return Err(Error::Corrupt("truncated pending install".into()));
+        }
+        Ok(Some(PendingInstall {
+            index: u64::from_be_bytes(b[..8].try_into().unwrap()),
+            term: u64::from_be_bytes(b[8..16].try_into().unwrap()),
+            conf: ConfState::parse_from_bytes(&b[20..20 + len])
+                .map_err(|_| Error::Corrupt("invalid pending configuration".into()))?,
+            membership: b[20 + len..].to_vec(),
+        }))
+    }
+    pub fn clear_pending_install(&self) -> Result<()> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            tx.open_table(STATE)?.remove("pending_install")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn set_conf_state(&self, cs: &ConfState) -> Result<()> {
         self.write_conf(cs, false)
     }
     pub fn initialize_voters(&self, voters: &[u64]) -> Result<()> {
+        if voters.is_empty() {
+            return Ok(());
+        }
         let mut cs = ConfState::default();
         cs.set_voters(voters.to_vec());
         self.write_conf(&cs, true)
@@ -189,6 +291,9 @@ impl LogStore {
         {
             let mut state = tx.open_table(STATE)?;
             if initialize {
+                if conf_index(&state)? > 0 {
+                    return Ok(());
+                }
                 let old: ConfState = decode(&state, "conf_state")?;
                 if old != *cs
                     && (old != ConfState::default()

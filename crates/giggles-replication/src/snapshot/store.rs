@@ -84,7 +84,8 @@ impl SnapshotStore {
         &self,
         index: u64,
         term: u64,
-        voters: &[u64],
+        conf: &raft::eraftpb::ConfState,
+        membership: &[u8],
         checkpoint: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Manifest> {
         let dest = self.root.join(label(index, term));
@@ -106,7 +107,8 @@ impl SnapshotStore {
                 cluster: self.cluster,
                 index,
                 term,
-                voters: voters.into(),
+                conf: conf.clone(),
+                membership: membership.to_vec(),
                 files: hash_dir(&tmp.join("data"))?,
             };
             // Apply the same size and name rules to locally produced manifests.

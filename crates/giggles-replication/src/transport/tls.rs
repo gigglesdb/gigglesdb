@@ -66,10 +66,22 @@ pub async fn connect(
     connector: &TlsConnector,
     id: u64,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    if id == config.node_id {
+        return Err(Error::Identity(
+            "cannot connect Raft transport to own node".into(),
+        ));
+    }
+    connect_admin(config, connector, id).await
+}
+
+pub(crate) async fn connect_admin(
+    config: &TransportConfig,
+    connector: &TlsConnector,
+    id: u64,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let peer = config
         .peers
         .get(&id)
-        .filter(|_| id != config.node_id)
         .ok_or_else(|| Error::Identity(format!("peers[{id}]: unknown or own node")))?;
     let tcp = TcpStream::connect(&peer.address).await?;
     let stream = connector

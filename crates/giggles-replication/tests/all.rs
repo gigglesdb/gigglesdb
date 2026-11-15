@@ -71,3 +71,19 @@ mod transport_snapshot;
 
 #[path = "cluster_net.rs"]
 mod cluster_net;
+
+#[path = "transport_peers.rs"]
+mod transport_peers;
+#[path = "membership.rs"]
+mod membership;
+
+#[path = "membership_node.rs"]
+mod membership_node;
+
+#[path = "replace_net.rs"]
+mod replace_net;
+#[path = "membership_crash.rs"]
+mod membership_crash;
+
+#[path = "admin_net.rs"]
+mod admin_net;

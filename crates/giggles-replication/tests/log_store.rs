@@ -237,7 +237,7 @@ fn install_snapshot_keeps_matching_tail_and_state() {
         .unwrap();
     let mut cs = ConfState::default();
     cs.set_voters(vec![2, 3, 4]);
-    s.install_snapshot_meta(2, 2, &cs).unwrap();
+    s.install_snapshot_meta(2, 2, &cs, &[]).unwrap();
     drop(s);
     let s = dir.open();
     assert_eq!(s.snapshot_meta().unwrap(), (2, 2));
@@ -250,7 +250,7 @@ fn install_snapshot_keeps_matching_tail_and_state() {
     assert_eq!(s.hard_state().unwrap(), HardState { commit: 2, ..hs });
     for index in [1, 2] {
         assert!(matches!(
-            s.install_snapshot_meta(index, 9, &ConfState::default()),
+            s.install_snapshot_meta(index, 9, &ConfState::default(), &[]),
             Err(Error::Corrupt(_))
         ));
     }
@@ -274,7 +274,7 @@ fn install_snapshot_drops_mismatching_or_absent_tail() {
             .unwrap();
         let mut cs = ConfState::default();
         cs.set_voters(vec![1, 3]);
-        s.install_snapshot_meta(index, 7, &cs).unwrap();
+        s.install_snapshot_meta(index, 7, &cs, &[]).unwrap();
         drop(s);
         let s = dir.open();
         assert_eq!(s.snapshot_meta().unwrap(), (index, 7));
@@ -323,4 +323,101 @@ fn size_limit_stops_before_reading_later_entries() {
         assert_eq!(entries(&s, 1, 4, Some(max)).unwrap(), vec![entry(1, 1)]);
     }
     assert!(entries(&s, 1, 4, None).is_err());
+}
+
+#[test]
+fn configuration_is_atomic_durable_and_monotonic() {
+    let dir = Temp::new();
+    let s = dir.open();
+    assert_eq!(s.conf_index().unwrap(), 0);
+    assert_eq!(s.membership().unwrap(), None);
+    s.initialize_voters(&[]).unwrap();
+    assert_eq!(s.conf_state().unwrap(), ConfState::default());
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![1, 2]);
+    cs.set_learners(vec![3]);
+    s.apply_conf(&cs, 7, b"membership").unwrap();
+    drop(s);
+    let s = dir.open();
+    assert_eq!(s.conf_state().unwrap(), cs);
+    assert_eq!(s.conf_index().unwrap(), 7);
+    assert_eq!(s.membership().unwrap(), Some(b"membership".to_vec()));
+    s.initialize_voters(&[4, 5]).unwrap();
+    assert_eq!(s.conf_state().unwrap(), cs);
+    for index in [0, 6, 7] {
+        assert!(matches!(
+            s.apply_conf(&ConfState::default(), index, b"bad"),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(s.conf_state().unwrap(), cs);
+        assert_eq!(s.conf_index().unwrap(), 7);
+        assert_eq!(s.membership().unwrap(), Some(b"membership".to_vec()));
+    }
+    s.apply_conf(&cs, 8, &[]).unwrap();
+    drop(s);
+    let s = dir.open();
+    assert_eq!(s.membership().unwrap(), None);
+    assert_eq!(s.conf_index().unwrap(), 8);
+}
+
+#[test]
+fn pending_install_and_snapshot_configuration_survive_reopen() {
+    use giggles_replication::log_store::PendingInstall;
+    let dir = Temp::new();
+    let s = dir.open();
+    let mut cs = ConfState::default();
+    cs.set_voters(vec![1, 2]);
+    cs.set_learners(vec![3]);
+    s.set_pending_install(&PendingInstall {
+        index: 10,
+        term: 2,
+        conf: cs.clone(),
+        membership: b"record".to_vec(),
+    })
+    .unwrap();
+    drop(s);
+    let s = dir.open();
+    let p = s.pending_install().unwrap().unwrap();
+    assert_eq!((p.index, p.term), (10, 2));
+    assert_eq!(p.conf, cs);
+    assert_eq!(p.membership, b"record");
+    s.install_snapshot_meta(p.index, p.term, &p.conf, &p.membership)
+        .unwrap();
+    drop(s);
+    let s = dir.open();
+    assert!(s.pending_install().unwrap().is_none());
+    assert_eq!(s.conf_state().unwrap(), cs);
+    assert_eq!(s.conf_index().unwrap(), 10);
+    assert_eq!(s.membership().unwrap(), Some(b"record".to_vec()));
+    s.install_snapshot_meta(11, 2, &cs, &[]).unwrap();
+    assert_eq!(s.membership().unwrap(), None);
+    s.set_pending_install(&p).unwrap();
+    s.clear_pending_install().unwrap();
+    assert!(s.pending_install().unwrap().is_none());
+}
+
+#[test]
+fn truncated_pending_install_is_corrupt() {
+    let dir = Temp::new();
+    drop(dir.open());
+    for len in [0, 8, 16, 19, 20, 21] {
+        let db = redb::Database::open(dir.0.join("raft.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut state = tx
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new("state"))
+                .unwrap();
+            let mut b = vec![0; len];
+            if len >= 20 {
+                b[19] = 2;
+            }
+            state.insert("pending_install", b.as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        assert!(matches!(
+            dir.open().pending_install(),
+            Err(Error::Corrupt(_))
+        ));
+    }
 }

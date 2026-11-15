@@ -1,4 +1,4 @@
-use super::{Body, Header, TransportConfig, frame, tls};
+use super::{Body, Header, PeerConfig, TransportConfig, fingerprint, frame, tls};
 use crate::{
     error::{Error, Result},
     sink::Outbox,
@@ -6,21 +6,24 @@ use crate::{
 };
 use raft::eraftpb::{Message, MessageType};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite},
     net::TcpListener,
     runtime::Runtime,
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
 pub trait PeerSink: Send + Sync {
     fn deliver(&self, from: u64, m: Message);
+    fn admin(&self, _from: u64, _req: crate::admin::AdminRequest) -> crate::admin::AdminResponse {
+        crate::admin::AdminResponse::Failed("admin not supported".into())
+    }
     fn snapshot_status(&self, to: u64, ok: bool);
 }
 
@@ -42,6 +45,12 @@ impl<S> LateSink<S> {
 }
 
 impl<S: PeerSink> PeerSink for LateSink<S> {
+    fn admin(&self, from: u64, req: crate::admin::AdminRequest) -> crate::admin::AdminResponse {
+        self.0.get().map_or_else(
+            || crate::admin::AdminResponse::Failed("admin not supported".into()),
+            |s| s.admin(from, req),
+        )
+    }
     fn deliver(&self, from: u64, m: Message) {
         if let Some(s) = self.0.get() {
             s.deliver(from, m);
@@ -56,47 +65,169 @@ impl<S: PeerSink> PeerSink for LateSink<S> {
 
 #[derive(Clone)]
 struct Sender {
-    peers: BTreeMap<u64, mpsc::Sender<Message>>,
+    shared: Arc<Peers>,
     sink: Arc<dyn PeerSink>,
     snapshots: Option<Arc<SnapshotSender>>,
 }
 
-struct SnapshotSender {
+struct Peer {
+    tx: mpsc::Sender<Message>,
+    task: JoinHandle<()>,
+    permit: Arc<Semaphore>,
+    cancel: watch::Sender<()>,
+}
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+struct PeerTable {
+    config: BTreeMap<u64, PeerConfig>,
+    active: BTreeMap<u64, Peer>,
+}
+struct Peers {
     config: Arc<TransportConfig>,
+    table: RwLock<PeerTable>,
     connector: tokio_rustls::TlsConnector,
+    runtime: tokio::runtime::Handle,
+}
+impl Peers {
+    fn set(self: &Arc<Self>, peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        if peers.get(&self.config.node_id).map(|p| &p.fingerprint)
+            != self
+                .config
+                .peers
+                .get(&self.config.node_id)
+                .map(|p| &p.fingerprint)
+        {
+            return Err(Error::Identity(
+                "own node missing or fingerprint changed".into(),
+            ));
+        }
+        for (id, peer) in &peers {
+            let fp = &peer.fingerprint;
+            if fp.len() != 64
+                || !fp
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || !seen.insert(fp)
+            {
+                return Err(Error::Identity(format!(
+                    "peers[{id}].fingerprint invalid or duplicate"
+                )));
+            }
+        }
+        let mut table = self.table.write().unwrap();
+        let changed: Vec<_> = table
+            .active
+            .keys()
+            .copied()
+            .filter(|id| {
+                peers.get(id).is_none_or(|p| {
+                    table.config[id].address != p.address
+                        || table.config[id].fingerprint != p.fingerprint
+                })
+            })
+            .collect();
+        for id in changed {
+            table.active.remove(&id);
+        }
+        for &id in peers.keys() {
+            if id == self.config.node_id || table.active.contains_key(&id) {
+                continue;
+            }
+            let (tx, rx) = mpsc::channel(1024);
+            let task = self.runtime.spawn(outbound(self.clone(), id, rx));
+            let (cancel, _) = watch::channel(());
+            table.active.insert(
+                id,
+                Peer {
+                    tx,
+                    task,
+                    permit: Arc::new(Semaphore::new(1)),
+                    cancel,
+                },
+            );
+        }
+        table.config = peers;
+        Ok(())
+    }
+    async fn connect(
+        &self,
+        id: u64,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let mut config = (*self.config).clone();
+        config.peers = self.table.read().unwrap().config.clone();
+        let stream = tls::connect(&config, &self.connector, id).await?;
+        let table = self.table.read().unwrap();
+        if table.config.get(&id).is_none_or(|p| {
+            p.fingerprint != config.peers[&id].fingerprint || p.address != config.peers[&id].address
+        }) {
+            return Err(protocol_error());
+        }
+        Ok(stream)
+    }
+}
+
+struct SnapshotSender {
+    shared: Arc<Peers>,
     store: Arc<SnapshotStore>,
     runtime: tokio::runtime::Handle,
-    permits: BTreeMap<u64, Arc<Semaphore>>,
 }
 
 impl Outbox for Sender {
+    fn apply_membership(&mut self, m: &crate::membership::Membership) {
+        let mut peers = self.shared.config.peers.clone();
+        for (id, peer) in &m.peers {
+            peers.insert(
+                *id,
+                PeerConfig {
+                    address: peer.address.clone(),
+                    fingerprint: peer.fingerprint.clone(),
+                },
+            );
+        }
+        peers.retain(|id, _| !m.retired.contains(id));
+        if let Err(error) = self.shared.set(peers) {
+            eprintln!("replication apply_membership failed: {error}");
+        }
+    }
+
+    fn set_peers(&mut self, peers: &BTreeMap<u64, PeerConfig>) {
+        if let Err(error) = self.shared.set(peers.clone()) {
+            eprintln!("replication set_peers failed: {error}");
+        }
+    }
     fn send(&mut self, m: Message) {
         if m.has_snapshot() || m.get_msg_type() == MessageType::MsgSnapshot {
             let Some(snapshots) = self.snapshots.clone() else {
                 self.sink.snapshot_status(m.to, false);
                 return;
             };
-            let permit = snapshots
-                .permits
-                .get(&m.to)
-                .and_then(|p| p.clone().try_acquire_owned().ok());
-            let Some(permit) = permit else {
+            let table = self.shared.table.read().unwrap();
+            let Some(peer) = table.active.get(&m.to) else {
                 self.sink.snapshot_status(m.to, false);
                 return;
             };
+            let Ok(permit) = peer.permit.clone().try_acquire_owned() else {
+                self.sink.snapshot_status(m.to, false);
+                return;
+            };
+            let mut cancelled = peer.cancel.subscribe();
             let sink = self.sink.clone();
             let runtime = snapshots.runtime.clone();
             runtime.spawn(async move {
                 let _permit = permit;
-                let ok = matches!(
-                    tokio::time::timeout(Duration::from_secs(300), send_snapshot(&snapshots, &m))
-                        .await,
-                    Ok(Ok(()))
-                );
+                let ok = tokio::select! {
+                    biased;
+                    _ = cancelled.changed() => false,
+                    result = tokio::time::timeout(Duration::from_secs(300), send_snapshot(&snapshots, &m)) => matches!(result, Ok(Ok(()))),
+                };
                 sink.snapshot_status(m.to, ok);
             });
-        } else if let Some(tx) = self.peers.get(&m.to) {
-            let _ = tx.try_send(m);
+        } else if let Some(peer) = self.shared.table.read().unwrap().active.get(&m.to) {
+            let _ = peer.tx.try_send(m);
         }
     }
 }
@@ -129,36 +260,30 @@ impl Transport {
             TcpListener::from_std(listener)?
         };
         let config = Arc::new(config);
-        let mut peers = BTreeMap::new();
-        let mut queues = Vec::new();
-        for &id in config.peers.keys().filter(|&&id| id != config.node_id) {
-            let (tx, rx) = mpsc::channel(1024);
-            peers.insert(id, tx);
-            queues.push((id, rx));
-        }
-        let snapshot_sender = snapshots.as_ref().map(|store| {
-            Arc::new(SnapshotSender {
-                config: config.clone(),
-                connector: connector.clone(),
-                store: store.clone(),
-                runtime: runtime.handle().clone(),
-                permits: peers
-                    .keys()
-                    .map(|&id| (id, Arc::new(Semaphore::new(1))))
-                    .collect(),
-            })
+        let shared = Arc::new(Peers {
+            config: config.clone(),
+            table: RwLock::new(PeerTable {
+                config: BTreeMap::new(),
+                active: BTreeMap::new(),
+            }),
+            connector,
+            runtime: runtime.handle().clone(),
         });
+        shared.set(config.peers.clone())?;
         let sender = Sender {
-            snapshots: snapshot_sender,
-            peers,
+            snapshots: snapshots.as_ref().map(|store| {
+                Arc::new(SnapshotSender {
+                    shared: shared.clone(),
+                    store: store.clone(),
+                    runtime: runtime.handle().clone(),
+                })
+            }),
+            shared: shared.clone(),
             sink: sink.clone(),
         };
         let (stop, mut stopped) = oneshot::channel();
         let task = runtime.spawn(async move {
             let mut tasks = JoinSet::new();
-            for (id, rx) in queues {
-                tasks.spawn(outbound(config.clone(), connector.clone(), id, rx));
-            }
             let permits = Arc::new(Semaphore::new(16));
             loop {
                 tokio::select! {
@@ -175,16 +300,22 @@ impl Transport {
                         };
                         let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                         let config = config.clone();
+                        let shared = shared.clone();
                         let acceptor = acceptor.clone();
                         let sink = sink.clone();
                         let snapshots = snapshots.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let Ok(Ok((peer, mut stream))) = tokio::time::timeout(
-                                Duration::from_secs(10), tls::accept(&config, &acceptor, tcp)
+                            let Ok(Ok(mut stream)) = tokio::time::timeout(
+                                Duration::from_secs(10), acceptor.accept(tcp)
                             ).await else { return };
+                            let Some(fp) = stream.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| fingerprint(c)) else { return };
+                            let peer = shared.table.read().unwrap().config.iter().find_map(|(&id, p)|
+                                (p.fingerprint == fp).then_some(id));
+                            let Some(peer) = peer else { return };
                             let h = Header { cluster: config.cluster, from: peer, to: config.node_id };
-                            let _ = inbound(&mut stream, h, sink.as_ref(), snapshots.as_deref()).await;
+                            let _ = inbound(&mut stream, h, sink, snapshots.as_deref(), &shared, &fp).await;
+
                         });
                     }
                 }
@@ -199,6 +330,10 @@ impl Transport {
             addr,
             sender,
         })
+    }
+
+    pub fn set_peers(&self, peers: BTreeMap<u64, PeerConfig>) -> Result<()> {
+        self.sender.shared.set(peers)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -233,12 +368,8 @@ impl Drop for Transport {
     }
 }
 
-async fn outbound(
-    config: Arc<TransportConfig>,
-    connector: tokio_rustls::TlsConnector,
-    id: u64,
-    mut rx: mpsc::Receiver<Message>,
-) {
+async fn outbound(peers: Arc<Peers>, id: u64, mut rx: mpsc::Receiver<Message>) {
+    let config = &peers.config;
     let h = Header {
         cluster: config.cluster,
         from: config.node_id,
@@ -247,7 +378,7 @@ async fn outbound(
     let mut backoff = Duration::from_millis(100);
     let mut pending = None;
     loop {
-        let connected = tls::connect(&config, &connector, id).await;
+        let connected = peers.connect(id).await;
         if let Ok(mut stream) = connected {
             backoff = Duration::from_millis(100);
             let mut probe = [0];
@@ -290,15 +421,15 @@ async fn read_body<S: AsyncRead + Unpin>(s: &mut S, h: &Header) -> Result<Body> 
 }
 
 async fn send_snapshot(sender: &SnapshotSender, m: &Message) -> Result<()> {
-    let manifest = Manifest::from_raft(sender.config.cluster, m.get_snapshot())?;
+    let manifest = Manifest::from_raft(sender.shared.config.cluster, m.get_snapshot())?;
     let dir = sender.store.built_data_dir(&manifest);
     if !dir.is_dir() {
         return Err(protocol_error());
     }
-    let mut stream = tls::connect(&sender.config, &sender.connector, m.to).await?;
+    let mut stream = sender.shared.connect(m.to).await?;
     let h = Header {
-        cluster: sender.config.cluster,
-        from: sender.config.node_id,
+        cluster: sender.shared.config.cluster,
+        from: sender.shared.config.node_id,
         to: m.to,
     };
     let reply = Header {
@@ -353,8 +484,10 @@ async fn send_snapshot(sender: &SnapshotSender, m: &Message) -> Result<()> {
 async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     h: Header,
-    sink: &dyn PeerSink,
+    sink: Arc<dyn PeerSink>,
     store: Option<&SnapshotStore>,
+    peers: &Peers,
+    fp: &str,
 ) -> Result<()> {
     let reply = Header {
         from: h.to,
@@ -362,15 +495,33 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
         ..h
     };
     loop {
-        match read_body(stream, &h).await? {
-            Body::Raft(m) => sink.deliver(h.from, m),
+        match read_current(stream, &h, peers, fp).await? {
+            Body::AdminRequest(bytes) => {
+                let req = crate::admin::AdminRequest::decode(&bytes)?;
+                let response = tokio::task::spawn_blocking(move || sink.admin(h.from, req))
+                    .await
+                    .map_err(|_| protocol_error())?;
+                write_body(stream, &reply, Body::AdminResponse(response.encode()?)).await?;
+                return Ok(());
+            }
+            Body::Raft(m) => {
+                if h.from == h.to {
+                    return Err(protocol_error());
+                }
+                let table = peers.table.read().unwrap();
+                authorized(&table, h.from, fp)?;
+                sink.deliver(h.from, m);
+            }
             Body::SnapOffer(bytes) => {
+                if h.from == h.to {
+                    return Err(protocol_error());
+                }
                 let manifest = Manifest::decode(h.cluster, &bytes)?;
                 let mut writer = store.ok_or_else(protocol_error)?.incoming(&manifest)?;
                 let (file, offset) = writer.resume_point();
                 write_body(stream, &reply, Body::SnapResume { file, offset }).await?;
                 loop {
-                    match read_body(stream, &h).await? {
+                    match read_current(stream, &h, peers, fp).await? {
                         Body::SnapChunk { file, offset, data } => {
                             if let Err(error) = writer.write_chunk(file, offset, &data) {
                                 write_body(stream, &reply, Body::SnapAck(Err(error.to_string())))
@@ -390,13 +541,15 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
                         _ => return Err(protocol_error()),
                     }
                 }
-                match read_body(stream, &h).await? {
+                match read_current(stream, &h, peers, fp).await? {
                     Body::Raft(m)
                         if m.get_msg_type() == MessageType::MsgSnapshot
                             && m.has_snapshot()
                             && m.get_snapshot().get_metadata().index == manifest.index
                             && m.get_snapshot().get_metadata().term == manifest.term =>
                     {
+                        let table = peers.table.read().unwrap();
+                        authorized(&table, h.from, fp)?;
                         sink.deliver(h.from, m);
                         return Ok(());
                     }
@@ -406,4 +559,22 @@ async fn inbound<S: AsyncRead + AsyncWrite + Unpin>(
             _ => return Err(protocol_error()),
         }
     }
+}
+
+fn authorized(table: &PeerTable, id: u64, fp: &str) -> Result<()> {
+    if table.config.get(&id).is_some_and(|p| p.fingerprint == fp) {
+        Ok(())
+    } else {
+        Err(protocol_error())
+    }
+}
+async fn read_current<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    h: &Header,
+    peers: &Peers,
+    fp: &str,
+) -> Result<Body> {
+    let body = read_body(stream, h).await?;
+    authorized(&peers.table.read().unwrap(), h.from, fp)?;
+    Ok(body)
 }

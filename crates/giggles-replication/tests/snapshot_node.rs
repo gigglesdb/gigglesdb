@@ -167,3 +167,60 @@ fn snapshot_with_received_files_is_rejected_while_busy() {
     assert_eq!(node.log().snapshot_meta().unwrap(), (0, 0));
     assert!(receiver.take_incoming(m.index, m.term).is_some());
 }
+
+#[test]
+fn startup_finishes_or_clears_pending_install() {
+    use giggles_replication::log_store::PendingInstall;
+    use raft::eraftpb::ConfState;
+    let c = Cluster::new("pending-install", 3, 46);
+    let membership = giggles_replication::membership::Membership::default().encode();
+    for installed in [true, false] {
+        let state = Arc::new(MemStateMachine::new());
+        if installed {
+            for index in 1..=10 {
+                state
+                    .apply_noop(AppliedPosition { index, term: 2 })
+                    .unwrap();
+            }
+        }
+        let log = LogStore::open(&c.root.join(format!("pending-{installed}")), CLUSTER, 1).unwrap();
+        let mut conf = ConfState::default();
+        conf.set_voters(vec![1, 2]);
+        conf.set_learners(vec![3]);
+        log.set_pending_install(&PendingInstall {
+            index: 10,
+            term: 2,
+            conf: conf.clone(),
+            membership: membership.clone(),
+        })
+        .unwrap();
+        let node = Replica::new(log, state, &[1, 2, 3]).unwrap();
+        assert!(node.log().pending_install().unwrap().is_none());
+        if installed {
+            assert_eq!(node.log().conf_state().unwrap(), conf);
+            assert_eq!(node.log().conf_index().unwrap(), 10);
+            assert_eq!(
+                node.log().membership().unwrap(),
+                Some(membership.clone())
+            );
+            assert_eq!(node.log().snapshot_meta().unwrap(), (10, 2));
+        } else {
+            assert_eq!(node.log().conf_state().unwrap().voters, vec![1, 2, 3]);
+            assert_eq!(node.log().conf_index().unwrap(), 0);
+            assert_eq!(node.log().membership().unwrap(), None);
+        }
+    }
+}
+
+#[test]
+fn snapshot_waits_when_configuration_is_ahead_of_data() {
+    let mut c = Cluster::new("snapshot-conf-ahead", 3, 47);
+    c.elect(1);
+    c.propose(1, b"batch").unwrap();
+    let node = c.nodes.get_mut(&1).unwrap();
+    let conf = node.log().conf_state().unwrap();
+    node.log()
+        .apply_conf(&conf, node.applied_index() + 1, b"membership")
+        .unwrap();
+    assert!(node.build_snapshot().unwrap().is_none());
+}

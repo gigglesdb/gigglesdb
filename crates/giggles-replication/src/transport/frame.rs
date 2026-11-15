@@ -19,6 +19,8 @@ pub struct Header {
 #[derive(Debug, PartialEq)]
 pub enum Body {
     Raft(Message),
+    AdminRequest(Vec<u8>),
+    AdminResponse(Vec<u8>),
     SnapOffer(Vec<u8>),
     SnapResume {
         file: u32,
@@ -43,6 +45,17 @@ pub fn encode(h: &Header, b: &Body) -> Result<Vec<u8>> {
     bytes.extend(h.from.to_be_bytes());
     bytes.extend(h.to.to_be_bytes());
     match b {
+        Body::AdminRequest(data) | Body::AdminResponse(data) => {
+            if data.len() > 64 << 10 {
+                return Err(corrupt());
+            }
+            bytes.push(if matches!(b, Body::AdminRequest(_)) {
+                7
+            } else {
+                8
+            });
+            bytes.extend(data);
+        }
         Body::Raft(m) => {
             if m.from != h.from || m.to != h.to {
                 return Err(Error::Identity("Raft from/to".into()));
@@ -109,6 +122,8 @@ pub fn decode(expected: &Header, bytes: &[u8]) -> Result<Body> {
             }
             Body::Raft(m)
         }
+        7 if p.len() <= 64 << 10 => Body::AdminRequest(p.to_vec()),
+        8 if p.len() <= 64 << 10 => Body::AdminResponse(p.to_vec()),
         2 => Body::SnapOffer(p.to_vec()),
         3 if p.len() == 12 => Body::SnapResume {
             file: u32::from_be_bytes(p[..4].try_into().unwrap()),
