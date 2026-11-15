@@ -229,7 +229,8 @@ fn preparation_has_no_durable_effects_or_business_condition_checks() {
         .unwrap();
     assert_eq!(
         engine.prepare_bound_text("pending", &Bindings::new()).err(),
-        Some(Error::Bind("table".into()))
+        // PG18: undefined table is 42P01; native errors carry SQL's SQLSTATE (R2 parity).
+        Some(Error::Sql { sqlstate: "42P01".into() })
     );
     uncommitted.rollback();
 }

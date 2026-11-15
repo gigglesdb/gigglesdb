@@ -305,7 +305,7 @@ pub(super) fn validate_transaction(transaction: &Transaction) -> Result<()> {
                     return Err(Error::Unsupported);
                 }
                 validate_request_nodes(request, &mut nodes)?;
-                if !identifier(request.table()?) {
+                if !relation_identifier(request.table()?) {
                     return Err(Error::Bind("identifier".into()));
                 }
             }
@@ -354,7 +354,6 @@ pub(super) fn bind_transaction(
     bindings: &Bindings,
 ) -> Result<BoundTransaction> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
-    let (_, catalog) = session.catalog_engine().map_err(core)?;
     let mut tables = Vec::new();
     let mut table_indices = BTreeMap::new();
     let mut locals: Vec<LocalShape> = Vec::new();
@@ -363,6 +362,7 @@ pub(super) fn bind_transaction(
     let mut remaining_value_bytes = MAX_BOUND_VALUE_BYTES;
     for step in &transaction.steps {
         crate::cancellation::check().map_err(core)?;
+        let bound_table;
         let mut binder = Binder {
             table: None,
             allow_fields: false,
@@ -378,17 +378,15 @@ pub(super) fn bind_transaction(
             }
             TransactionStep::Execute(request) | TransactionStep::Let { request, .. } => {
                 let name = request.table()?;
-                let table = catalog
-                    .iter()
-                    .find(|table| table.name == name)
-                    .ok_or_else(|| Error::Bind("table".into()))?;
+                bound_table = session.native_table_engine(&native_relation_key(name)).map_err(core)?;
+                let table = &bound_table;
                 if table.hidden_rowid().is_some() {
                     return Err(Error::Unsupported);
                 }
                 binder.table = Some(table);
                 binder.allow_fields = true;
                 let operation = binder.bind(request)?;
-                let table_index = *table_indices.entry(name.to_owned()).or_insert_with(|| {
+                let table_index = *table_indices.entry(table.id).or_insert_with(|| {
                     tables.push(table.clone());
                     tables.len() - 1
                 });

@@ -2414,6 +2414,28 @@ impl SqlSession {
         }
         result
     }
+    /// Resolve native requests in the same private snapshot/search path as SQL.
+    pub(crate) fn native_table_engine(&self, name: &str) -> Result<relational::TableDef, CoreError> {
+        self.inspect_metadata(|s| {
+            let key = s.sql.resolve_relation_key(name, &self.search_path);
+            s.sql.tables.get(&key).cloned()
+                .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+        })
+    }
+    pub(crate) fn native_creation_key_engine(&self, name: &str) -> Result<String, CoreError> {
+        self.inspect_metadata(|s| {
+            let schemas = s.sql.schema_metadata();
+            let (schema, table) = relational::split_key(name);
+            let schema = if name.contains('\0') { Some(schema) } else {
+                self.search_path.iter().map(String::as_str)
+                    .find(|s| *s == "public" || schemas.schemas.contains_key(*s))
+            }.ok_or(CoreError::Sql(relational::SqlError::InvalidSchema))?;
+            if schema != "public" && !schemas.schemas.contains_key(schema) {
+                return Err(CoreError::Sql(relational::SqlError::InvalidSchema));
+            }
+            Ok(relational::relation_key(schema, table))
+        })
+    }
     /// Eligibility from the active definition snapshot. Legacy requires empty
     /// business/task state; v2 uses SQL's synchronous populated-database DDL.
     pub(crate) fn catalog_empty_engine(&mut self) -> Result<bool, CoreError> {
@@ -2494,19 +2516,22 @@ impl SqlSession {
             let (domain, epoch) = self.snapshot_identity_engine()?;
             // Resolve against the same private catalog/search path as SQL, not
             // presentation metadata (which strips index schema names).
-            let (before, index_id) = self.inspect_metadata(|s| {
-                let key = s.sql.resolve_relation_key(&name, &self.search_path);
+            let (before, index_id, key, table_key) = self.inspect_metadata(|s| {
+                let key = if index { s.sql.resolve_index_key(&name, &self.search_path) }
+                    else { s.sql.resolve_relation_key(&name, &self.search_path) };
                 let descriptor = s.sql.secondary_descriptors_engine().iter().find(|d| index && d.name == key);
                 let table = if index {
                     descriptor.and_then(|d| s.sql.tables.values().find(|t| t.id == d.table))
                 } else { s.sql.tables.get(&key) };
-                Ok((table.cloned(), descriptor.map(|d| d.id)))
+                let table_key = if index { s.sql.index_table_key(&key) }
+                    else { table.map(|t| s.sql.table_key(t)) };
+                Ok((table.cloned(), descriptor.map(|d| d.id), key, table_key))
             })?;
             // V2 Prepared uses epoch zero; the outer catalog intent checks the
             // actual snapshot fence before entering this shared SQL path.
             let epoch = if self.is_v2_engine() { 0 } else { epoch };
             let mut prepared = if index {
-                relational::Prepared::drop_index_engine(name, cascade, domain, epoch)
+                Ok(relational::Prepared::drop_index_engine(key, table_key, cascade, domain, epoch))
             } else {
                 relational::Prepared::drop_table_engine(name, cascade, domain, epoch)
             }.map_err(CoreError::Sql)?;

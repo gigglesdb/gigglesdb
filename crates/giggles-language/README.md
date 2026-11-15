@@ -40,6 +40,11 @@ Explicit version 0.14 adds native CREATE INDEX text; 0.15 adds Numeric parameter
 RESTRICT is the default. SQL dependency behavior is shared; DROP INDEX CASCADE
 retains SQL's Unsupported result. Legacy drops require empty business state;
 v2 permits populated state.
+Explicit version 0.18 selects `embedded-trusted-native-0.18`, inheriting 0.17
+and accepting `schema.table` in reads, writes, blocks, CREATE TABLE, CREATE
+INDEX targets and DROP TABLE/INDEX. Each component follows the existing
+identifier/backtick rules; bare tables resolve through the default public search
+path. CREATE INDEX names remain unqualified. Create schemas through SQL.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:

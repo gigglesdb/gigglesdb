@@ -35,10 +35,10 @@
               "execution_fixture": "deliveries_reserved_boundary",
               "execution": {
                 "expectation": "execute-rejected",
-                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. PG18: undefined table is 42P01; native binding carries SQLSTATE 42P01 (R2 parity); no table rename or parser workaround is used.",
                 "bindings": {},
                 "error": {
-                  "Bind": "table"
+                  "Sql": { "sqlstate": "42P01" }
                 },
                 "verify_sql": {
                   "source": "SELECT * FROM reference_probe LIMIT 1024",
@@ -70,10 +70,10 @@
               "execution_fixture": "deliveries_reserved_boundary",
               "execution": {
                 "expectation": "execute-rejected",
-                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. PG18: undefined table is 42P01; native binding carries SQLSTATE 42P01 (R2 parity); no table rename or parser workaround is used.",
                 "bindings": {},
                 "error": {
-                  "Bind": "table"
+                  "Sql": { "sqlstate": "42P01" }
                 },
                 "verify_sql": {
                   "source": "SELECT * FROM reference_probe LIMIT 1024",
@@ -105,10 +105,10 @@
               "execution_fixture": "deliveries_reserved_boundary",
               "execution": {
                 "expectation": "execute-rejected",
-                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. PG18: undefined table is 42P01; native binding carries SQLSTATE 42P01 (R2 parity); no table rename or parser workaround is used.",
                 "bindings": {},
                 "error": {
-                  "Bind": "table"
+                  "Sql": { "sqlstate": "42P01" }
                 },
                 "verify_sql": {
                   "source": "SELECT * FROM reference_probe LIMIT 1024",
@@ -572,10 +572,10 @@
               "execution_fixture": "deliveries_reserved_boundary",
               "execution": {
                 "expectation": "execute-rejected",
-                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. Native binding therefore reports Bind(\"table\"); no table rename or parser workaround is used.",
+                "reason": "CREATE TABLE deliveries is denied with SqlError::Reserved. PG18: undefined table is 42P01; native binding carries SQLSTATE 42P01 (R2 parity); no table rename or parser workaround is used.",
                 "bindings": {},
                 "error": {
-                  "Bind": "table"
+                  "Sql": { "sqlstate": "42P01" }
                 },
                 "verify_sql": {
                   "source": "SELECT * FROM reference_probe LIMIT 1024",

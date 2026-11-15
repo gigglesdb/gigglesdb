@@ -122,7 +122,7 @@ fn heap_secondary_selector_rejects_before_optional_fallback() {
     impl Context for NoSession {
         type Input = ();
         fn checkpoint(&self) -> std::result::Result<(), CoreError> { Ok(()) }
-        fn catalog_engine(&mut self) -> std::result::Result<(u64, Vec<TableDef>), CoreError> { Err(CoreError::Unsupported) }
+        fn resolve_table_engine(&mut self, _: &str) -> std::result::Result<TableDef, CoreError> { Err(CoreError::Unsupported) }
         fn consume_complete_engine(&mut self, _: (), _: &TableDef) -> std::result::Result<Vec<SqlRow>, CoreError> { Err(CoreError::Unsupported) }
         fn insert_engine(&mut self, _: &TableDef, _: Vec<Value>) -> std::result::Result<crate::relational::SqlResult, CoreError> { Err(CoreError::Unsupported) }
         fn update_engine(&mut self, _: &TableDef, _: Vec<Value>, _: Vec<(usize, Value)>, _: u64) -> std::result::Result<crate::relational::SqlResult, CoreError> { Err(CoreError::Unsupported) }
@@ -132,4 +132,24 @@ fn heap_secondary_selector_rejects_before_optional_fallback() {
     }
     assert_eq!(secondary_selector::read(&mut NoSession, heap, &filter, vec![]), Err(Error::Unsupported));
     assert_eq!(secondary_selector::read(&mut NoSession, keyed, &filter, vec![]), Ok(vec![]));
+}
+
+#[test]
+fn schema_snapshot_point_scan_and_fence_keep_the_resolved_key() {
+    let mut state = state();
+    for sql in ["CREATE SCHEMA app", "CREATE TABLE app.keyed(id BIGINT PRIMARY KEY, n BIGINT)",
+        "INSERT INTO app.keyed VALUES(1, 99)"] {
+        let prepared = Prepared::parse(sql, 1, state.sql.epoch).unwrap();
+        state.sql.execute(&prepared, &[], None).unwrap();
+    }
+    let bindings = Bindings::new();
+    let (_, public) = state_adapter::execute(&state, &read("keyed"), &bindings).unwrap();
+    assert_eq!(public.rows[0].values[1], Value::Int(10));
+    let table = state.sql.tables["app\0keyed"].clone();
+    let description = BoundDescription { contract_version: ENGINE_CONTRACT_VERSION,
+        database_domain: state.view.domain, catalog_epoch: state.sql.epoch, columns: table.columns.clone(), table };
+    let (_, qualified) = state_adapter::execute_fenced(&state, &read("app.keyed"), &bindings, &description, None).unwrap();
+    assert_eq!(qualified.rows[0].values[1], Value::Int(99));
+    assert!(matches!(state_adapter::execute_fenced(&state, &read("keyed"), &bindings, &description, None),
+        Err(Error::Sql { sqlstate }) if sqlstate == "0A000"));
 }

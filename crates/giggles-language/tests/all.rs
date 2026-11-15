@@ -33,6 +33,8 @@ mod native_defaults_parity;
 mod native_drop_parity;
 #[path = "native_parity.rs"]
 mod native_parity;
+#[path = "native_schema_parity.rs"]
+mod native_schema_parity;
 #[path = "native_sqlstate_parity.rs"]
 mod native_sqlstate_parity;
 #[path = "once.rs"]

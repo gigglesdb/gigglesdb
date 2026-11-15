@@ -406,3 +406,5 @@ mod typed_join_read;
 
 #[path = "authorization_reads.rs"]
 mod authorization_reads;
+#[path = "native_schema_resolution.rs"]
+mod native_schema_resolution;

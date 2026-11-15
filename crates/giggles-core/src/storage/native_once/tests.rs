@@ -992,7 +992,8 @@ fn once_replay_precedes_binding_after_a_table_name_disappears_and_is_reused() {
     assert!(admin.catalog().unwrap().0 > first.description.catalog_epoch);
     assert_eq!(
         relational::with_sql_parser_forbidden(|| engine.execute(&operation, &bindings)),
-        Err(OperationError::Bind("table".into()))
+        // PG18: undefined table is 42P01; native errors carry SQL's SQLSTATE (R2 parity).
+        Err(OperationError::Sql { sqlstate: "42P01".into() })
     );
     let replayed = relational::with_sql_parser_forbidden(|| {
         engine.execute_once(&request, &bindings, &no_clock)

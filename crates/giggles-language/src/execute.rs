@@ -284,8 +284,8 @@ pub(crate) fn validate_catalog(
     version: LanguageVersion,
 ) -> Result<()> {
     if let CatalogStatement::DropTable { table: name, .. } | CatalogStatement::DropIndex { name, .. } = statement {
-        if version != LanguageVersion::Embedded017 { return Err(Error::Unsupported); }
-        if !parser::semantic_identifier(name, version) { return Err(Error::Bind("identifier".into())); }
+        if !matches!(version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018) { return Err(Error::Unsupported); }
+        if !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
         return validate_size(statement);
     }
     if let CatalogStatement::CreateIndex {
@@ -300,8 +300,7 @@ pub(crate) fn validate_catalog(
         if columns.len() > giggles_core::relational::MAX_COLUMNS {
             return Err(Error::Limit);
         }
-        if std::iter::once(table)
-            .chain(std::iter::once(name))
+        if !parser::semantic_relation(table, version) || std::iter::once(name)
             .chain(columns.iter())
             .any(|name| !parser::semantic_identifier(name, version))
         {
@@ -322,13 +321,13 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
-    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
+    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
         && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
     {
         return Err(Error::Unsupported);
     }
     // Every name is checked before any definition strings are cloned.
-    if !parser::semantic_identifier(table, version)
+    if !parser::semantic_relation(table, version)
         || columns
             .iter()
             .any(|column| !parser::semantic_identifier(&column.name, version))
@@ -816,6 +815,13 @@ fn validate_native_value(value: &ValueExpr) -> Result<()> {
         },
     }
 }
+fn relation_name(name: &str, version: LanguageVersion) -> Result<String> {
+    if parser::semantic_relation(name, version) {
+        Ok(name.to_owned())
+    } else {
+        Err(Error::Bind("identifier".into()))
+    }
+}
 fn identifier(name: &str, version: LanguageVersion) -> Result<String> {
     if parser::semantic_identifier(name, version) {
         Ok(name.to_owned())
@@ -1120,7 +1126,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             limit,
             projection,
         } => operations::Request::Read {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             filter: filter
                 .as_ref()
                 .map(|expr| expression(expr, version))
@@ -1133,7 +1139,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
                 .collect::<Result<_>>()?,
         },
         Statement::Insert { table, values } => operations::Request::Insert {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             values: assignments(values, version)?,
         },
         Statement::Update {
@@ -1143,7 +1149,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             values,
             intent: write_intent,
         } => operations::Request::Update {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             filter: expression(filter, version)?,
             guard: guard
                 .as_ref()
@@ -1158,7 +1164,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             guard,
             cap,
         } => operations::Request::Delete {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             filter: expression(filter, version)?,
             guard: guard
                 .as_ref()
@@ -1173,7 +1179,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             values,
             intent: write_intent,
         } => operations::Request::UpdateExpressions {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             filter: expression(filter, version)?,
             guard: guard
                 .as_ref()
@@ -1192,7 +1198,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             limit,
             projection,
         } => operations::Request::ReadExpressions {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             filter: filter
                 .as_ref()
                 .map(|expr| expression(expr, version))
@@ -1235,7 +1241,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             projection: projections(projection, version)?,
         },
         Statement::InsertExpressions { table, values } => operations::Request::InsertExpressions {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             values: values
                 .iter()
                 .map(|(name, expr)| Ok((identifier(name, version)?, expression(expr, version)?)))
@@ -1247,7 +1253,7 @@ fn lower_statement(stmt: &Statement, version: LanguageVersion) -> Result<operati
             rows,
             cap,
         } => operations::Request::InsertMany {
-            table: identifier(table, version)?,
+            table: relation_name(table, version)?,
             columns: columns
                 .iter()
                 .map(|name| identifier(name, version))
@@ -1316,7 +1322,7 @@ fn validate_parameter_admission(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);
@@ -1409,7 +1415,7 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);

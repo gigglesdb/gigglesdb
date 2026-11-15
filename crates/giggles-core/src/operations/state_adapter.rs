@@ -12,7 +12,7 @@ pub(super) trait Context {
         Ok(value)
     }
     fn checkpoint(&self) -> std::result::Result<(), CoreError>;
-    fn catalog_engine(&mut self) -> std::result::Result<(u64, Vec<TableDef>), CoreError>;
+    fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError>;
     fn consume_complete_engine(
         &mut self,
         input: Self::Input,
@@ -57,8 +57,8 @@ impl Context for SqlSession {
     fn session(&mut self) -> Result<&mut SqlSession> {
         Ok(self)
     }
-    fn catalog_engine(&mut self) -> std::result::Result<(u64, Vec<TableDef>), CoreError> {
-        SqlSession::catalog_engine(self)
+    fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError> {
+        SqlSession::native_table_engine(self, name)
     }
     fn consume_complete_engine(
         &mut self,
@@ -114,11 +114,10 @@ impl Context for SnapshotContext {
     fn checkpoint(&self) -> std::result::Result<(), CoreError> {
         Ok(())
     }
-    fn catalog_engine(&mut self) -> std::result::Result<(u64, Vec<TableDef>), CoreError> {
-        Ok((
-            self.state.sql.epoch,
-            self.state.sql.tables.values().cloned().collect(),
-        ))
+    fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError> {
+        let key = self.state.sql.resolve_relation_key(name, &["public".into()]);
+        self.state.sql.tables.get(&key).cloned()
+            .ok_or(CoreError::Sql(SqlError::UnknownTable))
     }
     fn consume_complete_engine(
         &mut self,
@@ -247,7 +246,8 @@ pub(crate) fn execute_fenced(
             .tables
             .get(&state.sql.table_key(&description.table))
             != Some(&description.table)
-        || request.table()? != description.table.name
+        || state.sql.resolve_relation_key(&native_relation_key(request.table()?), &["public".into()])
+            != state.sql.table_key(&description.table)
     {
         return Err(core(CoreError::Sql(SqlError::StaleSchema)));
     }
@@ -288,11 +288,9 @@ fn execute_inner(
         }
         _ => return Err(Error::Unsupported),
     };
-    let table = state
-        .sql
-        .tables
-        .get(request.table()?)
-        .ok_or_else(|| Error::Bind("table".into()))?;
+    let key = state.sql.resolve_relation_key(&native_relation_key(request.table()?), &["public".into()]);
+    let table = state.sql.tables.get(&key)
+        .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
     let mut seen = BTreeSet::new();
     point_filter(filter, table, &mut seen)?;
     if seen.len() != table.primary_key.len() {
@@ -306,7 +304,7 @@ fn execute_inner(
     // Preserve the existing engine's full-relation cap, including N+1 proof.
     let rows = context
         .scan(Scan {
-            table: table.name.clone(),
+            table: state.sql.table_key(&table),
             projection: vec![],
             prefix: vec![],
             lower: None,
@@ -319,7 +317,7 @@ fn execute_inner(
     if rows.len() == MAX_ROWS {
         let maximum = context
             .scan(Scan {
-                table: table.name.clone(),
+                table: state.sql.table_key(&table),
                 projection: table
                     .primary_key
                     .iter()

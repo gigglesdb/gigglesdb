@@ -2,6 +2,8 @@
 //!
 //! Frontends lower requests into these types without generating SQL. The engine
 //! binds against one transaction snapshot and publishes each request atomically.
+//! Table references accept canonical `table` or `schema.table`; bare names follow
+//! the session search path (a fresh Engine session defaults to public).
 //! This initial surface supports the existing finite native subset; it is not
 //! task authorization and does not replace the SQL frontend or its semantics.
 //! Storage failures during commit return [`Error::Unknown`] and must not be
@@ -547,7 +549,7 @@ impl Engine {
 fn validate_request(request: &Request) -> Result<()> {
     validate_depth(request)?;
     validate_size(request)?;
-    if !identifier(request.table()?) {
+    if !relation_identifier(request.table()?) {
         return Err(Error::Bind("identifier".into()));
     }
     Ok(())
@@ -571,12 +573,8 @@ fn bind_request(
     request: &Request,
     bindings: &Bindings,
 ) -> Result<(TableDef, Operation)> {
-    let table_name = request.table()?;
-    let (_, tables) = session.catalog_engine().map_err(core)?;
-    let table = tables
-        .into_iter()
-        .find(|table| table.name == table_name)
-        .ok_or_else(|| Error::Bind("table".into()))?;
+    let key = native_relation_key(request.table()?);
+    let table = session.resolve_table_engine(&key).map_err(core)?;
     if table.hidden_rowid().is_some() {
         return Err(Error::Unsupported);
     }
@@ -596,6 +594,17 @@ fn bind_request(
         return Err(Error::Bind("parameters".into()));
     }
     Ok((table, operation))
+}
+// Native references contain one or two canonical components; never accept wire keys.
+fn relation_identifier(s: &str) -> bool {
+    s.split_once('.').map_or_else(|| identifier(s), |(schema, name)| {
+        identifier(schema) && identifier(name)
+    })
+}
+fn native_relation_key(s: &str) -> String {
+    s.split_once('.').map_or_else(|| s.into(), |(schema, name)| {
+        format!("{schema}\0{name}")
+    })
 }
 // Canonical catalog names, independent of frontend-specific reserved words.
 fn identifier(s: &str) -> bool {

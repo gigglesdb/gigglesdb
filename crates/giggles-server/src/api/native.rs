@@ -298,7 +298,8 @@ mod tests {
             if table == "app" {
                 assert!(matches!(result, NativeResult::Operation(_)));
             } else {
-                assert!(matches!(result, NativeResult::Error(ops::Error::Bind(_))));
+                // PG18: undefined table is 42P01; native errors carry SQL's SQLSTATE (R2 parity).
+                assert!(matches!(result, NativeResult::Error(ops::Error::Sql { sqlstate }) if sqlstate == "42P01"));
                 assert_eq!(session.execute_sql("SELECT id FROM missing", &[]).unwrap_err(),
                     CoreError::Sql(SqlError::UnknownTable));
             }

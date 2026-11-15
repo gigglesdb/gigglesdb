@@ -317,7 +317,9 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
     let base = engine.execute_catalog(&create("base")).unwrap();
     assert_eq!(base.table.id, 1);
     assert_eq!(base.table.columns[0].id, 2);
-    for name in ["", "A", "two.parts", "1name", "é", "has space"] {
+    // PG18: CREATE TABLE two.parts without schema two is 3F000 (R2 parity).
+    reject_definition(&admin, &engine, &create("two.parts"), Error::Sql { sqlstate: "3F000".into() });
+    for name in ["", "A", "1name", "é", "has space"] {
         reject_definition(
             &admin,
             &engine,

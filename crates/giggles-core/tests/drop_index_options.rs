@@ -46,6 +46,28 @@ fn exercise(path: &std::path::Path, mut admin: Admin, views: bool) {
             run(&mut s, "DROP INDEX persisted CASCADE");
             error(&mut s, "DROP INDEX persisted", SqlError::UndefinedObject);
         }
+        // Explicit public names use the same catalog key as bare public names.
+        for sql in [
+            "CREATE TABLE public.qualified(id int)",
+            "CREATE TABLE other.qualified(id int)",
+            "CREATE INDEX qualified_i ON public.qualified(id)",
+            "CREATE INDEX qualified_i ON other.qualified(id)",
+            "DROP INDEX public.qualified_i",
+            "DROP INDEX other.qualified_i",
+            "CREATE INDEX qualified_i ON public.qualified(id)",
+            "CREATE INDEX qualified_i ON other.qualified(id)",
+        ] {
+            run(&mut s, sql);
+        }
+        s.set_search_path("other,public", "giggles");
+        run(&mut s, "DROP INDEX qualified_i");
+        error(&mut s, "DROP INDEX other.qualified_i", SqlError::UndefinedObject);
+        run(&mut s, "DROP INDEX public.qualified_i");
+        error(&mut s, "DROP INDEX public.qualified_i", SqlError::UndefinedObject);
+        run(&mut s, "DROP INDEX IF EXISTS public.qualified_i");
+        run(&mut s, "DROP TABLE public.qualified");
+        run(&mut s, "DROP TABLE other.qualified");
+        s.set_search_path("public", "giggles");
         for option in ["", " CASCADE", " RESTRICT"] {
             run(&mut s, "CREATE INDEX plain_i ON plain(id)");
             run(&mut s, &format!("DROP INDEX plain_i{option};"));
@@ -56,7 +78,7 @@ fn exercise(path: &std::path::Path, mut admin: Admin, views: bool) {
                 &format!("DROP INDEX missing{option}"),
                 SqlError::UndefinedObject,
             );
-            for name in ["owner_pkey", "owner_uq", "named_pk", "other.owner_pk"] {
+            for name in ["owner_pkey", "public.owner_pkey", "owner_uq", "named_pk", "other.owner_pk"] {
                 // PostgreSQL 18.6 refuses constraint indexes with 2BP01 for every option.
                 for optional in ["", " IF EXISTS"] {
                     error(

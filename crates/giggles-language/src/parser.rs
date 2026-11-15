@@ -42,6 +42,14 @@ fn canonical_identifier(s: &str) -> bool {
         && s.bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
+pub(crate) fn semantic_relation(name: &str, version: LanguageVersion) -> bool {
+    if let Some((schema, table)) = name.split_once('.') {
+        version.supports_schema_names()
+            && semantic_identifier(schema, version) && semantic_identifier(table, version)
+    } else {
+        semantic_identifier(name, version)
+    }
+}
 pub(crate) fn semantic_identifier(s: &str, version: LanguageVersion) -> bool {
     if version.supports_quoted_identifiers() {
         canonical_identifier(s)
@@ -300,6 +308,14 @@ impl Parser {
             _ => Err(self.error()),
         }
     }
+    fn relation_name(&mut self) -> Result<String> {
+        let first = self.name()?;
+        if self.version.supports_schema_names() && self.symbol('.') {
+            Ok(format!("{first}.{}", self.name()?))
+        } else {
+            Ok(first)
+        }
+    }
     fn variable_name(&mut self) -> Result<String> {
         if !self.version.supports_case() {
             return self.name();
@@ -394,7 +410,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -863,7 +879,7 @@ impl Parser {
             } else {
                 self.word("into");
             }
-            let table = self.name()?;
+            let table = self.relation_name()?;
             if self.version.supports_transactions() && self.symbol('(') {
                 let mut names = vec![self.name()?];
                 while self.symbol(',') {
@@ -936,7 +952,7 @@ impl Parser {
         }
         if self.word("update") {
             let many = self.word("many");
-            let table = self.name()?;
+            let table = self.relation_name()?;
             self.need("where")?;
             let filter = self.expr(0)?;
             let guard = if self.word("when") {
@@ -954,7 +970,7 @@ impl Parser {
         }
         if self.word("delete") {
             let many = self.word("many");
-            let table = self.name()?;
+            let table = self.relation_name()?;
             self.need("where")?;
             let filter = self.expr(0)?;
             let guard = if self.word("when") {
@@ -971,7 +987,7 @@ impl Parser {
             });
         }
         if self.word("claim") {
-            let table = self.name()?;
+            let table = self.relation_name()?;
             self.need("where")?;
             let filter = self.expr(0)?;
             let order = self.sorts()?;
@@ -995,7 +1011,7 @@ impl Parser {
             self.pos += 1;
             "show".into()
         } else {
-            self.name()?
+            self.relation_name()?
         };
         let filter = self.filter()?;
         let order = self.sorts()?;
@@ -1062,16 +1078,16 @@ impl Parser {
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if (create == "create" || (create == "drop" && self.version == LanguageVersion::Embedded017))
+            if (create == "create" || (create == "drop" && matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018)))
                 && (table == "table" || table == "index"))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
         }
-        if self.version == LanguageVersion::Embedded017 && self.word("drop") {
+        if matches!(self.version, LanguageVersion::Embedded017 | LanguageVersion::Embedded018) && self.word("drop") {
             let index = if self.word("index") { true } else { self.need("table")?; false };
-            let name = self.name()?;
+            let name = self.relation_name()?;
             let cascade = self.word("cascade");
             if !cascade { self.word("restrict"); }
             return Ok(if index {
@@ -1087,7 +1103,7 @@ impl Parser {
             }
             let name = self.name()?;
             self.need("on")?;
-            let table = self.name()?;
+            let table = self.relation_name()?;
             if !self.symbol('(') {
                 return Err(self.error());
             }
@@ -1108,7 +1124,7 @@ impl Parser {
             });
         }
         self.need("table")?;
-        let table = self.name()?;
+        let table = self.relation_name()?;
         if !self.symbol('(') {
             return Err(self.error());
         }
@@ -1151,7 +1167,7 @@ impl Parser {
                     CatalogType::Int64
                 } else if self.word("text") {
                     CatalogType::Text
-                } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017) && self.word("numeric") {
+                } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017 | LanguageVersion::Embedded018) && self.word("numeric") {
                     CatalogType::Numeric
                 } else if self.word("bytes") {
                     CatalogType::Bytes

@@ -125,7 +125,7 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
 }
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     if let CatalogRequest::DropTable { table: name, .. } | CatalogRequest::DropIndex { name, .. } = request {
-        if !identifier(name) { return Err(Error::Bind("identifier".into())); }
+        if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
         return validate_size(request);
     }
     if let CatalogRequest::CreateIndex {
@@ -137,7 +137,7 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
         if columns.is_empty() || columns.len() > crate::relational::MAX_COLUMNS {
             return Err(Error::Limit);
         }
-        if !identifier(table) || !identifier(name) || columns.iter().any(|c| !identifier(c)) {
+        if !relation_identifier(table) || !identifier(name) || columns.iter().any(|c| !identifier(c)) {
             return Err(Error::Bind("identifier".into()));
         }
         if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
@@ -165,7 +165,7 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     if primary_key.is_empty() {
         return Err(Error::Bind("primary key".into()));
     }
-    if !identifier(table)
+    if !relation_identifier(table)
         || columns.iter().any(|column| !identifier(&column.name))
         || primary_key.iter().any(|name| !identifier(name))
     {
@@ -173,7 +173,7 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     }
     validate_size(request)?;
     let definition = columns_for_create(columns);
-    crate::relational::validate_create_definition(table, &definition, primary_key)
+    crate::relational::validate_create_definition(table.rsplit('.').next().unwrap(), &definition, primary_key)
         .map_err(|error| core(CoreError::Sql(error)))?;
     for key in primary_key {
         let column = columns
@@ -205,10 +205,7 @@ fn bind_catalog(
         });
     }
     if let CatalogRequest::CreateIndex { table, columns, .. } = request {
-        let table = tables
-            .iter()
-            .find(|t| t.name == *table)
-            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+        let table = session.native_table_engine(&native_relation_key(table)).map_err(core)?;
         if table.hidden_rowid().is_some() {
             return Err(Error::Unsupported);
         }
@@ -248,8 +245,11 @@ fn bind_catalog(
     let CatalogRequest::CreateTable { table, .. } = request else {
         unreachable!()
     };
-    if tables.iter().any(|existing| existing.name == *table) {
-        return Err(Error::Sql { sqlstate: "42P07".into() });
+    let key = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;
+    match session.native_table_engine(&key) {
+        Ok(_) => return Err(Error::Sql { sqlstate: "42P07".into() }),
+        Err(CoreError::Sql(SqlError::UnknownTable)) => {},
+        Err(error) => return Err(core(error)),
     }
     if tables.len() >= crate::relational::MAX_TABLES {
         return Err(core(CoreError::Sql(SqlError::Limit)));
@@ -322,7 +322,7 @@ impl Engine {
             }
             if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = &prepared.description.request {
                 let is_index = matches!(prepared.description.request, CatalogRequest::DropIndex { .. });
-                let (table, index_id) = session.drop_catalog_engine(name.clone(), *cascade, is_index).map_err(core)?;
+                let (table, index_id) = session.drop_catalog_engine(native_relation_key(name), *cascade, is_index).map_err(core)?;
                 let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
                 return Ok(CatalogOutcome { catalog_epoch, table, index_id });
             }
@@ -334,11 +334,7 @@ impl Engine {
                 columns,
             } = &prepared.description.request
             {
-                let (_, tables) = session.catalog_engine().map_err(core)?;
-                let definition = tables
-                    .iter()
-                    .find(|t| t.name == *table)
-                    .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+                let definition = session.native_table_engine(&native_relation_key(table)).map_err(core)?;
                 let ids = columns
                     .iter()
                     .map(|name| {
@@ -350,8 +346,8 @@ impl Engine {
                             .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                index_id = Some(create_index(&mut session, definition, name, &ids).map_err(core)?);
-                table_name = table;
+                index_id = Some(create_index(&mut session, &definition, name, &ids).map_err(core)?);
+                table_name = native_relation_key(table);
             } else {
                 let CatalogRequest::CreateTable {
                     table,
@@ -363,19 +359,16 @@ impl Engine {
                 };
                 session
                     .create_table_engine(
-                        table.clone(),
+                        session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?,
                         columns_for_create(columns),
                         primary_key.clone(),
                     )
                     .map_err(core)?;
-                table_name = table;
+                table_name = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;
                 index_id = None;
             }
-            let (catalog_epoch, tables) = session.catalog_engine().map_err(core)?;
-            let table = tables
-                .into_iter()
-                .find(|created| created.name == *table_name)
-                .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownTable)))?;
+            let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+            let table = session.native_table_engine(&table_name).map_err(core)?;
             Ok(CatalogOutcome {
                 catalog_epoch,
                 table,

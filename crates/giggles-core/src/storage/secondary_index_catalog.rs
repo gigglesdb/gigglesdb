@@ -66,9 +66,10 @@ impl SqlSession {
                 if unique {
                     return Err(CoreError::Unsupported);
                 }
+                let key = self.inspect_metadata(|s| Ok(s.sql.table_key(table)))?;
                 let (domain, current) = db.inspect_binding(
                     self.v2_transaction.as_ref(),
-                    |domain, _, tables| (domain, tables.get(&table.name) == Some(table)),
+                    |domain, _, tables| (domain, tables.get(&key) == Some(table)),
                 )?;
                 if !current {
                     return Err(CoreError::Sql(relational::SqlError::StaleSchema));
@@ -82,7 +83,7 @@ impl SqlSession {
                         .ok_or(CoreError::Sql(relational::SqlError::UnknownColumn))
                 }).collect::<Result<Vec<_>, _>>()?;
                 let mut prepared = relational::Prepared::create_index_engine(
-                    table.name.clone(), name.into(), names, domain, 0,
+                    key, name.into(), names, domain, 0,
                 );
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)?;

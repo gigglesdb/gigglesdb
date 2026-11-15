@@ -1837,7 +1837,7 @@ impl Prepared {
                     .bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         };
-        if !native_name(&name)
+        if name.split('\0').any(|part| !native_name(part))
             || columns.iter().any(|column| !native_name(&column.name))
             || keys.iter().any(|key| !native_name(key))
         {
@@ -1851,13 +1851,14 @@ impl Prepared {
         }
         if keys.is_empty() {
             // Preserve the native CREATE error and its original precedence.
-            ident(&name)?;
+            schema_binding::validate_key(&name)?;
             if columns.is_empty() || columns.len() > MAX_COLUMNS {
                 return Err(SqlError::Limit);
             }
             return Err(SqlError::Unbounded);
         }
-        validate_create_definition(&name, &columns, &keys)?;
+        schema_binding::validate_key(&name)?;
+        validate_create_definition(split_key(&name).1, &columns, &keys)?;
         for key in &keys {
             if !columns
                 .iter()
@@ -1872,7 +1873,11 @@ impl Prepared {
         if state.tables.len() >= MAX_TABLES {
             return Err(SqlError::Limit);
         }
-        Ok(Self::engine(
+        let (schema, table) = split_key(&name);
+        let reference = schemas::Reference {
+            name: table.into(), schema: name.contains('\0').then(|| schema.into()), create: true,
+        };
+        let mut prepared = Self::engine(
             Statement::Create {
                 name,
                 optional: false,
@@ -1887,7 +1892,9 @@ impl Prepared {
             },
             domain,
             state.epoch,
-        ))
+        );
+        prepared.relations.push(reference);
+        Ok(prepared)
     }
     pub(crate) fn create_index_engine(
         table: String,
@@ -1909,20 +1916,19 @@ impl Prepared {
         )
     }
     pub(crate) fn drop_table_engine(name: String, cascade: bool, domain: u128, epoch: u64) -> R<Self> {
-        ident(&name)?;
+        ident(split_key(&name).0)?;
+        ident(split_key(&name).1)?;
         let mut prepared = Self::engine(Statement::DropTable {
             names: vec![name.clone()], optional: false, cascade, resolution_error: None,
         }, domain, epoch);
         prepared.relations.push(schemas::Reference::read(name, None));
         Ok(prepared)
     }
-    pub(crate) fn drop_index_engine(name: String, cascade: bool, domain: u128, epoch: u64) -> R<Self> {
-        ident(&name)?;
-        let mut prepared = Self::engine(Statement::DropIndex(sql_index::DropIndex {
-            name: name.clone(), table: None, optional: false, cascade,
-        }), domain, epoch);
-        prepared.relations.push(schemas::Reference::read(name, None));
-        Ok(prepared)
+    // Names and table ownership are already resolved in the caller's snapshot.
+    pub(crate) fn drop_index_engine(name: String, table: Option<String>, cascade: bool, domain: u128, epoch: u64) -> Self {
+        Self::engine(Statement::DropIndex(sql_index::DropIndex {
+            name, table, optional: false, cascade,
+        }), domain, epoch)
     }
     pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Begin, domain, epoch)
@@ -1978,7 +1984,7 @@ impl Prepared {
         row_check(table, &values)?;
         Ok(Self::engine(
             Statement::Insert {
-                name: table.name.clone(),
+                name: state.table_key(table),
                 columns: vec![],
                 values: values.into_iter().map(Expr::Literal).collect(),
                 returning: None,
@@ -2008,7 +2014,7 @@ impl Prepared {
             _ => Err(SqlError::Unsupported),
         }).collect::<R<Vec<_>>>()?;
         prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
-            table.name.clone(),
+            state.table_key(table),
             table.columns.iter().map(|c| c.name.clone()).collect(),
             table.columns.iter().map(|c| c.data_type.clone()).collect(),
             vec![values],
@@ -2053,7 +2059,7 @@ impl Prepared {
             .collect::<R<Vec<_>>>()?;
         Ok(Self::engine(
             Statement::Update {
-                name: table.name.clone(),
+                name: state.table_key(table),
                 sets,
                 predicates,
                 search: None,
@@ -2076,7 +2082,7 @@ impl Prepared {
         let predicates = Self::engine_key(table, key)?;
         Ok(Self::engine(
             Statement::Delete {
-                name: table.name.clone(),
+                name: state.table_key(table),
                 predicates,
                 search: None,
                 returning: None,
@@ -2514,7 +2520,7 @@ impl Prepared {
         }
     }
     pub(crate) fn scan(scan: Scan, domain: u128, state: &Relational) -> R<Self> {
-        ident(&scan.table)?;
+        schema_binding::validate_key(&scan.table)?;
         let t = state
             .tables
             .get(&scan.table)

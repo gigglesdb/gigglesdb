@@ -352,7 +352,8 @@ fn under_budget_exact_binding_and_type_errors_are_preserved() {
             &engine,
             "missing",
             &Bindings::new(),
-            Error::Bind("table".into()),
+            // PG18: undefined table is 42P01; native errors carry SQL's SQLSTATE (R2 parity).
+            Error::Sql { sqlstate: "42P01".into() },
         );
         let null = Bindings::from([("payload".into(), Value::Null)]);
         for entry in ENTRY_POINTS {

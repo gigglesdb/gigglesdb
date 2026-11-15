@@ -74,9 +74,10 @@ impl SqlSession {
     ) -> Result<CompleteRelation, CoreError> {
         let result = (|| {
             let snapshot = self.complete_snapshot(table)?;
+            let key = self.inspect_metadata(|s| Ok(s.sql.table_key(table)))?;
             let rows = self
                 .scan(Scan {
-                    table: table.name.clone(),
+                    table: key.clone(),
                     projection: vec![],
                     prefix: vec![],
                     lower: None,
@@ -89,7 +90,7 @@ impl SqlSession {
                 // The page bound is not a table capacity. Prove that the final
                 // full primary key equals this same snapshot's actual maximum.
                 let maximum = self.scan(Scan {
-                    table: table.name.clone(),
+                    table: key,
                     projection: table
                         .primary_key
                         .iter()

@@ -73,6 +73,28 @@ impl Relational {
             // A missing relation must not accidentally resolve to public.
             .unwrap_or_else(|| format!("\0\0{name}"))
     }
+
+    pub(crate) fn resolve_index_key(&self, name: &str, path: &[String]) -> String {
+        if name.contains('\0') {
+            let (schema, name) = split_key(name);
+            return relation_key(schema, name);
+        }
+        path.iter()
+            .map(|schema| relation_key(schema, name))
+            .find(|key| self.relation_name_taken(key)
+                || sql_index::primary_table(self, key).is_some())
+            .unwrap_or_else(|| self.resolve_relation_key(name, path))
+    }
+
+    pub(crate) fn index_table_key(&self, key: &str) -> Option<String> {
+        self.secondary_descriptors_engine()
+            .iter()
+            .find(|d| d.name == key)
+            .and_then(|d| self.tables.values().find(|t| t.id == d.table))
+            .or_else(|| sql_index::primary_table(self, key))
+            .map(|t| self.table_key(t))
+    }
+
 }
 
 impl Prepared {
@@ -184,22 +206,8 @@ impl Prepared {
             }
             Statement::CreateIndex(index) => read(&mut index.table),
             Statement::DropIndex(index) => {
-                index.name = if index.name.contains('\0') {
-                    index.name.clone()
-                } else {
-                    self.search_path.iter()
-                        .map(|schema| relation_key(schema, &index.name))
-                        .find(|key| state.relation_name_taken(key)
-                            || sql_index::primary_table(state, key).is_some())
-                        .unwrap_or_else(|| state.resolve_relation_key(&index.name, &self.search_path))
-                };
-                index.table = state
-                    .secondary_descriptors_engine()
-                    .iter()
-                    .find(|d| d.name == index.name)
-                    .and_then(|d| state.tables.values().find(|t| t.id == d.table))
-                    .or_else(|| sql_index::primary_table(state, &index.name))
-                    .map(|t| state.table_key(t));
+                index.name = state.resolve_index_key(&index.name, &self.search_path);
+                index.table = state.index_table_key(&index.name);
             }
             Statement::Sequence(ddl) => ddl.bind_schema_names(&read, &create)?,
             _ => {}
