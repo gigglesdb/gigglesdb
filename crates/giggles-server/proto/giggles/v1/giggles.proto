@@ -31,6 +31,7 @@ message ExecuteRequest {
     CommitRequest commit = 10;
     RollbackRequest rollback = 11;
     NativeTextRequest text = 12;
+    NativeTypedRead typed_read = 13;
   }
   optional uint32 budget_ms = 20;
 }
@@ -38,6 +39,67 @@ message NativeTextRequest {
   string text = 1;
   repeated NativeBinding bindings = 2;
   optional string language_version = 3;
+}
+
+// Exact identifiers; expressions are typed trees, never SQL fragments.
+message NativeTypedRead {
+  optional string table = 1;
+  repeated NativeReadProjection projection = 2;
+  NativeReadExpr filter = 3;
+  repeated NativeReadExpr group_by = 4;
+  NativeReadExpr having = 5;
+  repeated NativeReadOrder order_by = 6;
+  optional sint64 limit = 7;
+  NativeReadJoin join = 8;
+}
+message NativeReadJoin {
+  optional string table = 1;
+  optional string left_alias = 2;
+  optional string right_alias = 3;
+  optional bool left = 4; // false = INNER, true = LEFT
+  NativeReadExpr on = 5;
+}
+message NativeReadProjection {
+  NativeReadExpr expression = 1;
+  optional string alias = 2;
+}
+message NativeReadOrder {
+  NativeReadExpr expression = 1;
+  optional bool descending = 2;
+  optional bool nulls_first = 3;
+}
+message NativeReadColumn {
+  optional string name = 1;
+  optional string source = 2;
+}
+message NativeReadAggregate {
+  optional string function = 1; // count_star, count, sum, min, max, avg
+  NativeReadColumn column = 2; // absent only for count_star
+}
+message NativeReadExpr {
+  oneof expression {
+    NativeReadColumn column = 1;
+    Value literal = 2;
+    NativeReadAggregate aggregate = 3;
+    NativeReadCompare compare = 4;
+    NativeReadNull is_null = 5;
+    NativeReadExpr not_expr = 6;
+    NativeReadLogic and_expr = 7;
+    NativeReadLogic or_expr = 8;
+  }
+}
+message NativeReadCompare {
+  NativeReadExpr left = 1;
+  NativeComparison comparison = 2;
+  NativeReadExpr right = 3;
+}
+message NativeReadNull {
+  NativeReadExpr expression = 1;
+  optional bool negated = 2;
+}
+message NativeReadLogic {
+  NativeReadExpr left = 1;
+  NativeReadExpr right = 2;
 }
 message PingRequest {}
 message SqlRequest {

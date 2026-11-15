@@ -411,3 +411,39 @@ Use the same metadata for subsequent Execute and CloseSession calls. Reflection
 is intentionally unavailable. The build uses vendored protoc, includes generated
 Rust client/server types, and exposes the descriptor as
 `api::proto::FILE_DESCRIPTOR_SET`.
+
+## Typed aggregate and join reads
+
+`ExecuteRequest.typed_read` (protobuf field 13), JSON `typedRead`, reads a table
+with optional INNER/LEFT join, WHERE, GROUP BY, HAVING, ORDER BY and LIMIT.
+Table/column/source names are exact identifiers. Each source requires SELECT
+for Database roles or inclusion in the Application allowlist, before catalog
+binding. Task roles are refused. These reads use the retained session, including
+uncommitted SQL changes and native begin/commit/rollback controls.
+
+```json
+{"typedRead":{"table":"app","projection":[
+  {"expression":{"aggregate":{"function":"count_star"}},"alias":"n"}
+]}}
+```
+
+Column expressions use `{"column":{"name":"id","source":"a"}}` (source is
+optional). Other scalar arms are `literal` (the existing Value profile) and
+`aggregate`: `count_star` has no column; `count`, `sum`, `min`, `max`, `avg`
+require a column object. Predicates use `compare` (left/comparison/right with
+existing NATIVE_COMPARISON enums), `isNull` (expression/negated), `notExpr`,
+`andExpr` and `orExpr` (left/right). The OpenAPI schema describes all fields.
+Single-source groupBy accepts unqualified columns; join groupBy accepts scalar
+expressions. Each expression tree has depth at most 24; total nodes at most
+4096; projection/groupBy/orderBy each at most 64. Projection must be nonempty.
+
+Add `join: {"table":"other","leftAlias":"a","rightAlias":"b","left":true,
+"on":{"compare":{"left":{"column":{"source":"a","name":"id"}},
+"comparison":"NATIVE_COMPARISON_EQ","right":{"column":{"source":"b","name":"id"}}}}}`
+inside typedRead for a LEFT JOIN (`left:false` selects INNER JOIN).
+`orderBy` entries require expression and descending, with optional nullsFirst;
+`limit` is a canonical signed 64-bit decimal string. Results use
+`operationOutcome` columns/rows (matched=row count, affected=changed=0,
+complete=true). Binding/execution failures use nativeError kind SQL with the underlying SQLSTATE.
+Malformed shapes return HTTP 400/gRPC InvalidArgument before leasing the
+session; an execution failure aborts an open transaction.

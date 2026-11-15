@@ -10,6 +10,28 @@ pub(crate) enum NativeResult {
     Error(ops::Error),
 }
 
+fn read_tables(invocation: &Invocation) -> Vec<String> {
+    match invocation {
+        Invocation::Read(r) => vec![r.table.clone()],
+        Invocation::Join(r) => vec![r.left.table.clone(), r.right.table.clone()],
+        _ => vec![],
+    }
+}
+fn read_outcome(result: Result<giggles_core::relational::SqlResult, CoreError>) -> Result<NativeResult, CoreError> {
+    let result = match result {
+        Ok(result) => result,
+        Err(error @ CoreError::Sql(_)) => {
+            giggles_core::cancellation::check()?;
+            return Ok(NativeResult::Error(ops::Error::Sql { sqlstate: crate::sqlstate(&error).into() }));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(NativeResult::Operation(ops::Outcome {
+        matched: result.rows.len(), columns: result.columns, rows: result.rows,
+        ..ops::Outcome::default()
+    }))
+}
+
 fn authorize_request(
     request: &ops::Request,
     tables: &std::collections::BTreeSet<String>,
@@ -119,6 +141,8 @@ pub(crate) fn run(
         if matches!(&session.role, Role::Database { .. }) {
             let mut reqs = Vec::new();
             match &invocation {
+                Invocation::Read(_) | Invocation::Join(_) => reqs.extend(read_tables(&invocation)
+                    .into_iter().map(|t| (t, giggles_core::roles::TablePrivilege::Select))),
                 Invocation::Operation { request, .. } => reqs.extend(table_requirements(request)?),
                 Invocation::Transaction { transaction, .. } => {
                     if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
@@ -143,6 +167,13 @@ pub(crate) fn run(
         // Traverse all targets before consulting any catalog or executing an
         // earlier block step. Expressions cannot introduce additional tables.
         match &invocation {
+            Invocation::Read(_) | Invocation::Join(_) => {
+                for table in read_tables(&invocation) {
+                    if table == "giggles_join" || !tables.contains(&table) {
+                        return Err(CoreError::Policy(Error::Scope));
+                    }
+                }
+            }
             Invocation::Operation { request, .. } => authorize_request(request, tables)?,
             Invocation::Transaction { transaction, .. } => {
                 if transaction.steps.len() > ops::MAX_TRANSACTION_ITEMS {
@@ -167,6 +198,8 @@ pub(crate) fn run(
             return Err(CoreError::Sql(SqlError::Aborted));
         }
         let result = match invocation {
+            Invocation::Read(read) => return read_outcome(session.sql.execute_typed_read(*read, None)),
+            Invocation::Join(read) => return read_outcome(session.sql.execute_typed_join(*read, None)),
             Invocation::Operation { request, bindings } => session
                 .sql
                 .execute_native(&request, &bindings)

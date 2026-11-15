@@ -53,6 +53,7 @@ fn descriptor_publishes_only_the_three_v1_methods() {
             ("commit", 10),
             ("rollback", 11),
             ("text", 12),
+            ("typed_read", 13),
             ("budget_ms", 20)
         ]
     );

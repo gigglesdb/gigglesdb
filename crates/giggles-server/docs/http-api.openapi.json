@@ -337,6 +337,11 @@
                 "$ref": "#/components/schemas/ExecuteRequest"
               },
               "examples": {
+                "typedAggregate": {
+                  "value": {"typedRead": {"table": "app", "projection": [
+                    {"expression": {"aggregate": {"function": "count_star"}}, "alias": "n"}
+                  ]}}
+                },
                 "ping": {
                   "value": {
                     "ping": {}
@@ -1712,7 +1717,8 @@
           },
           "text": {
             "$ref": "#/components/schemas/NativeTextRequest"
-          }
+          },
+          "typedRead": {"$ref": "#/components/schemas/NativeTypedRead"}
         },
         "additionalProperties": false,
         "oneOf": [
@@ -1773,7 +1779,8 @@
           },
           {
             "required": ["text"]
-          }
+          },
+          {"required": ["typedRead"]}
         ],
         "description": "Exactly one request alternative. Duplicate keys, aliases, unknown fields, JSON null, trailing documents and nesting deeper than 128 are rejected by the parser. Raw UTF-8 body limit is 262144 bytes including whitespace. Native request trees are typed directly into the core operation engine; SQL is a separate optional arm. Semantic core failures use nativeError in a successful HTTP 200 reply."
       },
@@ -1943,6 +1950,85 @@
           "request"
         ],
         "x-max-binding-value-bytes": 65536
+      },
+      "NativeTypedRead": {
+        "type": "object", "additionalProperties": false,
+        "required": ["table", "projection"],
+        "description": "Exact source identifiers, authorized for SELECT before binding. Uses the retained SQL session and returns operationOutcome rows, matched=row count, affected=changed=0, complete=true. At most 4096 expression nodes, depth 24 (root=0). Scalar positions accept column/literal/aggregate; predicate positions accept compare/isNull/notExpr/andExpr/orExpr. Single-source groupBy accepts unqualified columns only; joins accept typed scalar group expressions. Binding/execution errors use nativeError kind SQL with the underlying SQLSTATE, and abort an open transaction.",
+        "properties": {
+          "table": {"type": "string"},
+          "projection": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/components/schemas/NativeReadProjection"}},
+          "filter": {"$ref": "#/components/schemas/NativeReadExpr"},
+          "groupBy": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/NativeReadExpr"}},
+          "having": {"$ref": "#/components/schemas/NativeReadExpr"},
+          "orderBy": {"type": "array", "maxItems": 64, "items": {"$ref": "#/components/schemas/NativeReadOrder"}},
+          "limit": {"$ref": "#/components/schemas/Int64"},
+          "join": {"$ref": "#/components/schemas/NativeReadJoin"}
+        }
+      },
+      "NativeReadJoin": {
+        "type": "object", "additionalProperties": false,
+        "required": ["table", "leftAlias", "rightAlias", "left", "on"],
+        "properties": {
+          "table": {"type": "string"}, "leftAlias": {"type": "string"}, "rightAlias": {"type": "string"},
+          "left": {"type": "boolean", "description": "false=INNER JOIN, true=LEFT JOIN"},
+          "on": {"$ref": "#/components/schemas/NativeReadExpr"}
+        }
+      },
+      "NativeReadProjection": {
+        "type": "object", "additionalProperties": false, "required": ["expression"],
+        "properties": {"expression": {"$ref": "#/components/schemas/NativeReadExpr"}, "alias": {"type": "string"}}
+      },
+      "NativeReadOrder": {
+        "type": "object", "additionalProperties": false, "required": ["expression", "descending"],
+        "properties": {
+          "expression": {"$ref": "#/components/schemas/NativeReadExpr"}, "descending": {"type": "boolean"},
+          "nullsFirst": {"type": "boolean", "description": "Omitted defaults to descending (SQL default)."}
+        }
+      },
+      "NativeReadColumn": {
+        "type": "object", "additionalProperties": false, "required": ["name"],
+        "properties": {"name": {"type": "string"}, "source": {"type": "string"}}
+      },
+      "NativeReadAggregate": {
+        "type": "object", "additionalProperties": false, "required": ["function"],
+        "properties": {
+          "function": {"enum": ["count_star", "count", "sum", "min", "max", "avg"]},
+          "column": {"$ref": "#/components/schemas/NativeReadColumn"}
+        },
+        "oneOf": [
+          {"properties": {"function": {"const": "count_star"}}, "not": {"required": ["column"]}},
+          {"properties": {"function": {"enum": ["count", "sum", "min", "max", "avg"]}}, "required": ["column"]}
+        ]
+      },
+      "NativeReadExpr": {
+        "type": "object", "additionalProperties": false, "minProperties": 1, "maxProperties": 1,
+        "properties": {
+          "column": {"$ref": "#/components/schemas/NativeReadColumn"},
+          "literal": {"$ref": "#/components/schemas/Value"},
+          "aggregate": {"$ref": "#/components/schemas/NativeReadAggregate"},
+          "compare": {"$ref": "#/components/schemas/NativeReadCompare"},
+          "isNull": {"$ref": "#/components/schemas/NativeReadNull"},
+          "notExpr": {"$ref": "#/components/schemas/NativeReadExpr"},
+          "andExpr": {"$ref": "#/components/schemas/NativeReadLogic"},
+          "orExpr": {"$ref": "#/components/schemas/NativeReadLogic"}
+        }
+      },
+      "NativeReadCompare": {
+        "type": "object", "additionalProperties": false, "required": ["left", "comparison", "right"],
+        "properties": {
+          "left": {"$ref": "#/components/schemas/NativeReadExpr"},
+          "comparison": {"$ref": "#/components/schemas/NativeComparison"},
+          "right": {"$ref": "#/components/schemas/NativeReadExpr"}
+        }
+      },
+      "NativeReadNull": {
+        "type": "object", "additionalProperties": false, "required": ["expression", "negated"],
+        "properties": {"expression": {"$ref": "#/components/schemas/NativeReadExpr"}, "negated": {"type": "boolean"}}
+      },
+      "NativeReadLogic": {
+        "type": "object", "additionalProperties": false, "required": ["left", "right"],
+        "properties": {"left": {"$ref": "#/components/schemas/NativeReadExpr"}, "right": {"$ref": "#/components/schemas/NativeReadExpr"}}
       },
       "NativeTextRequest": {
         "type": "object",

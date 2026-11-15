@@ -214,6 +214,7 @@ fn intent_shape(i: &p::NativeIntent) -> R<()> {
 }
 pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
     match input.request.as_ref() {
+        Some(p::execute_request::Request::TypedRead(v)) => read_shape(v)?,
         Some(p::execute_request::Request::Operation(v)) => {
             Shape::default().request(need(v.request.as_ref())?, 0)?;
             check_bindings(&v.bindings)?;
@@ -225,6 +226,112 @@ pub(crate) fn validate(input: &p::ExecuteRequest) -> R<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn read_shape(v: &p::NativeTypedRead) -> R<()> {
+    cap(v.projection.len(), 64)?;
+    cap(v.group_by.len(), 64)?;
+    cap(v.order_by.len(), 64)?;
+    let mut pending = Vec::new();
+    for e in v.projection.iter().filter_map(|p| p.expression.as_ref())
+        .chain(v.group_by.iter()).chain(v.order_by.iter().filter_map(|o| o.expression.as_ref()))
+        .chain(v.filter.iter()).chain(v.having.iter())
+        .chain(v.join.iter().filter_map(|j| j.on.as_ref())) {
+        pending.push((e, 0));
+    }
+    let mut nodes = 0;
+    while let Some((e, depth)) = pending.pop() {
+        nodes += 1;
+        cap(nodes + pending.len(), 4096)?;
+        cap(depth, MAX_EXPR_DEPTH)?;
+        use p::native_read_expr::Expression as E;
+        let mut push = |e| pending.push((e, depth + 1));
+        match need(e.expression.as_ref())? {
+            E::Compare(v) => { push(need(v.left.as_deref())?); push(need(v.right.as_deref())?); }
+            E::AndExpr(v) | E::OrExpr(v) => { push(need(v.left.as_deref())?); push(need(v.right.as_deref())?); }
+            E::IsNull(v) => push(need(v.expression.as_deref())?),
+            E::NotExpr(v) => push(v),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+fn read_expr(v: p::NativeReadExpr) -> R<giggles_core::relational::ReadExpr> {
+    use giggles_core::relational::{ReadAggregate as A, ReadExpr as E};
+    use p::native_read_expr::Expression as P;
+    Ok(match need(v.expression)? {
+        P::Literal(v) => E::Literal(codec::decode_value(v)?),
+        P::Column(v) => match v.source {
+            Some(source) => E::QualifiedColumn { source, column: need(v.name)? },
+            None => E::Column(need(v.name)?),
+        },
+        P::Aggregate(v) => {
+            let function = need(v.function)?;
+            if function == "count_star" {
+                if v.column.is_some() { return Err(ApiError::InvalidArgument); }
+                E::Aggregate(A::CountStar)
+            } else {
+                let column = need(v.column)?;
+                let name = need(column.name)?;
+                let aggregate = match function.as_str() {
+                    "count" => A::Count(name), "sum" => A::Sum(name), "min" => A::Min(name),
+                    "max" => A::Max(name), "avg" => A::Avg(name),
+                    _ => return Err(ApiError::InvalidArgument),
+                };
+                E::Aggregate(match column.source {
+                    Some(source) => A::Qualified { source, aggregate: Box::new(aggregate) },
+                    None => aggregate,
+                })
+            }
+        }
+        _ => return Err(ApiError::InvalidArgument),
+    })
+}
+fn read_predicate(v: p::NativeReadExpr) -> R<giggles_core::relational::ReadPredicate> {
+    use giggles_core::relational::{ReadCompare as C, ReadPredicate as P};
+    use p::native_read_expr::Expression as E;
+    let boxed = |v: Option<Box<p::NativeReadExpr>>| read_predicate(*need(v)?).map(Box::new);
+    Ok(match need(v.expression)? {
+        E::Compare(v) => P::Compare(read_expr(*need(v.left)?)?, match v.comparison {
+            1 => C::Eq, 2 => C::Ne, 3 => C::Lt, 4 => C::Le, 5 => C::Gt, 6 => C::Ge,
+            _ => return Err(ApiError::InvalidArgument),
+        }, read_expr(*need(v.right)?)?),
+        E::IsNull(v) => P::IsNull(read_expr(*need(v.expression)?)?, need(v.negated)?),
+        E::NotExpr(v) => P::Not(Box::new(read_predicate(*v)?)),
+        E::AndExpr(v) => P::And(boxed(v.left)?, boxed(v.right)?),
+        E::OrExpr(v) => P::Or(boxed(v.left)?, boxed(v.right)?),
+        _ => return Err(ApiError::InvalidArgument),
+    })
+}
+pub(crate) fn typed_read(v: p::NativeTypedRead) -> R<codec::Invocation> {
+    use giggles_core::relational as r;
+    let projection = list(v.projection, |p| Ok(r::ReadProjection {
+        expression: read_expr(need(p.expression)?)?, alias: p.alias,
+    }))?;
+    if projection.is_empty() { return Err(ApiError::InvalidArgument); }
+    let filter = v.filter.map(read_predicate).transpose()?;
+    let group_by = list(v.group_by, read_expr)?;
+    let mut clauses = r::ReadClauses {
+        having: v.having.map(read_predicate).transpose()?, limit: v.limit,
+        order_by: list(v.order_by, |o| Ok(r::ReadOrder {
+            expression: read_expr(need(o.expression)?)?, descending: need(o.descending)?,
+            nulls_first: o.nulls_first,
+        }))?, ..r::ReadClauses::default()
+    };
+    Ok(if let Some(j) = v.join {
+        codec::Invocation::Join(Box::new(r::TwoSourceRead {
+            left: r::ReadSource { table: need(v.table)?, alias: need(j.left_alias)? },
+            right: r::ReadSource { table: need(j.table)?, alias: need(j.right_alias)? },
+            kind: if need(j.left)? { r::ReadJoinKind::Left } else { r::ReadJoinKind::Inner },
+            on: read_predicate(need(j.on)?)?, group_by, projection, filter,
+        }.with_clauses(clauses)))
+    } else {
+        clauses.group_by = list(group_by, |e| match e {
+            r::ReadExpr::Column(c) => Ok(c), _ => Err(ApiError::InvalidArgument),
+        })?;
+        codec::Invocation::Read(Box::new(r::SingleSourceRead { table: need(v.table)?, projection, filter }
+            .with_clauses(clauses)))
+    })
 }
 fn check_bindings(values: &[p::NativeBinding]) -> R<()> {
     cap(values.len(), o::MAX_BINDINGS)?;

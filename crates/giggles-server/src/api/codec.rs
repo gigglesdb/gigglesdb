@@ -24,6 +24,8 @@ pub enum Invocation {
     Begin,
     Commit,
     Rollback,
+    Read(Box<giggles_core::relational::SingleSourceRead>),
+    Join(Box<giggles_core::relational::TwoSourceRead>),
 }
 
 impl Invocation {
@@ -71,6 +73,9 @@ pub fn decode_execute(input: proto::ExecuteRequest) -> Result<DecodedExecute, Ap
     use proto::execute_request::Request as P;
     let input = input.request.ok_or(ApiError::InvalidArgument)?;
     let request = match input {
+        P::TypedRead(v) => return Ok(DecodedExecute {
+            request: super::native_codec::typed_read(v)?, budget_ms,
+        }),
         P::Text(v) => {
             let language_version = v
                 .language_version

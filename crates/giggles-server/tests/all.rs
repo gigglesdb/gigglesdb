@@ -23,6 +23,7 @@ mod ambiguous_column_error;
 mod api_contract;
 #[path = "api_native.rs"]
 mod api_native;
+#[path = "api_typed_read.rs"] mod api_typed_read;
 #[path = "api_network.rs"]
 mod api_network;
 #[path = "api_process.rs"]

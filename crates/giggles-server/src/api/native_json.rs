@@ -163,6 +163,96 @@ pub(super) struct Decoder {
     wrappers: usize,
 }
 impl Decoder {
+    pub(super) fn typed_read(&mut self, v: Json) -> R<p::NativeTypedRead> {
+        let mut f = Object::new(v)?;
+        let table = Some(text(f.required("table")?)?);
+        let projection = items(f.optional("projection"), 64)?.into_iter().map(|v| {
+            let mut f = Object::new(v)?;
+            let expression = Some(self.read_expr(f.required("expression")?)?);
+            let alias = f.optional("alias").map(text).transpose()?;
+            f.finish()?;
+            Ok(p::NativeReadProjection { expression, alias })
+        }).collect::<R<_>>()?;
+        let filter = f.optional("filter").map(|v| self.read_expr(v)).transpose()?;
+        let group_by = items(f.optional("groupBy"), 64)?.into_iter()
+            .map(|v| self.read_expr(v)).collect::<R<_>>()?;
+        let having = f.optional("having").map(|v| self.read_expr(v)).transpose()?;
+        let order_by = items(f.optional("orderBy"), 64)?.into_iter().map(|v| {
+            let mut f = Object::new(v)?;
+            let expression = Some(self.read_expr(f.required("expression")?)?);
+            let descending = Some(boolean(f.required("descending")?)?);
+            let nulls_first = f.optional("nullsFirst").map(boolean).transpose()?;
+            f.finish()?;
+            Ok(p::NativeReadOrder { expression, descending, nulls_first })
+        }).collect::<R<_>>()?;
+        let limit = f.optional("limit").map(super::json::int).transpose()?;
+        let join = f.optional("join").map(|v| -> R<_> {
+            let mut f = Object::new(v)?;
+            let table = Some(text(f.required("table")?)?);
+            let left_alias = Some(text(f.required("leftAlias")?)?);
+            let right_alias = Some(text(f.required("rightAlias")?)?);
+            let left = Some(boolean(f.required("left")?)?);
+            let on = Some(self.read_expr(f.required("on")?)?);
+            f.finish()?;
+            Ok(p::NativeReadJoin { table, left_alias, right_alias, left, on })
+        }).transpose()?;
+        f.finish()?;
+        Ok(p::NativeTypedRead { table, projection, filter, group_by, having, order_by, limit, join })
+    }
+    fn read_column(&mut self, v: Json) -> R<p::NativeReadColumn> {
+        let mut f = Object::new(v)?;
+        let name = Some(text(f.required("name")?)?);
+        let source = f.optional("source").map(text).transpose()?;
+        f.finish()?;
+        Ok(p::NativeReadColumn { name, source })
+    }
+    fn read_expr(&mut self, v: Json) -> R<p::NativeReadExpr> {
+        if self.depth > super::native_codec::MAX_EXPR_DEPTH || self.nodes >= 4096 {
+            return Err(ApiError::InvalidArgument);
+        }
+        self.depth += 1;
+        self.nodes += 1;
+        let (kind, v) = Object::new(v)?.one()?;
+        use p::native_read_expr::Expression as E;
+        let expression = Some(match kind.as_str() {
+            "column" => E::Column(self.read_column(v)?),
+            "literal" => E::Literal(decode_value(v)?),
+            "aggregate" => {
+                let mut f = Object::new(v)?;
+                let function = Some(text(f.required("function")?)?);
+                let column = f.optional("column").map(|v| self.read_column(v)).transpose()?;
+                f.finish()?;
+                E::Aggregate(p::NativeReadAggregate { function, column })
+            }
+            "notExpr" => E::NotExpr(Box::new(self.read_expr(v)?)),
+            "isNull" => {
+                let mut f = Object::new(v)?;
+                let expression = Some(Box::new(self.read_expr(f.required("expression")?)?));
+                let negated = Some(boolean(f.required("negated")?)?);
+                f.finish()?;
+                E::IsNull(Box::new(p::NativeReadNull { expression, negated }))
+            }
+            "compare" | "andExpr" | "orExpr" => {
+                let mut f = Object::new(v)?;
+                let left = Some(Box::new(self.read_expr(f.required("left")?)?));
+                let right = Some(Box::new(self.read_expr(f.required("right")?)?));
+                let result = if kind == "compare" {
+                    let comparison = p::NativeComparison::from_str_name(&text(f.required("comparison")?)?)
+                        .ok_or(ApiError::InvalidArgument)? as i32;
+                    E::Compare(Box::new(p::NativeReadCompare { left, comparison, right }))
+                } else if kind == "andExpr" {
+                    E::AndExpr(Box::new(p::NativeReadLogic { left, right }))
+                } else {
+                    E::OrExpr(Box::new(p::NativeReadLogic { left, right }))
+                };
+                f.finish()?;
+                result
+            }
+            _ => return Err(ApiError::InvalidArgument),
+        });
+        self.depth -= 1;
+        Ok(p::NativeReadExpr { expression })
+    }
     pub(super) fn begin_request(&mut self, v: Json) -> R<p::BeginRequest> {
         empty(v)?;
         Ok(p::BeginRequest {})
