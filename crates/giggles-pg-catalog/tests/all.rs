@@ -121,3 +121,5 @@ mod rails_columns;
 mod rails_indexes;
 
 #[path = "view_presentation.rs"] mod view_presentation;
+#[path = "union_type_resolution.rs"]
+mod union_type_resolution;

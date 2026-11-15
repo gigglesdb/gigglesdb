@@ -372,7 +372,7 @@ impl Visitor for Scan {
         if is_catalog {
             self.catalog = true;
             self.explicit_catalog = true;
-        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="generate_subscripts" || n=="unnest" || n=="pg_available_extension_versions" || n=="pg_options_to_table" || self.ctes.contains(n))
+        } else if !matches!(p.as_slice(),[n] if n=="generate_series" || n=="generate_subscripts" || n=="unnest" || n=="aclexplode" || n=="pg_available_extension_versions" || n=="pg_options_to_table" || self.ctes.contains(n))
         {
             self.user = true
         }
@@ -926,15 +926,19 @@ impl Compiler {
             };
             // Borrow each subtree: cloning the remaining left-deep chain at
             // every UNION node would use quadratic AST memory.
-            let l = self.query_body(left, None, None, outer)?;
-            let r = self.query_body(right, None, None, outer)?;
-            if l.fields.len() != r.fields.len()
-                || l.fields
-                    .iter()
-                    .zip(&r.fields)
-                    .any(|(l, r)| l.data_type != r.data_type)
-            {
+            let mut l = self.query_body(left, None, None, outer)?;
+            let mut r = self.query_body(right, None, None, outer)?;
+            if l.fields.len() != r.fields.len() {
                 return Err(Error::Type);
+            }
+            // Resolve each binary UNION before its parent: an all-unknown
+            // inner UNION becomes text, just as in PostgreSQL.
+            for i in 0..l.fields.len() {
+                let ty = union_type(&l.projection[i], &r.projection[i])?;
+                for arm in [&mut l, &mut r] {
+                    union_coerce(&mut arm.projection[i], ty)?;
+                    arm.fields[i].data_type = ty;
+                }
             }
             let fields = l.fields.clone();
             let projection = fields
@@ -1483,6 +1487,32 @@ impl Compiler {
             aggregate,
         })
     }
+    fn acl_source(&mut self, args: &[a::FunctionArg], outer: &Schema) -> R<(Source, Vec<Field>)> {
+        if args.len() != 1 {
+            return Err(Error::Unsupported);
+        }
+        let mut args = self.args(args, outer)?;
+        expect(&mut args[0], PgType::AclItemArray)?;
+        no_set_or_window(&args[0])?;
+        Ok((
+            Source::Unnest(
+                E {
+                    kind: K::Call("_aclexplode".into(), args),
+                    ty: PgType::AnyArray,
+                },
+                false,
+            ),
+            [
+                ("grantor", PgType::Oid),
+                ("grantee", PgType::Oid),
+                ("privilege_type", PgType::Text),
+                ("is_grantable", PgType::Bool),
+            ]
+            .into_iter()
+            .map(|(name, data_type)| Field { name: name.into(), data_type })
+            .collect(),
+        ))
+    }
     fn table(&mut self, t: &a::TableFactor, outer: &Schema) -> R<(Source, Schema)> {
         if let a::TableFactor::NestedJoin { table_with_joins: from, alias: None } = t {
             let (mut source, mut schema) = self.table(&from.relation, outer)?;
@@ -1519,6 +1549,16 @@ impl Compiler {
             return Err(Error::Limit);
         }
         let (source, fields, alias, default) = match t {
+            a::TableFactor::Function { name, args, alias, .. } => {
+                let p = object(name);
+                if !matches!(p.as_slice(), [n] if n == "aclexplode")
+                    && !matches!(p.as_slice(), [ns, n] if ns == "pg_catalog" && n == "aclexplode")
+                {
+                    return Err(Error::Unsupported);
+                }
+                let (source, fields) = self.acl_source(args, outer)?;
+                (source, fields, alias, "aclexplode".into())
+            }
             a::TableFactor::Table {
                 name,
                 alias,
@@ -1572,7 +1612,10 @@ impl Compiler {
                     );
                 }
                 if let Some(args) = args {
-                    if n == "pg_available_extension_versions"
+                    if n == "aclexplode" && args.settings.is_none() {
+                        let (source, fields) = self.acl_source(&args.args, outer)?;
+                        (source, fields, alias, n)
+                    } else if n == "pg_available_extension_versions"
                         && args.args.is_empty()
                         && args.settings.is_none()
                     {
@@ -2931,6 +2974,44 @@ fn coerce(e: &mut E, t: PgType) -> R<()> {
     }
     Ok(())
 }
+// Keep UNION's numeric promotion separate from the narrower integer-only
+// arithmetic and CASE profile. These are PostgreSQL's implicit widening edges.
+fn union_numeric_rank(t: PgType) -> Option<u8> {
+    Some(match t {
+        PgType::Int2 => 0,
+        PgType::Int4 => 1,
+        PgType::Int8 => 2,
+        PgType::Numeric => 3,
+        PgType::Float4 => 4,
+        PgType::Float8 => 5,
+        _ => return None,
+    })
+}
+fn union_type(l: &E, r: &E) -> R<PgType> {
+    if !unknown(l)
+        && !unknown(r)
+        && let (Some(a), Some(b)) = (union_numeric_rank(l.ty), union_numeric_rank(r.ty))
+    {
+        return Ok(if a >= b { l.ty } else { r.ty });
+    }
+    common_type([l, r].into_iter())
+}
+fn union_coerce(e: &mut E, ty: PgType) -> R<()> {
+    if !unknown(e)
+        && e.ty != ty
+        && let (Some(from), Some(to)) = (union_numeric_rank(e.ty), union_numeric_rank(ty))
+    {
+        if from > to {
+            return Err(Error::Type);
+        }
+        *e = E {
+            kind: K::Cast(Box::new(e.clone()), ty),
+            ty,
+        };
+        return Ok(());
+    }
+    coerce(e, ty)
+}
 fn check_expr(e: &mut E) -> R<()> {
     match &mut e.kind {
         K::Distinct(l, r, _) => compatible(l, r)?,
@@ -3530,7 +3611,19 @@ impl Runtime<'_> {
                     let mut bytes = 0;
                     for (i, v) in values.into_iter().enumerate() {
                         self.charge(1)?;
-                        let mut row = vec![v];
+                        // FROM aclexplode exposes the existing evaluator's four
+                        // record members as columns; ordinary unnest stays scalar.
+                        let mut row = if matches!(&e.kind, K::Call(n, _) if n == "_aclexplode") {
+                            let Value::Record(row) = v else {
+                                return Err(Error::Type);
+                            };
+                            if row.len() != 4 {
+                                return Err(Error::Type);
+                            }
+                            row
+                        } else {
+                            vec![v]
+                        };
                         if *ordinality {
                             row.push(Value::Int(i as i64 + 1));
                         }
@@ -5255,6 +5348,9 @@ fn cast(v: Value, t: PgType) -> R<Value> {
             let text = match v {
                 S(s) => s,
                 I(i) => i.to_string(),
+                Value::Numeric(n) => n.to_string(),
+                Value::Float4(f) => f64::from(f.value()).to_string(),
+                Value::Float8(f) => f.value().to_string(),
                 _ => return Err(Error::Type),
             };
             match t {
