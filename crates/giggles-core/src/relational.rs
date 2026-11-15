@@ -1974,6 +1974,57 @@ impl Prepared {
     pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Begin, domain, epoch)
     }
+    pub(crate) fn constraint_engine(request: &crate::operations::CatalogRequest, domain: u128, epoch: u64) -> R<Self> {
+        use crate::operations::{CatalogRequest as C, ConstraintSpec as S, ForeignKeyAction as F, Expr as E, ValueExpr, Compare};
+        let names = |columns: &[String]| -> R<()> {
+            if columns.is_empty() || columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
+            for name in columns { ident(name)?; }
+            Ok(())
+        };
+        let action = |a: F| match a { F::NoAction => catalog_ext::Action::NoAction, F::Restrict => catalog_ext::Action::Restrict, F::Cascade => catalog_ext::Action::Cascade, F::SetNull => catalog_ext::Action::SetNull, F::SetDefault => catalog_ext::Action::SetDefault };
+        let (table, action, parent) = match request {
+            C::AddConstraint { table, name, constraint } => {
+                let mut parent_ref = None;
+                let definition = match constraint {
+                    S::Unique { columns } => { names(columns)?; constraints::Definition::Unique { name: name.clone(), columns: columns.clone() } }
+                    S::Check { expression } => {
+                        let E::Compare(left, op, right) = expression else { return Err(SqlError::Unsupported); };
+                        let (E::Field(column), E::Value(ValueExpr::Literal(value))) = (&**left, &**right) else { return Err(SqlError::Unsupported); };
+                        ident(column)?;
+                        let mut tokens = vec![Token::QuotedIdent(column.clone()), Token::Op(match op { Compare::Eq => "=", Compare::Ne => "<>", Compare::Lt => "<", Compare::Le => "<=", Compare::Gt => ">", Compare::Ge => ">=" }.into())];
+                        let literal = match value {
+                            Value::Int(n) => { if *n < 0 { tokens.push(Token::Op("-".into())); } Token::Number(n.unsigned_abs().to_string()) }
+                            Value::Text(s) => Token::String(s.clone()),
+                            Value::Bool(b) => Token::Word(b.to_string()),
+                            Value::Null => Token::Word("null".into()),
+                            _ => return Err(SqlError::Unsupported),
+                        };
+                        tokens.push(literal);
+                        constraints::Definition::Check { name: name.clone(), expression: tokens, not_valid: false }
+                    }
+                    S::ForeignKey { columns, ref_table, ref_columns, on_delete, on_update } => {
+                        names(columns)?; ident(split_key(ref_table).0)?; ident(split_key(ref_table).1)?;
+                        if let Some(columns) = ref_columns { names(columns)?; }
+                        parent_ref = Some(ref_table.clone());
+                        constraints::Definition::ForeignKey { name: name.clone(), columns: columns.clone(), parent: ref_table.clone(), resolution_error: None, references: ref_columns.clone().unwrap_or_default(), on_delete: action(*on_delete), on_update: action(*on_update), not_valid: false, deferral: Deferral::NotDeferrable }
+                    }
+                };
+                (table, alter_table::Action::Constraint(definition), parent_ref)
+            }
+            C::DropConstraint { table, name, cascade } => {
+                // SQL currently rejects the trailing CASCADE token (42601).
+                // Known gap: J:/gigglesdb-work/r2/r2-33/design.md, pending DD-0068.
+                if *cascade { return Err(SqlError::Syntax); }
+                (table, alter_table::Action::DropConstraint(name.clone(), false), None)
+            }
+            _ => return Err(SqlError::Unsupported),
+        };
+        ident(split_key(table).0)?; ident(split_key(table).1)?;
+        let mut prepared = Self::engine(Statement::AlterTable(alter_table::AlterTable { table: table.clone(), actions: vec![action], resolution_error: None }), domain, epoch);
+        prepared.relations.push(schemas::Reference::read(table.clone(), None));
+        if let Some(parent) = parent { prepared.relations.push(schemas::Reference::read(parent, None)); }
+        Ok(prepared)
+    }
     pub(crate) fn commit_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Commit, domain, epoch)
     }

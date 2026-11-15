@@ -2529,6 +2529,22 @@ impl SqlSession {
         )
         .map(|_| ())
     }
+    /// Typed constraints use SQL's DDL executor and the caller's transaction decision.
+    pub(crate) fn constraint_catalog_engine(&mut self, request: &crate::operations::CatalogRequest) -> Result<relational::TableDef, CoreError> {
+        let result = (|| {
+            let (domain, epoch) = self.snapshot_identity_engine()?;
+            let mut prepared = relational::Prepared::constraint_engine(request, domain, if self.is_v2_engine() { 0 } else { epoch }).map_err(CoreError::Sql)?;
+            prepared.transaction = self.transaction_id;
+            self.execute_bound_engine(&prepared, &[], None)?;
+            let (crate::operations::CatalogRequest::AddConstraint { table, .. } | crate::operations::CatalogRequest::DropConstraint { table, .. }) = request else { unreachable!() };
+            self.inspect_metadata(|s| {
+                let key = s.sql.resolve_relation_key(table, &self.search_path);
+                s.sql.tables.get(&key).cloned().ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+            })
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     /// Typed drops use SQL's DDL executor and the caller's transaction decision.
     pub(crate) fn drop_catalog_engine(&mut self, name: String, cascade: bool, index: bool) -> Result<(relational::TableDef, Option<u64>), CoreError> {
         let result = (|| {

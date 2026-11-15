@@ -3,6 +3,18 @@ use super::*;
 mod unique;
 pub use unique::*;
 
+/// Named constraints share SQL's immediate validation and referential actions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ConstraintSpec {
+    Unique { columns: Vec<String> },
+    /// Currently bounded to a column compared with an int, text, bool or NULL literal.
+    Check { expression: Expr },
+    ForeignKey { columns: Vec<String>, ref_table: String, ref_columns: Option<Vec<String>>, on_delete: ForeignKeyAction, on_update: ForeignKeyAction },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignKeyAction { NoAction, Restrict, Cascade, SetNull, SetDefault }
+
 /// An unallocated column definition. Stable IDs are assigned only by execution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnSpec {
@@ -41,6 +53,8 @@ pub enum CatalogRequest {
     DropTable { table: String, cascade: bool },
     DropIndex { name: String, cascade: bool },
     AlterTable { table: String, action: AlterTableAction },
+    AddConstraint { table: String, name: Option<String>, constraint: ConstraintSpec },
+    DropConstraint { table: String, name: String, cascade: bool },
 }
 // Preserve the legacy CreateTable decoder while requiring exact new catalog
 // requests. Unknown options must never disappear during raw request decoding.
@@ -63,6 +77,12 @@ impl<'de> Deserialize<'de> for CatalogRequest {
         #[serde(deny_unknown_fields)]
         struct AlterTable { table: String, action: AlterTableAction }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AddConstraint { table: String, name: Option<String>, constraint: ConstraintSpec }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DropConstraint { table: String, name: String, cascade: bool }
+        #[derive(Deserialize)]
         enum Wire {
             CreateTable {
                 table: String,
@@ -73,9 +93,13 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             DropTable(DropTable),
             DropIndex(DropIndex),
             AlterTable(AlterTable),
+            AddConstraint(AddConstraint),
+            DropConstraint(DropConstraint),
         }
         Ok(match Wire::deserialize(d)? {
             Wire::AlterTable(AlterTable { table, action }) => Self::AlterTable { table, action },
+            Wire::AddConstraint(AddConstraint { table, name, constraint }) => Self::AddConstraint { table, name, constraint },
+            Wire::DropConstraint(DropConstraint { table, name, cascade }) => Self::DropConstraint { table, name, cascade },
             Wire::DropTable(DropTable { table, cascade }) => Self::DropTable { table, cascade },
             Wire::DropIndex(DropIndex { name, cascade }) => Self::DropIndex { name, cascade },
             Wire::CreateTable {
@@ -144,6 +168,21 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
         })
         .collect()
 }
+fn constraint_relation_keys(request: &CatalogRequest) -> CatalogRequest {
+    let mut request = request.clone();
+    match &mut request {
+        CatalogRequest::AddConstraint { table, constraint, .. } => {
+            *table = native_relation_key(table);
+            if let ConstraintSpec::ForeignKey { ref_table, .. } = constraint {
+                *ref_table = native_relation_key(ref_table);
+            }
+        }
+        CatalogRequest::DropConstraint { table, .. } => *table = native_relation_key(table),
+        _ => (),
+    }
+    request
+}
+
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
     if let CatalogRequest::AlterTable { table, action } = request {
         let names = match action {
@@ -156,6 +195,33 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
             return Err(Error::Bind("identifier".into()));
         }
         return validate_size(request);
+    }
+    if let CatalogRequest::AddConstraint { table, .. } | CatalogRequest::DropConstraint { table, .. } = request {
+        let name = match request { CatalogRequest::AddConstraint { name, .. } => name.as_deref(), CatalogRequest::DropConstraint { name, .. } => Some(name.as_str()), _ => unreachable!() };
+        if !relation_identifier(table) || name.is_some_and(|n| !identifier(n)) { return Err(Error::Bind("identifier".into())); }
+        if let CatalogRequest::AddConstraint { constraint, .. } = request {
+            let check_columns = |columns: &[String]| -> Result<()> {
+                if columns.is_empty() || columns.len() > crate::relational::MAX_COLUMNS { return Err(Error::Limit); }
+                if columns.iter().any(|n| !identifier(n)) { return Err(Error::Bind("identifier".into())); }
+                Ok(())
+            };
+            match constraint {
+                ConstraintSpec::Unique { columns } => check_columns(columns)?,
+                ConstraintSpec::ForeignKey { columns, ref_table, ref_columns, .. } => {
+                    check_columns(columns)?;
+                    if !relation_identifier(ref_table) { return Err(Error::Bind("identifier".into())); }
+                    if let Some(columns) = ref_columns { check_columns(columns)?; }
+                }
+                ConstraintSpec::Check { expression } => {
+                    let Expr::Compare(left, _, right) = expression else { return Err(Error::Unsupported); };
+                    let (Expr::Field(column), Expr::Value(ValueExpr::Literal(Value::Int(_) | Value::Bool(_) | Value::Text(_) | Value::Null))) = (&**left, &**right) else { return Err(Error::Unsupported); };
+                    if !identifier(column) { return Err(Error::Bind("identifier".into())); }
+                }
+            }
+        }
+        validate_size(request)?;
+        crate::relational::Prepared::constraint_engine(&constraint_relation_keys(request), 0, 0).map_err(|e| core(CoreError::Sql(e)))?;
+        return Ok(());
     }
     if let CatalogRequest::DropTable { table: name, .. } | CatalogRequest::DropIndex { name, .. } = request {
         if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
@@ -227,7 +293,7 @@ fn bind_catalog(
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
     let (_, tables) = session.catalog_engine().map_err(core)?;
-    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. }) {
+    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. } | CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
         return Ok(BoundCatalogOperation {
             description: BoundCatalogDescription {
                 contract_version: ENGINE_CONTRACT_VERSION,
@@ -352,6 +418,11 @@ impl Engine {
             let prepared = bind(&mut session)?;
             if !session.catalog_empty_engine().map_err(core)? {
                 return Err(Error::PlanRequired);
+            }
+            if matches!(&prepared.description.request, CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
+                let table = session.constraint_catalog_engine(&constraint_relation_keys(&prepared.description.request)).map_err(core)?;
+                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
             }
             if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = &prepared.description.request {
                 let is_index = matches!(prepared.description.request, CatalogRequest::DropIndex { .. });

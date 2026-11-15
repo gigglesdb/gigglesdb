@@ -420,3 +420,4 @@ mod alter_drop_column_views;
 
 #[path = "native_alter_table.rs"]
 mod native_alter_table;
+#[path = "native_constraints.rs"] mod native_constraints;
