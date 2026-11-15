@@ -2475,6 +2475,40 @@ impl SqlSession {
         )
         .map(|_| ())
     }
+    /// Typed drops use SQL's DDL executor and the caller's transaction decision.
+    pub(crate) fn drop_catalog_engine(&mut self, name: String, cascade: bool, index: bool) -> Result<(relational::TableDef, Option<u64>), CoreError> {
+        let result = (|| {
+            let (domain, epoch) = self.snapshot_identity_engine()?;
+            // Resolve against the same private catalog/search path as SQL, not
+            // presentation metadata (which strips index schema names).
+            let (before, index_id) = self.inspect_metadata(|s| {
+                let key = s.sql.resolve_relation_key(&name, &self.search_path);
+                let descriptor = s.sql.secondary_descriptors_engine().iter().find(|d| index && d.name == key);
+                let table = if index {
+                    descriptor.and_then(|d| s.sql.tables.values().find(|t| t.id == d.table))
+                } else { s.sql.tables.get(&key) };
+                Ok((table.cloned(), descriptor.map(|d| d.id)))
+            })?;
+            // V2 Prepared uses epoch zero; the outer catalog intent checks the
+            // actual snapshot fence before entering this shared SQL path.
+            let epoch = if self.is_v2_engine() { 0 } else { epoch };
+            let mut prepared = if index {
+                relational::Prepared::drop_index_engine(name, cascade, domain, epoch)
+            } else {
+                relational::Prepared::drop_table_engine(name, cascade, domain, epoch)
+            }.map_err(CoreError::Sql)?;
+            prepared.transaction = self.transaction_id;
+            self.execute_bound_engine(&prepared, &[], None)?;
+            let mut table = before.ok_or(CoreError::Sql(relational::SqlError::UnknownTable))?;
+            if index {
+                table = self.catalog_engine()?.1.into_iter().find(|t| t.id == table.id)
+                    .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))?;
+            }
+            Ok((table, index_id))
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     /// Identity for binding against an active transaction's catalog snapshot.
     pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
         let result = (|| {

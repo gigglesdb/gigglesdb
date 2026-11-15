@@ -32,6 +32,8 @@ mod constraint_restrict_error;
 mod copy_ingest;
 #[path = "differential.rs"]
 mod differential;
+#[path = "drop_index_options.rs"]
+mod drop_index_options;
 #[path = "e2_assignment_numeric_char.rs"]
 mod e2_assignment_numeric_char;
 #[path = "e2_known_gap_bpchar.rs"]

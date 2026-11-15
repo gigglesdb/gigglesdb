@@ -23,8 +23,10 @@ pub enum CatalogRequest {
         name: String,
         columns: Vec<String>,
     },
+    DropTable { table: String, cascade: bool },
+    DropIndex { name: String, cascade: bool },
 }
-// Preserve the legacy CreateTable decoder while requiring exact new index
+// Preserve the legacy CreateTable decoder while requiring exact new catalog
 // requests. Unknown options must never disappear during raw request decoding.
 impl<'de> Deserialize<'de> for CatalogRequest {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -36,6 +38,12 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             columns: Vec<String>,
         }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DropTable { table: String, cascade: bool }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DropIndex { name: String, cascade: bool }
+        #[derive(Deserialize)]
         enum Wire {
             CreateTable {
                 table: String,
@@ -43,8 +51,12 @@ impl<'de> Deserialize<'de> for CatalogRequest {
                 primary_key: Vec<String>,
             },
             CreateIndex(Index),
+            DropTable(DropTable),
+            DropIndex(DropIndex),
         }
         Ok(match Wire::deserialize(d)? {
+            Wire::DropTable(DropTable { table, cascade }) => Self::DropTable { table, cascade },
+            Wire::DropIndex(DropIndex { name, cascade }) => Self::DropIndex { name, cascade },
             Wire::CreateTable {
                 table,
                 columns,
@@ -66,6 +78,8 @@ impl<'de> Deserialize<'de> for CatalogRequest {
         })
     }
 }
+/// DROP TABLE returns the table's preimage and no index ID. DROP INDEX returns
+/// its owning table's postimage and the dropped index ID; creates return postimages.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogOutcome {
     pub catalog_epoch: u64,
@@ -110,6 +124,10 @@ fn columns_for_create(columns: &[ColumnSpec]) -> Vec<ColumnDef> {
         .collect()
 }
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
+    if let CatalogRequest::DropTable { table: name, .. } | CatalogRequest::DropIndex { name, .. } = request {
+        if !identifier(name) { return Err(Error::Bind("identifier".into())); }
+        return validate_size(request);
+    }
     if let CatalogRequest::CreateIndex {
         table,
         name,
@@ -176,6 +194,16 @@ fn bind_catalog(
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
     let (_, tables) = session.catalog_engine().map_err(core)?;
+    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. }) {
+        return Ok(BoundCatalogOperation {
+            description: BoundCatalogDescription {
+                contract_version: ENGINE_CONTRACT_VERSION,
+                database_domain,
+                catalog_epoch,
+                request: request.clone(),
+            },
+        });
+    }
     if let CatalogRequest::CreateIndex { table, columns, .. } = request {
         let table = tables
             .iter()
@@ -236,7 +264,7 @@ fn bind_catalog(
     })
 }
 impl Engine {
-    /// Execute a safe create in one fresh snapshot and one commit decision.
+    /// Execute a catalog intent in one fresh snapshot and one commit decision.
     pub fn execute_catalog(&self, request: &CatalogRequest) -> Result<CatalogOutcome> {
         validate_catalog_request(request)?;
         self.execute_catalog_plan(|session| bind_catalog(session, request))
@@ -291,6 +319,12 @@ impl Engine {
             let prepared = bind(&mut session)?;
             if !session.catalog_empty_engine().map_err(core)? {
                 return Err(Error::PlanRequired);
+            }
+            if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = &prepared.description.request {
+                let is_index = matches!(prepared.description.request, CatalogRequest::DropIndex { .. });
+                let (table, index_id) = session.drop_catalog_engine(name.clone(), *cascade, is_index).map_err(core)?;
+                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+                return Ok(CatalogOutcome { catalog_epoch, table, index_id });
             }
             let index_id;
             let table_name;

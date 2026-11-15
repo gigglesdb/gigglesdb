@@ -283,6 +283,11 @@ pub(crate) fn validate_catalog(
     statement: &CatalogStatement,
     version: LanguageVersion,
 ) -> Result<()> {
+    if let CatalogStatement::DropTable { table: name, .. } | CatalogStatement::DropIndex { name, .. } = statement {
+        if version != LanguageVersion::Embedded017 { return Err(Error::Unsupported); }
+        if !parser::semantic_identifier(name, version) { return Err(Error::Bind("identifier".into())); }
+        return validate_size(statement);
+    }
     if let CatalogStatement::CreateIndex {
         table,
         name,
@@ -317,7 +322,7 @@ pub(crate) fn validate_catalog(
     {
         return Err(Error::Limit);
     }
-    if version != LanguageVersion::Embedded016
+    if !matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
         && columns.iter().any(|column| column.data_type == CatalogType::Numeric)
     {
         return Err(Error::Unsupported);
@@ -344,6 +349,11 @@ fn lower_catalog_checked(
         return Err(Error::Unsupported);
     }
     validate_catalog(statement, version)?;
+    match statement {
+        CatalogStatement::DropTable { table, cascade } => return Ok(operations::CatalogRequest::DropTable { table: table.clone(), cascade: *cascade }),
+        CatalogStatement::DropIndex { name, cascade } => return Ok(operations::CatalogRequest::DropIndex { name: name.clone(), cascade: *cascade }),
+        _ => {}
+    }
     if let CatalogStatement::CreateIndex {
         table,
         name,
@@ -1306,7 +1316,7 @@ fn validate_parameter_admission(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);
@@ -1399,7 +1409,7 @@ fn validate_transaction_parameters(
     bindings: &Bindings,
     version: LanguageVersion,
 ) -> Result<()> {
-    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016)
+    if !matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017)
         || !bindings.values().any(|v| matches!(v, Value::Numeric(_)))
     {
         return validate_numeric_bindings(bindings);

@@ -7,6 +7,177 @@ fn directory() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("giggles-v2-{:032x}", u128::from_be_bytes(nonce)))
 }
 #[test]
+fn native_catalog_drop_decode() {
+    use crate::operations::CatalogRequest;
+    for (kind, field) in [("DropTable", "table"), ("DropIndex", "name")] {
+        let value = serde_json::json!({kind: {field: "items", "cascade": false}});
+        let request: CatalogRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for extra in ["if_exists", "optional", "concurrently", "unknown"] {
+            let mut invalid = value.clone();
+            invalid[kind][extra] = true.into();
+            assert!(serde_json::from_value::<CatalogRequest>(invalid).is_err());
+        }
+        let mut invalid = value;
+        invalid[kind].as_object_mut().unwrap().remove("cascade");
+        assert!(serde_json::from_value::<CatalogRequest>(invalid).is_err());
+    }
+}
+
+#[test]
+fn native_catalog_drops_match_sql() {
+    use crate::operations::{CatalogRequest, Engine as Native, Error};
+    use relational::with_sql_parser_forbidden;
+    for backend in [Engine::Legacy, Engine::V2] {
+        if backend == Engine::V2 && !cfg!(feature = "engine-rocksdb") { continue; }
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
+        let native = Native::new(admin.clone());
+        let mut sql = admin.sql_session();
+        for ddl in ["CREATE TABLE parent(id BIGINT PRIMARY KEY, u BIGINT CONSTRAINT parent_uq UNIQUE)",
+            "CREATE TABLE child(id BIGINT PRIMARY KEY, pid BIGINT REFERENCES parent(id))",
+            "CREATE INDEX parent_idx ON parent(id)",
+            "CREATE UNIQUE INDEX parent_unique_idx ON parent(id)"] {
+            sql.execute(ddl, &[], None).unwrap();
+        }
+        if backend == Engine::V2 {
+            sql.execute("INSERT INTO parent(id) VALUES(1)", &[], None).unwrap();
+            sql.execute("INSERT INTO child VALUES(1,1)", &[], None).unwrap();
+        }
+        for (request, text, sqlstate) in [
+            (CatalogRequest::DropTable { table: "parent".into(), cascade: false }, "DROP TABLE parent RESTRICT", "2BP01"),
+            (CatalogRequest::DropTable { table: "missing".into(), cascade: false }, "DROP TABLE missing", "42P01"),
+            (CatalogRequest::DropIndex { name: "missing".into(), cascade: false }, "DROP INDEX missing", "42704"),
+            (CatalogRequest::DropIndex { name: "parent_pkey".into(), cascade: false }, "DROP INDEX parent_pkey RESTRICT", "2BP01"),
+            (CatalogRequest::DropIndex { name: "parent_pkey".into(), cascade: true }, "DROP INDEX parent_pkey CASCADE", "2BP01"),
+            (CatalogRequest::DropIndex { name: "parent_uq".into(), cascade: false }, "DROP INDEX parent_uq RESTRICT", "2BP01"),
+            (CatalogRequest::DropIndex { name: "parent_uq".into(), cascade: true }, "DROP INDEX parent_uq CASCADE", "2BP01"),
+            (CatalogRequest::DropIndex { name: "parent_unique_idx".into(), cascade: true }, "DROP INDEX parent_unique_idx CASCADE", "0A000"),
+        ] {
+            let before = admin.catalog().unwrap();
+            let error = sql.execute(text, &[], None).unwrap_err();
+            assert_eq!(crate::sqlstate(&error), sqlstate, "{text}");
+            let native_error = with_sql_parser_forbidden(|| native.execute_catalog(&request)).unwrap_err();
+            assert_eq!(native_error.sqlstate(), Some(crate::sqlstate(&error)), "{text}");
+            assert_eq!(admin.catalog().unwrap(), before);
+        }
+        let preimage = admin.catalog().unwrap().1.into_iter().find(|t| t.name == "parent").unwrap();
+        let index_id = sql.catalog_metadata().unwrap().indexes.iter().find(|i| i.name == "parent_idx").unwrap().id;
+        with_sql_parser_forbidden(|| {
+            sql.begin_engine().unwrap();
+            sql.drop_catalog_engine("parent_idx".into(), false, true).unwrap();
+            sql.drop_catalog_engine("parent".into(), true, false).unwrap();
+            assert!(!sql.catalog_engine().unwrap().1.iter().any(|t| t.name == "parent"));
+            sql.rollback();
+            assert_eq!(sql.catalog_engine().unwrap().1.iter().find(|t| t.name == "parent"), Some(&preimage));
+            assert_eq!(sql.catalog_metadata().unwrap().presentation.constraints.iter().filter(|c| c.kind == 'f').count(), 1);
+            let drop_index = CatalogRequest::DropIndex { name: "parent_idx".into(), cascade: true };
+            let bound = native.prepare_catalog_bound(&drop_index).unwrap();
+            let outcome = native.execute_catalog_bound(&bound).unwrap();
+            assert_eq!(outcome.index_id, Some(index_id));
+            assert_eq!(outcome.table, preimage);
+            assert!(outcome.catalog_epoch > bound.description().catalog_epoch);
+            assert_eq!(native.execute_catalog_bound(&bound).unwrap_err().sqlstate(), Some("0A000"));
+            native.execute_catalog(&CatalogRequest::DropIndex { name: "parent_unique_idx".into(), cascade: false }).unwrap();
+            native.execute_catalog(&CatalogRequest::CreateIndex { table: "parent".into(), name: "automatic_idx".into(), columns: vec!["id".into()] }).unwrap();
+            let request = CatalogRequest::DropTable { table: "parent".into(), cascade: true };
+            let bound = native.prepare_catalog_bound(&request).unwrap();
+            let outcome = native.execute_catalog_bound(&bound).unwrap();
+            assert_eq!(outcome.table, preimage);
+            assert_eq!(outcome.index_id, None);
+            assert!(outcome.catalog_epoch > bound.description().catalog_epoch);
+            assert_eq!(native.execute_catalog_bound(&bound).unwrap_err().sqlstate(), Some("0A000"));
+        });
+        assert!(sql.catalog_metadata().unwrap().indexes.is_empty());
+        // CASCADE removes the FK, not its owning table (PG18.6).
+        sql.execute("INSERT INTO child VALUES(2,999)", &[], None).unwrap();
+        if backend == Engine::Legacy {
+            assert_eq!(native.execute_catalog(&CatalogRequest::DropTable { table: "child".into(), cascade: false }), Err(Error::PlanRequired));
+        }
+        let expected = admin.catalog().unwrap();
+        drop(sql);
+        drop(native);
+        drop(admin);
+        let reopened = Admin::open(&path, Limits::default()).unwrap();
+        assert_eq!(reopened.catalog().unwrap(), expected);
+        assert!(reopened.sql_session().catalog_metadata().unwrap().indexes.is_empty());
+        assert_eq!(reopened.sql_session().execute("SELECT * FROM child ORDER BY id", &[], None).unwrap().rows.len(), if backend == Engine::V2 { 2 } else { 1 });
+        if backend == Engine::Legacy {
+            reopened.sql_session().execute("DELETE FROM child WHERE id=2", &[], None).unwrap();
+        }
+        let dropped = Native::new(reopened.clone()).execute_catalog(&CatalogRequest::DropTable { table: "child".into(), cascade: false }).unwrap();
+        assert_eq!(dropped.table.name, "child");
+        assert!(reopened.catalog().unwrap().1.is_empty());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn native_catalog_drop_view_dependencies() {
+    use crate::operations::{CatalogRequest, Engine as Native};
+    use relational::with_sql_parser_forbidden;
+    if !cfg!(feature = "engine-rocksdb") { return; }
+    for cascade in [false, true] {
+        let mut catalogs = Vec::new();
+        for native_path in [false, true] {
+            let path = directory();
+            let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+            let mut sql = admin.sql_session();
+            for text in ["CREATE TABLE items(id BIGINT PRIMARY KEY)", "INSERT INTO items VALUES(1)",
+                "CREATE VIEW visible AS SELECT id FROM items", "CREATE VIEW nested AS SELECT id FROM visible"] {
+                sql.execute(text, &[], None).unwrap();
+            }
+            let native = Native::new(admin.clone());
+            let result = if native_path {
+                with_sql_parser_forbidden(|| native.execute_catalog(&CatalogRequest::DropTable { table: "items".into(), cascade }))
+                    .map(|_| ()).map_err(|e| e.sqlstate().unwrap().to_owned())
+            } else {
+                sql.execute(if cascade { "DROP TABLE items CASCADE" } else { "DROP TABLE items RESTRICT" }, &[], None)
+                    .map(|_| ()).map_err(|e| crate::sqlstate(&e).to_owned())
+            };
+            assert_eq!(result.is_ok(), cascade);
+            if !cascade { assert_eq!(result.as_ref().unwrap_err(), "2BP01"); }
+            let metadata = sql.catalog_metadata().unwrap();
+            assert_eq!(metadata.presentation.views.len(), if cascade { 0 } else { 2 });
+            catalogs.push((result, admin.catalog().unwrap().1, metadata.presentation.views.into_values().map(|v| v.table).collect::<Vec<_>>()));
+            drop(native);
+            drop(sql);
+            drop(admin);
+            fs::remove_dir_all(path).unwrap();
+        }
+        assert_eq!(catalogs[0], catalogs[1]);
+    }
+}
+
+#[test]
+fn native_catalog_drop_outcomes_resolve_schema_names() {
+    use crate::operations::{CatalogRequest, Engine as Native};
+    let path = directory();
+    let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();
+    let mut sql = admin.sql_session();
+    for text in ["CREATE SCHEMA alpha", "CREATE TABLE alpha.items(id BIGINT PRIMARY KEY)",
+        "CREATE TABLE items(id BIGINT PRIMARY KEY)", "CREATE INDEX same_name ON alpha.items(id)",
+        "CREATE INDEX same_name ON items(id)"] { sql.execute(text, &[], None).unwrap(); }
+    let metadata = sql.catalog_metadata().unwrap();
+    let public_table = sql.inspect_metadata(|s| Ok(s.sql.tables["items"].clone())).unwrap();
+    let public_id = metadata.indexes.iter().find(|i| i.table == public_table.id).unwrap().id;
+    let native = Native::new(admin.clone());
+    let dropped = relational::with_sql_parser_forbidden(|| native.execute_catalog(&CatalogRequest::DropIndex { name: "same_name".into(), cascade: false })).unwrap();
+    assert_eq!(dropped.index_id, Some(public_id));
+    assert_eq!(dropped.table, public_table);
+    let table = dropped.table;
+    assert_eq!(sql.catalog_metadata().unwrap().indexes.len(), 1);
+    let dropped = native.execute_catalog(&CatalogRequest::DropTable { table: "items".into(), cascade: false }).unwrap();
+    assert_eq!(dropped.table, table);
+    assert_eq!(admin.catalog().unwrap().1.len(), 1);
+    drop(native);
+    drop(sql);
+    drop(admin);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn legacy_reopens_without_classifying_unrelated_files() {
     let path = directory();
     let admin = Admin::create_engine(&path, Limits::default(), Engine::Legacy).unwrap();

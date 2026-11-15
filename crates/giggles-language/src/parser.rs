@@ -394,7 +394,7 @@ impl Parser {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 => self.sum(d),
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 => self.sum(d),
         }
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
@@ -1062,11 +1062,23 @@ impl Parser {
     }
     fn catalog_prefix(&self) -> bool {
         matches!(&self.tokens[self.pos..], [(Token::Word(create), _), (Token::Word(table), _), ..]
-            if create == "create" && (table == "table" || table == "index"))
+            if (create == "create" || (create == "drop" && self.version == LanguageVersion::Embedded017))
+                && (table == "table" || table == "index"))
     }
     fn catalog(&mut self) -> Result<CatalogStatement> {
         if !self.version.supports_catalog() {
             return Err(Error::Unsupported);
+        }
+        if self.version == LanguageVersion::Embedded017 && self.word("drop") {
+            let index = if self.word("index") { true } else { self.need("table")?; false };
+            let name = self.name()?;
+            let cascade = self.word("cascade");
+            if !cascade { self.word("restrict"); }
+            return Ok(if index {
+                CatalogStatement::DropIndex { name, cascade }
+            } else {
+                CatalogStatement::DropTable { table: name, cascade }
+            });
         }
         self.need("create")?;
         if self.word("index") {
@@ -1139,7 +1151,7 @@ impl Parser {
                     CatalogType::Int64
                 } else if self.word("text") {
                     CatalogType::Text
-                } else if self.version == LanguageVersion::Embedded016 && self.word("numeric") {
+                } else if matches!(self.version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017) && self.word("numeric") {
                     CatalogType::Numeric
                 } else if self.word("bytes") {
                     CatalogType::Bytes

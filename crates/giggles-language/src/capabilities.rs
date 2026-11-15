@@ -194,7 +194,7 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         });
     };
 
-    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016) {
+    if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017) {
         add(
             CapabilityInterface::RustText,
             "numeric_parameters",
@@ -208,11 +208,19 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
         );
     }
 
-    if version == LanguageVersion::Embedded016 {
+    if matches!(version, LanguageVersion::Embedded016 | LanguageVersion::Embedded017) {
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
             add(interface, "numeric_column_declaration", CapabilityState::Implemented,
                 "Legacy native CREATE TABLE: unconstrained NUMERIC, required or nullable. No typmod; v2 catalog writes remain refused.",
                 vec![evidence("crates/giggles-language/tests/native_parity.rs", "numeric_native_catalog_matches_sql")], vec![]);
+        }
+    }
+
+    if version == LanguageVersion::Embedded017 {
+        for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree, CapabilityInterface::Cli] {
+            add(interface, "catalog_drop", CapabilityState::Implemented,
+                "Standalone DROP TABLE/INDEX with default RESTRICT or explicit CASCADE/RESTRICT. Shared SQL dependencies and errors; DROP INDEX CASCADE remains Unsupported. Legacy requires empty business state; v2 permits populated state.",
+                vec![evidence("crates/giggles-language/tests/native_drop_parity.rs", "drop_matrix_matches_sql")], vec![]);
         }
     }
 
@@ -1731,6 +1739,10 @@ fn rejection_evidence(version: LanguageVersion) -> TestEvidence {
         LanguageVersion::Embedded011 => (
             "crates/giggles-language/tests/once_capabilities.rs",
             "once_selected_manifest_rejections_use_selected_version",
+        ),
+        LanguageVersion::Embedded017 => (
+            "crates/giggles-language/tests/native_drop_parity.rs",
+            "drop_profile_is_opt_in_and_inherits_numeric",
         ),
         LanguageVersion::Embedded016 => (
             "crates/giggles-language/tests/native_parity.rs",

@@ -131,6 +131,14 @@ pub(super) struct DropIndex {
     pub name: String,
     pub table: Option<String>,
     pub optional: bool,
+    pub cascade: bool,
+}
+
+pub(super) fn primary_table<'a>(state: &'a Relational, name: &str) -> Option<&'a TableDef> {
+    state.tables.values().find(|table| {
+        constraint_primary_key::primary_key_name(state, table)
+            .is_some_and(|key| relation_key(state.table_schema(table.id), &key) == name)
+    })
 }
 pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
     p.need("drop")?;
@@ -143,10 +151,10 @@ pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
         p.need("exists")?;
     }
     let name = p.table_name()?;
-    if p.word("cascade") {
-        return Err(SqlError::Unsupported);
+    let cascade = p.word("cascade");
+    if !cascade {
+        p.word("restrict");
     }
-    p.word("restrict");
     p.sym(';');
     if p.at != p.tokens.len() {
         return Err(SqlError::Syntax);
@@ -155,6 +163,7 @@ pub(super) fn parse_drop(p: &mut Parser) -> R<DropIndex> {
         name,
         table: None,
         optional,
+        cascade,
     })
 }
 

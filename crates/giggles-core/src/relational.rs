@@ -1908,6 +1908,22 @@ impl Prepared {
             epoch,
         )
     }
+    pub(crate) fn drop_table_engine(name: String, cascade: bool, domain: u128, epoch: u64) -> R<Self> {
+        ident(&name)?;
+        let mut prepared = Self::engine(Statement::DropTable {
+            names: vec![name.clone()], optional: false, cascade, resolution_error: None,
+        }, domain, epoch);
+        prepared.relations.push(schemas::Reference::read(name, None));
+        Ok(prepared)
+    }
+    pub(crate) fn drop_index_engine(name: String, cascade: bool, domain: u128, epoch: u64) -> R<Self> {
+        ident(&name)?;
+        let mut prepared = Self::engine(Statement::DropIndex(sql_index::DropIndex {
+            name: name.clone(), table: None, optional: false, cascade,
+        }), domain, epoch);
+        prepared.relations.push(schemas::Reference::read(name, None));
+        Ok(prepared)
+    }
     pub(crate) fn begin_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Begin, domain, epoch)
     }
@@ -3649,6 +3665,11 @@ impl Relational {
                         matches!(c.kind, ConstraintKind::Unique { index, .. } if index == descriptor.id)) {
                         return Err(SqlError::DependentObjects);
                     }
+                    // Standalone UNIQUE indexes need persisted FK-to-index dependencies
+                    // before CASCADE can safely implement PostgreSQL semantics.
+                    if descriptor.unique && index.cascade {
+                        return Err(SqlError::Unsupported);
+                    }
                     let descriptors = self
                         .secondary_descriptors_engine()
                         .iter()
@@ -3658,6 +3679,8 @@ impl Relational {
                     self.secondary =
                         self.secondary_build_complete_engine(&descriptors, &mut cancel)?;
                     self.epoch = self.epoch.checked_add(1).ok_or(SqlError::Overflow)?;
+                } else if sql_index::primary_table(self, &index.name).is_some() {
+                    return Err(SqlError::DependentObjects);
                 } else if !index.optional {
                     return Err(SqlError::UndefinedObject);
                 }

@@ -184,12 +184,21 @@ impl Prepared {
             }
             Statement::CreateIndex(index) => read(&mut index.table),
             Statement::DropIndex(index) => {
-                read(&mut index.name);
+                index.name = if index.name.contains('\0') {
+                    index.name.clone()
+                } else {
+                    self.search_path.iter()
+                        .map(|schema| relation_key(schema, &index.name))
+                        .find(|key| state.relation_name_taken(key)
+                            || sql_index::primary_table(state, key).is_some())
+                        .unwrap_or_else(|| state.resolve_relation_key(&index.name, &self.search_path))
+                };
                 index.table = state
                     .secondary_descriptors_engine()
                     .iter()
                     .find(|d| d.name == index.name)
                     .and_then(|d| state.tables.values().find(|t| t.id == d.table))
+                    .or_else(|| sql_index::primary_table(state, &index.name))
                     .map(|t| state.table_key(t));
             }
             Statement::Sequence(ddl) => ddl.bind_schema_names(&read, &create)?,

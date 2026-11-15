@@ -33,6 +33,13 @@ capability/limit discovery and trusted committed catalog inspection. It inherits
 0.11 once support in Rust; CLI once/outcome still require unavailable context.
 Explicit version 0.13 selects `embedded-trusted-native-0.13`, adding bounded
 trusted static explain for simple reads.
+Explicit version 0.14 adds native CREATE INDEX text; 0.15 adds Numeric parameters;
+0.16 adds unconstrained Numeric column declarations. Version 0.17 selects
+`embedded-trusted-native-0.17`, inheriting 0.16 and adding standalone
+`drop table NAME [cascade|restrict]` and `drop index NAME [cascade|restrict]`.
+RESTRICT is the default. SQL dependency behavior is shared; DROP INDEX CASCADE
+retains SQL's Unsupported result. Legacy drops require empty business state;
+v2 permits populated state.
 No version implements the complete proposed native v1 language.
 
 From the repository root in PowerShell:

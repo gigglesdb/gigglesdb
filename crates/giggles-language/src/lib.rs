@@ -101,6 +101,8 @@ pub enum LanguageVersion {
     Embedded015,
     #[serde(rename = "0.16")]
     Embedded016,
+    #[serde(rename = "0.17")]
+    Embedded017,
 }
 impl LanguageVersion {
     pub const fn as_str(self) -> &'static str {
@@ -121,6 +123,7 @@ impl LanguageVersion {
             Self::Embedded014 => "0.14",
             Self::Embedded015 => "0.15",
             Self::Embedded016 => "0.16",
+            Self::Embedded017 => "0.17",
         }
     }
     pub const fn profile_name(self) -> &'static str {
@@ -141,10 +144,11 @@ impl LanguageVersion {
             Self::Embedded014 => "embedded-trusted-native-0.14",
             Self::Embedded015 => "embedded-trusted-native-0.15",
             Self::Embedded016 => "embedded-trusted-native-0.16",
+            Self::Embedded017 => "embedded-trusted-native-0.17",
         }
     }
     pub(crate) const fn supports_indexes(self) -> bool {
-        matches!(self, Self::Embedded014 | Self::Embedded015 | Self::Embedded016)
+        matches!(self, Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017)
     }
     pub(crate) const fn supports_computed(self) -> bool {
         matches!(
@@ -161,7 +165,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_return(self) -> bool {
@@ -178,7 +182,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_transactions(self) -> bool {
@@ -194,7 +198,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_insert_many(self) -> bool {
@@ -209,7 +213,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_catalog(self) -> bool {
@@ -223,7 +227,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_scalar_functions(self) -> bool {
@@ -236,7 +240,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_case(self) -> bool {
@@ -248,7 +252,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_quoted_identifiers(self) -> bool {
@@ -260,7 +264,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_upsert(self) -> bool {
@@ -271,7 +275,7 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_once(self) -> bool {
@@ -281,19 +285,19 @@ impl LanguageVersion {
                 | Self::Embedded012
                 | Self::Embedded013
                 | Self::Embedded014
-                | Self::Embedded015 | Self::Embedded016
+                | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_explain(self) -> bool {
         matches!(
             self,
-            Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016
+            Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
     pub(crate) const fn supports_inspection(self) -> bool {
         matches!(
             self,
-            Self::Embedded012 | Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016
+            Self::Embedded012 | Self::Embedded013 | Self::Embedded014 | Self::Embedded015 | Self::Embedded016 | Self::Embedded017
         )
     }
 }
@@ -512,6 +516,8 @@ pub enum CatalogType {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatalogStatement {
+    DropTable { table: String, cascade: bool },
+    DropIndex { name: String, cascade: bool },
     CreateIndex {
         table: String,
         name: String,
@@ -640,7 +646,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
         name: version.profile_name(),
         max_rows: MAX_ROWS,
         default_page: 100,
-        scalar_types: if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016) {
+        scalar_types: if matches!(version, LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017) {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null", "numeric parameters"]
         } else {
             &["boolean", "smallint", "integer", "bigint", "text", "bytes", "null"]
@@ -790,7 +796,7 @@ pub fn profile_for(version: LanguageVersion) -> Profile {
             | LanguageVersion::Embedded012
             | LanguageVersion::Embedded013
             | LanguageVersion::Embedded014
-            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 => &[
+            | LanguageVersion::Embedded015 | LanguageVersion::Embedded016 | LanguageVersion::Embedded017 => &[
                 "once without explicit original scope and trusted clock",
                 "CLI once execution and outcome lookup",
                 "duration parameters",

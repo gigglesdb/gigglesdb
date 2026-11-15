@@ -29,6 +29,8 @@ mod inspection;
 mod inspection_capabilities;
 #[path = "native_defaults_parity.rs"]
 mod native_defaults_parity;
+#[path = "native_drop_parity.rs"]
+mod native_drop_parity;
 #[path = "native_parity.rs"]
 mod native_parity;
 #[path = "native_sqlstate_parity.rs"]
