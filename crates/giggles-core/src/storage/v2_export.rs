@@ -411,6 +411,9 @@ pub(super) fn restore(
     }
     let read = ExportRead::open(export)?;
     read.verify()?;
+    if read.features & engine::meta::REPLICATED != 0 {
+        return Err(CoreError::Unsupported);
+    }
     fs::create_dir(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             CoreError::Exists

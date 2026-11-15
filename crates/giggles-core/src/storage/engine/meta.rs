@@ -15,7 +15,8 @@ pub(crate) const SCHEMAS_AND_USER_TYPES: u64 = 1 << 12;
 pub(crate) const UNIQUE_CONSTRAINT_IDENTITY: u64 = 1 << 13;
 pub(crate) const SQL_VIEWS: u64 = 1 << 14;
 pub(crate) const RELATION_COMMENTS: u64 = 1 << 15;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 16] = [
+pub(crate) const REPLICATED: u64 = 1 << 16;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 17] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -32,6 +33,7 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 16] = [
     (UNIQUE_CONSTRAINT_IDENTITY, "unique_constraint_identity"),
     (SQL_VIEWS, "sql_views"),
     (RELATION_COMMENTS, "relation_comments"),
+    (REPLICATED, "replicated"),
 ];
 const MARKER: &str = "GIGGLES_FORMAT";
 const TMP: &str = "GIGGLES_FORMAT.tmp";
@@ -194,6 +196,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
                 | b"engine"
                 | b"last_commit_ts"
                 | b"gc_watermark"
+                | b"raft_applied"
         ) {
             return Err(FormatError::Unsupported("unknown metadata key".into()));
         }
@@ -211,6 +214,16 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     }
     let features = u64::from_be_bytes(fixed(kv, b"features")?);
     check_features(features)?;
+    if let Some(applied) = kv.get(Keyspace::Meta, b"raft_applied").map_err(corrupt)? {
+        if applied.len() != 16 {
+            return Err(corrupt("wrong raft_applied length"));
+        }
+        if features & REPLICATED == 0 {
+            return Err(FormatError::Unsupported(
+                "raft_applied without replicated feature".into(),
+            ));
+        }
+    }
     let domain = fixed(kv, b"domain")?;
     if kv
         .get(Keyspace::Meta, b"engine")
@@ -261,7 +274,7 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
     })
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS)
+    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED)
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {
@@ -302,13 +315,21 @@ pub(crate) fn create(
     domain: [u8; 16],
     open: impl FnOnce(&Path) -> Result<Arc<dyn KvBackend>, KvError>,
 ) -> Result<Arc<dyn KvBackend>, FormatError> {
+    create_with_features(dir, domain, 0, open)
+}
+pub(crate) fn create_with_features(
+    dir: &Path,
+    domain: [u8; 16],
+    extra_features: u64,
+    open: impl FnOnce(&Path) -> Result<Arc<dyn KvBackend>, KvError>,
+) -> Result<Arc<dyn KvBackend>, FormatError> {
     #[cfg(test)]
     {
-        create_inner(dir, domain, open, |_| Ok(()))
+        create_inner(dir, domain, extra_features, open, |_| Ok(()))
     }
     #[cfg(not(test))]
     {
-        create_inner(dir, domain, open)
+        create_inner(dir, domain, extra_features, open)
     }
 }
 pub(crate) fn write_initial_meta(
@@ -331,6 +352,7 @@ pub(crate) fn write_initial_meta(
 fn create_inner(
     dir: &Path,
     domain: [u8; 16],
+    extra_features: u64,
     open: impl FnOnce(&Path) -> Result<Arc<dyn KvBackend>, KvError>,
     #[cfg(test)] hook: impl Fn(Stage) -> Result<(), FormatError>,
 ) -> Result<Arc<dyn KvBackend>, FormatError> {
@@ -341,7 +363,7 @@ fn create_inner(
     let kv = open(dir).map_err(corrupt)?;
     #[cfg(test)]
     hook(Stage::Open)?;
-    write_initial_meta(kv.as_ref(), domain, 0)?;
+    write_initial_meta(kv.as_ref(), domain, extra_features)?;
     #[cfg(test)]
     hook(Stage::MetaBatch)?;
     let mut file = fs::File::create(dir.join(TMP)).map_err(corrupt)?;

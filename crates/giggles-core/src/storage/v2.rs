@@ -72,7 +72,7 @@ impl V2Db {
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
-        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES)
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES, false)
     }
     #[cfg(feature = "engine-rocksdb")]
     #[allow(dead_code)] // Entry point for replicated backends.
@@ -80,14 +80,22 @@ impl V2Db {
         backend: Arc<dyn engine::kv::KvBackend>,
         write_set_bytes: usize,
     ) -> Result<Self, CoreError> {
-        Self::from_kv_with_limit(Arc::new(engine::kv::Kv::new(backend)), write_set_bytes)
+        Self::from_kv_with_limit(
+            Arc::new(engine::kv::Kv::new(backend)),
+            write_set_bytes,
+            true,
+        )
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv_with_limit(
         kv: Arc<engine::kv::Kv>,
         write_set_bytes: usize,
+        replicated_allowed: bool,
     ) -> Result<Self, CoreError> {
         let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
+        if meta.features & engine::meta::REPLICATED != 0 && !replicated_allowed {
+            return Err(CoreError::Unsupported);
+        }
         if !meta.stale_counters.is_empty() {
             let mut batch = engine::kv::WriteBatch::default();
             for key in &meta.stale_counters {

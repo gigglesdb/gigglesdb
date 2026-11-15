@@ -118,3 +118,55 @@ fn single_node_creation_preserves_initial_meta() {
     drop(admin);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn single_node_open_refuses_replicated_without_meta_changes() {
+    use engine::kv::{KvBackend, KvRead};
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "v2-replicated-meta-{:032x}",
+        u128::from_be_bytes(nonce)
+    ));
+    let meta = |kv: &dyn KvRead| {
+        kv.range(
+            Keyspace::Meta,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Direction::Forward,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    let backend = engine::meta::create_with_features(&path, nonce, engine::meta::REPLICATED, |p| {
+        Ok(Arc::new(engine::kv_rocksdb::RocksKv::open(p, 8 << 20)?))
+    })
+    .unwrap();
+    let before = meta(backend.as_ref());
+    drop(backend);
+    assert!(matches!(
+        Admin::open(&path, Limits::default()),
+        Err(CoreError::Unsupported)
+    ));
+    let backend = engine::kv_rocksdb::RocksKv::open(&path, 8 << 20).unwrap();
+    assert_eq!(meta(backend.snapshot().unwrap().as_ref()), before);
+    drop(backend);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn supplied_replicated_backend_supports_sql() {
+    use engine::kv::{Durability, KvBackend, WriteBatch};
+    let backend = Arc::new(engine::kv_mem::MemKv::new());
+    engine::meta::write_initial_meta(backend.as_ref(), [3; 16], engine::meta::REPLICATED).unwrap();
+    let mut batch = WriteBatch::default();
+    batch.put(Keyspace::Meta, b"raft_applied".to_vec(), vec![0; 16]);
+    backend.write(batch, Durability::Sync).unwrap();
+    let admin =
+        Admin::attach_v2_backend(backend, Limits::default(), DEFAULT_WRITE_SET_BYTES).unwrap();
+    admin
+        .sql_session()
+        .execute("CREATE TABLE t(id int PRIMARY KEY)", &[], None)
+        .unwrap();
+}

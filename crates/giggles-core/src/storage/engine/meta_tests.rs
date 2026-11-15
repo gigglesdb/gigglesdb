@@ -153,12 +153,13 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0xFFFF
+        0x1FFFF
     );
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
     }
     assert_eq!(FEATURE_TABLE[14].0, SQL_VIEWS);
+    assert_eq!(FEATURE_TABLE[16].0, REPLICATED);
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -177,7 +178,7 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 16..64 {
+    for i in 17..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -300,9 +301,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 16, FormatError::Unsupported("feature bits".into())),
+        (1 << 17, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 16) | 0xC00,
+            (1 << 17) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -349,7 +350,7 @@ fn rocks_creation_crash_witnesses_and_reopen() {
         Stage::Rename,
     ] {
         let d = TestDir::new();
-        let result = create_inner(&d.0, [3; 16], open, |at| {
+        let result = create_inner(&d.0, [3; 16], 0, open, |at| {
             if at == stage {
                 Err(FormatError::Incomplete("crash hook".into()))
             } else {
@@ -436,4 +437,35 @@ fn old_binary_guard_rejects_schema_type_bit_before_catalog_decode() {
         Err(FormatError::Unsupported("feature bits".into()))
     );
     check_features_allowed(bits, 0x1FFF).unwrap();
+}
+
+#[test]
+fn raft_applied_requires_replicated_feature_and_exact_length() {
+    let kv = MemKv::new();
+    write_initial_meta(&kv, [3; 16], REPLICATED).unwrap();
+    put(&kv, b"raft_applied", &[0; 16]);
+    assert_eq!(validate_meta(&kv).unwrap().features, REPLICATED);
+    put(&kv, b"features", &0u64.to_be_bytes());
+    assert_eq!(
+        validate_meta(&kv).unwrap_err(),
+        FormatError::Unsupported("raft_applied without replicated feature".into())
+    );
+    put(&kv, b"features", &REPLICATED.to_be_bytes());
+    for len in [15, 17] {
+        put(&kv, b"raft_applied", &vec![0; len]);
+        assert_eq!(
+            validate_meta(&kv).unwrap_err(),
+            corrupt("wrong raft_applied length")
+        );
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn replicated_creation_is_v2() {
+    let d = TestDir::new();
+    let kv = create_with_features(&d.0, [3; 16], REPLICATED, open).unwrap();
+    assert_eq!(validate_meta(kv.as_ref()).unwrap().features, REPLICATED);
+    drop(kv);
+    assert_eq!(classify_dir(&d.0).unwrap(), DirClass::V2);
 }
