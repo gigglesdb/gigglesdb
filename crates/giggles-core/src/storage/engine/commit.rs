@@ -46,6 +46,8 @@ impl Clock for ManualClock {
 pub(crate) struct SequencerConfig {
     /// Maximum additional requests gathered after the first; zero means singleton.
     pub(crate) group_max: usize,
+    /// Optional key/value byte limit; the first request is always accepted.
+    pub(crate) group_max_bytes: Option<usize>,
     /// Zero or sub-millisecond waits only drain requests already queued.
     pub(crate) group_wait: Duration,
     pub(crate) recent_log_bytes: usize,
@@ -55,6 +57,7 @@ impl Default for SequencerConfig {
     fn default() -> Self {
         Self {
             group_max: 64,
+            group_max_bytes: None,
             group_wait: Duration::ZERO,
             recent_log_bytes: 256 * 1024 * 1024,
             write_set_bytes: 256 * 1024 * 1024,
@@ -337,11 +340,31 @@ impl Drop for Sequencer {
     }
 }
 
+fn request_bytes(request: &CommitRequest) -> usize {
+    let writes = request
+        .writes
+        .iter()
+        .map(|((_, key), value)| key.len() + value.as_ref().map_or(0, Vec::len))
+        .sum::<usize>();
+    writes
+        + request
+            .raw
+            .iter()
+            .map(|op| match op {
+                RawOp::DeleteCounter { key } => key.len(),
+                RawOp::PutCounter { key, value } => key.len() + value.len(),
+            })
+            .sum::<usize>()
+}
+
 fn gather(
     first: Pending,
     receiver: &mpsc::Receiver<Message>,
     config: &SequencerConfig,
 ) -> (Vec<Pending>, Option<Message>, bool) {
+    let mut bytes = config
+        .group_max_bytes
+        .map(|_| request_bytes(&first.request));
     let mut group = vec![first];
     // Windows timed receives can round a sub-millisecond wait up to a roughly
     // 15 ms timer tick. Drain without waiting by default, and only opt into a
@@ -371,7 +394,16 @@ fn gather(
             }
         };
         match message {
-            Message::Commit(pending) => group.push(pending),
+            Message::Commit(pending) => {
+                if let (Some(cap), Some(total)) = (config.group_max_bytes, bytes.as_mut()) {
+                    let size = request_bytes(&pending.request);
+                    if *total > cap || size > cap - *total {
+                        return (group, Some(Message::Commit(pending)), false);
+                    }
+                    *total += size;
+                }
+                group.push(pending);
+            }
             counter @ Message::Counter { .. } => return (group, Some(counter), false),
             Message::Shutdown => return (group, None, true),
         }
@@ -687,3 +719,7 @@ mod guard_tests;
 #[cfg(test)]
 #[path = "commit_batch_tests.rs"]
 mod batch_tests;
+
+#[cfg(test)]
+#[path = "commit_cap_tests.rs"]
+mod cap_tests;
