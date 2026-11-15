@@ -1,0 +1,210 @@
+//! Blocking client seam over a single Raft driver thread.
+use crate::{
+    barrier::ReadBarrier,
+    error::Error,
+    node::{Replica, RoleInfo},
+};
+use raft::{StateRole, eraftpb::Message};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicateError {
+    NotLeader,
+    Unknown(String),
+    Stopped,
+}
+impl fmt::Display for ReplicateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLeader => f.write_str("not leader"),
+            Self::Unknown(s) => write!(f, "outcome unknown: {s}"),
+            Self::Stopped => f.write_str("replica stopped"),
+        }
+    }
+}
+impl std::error::Error for ReplicateError {}
+pub trait Outbox: Send {
+    fn send(&mut self, m: Message);
+}
+type Reply<T> = mpsc::Sender<Result<T, ReplicateError>>;
+enum Command {
+    Propose(Vec<u8>, Reply<()>),
+    Read(Reply<u64>),
+    Step(u64, Message),
+    Shutdown,
+}
+#[derive(Clone)]
+pub struct ReplicaHandle {
+    tx: mpsc::Sender<Command>,
+    role: Arc<Mutex<RoleInfo>>,
+    rounds: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+}
+impl ReplicaHandle {
+    pub fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::Propose(encoded_batch, tx))
+            .map_err(|_| ReplicateError::Stopped)?;
+        rx.recv().unwrap_or(Err(ReplicateError::Stopped))
+    }
+    pub fn read_barrier(&self) -> Result<u64, ReplicateError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::Read(tx))
+            .map_err(|_| ReplicateError::Stopped)?;
+        rx.recv().unwrap_or(Err(ReplicateError::Stopped))
+    }
+    pub fn step(&self, from: u64, m: Message) {
+        let _ = self.tx.send(Command::Step(from, m));
+    }
+    pub fn role(&self) -> RoleInfo {
+        *self.role.lock().expect("role mutex poisoned")
+    }
+    pub fn read_rounds(&self) -> u64 {
+        self.rounds.load(Ordering::Relaxed)
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(Command::Shutdown);
+    }
+}
+
+pub fn spawn(
+    mut replica: Replica,
+    mut outbox: Box<dyn Outbox>,
+    tick: Duration,
+) -> (ReplicaHandle, thread::JoinHandle<()>) {
+    assert!(!tick.is_zero(), "tick interval must be positive");
+    let (tx, rx) = mpsc::channel();
+    let handle = ReplicaHandle {
+        tx,
+        role: Arc::new(Mutex::new(replica.role())),
+        rounds: Arc::new(AtomicU64::new(0)),
+        stopped: Arc::new(AtomicBool::new(false)),
+    };
+    let role = handle.role.clone();
+    let rounds = handle.rounds.clone();
+    let stopped = handle.stopped.clone();
+    let join = thread::spawn(move || {
+        let mut barrier = ReadBarrier::new(replica.node_id(), 5);
+        let mut pending: HashMap<u64, Reply<()>> = HashMap::new();
+        let mut read_indexes = BTreeSet::new();
+        let mut seq = 0u64;
+        let mut published = replica.role();
+        let mut next_tick = Instant::now() + tick;
+        let issue = |replica: &mut Replica, ctx| {
+            if replica.read_index(ctx).is_ok() {
+                rounds.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        loop {
+            // Checking the deadline before receiving prevents busy peer traffic from starving ticks.
+            if Instant::now() >= next_tick {
+                replica.tick();
+                if let Some(ctx) = barrier.tick() {
+                    issue(&mut replica, ctx);
+                }
+                next_tick = Instant::now() + tick;
+            } else {
+                match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                    Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Ok(Command::Step(from, m)) => {
+                        let _ = replica.step(from, m);
+                    }
+                    Ok(Command::Propose(batch, reply)) => {
+                        seq = seq.checked_add(1).expect("proposal sequence exhausted");
+                        match replica.propose(&batch, seq) {
+                            Ok(()) => {
+                                pending.insert(seq, reply);
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(match e {
+                                    Error::NotLeader => ReplicateError::NotLeader,
+                                    e => ReplicateError::Unknown(e.to_string()),
+                                }));
+                            }
+                        }
+                    }
+                    Ok(Command::Read(reply)) => {
+                        if replica.role().state != StateRole::Leader {
+                            let _ = reply.send(Err(ReplicateError::NotLeader));
+                        } else if let Some(ctx) = barrier.request(reply) {
+                            issue(&mut replica, ctx);
+                        }
+                    }
+                }
+            }
+            let Ok(out) = replica.drive() else {
+                break;
+            };
+            for m in out.messages {
+                outbox.send(m);
+            }
+            for (waiter, _) in out.applied {
+                if let Some(reply) = pending.remove(&waiter) {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            for waiter in out.failed {
+                if let Some(reply) = pending.remove(&waiter) {
+                    let _ = reply.send(Err(ReplicateError::Unknown(
+                        "leadership or proposal lost".into(),
+                    )));
+                }
+            }
+            if out.role.state != StateRole::Leader || out.role.term != published.term {
+                for reply in barrier.fail_all() {
+                    let _ = reply.send(Err(ReplicateError::NotLeader));
+                }
+                read_indexes.clear();
+            } else {
+                for (ctx, index) in out.read_states {
+                    if let Some(ctx) = barrier.on_read_state(&ctx, index) {
+                        issue(&mut replica, ctx);
+                    }
+                    read_indexes.insert(index);
+                }
+                // Release in index order so each reply carries its confirmed read index.
+                while let Some(index) = read_indexes.first().copied() {
+                    if index > replica.applied_index() {
+                        break;
+                    }
+                    read_indexes.remove(&index);
+                    for reply in barrier.on_applied(index) {
+                        let _ = reply.send(Ok(index));
+                    }
+                }
+            }
+            published = out.role;
+            *role.lock().expect("role mutex poisoned") = published;
+        }
+        *role.lock().expect("role mutex poisoned") = RoleInfo {
+            state: StateRole::Follower,
+            term: replica.role().term,
+            leader: 0,
+        };
+        stopped.store(true, Ordering::Release);
+        for (_, reply) in pending {
+            let _ = reply.send(Err(ReplicateError::Stopped));
+        }
+        for reply in barrier.fail_all() {
+            let _ = reply.send(Err(ReplicateError::Stopped));
+        }
+        // Dropping rx also drops replies on commands still queued at shutdown.
+    });
+    (handle, join)
+}

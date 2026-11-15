@@ -1,0 +1,17 @@
+[package]
+name = "giggles-replication"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[dependencies]
+giggles-core = { path = "../giggles-core" }
+raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
+protobuf = "=2.28.0"
+slog = "2"
+redb = "3.1"
+sha2 = "0.10"
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
