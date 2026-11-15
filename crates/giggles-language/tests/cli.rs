@@ -342,7 +342,6 @@ fn default_init_without_rocksdb_refuses_before_filesystem_effects() {
 
 #[cfg(feature = "engine-rocksdb")]
 #[test]
-#[ignore = "R2-16: core secondary_read_native_engine requires legacy staged state on v2"]
 fn v2_keyed_filtered_read_reopens_through_autocommit() {
     let p = path();
     let pstr = p.to_str().unwrap();

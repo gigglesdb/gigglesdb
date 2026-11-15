@@ -7,6 +7,9 @@ impl SqlSession {
         table: &relational::TableDef,
         request: &relational::secondary_index_access::Request<'_>,
     ) -> Result<relational::SqlResult, CoreError> {
+        if self.is_v2_engine() {
+            return Err(CoreError::Sql(relational::SqlError::Unsupported));
+        }
         let (_, epoch) = self.snapshot_identity_engine()?;
         let state = self
             .staged

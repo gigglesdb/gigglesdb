@@ -799,3 +799,58 @@ fn typed_keyed_delete_admission_cap() {
         fs::remove_dir_all(path).unwrap();
     }
 }
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn native_filtered_reads_fall_back_with_and_without_secondary_index() {
+    use crate::operations::{Bindings, Compare, Expr, Request, Sort, ValueExpr};
+    use crate::relational::{Value as V, with_sql_parser_forbidden};
+
+    for indexed in [false, true] {
+        let path = directory();
+        let admin = Admin::create_engine(&path, Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        session.execute("CREATE TABLE items(id BIGINT PRIMARY KEY, state TEXT)", &[], None).unwrap();
+        session.execute("INSERT INTO items VALUES(1,'ready'),(2,'pending'),(3,'ready')", &[], None).unwrap();
+        if indexed {
+            session.execute("CREATE INDEX items_state ON items(state)", &[], None).unwrap();
+        }
+        let request = Request::Read {
+            table: "items".into(),
+            filter: Some(Expr::Compare(
+                Box::new(Expr::Field("state".into())),
+                Compare::Eq,
+                Box::new(Expr::Value(ValueExpr::Literal(V::Text("ready".into())))),
+            )),
+            order: vec![Sort { field: "id".into(), descending: false }],
+            limit: None,
+            projection: vec!["id".into(), "state".into()],
+        };
+        let native = crate::operations::Engine::new(admin.clone());
+        for transactional in [false, true] {
+            if transactional {
+                session.begin_native().unwrap();
+                session.execute("INSERT INTO items VALUES(4,'ready')", &[], None).unwrap();
+            }
+            let expected = session.execute(
+                "SELECT id,state FROM items WHERE state='ready' ORDER BY id", &[], None,
+            ).unwrap().rows.into_iter().map(|r| r.values).collect::<Vec<_>>();
+            assert_eq!(expected.len(), if transactional { 3 } else { 2 });
+            let result = with_sql_parser_forbidden(|| {
+                if transactional {
+                    session.execute_native(&request, &Bindings::new())
+                } else {
+                    native.execute(&request, &Bindings::new())
+                }
+            }).unwrap();
+            assert_eq!(result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(), expected);
+            if transactional {
+                session.rollback_native().unwrap();
+            }
+        }
+        drop(native);
+        drop(session);
+        drop(admin);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
