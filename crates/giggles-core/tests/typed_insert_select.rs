@@ -82,6 +82,63 @@ fn insert_requires_explicit_bounded_columns_and_exact_target_names() {
         let input = TypedInsertSelect { columns, ..insert(TypedRead::Single(Box::new(read()))) };
         assert!(matches!(Prepared::from_typed_insert_select(0, 0, input), Err(SqlError::Limit)));
     }
-    let input = TypedInsertSelect { table: "dest.secret".into(), ..insert(TypedRead::Single(Box::new(read()))) };
+    for target in ["dest.secret.x", ".dest", "app.", "App.dest", "app.Dest", "app.de st", "app.1dest"] {
+        let input = TypedInsertSelect { table: target.into(), ..insert(TypedRead::Single(Box::new(read()))) };
+        assert!(matches!(Prepared::from_typed_insert_select(0, 0, input), Err(SqlError::Syntax)));
+    }
+    let input = TypedInsertSelect { columns: vec!["dest.id".into()], ..insert(TypedRead::Single(Box::new(read()))) };
     assert!(matches!(Prepared::from_typed_insert_select(0, 0, input), Err(SqlError::Syntax)));
+}
+
+#[test]
+fn qualified_insert_targets_match_sql_and_search_path() {
+    #[allow(unused_mut)]
+    let mut engines = vec![Engine::Legacy];
+    #[cfg(feature = "engine-rocksdb")] engines.push(Engine::V2);
+    for engine in engines {
+        for (target, path, destination) in [("app.dest", "public", "app.dest"),
+            ("dest", "app, public", "app.dest"), ("dest", "public", "public.dest"),
+            ("public.dest", "app, public", "public.dest")] {
+            // Known V2 SQL gap: PG18.6 (and Legacy) write public.dest here; V2 SQL, and so the
+            // typed path, re-resolves the bare public key through search_path to app.dest.
+            #[cfg(feature = "engine-rocksdb")]
+            let destination = if target == "public.dest" && engine == Engine::V2 { "app.dest" } else { destination };
+            let paths = [common::fresh("typed-qualified-insert"), common::fresh("sql-qualified-insert")];
+            let admins = paths.iter().map(|p| Admin::create_engine(p, Limits::default(), engine).unwrap()).collect::<Vec<_>>();
+            let mut typed = admins[0].sql_session();
+            let mut sql = admins[1].sql_session();
+            for s in [&mut typed, &mut sql] {
+                for statement in ["CREATE SCHEMA app", "CREATE TABLE app.dest(id INT PRIMARY KEY)",
+                    "CREATE TABLE public.dest(id INT PRIMARY KEY)", "CREATE TABLE src(id INT)",
+                    "INSERT INTO src VALUES(1),(2)"] { s.execute(statement, &[], None).unwrap(); }
+                s.set_search_path(path, "postgres");
+            }
+            let input = || TypedInsertSelect { table: target.into(), columns: vec!["id".into()],
+                source: TypedRead::Single(Box::new(SingleSourceRead { table: "src".into(), ..read() })) };
+            let actual = trap(|| typed.execute_typed_insert_select(input(), None)).unwrap();
+            let expected = sql.execute(&format!("INSERT INTO {target}(id) SELECT id FROM src"), &[], None).unwrap();
+            assert_eq!(actual.affected, expected.affected);
+            assert_eq!(actual.affected, 2);
+            for table in ["app.dest", "public.dest"] {
+                let query = format!("SELECT id FROM {table} ORDER BY id");
+                let actual = typed.execute(&query, &[], None).unwrap();
+                let expected = sql.execute(&query, &[], None).unwrap();
+                assert_eq!(actual.rows.iter().map(|r| &r.values).collect::<Vec<_>>(),
+                    expected.rows.iter().map(|r| &r.values).collect::<Vec<_>>());
+                assert_eq!(actual.rows.len(), if table == destination { 2 } else { 0 });
+            }
+            for target in ["nope.dest", "app.missing"] {
+                let request = TypedInsertSelect { table: target.into(), ..input() };
+                let actual = trap(|| typed.execute_typed_insert_select(request, None)).unwrap_err();
+                let expected = sql.execute(&format!("INSERT INTO {target}(id) SELECT id FROM src"), &[], None).unwrap_err();
+                assert_eq!(giggles_core::sqlstate(&actual), "42P01");
+                assert_eq!(giggles_core::sqlstate(&actual), giggles_core::sqlstate(&expected));
+            }
+            for s in [&mut typed, &mut sql] {
+                assert_eq!(s.execute(&format!("SELECT id FROM {destination}"), &[], None).unwrap().rows.len(), 2);
+            }
+            drop(typed); drop(sql); drop(admins);
+            for p in paths { std::fs::remove_dir_all(p).unwrap(); }
+        }
+    }
 }

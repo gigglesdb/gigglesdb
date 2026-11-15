@@ -3183,7 +3183,8 @@ impl SqlSession {
     /// Trusted Admin entry point; gateways authorize the target and every source first.
     pub fn execute_typed_insert_select(&mut self, insert: relational::TypedInsertSelect,
         expected_version: Option<u64>) -> Result<relational::SqlResult, CoreError> {
-        let p = self.prepare_typed_read(vec![insert.table.clone()], |domain, epoch|
+        let target = insert.table.replace('.', "\0");
+        let p = self.prepare_typed_read(vec![target], |domain, epoch|
             relational::Prepared::from_typed_insert_select(domain, epoch, insert))?;
         self.execute_bound_engine(&p, &[], expected_version)
     }

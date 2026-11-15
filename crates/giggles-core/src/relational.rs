@@ -1824,8 +1824,21 @@ impl Prepared {
     /// Construct an ordinary INSERT from a typed query, without parsing SQL.
     pub fn from_typed_insert_select(domain: u128, epoch: u64, insert: TypedInsertSelect) -> R<Self> {
         if insert.columns.is_empty() || insert.columns.len() > MAX_COLUMNS { return Err(SqlError::Limit); }
-        let mut bytes = 0usize;
-        for name in std::iter::once(&insert.table).chain(&insert.columns) {
+        let (table, schema) = match insert.table.split_once('.') {
+            Some((schema, name)) => {
+                for component in [schema, name] {
+                    ident(component)?;
+                    if !component.as_bytes()[0].is_ascii_alphabetic()
+                        || !component.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') {
+                        return Err(SqlError::Syntax);
+                    }
+                }
+                (format!("{schema}\0{name}"), Some(schema.to_owned()))
+            }
+            None => { ident(&insert.table)?; (insert.table.clone(), None) }
+        };
+        let mut bytes = insert.table.len();
+        for name in &insert.columns {
             ident(name)?;
             if name.contains('.') { return Err(SqlError::Syntax); }
             bytes = bytes.checked_add(name.len()).ok_or(SqlError::Limit)?;
@@ -1836,9 +1849,9 @@ impl Prepared {
             TypedRead::Join(read) => Self::from_two_source_read(domain, epoch, *read)?,
         };
         let Statement::Query(source) = prepared.statement else { unreachable!() };
-        prepared.relations.push(schemas::Reference::read(insert.table.clone(), None));
+        prepared.relations.push(schemas::Reference::read(split_key(&table).1.into(), schema));
         prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::from_query(
-            insert.table, insert.columns, source)));
+            table, insert.columns, source)));
         Ok(prepared)
     }
     /// Native view DDL lowers directly to the same statement as parsed SQL.
