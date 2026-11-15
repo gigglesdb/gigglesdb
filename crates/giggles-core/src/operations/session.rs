@@ -121,6 +121,29 @@ impl SqlSession {
         Ok(())
     }
 
+    /// Capture a named native/SQL savepoint in the active transaction.
+    /// Names are case-sensitive identifier values, like quoted SQL names,
+    /// and are truncated at PostgreSQL's 63-byte UTF-8 boundary.
+    pub fn savepoint(&mut self, name: &str) -> std::result::Result<(), CoreError> {
+        self.native_control(|session| {
+            session.named_control_engine(name, crate::relational::Prepared::savepoint_engine)
+        })
+    }
+
+    /// Undo to a savepoint, recovering an aborted transaction like SQL ROLLBACK TO.
+    pub fn rollback_to(&mut self, name: &str) -> std::result::Result<(), CoreError> {
+        self.native_control(|session| {
+            session.named_control_engine(name, crate::relational::Prepared::rollback_to_engine)
+        })
+    }
+
+    /// Release the named savepoint and all savepoints created after it.
+    pub fn release(&mut self, name: &str) -> std::result::Result<(), CoreError> {
+        self.native_control(|session| {
+            session.named_control_engine(name, crate::relational::Prepared::release_engine)
+        })
+    }
+
     fn native_control(
         &mut self,
         work: impl FnOnce(&mut Self) -> std::result::Result<(), CoreError>,
@@ -147,3 +170,45 @@ impl SqlSession {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod savepoint_tests {
+    use crate::{Admin, CoreError, Engine, Limits, relational::{SqlError, Value}};
+
+    #[test]
+    fn rollback_to_past_ddl_invalidates_bound_native_table_handles() {
+        #[allow(unused_mut)]
+        let mut engines = vec![Engine::Legacy];
+        #[cfg(feature = "engine-rocksdb")]
+        engines.push(Engine::V2);
+        std::fs::create_dir_all(crate::test_artifact_root()).unwrap();
+        for engine in engines {
+            let mut token = [0; 16];
+            getrandom::fill(&mut token).unwrap();
+            let path = crate::test_artifact_root().join(format!(
+                "native-savepoint-ddl-{:032x}", u128::from_be_bytes(token)));
+            let admin = Admin::create_engine(&path, Limits::default(), engine).unwrap();
+            let mut s = admin.sql_session();
+            s.execute("CREATE TABLE t(id BIGINT PRIMARY KEY)", &[], None).unwrap();
+            for native in [false, true] {
+                s.begin_native().unwrap();
+                if native { s.savepoint("before_ddl").unwrap(); }
+                else { s.execute("SAVEPOINT before_ddl", &[], None).unwrap(); }
+                s.execute("ALTER TABLE t ADD COLUMN extra BIGINT", &[], None).unwrap();
+                let (bound_fence, tables) = s.catalog_engine().unwrap();
+                let bound = tables.into_iter().find(|table| table.name == "t").unwrap();
+                if native { s.rollback_to("before_ddl").unwrap(); }
+                else { s.execute("ROLLBACK TO before_ddl", &[], None).unwrap(); }
+                assert_ne!(s.catalog_engine().unwrap().0, bound_fence);
+                assert_eq!(s.insert_engine(&bound, vec![Value::Int(1), Value::Int(2)]),
+                    Err(CoreError::Sql(SqlError::StaleSchema)));
+                s.rollback_to("before_ddl").unwrap();
+                assert!(!s.is_aborted());
+                s.rollback_native().unwrap();
+            }
+            drop(s);
+            drop(admin);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}

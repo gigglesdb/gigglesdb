@@ -1939,6 +1939,24 @@ impl Prepared {
     pub(crate) fn rollback_engine(domain: u128, epoch: u64) -> Self {
         Self::engine(Statement::Rollback, domain, epoch)
     }
+    pub(crate) fn savepoint_engine(name: &str, domain: u128, epoch: u64) -> R<Self> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(SqlError::Syntax);
+        }
+        Ok(Self::engine(Statement::Savepoint(ident::truncate(name, 63).to_owned()), domain, epoch))
+    }
+    pub(crate) fn rollback_to_engine(name: &str, domain: u128, epoch: u64) -> R<Self> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(SqlError::Syntax);
+        }
+        Ok(Self::engine(Statement::RollbackTo(ident::truncate(name, 63).to_owned()), domain, epoch))
+    }
+    pub(crate) fn release_engine(name: &str, domain: u128, epoch: u64) -> R<Self> {
+        if name.is_empty() || name.contains('\0') {
+            return Err(SqlError::Syntax);
+        }
+        Ok(Self::engine(Statement::Release(ident::truncate(name, 63).to_owned()), domain, epoch))
+    }
     fn engine_table(table: &TableDef, state: &Relational) -> R<()> {
         // Callers cannot smuggle stale IDs, column types or unchecked key indexes
         // into the executor through a hand-built descriptor.

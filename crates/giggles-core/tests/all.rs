@@ -410,3 +410,4 @@ mod authorization_reads;
 mod native_schema_resolution;
 #[path = "native_typed_params.rs"]
 mod native_typed_params;
+#[path = "native_savepoints.rs"] mod native_savepoints;

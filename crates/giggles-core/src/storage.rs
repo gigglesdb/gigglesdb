@@ -2378,6 +2378,25 @@ impl SqlSession {
             relational::Prepared::rollback_engine(u128::from_be_bytes(db.meta.domain), 0);
         self.execute_bound_engine(&prepared, &[], None).map(|_| ())
     }
+    pub(crate) fn named_control_engine(
+        &mut self,
+        name: &str,
+        make: impl FnOnce(&str, u128, u64) -> Result<relational::Prepared, relational::SqlError>,
+    ) -> Result<(), CoreError> {
+        // Do not use execute_engine: its aborted-state guard blocks recovery.
+        let (domain, epoch) = if let Backend::V2(db) = &self.admin.inner.backend {
+            (u128::from_be_bytes(db.meta.domain), 0)
+        } else {
+            self.admin.inner.db(SQL_SESSIONS)?;
+            match &self.staged {
+                Some(s) => (s.view.domain, s.sql.epoch),
+                None => self.admin.inner.inspect(|s| Ok((s.view.domain, s.sql.epoch)))?,
+            }
+        };
+        let mut prepared = make(name, domain, epoch).map_err(CoreError::Sql)?;
+        prepared.transaction = self.transaction_id;
+        self.execute_bound_engine(&prepared, &[], None).map(|_| ())
+    }
     /// Native block steps are separate RC statements; legacy keeps its block snapshot.
     pub(crate) fn begin_native_step(&mut self) -> Result<(), CoreError> {
         crate::cancellation::check()?;
