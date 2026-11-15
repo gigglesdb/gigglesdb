@@ -423,3 +423,5 @@ mod native_alter_table;
 #[path = "native_constraints.rs"] mod native_constraints;
 #[path = "native_views.rs"]
 mod native_views;
+
+#[path = "qualified_dml_targets.rs"] mod qualified_dml_targets;

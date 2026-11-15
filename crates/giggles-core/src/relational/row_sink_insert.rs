@@ -49,7 +49,6 @@ pub(super) fn execute(
     let mut template = prepared.clone();
     template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?.parameters.into_iter().map(Some).collect();
     template.statement = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
-    template.unbound_statement = None;
     let mut output = scan::Retention::new(MAX_RESULT_BYTES);
     let mut result = SqlResult::default();
     let mut after = None;
@@ -93,6 +92,7 @@ pub(super) fn execute(
         }
         let mut batch = template.clone();
         batch.statement = Statement::InsertMulti(Box::new(input));
+        batch.preserve_page_target();
         let part = page.execute_with_sink(
             &batch,
             params,

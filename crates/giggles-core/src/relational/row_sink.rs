@@ -9,6 +9,23 @@ use crate::CoreError;
 
 pub(crate) type DdlRows = BTreeMap<Vec<u8>, SqlRow>;
 
+impl Prepared {
+    // Insert pages replace input rows after schema binding. Preserve
+    // their target identity when the page is bound again: a bare storage key
+    // denotes public here, even when search_path prefers another schema.
+    fn preserve_page_target(&mut self) {
+        let mut statement = self.statement.clone();
+        let name = match &mut statement {
+            Statement::InsertMulti(insert) => &mut insert.table,
+            _ => unreachable!("paged mutation target"),
+        };
+        if !name.contains('\0') {
+            *name = format!("public\0{name}");
+        }
+        self.unbound_statement = Some(Box::new(statement));
+    }
+}
+
 pub(crate) fn retained_bytes(key: &[u8], row: &SqlRow) -> R<usize> {
     searched::retained_row_bytes(key, row)
 }
@@ -400,7 +417,7 @@ impl Relational {
             None
         };
         if conflict_rows.is_some() {
-            normalized.unbound_statement = None;
+            normalized.preserve_page_target();
         }
         let prepared = &normalized;
         let arbiter = match &prepared.statement {

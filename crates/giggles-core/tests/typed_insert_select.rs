@@ -99,10 +99,6 @@ fn qualified_insert_targets_match_sql_and_search_path() {
         for (target, path, destination) in [("app.dest", "public", "app.dest"),
             ("dest", "app, public", "app.dest"), ("dest", "public", "public.dest"),
             ("public.dest", "app, public", "public.dest")] {
-            // Known V2 SQL gap: PG18.6 (and Legacy) write public.dest here; V2 SQL, and so the
-            // typed path, re-resolves the bare public key through search_path to app.dest.
-            #[cfg(feature = "engine-rocksdb")]
-            let destination = if target == "public.dest" && engine == Engine::V2 { "app.dest" } else { destination };
             let paths = [common::fresh("typed-qualified-insert"), common::fresh("sql-qualified-insert")];
             let admins = paths.iter().map(|p| Admin::create_engine(p, Limits::default(), engine).unwrap()).collect::<Vec<_>>();
             let mut typed = admins[0].sql_session();
