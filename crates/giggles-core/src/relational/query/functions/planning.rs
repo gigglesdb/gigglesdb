@@ -403,6 +403,7 @@ impl BoundScalar {
             | Node::Column(..)
             | Node::Clock(..)
             | Node::Sequence(..)
+            | Node::Xact(..)
             | Node::ZonedOperator(..)
             | Node::CrossCompare(..)
             | Node::SessionCast(..) => Ok(None),
@@ -486,6 +487,7 @@ impl BoundScalar {
             | Node::Param(_)
             | Node::Clock(..)
             | Node::Sequence(..)
+            | Node::Xact(..)
             | Node::SessionCast(..)
             | Node::ZonedOperator(..) => false,
             // PG18: comparisons through timestamptz or timetz depend on TimeZone (STABLE);
@@ -525,9 +527,9 @@ impl BoundScalar {
                 value.insert_input_only()
             }
             Node::CrossCompare(_, a, b, _) => a.insert_input_only() && b.insert_input_only(),
-            Node::Sequence(_, args, _) | Node::ZonedOperator(_, args, _) => {
-                args.iter().all(Self::insert_input_only)
-            }
+            Node::Sequence(_, args, _)
+            | Node::Xact(_, args, _)
+            | Node::ZonedOperator(_, args, _) => args.iter().all(Self::insert_input_only),
             Node::Cast(value) => {
                 value.insert_input_only()
                     && (immutable_cast(&value.ty, &self.ty)

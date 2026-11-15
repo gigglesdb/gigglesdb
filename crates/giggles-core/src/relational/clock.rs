@@ -41,11 +41,14 @@ impl std::fmt::Debug for StatementClock {
 /// without translating the caller's CoreError.
 pub(crate) type SequenceCallback =
     Arc<dyn Fn(&str, &str, Option<i64>, bool) -> Result<Value, CoreError> + Send + Sync>;
+pub(crate) type XactCallback =
+    Arc<dyn Fn(&str, Option<i64>) -> Result<Value, CoreError> + Send + Sync>;
 #[derive(Clone)]
 pub(crate) struct ExecutionClock {
     clock: StatementClock,
     error: Arc<Mutex<Option<CoreError>>>,
     sequence: Option<SequenceCallback>,
+    xact: Option<XactCallback>,
     extra_float_digits: i32,
 }
 impl ExecutionClock {
@@ -53,6 +56,7 @@ impl ExecutionClock {
         Self {
             clock: clock.clone(),
             sequence: None,
+            xact: None,
             extra_float_digits: 1,
             error: Arc::new(Mutex::new(None)),
         }
@@ -79,6 +83,20 @@ impl ExecutionClock {
     ) -> Result<Value, SqlError> {
         match (self.sequence.as_ref().ok_or(SqlError::Unsupported)?)(name, sequence, value, called)
         {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                Err(SqlError::Unsupported)
+            }
+        }
+    }
+    pub(crate) fn with_xact(&self, callback: XactCallback) -> Self {
+        let mut context = self.clone();
+        context.xact = Some(callback);
+        context
+    }
+    pub(crate) fn xact(&self, name: &str, arg: Option<i64>) -> Result<Value, SqlError> {
+        match (self.xact.as_ref().ok_or(SqlError::Unsupported)?)(name, arg) {
             Ok(value) => Ok(value),
             Err(error) => {
                 *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
@@ -182,6 +200,7 @@ impl std::fmt::Debug for ExecutionClock {
         f.debug_struct("ExecutionClock")
             .field("clock", &self.clock)
             .field("sequence", &self.sequence.as_ref().map(|_| "<callback>"))
+            .field("xact", &self.xact.as_ref().map(|_| "<callback>"))
             .finish_non_exhaustive()
     }
 }

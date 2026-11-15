@@ -116,6 +116,11 @@ enum Node {
         Vec<BoundScalar>,
         Option<crate::relational::clock::ExecutionClock>,
     ),
+    Xact(
+        String,
+        Vec<BoundScalar>,
+        Option<crate::relational::clock::ExecutionClock>,
+    ),
     Clock(
         String,
         i32,
@@ -465,7 +470,14 @@ impl Scalar {
             Self::Call(name, args) => {
                 matches!(
                     name.as_str(),
-                    "nextval" | "setval" | "currval" | "random" | "clock_timestamp"
+                    "nextval"
+                        | "setval"
+                        | "currval"
+                        | "random"
+                        | "clock_timestamp"
+                        | "pg_current_xact_id"
+                        | "pg_current_xact_id_if_assigned"
+                        | "pg_xact_status"
                 ) || args.iter().any(Self::has_volatile_call)
             }
             Self::Cast(value, _) | Self::Domain(value, ..) | Self::Unary(_, value) => {
@@ -1169,6 +1181,43 @@ impl Scalar {
                 return greatest::bind(name, args, resolve, tables, parameters);
             }
             Self::Call(name, args) => {
+                if matches!(
+                    name.as_str(),
+                    "pg_current_xact_id" | "pg_current_xact_id_if_assigned" | "pg_xact_status"
+                ) {
+                    let status = name == "pg_xact_status";
+                    if args.len() != usize::from(status) {
+                        return Err(SqlError::UndefinedFunction);
+                    }
+                    let mut bound = Vec::with_capacity(args.len());
+                    for arg in args {
+                        let mut value = arg.bind(resolve, tables, parameters)?;
+                        if value.ty != DataType::BigInt {
+                            if let Self::Literal(raw @ (Value::Text(_) | Value::Null)) = arg {
+                                value = BoundScalar {
+                                    ty: DataType::BigInt,
+                                    node: literal_cast_node(raw.clone(), &DataType::BigInt)?,
+                                };
+                            } else if integer(&value.ty) {
+                                value = BoundScalar {
+                                    ty: DataType::BigInt,
+                                    node: Node::Cast(Box::new(value)),
+                                };
+                            } else {
+                                return Err(SqlError::UndefinedFunction);
+                            }
+                        }
+                        bound.push(value);
+                    }
+                    return Ok(BoundScalar {
+                        ty: if status {
+                            DataType::Text
+                        } else {
+                            DataType::BigInt
+                        },
+                        node: Node::Xact(name.clone(), bound, None),
+                    });
+                }
                 if planning::sequence_volatility(name).is_some() {
                     if !(matches!(name.as_str(), "nextval" | "currval") && args.len() == 1
                         || name == "setval" && matches!(args.len(), 2 | 3))
@@ -1729,7 +1778,9 @@ impl BoundScalar {
                 b.attach_clock(clock);
             }
             Node::Clock(_, _, target) => *target = clock.cloned(),
-            Node::Sequence(_, args, target) | Node::ZonedOperator(_, args, target) => {
+            Node::Sequence(_, args, target)
+            | Node::Xact(_, args, target)
+            | Node::ZonedOperator(_, args, target) => {
                 *target = clock.cloned();
                 args.iter_mut().for_each(|a| a.attach_clock(clock));
             }
@@ -1770,7 +1821,8 @@ impl BoundScalar {
             Node::Column(_, name)
             | Node::Call(name, _)
             | Node::Clock(name, ..)
-            | Node::Sequence(name, ..) => Some(name),
+            | Node::Sequence(name, ..)
+            | Node::Xact(name, ..) => Some(name),
             Node::Cast(a) | Node::SessionCast(a, _) | Node::TypmodCast(a, _) => a.strong_name(),
             _ => None,
         }
@@ -1819,7 +1871,7 @@ impl BoundScalar {
             Node::Call(n, args) if n == "\0array_subscript" => args[0].name(),
             Node::Call(n, _) if n.starts_with("\0json_") => "?column?",
             Node::Call(n, _) if arithmetic::internal_name(n) => "?column?",
-            Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) => n,
+            Node::Call(n, _) | Node::Clock(n, ..) | Node::Sequence(n, ..) | Node::Xact(n, ..) => n,
         }
     }
     pub(super) fn eval(&self, row: &Tuple, params: &[Value], budget: &mut usize) -> R<Value> {
@@ -1869,6 +1921,22 @@ impl BoundScalar {
                     ">=" => order != Ordering::Less,
                     _ => return Err(SqlError::UndefinedFunction),
                 });
+                charge(budget, &value)?;
+                Ok(value)
+            }
+            Node::Xact(name, args, clock) => {
+                let arg = match args.first() {
+                    Some(arg) => match arg.eval(row, params, budget)? {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Int(value) => Some(value),
+                        _ => return Err(SqlError::Type),
+                    },
+                    None => None,
+                };
+                let value = clock
+                    .as_ref()
+                    .ok_or(SqlError::Unsupported)?
+                    .xact(name, arg)?;
                 charge(budget, &value)?;
                 Ok(value)
             }
@@ -2683,6 +2751,11 @@ impl Scalar {
                 }
                 return Err(deferred_routine_error(n).unwrap());
             }
+            Self::Call(n, args) if n == "pg_xact_status" => {
+                for arg in args {
+                    arg.infer(Some(&DataType::BigInt), parameters, resolve, tables)?;
+                }
+            }
             Self::Call(n, args) if sequence_name(n) => {
                 for (i, arg) in args.iter().enumerate() {
                     let target = match i {
@@ -3126,5 +3199,134 @@ impl BoundScalar {
             ty: target.clone(),
             node,
         })
+    }
+}
+
+#[cfg(test)]
+mod xact_tests {
+    use super::*;
+    use crate::relational::clock::{ExecutionClock, StatementClock};
+    use std::sync::{Arc, Mutex};
+
+    fn clock() -> ExecutionClock {
+        ExecutionClock::new(&StatementClock {
+            unavailable: None,
+            transaction_us: 0,
+            statement_us: 0,
+            zone: None,
+            wall: None,
+        })
+    }
+    fn bind(name: &str, args: Vec<Scalar>) -> R<BoundScalar> {
+        let scalar = Scalar::Call(name.into(), args);
+        let resolve = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
+        let mut parameters = [None];
+        scalar.infer(None, &mut parameters, &resolve, &[])?;
+        scalar.bind(&resolve, &[], &parameters)
+    }
+    fn eval(bound: &mut BoundScalar, clock: &ExecutionClock, params: &[Value]) -> R<Value> {
+        bound.attach_clock(Some(clock));
+        bound.eval(
+            &Tuple {
+                values: vec![],
+                version: 0,
+            },
+            params,
+            &mut 0,
+        )
+    }
+    #[test]
+    fn current_ids_and_volatility() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let recorded = calls.clone();
+        let clock = clock().with_xact(Arc::new(move |name, arg| {
+            recorded.lock().unwrap().push((name.to_owned(), arg));
+            Ok(Value::Int(42))
+        }));
+        for name in ["pg_current_xact_id", "pg_current_xact_id_if_assigned"] {
+            let mut bound = bind(name, vec![]).unwrap();
+            assert_eq!(bound.ty, DataType::BigInt);
+            assert!(Scalar::Call(name.into(), vec![]).has_volatile_call());
+            assert_eq!(bound.plan_constant(&mut 0), Ok(None));
+            assert!(!bound.constraint_immutable());
+            assert_eq!(eval(&mut bound, &clock, &[]), Ok(Value::Int(42)));
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("pg_current_xact_id".into(), None),
+                ("pg_current_xact_id_if_assigned".into(), None),
+            ]
+        );
+    }
+    #[test]
+    fn status_arguments_and_null() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let recorded = calls.clone();
+        let clock = clock().with_xact(Arc::new(move |name, arg| {
+            recorded.lock().unwrap().push((name.to_owned(), arg));
+            Ok(Value::Text("committed".into()))
+        }));
+        for arg in [
+            Scalar::Literal(Value::Int(7)),
+            Scalar::Literal(Value::Text("7".into())),
+            Scalar::Param(1),
+            Scalar::Cast(Box::new(Scalar::Literal(Value::Int(7))), DataType::SmallInt),
+        ] {
+            let mut bound = bind("pg_xact_status", vec![arg]).unwrap();
+            assert_eq!(bound.ty, DataType::Text);
+            assert_eq!(bound.plan_constant(&mut 0), Ok(None));
+            assert_eq!(
+                eval(&mut bound, &clock, &[Value::Int(7)]),
+                Ok(Value::Text("committed".into()))
+            );
+        }
+        let mut null = bind("pg_xact_status", vec![Scalar::Literal(Value::Null)]).unwrap();
+        assert_eq!(eval(&mut null, &clock, &[]), Ok(Value::Null));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("pg_xact_status".into(), Some(7)); 4]
+        );
+        let resolve = |_: &ColumnRef, _: usize| Err(SqlError::UnknownColumn);
+        let mut parameters = [None];
+        Scalar::Call("pg_xact_status".into(), vec![Scalar::Param(1)])
+            .infer(None, &mut parameters, &resolve, &[])
+            .unwrap();
+        assert_eq!(parameters, [Some(DataType::BigInt)]);
+    }
+    #[test]
+    fn invalid_signatures() {
+        for (name, args) in [
+            ("pg_current_xact_id", vec![Scalar::Literal(Value::Int(1))]),
+            (
+                "pg_current_xact_id_if_assigned",
+                vec![Scalar::Literal(Value::Int(1))],
+            ),
+            ("pg_xact_status", vec![]),
+            ("pg_xact_status", vec![Scalar::Literal(Value::Bool(true))]),
+        ] {
+            assert!(matches!(bind(name, args), Err(SqlError::UndefinedFunction)));
+        }
+    }
+    #[test]
+    fn missing_callback_and_error_bridge() {
+        let clock = clock();
+        for (name, args) in [
+            ("pg_current_xact_id", vec![]),
+            ("pg_current_xact_id_if_assigned", vec![]),
+            ("pg_xact_status", vec![Scalar::Literal(Value::Int(7))]),
+        ] {
+            let mut bound = bind(name, args).unwrap();
+            assert_eq!(eval(&mut bound, &clock, &[]), Err(SqlError::Unsupported));
+        }
+        let failing = clock.with_xact(Arc::new(|_, _| {
+            Err(crate::CoreError::Storage("xact failure".into()))
+        }));
+        let mut bound = bind("pg_current_xact_id", vec![]).unwrap();
+        assert_eq!(eval(&mut bound, &failing, &[]), Err(SqlError::Unsupported));
+        assert!(
+            matches!(clock.take_error(), Some(crate::CoreError::Storage(message)) if message == "xact failure")
+        );
+        assert!(failing.take_error().is_none());
     }
 }

@@ -10,6 +10,11 @@ use relational::{
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
 mod sql_sequences;
+#[path = "v2_sql_xact.rs"]
+mod sql_xact;
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_xact_tests.rs"]
+mod xact_tests;
 #[path = "v2_reduction.rs"]
 mod reduction;
 #[cfg(all(test, feature = "engine-rocksdb"))]
@@ -134,7 +139,8 @@ impl SqlSession {
                     self.sequence_baseline.clone(),
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
-                ));
+                ))
+                .with_xact(sql_xact::callback(db.clone(), self.xact.clone()));
             let output = state.sql.normalize_copy(prepared, rows, Some(&context));
             crate::cancellation::check()?;
             if let Some(error) = context.take_error() {
@@ -266,7 +272,15 @@ impl SqlSession {
                                 .ok_or(CoreError::Sql(E::Transaction))?;
                             inner.sql_transactions.fetch_sub(1, Ordering::AcqRel);
                             let mut txn = txn;
-                            let validation = validate_pending(db, &mut txn, &mut self.deferral);
+                            let validation = validate_pending(db, &mut txn, &mut self.deferral)
+                                .and_then(|()| {
+                                    if let Some(guard) = self.xact.lock()
+                                        .map_err(|_| CoreError::Fenced)?.take()
+                                    {
+                                        txn.attach_xact(guard)?;
+                                    }
+                                    Ok(())
+                                });
                             if validation.is_err() {
                                 drop(live);
                                 self.rollback();
@@ -620,6 +634,7 @@ impl SqlSession {
                                 self.pending_sequences.clone(),
                                 self.sequence_values.clone(),
                             ))
+                            .with_xact(sql_xact::callback(db.clone(), self.xact.clone()))
                         });
                         if let Some(input) = self.copy_input.as_mut() {
                             let table = bound.table().ok_or(CoreError::Sql(E::Unsupported))?;
@@ -791,7 +806,13 @@ impl SqlSession {
                     txn.release(mark).map_err(CoreError::from)?;
                     if self.v2_transaction.is_none() && result.is_ok() {
                         let point = *inner.crash.lock().map_err(|_| CoreError::Fenced)?;
-                        commit_sql(db, implicit.take().expect("implicit transaction"), point)?;
+                        let mut txn = implicit.take().expect("implicit transaction");
+                        if let Some(guard) = self.xact.lock()
+                            .map_err(|_| CoreError::Fenced)?.take()
+                        {
+                            txn.attach_xact(guard)?;
+                        }
+                        commit_sql(db, txn, point)?;
                         acknowledge_sql_commit(point)?;
                     }
                     result
@@ -812,6 +833,7 @@ impl SqlSession {
             self.abort();
         }
         if self.v2_transaction.is_none() {
+            self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
             self.transaction_clock_us = None;
         }
         result

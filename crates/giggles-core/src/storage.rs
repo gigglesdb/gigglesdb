@@ -1882,6 +1882,8 @@ fn deferral_bytes(state: &relational::DeferralState) -> Result<u64, CoreError> {
     }
     Ok(bytes)
 }
+pub(crate) type XactSlot = Arc<Mutex<Option<engine::xact::XactGuard>>>;
+
 /// Trusted session only. Dropping a session discards its staged transaction.
 /// No lock or admission ticket lives across client calls.
 pub struct SqlSession {
@@ -1903,6 +1905,7 @@ pub struct SqlSession {
     staged_revision: u64,
     sequence_values: sequences::SessionValues,
     pending_sequences: sequences::Pending,
+    xact: XactSlot,
     sequence_baseline: BTreeMap<u64, u128>,
     sequence_tables: Option<std::collections::BTreeSet<String>>,
     deferral: relational::DeferralState,
@@ -1931,6 +1934,7 @@ impl Admin {
             staged_revision: 0,
             sequence_values: Default::default(),
             pending_sequences: Default::default(),
+            xact: Default::default(),
             sequence_baseline: BTreeMap::new(),
             sequence_tables: None,
             deferral: Default::default(),
@@ -3723,6 +3727,7 @@ impl SqlSession {
             })
     }
     pub fn rollback(&mut self) {
+        self.xact.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.copy_input = None;
         let v2 = self.v2_transaction.take().is_some();
         if self.staged.take().is_some() || v2 {
