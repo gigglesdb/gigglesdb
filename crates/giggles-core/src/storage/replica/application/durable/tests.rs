@@ -454,3 +454,105 @@ fn export_restore_fresh_domain_revokes_active_authority_retains_forensic_outcome
     fresh.body.domain = fresh_authority.domain;
     assert!(matches!(apply(&next, &fresh).1, Outcome::Success(_)));
 }
+
+fn legacy_fixture() -> (Image, Command) {
+    let (original, mut command, authority) = fixture();
+    let mut s = state(&original);
+    let create = Prepared::create_engine(
+        "typed_items".into(),
+        [("id", DataType::BigInt, true), ("s", DataType::SmallInt, false),
+         ("i", DataType::Integer, false), ("num", DataType::Numeric, false),
+         ("t", DataType::Text, false), ("b", DataType::Boolean, false),
+         ("nn", DataType::BigInt, true)]
+            .into_iter().map(|(name, data_type, not_null)| ColumnDef {
+                id: 0, name: name.into(), data_type, not_null,
+            }).collect(), vec!["id".into()], 123, &s.sql,
+    ).unwrap();
+    s.sql.execute(&create, &[], None).unwrap();
+    let table = s.sql.tables["typed_items"].clone();
+    let insert = Prepared::insert_engine(&table, vec![Value::Int(1), Value::Null,
+        Value::Null, Value::Null, Value::Null, Value::Null, Value::Int(9)], 123, &s.sql).unwrap();
+    s.sql.execute(&insert, &[], None).unwrap();
+    s.applications = None;
+    command.body.table = table.id;
+    command.body.catalog_epoch = s.sql.epoch;
+    let authority = Authority { catalog_epoch: s.sql.epoch,
+        read_tables: BTreeSet::from([table.id]), write_tables: BTreeSet::from([table.id]),
+        ..authority };
+    (image(&s).evaluate_application_owner(&OwnerCommand::Provision(authority)).unwrap(), command)
+}
+#[test]
+fn frozen_bind_failures_and_success_are_retained() {
+    use crate::relational::{Numeric, Float8};
+    let (original, read) = legacy_fixture();
+    let (_, read_out) = apply(&original, &read);
+    let table = state(&original).sql.tables["typed_items"].clone();
+    let numeric = |s| Value::Numeric(Numeric::parse(s).unwrap());
+    let cases = vec![
+        vec![(1, Value::Int(100000))], vec![(2, Value::Int(2147483648))],
+        vec![(3, Value::Int(7))], vec![(2, numeric("2.5"))],
+        vec![(6, Value::Float8(Float8::from_bits(2.5f64.to_bits())))],
+        vec![(2, Value::Bool(true))], vec![(3, Value::Text("1".into()))],
+        vec![(6, Value::Null)], vec![(1, Value::Int(100000)), (6, Value::Null)],
+        vec![(4, Value::Text("ok".into())), (1, Value::Int(100000))],
+    ];
+    for (n, values) in cases.into_iter().enumerate() {
+        let mut command = read.clone();
+        command.identity.operation = 10 + n as u128;
+        command.body.operation = Operation::GuardedWrite { key: vec![Value::Int(1)],
+            expected_version: version(&read_out), assignments: values.into_iter()
+                .map(|(i, v)| (table.columns[i].id, v)).collect() };
+        let before = original.bytes().to_vec();
+        let (next, out) = apply(&original, &command);
+        assert_eq!(out, Outcome::Failure(Failure::Type), "case {n}");
+        assert_eq!(original.bytes(), before);
+        assert_eq!(state(&next).sql, state(&original).sql);
+        let reopened = Image::from_bytes(next.bytes().to_vec()).unwrap();
+        assert_eq!(apply(&reopened, &command), (next.clone(), out));
+        assert_eq!(apply(&original, &command).0, next);
+    }
+    for (n, value) in [Value::Text("1".into()), Value::Bool(true)].into_iter().enumerate() {
+        let mut command = read.clone();
+        command.identity.operation = 30 + n as u128;
+        command.body.operation = Operation::Read { key: vec![value] };
+        let before = original.bytes().to_vec();
+        let (next, out) = apply(&original, &command);
+        assert_eq!(out, Outcome::Failure(Failure::Type));
+        assert_eq!(original.bytes(), before);
+        assert_eq!(state(&next).sql, state(&original).sql);
+        assert_eq!(apply(&next, &command), (next.clone(), out));
+        assert_eq!(apply(&original, &command).0, next);
+    }
+    let mut command = read;
+    command.identity.operation = 40;
+    command.body.operation = Operation::GuardedWrite { key: vec![Value::Int(1)],
+        expected_version: version(&read_out), assignments: vec![
+            (table.columns[1].id, Value::Int(5)), (table.columns[3].id, numeric("1.5")),
+            (table.columns[4].id, Value::Text("ok".into()))] };
+    let (next, out) = apply(&original, &command);
+    assert_eq!(out, Outcome::Success(Success { columns: vec![], rows: vec![],
+        matched: 1, affected: 1, changed: 1, complete: true }));
+    assert_eq!(apply(&next, &command), (next.clone(), out));
+    let mut fresh = command;
+    fresh.identity.operation = 41;
+    fresh.body.operation = Operation::Read { key: vec![Value::Int(1)] };
+    let Outcome::Success(out) = apply(&next, &fresh).1 else { panic!() };
+    assert_eq!(out.rows[0].values, vec![Value::Int(1), Value::Int(5), Value::Null,
+        numeric("1.5"), Value::Text("ok".into()), Value::Null, Value::Int(9)]);
+}
+#[test]
+fn frozen_bind_bpchar_and_expansion_limit() {
+    let (original, read) = legacy_fixture();
+    let mut table = state(&original).sql.tables["typed_items"].clone();
+    table.columns[0].data_type = DataType::Bpchar;
+    assert_eq!(legacy::bind_failure(&table, &read.body), Some(Failure::Unsupported));
+    table.columns[0].data_type = DataType::Text;
+    let mut body = read.body.clone();
+    body.operation = Operation::GuardedWrite {
+        key: vec![Value::Text("x".repeat(operations::MAX_BOUND_VALUE_BYTES / 2 + 1))],
+        expected_version: 1, assignments: vec![(table.columns[4].id, Value::Text("ok".into()))],
+    };
+    // A valid command exceeds the binder cap when its key is bound again for the guard.
+    Command { body: body.clone(), ..read }.validate().unwrap();
+    assert_eq!(legacy::bind_failure(&table, &body), Some(Failure::Limit));
+}

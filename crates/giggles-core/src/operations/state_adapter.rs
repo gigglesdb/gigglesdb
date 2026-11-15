@@ -238,19 +238,6 @@ pub(crate) fn execute_fenced(
     description: &BoundDescription,
     expected_version: Option<u64>,
 ) -> Result<(State, Outcome)> {
-    if description.contract_version != ENGINE_CONTRACT_VERSION
-        || state.view.domain != description.database_domain
-        || state.sql.epoch != description.catalog_epoch
-        || state
-            .sql
-            .tables
-            .get(&state.sql.table_key(&description.table))
-            != Some(&description.table)
-        || state.sql.resolve_relation_key(&native_relation_key(request.table()?), &["public".into()])
-            != state.sql.table_key(&description.table)
-    {
-        return Err(core(CoreError::Sql(SqlError::StaleSchema)));
-    }
     execute_inner(
         state,
         request,
@@ -258,12 +245,35 @@ pub(crate) fn execute_fenced(
         Some((description, expected_version)),
     )
 }
-fn execute_inner(
+/// Check the snapshot fence and request shape before binding any values.
+pub(crate) fn admit_fenced(
     state: &State,
     request: &Request,
     bindings: &Bindings,
-    fence: Option<(&BoundDescription, Option<u64>)>,
-) -> Result<(State, Outcome)> {
+    description: &BoundDescription,
+) -> Result<()> {
+    admit_inner(state, request, bindings, Some(description))
+}
+fn admit_inner(
+    state: &State,
+    request: &Request,
+    bindings: &Bindings,
+    description: Option<&BoundDescription>,
+) -> Result<()> {
+    if let Some(description) = description
+        && (description.contract_version != ENGINE_CONTRACT_VERSION
+            || state.view.domain != description.database_domain
+            || state.sql.epoch != description.catalog_epoch
+            || state
+                .sql
+                .tables
+                .get(&state.sql.table_key(&description.table))
+                != Some(&description.table)
+            || state.sql.resolve_relation_key(&native_relation_key(request.table()?), &["public".into()])
+                != state.sql.table_key(&description.table))
+    {
+        return Err(core(CoreError::Sql(SqlError::StaleSchema)));
+    }
     validate_request(request)?;
     validate_bindings(bindings)?;
     let filter = match request {
@@ -296,6 +306,15 @@ fn execute_inner(
     if seen.len() != table.primary_key.len() {
         return Err(Error::Unsupported);
     }
+    Ok(())
+}
+fn execute_inner(
+    state: &State,
+    request: &Request,
+    bindings: &Bindings,
+    fence: Option<(&BoundDescription, Option<u64>)>,
+) -> Result<(State, Outcome)> {
+    admit_inner(state, request, bindings, fence.map(|(description, _)| description))?;
     let mut context = SnapshotContext {
         state: state.clone(),
     };

@@ -11,6 +11,15 @@ pub(crate) fn execute(
     operations::state_adapter::execute(state, request, bindings)
 }
 
+pub(crate) fn admit_fenced(
+    state: &State,
+    request: &Request,
+    bindings: &Bindings,
+    description: &BoundDescription,
+) -> operations::Result<()> {
+    operations::state_adapter::admit_fenced(state, request, bindings, description)
+}
+
 /// Exact canonical catalog/domain/table fence and explicit optimistic row version.
 /// No caller authority or retry ledger is inferred from the supplied description.
 #[allow(dead_code)]

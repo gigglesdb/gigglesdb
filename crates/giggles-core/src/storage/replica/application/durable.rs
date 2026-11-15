@@ -1,3 +1,4 @@
+mod legacy;
 use super::*;
 use crate::operations::{self, Bindings, BoundDescription, Compare, Expr, Intent, ValueExpr};
 use crate::storage::{State, decode, encode, records};
@@ -225,6 +226,7 @@ fn fenced<'a>(
         .ok_or(Error::Fenced)?;
     Ok((ledger, table))
 }
+// Bind-time categories come from legacy.rs.
 fn failure(error: operations::Error) -> Failure {
     use operations::Error as E;
     match error {
@@ -432,15 +434,23 @@ impl super::super::Image {
         {
             return Ok(Err(Error::Capacity));
         }
-        let (mut next, outcome) = match crate::storage::operation_adapter::execute_fenced(
-            &state,
-            &request,
-            &Bindings::new(),
-            &description,
-            expected,
+        let (mut next, outcome) = if let Err(e) = crate::storage::operation_adapter::admit_fenced(
+            &state, &request, &Bindings::new(), &description,
         ) {
-            Ok((next, out)) => (next, Outcome::Success(out.into())),
-            Err(e) => (state.clone(), Outcome::Failure(failure(e))),
+            (state.clone(), Outcome::Failure(failure(e)))
+        } else if let Some(failure) = legacy::bind_failure(table, &command.body) {
+            (state.clone(), Outcome::Failure(failure))
+        } else {
+            match crate::storage::operation_adapter::execute_fenced(
+                &state,
+                &request,
+                &Bindings::new(),
+                &description,
+                expected,
+            ) {
+                Ok((next, out)) => (next, Outcome::Success(out.into())),
+                Err(e) => (state.clone(), Outcome::Failure(failure(e))),
+            }
         };
         if encode(&outcome)?.len() > reserve {
             return Err(CoreError::Limit);

@@ -1129,3 +1129,13 @@ fn sql_proposed_update_image_conflict() {
     assert!(session.is_aborted());
     assert_eq!(actual(&mut admin.sql_session()), before);
 }
+
+#[test]
+fn into_sql_preserves_operator_type_errors() {
+    assert_eq!(
+        into_sql(PlanError::Engine(Error::Sql {
+            sqlstate: "42883".into(),
+        })),
+        SqlError::Type
+    );
+}

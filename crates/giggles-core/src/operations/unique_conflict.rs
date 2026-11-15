@@ -778,6 +778,7 @@ fn into_sql(error: PlanError) -> SqlError {
             Error::Type => SqlError::Type,
             Error::Sql { sqlstate } if sqlstate == "23502" => SqlError::Null,
             Error::Sql { sqlstate } if sqlstate == "42804" => SqlError::Type,
+            Error::Sql { sqlstate } if sqlstate == "42883" => SqlError::Type,
             Error::DivisionByZero => SqlError::DivisionByZero,
             Error::Limit => SqlError::Limit,
             Error::Overflow => SqlError::Overflow,

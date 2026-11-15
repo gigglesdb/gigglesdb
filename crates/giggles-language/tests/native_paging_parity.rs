@@ -117,7 +117,9 @@ fn paging_errors_and_opt_in() {
         assert_eq!(with_sql_parser_forbidden(|| e.read_page(&tree, &many)), Err(Error::Limit));
         let shared = Bindings::from([("i".into(),Value::Int(7))]);
         assert!(with_sql_parser_forbidden(|| e.read_page_text("page t where id>$i order by id after ($i)", &shared)).is_ok());
-        assert_eq!(with_sql_parser_forbidden(|| e.read_page_text(r#"page t order by id after ("bad")"#, &b)), Err(Error::Type));
+        // A text cursor against an int key is an int-vs-text comparison: PG18.6 gives 42883
+        // (operator does not exist), which native reports since CORE-GAPS (GD-0001 R2).
+        assert_eq!(with_sql_parser_forbidden(|| e.read_page_text(r#"page t order by id after ("bad")"#, &b)), Err(Error::Sql { sqlstate: "42883".into() }));
         let numeric = Bindings::from([("i".into(), Value::Numeric(giggles_core::relational::Numeric::parse("1").unwrap()))]);
         assert_eq!(with_sql_parser_forbidden(|| e.read_page_text("page t order by id after ($i)", &numeric)), Err(Error::Unsupported));
         let extra = Bindings::from([("extra".into(),Value::Int(1))]);
