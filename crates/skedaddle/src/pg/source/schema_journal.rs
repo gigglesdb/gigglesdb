@@ -42,6 +42,87 @@ fn source(s: &SourceIdentity) -> [String; 5] {
     ]
 }
 
+/// Canonical JSON carried by the authenticated coordinator Progress journal.
+/// No schema object is written for ordinary DML.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BufferedEnd {
+    version: u32,
+    identity: Identity,
+    mseq: u64,
+    manifest_digest: [u8; 32],
+    txn: Vec<u8>,
+    txn_digest: [u8; 32],
+    commit: u64,
+    end: u64,
+}
+
+impl BufferedEnd {
+    fn encode(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|_| invalid("buffered END encoding"))
+    }
+    fn decode(marker: &str) -> Result<Option<Self>> {
+        if marker == "manifest-durable" {
+            return Ok(None);
+        }
+        let value: Self = serde_json::from_str(marker).map_err(|_| {
+            invalid("buffered END encoding/version; recovery or fresh snapshot required")
+        })?;
+        if value.version != 1 || value.encode()? != marker || value.end < value.commit {
+            return Err(invalid("noncanonical buffered END binding"));
+        }
+        Ok(Some(value))
+    }
+    fn verify(&self, identity: &Identity, c: &WriterCheckpoint) -> Result<Option<u64>> {
+        if &self.identity != identity {
+            return Err(invalid("buffered END source/stream identity mismatch"));
+        }
+        // A publication absent from the recovered prefix cannot authorize END.
+        if self.mseq >= c.next_mseq {
+            return Ok(None);
+        }
+        if self.mseq == c.next_mseq - 1 && self.manifest_digest != c.prev_digest {
+            return Err(invalid("buffered END manifest digest mismatch"));
+        }
+        // These references come from verified manifest replay OR the trusted
+        // writer checkpoint. Thus GC of the underlying objects is harmless.
+        let entries: Vec<_> = c
+            .redelivery
+            .iter()
+            .filter(|r| r.manifest.as_ref().is_some_and(|m| m.mseq == self.mseq))
+            .collect();
+        if !entries.is_empty() {
+            if entries
+                .iter()
+                .any(|r| r.manifest.as_ref().unwrap().manifest_digest != self.manifest_digest)
+            {
+                return Err(invalid("buffered END manifest digest mismatch"));
+            }
+            if entries.iter().any(|r| {
+                source(&r.source) == identity.source
+                    && r.position.order_domain() == identity.domain
+                    && r.position.bytes() == self.commit.to_be_bytes()
+                    && r.txn.0 == self.txn
+                    && r.digest == self.txn_digest
+                    && !r.chunk_rows
+            }) {
+                return Ok(Some(self.end));
+            }
+            return Err(invalid("buffered END transaction mismatch"));
+        }
+        // History retired from the checkpoint has no remaining proof. Never
+        // infer END from COMMIT, WAL tips, or a sequence comparison alone.
+        if c.redelivery_from.as_ref().is_some_and(|p| {
+            p.order_domain() == identity.domain && p.bytes() > self.commit.to_be_bytes().as_slice()
+        }) {
+            return Ok(None);
+        }
+        Err(invalid(
+            "buffered END missing writer evidence; recover journal/writer or take a fresh snapshot",
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriterBoundary {
@@ -187,6 +268,74 @@ impl SchemaJournal {
             pending: None,
             ready: false,
         })
+    }
+
+    pub fn buffered_marker(
+        &self,
+        c: &WriterCheckpoint,
+        txn: &AssembledTxn,
+        end: u64,
+    ) -> Result<String> {
+        let commit = commit_lsn(txn)?;
+        let r = c
+            .redelivery
+            .iter()
+            .find(|r| {
+                r.source == txn.source
+                    && r.txn == txn.txn
+                    && r.digest == txn.digest
+                    && r.position == txn.commit_position
+                    && !r.chunk_rows
+            })
+            .ok_or(invalid("buffered END transaction not durable"))?;
+        let m = r
+            .manifest
+            .as_ref()
+            .ok_or(invalid("buffered END manifest not durable"))?;
+        let value = BufferedEnd {
+            version: 1,
+            identity: self.identity.clone(),
+            mseq: m.mseq,
+            manifest_digest: m.manifest_digest,
+            txn: txn.txn.0.clone(),
+            txn_digest: txn.digest,
+            commit,
+            end,
+        };
+        if value.verify(&self.identity, c)? != Some(end) {
+            return Err(invalid("buffered END outside writer prefix"));
+        }
+        value.encode()
+    }
+
+    async fn resume_end(
+        &self,
+        c: &WriterCheckpoint,
+        fallback: u64,
+        schema_end: u64,
+    ) -> Result<u64> {
+        // Read durable journal state, never Runtime's coalesced pending markers.
+        let state = self
+            .binding
+            .journal
+            .load(true)
+            .await
+            .map_err(Error::SchemaJournal)?;
+        let Some((marker, position)) = state.progress.get("buffered") else {
+            return Ok(fallback);
+        };
+        let Some(value) = BufferedEnd::decode(marker)? else {
+            return Ok(fallback);
+        };
+        if position != &value.end.to_string() {
+            return Err(invalid("buffered END progress position mismatch"));
+        }
+        // A cancelled step can promote a newer DDL snapshot before its
+        // coalesced buffered marker is flushed. Its independently authenticated
+        // END must not regress, or replay would reclassify already-restored DDL.
+        Ok(value
+            .verify(&self.identity, c)?
+            .map_or(fallback, |end| end.max(schema_end)))
     }
 
     fn stream(&self) -> String {
@@ -548,7 +697,8 @@ impl SchemaJournal {
                 self.pending = None;
                 return Ok((
                     baseline.clone(),
-                    baseline_lsn.max(Self::writer_lsn(c)?),
+                    self.resume_end(c, baseline_lsn.max(Self::writer_lsn(c)?), baseline_lsn)
+                        .await?,
                     false,
                 ));
             }
@@ -562,7 +712,12 @@ impl SchemaJournal {
         self.pending = None;
         Ok((
             restored,
-            selected.end_lsn.max(Self::writer_lsn(c)?),
+            self.resume_end(
+                c,
+                selected.end_lsn.max(Self::writer_lsn(c)?),
+                selected.end_lsn,
+            )
+            .await?,
             selected.unknown,
         ))
     }
@@ -671,5 +826,113 @@ impl SchemaJournal {
         self.cleanup(&mut head).await?;
         self.pending = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod buffered_end_tests {
+    use super::*;
+    use crate::{
+        buffer::writer::{DurableManifestRef, RetainedRedelivery},
+        event::{Position, TxnId},
+    };
+
+    fn fixture() -> (BufferedEnd, WriterCheckpoint) {
+        let identity = Identity {
+            namespace: "journal".into(),
+            stream: "stream".into(),
+            installation: "installation".into(),
+            source: ["pg", "system", "timeline", "database", "slot"].map(str::to_string),
+            domain: "domain".into(),
+        };
+        let value = BufferedEnd {
+            version: 1,
+            identity,
+            mseq: 2,
+            manifest_digest: [3; 32],
+            txn: vec![7],
+            txn_digest: [9; 32],
+            commit: 100,
+            end: 148,
+        };
+        let checkpoint = WriterCheckpoint {
+            next_mseq: 3,
+            prev_digest: [3; 32],
+            redelivery: vec![RetainedRedelivery {
+                source: SourceIdentity {
+                    engine: "pg".into(),
+                    system_id: "system".into(),
+                    lineage: "timeline".into(),
+                    db_name: "database".into(),
+                    slot: "slot".into(),
+                },
+                txn: TxnId(vec![7]),
+                position: Position::new("domain", 100u64.to_be_bytes()),
+                digest: [9; 32],
+                chunk_rows: false,
+                manifest: Some(DurableManifestRef {
+                    mseq: 2,
+                    manifest_digest: [3; 32],
+                }),
+            }],
+            ..WriterCheckpoint::default()
+        };
+        (value, checkpoint)
+    }
+
+    #[test]
+    fn canonical_round_trip_and_legacy_fallback() {
+        let (v, _) = fixture();
+        assert_eq!(
+            BufferedEnd::decode(&v.encode().unwrap()).unwrap(),
+            Some(v.clone())
+        );
+        assert!(BufferedEnd::decode("manifest-durable").unwrap().is_none());
+        assert!(BufferedEnd::decode(&(v.encode().unwrap() + " ")).is_err());
+        let mut bad = v;
+        bad.version = 2;
+        assert!(BufferedEnd::decode(&bad.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn authentic_prefix_accepts_and_conflicts_fail_closed() {
+        let (v, c) = fixture();
+        assert_eq!(v.verify(&v.identity, &c).unwrap(), Some(148));
+        let mut bad = v.clone();
+        bad.manifest_digest[0] ^= 1;
+        assert!(bad.verify(&v.identity, &c).is_err());
+        let mut bad = v.clone();
+        bad.txn_digest[0] ^= 1;
+        assert!(bad.verify(&v.identity, &c).is_err());
+        let mut bad = v.clone();
+        bad.commit += 1;
+        assert!(bad.verify(&v.identity, &c).is_err());
+        for field in 0..5 {
+            let mut identity = v.identity.clone();
+            identity.source[field].push('x');
+            assert!(v.verify(&identity, &c).is_err());
+        }
+        let mut identity = v.identity.clone();
+        identity.stream.push('x');
+        assert!(v.verify(&identity, &c).is_err());
+        let mut bad = v.clone();
+        bad.mseq = 1;
+        assert!(bad.verify(&v.identity, &c).is_err());
+    }
+
+    #[test]
+    fn absent_cancelled_publication_and_pruned_history() {
+        let (v, mut c) = fixture();
+        c.next_mseq = 2;
+        c.redelivery.clear();
+        assert_eq!(v.verify(&v.identity, &c).unwrap(), None);
+        // An authenticated checkpoint retains the proof even after object GC.
+        let (v, mut c) = fixture();
+        c.next_mseq = 5;
+        c.prev_digest = [8; 32];
+        assert_eq!(v.verify(&v.identity, &c).unwrap(), Some(148));
+        c.redelivery.clear();
+        c.redelivery_from = Some(Position::new("domain", 200u64.to_be_bytes()));
+        assert_eq!(v.verify(&v.identity, &c).unwrap(), None);
     }
 }

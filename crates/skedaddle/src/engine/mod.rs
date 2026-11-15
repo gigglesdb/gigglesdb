@@ -103,6 +103,15 @@ pub trait Capture {
     fn schema_state(&self) -> Option<source::SchemaState> {
         None
     }
+    /// Schema-aware adapters must forward the writer-bound END receipt.
+    fn buffered_marker(&self, _batch: &Captured) -> Result<String> {
+        if self.schema_state().is_some() {
+            return Err(recovery(
+                "schema-aware capture must forward buffered_marker",
+            ));
+        }
+        Ok("manifest-durable".into())
+    }
     fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
         Ok(None)
     }
@@ -1111,13 +1120,19 @@ fn capture_loop(
             runtime.6.observe(&batch);
             runtime.7.observe(&batch);
             let checkpoint = capture.writer_checkpoint()?;
-            Box::pin(runtime.capture_final_marker(&batch, checkpoint.as_ref())).await?;
-            runtime.queue_writer(checkpoint).await;
             if let Some(lsn) = batch.durable_lsn {
                 runtime
-                    .progress_marker("buffered", "manifest-durable".into(), lsn.to_string())
+                    .progress_marker(
+                        "buffered",
+                        capture.buffered_marker(&batch)?,
+                        lsn.to_string(),
+                    )
                     .await?;
             }
+            // Final receipts flush the current END binding before notifying
+            // receipt waiters; never publish a receipt ahead of restart proof.
+            Box::pin(runtime.capture_final_marker(&batch, checkpoint.as_ref())).await?;
+            runtime.queue_writer(checkpoint).await;
             if batch
                 .transaction
                 .as_ref()

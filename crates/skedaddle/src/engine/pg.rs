@@ -352,6 +352,16 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
     fn schema_state(&self) -> Option<source::SchemaState> {
         Some(self.capture.schema_state())
     }
+    fn buffered_marker(&self, batch: &Captured) -> Result<String> {
+        let txn = batch
+            .transaction
+            .as_ref()
+            .ok_or_else(|| recovery("buffered END missing transaction"))?;
+        let end = batch
+            .durable_lsn
+            .ok_or_else(|| recovery("buffered END missing END"))?;
+        self.capture.buffered_marker(txn, end).map_err(recovery)
+    }
     fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
         self.capture
             .writer()

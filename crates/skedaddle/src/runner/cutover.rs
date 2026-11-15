@@ -362,6 +362,9 @@ impl<C: Capture> Capture for Observed<C> {
     fn schema_state(&self) -> Option<source::SchemaState> {
         self.capture.schema_state()
     }
+    fn buffered_marker(&self, batch: &engine::Captured) -> coordinator::Result<String> {
+        self.capture.buffered_marker(batch)
+    }
     fn writer_checkpoint(
         &self,
     ) -> coordinator::Result<Option<crate::buffer::writer::WriterCheckpoint>> {

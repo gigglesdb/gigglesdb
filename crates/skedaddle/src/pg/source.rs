@@ -131,7 +131,13 @@ pub(super) async fn resume<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     verify_connected(connection, &checkpoint.lineage)?;
     connection
         .start(&checkpoint.slot, checkpoint.durable_lsn, publications)
-        .await?;
+        .await
+        .map_err(|error| match error {
+            ReplicationError::RecoveryRequired(super::replication::RecoveryRequired::PositionUnavailable { .. }) => Error::RecoveryRequired(
+                "slot no longer covers authenticated resume position; restore matching writer/journal evidence or take a fresh snapshot (legacy or retired buffered END proof may be unavailable)",
+            ),
+            other => Error::Replication(other),
+        })?;
     Ok(())
 }
 
@@ -357,6 +363,16 @@ impl<R: TypeResolver> Capture<R> {
         self.restored_unknown = unknown;
         journal.ready = true;
         Ok(())
+    }
+
+    /// Bind a captured END to this installation's durable writer prefix.
+    pub fn buffered_marker(&self, txn: &AssembledTxn, end: u64) -> Result<String> {
+        self.schema_journal
+            .as_ref()
+            .ok_or(Error::RecoveryRequired(
+                "buffered END requires schema journal",
+            ))?
+            .buffered_marker(&self.writer.checkpoint()?, txn, end)
     }
 
     /// Complete retained state for inspection, without exposing mutable capture

@@ -537,6 +537,9 @@ async fn delayed_manifest_acknowledgement_completes_without_tick_cancellation() 
         fn schema_state(&self) -> Option<source::SchemaState> {
             self.0.schema_state()
         }
+        fn buffered_marker(&self, batch: &Captured) -> Result<String> {
+            self.0.buffered_marker(batch)
+        }
         fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
             self.0.writer_checkpoint()
         }
@@ -965,6 +968,9 @@ async fn copy_throttle_never_stalls_capture() {
         }
         fn schema_state(&self) -> Option<source::SchemaState> {
             self.inner.schema_state()
+        }
+        fn buffered_marker(&self, batch: &Captured) -> Result<String> {
+            self.inner.buffered_marker(batch)
         }
         fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
             self.inner.writer_checkpoint()

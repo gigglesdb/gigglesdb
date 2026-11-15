@@ -359,10 +359,11 @@ impl source::Transport for Bytes {
     }
 }
 #[derive(Default)]
-struct Sink(usize);
+struct Sink(usize, Option<AssembledTxn>);
 impl WatermarkSink for Sink {
-    fn committed(&mut self, _: &AssembledTxn) -> source::Result<()> {
+    fn committed(&mut self, txn: &AssembledTxn) -> source::Result<()> {
         self.0 += 1;
+        self.1 = Some(txn.clone());
         Ok(())
     }
     fn watermark(&mut self, _: source::Watermark) -> source::Result<()> {
@@ -1049,7 +1050,7 @@ fn schema_snapshot_rejects_duplicate_tables_and_future_versions() {
 
 // Protocol fixtures transport bytes only; publication, journal and snapshots use
 // real local durable backends throughout these regressions.
-async fn dml(c: &mut Capture<Resolver>, lsn: u64) {
+async fn dml(c: &mut Capture<Resolver>, lsn: u64) -> AssembledTxn {
     let mut wire = messages(&internal(1), lsn);
     let mut relation = vec![b'R'];
     relation.extend(1_u32.to_be_bytes());
@@ -1077,12 +1078,82 @@ async fn dml(c: &mut Capture<Resolver>, lsn: u64) {
             Step::Message
         );
     }
+    let mut sink = Sink::default();
     assert!(matches!(
-        c.step(&mut bytes, &mut Sink::default(), &mut paused)
-            .await
-            .unwrap(),
+        c.step(&mut bytes, &mut sink, &mut paused).await.unwrap(),
         Step::Durable { stop: None, .. }
     ));
+    sink.1.unwrap()
+}
+
+#[tokio::test]
+async fn buffered_end_restore_uses_only_durable_matching_writer_evidence() {
+    for mode in [
+        "bound",
+        "legacy",
+        "cancelled",
+        "absent",
+        "retired",
+        "schema-ahead",
+        "gc",
+        "conflict",
+    ] {
+        let f = Fixture::new();
+        let (e, mut c) = f.fresh().await;
+        capture_record(&mut c, &alter(), 20).await;
+        let txn = dml(&mut c, 40).await;
+        let marker = c.buffered_marker(&txn, 41).unwrap();
+        let marker = match mode {
+            "legacy" => "manifest-durable".into(),
+            "absent" => marker.replace("\"mseq\":1", "\"mseq\":2"),
+            "conflict" => marker.replace("\"commit\":40", "\"commit\":39"),
+            _ => marker,
+        };
+        if mode != "cancelled" {
+            e.runtime()
+                .marker("buffered", marker, "41".into())
+                .await
+                .unwrap();
+        }
+        let mut saved = c.writer().checkpoint().unwrap();
+        if mode == "retired" {
+            // Advance beyond the receipt; trusted checkpoint references still
+            // authenticate the older marker without a manifest object read.
+            dml(&mut c, 50).await;
+            saved = c.writer().checkpoint().unwrap();
+        }
+        if mode == "schema-ahead" {
+            // Schema promotion can complete while capture-loop cancellation
+            // leaves the durable buffered marker at the preceding DML END.
+            capture_record(&mut c, &internal(2), 60).await;
+            saved = c.writer().checkpoint().unwrap();
+        }
+        if mode == "gc" {
+            f.buffer
+                .delete(&reader_config().manifest_key(1))
+                .await
+                .unwrap();
+        }
+        drop(c);
+        drop(e);
+        let e = f.owner().await;
+        let mut c = f.capture(e.runtime().state().await.epoch, saved).await;
+        let restored = c.restore_schema(f.binding(e.runtime())).await;
+        if mode == "conflict" {
+            assert!(restored.is_err());
+            continue;
+        }
+        restored.unwrap();
+        assert_eq!(
+            c.durable_lsn(),
+            match mode {
+                "bound" | "gc" => 41,
+                "retired" => 41,
+                "schema-ahead" => 61,
+                _ => 40,
+            }
+        );
+    }
 }
 
 #[tokio::test]

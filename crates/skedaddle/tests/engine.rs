@@ -1095,6 +1095,8 @@ fn copy_table(
                 stream: serde_json::json!(["engine", id, "wal"]).to_string(),
             })).await?;
             assert_eq!(serde_json::to_value(raw.schema_snapshot())?, saved_schema);
+            let buffered_end: u64 = state.progress.get("buffered").ok_or("durable buffered END absent")?.1.parse()?;
+            assert_eq!(raw.durable_lsn(), buffered_end, "restart must retain acknowledged transaction END after later DML");
             let mut checkpoint = checkpoint.clone();
             checkpoint.durable_lsn = raw.durable_lsn();
             // Preserve the server floors alongside the authenticated restart

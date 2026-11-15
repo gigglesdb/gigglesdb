@@ -471,3 +471,22 @@ async fn prepared_capture_continuation_keeps_inflight_ddl_in_same_epoch() {
     assert_eq!(c.capture.durable_lsn(), 21);
     assert!(!c.capture.schema_state().unknown_schema_job);
 }
+
+#[tokio::test]
+async fn buffered_feedback_never_passes_durable_marker() {
+    let fixture = Fixture::new();
+    let engine = fixture.owner().await;
+    let runtime = engine.runtime();
+    runtime
+        .marker("buffered", "manifest-durable".into(), "100".into())
+        .await
+        .unwrap();
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "200".into())
+        .await
+        .unwrap();
+    assert_eq!(runtime.durable_feedback_lsn(250, 0).unwrap(), 100);
+    runtime.flush_progress().await.unwrap();
+    assert_eq!(runtime.durable_feedback_lsn(250, 0).unwrap(), 200);
+    assert_eq!(runtime.durable_feedback_lsn(150, 0).unwrap(), 150);
+}
