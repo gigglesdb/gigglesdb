@@ -993,7 +993,12 @@ fn case_cli_and_selected_manifest_match_version_nine() {
         metadata
     );
     let empty = path();
-    json(&invoke(&["init", empty.to_str().unwrap()]));
+    json(&invoke(&[
+        "init",
+        "--engine",
+        "legacy",
+        empty.to_str().unwrap(),
+    ]));
     let created: CatalogOutcome = serde_json::from_value(json(&invoke(&[
         "run",
         "--language-version",

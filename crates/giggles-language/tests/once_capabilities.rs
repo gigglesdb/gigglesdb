@@ -133,7 +133,7 @@ fn once_cli_refuses_retry_context_before_open() {
 fn once_cli_version_selection_keeps_ordinary_commands_and_defaults() {
     let database = path();
     let db = database.to_str().unwrap();
-    json(&invoke(&["init", db]));
+    json(&invoke(&["init", "--engine", "legacy", db]));
     let catalog = json(&invoke(&[
         "run",
         "--language-version",

@@ -269,10 +269,10 @@ fn unsupported_native_construct_cannot_pass() {
         },
     ));
 }
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn native_on_v2_still_refuses_catalog_writes() {
-    // giggles-language's core dependency enables engine-rocksdb even when this
-    // crate is tested with --no-default-features.
+    // V2 coverage requires giggles-language's engine-rocksdb feature.
     let (_db, admin) = Database::fresh(StorageEngine::V2);
     // R2 item 2: typed BEGIN/ROLLBACK run on v2 without the SQL parser.
     with_sql_parser_forbidden(|| {
@@ -520,6 +520,7 @@ fn index_text_is_opt_in_and_rejects_extended_forms() {
     }
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn v2_native_read_matches_sql() {
     let (_db, admin) = Database::fresh(StorageEngine::V2);
@@ -529,6 +530,7 @@ fn v2_native_read_matches_sql() {
         sql(&admin, "select * from items order by id"));
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn v2_native_insert_matches_sql() {
     let (left_db, left) = Database::fresh(StorageEngine::V2);
@@ -543,6 +545,7 @@ fn v2_native_insert_matches_sql() {
     assert!(parity(&reopen_observation(&left_db), &reopen_observation(&right_db)));
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn v2_native_update_matches_sql() {
     let (_left_db, left) = Database::fresh(StorageEngine::V2);
@@ -559,6 +562,7 @@ fn v2_native_update_matches_sql() {
     assert_eq!(snapshot(&left), snapshot(&right));
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn v2_native_delete_matches_sql() {
     let (_left_db, left) = Database::fresh(StorageEngine::V2);
@@ -580,6 +584,7 @@ fn v2_native_delete_matches_sql() {
     }
 }
 
+#[cfg(feature = "engine-rocksdb")]
 #[test]
 fn v2_native_block_matches_sql_transaction() {
     let (_left_db, left) = Database::fresh(StorageEngine::V2);
@@ -604,7 +609,11 @@ fn v2_native_block_matches_sql_transaction() {
 #[test]
 fn numeric_parameters_match_sql() {
     use giggles_core::relational::Numeric;
-    for storage in [StorageEngine::Legacy, StorageEngine::V2] {
+    for storage in [
+        StorageEngine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        StorageEngine::V2,
+    ] {
     let (_left_db, left) = Database::fresh(storage);
     let (_right_db, right) = Database::fresh(storage);
     for admin in [&left, &right] {
@@ -711,21 +720,28 @@ fn numeric_native_catalog_matches_sql() {
     let expected = reopen_observation(&right_db);
     assert!(parity(&reopen_observation(&left_db), &expected));
     assert!(parity(&reopen_observation(&tree_db), &expected));
-    let (_db, v2) = Database::fresh(StorageEngine::V2);
-    let engine = Engine::with_version(v2.clone(), v);
-    with_sql_parser_forbidden(|| {
-        for result in [engine.execute_catalog_text(text), engine.execute_catalog(&tree)] {
-            assert!(matches!(result, Err(Error::Core(message))
-                if message.contains("EngineUnsupported") && message.contains("v2")));
-        }
-    });
-    assert!(snapshot(&v2).is_empty());
+    #[cfg(feature = "engine-rocksdb")]
+    {
+        let (_db, v2) = Database::fresh(StorageEngine::V2);
+        let engine = Engine::with_version(v2.clone(), v);
+        with_sql_parser_forbidden(|| {
+            for result in [engine.execute_catalog_text(text), engine.execute_catalog(&tree)] {
+                assert!(matches!(result, Err(Error::Core(message))
+                    if message.contains("EngineUnsupported") && message.contains("v2")));
+            }
+        });
+        assert!(snapshot(&v2).is_empty());
+    }
 }
 
 #[test]
 fn arithmetic_zero_divisor_sqlstate_matches_on_both_engines() {
     // PG 18.6: both bigint division and remainder by zero report 22012.
-    for storage in [StorageEngine::Legacy, StorageEngine::V2] {
+    for storage in [
+        StorageEngine::Legacy,
+        #[cfg(feature = "engine-rocksdb")]
+        StorageEngine::V2,
+    ] {
         let (_left_db, left) = Database::fresh(storage);
         let (_right_db, right) = Database::fresh(storage);
         for admin in [&left, &right] {

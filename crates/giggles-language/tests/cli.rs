@@ -24,6 +24,8 @@ fn invoke(args: &[&str]) -> Output {
 fn init(p: &str) {
     let out = invoke(&[
         "init",
+        "--engine",
+        "legacy",
         p,
         "create table items (id bigint primary key, state text not null)",
     ]);
@@ -105,7 +107,7 @@ fn capabilities_honest() {
 fn init_requires_a_create_table_statement() {
     for schema in ["begin", "commit", "rollback", "select * from missing"] {
         let p = path();
-        let out = invoke(&["init", p.to_str().unwrap(), schema]);
+        let out = invoke(&["init", "--engine", "legacy", p.to_str().unwrap(), schema]);
         assert!(!out.status.success(), "accepted schema {schema}: {out:?}");
         assert!(out.stdout.is_empty());
     }
@@ -138,7 +140,13 @@ fn subprocess_failure_reopen_controls() {
             1
         )
     }
-    let duplicate = invoke(&["init", p, "create table other (id bigint primary key)"]);
+    let duplicate = invoke(&[
+        "init",
+        "--engine",
+        "legacy",
+        p,
+        "create table other (id bigint primary key)",
+    ]);
     assert!(!duplicate.status.success());
     assert_eq!(json(&invoke(&["run", p, "items"]))["matched"], 2);
 }
@@ -225,14 +233,18 @@ fn explicit_engine_init_run_reopen() {
             pstr,
             "create table items (id bigint primary key, state text not null)",
         ]);
-        // Also exercises the no-RocksDB build when core defaults are disabled.
-        if engine == "v2" && !out.status.success() {
+        // A v2 failure must never pass unnoticed in the default build.
+        if engine == "v2" && !cfg!(feature = "engine-rocksdb") {
+            assert!(!out.status.success());
             let error = String::from_utf8(out.stderr).unwrap();
             assert!(error.contains("engine-rocksdb"), "{error}");
+            assert!(error.contains("--engine legacy"), "{error}");
             assert!(!p.exists());
             continue;
         }
         json(&out);
+        assert_eq!(p.join("data.redb").exists(), engine == "legacy");
+        assert_eq!(p.join("CURRENT").exists(), engine == "v2");
         assert_eq!(
             json(&invoke(&[
                 "run",
@@ -284,4 +296,67 @@ fn invalid_cli_options_have_no_filesystem_effects() {
             .unwrap()
             .contains("unknown engine")
     );
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn default_init_creates_v2_and_reopens() {
+    let p = path();
+    let pstr = p.to_str().unwrap();
+    json(&invoke(&[
+        "init",
+        pstr,
+        "create table items (id bigint primary key, state text not null)",
+    ]));
+    assert!(p.join("CURRENT").is_file());
+    assert!(!p.join("data.redb").exists());
+    json(&invoke(&[
+        "run",
+        pstr,
+        "insert items set id=1,state=\"ready\"",
+    ]));
+    let rows = json(&invoke(&["run", pstr, "items"]));
+    assert_eq!(rows["matched"], 1);
+    assert_eq!(rows["rows"][0]["values"][1]["Text"], "ready");
+}
+
+#[cfg(not(feature = "engine-rocksdb"))]
+#[test]
+fn default_init_without_rocksdb_refuses_before_filesystem_effects() {
+    let parent = path();
+    let db = parent.join("db");
+    let p = db.to_str().unwrap();
+    for args in [
+        vec!["init", p],
+        vec!["init", p, "create table items(id bigint primary key)"],
+        vec!["init", "--engine", "v2", p],
+    ] {
+        let out = invoke(&args);
+        assert!(!out.status.success(), "{args:?}");
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(error.contains("engine-rocksdb"), "{error}");
+        assert!(error.contains("--engine legacy"), "{error}");
+        assert!(!parent.exists(), "{args:?} created a directory");
+    }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+#[ignore = "R2-16: core secondary_read_native_engine requires legacy staged state on v2"]
+fn v2_keyed_filtered_read_reopens_through_autocommit() {
+    let p = path();
+    let pstr = p.to_str().unwrap();
+    json(&invoke(&[
+        "init",
+        pstr,
+        "create table items (id bigint primary key, state text not null)",
+    ]));
+    json(&invoke(&[
+        "run",
+        pstr,
+        "insert items set id=1,state=\"ready\"",
+    ]));
+    let rows = json(&invoke(&["run", pstr, "items where id=1 select state"]));
+    assert_eq!(rows["matched"], 1);
+    assert_eq!(rows["rows"][0]["values"][0]["Text"], "ready");
 }

@@ -4,13 +4,17 @@ version = "0.1.0"
 edition = "2024"
 autotests = false
 
+[features]
+default = ["engine-rocksdb"]
+engine-rocksdb = ["giggles-core/engine-rocksdb"]
+
 [dependencies]
-giggles-core = { path = "../giggles-core" }
+giggles-core = { path = "../giggles-core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-giggles-core = { path = "../giggles-core", features = ["test-sql-parser-trap"] }
+giggles-core = { path = "../giggles-core", default-features = false, features = ["test-sql-parser-trap"] }
 
 [[test]]
 name = "all"

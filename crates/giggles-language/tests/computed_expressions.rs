@@ -530,6 +530,8 @@ fn computed_native_expression_admission_and_expansion_are_bounded() {
 fn initialize_cli(database: &Path) {
     output_json(&invoke(&[
         "init",
+        "--engine",
+        "legacy",
         database.to_str().unwrap(),
         "CREATE TABLE items (id BIGINT PRIMARY KEY,x BIGINT,y BIGINT,n INTEGER,state TEXT NOT NULL)",
     ]));

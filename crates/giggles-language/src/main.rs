@@ -45,7 +45,7 @@ fn run() -> std::result::Result<serde_json::Value, Error> {
             execute(path, text, &b, LanguageVersion::Embedded01)
         }
         _ => Err(Error::Bind(
-            "usage: capabilities [--language-version VERSION] | capability-manifest [--language-version VERSION] | init [--engine legacy|v2] PATH [SQL_SCHEMA] | run [--language-version VERSION] PATH NATIVE [BINDINGS_JSON]".into(),
+            "usage: capabilities [--language-version VERSION] | capability-manifest [--language-version VERSION] | init [--engine legacy|v2] PATH [SQL_SCHEMA] (default engine: v2) | run [--language-version VERSION] PATH NATIVE [BINDINGS_JSON]".into(),
         )),
     }
 }
@@ -60,17 +60,23 @@ fn initialize(args: &[String]) -> Result<serde_json::Value, Error> {
             };
             (engine, rest)
         }
-        _ => (StorageEngine::Legacy, args),
+        _ => (StorageEngine::V2, args),
     };
     let (path, schema) = match rest {
         [path] if !path.starts_with("--") => (path, None),
         [path, schema] if !path.starts_with("--") => (path, Some(schema)),
         _ => {
             return Err(Error::Bind(
-                "usage: init [--engine legacy|v2] PATH [SQL_SCHEMA]".into(),
+                "usage: init [--engine legacy|v2] PATH [SQL_SCHEMA] (default engine: v2)".into(),
             ));
         }
     };
+    #[cfg(not(feature = "engine-rocksdb"))]
+    if engine == StorageEngine::V2 {
+        return Err(Error::Bind(
+            "v2 requires engine-rocksdb; use init --engine legacy PATH [SQL_SCHEMA]".into(),
+        ));
+    }
     let admin = Admin::create_engine(path, Limits::default(), engine)
         .map_err(|e| Error::Core(e.to_string()))?;
     if let Some(schema) = schema {

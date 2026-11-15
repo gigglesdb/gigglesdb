@@ -509,7 +509,12 @@ fn catalog_rejections_and_populated_policy_are_atomic() {
 #[test]
 fn catalog_cli_empty_init_and_selected_manifest_match_version_seven() {
     let database = path();
-    json(&invoke(&["init", database.to_str().unwrap()]));
+    json(&invoke(&[
+        "init",
+        "--engine",
+        "legacy",
+        database.to_str().unwrap(),
+    ]));
     let admin = Admin::open(&database, Limits::default()).unwrap();
     assert_eq!(admin.catalog().unwrap(), (0, vec![]));
     drop(admin);
@@ -689,6 +694,8 @@ fn catalog_cli_empty_init_and_selected_manifest_match_version_seven() {
     let legacy = path();
     json(&invoke(&[
         "init",
+        "--engine",
+        "legacy",
         legacy.to_str().unwrap(),
         "CREATE TABLE legacy(id BIGINT PRIMARY KEY,s SMALLINT)",
     ]));

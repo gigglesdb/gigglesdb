@@ -511,6 +511,8 @@ fn returning_native_wrapper_admission_and_alias_binding_are_bounded() {
 fn initialize_cli(database: &Path) {
     json(&invoke(&[
         "init",
+        "--engine",
+        "legacy",
         database.to_str().unwrap(),
         "CREATE TABLE items (id BIGINT PRIMARY KEY,x BIGINT,state TEXT NOT NULL)",
     ]));

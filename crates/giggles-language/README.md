@@ -384,15 +384,18 @@ Source-fed inserts, conflict actions and upserts remain unsupported.
 Version 0.7 adds safe standalone table creation without requiring SQL provisioning:
 
 ```powershell
-& $cli init native-schema.db
+& $cli init --engine legacy native-schema.db
 & $cli run --language-version 0.7 native-schema.db 'create table work (id int64, state text, note nullable text, primary key (id))'
 & $cli run --language-version 0.7 native-schema.db 'insert into work(id,state) values(1,"ready")'
 ```
 
 `init [--engine legacy|v2] PATH [SQL_SCHEMA]` selects the engine for a fresh
-database. The default remains `legacy`; for example, `init --engine v2 native.db`
-creates a v2 database when core's `engine-rocksdb` feature is compiled in.
-Otherwise v2 initialization fails before creating the database directory.
+database. The default is `v2`, enabled by this crate's default `engine-rocksdb`
+feature. Use `init --engine legacy native.db` to create a legacy database in
+both builds. With `--no-default-features`, plain `init` and `init --engine v2`
+fail before filesystem effects and direct callers to `--engine legacy`; there
+is no automatic fallback. Explicit `init --engine v2 native.db` is also accepted
+when `engine-rocksdb` is enabled.
 Unknown engine names and unsupported language versions reject before filesystem
 effects. `--engine` is init-only: `run` detects the existing database's engine
 automatically, and repeated `init` refuses an existing path even with a different

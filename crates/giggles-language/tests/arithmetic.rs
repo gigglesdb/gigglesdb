@@ -467,6 +467,8 @@ fn arithmetic_nodes_preserve_limits_and_binding_admission() {
 fn initialize_cli(path: &Path) {
     output_json(&invoke(&[
         "init",
+        "--engine",
+        "legacy",
         path.to_str().unwrap(),
         "CREATE TABLE items (id BIGINT PRIMARY KEY, n BIGINT, state TEXT NOT NULL)",
     ]));
