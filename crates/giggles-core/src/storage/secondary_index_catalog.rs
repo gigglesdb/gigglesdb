@@ -7,8 +7,18 @@ impl SqlSession {
         table: &relational::TableDef,
         request: &relational::secondary_index_access::Request<'_>,
     ) -> Result<relational::SqlResult, CoreError> {
-        if self.is_v2_engine() {
-            return Err(CoreError::Sql(relational::SqlError::Unsupported));
+        if let Backend::V2(db) = &self.admin.inner.backend {
+            let db = db.clone();
+            let before = self.snapshot_identity_engine()?;
+            let inner = self.admin.inner.clone();
+            let _ticket = inner.enter_sql()?;
+            let txn = self.v2_transaction.as_mut()
+                .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
+            let result = v2_sql::secondary_read_native(&db, txn, table, request);
+            if self.snapshot_identity_engine()? != before {
+                return Err(CoreError::Sql(relational::SqlError::StaleSchema));
+            }
+            return result;
         }
         let (_, epoch) = self.snapshot_identity_engine()?;
         let state = self
@@ -164,6 +174,45 @@ impl Admin {
 mod tests {
     use super::*;
     use crate::relational::{MAX_RESULT_BYTES, MAX_ROWS, Value, secondary_index_access::Request};
+
+    #[cfg(feature = "engine-rocksdb")]
+    #[test]
+    fn v2_native_secondary_reads_keep_statement_snapshot_and_project_private_rows() {
+        let mut token = [0; 16];
+        getrandom::fill(&mut token).unwrap();
+        let path = crate::test_artifact_root().join(format!("v2-native-index-snapshot-{:032x}",
+            u128::from_be_bytes(token)));
+        let admin = Admin::create_engine(&path, crate::Limits::default(), Engine::V2).unwrap();
+        let mut session = admin.sql_session();
+        for sql in ["CREATE TABLE items(id BIGINT PRIMARY KEY, tag TEXT)",
+            "CREATE INDEX by_tag ON items(tag)", "INSERT INTO items VALUES(1,'z')"] {
+            session.execute(sql, &[], None).unwrap();
+        }
+        session.begin_native().unwrap();
+        let table = session.catalog_engine().unwrap().1.remove(0);
+        let equal = [(table.columns[1].id, Value::Text("z".into()))];
+        let projection = [table.columns[0].id];
+        let mut request = Request { equal: &equal, range: None, projection: &projection,
+            descending: false, residuals: &[], max_rows: MAX_ROWS, max_bytes: MAX_RESULT_BYTES };
+        let first = relational::with_sql_parser_forbidden(|| session.secondary_read_native_engine(&table, &request)).unwrap();
+        assert_eq!(first.columns, vec!["id"]);
+        assert_eq!(first.rows[0].values, vec![Value::Int(1)]);
+        admin.sql_session().execute("INSERT INTO items VALUES(2,'z')", &[], None).unwrap();
+        assert_eq!(session.secondary_read_native_engine(&table, &request).unwrap(), first);
+        session.execute("INSERT INTO items VALUES(3,'z')", &[], None).unwrap();
+        let own = session.secondary_read_native_engine(&table, &request).unwrap();
+        assert_eq!(own.rows.into_iter().map(|r| r.values).collect::<Vec<_>>(),
+            vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
+        request.max_rows = 1;
+        assert_eq!(session.secondary_read_native_engine(&table, &request), Err(CoreError::Sql(relational::SqlError::Limit)));
+        request.max_rows = MAX_ROWS;
+        request.descending = true;
+        assert_eq!(session.secondary_read_native_engine(&table, &request), Err(CoreError::Sql(relational::SqlError::Unsupported)));
+        session.rollback_native().unwrap();
+        drop(session);
+        drop(admin);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn native_secondary_read_and_index_creates_reject_heaps_but_accept_keyed_tables() {

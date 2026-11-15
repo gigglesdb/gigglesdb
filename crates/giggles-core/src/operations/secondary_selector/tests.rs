@@ -1,6 +1,120 @@
 use super::*;
 use crate::Limits;
 
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_indexed_native_reads_match_sql_and_fallback_with_private_writes_and_drop_fence() {
+    use crate::Engine as Backend;
+    let mut paths = Vec::new();
+    let mut admins = Vec::new();
+    for indexed in [false, true] {
+        let mut token = [0; 16];
+        getrandom::fill(&mut token).unwrap();
+        let path = std::env::temp_dir().join(format!("v2-native-index-{:032x}", u128::from_be_bytes(token)));
+        let admin = Admin::create_engine(&path, Limits::default(), Backend::V2).unwrap();
+        let mut sql = admin.sql_session();
+        for statement in [
+            "CREATE TABLE items(id BIGINT PRIMARY KEY, tag TEXT, score SMALLINT)",
+            "INSERT INTO items VALUES(1,'z',10),(2,NULL,20),(3,'a',30),(4,'z',40)",
+        ] { sql.execute(statement, &[], None).unwrap(); }
+        if indexed {
+            sql.execute("CREATE INDEX by_tag ON items(tag,score)", &[], None).unwrap();
+        }
+        paths.push(path);
+        admins.push(admin);
+    }
+    let engines = admins.iter().cloned().map(Engine::new).collect::<Vec<_>>();
+    let mut sessions = admins.iter().map(Admin::sql_session).collect::<Vec<_>>();
+    let term = |field: &str, op, value| Expr::Compare(Box::new(Expr::Field(field.into())), op,
+        Box::new(Expr::Value(ValueExpr::Literal(value))));
+    let request = |filter| Request::Read { table: "items".into(), filter: Some(filter), order: vec![],
+        limit: None, projection: vec!["id".into(), "tag".into(), "score".into()] };
+    SUCCESSES.set(0);
+    for transactional in [false, true] {
+        if transactional {
+            for session in &mut sessions {
+                session.begin_native().unwrap();
+                for statement in ["INSERT INTO items VALUES(5,'z',50)",
+                    "UPDATE items SET tag='z',score=35 WHERE id=3", "DELETE FROM items WHERE id=1"] {
+                    session.execute(statement, &[], None).unwrap();
+                }
+            }
+        }
+        for (filter, predicate) in [
+            (term("tag", Compare::Eq, Value::Text("z".into())), "tag='z'"),
+            (term("tag", Compare::Lt, Value::Text("z".into())), "tag<'z'"),
+            (term("tag", Compare::Ge, Value::Text("a".into())), "tag>='a'"),
+            (Expr::And(Box::new(term("tag", Compare::Eq, Value::Text("z".into()))),
+                Box::new(Expr::And(Box::new(term("score", Compare::Gt, Value::Int(10))),
+                    Box::new(term("score", Compare::Le, Value::Int(40)))))), "tag='z' AND score>10 AND score<=40"),
+        ] {
+            let request = request(filter);
+            let mut results = Vec::new();
+            for i in 0..2 {
+                let expected = sessions[i].execute(&format!(
+                    "SELECT id,tag,score FROM items WHERE {predicate} ORDER BY id"), &[], None)
+                    .unwrap().rows.into_iter().map(|r| r.values).collect::<Vec<_>>();
+                if transactional && predicate == "tag='z'" {
+                    assert_eq!(expected.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+                        vec![Value::Int(3), Value::Int(4), Value::Int(5)]);
+                }
+                let before = SUCCESSES.get();
+                let result = crate::relational::with_sql_parser_forbidden(|| {
+                    if transactional { sessions[i].execute_native(&request, &Bindings::new()) }
+                    else { engines[i].execute(&request, &Bindings::new()) }
+                }).unwrap();
+                assert_eq!(SUCCESSES.get() - before, i, "only the indexed database must use the accessor");
+                let actual = result.rows.into_iter().map(|r| r.values).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                results.push(actual);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        if transactional { for session in &mut sessions { session.rollback_native().unwrap(); } }
+    }
+    assert_eq!(SUCCESSES.get(), 8);
+    let outside = request(Expr::And(Box::new(term("tag", Compare::Eq, Value::Text("z".into()))),
+        Box::new(term("score", Compare::Gt, Value::Int(32768)))));
+    let expected = engines[0].execute(&outside, &Bindings::new()).unwrap();
+    assert!(expected.rows.is_empty());
+    assert_eq!(engines[1].execute(&outside, &Bindings::new()).unwrap(), expected);
+    assert_eq!(SUCCESSES.get(), 8, "out-of-domain comparison operands must fall back");
+    let bound = engines[1].prepare_bound(&request(term("tag", Compare::Eq, Value::Text("z".into()))),
+        &Bindings::new()).unwrap();
+    sessions[1].execute("DROP INDEX by_tag", &[], None).unwrap();
+    assert_eq!(engines[1].execute_bound(&bound), Err(core(CoreError::Sql(SqlError::StaleSchema))));
+    drop(sessions);
+    drop(engines);
+    drop(admins);
+    for path in paths { std::fs::remove_dir_all(path).unwrap(); }
+}
+
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn v2_secondary_projection_limit_preserves_complete_fallback() {
+    let mut token = [0; 16];
+    getrandom::fill(&mut token).unwrap();
+    let path = std::env::temp_dir().join(format!("v2-native-index-limit-{:032x}", u128::from_be_bytes(token)));
+    let admin = Admin::create_engine(&path, Limits::default(), crate::Engine::V2).unwrap();
+    let mut session = admin.sql_session();
+    session.execute("CREATE TABLE items(id BIGINT PRIMARY KEY, tag TEXT, payload NUMERIC)", &[], None).unwrap();
+    let values = (0..33).map(|id| format!("({id},'x',1)")).collect::<Vec<_>>().join(",");
+    session.execute(&format!("INSERT INTO items VALUES {values}"), &[], None).unwrap();
+    let engine = Engine::new(admin.clone());
+    let request = read(Compare::Eq, Value::Text("x".into()));
+    let expected = engine.execute(&request, &Bindings::new()).unwrap();
+    session.execute("CREATE INDEX by_tag ON items(tag)", &[], None).unwrap();
+    SUCCESSES.set(0);
+    let actual = crate::relational::with_sql_parser_forbidden(|| engine.execute(&request, &Bindings::new())).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.rows.len(), 33);
+    assert_eq!(SUCCESSES.get(), 0, "the accessor's conservative Numeric quota must fall back");
+    drop(engine);
+    drop(session);
+    drop(admin);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 fn fixture(indexed: bool) -> (Admin, Engine) {
     let mut token = [0; 16];
     getrandom::fill(&mut token).unwrap();

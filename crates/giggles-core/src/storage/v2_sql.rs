@@ -1516,6 +1516,98 @@ impl RowSink for SqlRows<'_> {
     }
 }
 
+/// Native reads share SQL's index selection, tuple bounds and MVCC visitor.
+/// Do not begin a statement here: the complete input already pinned its snapshot.
+pub(super) fn secondary_read_native(
+    db: &v2::V2Db, txn: &mut Transaction, table: &TableDef,
+    request: &relational::secondary_index_access::Request<'_>,
+) -> Result<relational::SqlResult, CoreError> {
+    use relational::{DataType, Value, MAX_COLUMNS, MAX_RESULT_BYTES, MAX_ROWS};
+    let unsupported = CoreError::Sql(SqlError::Unsupported);
+    crate::cancellation::check()?;
+    let catalog = db.catalog().snapshot(txn)?;
+    let image = catalog.image().map_err(CoreError::Sql)?;
+    if image.tables.get(&image.table_key(table)) != Some(table) {
+        return Err(CoreError::Sql(SqlError::StaleSchema));
+    }
+    if table.hidden_rowid().is_some() || request.descending || !request.residuals.is_empty()
+        || request.equal.is_empty() && request.range.is_none()
+    { return Err(unsupported); }
+    if request.equal.len() > MAX_COLUMNS || request.projection.len() > MAX_COLUMNS
+        || request.max_rows > MAX_ROWS || request.max_bytes > MAX_RESULT_BYTES
+    { return Err(CoreError::Sql(SqlError::Limit)); }
+    let offset = |id| table.columns.iter().position(|c| c.id == id)
+        .ok_or(CoreError::Sql(SqlError::UnknownColumn));
+    let mut predicates = Vec::new();
+    let mut checks = Vec::new();
+    let mut input_bytes = 0usize;
+    let mut predicate = |id, op: &str, value: &Value| -> Result<(), CoreError> {
+        let i = offset(id)?;
+        let column = &table.columns[i];
+        if !matches!(column.data_type, DataType::Boolean | DataType::SmallInt
+            | DataType::Integer | DataType::BigInt | DataType::Text | DataType::Varchar | DataType::Bytes)
+            || matches!(value, Value::Null)
+            || catalog.parts.ext.columns.get(&id).is_some_and(|c| c.type_id.is_some())
+        { return Err(CoreError::Sql(SqlError::Unsupported)); }
+        // A comparison operand need not fit the stored column (for example,
+        // SMALLINT > 32768). Leave such predicates to the complete fallback.
+        if relational::check(value, column).is_err() {
+            return Err(CoreError::Sql(SqlError::Unsupported));
+        }
+        input_bytes = input_bytes.checked_add(relational::value_bytes(value))
+            .ok_or(CoreError::Sql(SqlError::Limit))?;
+        if input_bytes >= relational::MAX_ROW_BYTES { return Err(CoreError::Sql(SqlError::Limit)); }
+        checks.push((i, op.to_owned(), codec::index_tuple_bytes(
+            std::slice::from_ref(value), &[codec::Direction::Asc])?));
+        predicates.push((column.name.clone(), op.to_owned(), value.clone()));
+        Ok(())
+    };
+    for (id, value) in request.equal { predicate(*id, "=", value)?; }
+    if let Some(range) = request.range {
+        if range.lower.is_none() && range.upper.is_none() { return Err(unsupported); }
+        if let Some(e) = range.lower { predicate(range.column, if e.inclusive { ">=" } else { ">" }, e.value)?; }
+        if let Some(e) = range.upper { predicate(range.column, if e.inclusive { "<=" } else { "<" }, e.value)?; }
+    }
+    let (descriptor, lo, hi) = SqlRows::index_range(&catalog.parts, table, &predicates)
+        .ok_or(unsupported)?;
+    let projection = request.projection.iter().map(|id| offset(*id)).collect::<Result<Vec<_>, _>>()?;
+    let mut bytes = projection.iter().map(|i| table.columns[*i].name.len()).sum::<usize>();
+    if bytes > request.max_bytes { return Err(CoreError::Sql(SqlError::Limit)); }
+    let mut result = relational::SqlResult {
+        columns: projection.iter().map(|i| table.columns[*i].name.clone()).collect(),
+        ..Default::default()
+    };
+    let entry = TableEntry { def: table.clone(), heap: false, columns_ext: BTreeMap::new() };
+    engine::indexes::visit(txn, &entry, &descriptor, lo, hi, &mut |_, row| {
+        crate::cancellation::check()?;
+        // SQL selects on the leading index column. Check every native term,
+        // including remaining equality columns and a composite range suffix.
+        for (i, op, bound) in &checks {
+            let value = codec::index_tuple_bytes(std::slice::from_ref(&row.values[*i]), &[codec::Direction::Asc])?;
+            let matches = match op.as_str() {
+                "=" => value == *bound, ">" => value > *bound, ">=" => value >= *bound,
+                "<" => value < *bound, "<=" => value <= *bound, _ => unreachable!(),
+            };
+            if !matches { return Ok(()); }
+        }
+        if result.rows.len() >= request.max_rows { return Err(CoreError::Sql(SqlError::Limit)); }
+        for i in &projection {
+            let size = match &row.values[*i] {
+                Value::Numeric(_) => giggles_pg_types::MAX_TEXT,
+                Value::Float4(_) => 4, Value::Float8(_) => 8,
+                Value::Text(s) => s.len(), Value::Bytes(b) => b.len(), _ => 9,
+            };
+            bytes = bytes.checked_add(size).ok_or(CoreError::Sql(SqlError::Limit))?;
+            if bytes > request.max_bytes { return Err(CoreError::Sql(SqlError::Limit)); }
+        }
+        result.rows.push(SqlRow { values: projection.iter().map(|i| row.values[*i].clone()).collect(),
+            version: row.version });
+        Ok(())
+    })?;
+    crate::cancellation::check()?;
+    Ok(result)
+}
+
 /// Short transaction borrows permit nested physical scans with bounded pages.
 /// Every scan reads the same statement snapshot plus transaction own writes.
 struct MutationRows<'a> {
@@ -1586,16 +1678,18 @@ impl SqlRows<'_> {
         self.scan_index_predicates(table, &self.prepared.v2_index_predicates(self.params))
     }
     fn scan_index_predicates(&self, table: &TableDef, predicates: &[(String, String, relational::Value)]) -> Option<IndexRange> {
-        (!self.writing)
+        (!self.writing).then(|| Self::index_range(self.parts, table, predicates)).flatten()
+    }
+    fn index_range(parts: &CatalogParts, table: &TableDef, predicates: &[(String, String, relational::Value)]) -> Option<IndexRange> {
+        (!predicates.is_empty())
             .then(|| {
-                self.parts.indexes.iter().find_map(|d| {
+                parts.indexes.iter().find_map(|d| {
                     if d.table != table.id {
                         return None;
                     }
                     let column = table.columns.iter().find(|c| c.id == d.columns[0])?;
                     // User types can have a SQL order different from their storage type.
-                    if self
-                        .parts
+                    if parts
                         .ext
                         .columns
                         .get(&column.id)
