@@ -242,8 +242,20 @@ async fn live_cli_excluded_sentinel_catching_up_pause_resume_and_equal_row_count
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }).await.unwrap();
-            let (code, requested) = invoke(&root, "pause", &id);
-            assert_eq!(code, 0, "{requested}");
+            // Counts and journaled progress can already describe the previous
+            // run. Only an accepted generation-scoped request proves that the
+            // resumed owner is active and has durably received this pause.
+            let requested = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let (code, requested) = invoke(&root, "pause", &id);
+                    assert_eq!(code, 0, "{requested}");
+                    if requested["data"]["pause_requested"] == true {
+                        break requested;
+                    }
+                    running.assert_running("resume exited before accepting pause");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("resumed owner did not accept pause within 30s");
             assert_eq!(requested["data"]["pause_requested"], true);
             let (code, paused) = child_result(&mut running).await;
             assert_eq!(code, 0, "{paused}");

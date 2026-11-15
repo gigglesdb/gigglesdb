@@ -856,6 +856,12 @@ fn copy_table(
         let (pause, paused) = tokio::sync::watch::channel(false);
         let runtime = engine.runtime();
         let final_observed = std::sync::Mutex::new(None);
+        let phase = std::sync::Mutex::new("waiting for chunk start");
+        let started = std::time::Instant::now();
+        let stage = |label| {
+            *phase.lock().unwrap() = label;
+            eprintln!("engine qualification phase={label} elapsed={:?}", started.elapsed());
+        };
         let workload = async {
             // Start writes only after the engine journals Started. They continue
             // while snapshot/capture/apply are all running under the same scope.
@@ -883,6 +889,7 @@ fn copy_table(
             source
                 .execute(&format!("DELETE FROM {id}.rows WHERE id=9"), &[])
                 .await?;
+            stage("waiting for catching-up and equal rows");
             let expected = rows(&source, &id).await?;
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
@@ -898,6 +905,7 @@ fn copy_table(
             if let Some(emitter) = final_marker {
                 let restart = matches!(emitter, MarkerEmitter::NativeRestart);
                 if restart {
+                    stage("waiting for apply hold acknowledgment");
                     hold_apply.send_replace(true);
                     held.notified().await;
                 } else {
@@ -917,6 +925,7 @@ fn copy_table(
                     coordinator: runtime.state().await.owner,
                 };
                 let progress = runtime.final_marker_progress(&key, &identity)?;
+                stage("emitting final marker");
                 match emitter {
                     MarkerEmitter::Manual => {
                         source.batch_execute("BEGIN").await?;
@@ -944,9 +953,13 @@ fn copy_table(
                         .await?;
                     }
                 }
+                stage("waiting for buffered final marker");
                 let buffered = progress
                     .wait(&marker, false, Duration::from_secs(30))
-                    .await?;
+                    .await.map_err(|error| {
+                        eprintln!("buffered marker wait failed after {:?}: {error:?}; live={:?}", started.elapsed(), runtime.live_readiness());
+                        error
+                    })?;
                 assert!(
                     progress.receipt(&marker, true)?.is_none(),
                     "withheld destination effects cannot have applied evidence"
@@ -964,6 +977,7 @@ fn copy_table(
                     }}).await?;
                     runtime.commit(Transition::Lifecycle { event: Event::Advance { to: State::SourceFenced } }).await?;
                     *final_observed.lock().unwrap() = Some((progress, marker));
+                    stage("joining initial owner after pause");
                     pause.send_replace(true);
                     return TestResult::Ok(());
                 }
@@ -1067,7 +1081,7 @@ fn copy_table(
             }
             TestResult::Ok(())
         })
-        .await??;
+        .await.map_err(|error| format!("engine qualification timed out after {:?}, phase={}: {error}", started.elapsed(), phase.lock().unwrap()))??;
         if matches!(final_marker, Some(MarkerEmitter::NativeRestart)) {
             let (old_progress, marker) = final_observed.into_inner().unwrap().ok_or("restart marker absent")?;
             assert_eq!(old_progress.receipt(&marker, true), Err(engine::MarkerProgressError::RunExited));
@@ -1313,7 +1327,13 @@ async fn qualify_live_readiness(
         }
         TestResult::Ok(())
     })
-    .await??;
+    .await
+    .map_err(|error| {
+        format!(
+            "readiness light-load within budget: {error}; live={:?}",
+            runtime.live_readiness()
+        )
+    })??;
     // A real row lock holds destination apply while real source transactions
     // accumulate beyond the definition's one-second policy while source
     // probes remain fresh. Age, independently of byte distance, must fail.
@@ -1345,7 +1365,13 @@ async fn qualify_live_readiness(
             }
             TestResult::Ok(())
         })
-        .await??;
+        .await
+        .map_err(|error| {
+            format!(
+                "readiness locked-destination lag exceeds budget: {error}; live={:?}",
+                runtime.live_readiness()
+            )
+        })??;
         TestResult::Ok(())
     }
     .await;
@@ -1371,7 +1397,13 @@ async fn qualify_live_readiness(
             tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await
+    .map_err(|error| {
+        format!(
+            "readiness DDL blocks boundary: {error}; live={:?}",
+            runtime.live_readiness()
+        )
+    })?;
     Ok(())
 }
 
