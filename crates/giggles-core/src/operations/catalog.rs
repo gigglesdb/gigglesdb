@@ -72,6 +72,8 @@ pub enum CatalogRequest {
     DropConstraint { table: String, name: String, cascade: bool },
     CreateView { name: String, read: ViewRead },
     DropView { name: String, cascade: bool },
+    CreateSequence { name: String },
+    DropSequence { name: String, cascade: bool },
 }
 // Preserve the legacy CreateTable decoder while requiring exact new catalog
 // requests. Unknown options must never disappear during raw request decoding.
@@ -103,6 +105,12 @@ impl<'de> Deserialize<'de> for CatalogRequest {
         #[serde(deny_unknown_fields)]
         struct CreateView { name: String, read: ViewRead }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CreateSequence { name: String }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DropSequence { name: String, cascade: bool }
+        #[derive(Deserialize)]
         enum Wire {
             CreateTable {
                 table: String,
@@ -117,6 +125,8 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             DropConstraint(DropConstraint),
             CreateView(CreateView),
             DropView(DropIndex),
+            CreateSequence(CreateSequence),
+            DropSequence(DropSequence),
         }
         Ok(match Wire::deserialize(d)? {
             Wire::AlterTable(AlterTable { table, action }) => Self::AlterTable { table, action },
@@ -124,6 +134,8 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             Wire::DropConstraint(DropConstraint { table, name, cascade }) => Self::DropConstraint { table, name, cascade },
             Wire::CreateView(CreateView { name, read }) => Self::CreateView { name, read },
             Wire::DropView(DropIndex { name, cascade }) => Self::DropView { name, cascade },
+            Wire::CreateSequence(CreateSequence { name }) => Self::CreateSequence { name },
+            Wire::DropSequence(DropSequence { name, cascade }) => Self::DropSequence { name, cascade },
             Wire::DropTable(DropTable { table, cascade }) => Self::DropTable { table, cascade },
             Wire::DropIndex(DropIndex { name, cascade }) => Self::DropIndex { name, cascade },
             Wire::CreateTable {
@@ -209,6 +221,9 @@ fn constraint_relation_keys(request: &CatalogRequest) -> CatalogRequest {
 }
 
 fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
+    if matches!(request, CatalogRequest::CreateSequence { .. } | CatalogRequest::DropSequence { .. }) {
+        return Err(Error::Unsupported);
+    }
     if let CatalogRequest::AlterTable { table, action } = request {
         let names = match action {
             AlterTableAction::AddColumn { column } => vec![&column.name],

@@ -437,3 +437,5 @@ mod native_views;
 #[path = "native_numeric_assignment.rs"] mod native_numeric_assignment;
 
 #[path = "native_create_defaults.rs"] mod native_create_defaults;
+
+#[path = "native_sequences.rs"] mod native_sequences;

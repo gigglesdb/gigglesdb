@@ -2734,8 +2734,57 @@ impl SqlSession {
             .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
         relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
     }
-    /// Normalize native input before key admission and RETURN evaluation. Native
-    /// execution has no time oracle, but sequences use SQL's durable callbacks.
+    /// Share SQL sequence state and callbacks across native entry points.
+    fn native_sequence_callback(&self) -> Result<(State, relational::clock::SequenceCallback), CoreError> {
+        let mut state = match &self.admin.inner.backend {
+            Backend::V2(db) => db.metadata_state(self.v2_transaction.as_ref())?,
+            _ => match &self.staged {
+                Some(state) => state.clone(),
+                None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
+            },
+        };
+        let callback = if let Backend::V2(db) = &self.admin.inner.backend {
+            self.insert_sequence_callback(db, state.sql.clone())
+        } else {
+            self.admin.inner.merge_live_sequences(&mut state)?;
+            sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
+            let baseline = if self.staged.is_some() {
+                self.sequence_baseline.clone()
+            } else {
+                state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
+            };
+            self.admin.inner.sequence_callback(
+                state.clone(), baseline, self.pending_sequences.clone(),
+                self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
+            )
+        };
+        Ok((state, callback))
+    }
+    pub(crate) fn sequence_call_engine(&mut self, operation: &str, name: &str, value: Option<i64>, called: bool) -> Result<i64, CoreError> {
+        let _ticket = self.admin.inner.enter_sql()?;
+        crate::cancellation::check()?;
+        let (state, callback) = self.native_sequence_callback()?;
+        let qualified = if self.is_v2_engine() {
+            let key = state.sql.resolve_relation_key(name, &self.search_path);
+            if !state.sql.catalog_ext().sequences.values().any(|def| def.name == key) {
+                return Err(CoreError::Sql(relational::SqlError::UnknownTable));
+            }
+            key.split('\0').map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(".")
+        } else { name.to_string() };
+        match callback(operation, &qualified, value, called)? {
+            relational::Value::Int(value) => Ok(value),
+            _ => Err(CoreError::Sql(relational::SqlError::Type)),
+        }
+    }
+    pub(crate) fn sequence_catalog_engine(&mut self, ddl: relational::defaults::SequenceDdl) -> Result<u64, CoreError> {
+        let (domain, epoch) = self.snapshot_identity_engine()?;
+        let epoch = if self.is_v2_engine() { 0 } else { epoch };
+        let mut prepared = relational::Prepared::sequence_engine(ddl, domain, epoch).map_err(CoreError::Sql)?;
+        prepared.transaction = self.transaction_id;
+        self.execute_bound_engine(&prepared, &[], None)?;
+        Ok(self.catalog_engine()?.0)
+    }
+    /// Normalize native input using SQL defaults and durable sequence callbacks.
     pub(crate) fn normalize_insert_engine(
         &mut self,
         table: &relational::TableDef,
@@ -2748,28 +2797,7 @@ impl SqlSession {
             if self.aborted {
                 return Err(CoreError::Sql(relational::SqlError::Aborted));
             }
-            let mut state = match &self.admin.inner.backend {
-                Backend::V2(db) => db.metadata_state(self.v2_transaction.as_ref())?,
-                _ => match &self.staged {
-                    Some(state) => state.clone(),
-                    None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
-                },
-            };
-            let callback = if let Backend::V2(db) = &self.admin.inner.backend {
-                self.insert_sequence_callback(db, state.sql.clone())
-            } else {
-                self.admin.inner.merge_live_sequences(&mut state)?;
-                sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
-                let baseline = if self.staged.is_some() {
-                    self.sequence_baseline.clone()
-                } else {
-                    state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
-                };
-                self.admin.inner.sequence_callback(
-                    state.clone(), baseline, self.pending_sequences.clone(),
-                    self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
-                )
-            };
+            let (state, callback) = self.native_sequence_callback()?;
             let clock = relational::clock::ExecutionClock::new(&relational::StatementClock {
                 unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
                 transaction_us: 0, statement_us: 0, zone: None, wall: None,

@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Debug, Clone)]
-pub(super) enum SequenceDdl {
+pub(crate) enum SequenceDdl {
     Create {
         name: String,
         optional: bool,
@@ -23,6 +23,12 @@ pub(super) enum SequenceDdl {
     },
 }
 impl SequenceDdl {
+    pub(crate) fn create_native(name: String) -> Self {
+        Self::Create { name, optional: false, spec: SequenceSpec::default(), resolution_error: None }
+    }
+    pub(crate) fn drop_native(name: String, cascade: bool) -> Self {
+        Self::Drop { names: vec![name], optional: false, cascade, resolution_error: None }
+    }
     pub(super) fn bind_schema_names(
         &mut self,
         read: &impl Fn(&mut String),

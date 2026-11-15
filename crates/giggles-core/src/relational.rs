@@ -1985,6 +1985,15 @@ impl Prepared {
             epoch,
         )
     }
+    pub(crate) fn sequence_engine(ddl: defaults::SequenceDdl, domain: u128, epoch: u64) -> R<Self> {
+        for name in ddl.names() { ident(name)?; }
+        let references = ddl.names().iter().map(|name| schemas::Reference {
+            name: (*name).to_string(), schema: None, create: matches!(ddl, defaults::SequenceDdl::Create { .. }),
+        }).collect();
+        let mut prepared = Self::engine(Statement::Sequence(ddl), domain, epoch);
+        prepared.relations = references;
+        Ok(prepared)
+    }
     pub(crate) fn drop_table_engine(name: String, cascade: bool, domain: u128, epoch: u64) -> R<Self> {
         ident(split_key(&name).0)?;
         ident(split_key(&name).1)?;

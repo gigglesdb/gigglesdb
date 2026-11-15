@@ -47,7 +47,7 @@ impl SqlSession {
         )
     }
 
-    fn native_scope<T>(
+    pub(super) fn native_scope<T>(
         &mut self,
         read_only: bool,
         validate: impl FnOnce() -> Result<()>,

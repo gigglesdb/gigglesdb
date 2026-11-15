@@ -26,6 +26,8 @@ pub mod once;
 #[cfg(test)]
 mod scalar_tests;
 mod session;
+mod sequence;
+pub use sequence::*;
 mod transaction;
 mod unique_conflict;
 mod upsert;
