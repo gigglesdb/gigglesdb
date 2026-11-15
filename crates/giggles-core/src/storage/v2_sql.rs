@@ -3,9 +3,8 @@ use super::*;
 use engine::{catalog::CatalogParts, txn::Isolation};
 use engine::{catalog::TableEntry, codec, kv::Keyspace, locks::LockMode, txn::Transaction};
 use relational::{
-    SqlError, SqlRow, TableDef, relation_key,
+    SqlError, SqlRow, TableDef,
     row_sink::{DdlRows, RowSink},
-    split_key,
 };
 use std::{collections::BTreeSet, ops::Bound};
 #[path = "v2_sql_sequences.rs"]
@@ -55,7 +54,7 @@ impl SqlSession {
         image: relational::Relational,
     ) -> relational::clock::SequenceCallback {
         sql_sequences::callback(db.clone(), image, self.sequence_baseline.clone(),
-            self.pending_sequences.clone(), self.sequence_values.clone())
+            self.pending_sequences.clone(), self.sequence_values.clone(), self.search_path.clone())
     }
 
     // Typed scans deliberately retain the active statement snapshot. In
@@ -139,6 +138,7 @@ impl SqlSession {
                     self.sequence_baseline.clone(),
                     self.pending_sequences.clone(),
                     self.sequence_values.clone(),
+                    self.search_path.clone(),
                 ))
                 .with_xact(sql_xact::callback(db.clone(), self.xact.clone()));
             let output = state.sql.normalize_copy(prepared, rows, Some(&context));
@@ -633,6 +633,7 @@ impl SqlSession {
                                 self.sequence_baseline.clone(),
                                 self.pending_sequences.clone(),
                                 self.sequence_values.clone(),
+                                self.search_path.clone(),
                             ))
                             .with_xact(sql_xact::callback(db.clone(), self.xact.clone()))
                         });

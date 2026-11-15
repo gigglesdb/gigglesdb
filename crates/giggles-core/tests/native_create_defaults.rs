@@ -124,3 +124,71 @@ fn native_default_errors_and_legacy_json() {
     assert!(old.default.is_none() && old.generated.is_none());
     assert_eq!(serde_json::to_string(&old).unwrap(), json);
 }
+
+#[test]
+fn qualified_defaults_match_sql() {
+    for backend in [Backend::Legacy, Backend::V2] {
+        if backend == Backend::V2 && !cfg!(feature = "engine-rocksdb") { continue; }
+        let admin = Admin::create_engine(common::fresh("qualified-defaults"), Limits::default(), backend).unwrap();
+        let engine = Engine::new(admin.clone()); let mut sql = admin.sql_session();
+        let clock = giggles_core::relational::StatementClock { unavailable: None, transaction_us: 100, statement_us: 100, zone: None, wall: None };
+        for text in ["CREATE SCHEMA app", "CREATE SEQUENCE app.s", "CREATE SEQUENCE public.s", "SELECT setval('public.s',100)"] {
+            sql.execute_at(text, &[], None, &clock).unwrap();
+        }
+        for (suffix, generated, definition) in [("serial", G::Serial, "BIGSERIAL"), ("identity", G::IdentityAlways, "BIGINT GENERATED ALWAYS AS IDENTITY")] {
+            let n = format!("app.n_{suffix}"); let s = format!("app.s_{suffix}");
+            let columns = vec![column("id", T::BigInt, None, Some(generated)),
+                column("n", T::Integer, Some(D::Value(V::Int(7))), None),
+                column("explicit_value", T::BigInt, Some(D::Nextval("app.s".into())), None), column("marker", T::Integer, None, None)];
+            let public = engine.execute_catalog(&create(&format!("public.n_{suffix}"), columns.clone())).unwrap().table;
+            let native = engine.execute_catalog(&create(&n, columns.clone())).unwrap().table;
+            assert_ne!(native.id, public.id);
+            sql.execute_at(&format!("CREATE TABLE {s} (id {definition} PRIMARY KEY, n INTEGER DEFAULT 7, explicit_value BIGINT DEFAULT nextval('app.s'), marker INTEGER)"), &[], None, &clock).unwrap();
+            let presentation = admin.catalog_presentation().unwrap();
+            let reference = admin.catalog().unwrap().1.into_iter().find(|t| t.name == format!("s_{suffix}")).unwrap();
+            for (a, b) in native.columns.iter().zip(&reference.columns) {
+                let text = |id| presentation.defaults.get(&id).map(|v| v.replace(&format!("n_{suffix}"), "x").replace(&format!("s_{suffix}"), "x"));
+                assert_eq!(text(a.id), text(b.id));
+                assert_eq!(presentation.identities.get(&a.id), presentation.identities.get(&b.id));
+            }
+            // Repo SQL quotes canonical qualified regclass text; PG18 prints app.s here.
+            assert_eq!(presentation.defaults.get(&native.columns[2].id).unwrap(), r#"nextval('"app"."s"'::regclass)"#);
+            let owners = sql.sequence_owners().unwrap();
+            for prefix in ["n", "s"] {
+                assert!(owners.contains(&(format!("app\0{prefix}_{suffix}_id_seq"), Some(format!("app\0{prefix}_{suffix}")))));
+            }
+            sql.set_search_path("app, public", "giggles");
+            for table in [&n, &s] {
+                sql.execute_at("SELECT setval('app.s',41,false)", &[], None, &clock).unwrap();
+                if table == &n {
+                    sql.execute_native(&Request::Insert { table: format!("n_{suffix}"), values: vec![("marker".into(), giggles_core::operations::ValueExpr::Literal(V::Int(9)))] }, &Bindings::new()).unwrap();
+                } else { sql.execute_at(&format!("INSERT INTO {s} (marker) VALUES (9)"), &[], None, &clock).unwrap(); }
+            }
+            let rows = |session: &mut giggles_core::SqlSession, table: &str| session.execute_at(&format!("SELECT * FROM {table}"), &[], None, &clock).unwrap().rows;
+            assert_eq!(rows(&mut sql, &n)[0].values, rows(&mut sql, &s)[0].values);
+            assert_eq!(rows(&mut sql, &n)[0].values, [V::Int(1), V::Int(7), V::Int(41), V::Int(9)]);
+            assert!(rows(&mut sql, &format!("public.n_{suffix}")).is_empty());
+            assert_eq!(engine.execute_catalog(&create("nope.t", columns)).unwrap_err().sqlstate(), Some("3F000"));
+            assert_eq!(giggles_core::sqlstate(&sql.execute_at("CREATE TABLE nope.t(id BIGSERIAL PRIMARY KEY, n INTEGER DEFAULT 7)", &[], None, &clock).unwrap_err()), "3F000");
+            if suffix == "serial" {
+                assert_eq!(engine.execute_sequence_catalog(&CatalogRequest::DropSequence { name: format!("{n}_id_seq"), cascade: false }).unwrap_err().sqlstate(), Some("2BP01"));
+                assert_eq!(giggles_core::sqlstate(&sql.execute_at(&format!("DROP SEQUENCE {s}_id_seq"), &[], None, &clock).unwrap_err()), "2BP01");
+            }
+            let drop = CatalogRequest::DropTable { table: n.clone(), cascade: false };
+            if backend == Backend::Legacy {
+                assert_eq!(engine.execute_catalog(&drop).unwrap_err(), Error::PlanRequired);
+                for table in [&n, &s] { sql.execute_at(&format!("DELETE FROM {table} WHERE id=1"), &[], None, &clock).unwrap(); }
+            }
+            engine.execute_catalog(&drop).unwrap();
+            sql.execute_at(&format!("DROP TABLE {s}"), &[], None, &clock).unwrap();
+            for table in [&n, &s] {
+                assert_eq!(giggles_core::sqlstate(&sql.execute_at(&format!("SELECT nextval('{table}_id_seq')"), &[], None, &clock).unwrap_err()), "42P01");
+            }
+            assert_eq!(sql.execute_at("SELECT nextval('app.s')", &[], None, &clock).unwrap().rows[0].values, [V::Int(42)]);
+            assert_eq!(sql.execute_at("SELECT nextval('public.s')", &[], None, &clock).unwrap().rows[0].values, [V::Int(if suffix == "serial" { 101 } else { 102 })]);
+        }
+        for name in ["app.t.x", "App.t"] {
+            assert_eq!(engine.execute_catalog(&create(name, vec![column("id", T::BigInt, None, Some(G::Serial))])).unwrap_err(), Error::Bind("identifier".into()));
+        }
+    }
+}

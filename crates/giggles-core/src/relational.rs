@@ -1986,9 +1986,13 @@ impl Prepared {
         )
     }
     pub(crate) fn sequence_engine(ddl: defaults::SequenceDdl, domain: u128, epoch: u64) -> R<Self> {
-        for name in ddl.names() { ident(name)?; }
-        let references = ddl.names().iter().map(|name| schemas::Reference {
-            name: (*name).to_string(), schema: None, create: matches!(ddl, defaults::SequenceDdl::Create { .. }),
+        for name in ddl.names() {
+            for part in name.split('\0') { ident(part)?; }
+        }
+        let references = ddl.names().iter().map(|name| {
+            let (schema, leaf) = split_key(name);
+            schemas::Reference { name: leaf.into(), schema: name.contains('\0').then(|| schema.into()),
+                create: matches!(ddl, defaults::SequenceDdl::Create { .. }) }
         }).collect();
         let mut prepared = Self::engine(Statement::Sequence(ddl), domain, epoch);
         prepared.relations = references;

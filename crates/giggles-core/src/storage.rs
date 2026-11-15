@@ -2764,13 +2764,16 @@ impl SqlSession {
         let _ticket = self.admin.inner.enter_sql()?;
         crate::cancellation::check()?;
         let (state, callback) = self.native_sequence_callback()?;
+        let quoted = |key: &str| key.split('\0')
+            .map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(".");
         let qualified = if self.is_v2_engine() {
             let key = state.sql.resolve_relation_key(name, &self.search_path);
             if !state.sql.catalog_ext().sequences.values().any(|def| def.name == key) {
                 return Err(CoreError::Sql(relational::SqlError::UnknownTable));
             }
-            key.split('\0').map(|part| format!("\"{}\"", part.replace('"', "\"\""))).collect::<Vec<_>>().join(".")
-        } else { name.to_string() };
+            let key = if key.contains('\0') { key } else { format!("public\0{key}") };
+            quoted(&key)
+        } else { quoted(name) };
         match callback(operation, &qualified, value, called)? {
             relational::Value::Int(value) => Ok(value),
             _ => Err(CoreError::Sql(relational::SqlError::Type)),

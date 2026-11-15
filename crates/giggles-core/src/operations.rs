@@ -602,7 +602,11 @@ fn read_page(session: &mut SqlSession, request: &Request, after: Option<&[Value]
         if key.len() != order.len() { return Err(Error::Bind("paging key length".into())); }
         let mut remaining = MAX_BOUND_VALUE_BYTES;
         for (value, (index, _)) in key.iter().zip(&order) {
-            check(value, &table.columns[*index])?;
+            let column = &table.columns[*index];
+            if matches!((Some(colty(column)), ty(value)), (Some(Ty::Int), Some(Ty::Text | Ty::Bool)) | (Some(Ty::Text | Ty::Bool), Some(Ty::Int))) {
+                return Err(core(CoreError::Sql(SqlError::UndefinedFunction)));
+            }
+            check(value, column)?;
             charge_value(&mut remaining, value)?;
         }
     }

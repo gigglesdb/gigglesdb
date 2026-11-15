@@ -10,12 +10,12 @@ impl Engine {
     pub fn execute_sequence_catalog(&self, request: &CatalogRequest) -> Result<u64> {
         use crate::relational::defaults::SequenceDdl;
         let (name, ddl) = match request {
-            CatalogRequest::CreateSequence { name } => (name, SequenceDdl::create_native(name.clone())),
-            CatalogRequest::DropSequence { name, cascade } => (name, SequenceDdl::drop_native(name.clone(), *cascade)),
+            CatalogRequest::CreateSequence { name } => (name, SequenceDdl::create_native(native_relation_key(name))),
+            CatalogRequest::DropSequence { name, cascade } => (name, SequenceDdl::drop_native(native_relation_key(name), *cascade)),
             _ => return Err(Error::Unsupported),
         };
         self.admin.sql_session().native_scope(false, || {
-            if !identifier(name) { return Err(Error::Bind("identifier".into())); }
+            if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
             validate_size(request)
         }, |session| session.sequence_catalog_engine(ddl).map_err(core))
     }
@@ -32,8 +32,8 @@ impl SqlSession {
             SequenceCall::Setval { name, value, is_called } => ("setval", name, Some(*value), is_called.unwrap_or(true)),
         };
         self.native_scope(false, || {
-            if !identifier(name) { return Err(Error::Bind("identifier".into())); }
+            if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
             Ok(())
-        }, |session| session.sequence_call_engine(operation, name, value, called).map_err(core))
+        }, |session| session.sequence_call_engine(operation, &native_relation_key(name), value, called).map_err(core))
     }
 }

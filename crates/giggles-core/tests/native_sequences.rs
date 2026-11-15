@@ -86,7 +86,7 @@ fn run(backend: giggles_core::Engine) {
     assert_eq!(sql(&mut reference, "SELECT nextval('reopen_ref')"), Ok(1));
     assert_eq!(engine.execute_sequence(&S::Currval("reopen".into())), Err(err("55000")));
     assert_eq!(sql(&mut admin.sql_session(), "SELECT currval('reopen_ref')"), Err(err("55000")));
-    for name in ["Bad", "a.b", ""] {
+    for name in ["Bad", "a.b.c", ""] {
         assert_eq!(engine.execute_sequence_catalog(&create(name)), Err(Error::Bind("identifier".into())));
         assert_eq!(engine.execute_sequence(&S::Nextval(name.into())), Err(Error::Bind("identifier".into())));
     }
@@ -106,5 +106,51 @@ fn v2() { run(giggles_core::Engine::V2); }
 fn strict_decode() {
     for text in [r#"{"CreateSequence":{"name":"s","extra":true}}"#, r#"{"DropSequence":{"name":"s","cascade":false,"extra":true}}"#] {
         assert!(serde_json::from_str::<C>(text).is_err());
+    }
+}
+
+#[test]
+fn qualified_sequences_match_sql() {
+    for backend in [giggles_core::Engine::Legacy, giggles_core::Engine::V2] {
+        if backend == giggles_core::Engine::V2 && !cfg!(feature = "engine-rocksdb") { continue; }
+        let admin = Admin::create_engine(common::fresh("qualified-sequences"), Limits::default(), backend).unwrap();
+        let engine = Engine::new(admin.clone());
+        let mut native = admin.sql_session(); let mut reference = admin.sql_session();
+        sql(&mut reference, "CREATE SCHEMA app").unwrap();
+        for name in ["app.s", "public.s"] { engine.execute_sequence_catalog(&create(name)).unwrap(); }
+        for name in ["app.r", "public.r"] { sql(&mut reference, &format!("CREATE SEQUENCE {name}")).unwrap(); }
+        native.set_search_path("app, public", "giggles"); reference.set_search_path("app, public", "giggles");
+        for (call, text, expected) in [
+            (S::Currval("app.s".into()), "SELECT currval('app.r')", Err(err("55000"))),
+            (S::Setval { name: "app.s".into(), value: 41, is_called: Some(false) }, "SELECT setval('app.r',41,false)", Ok(41)),
+            (S::Currval("s".into()), "SELECT currval('r')", Err(err("55000"))),
+            (S::Nextval("s".into()), "SELECT nextval('r')", Ok(41)),
+            (S::Currval("app.s".into()), "SELECT currval('app.r')", Ok(41)),
+            (S::Nextval("public.s".into()), "SELECT nextval('public.r')", Ok(1)),
+            (S::Setval { name: "s".into(), value: 100, is_called: None }, "SELECT setval('r',100)", Ok(100)),
+            (S::Currval("s".into()), "SELECT currval('r')", Ok(100)),
+            (S::Nextval("nope.s".into()), "SELECT nextval('nope.s')", Err(err("42P01"))),
+            (S::Nextval("app.missing".into()), "SELECT nextval('app.missing')", Err(err("42P01"))),
+        ] {
+            assert_eq!(native.execute_sequence_native(&call), expected, "{call:?}");
+            assert_eq!(sql(&mut reference, text), expected, "{text}");
+        }
+        assert_eq!(engine.execute_sequence_catalog(&create("nope.s")), Err(err("3F000")));
+        assert_eq!(sql(&mut reference, "CREATE SEQUENCE nope.s"), Err(err("3F000")));
+        // Repo SQL reports a missing relation (42P01); PG18 reports missing schema (3F000).
+        assert_eq!(engine.execute_sequence_catalog(&drop_sequence("nope.s", false)), Err(err("42P01")));
+        assert_eq!(sql(&mut reference, "DROP SEQUENCE nope.s"), Err(err("42P01")));
+        engine.execute_sequence_catalog(&drop_sequence("app.s", false)).unwrap();
+        sql(&mut reference, "DROP SEQUENCE app.r").unwrap();
+        assert_eq!(native.execute_sequence_native(&S::Nextval("s".into())), Ok(2));
+        assert_eq!(sql(&mut reference, "SELECT nextval('r')"), Ok(2));
+        for name in ["app.s.x", "App.s", "app.", ".s"] {
+            for request in [create(name), drop_sequence(name, false)] {
+                assert_eq!(engine.execute_sequence_catalog(&request), Err(Error::Bind("identifier".into())));
+            }
+            for call in [S::Nextval(name.into()), S::Currval(name.into()), S::Setval { name: name.into(), value: 1, is_called: None }] {
+                assert_eq!(native.execute_sequence_native(&call), Err(Error::Bind("identifier".into())));
+            }
+        }
     }
 }

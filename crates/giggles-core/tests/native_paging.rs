@@ -56,7 +56,8 @@ fn exercise(storage: StorageEngine) {
     if let Request::Read { order, .. } = &mut invalid { order.pop(); }
     assert_eq!(engine.read_page(&invalid, None, &bindings), Err(Error::Bind("paging order must end in the full primary key".into())));
     assert_eq!(engine.read_page(&request, Some(&[]), &bindings), Err(Error::Bind("paging key length".into())));
-    assert_eq!(engine.read_page(&request, Some(&[Value::Text("bad".into()), Value::Int(0), Value::Int(0)]), &bindings), Err(Error::Type));
+    // PG18: a typed text cursor compared with an integer row key gives 42883.
+    assert_eq!(engine.read_page(&request, Some(&[Value::Text("bad".into()), Value::Int(0), Value::Int(0)]), &bindings), Err(Error::Sql { sqlstate: "42883".into() }));
     let mut default_size = request.clone();
     if let Request::Read { limit, .. } = &mut default_size { *limit = None; }
     assert_eq!(engine.read_page(&default_size, None, &bindings).unwrap().outcome.rows.len(), 100);

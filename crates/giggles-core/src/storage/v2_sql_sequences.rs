@@ -7,12 +7,12 @@ pub(super) fn callback(
     baseline: BTreeMap<u64, u128>,
     pending: sequences::Pending,
     values: sequences::SessionValues,
+    search_path: Vec<String>,
 ) -> relational::clock::SequenceCallback {
     Arc::new(move |operation, name, value, called| {
         crate::cancellation::check()?;
         let name = sequences::sequence_name(name).map_err(CoreError::Sql)?;
-        let (schema, name) = split_key(&name);
-        let name = relation_key(schema, name);
+        let name = image.resolve_relation_key(&name, &search_path);
         let (&id, def) = image
             .catalog_ext()
             .sequences
