@@ -36,7 +36,8 @@ mod numeric;
 mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
-pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare};
+pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare,
+    ReadAggregate, ReadClauses, ReadOrder};
 use query::{TypmodSource, result_typmod};
 pub(crate) mod cursor;
 mod returning;

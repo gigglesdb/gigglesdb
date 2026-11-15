@@ -396,3 +396,5 @@ mod view_ddl;
 
 #[path = "many_params.rs"]
 mod many_params;
+#[path = "typed_aggregate_read.rs"]
+mod typed_aggregate_read;

@@ -1,4 +1,4 @@
-//! Bounded, unbound leaf reads. Names are exact identifiers, never SQL text.
+//! Bounded, unbound single-source reads. Names are exact identifiers, never SQL text.
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -16,6 +16,40 @@ pub struct ReadProjection {
 pub enum ReadExpr {
     Column(String),
     Literal(Value),
+    Aggregate(ReadAggregate),
+}
+#[derive(Debug, Clone)]
+pub enum ReadAggregate {
+    CountStar,
+    Count(String),
+    Sum(String),
+    Min(String),
+    Max(String),
+    Avg(String),
+}
+/// Optional clauses, attached once with `SingleSourceRead::with_clauses`.
+#[derive(Debug, Clone, Default)]
+pub struct ReadClauses {
+    pub group_by: Vec<String>,
+    pub having: Option<ReadPredicate>,
+    pub order_by: Vec<ReadOrder>,
+    pub limit: Option<i64>,
+}
+#[derive(Debug, Clone)]
+pub struct ReadOrder {
+    pub expression: ReadExpr,
+    pub descending: bool,
+    /// None uses SQL's default (NULLS FIRST for DESC, NULLS LAST for ASC).
+    pub nulls_first: Option<bool>,
+}
+impl SingleSourceRead {
+    /// Preserve the ordinary WHERE filter while attaching post-filter clauses.
+    pub fn with_clauses(mut self, clauses: ReadClauses) -> Self {
+        self.filter = Some(ReadPredicate::Clauses {
+            filter: self.filter.map(Box::new), clauses: Box::new(clauses),
+        });
+        self
+    }
 }
 #[derive(Debug, Clone, Copy)]
 pub enum ReadCompare {
@@ -23,6 +57,8 @@ pub enum ReadCompare {
 }
 #[derive(Debug, Clone)]
 pub enum ReadPredicate {
+    /// Root-only clause bundle; use `SingleSourceRead::with_clauses`.
+    Clauses { filter: Option<Box<Self>>, clauses: Box<ReadClauses> },
     Compare(ReadExpr, ReadCompare, ReadExpr),
     /// The boolean negates IS NULL (true means IS NOT NULL).
     IsNull(ReadExpr, bool),
@@ -42,6 +78,18 @@ struct Budget {
     bytes: usize,
 }
 impl Budget {
+    fn aggregate(&mut self, value: ReadAggregate, depth: usize) -> R<(Aggregate, Option<Scalar>)> {
+        self.add(0, depth)?;
+        let (kind, column) = match value {
+            ReadAggregate::CountStar => return Ok((Aggregate::Count, None)),
+            ReadAggregate::Count(c) => (Aggregate::Count, c),
+            ReadAggregate::Sum(c) => (Aggregate::Sum, c),
+            ReadAggregate::Min(c) => (Aggregate::Min, c),
+            ReadAggregate::Max(c) => (Aggregate::Max, c),
+            ReadAggregate::Avg(c) => (Aggregate::Avg, c),
+        };
+        Ok((kind, Some(self.expr(ReadExpr::Column(column), depth + 1)?)))
+    }
     fn add(&mut self, bytes: usize, depth: usize) -> R<()> {
         self.nodes += 1;
         self.bytes = self.bytes.checked_add(bytes).ok_or(SqlError::Limit)?;
@@ -52,6 +100,11 @@ impl Budget {
     }
     fn expr(&mut self, value: ReadExpr, depth: usize) -> R<Scalar> {
         Ok(match value {
+            ReadExpr::Aggregate(value) => {
+                let (kind, argument) = self.aggregate(value, depth)?;
+                // The SQL parser also lowers post-group COUNT(*) to COUNT(1).
+                Scalar::Call(kind.name().into(), vec![argument.unwrap_or(Scalar::Literal(Value::Int(1)))])
+            }
             ReadExpr::Column(column) => {
                 self.add(column.len(), depth)?;
                 name(&column)?;
@@ -70,6 +123,7 @@ impl Budget {
     fn predicate(&mut self, value: ReadPredicate, depth: usize) -> R<Filter> {
         self.add(0, depth)?;
         Ok(match value {
+            ReadPredicate::Clauses { .. } => return Err(SqlError::Syntax),
             ReadPredicate::Compare(a, op, b) => {
                 let op = match op {
                     ReadCompare::Eq => "=", ReadCompare::Ne => "<>",
@@ -100,9 +154,36 @@ pub(super) fn lower(read: SingleSourceRead) -> R<Query> {
             name(alias)?;
             budget.add(alias.len(), 0)?;
         }
-        Ok((Item::Scalar(budget.expr(p.expression, 0)?), p.alias))
+        let item = match p.expression {
+            ReadExpr::Aggregate(value) => {
+                let (kind, argument) = budget.aggregate(value, 0)?;
+                Item::Aggregate(kind, argument)
+            }
+            expression => Item::Scalar(budget.expr(expression, 0)?),
+        };
+        Ok((item, p.alias))
     }).collect::<R<Vec<_>>>()?;
-    let filter = read.filter.map(|f| budget.predicate(f, 0)).transpose()?;
+    let (filter, clauses) = match read.filter {
+        Some(ReadPredicate::Clauses { filter, clauses }) => (filter.map(|f| *f), *clauses),
+        filter => (filter, ReadClauses::default()),
+    };
+    if clauses.group_by.len() > MAX_COLUMNS || clauses.order_by.len() > MAX_COLUMNS {
+        return Err(SqlError::Limit);
+    }
+    let filter = filter.map(|f| budget.predicate(f, 0)).transpose()?;
+    let group = clauses.group_by.into_iter().map(|c| budget.expr(ReadExpr::Column(c), 0))
+        .collect::<R<Vec<_>>>()?;
+    let having = clauses.having.map(|f| budget.predicate(f, 0)).transpose()?;
+    let order = clauses.order_by.into_iter().map(|o| {
+        Ok((budget.expr(o.expression, 0)?, o.descending, o.nulls_first.unwrap_or(o.descending)))
+    }).collect::<R<Vec<_>>>()?;
+    let limit = clauses.limit.map(|n| -> R<Expr> {
+        budget.add(std::mem::size_of::<i64>(), 0)?;
+        Ok(Expr::Literal(Value::Int(n)))
+    }).transpose()?;
+    let filter = if group.is_empty() && having.is_none() { filter } else {
+        Some(Filter::Clauses(Box::new(QueryClauses { filter, group, having, ..QueryClauses::default() })))
+    };
     Ok(Query { explain: false, sources: vec![Source { alias: read.table.clone(), name: read.table }],
-        joins: vec![], items, predicates: vec![], filter, order: vec![], limit: None })
+        joins: vec![], items, predicates: vec![], filter, order, limit })
 }
