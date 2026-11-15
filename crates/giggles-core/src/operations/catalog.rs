@@ -221,7 +221,7 @@ fn bind_catalog(
         unreachable!()
     };
     if tables.iter().any(|existing| existing.name == *table) {
-        return Err(core(CoreError::Sql(SqlError::Duplicate)));
+        return Err(Error::Sql { sqlstate: "42P07".into() });
     }
     if tables.len() >= crate::relational::MAX_TABLES {
         return Err(core(CoreError::Sql(SqlError::Limit)));

@@ -1625,6 +1625,35 @@ impl Parser {
         Ok(st)
     }
 }
+impl Relational {
+    /// Fill omissions once, using the same defaults and sequence context as SQL.
+    pub(crate) fn normalize_insert_engine(
+        &self,
+        table: &TableDef,
+        supplied: &[usize],
+        values: Vec<Value>,
+        clock: &clock::ExecutionClock,
+    ) -> R<Vec<Value>> {
+        Prepared::engine_table(table, self)?;
+        unique(supplied)?;
+        if values.len() != supplied.len() {
+            return Err(SqlError::Type);
+        }
+        for index in supplied {
+            defaults::check_explicit(self, table.columns.get(*index).ok_or(SqlError::UnknownColumn)?)?;
+        }
+        let mut row = defaults::row(self, table, supplied, Some(clock))?;
+        for (index, value) in supplied.iter().zip(values) {
+            row[*index] = value;
+        }
+        for (value, column) in row.iter_mut().zip(&table.columns) {
+            *value = coerce_to_column(self, column, value.clone())?;
+        }
+        Relational::secondary_admit_values(row.iter())?;
+        row_check(table, &row)?;
+        Ok(row)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Prepared {
     pub(crate) domain: u128,
@@ -1941,6 +1970,34 @@ impl Prepared {
             domain,
             state.epoch,
         ))
+    }
+    /// Insert a normalized native postimage without treating generated defaults
+    /// as explicit identity assignments. The supplied columns alone are checked.
+    pub(crate) fn insert_normalized_engine(
+        table: &TableDef,
+        values: Vec<Value>,
+        supplied: &[usize],
+        domain: u128,
+        state: &Relational,
+    ) -> R<Self> {
+        for index in supplied {
+            defaults::check_explicit(state, table.columns.get(*index).ok_or(SqlError::UnknownColumn)?)?;
+        }
+        let mut prepared = Self::insert_engine(table, values, domain, state)?;
+        let Statement::Insert { values, .. } = prepared.statement else {
+            return Err(SqlError::Unsupported);
+        };
+        let values = values.into_iter().map(|expr| match expr {
+            Expr::Literal(value) => Ok(value),
+            _ => Err(SqlError::Unsupported),
+        }).collect::<R<Vec<_>>>()?;
+        prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::copy(
+            table.name.clone(),
+            table.columns.iter().map(|c| c.name.clone()).collect(),
+            table.columns.iter().map(|c| c.data_type.clone()).collect(),
+            vec![values],
+        )));
+        Ok(prepared)
     }
     pub(crate) fn update_engine(
         table: &TableDef,

@@ -588,6 +588,7 @@ pub(crate) fn encode_error(v: o::Error) -> p::NativeError {
     } else {
         None
     };
+    let sqlstate = v.sqlstate().map(str::to_owned);
     let kind = match v {
         o::Error::Syntax { .. } => 1,
         o::Error::Unsupported => 2,
@@ -608,9 +609,11 @@ pub(crate) fn encode_error(v: o::Error) -> p::NativeError {
         o::Error::DuplicateTarget => 17,
         o::Error::PlanRequired => 18,
         o::Error::Duplicate => 19,
+        o::Error::Sql { .. } => 20,
     };
     p::NativeError {
         kind,
         syntax_offset,
+        sqlstate,
     }
 }

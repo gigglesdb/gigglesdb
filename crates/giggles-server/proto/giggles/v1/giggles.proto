@@ -537,6 +537,7 @@ enum NativeDataType {
 message NativeError {
   NativeErrorClass kind = 1;
   optional uint64 syntax_offset = 2;
+  optional string sqlstate = 3;
 }
 
 enum NativeErrorClass {
@@ -560,4 +561,5 @@ enum NativeErrorClass {
   NATIVE_ERROR_CLASS_DUPLICATE_TARGET = 17;
   NATIVE_ERROR_CLASS_PLAN_REQUIRED = 18;
   NATIVE_ERROR_CLASS_DUPLICATE = 19; // SQLSTATE 23505
+  NATIVE_ERROR_CLASS_SQL = 20; // Underlying SQLSTATE in sqlstate
 }

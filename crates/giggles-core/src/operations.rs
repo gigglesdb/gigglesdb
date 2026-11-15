@@ -94,6 +94,7 @@ pub enum Error {
     DuplicateTarget,
     PlanRequired,
     Duplicate,
+    Sql { sqlstate: String },
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,10 +103,13 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl Error {
-    /// SQLSTATE for the duplicate-key identity preserved by native execution.
-    pub fn sqlstate(&self) -> Option<&'static str> {
+    /// SQLSTATE identity preserved by native execution.
+    pub fn sqlstate(&self) -> Option<&str> {
         match self {
+            Self::Sql { sqlstate } => Some(sqlstate),
             Self::Duplicate => Some("23505"),
+            Self::Overflow => Some("22003"),
+            Self::DivisionByZero => Some("22012"),
             _ => None,
         }
     }
@@ -436,6 +440,9 @@ fn core(e: CoreError) -> Error {
         CoreError::Sql(SqlError::Conflict) => Error::Conflict,
         CoreError::Sql(SqlError::Duplicate) => Error::Duplicate,
         CoreError::Sql(SqlError::Overflow) => Error::Overflow,
+        CoreError::Sql(_) => Error::Sql {
+            sqlstate: crate::sqlstate(&e).into(),
+        },
         _ => Error::Core(e.to_string()),
     }
 }
@@ -912,7 +919,7 @@ impl Binder<'_> {
             .columns
             .iter()
             .position(|c| c.name == s)
-            .ok_or_else(|| Error::Bind("column".into()))
+            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))
     }
     fn value(&mut self, e: &ValueExpr) -> Result<Value> {
         let (value, parameter) = match e {
@@ -1214,7 +1221,9 @@ impl Binder<'_> {
                 return Err(Error::Unsupported);
             }
             let v = self.value(e)?;
-            check(&v, &self.table()?.columns[i])?;
+            if !insert || v != Value::Null {
+                check(&v, &self.table()?.columns[i])?;
+            }
             out.push((i, v))
         }
         Ok(out)
@@ -1407,13 +1416,6 @@ impl Binder<'_> {
                     }
                     bound_rows.push(bound_row);
                 }
-                if !rows.is_empty() {
-                    for (index, column) in self.table()?.columns.iter().enumerate() {
-                        if !seen.contains(&index) {
-                            check(&Value::Null, column)?;
-                        }
-                    }
-                }
                 Operation::InsertMany {
                     columns: indexes,
                     rows: bound_rows,
@@ -1450,26 +1452,21 @@ impl Binder<'_> {
                     }
                     expressions[index] = expression;
                 }
-                for (index, column) in self.table()?.columns.iter().enumerate() {
-                    if !seen.contains(&index) {
-                        check(&Value::Null, column)?;
+                if seen.len() == expressions.len() {
+                    Operation::InsertExpressions { values: expressions, returning: None }
+                } else {
+                    let values = expressions.into_iter().enumerate()
+                        .filter_map(|(i, value)| seen.contains(&i).then_some(value)).collect();
+                    Operation::InsertMany {
+                        columns: seen.into_iter().collect(), rows: vec![values], cap: 1, returning: None,
                     }
-                }
-                Operation::InsertExpressions {
-                    values: expressions,
-                    returning: None,
                 }
             }
             Request::Insert { values, .. } => {
-                let a = self.assignments(values, true)?;
-                let mut values = vec![Value::Null; self.table()?.columns.len()];
-                for (i, v) in a {
-                    values[i] = v
-                }
-                for (v, c) in values.iter().zip(&self.table()?.columns) {
-                    check(v, c)?
-                }
+                let assignments = self.assignments(values, true)?;
+                let (columns, values) = assignments.into_iter().unzip();
                 Operation::Insert {
+                    columns,
                     values,
                     returning: None,
                 }
@@ -1565,8 +1562,8 @@ impl Binder<'_> {
             self.allow_conflict_fields = false;
             let action = bound_action?;
             let (columns, rows, cap) = match operation {
-                Operation::Insert { values, .. } => (
-                    (0..values.len()).collect(),
+                Operation::Insert { columns, values, .. } => (
+                    columns,
                     vec![values.into_iter().map(Bound::Value).collect()],
                     1,
                 ),
@@ -1681,6 +1678,7 @@ enum Operation {
         projection: Vec<BoundProjection>,
     },
     Insert {
+        columns: Vec<usize>,
         values: Vec<Value>,
         returning: Option<Vec<BoundProjection>>,
     },
@@ -1979,12 +1977,22 @@ fn run<C: Context>(
         ..
     } = op
     {
+        let session = s.session()?;
+        let mut normalized = Vec::new();
+        let mut remaining = MAX_INSERT_BYTES;
+        for expressions in proposed {
+            let values = expressions.iter().map(|e| e.eval(&[]).map(Cow::into_owned))
+                .collect::<Result<Vec<_>>>()?;
+            let values = normalize_insert(session, t, &columns, values)?;
+            for value in &values { charge_value(&mut remaining, value)?; }
+            normalized.push(values.into_iter().map(Bound::Value).collect());
+        }
         return upsert::run(
-            s.session()?,
+            session,
             t,
             upsert::Plan {
-                columns,
-                expressions: proposed,
+                columns: (0..t.columns.len()).collect(),
+                expressions: normalized,
                 action,
                 returning,
             },
@@ -2002,23 +2010,9 @@ fn run<C: Context>(
     let op = match op {
         Operation::InsertExpressions { values, returning } => {
             s.checkpoint().map_err(core)?;
-            let evaluated = values
-                .iter()
-                .zip(&t.columns)
-                .map(|(value, column)| {
-                    s.coerce_column(column, value.eval(&[])?.into_owned())
-                        .map(Cow::Owned)
-                })
+            let evaluated = values.iter().map(|v| v.eval(&[]).map(Cow::into_owned))
                 .collect::<Result<Vec<_>>>()?;
-            let mut remaining = crate::relational::MAX_ROW_BYTES;
-            for (value, column) in evaluated.iter().zip(&t.columns) {
-                check(value, column)?;
-                charge_value(&mut remaining, value)?;
-            }
-            Operation::Insert {
-                values: evaluated.into_iter().map(Cow::into_owned).collect(),
-                returning,
-            }
+            Operation::Insert { columns: (0..evaluated.len()).collect(), values: evaluated, returning }
         }
         other => other,
     };
@@ -2109,12 +2103,8 @@ fn run<C: Context>(
                 }
             }
         }
-        Operation::Insert { values, returning } => {
-            let values = values
-                .into_iter()
-                .zip(&t.columns)
-                .map(|(value, column)| s.coerce_column(column, value))
-                .collect::<Result<Vec<_>>>()?;
+        Operation::Insert { columns, values, returning } => {
+            let values = normalize_insert(s.session()?, t, &columns, values)?;
             let key = if let Some(projection) = &returning {
                 s.checkpoint().map_err(core)?;
                 let mut remaining_row = crate::relational::MAX_ROW_BYTES;
@@ -2427,6 +2417,22 @@ impl Operation {
     }
 }
 
+// Preserve native admission errors for explicit input and finite row budgets;
+// omissions and identity violations retain the SQL error produced by defaults.
+fn normalize_insert(
+    session: &mut SqlSession,
+    table: &TableDef,
+    columns: &[usize],
+    values: Vec<Value>,
+) -> Result<Vec<Value>> {
+    let invalid_supplied = columns.iter().zip(&values)
+        .any(|(index, value)| check(value, &table.columns[*index]).is_err());
+    session.normalize_insert_engine(table, columns, values).map_err(|error| match error {
+        CoreError::Sql(SqlError::Limit) => Error::Limit,
+        CoreError::Sql(SqlError::Null | SqlError::Type) if invalid_supplied => Error::Type,
+        error => core(error),
+    })
+}
 fn insert_many(
     session: &mut SqlSession,
     table: &TableDef,
@@ -2439,17 +2445,14 @@ fn insert_many(
     let count = expressions.len();
     let mut proposed = Vec::new();
     let mut remaining = MAX_INSERT_BYTES;
-    // Borrow explicit payload through full-row and aggregate admission. Omitted
-    // nullable fields are generated only for actual proposed rows.
+    // Normalize each actual proposal before full-row and aggregate admission.
+    // Defaults are consumed once, before key checks and RETURN evaluation.
     for expressions in &expressions {
         crate::cancellation::check().map_err(core)?;
-        let mut row = vec![Cow::Owned(Value::Null); table.columns.len()];
-        for (index, expression) in columns.iter().zip(expressions) {
-            row[*index] = Cow::Owned(
-                session
-                    .coerce_column(&table.columns[*index], expression.eval(&[])?.into_owned())?,
-            );
-        }
+        let values = expressions.iter().map(|e| e.eval(&[]).map(Cow::into_owned))
+            .collect::<Result<Vec<_>>>()?;
+        let row = normalize_insert(session, table, &columns, values)?
+            .into_iter().map(Cow::Owned).collect::<Vec<_>>();
         let mut remaining_row = crate::relational::MAX_ROW_BYTES;
         for (value, column) in row.iter().zip(&table.columns) {
             check(value, column)?;

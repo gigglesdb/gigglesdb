@@ -258,7 +258,7 @@ fn bound_operations_reject_catalog_changes_and_restored_database_domains() {
         restored.snapshot().unwrap().domain,
         bound.description().database_domain
     );
-    let stale = Err(Error::Core("Sql(StaleSchema)".into()));
+    let stale = Err(Error::Sql { sqlstate: "0A000".into() });
     with_sql_parser_forbidden(|| assert_eq!(restored_engine.execute_bound(&bound), stale));
     assert_eq!(rows(&restored), rows(&admin));
 

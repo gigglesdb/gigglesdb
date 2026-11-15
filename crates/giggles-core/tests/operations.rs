@@ -327,7 +327,7 @@ fn binding_rejects_missing_extra_wrong_type_and_invalid_empty_mutations() {
     for (name, value, expected) in [
         ("n", V::Int(i64::MAX), Error::Type),
         ("state", V::Null, Error::Type),
-        ("absent", V::Int(1), Error::Bind("column".into())),
+        ("absent", V::Int(1), Error::Sql { sqlstate: "42703".into() }),
     ] {
         let invalid = Request::Update {
             table: "items".into(),

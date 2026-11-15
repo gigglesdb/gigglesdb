@@ -311,20 +311,12 @@ fn v2_native_catalog_matches_sql_on_populated_database() {
     ] {
         assert_eq!(sql(&left, statement), Step::Sql(kind.clone()));
         let actual = with_sql_parser_forbidden(|| engine.execute_catalog_text(text)).unwrap_err();
-        if kind == SqlError::DuplicateTable {
-            // Known difference: native CREATE TABLE still exposes 23505 vs SQL 42P07.
+        if kind == SqlError::Duplicate {
             assert_eq!(actual, Error::Duplicate);
-            assert_eq!(actual.sqlstate(), Some("23505"));
-            assert_ne!(actual.sqlstate(), Some(code));
-        } else if kind == SqlError::UnknownColumn {
-            // Existing string forwarding retains the cause but exposes no SQLSTATE.
-            assert_eq!(actual, Error::Core(CoreError::Sql(kind).to_string()));
-            assert_eq!(actual.sqlstate(), None);
-            assert_eq!(code, "42703");
         } else {
-            assert_eq!(actual, Error::Duplicate);
-            assert_eq!(actual.sqlstate(), Some(code));
+            assert_eq!(actual, Error::Sql { sqlstate: code.into() });
         }
+        assert_eq!(actual.sqlstate(), Some(code));
         assert_eq!(snapshot(&left), snapshot(&right));
     }
     let before = snapshot(&left);
@@ -778,7 +770,7 @@ fn numeric_native_catalog_matches_sql() {
         let engine = Engine::with_version(v2.clone(), v);
         with_sql_parser_forbidden(|| {
             engine.execute_catalog_text(text).unwrap();
-            assert_eq!(engine.execute_catalog(&tree), Err(Error::Duplicate));
+            assert_eq!(engine.execute_catalog(&tree), Err(Error::Sql { sqlstate: "42P07".into() }));
         });
         assert_eq!(snapshot(&v2)[0].columns, expected.state[0].columns);
     }

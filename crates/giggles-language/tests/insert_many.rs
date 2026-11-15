@@ -384,7 +384,7 @@ fn insert_many_text_tree_and_bound_execution_match_without_sql() {
         .unwrap();
     assert_eq!(
         engine.execute_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
 
     let (_, admin, engine) =

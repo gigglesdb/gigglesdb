@@ -436,7 +436,7 @@ fn catalog_rejections_and_populated_policy_are_atomic() {
     let before = digest(&admin);
     assert_eq!(
         engine.execute_catalog(&create("items")),
-        Err(Error::Duplicate)
+        Err(Error::Sql { sqlstate: "42P07".into() })
     );
     assert_eq!(digest(&admin), before);
     for source in [
@@ -486,7 +486,7 @@ fn catalog_rejections_and_populated_policy_are_atomic() {
     assert_eq!(created.catalog_epoch, 2);
     assert_eq!(
         engine.execute_catalog_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let read = engine
         .prepare_bound_text("items", &Bindings::new())
@@ -498,11 +498,11 @@ fn catalog_rejections_and_populated_policy_are_atomic() {
         .unwrap();
     assert_eq!(
         engine.execute_bound(&read),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(
         engine.execute_catalog_bound(&catalog),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
 }
 

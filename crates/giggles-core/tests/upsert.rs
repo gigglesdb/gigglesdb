@@ -418,11 +418,12 @@ fn upsert_caps_incoming_constraints_and_duplicate_identities_precede_conflicts()
             Error::Type,
         );
     }
-    static_failure(
+    runtime_failure(
         &admin,
         &engine,
         &nothing(many(&["id"], vec![vec![int(1)]], 1)),
-        Some(Error::Type),
+        &Bindings::new(),
+        Error::Sql { sqlstate: "23502".into() },
     );
     // Identity comes from the canonical full key, independent of target-list order.
     let (_, admin, engine) =
@@ -1157,7 +1158,7 @@ fn upsert_prepared_winners_and_skipped_transaction_locals_are_fresh() {
     let before = digest(&admin);
     assert_eq!(
         engine.execute_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(digest(&admin), before);
 }

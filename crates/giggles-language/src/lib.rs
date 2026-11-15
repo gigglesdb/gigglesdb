@@ -322,6 +322,7 @@ pub enum Error {
     DuplicateTarget,
     PlanRequired,
     Duplicate,
+    Sql { sqlstate: String },
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -331,8 +332,9 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 impl Error {
     /// SQLSTATE for selected native error identities.
-    pub fn sqlstate(&self) -> Option<&'static str> {
+    pub fn sqlstate(&self) -> Option<&str> {
         match self {
+            Self::Sql { sqlstate } => Some(sqlstate),
             Self::Duplicate => Some("23505"),
             Self::Overflow => Some("22003"),
             Self::DivisionByZero => Some("22012"),

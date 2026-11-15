@@ -476,7 +476,7 @@ fn native_binding_metadata_parity() {
             .sql_session()
             .execute("CREATE TABLE changed (id BIGINT PRIMARY KEY)", &[], None)
             .unwrap();
-        let stale = Error::Core(CoreError::Sql(relational::SqlError::StaleSchema).to_string());
+        let stale = Error::Sql { sqlstate: "0A000".into() };
         assert_eq!(native.execute_bound(&handle), Err(stale.clone()));
         let other_path = directory();
         let other = Admin::create_engine(&other_path, Limits::default(), backend).unwrap();
@@ -744,7 +744,7 @@ fn typed_keyed_delete_parity() {
                     relational::SqlError::ForeignKeyViolation // 23503
                 };
                 assert_eq!(sql_result, Err(CoreError::Sql(expected.clone())));
-                assert_eq!(result, Err(Error::Core(CoreError::Sql(expected).to_string())));
+                assert_eq!(result, Err(Error::Sql { sqlstate: crate::sqlstate(&CoreError::Sql(expected)).into() }));
                 // Rows 1 and 2 were selected before the failing referenced row 3.
                 assert_eq!(session.execute("SELECT * FROM parent ORDER BY id", &[], None).unwrap().rows, before);
                 assert_eq!(session.execute("SELECT * FROM child", &[], None).unwrap().rows.len(), 1);
@@ -859,7 +859,7 @@ fn native_filtered_reads_fall_back_with_and_without_secondary_index() {
 #[test]
 fn native_catalog_publication_and_fences() {
     use crate::operations::{CatalogRequest, ColumnSpec, Engine as Native, Error};
-    use relational::{DataType, SqlError, with_sql_parser_forbidden};
+    use relational::{DataType, with_sql_parser_forbidden};
     let create = |name: &str| CatalogRequest::CreateTable {
         table: name.into(),
         columns: vec![ColumnSpec { name: "id".into(), data_type: DataType::BigInt, not_null: true }],
@@ -869,7 +869,7 @@ fn native_catalog_publication_and_fences() {
         let path = directory();
         let admin = Admin::create_engine(&path, Limits::default(), backend).unwrap();
         let native = Native::new(admin.clone());
-        let stale = Error::Core(CoreError::Sql(SqlError::StaleSchema).to_string());
+        let stale = Error::Sql { sqlstate: "0A000".into() };
         with_sql_parser_forbidden(|| {
             let bound = native.prepare_catalog_bound(&create("items")).unwrap();
             native.execute_catalog_bound(&bound).unwrap();

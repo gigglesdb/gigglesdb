@@ -206,7 +206,7 @@ fn transaction_binds_every_step_and_lexical_local_shape_before_execution() {
                 vec![earlier, TransactionStep::Execute(bad_read.clone())],
                 None,
             ),
-            Some(Error::Bind("column".into())),
+            Some(Error::Sql { sqlstate: "42703".into() }),
         );
     }
     let singular = returning(
@@ -922,7 +922,7 @@ fn transaction_prepared_multi_table_fences_freeze_parameters_not_rows() {
     let before = digest(&admin);
     assert_eq!(
         engine.execute_transaction_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(digest(&admin), before);
     let fresh = engine.prepare_transaction_bound(&tx, &bindings).unwrap();
@@ -938,7 +938,7 @@ fn transaction_prepared_multi_table_fences_freeze_parameters_not_rows() {
     let before = digest(&restored);
     assert_eq!(
         Engine::new(restored.clone()).execute_transaction_bound(&fresh),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(digest(&restored), before);
 }

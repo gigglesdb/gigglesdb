@@ -359,7 +359,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             &admin,
             &engine,
             &create(name),
-            Error::Core("Sql(Reserved)".into()),
+            Error::Sql { sqlstate: "0A000".into() },
         );
         let request = CatalogRequest::CreateTable {
             table: "candidate".into(),
@@ -373,7 +373,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
             &admin,
             &engine,
             &request,
-            Error::Core("Sql(Reserved)".into()),
+            Error::Sql { sqlstate: "0A000".into() },
         );
     }
     for (columns, primary_key, expected) in [
@@ -396,7 +396,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         (
             vec![column("id", DataType::BigInt, true)],
             vec!["absent".into()],
-            Error::Core("Sql(UnknownColumn)".into()),
+            Error::Sql { sqlstate: "42703".into() },
         ),
         (
             vec![column("id", DataType::BigInt, false)],
@@ -431,7 +431,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         &admin,
         &engine,
         &create("base"),
-        Error::Duplicate,
+        Error::Sql { sqlstate: "42P07".into() },
     );
     let valid = create(&"a".repeat(63));
     let result = engine.execute_catalog(&valid).unwrap();
@@ -496,7 +496,7 @@ fn catalog_definitions_limits_and_allocators_are_atomic() {
         &admin,
         &engine,
         &create("one_too_many"),
-        Error::Core("Sql(Limit)".into()),
+        Error::Sql { sqlstate: "54000".into() },
     );
     admin
         .sql_session()
@@ -552,7 +552,7 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
     assert_eq!(created.catalog_epoch, 2);
     assert_eq!(
         engine.execute_catalog_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let bound = engine.prepare_catalog_bound(&create("later")).unwrap();
     admin
@@ -576,7 +576,7 @@ fn catalog_preparation_freezes_definition_and_rechecks_empty_state() {
         .unwrap();
     assert_eq!(
         engine.execute_catalog_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let fresh = engine.prepare_catalog_bound(&create("later")).unwrap();
     assert_eq!(
@@ -712,22 +712,22 @@ fn catalog_epoch_domain_fences_survive_reopen_and_restore() {
     );
     assert_eq!(
         engine.execute_bound(&native_read),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(
         engine.execute_transaction_bound(&native_block),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(
         engine.execute_catalog_bound(&sibling),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let sibling = engine.prepare_catalog_bound(&create("sibling")).unwrap();
     sql.execute("CREATE TABLE sql_later (id BIGINT PRIMARY KEY)", &[], None)
         .unwrap();
     assert_eq!(
         engine.execute_catalog_bound(&sibling),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let bound = engine
         .prepare_catalog_bound(&create("restored_later"))
@@ -745,7 +745,7 @@ fn catalog_epoch_domain_fences_survive_reopen_and_restore() {
     let before = digest(&restored);
     assert_eq!(
         Engine::new(restored.clone()).execute_catalog_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     assert_eq!(digest(&restored), before);
     drop(sql);

@@ -113,89 +113,8 @@ fn digest(effects: &[Effect]) -> String {
         serde_json::to_vec(effects).expect("effect serialization"),
     ))
 }
-pub fn sqlstate(e: &CoreError) -> &'static str {
-    use giggles_core::relational::SqlError as S;
-    match e {
-        CoreError::Policy(Error::Authentication | Error::UnknownTask) => "28000",
-        CoreError::Policy(Error::Revoked | Error::Expired | Error::Scope) => "42501",
-        CoreError::Policy(Error::UncertainTime | Error::TimeRegression) => "55000",
-        CoreError::Policy(Error::Budget) => "54000",
-        CoreError::Policy(
-            Error::ApprovalRequired | Error::InvalidApproval | Error::StalePreview,
-        ) => "GD001",
-        CoreError::Policy(Error::IdConflict) => "GD002",
-        CoreError::Policy(
-            Error::InvalidGrant
-            | Error::TaskExists
-            | Error::MissingRow
-            | Error::DuplicateKey
-            | Error::InvalidPredicate
-            | Error::Overflow,
-        ) => "22023",
-        CoreError::Sql(S::Unsupported | S::Reserved)
-        | CoreError::Unsupported
-        | CoreError::EngineUnsupported { .. } => "0A000",
-        CoreError::Sql(S::Syntax) => "42601",
-        CoreError::Sql(S::UnknownTable) => "42P01",
-        CoreError::Sql(S::UnknownColumn) => "42703",
-        CoreError::Sql(S::Duplicate) => "23505",
-        CoreError::Sql(S::Null) => "23502",
-        CoreError::Sql(S::Type | S::Parameters) => "42804",
-        CoreError::Sql(S::Limit | S::Unbounded) | CoreError::Limit => "54000",
-        CoreError::Sql(S::Version | S::Conflict) => "40001",
-        CoreError::Sql(S::StaleSchema) => "0A000",
-        CoreError::Sql(S::Transaction) => "25000",
-        CoreError::Sql(S::Aborted) => "25P02",
-        CoreError::Sql(S::Overflow) => "22003",
-        CoreError::Sql(S::StringDataRightTruncation) => "22001",
-        CoreError::Sql(S::UndefinedFunction) => "42883",
-        CoreError::Sql(S::InvalidParameterValue) => "22023",
-        CoreError::Sql(S::InvalidDatetimeFormat) => "22007",
-        CoreError::Sql(S::DatetimeFieldOverflow) => "22008",
-        CoreError::Sql(S::IntervalFieldOverflow) => "22015",
-        CoreError::Sql(S::AmbiguousFunction) => "42725",
-        CoreError::Sql(S::GroupingError) => "42803",
-        CoreError::Sql(S::IndeterminateDatatype) => "42P18",
-        CoreError::Sql(S::AmbiguousParameter) => "42P08",
-        CoreError::Sql(S::InvalidTextRepresentation) => "22P02",
-        CoreError::Sql(S::SubstringError) => "22011",
-        CoreError::Sql(S::CharacterNotInRepertoire) => "22021",
-        CoreError::Sql(S::DuplicateTable) => "42P07",
-        CoreError::Sql(S::DuplicateColumn) => "42701",
-        CoreError::Sql(S::DuplicateObject) => "42710",
-        CoreError::Sql(S::UndefinedObject) => "42704",
-        CoreError::Sql(S::CheckViolation) => "23514",
-        CoreError::Sql(S::ForeignKeyViolation) => "23503",
-        CoreError::Sql(S::DependentObjects) => "2BP01",
-        CoreError::Sql(S::GeneratedAlways) => "428C9",
-        CoreError::Sql(S::ObjectNotInPrerequisiteState) => "55000",
-        CoreError::Sql(S::SequenceLimit) => "2200H",
-        CoreError::Sql(S::NoActiveTransaction) => "25P01",
-        CoreError::Sql(S::InvalidSavepoint) => "3B001",
-        CoreError::Sql(S::InvalidForeignKey) => "42830",
-        CoreError::Sql(S::InvalidSchema) => "3F000",
-        CoreError::DuplicateSchema => "42P06",
-        CoreError::Sql(S::DivisionByZero) => "22012",
-        CoreError::Sql(S::InvalidEscapeSequence) => "22025",
-        CoreError::Sql(S::InvalidTableDefinition) => "42P16",
-        CoreError::Sql(S::RestrictViolation) => "23001",
-        CoreError::Sql(S::WrongObjectType) => "42809",
-        CoreError::Sql(S::NullValueNotAllowed) => "22004",
-        CoreError::Sql(S::CannotCoerce) => "42846",
-        CoreError::Sql(S::BadCopyFileFormat) => "22P04",
-        CoreError::Sql(S::InvalidTimeZoneDisplacementValue) => "22009",
-        CoreError::Sql(S::AmbiguousColumn) => "42702",
-        CoreError::Sql(S::InvalidRowCountInLimitClause) => "2201W",
-        CoreError::Sql(S::InvalidRowCountInResultOffsetClause) => "2201X",
-        CoreError::Sql(S::CardinalityViolation) => "21000",
-        CoreError::Sql(S::InvalidColumnReference) => "42P10",
-        CoreError::Cancelled => "57014",
-        CoreError::Busy => "53300",
-        CoreError::Deadlock => "40P01",
-        CoreError::Storage(_) | CoreError::Fenced => "08007",
-        CoreError::Corrupt(_) | CoreError::Exists => "XX000",
-    }
-}
+pub use giggles_core::sqlstate;
+
 pub struct Service {
     pub(crate) advisory: crate::advisory::Locks,
     pub(crate) blocking: crate::blocking::Blocking,
@@ -1150,6 +1069,60 @@ impl Session {
                     .is_ok_and(|privileges| privileges.contains(&privilege))
             }))
     }
+    fn table_privilege_superuser(&self) -> Result<bool, CoreError> {
+        let Role::Database { name } = &self.role else {
+            return Ok(false);
+        };
+        self.service
+            .admin
+            .roles()
+            .get(name)
+            .map_err(|_| CoreError::Policy(Error::Authentication))?
+            .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
+            .map(|role| role.superuser)
+            .ok_or(CoreError::Policy(Error::Authentication))
+    }
+    fn table_requirements_allowed(
+        &self,
+        reqs: &[(String, roles::TablePrivilege)],
+        superuser: bool,
+    ) -> Result<bool, CoreError> {
+        if matches!(&self.role, Role::Task { .. }) {
+            return Ok(false);
+        }
+        for (table, privilege) in reqs {
+            let allowed = match &self.role {
+                Role::Application { tables, .. } => {
+                    table != "giggles_join" && tables.contains(table)
+                }
+                Role::Database { name } => {
+                    superuser || self.table_privilege_allowed(table, name, Some(*privilege))?
+                }
+                Role::Task { .. } => false,
+            };
+            if !allowed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// Check ordered table requirements before binding or classifying a request.
+    /// Names are SQL authority keys (including staged names); only authority
+    /// metadata is read. Sequence and DDL authority remain separate checks.
+    #[allow(dead_code)] // Entry point for the subsequent native integration.
+    pub(crate) fn authorize_table_requirements(
+        &mut self,
+        reqs: &[(String, roles::TablePrivilege)],
+    ) -> Result<(), CoreError> {
+        self.authority_scope(|session| {
+            let superuser = session.table_privilege_superuser()?;
+            if !session.table_requirements_allowed(reqs, superuser)? {
+                session.sql.abort();
+                return Err(CoreError::Policy(Error::Scope));
+            }
+            Ok(())
+        })
+    }
     fn authorize(&mut self, p: &Prepared) -> Result<(), CoreError> {
         if let Some((schema, owner, create)) = p.schema_ddl() {
             let allowed = if let Role::Database { name } = &self.role {
@@ -1211,21 +1184,21 @@ impl Session {
         let joined_read = !read_tables.is_empty()
             && matches!(p.command(), "SELECT" | "EXPLAIN")
             && p.table() == Some("giggles_join");
-        let allowed = matches!(&self.role, Role::Application { tables,.. }
-            if !p.is_ddl() && p.table().is_none_or(|t| t != "giggles_join" && tables.contains(t)));
-        let allowed =
-            allowed || matches!(&self.role, Role::Application { .. } if !p.is_ddl() && joined_read);
+        let allowed = if matches!(&self.role, Role::Application { .. }) && !p.is_ddl() {
+            match p.table() {
+                Some("giggles_join") => joined_read,
+                Some(table) => self.table_requirements_allowed(
+                    &[(table.to_owned(), roles::TablePrivilege::Select)],
+                    false,
+                )?,
+                None => true,
+            }
+        } else {
+            false
+        };
         let mut superuser = false;
         let allowed = if let Role::Database { name } = &self.role {
-            let role = self
-                .service
-                .admin
-                .roles()
-                .get(name)
-                .map_err(|_| CoreError::Policy(Error::Authentication))?
-                .filter(|role| role.login && self.service.role_generation_matches(role, self.epoch))
-                .ok_or(CoreError::Policy(Error::Authentication))?;
-            if role.superuser {
+            if self.table_privilege_superuser()? {
                 superuser = true;
                 true
             } else if p.command() == "COMMENT" || p.is_alter_table()
@@ -1271,7 +1244,11 @@ impl Session {
                         "DELETE" | "TRUNCATE TABLE" => Some(roles::TablePrivilege::Delete),
                         _ => None,
                     };
-                    self.table_privilege_allowed(table, name, privilege)?
+                    if let Some(privilege) = privilege {
+                        self.table_requirements_allowed(&[(table.to_owned(), privilege)], false)?
+                    } else {
+                        self.table_privilege_allowed(table, name, None)?
+                    }
                 }
             } else {
                 true
@@ -1286,23 +1263,10 @@ impl Session {
                 && p.deferred_routine_only());
         let mut allowed = allowed;
         if allowed && !superuser {
-            for table in read_tables {
-                let readable = match &self.role {
-                    Role::Application { tables, .. } => {
-                        table != "giggles_join" && tables.contains(&table)
-                    }
-                    Role::Database { name } => self.table_privilege_allowed(
-                        &table,
-                        name,
-                        Some(roles::TablePrivilege::Select),
-                    )?,
-                    _ => false,
-                };
-                if !readable {
-                    allowed = false;
-                    break;
-                }
-            }
+            let reqs: Vec<_> = read_tables.into_iter()
+                .map(|table| (table, roles::TablePrivilege::Select))
+                .collect();
+            allowed = self.table_requirements_allowed(&reqs, false)?;
         }
         if !allowed {
             self.sql.abort();
@@ -1900,6 +1864,109 @@ mod lifecycle_tests {
         )
     }
     #[test]
+    fn table_requirements_match_sql_roles_and_live_grants() {
+        use roles::TablePrivilege::{Delete, Insert, Select, Update};
+        let (service, _) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("owner", false), ("root", true), ("reader", false)] {
+            roles.create(roles::NewRole {
+                name: name.into(), login: true, superuser,
+                ..roles::NewRole::default()
+            }).unwrap();
+        }
+        roles.set_table_owner("app", "owner").unwrap();
+        roles.grant_table("app", "reader", &[Select]).unwrap();
+        for name in ["owner", "root", "reader"] {
+            let mut policy = service.role_session(name).unwrap();
+            let mut sql = service.role_session(name).unwrap();
+            for (privilege, statement) in [
+                (Select, "SELECT id FROM app"),
+                (Select, "EXPLAIN SELECT id FROM app"),
+                (Insert, "INSERT INTO app VALUES (1)"),
+                (Update, "UPDATE app SET id = 2"),
+                (Delete, "DELETE FROM app"),
+                (Delete, "TRUNCATE TABLE app"),
+            ] {
+                let expected = if name != "reader" || privilege == Select { Ok(()) }
+                    else { Err(CoreError::Policy(Error::Scope)) };
+                assert_eq!(policy.authorize_table_requirements(&[("app".into(), privilege)]), expected);
+                assert_eq!(sql.prepare(statement).map(|_| ()), expected, "{name}: {statement}");
+            }
+        }
+        let mut owner = service.role_session("owner").unwrap();
+        owner.execute_sql("BEGIN", &[]).unwrap();
+        owner.execute_sql("ALTER TABLE app RENAME TO renamed_app", &[]).unwrap();
+        assert_eq!(
+            owner.authorize_table_requirements(&[("renamed_app".into(), Insert)]),
+            Ok(())
+        );
+        assert!(owner.prepare("INSERT INTO renamed_app VALUES (1)").is_ok());
+        owner.execute_sql("ROLLBACK", &[]).unwrap();
+        let mut policy = service.role_session("reader").unwrap();
+        let mut sql = service.role_session("reader").unwrap();
+        let reqs = [("app".into(), Insert)];
+        let statement = "INSERT INTO app VALUES (1)";
+        for grant in [false, true, false] {
+            if grant { roles.grant_table("app", "reader", &[Insert]).unwrap(); }
+            else { roles.revoke_table("app", "reader", &[Insert]).unwrap(); }
+            let expected = if grant { Ok(()) } else { Err(CoreError::Policy(Error::Scope)) };
+            assert_eq!(policy.authorize_table_requirements(&reqs), expected);
+            assert_eq!(sql.prepare(statement).map(|_| ()), expected);
+        }
+        policy.execute_sql("BEGIN", &[]).unwrap();
+        sql.execute_sql("BEGIN", &[]).unwrap();
+        assert_eq!(policy.authorize_table_requirements(&reqs), sql.prepare(statement).map(|_| ()));
+        assert!(policy.is_aborted() && sql.is_aborted());
+        policy.execute_sql("ROLLBACK", &[]).unwrap();
+        sql.execute_sql("ROLLBACK", &[]).unwrap();
+    }
+    #[test]
+    fn table_requirements_preserve_sql_missing_table_and_child_read_precedence() {
+        use roles::TablePrivilege::{Insert, Select};
+        let (service, bindings) = fixture();
+        let roles = service.admin.roles();
+        for (name, superuser) in [("reader", false), ("root", true)] {
+            roles.create(roles::NewRole {
+                name: name.into(), login: true, superuser,
+                ..roles::NewRole::default()
+            }).unwrap();
+        }
+        let mut policy = service.role_session("reader").unwrap();
+        let mut sql = service.role_session("reader").unwrap();
+        for table in ["app", "missing"] {
+            let reqs = [(table.into(), Select)];
+            let statement = format!("SELECT id FROM {table}");
+            let denied = Err(CoreError::Policy(Error::Scope));
+            assert_eq!(policy.authorize_table_requirements(&reqs), denied);
+            assert_eq!(sql.prepare(&statement).map(|_| ()), denied);
+            assert_eq!(sql.execute_sql(&statement, &[]).unwrap_err(), CoreError::Policy(Error::Scope));
+        }
+        roles.grant_table("missing", "reader", &[Select]).unwrap();
+        // Qualified public names retain this authority key even when absent;
+        // unqualified absent names use SQL's deliberately unresolvable key.
+        for name in ["reader", "root"] {
+            let mut policy = service.role_session(name).unwrap();
+            let mut sql = service.role_session(name).unwrap();
+            assert_eq!(policy.authorize_table_requirements(&[("missing".into(), Select)]), Ok(()));
+            assert!(sql.prepare("SELECT id FROM public.missing").is_ok());
+            assert_eq!(sql.execute_sql("SELECT id FROM public.missing", &[]).unwrap_err(),
+                CoreError::Sql(relational::SqlError::UnknownTable));
+        }
+        roles.grant_table("app", "reader", &[Insert]).unwrap();
+        let statement = "INSERT INTO app SELECT id FROM app";
+        let reqs = [("app".into(), Insert), ("app".into(), Select)];
+        assert_eq!(policy.authorize_table_requirements(&reqs), sql.prepare(statement).map(|_| ()));
+        assert_eq!(policy.authorize_table_requirements(&reqs), Err(CoreError::Policy(Error::Scope)));
+        roles.grant_table("app", "reader", &[Select]).unwrap();
+        assert_eq!(policy.authorize_table_requirements(&reqs), Ok(()));
+        assert!(sql.prepare(statement).is_ok());
+        let mut app = service.session(&bindings[0].fingerprint).unwrap();
+        for table in ["app", "missing"] {
+            assert_eq!(app.authorize_table_requirements(&[(table.into(), Select)]),
+                app.prepare(&format!("SELECT id FROM {table}")).map(|_| ()));
+        }
+    }
+    #[test]
     fn copy_authority_and_atomic_insert_use_existing_sql_policy() {
         let (service, bindings) = fixture();
         let mut session = service.session(&bindings[0].fingerprint).unwrap();
@@ -1938,15 +2005,6 @@ mod lifecycle_tests {
         assert_eq!(
             sqlstate(&CoreError::Sql(relational::SqlError::BadCopyFileFormat)),
             "22P04"
-        );
-    }
-    #[test]
-    fn sqlstate_time_zone_displacement() {
-        assert_eq!(
-            sqlstate(&CoreError::Sql(
-                relational::SqlError::InvalidTimeZoneDisplacementValue
-            )),
-            "22009"
         );
     }
     #[test]

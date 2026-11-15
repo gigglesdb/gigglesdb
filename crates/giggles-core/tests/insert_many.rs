@@ -118,7 +118,7 @@ fn insert_many_binding_and_shape_checks_precede_execution() {
             many(&["id", "id"], vec![], 0),
             Error::Bind("duplicate assignment".into()),
         ),
-        (many(&["absent"], vec![], 0), Error::Bind("column".into())),
+        (many(&["absent"], vec![], 0), Error::Sql { sqlstate: "42703".into() }),
         (many(&["id", "n"], vec![vec![int(1)]], 0), Error::Type),
         (
             many(
@@ -181,11 +181,12 @@ fn insert_many_binding_and_shape_checks_precede_execution() {
     assert_eq!(bound.description().columns[0].data_type, DataType::BigInt);
     assert_eq!(bound.description().columns[0].id, 0);
     assert!(engine.execute_bound(&bound).unwrap().rows.is_empty());
-    static_failure(
+    runtime_failure(
         &admin,
         &engine,
         &many(&["n"], vec![vec![int(1)]], 1),
-        Some(Error::Type),
+        &Bindings::new(),
+        Error::Sql { sqlstate: "23502".into() },
     );
     let mut deep = int(1);
     for _ in 0..=MAX_DEPTH {
@@ -663,7 +664,7 @@ fn insert_many_prepared_and_transaction_local_contracts() {
         .unwrap();
     assert_eq!(
         engine.execute_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
     let bound = engine.prepare_bound(&request, &bindings).unwrap();
     let export = common::fresh("insert-many-domain-export");
@@ -676,7 +677,7 @@ fn insert_many_prepared_and_transaction_local_contracts() {
     .unwrap();
     assert_eq!(
         Engine::new(restored).execute_bound(&bound),
-        Err(Error::Core("Sql(StaleSchema)".into()))
+        Err(Error::Sql { sqlstate: "0A000".into() })
     );
 
     let (_, admin, engine) = fixture();

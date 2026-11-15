@@ -1418,6 +1418,14 @@ mod tests {
     }
 
     #[test]
+    fn sql_error_is_nonterminal_and_rejected_by_receipt_codec() {
+        let error = crate::operations::core(CoreError::Sql(crate::relational::SqlError::CheckViolation));
+        assert_eq!(error, Error::Sql { sqlstate: "23514".into() });
+        assert!(!super::super::terminal(&error));
+        assert_eq!(encode(&Err(error)), Err(OnceError::InvalidOutcome));
+    }
+
+    #[test]
     fn duplicate_is_not_terminal() {
         assert!(!super::super::terminal(&Error::Duplicate));
         assert!(!super::super::terminal(&Error::Core(

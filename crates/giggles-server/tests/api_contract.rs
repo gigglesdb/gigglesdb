@@ -168,7 +168,7 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
             vec!["execute", "let_binding", "require"],
         ),
         ("NativeEmitExpr", vec!["scalar", "row", "rows"]),
-        ("NativeError", vec!["kind", "syntax_offset"]),
+        ("NativeError", vec!["kind", "syntax_offset", "sqlstate"]),
     ] {
         let descriptor = file
             .message_type
@@ -188,6 +188,7 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
         ("NativeSort", "descending"),
         ("NativeIsNull", "negated"),
         ("NativeTransaction", "read_only"),
+        ("NativeError", "sqlstate"),
     ] {
         let message = file
             .message_type
@@ -206,11 +207,14 @@ fn native_descriptor_has_complete_typed_arms_and_explicit_presence() {
         .iter()
         .find(|e| e.name.as_deref() == Some("NativeErrorClass"))
         .unwrap();
-    assert_eq!(error.value.len(), 20); // sentinel plus the eighteen stable core classes
+    assert_eq!(error.value.len(), 21); // sentinel plus twenty stable core classes
     assert_eq!(
         error.value.last().unwrap().name.as_deref(),
-        Some("NATIVE_ERROR_CLASS_DUPLICATE")
+        Some("NATIVE_ERROR_CLASS_SQL")
     );
+    assert_eq!(error.value[19].name.as_deref(), Some("NATIVE_ERROR_CLASS_DUPLICATE"));
+    assert_eq!(error.value[19].number, Some(19));
+    assert_eq!(error.value[20].number, Some(20));
     let reply = file
         .message_type
         .iter()

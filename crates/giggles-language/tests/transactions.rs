@@ -476,15 +476,15 @@ fn transaction_local_shapes_and_upfront_binding_reject_invalid_blocks() {
                 engine
                     .prepare_transaction_bound_text(&text, &Bindings::new())
                     .unwrap_err(),
-                Error::Bind("column".into())
+                Error::Sql { sqlstate: "42703".into() }
             );
             assert_eq!(
                 engine.execute_transaction_text(&text, &Bindings::new()),
-                Err(Error::Bind("column".into()))
+                Err(Error::Sql { sqlstate: "42703".into() })
             );
             assert_eq!(
                 engine.execute_transaction(&tree, &Bindings::new()),
-                Err(Error::Bind("column".into()))
+                Err(Error::Sql { sqlstate: "42703".into() })
             );
         });
     }

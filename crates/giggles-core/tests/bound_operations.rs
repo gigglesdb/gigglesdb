@@ -88,7 +88,7 @@ fn digest(admin: &Admin) -> [u8; 32] {
     admin.export(common::fresh("bound-state-export")).unwrap()
 }
 fn stale() -> Error {
-    Error::Core("Sql(StaleSchema)".into())
+    Error::Sql { sqlstate: "0A000".into() }
 }
 
 #[test]

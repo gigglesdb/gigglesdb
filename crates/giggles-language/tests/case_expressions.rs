@@ -727,7 +727,7 @@ fn case_quoted_names_are_canonical_and_share_sql_catalog() {
         let before = digest(&admin);
         assert_eq!(
             engine.execute_catalog_text(source),
-            Err(Error::Core("Sql(Reserved)".into()))
+            Err(Error::Sql { sqlstate: "0A000".into() })
         );
         assert_eq!(digest(&admin), before);
     }

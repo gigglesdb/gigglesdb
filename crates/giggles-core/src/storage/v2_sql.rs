@@ -26,6 +26,15 @@ thread_local! {
 }
 
 impl SqlSession {
+    pub(super) fn insert_sequence_callback(
+        &self,
+        db: &Arc<v2::V2Db>,
+        image: relational::Relational,
+    ) -> relational::clock::SequenceCallback {
+        sql_sequences::callback(db.clone(), image, self.sequence_baseline.clone(),
+            self.pending_sequences.clone(), self.sequence_values.clone())
+    }
+
     // Typed scans deliberately retain the active statement snapshot. In
     // particular, the completeness forward/max probes must never refresh it.
     #[cfg(feature = "engine-rocksdb")]

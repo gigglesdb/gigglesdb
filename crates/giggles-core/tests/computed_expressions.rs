@@ -582,10 +582,10 @@ fn computed_projection_metadata_aliases_and_source_scope_are_explicit() {
                 *filter = Some(eq(field("computed"), int(6)));
             }
         }
-        assert!(matches!(
+        assert_eq!(
             engine.prepare_bound(&invalid, &Bindings::new()).err(),
-            Some(Error::Bind(_))
-        ));
+            Some(Error::Sql { sqlstate: "42703".into() })
+        );
     }
     assert_eq!(
         engine

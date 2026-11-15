@@ -231,10 +231,14 @@ completeness. Ordinary operation results contain column names, not invented
 column type metadata. Every emitted value is checked against the reply limit.
 
 Native failures use `code: "native_error"` and `nativeError.kind`, with an optional
-syntax offset. The `NATIVE_ERROR_CLASS_` suffixes are `SYNTAX`, `UNSUPPORTED`,
+syntax offset and an optional `sqlstate` string carrying the underlying SQLSTATE.
+The `NATIVE_ERROR_CLASS_` suffixes are `SYNTAX`, `UNSUPPORTED`,
 `LIMIT`, `BIND`, `TYPE`, `NOT_FOUND`, `AMBIGUOUS_MATCH`, `CONDITION_FAILED`,
 `TOO_MANY_MATCHES`, `CLAIM_NOT_CONSUMED`, `CONFLICT`, `CORE`, `UNKNOWN`, `OVERFLOW`,
-`DIVISION_BY_ZERO`, `REQUIREMENT_FAILED`, `DUPLICATE_TARGET` and `PLAN_REQUIRED`.
+`DIVISION_BY_ZERO`, `REQUIREMENT_FAILED`, `DUPLICATE_TARGET`, `PLAN_REQUIRED`,
+`DUPLICATE` (tag 19, SQLSTATE 23505) and `SQL` (tag 20). Existing tags 1 through
+19 are unchanged; `NativeError.sqlstate` is optional protobuf field 3.
+`SQL` preserves errors such as unknown column (42703) and FK violation (23503).
 Bind/core diagnostics do not expose raw engine strings. Unknown native decisions
 use `code: "08007"` and `NATIVE_ERROR_CLASS_UNKNOWN`, without successful outcomes.
 Authorization, transaction state and cancellation retain the existing `42501`,

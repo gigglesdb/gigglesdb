@@ -1899,7 +1899,8 @@
           "NATIVE_ERROR_CLASS_REQUIREMENT_FAILED",
           "NATIVE_ERROR_CLASS_DUPLICATE_TARGET",
           "NATIVE_ERROR_CLASS_PLAN_REQUIRED",
-          "NATIVE_ERROR_CLASS_DUPLICATE"
+          "NATIVE_ERROR_CLASS_DUPLICATE",
+          "NATIVE_ERROR_CLASS_SQL"
         ]
       },
       "BeginRequest": {
@@ -3315,6 +3316,11 @@
           },
           "syntaxOffset": {
             "$ref": "#/components/schemas/UInt64"
+          },
+          "sqlstate": {
+            "type": "string",
+            "pattern": "^[0-9A-Z]{5}$",
+            "description": "Underlying SQLSTATE, including SQL (tag 20), DUPLICATE, OVERFLOW and DIVISION_BY_ZERO errors."
           }
         },
         "additionalProperties": false,

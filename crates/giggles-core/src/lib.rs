@@ -14,6 +14,8 @@ pub use storage::{
     RecoveryPoint, UpgradePoint, UpgradeReport,
 };
 pub use storage::{Cursor, SqlSession};
+mod sqlstate;
+pub use sqlstate::sqlstate;
 mod sql;
 pub use sql::parse_repair;
 

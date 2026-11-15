@@ -213,7 +213,7 @@ fn arithmetic_binding_is_eager_even_on_empty_relations() {
     );
     assert_eq!(
         engine.execute(&absent, &Bindings::new()),
-        Err(Error::Bind("column".into()))
+        Err(Error::Sql { sqlstate: "42703".into() })
     );
     assert_eq!(digest(&admin), before);
     let catalog = admin.catalog().unwrap();

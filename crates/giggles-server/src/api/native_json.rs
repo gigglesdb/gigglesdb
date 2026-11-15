@@ -117,6 +117,9 @@ impl Serialize for p::NativeError {
         if let Some(v) = self.syntax_offset {
             m.serialize_entry("syntaxOffset", &Decimal(v))?;
         }
+        if let Some(v) = &self.sqlstate {
+            m.serialize_entry("sqlstate", v)?;
+        }
         m.end()
     }
 }

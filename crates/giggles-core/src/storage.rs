@@ -2564,6 +2564,53 @@ impl SqlSession {
             .ok_or(CoreError::Sql(relational::SqlError::Transaction))?;
         relational::coerce_to_column(&state.sql, column, value).map_err(CoreError::Sql)
     }
+    /// Normalize native input before key admission and RETURN evaluation. Native
+    /// execution has no time oracle, but sequences use SQL's durable callbacks.
+    pub(crate) fn normalize_insert_engine(
+        &mut self,
+        table: &relational::TableDef,
+        supplied: &[usize],
+        values: Vec<relational::Value>,
+    ) -> Result<Vec<relational::Value>, CoreError> {
+        let result = (|| {
+            let _ticket = self.admin.inner.enter_sql()?;
+            crate::cancellation::check()?;
+            if self.aborted {
+                return Err(CoreError::Sql(relational::SqlError::Aborted));
+            }
+            let mut state = match &self.admin.inner.backend {
+                Backend::V2(db) => db.metadata_state(self.v2_transaction.as_ref())?,
+                _ => match &self.staged {
+                    Some(state) => state.clone(),
+                    None => self.admin.inner.inspect(|state| Ok(state.clone()))?,
+                },
+            };
+            let callback = if let Backend::V2(db) = &self.admin.inner.backend {
+                self.insert_sequence_callback(db, state.sql.clone())
+            } else {
+                self.admin.inner.merge_live_sequences(&mut state)?;
+                sequences::merge(&mut state, &*self.pending_sequences.lock().map_err(|_| CoreError::Fenced)?);
+                let baseline = if self.staged.is_some() {
+                    self.sequence_baseline.clone()
+                } else {
+                    state.sql.catalog_ext().sequences.iter().map(|(&id, d)| (id, d.incarnation)).collect()
+                };
+                self.admin.inner.sequence_callback(
+                    state.clone(), baseline, self.pending_sequences.clone(),
+                    self.sequence_values.clone(), self.sequence_tables.clone(), self.search_path.clone(),
+                )
+            };
+            let clock = relational::clock::ExecutionClock::new(&relational::StatementClock {
+                unavailable: Some(CoreError::Sql(relational::SqlError::Unsupported)),
+                transaction_us: 0, statement_us: 0, zone: None, wall: None,
+            }).with_extra_float_digits(self.extra_float_digits).with_sequences(callback);
+            let output = state.sql.normalize_insert_engine(table, supplied, values, &clock);
+            if let Some(error) = clock.take_error() { return Err(error); }
+            output.map_err(CoreError::Sql)
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     pub(crate) fn insert_engine(
         &mut self,
         table: &relational::TableDef,
@@ -2578,8 +2625,8 @@ impl SqlSession {
                 let mut state = db.metadata_state(self.v2_transaction.as_ref())?;
                 // V2 binds durable metadata at execution; prepared epochs use zero.
                 state.sql.epoch = 0;
-                let mut prepared = relational::Prepared::insert_engine(
-                    table, values, state.view.domain, &state.sql).map_err(CoreError::Sql)?;
+                let mut prepared = relational::Prepared::insert_normalized_engine(
+                    table, values, &[], state.view.domain, &state.sql).map_err(CoreError::Sql)?;
                 prepared.transaction = self.transaction_id;
                 self.execute_bound_engine(&prepared, &[], None)
             })();
@@ -2588,7 +2635,7 @@ impl SqlSession {
         }
         self.admin.inner.db(SQL_SESSIONS)?;
         self.execute_engine(
-            |domain, state| relational::Prepared::insert_engine(table, values, domain, state),
+            |domain, state| relational::Prepared::insert_normalized_engine(table, values, &[], domain, state),
             None,
         )
     }
