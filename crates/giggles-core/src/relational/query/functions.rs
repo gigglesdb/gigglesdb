@@ -1065,8 +1065,13 @@ impl Scalar {
                 (ty, Node::Case(arms, otherwise))
             }
             Self::Unary(..) | Self::Binary(..) => unreachable!(),
+            // Grouping identity probes omit parameter types before inference.
+            // Report an unresolved binding so those probes retain the syntax.
             Self::Param(n) => (
-                parameters[*n - 1].clone().ok_or(SqlError::Parameters)?,
+                parameters
+                    .get(n - 1)
+                    .and_then(Clone::clone)
+                    .ok_or(SqlError::Parameters)?,
                 Node::Param(*n),
             ),
             Self::Domain(a, _, target) => {
