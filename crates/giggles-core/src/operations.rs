@@ -1341,7 +1341,7 @@ impl Binder<'_> {
             if !insert && self.table()?.primary_key.contains(&i) {
                 return Err(Error::Unsupported);
             }
-            let v = self.value(e)?;
+            let v = assign_number(self.value(e)?, &self.table()?.columns[i])?;
             if !insert || v != Value::Null {
                 check(&v, &self.table()?.columns[i])?;
             }
@@ -1365,6 +1365,7 @@ impl Binder<'_> {
             }
             let (expression, ty) = self.expr(expression, 0)?;
             if ty.is_some()
+                && !numeric_assignment(ty, &self.table()?.columns[index])
                 && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
                     != Some(
                         if self.table()?.columns[index].data_type == DataType::Bpchar {
@@ -1522,6 +1523,7 @@ impl Binder<'_> {
                         self.allow_fields = true;
                         let (expression, ty) = bound?;
                         if ty.is_some()
+                            && !numeric_assignment(ty, &self.table()?.columns[*index])
                             && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
                                 != Some(
                                     if self.table()?.columns[*index].data_type == DataType::Bpchar {
@@ -1560,6 +1562,7 @@ impl Binder<'_> {
                     self.allow_fields = true;
                     let (expression, ty) = bound?;
                     if ty.is_some()
+                        && !numeric_assignment(ty, &self.table()?.columns[index])
                         && ty.map(|ty| if ty == Ty::Bpchar { Ty::Text } else { ty })
                             != Some(
                                 if self.table()?.columns[index].data_type == DataType::Bpchar {
@@ -2602,6 +2605,14 @@ impl Operation {
     }
 }
 
+fn numeric_assignment(source: Option<Ty>, column: &ColumnDef) -> bool {
+    let number = |ty| matches!(ty, Ty::Int | Ty::Numeric | Ty::Real | Ty::DoublePrecision);
+    source.is_some_and(number) && number(colty(column))
+}
+fn assign_number(value: Value, column: &ColumnDef) -> Result<Value> {
+    crate::relational::assign::assign_number_engine(value, column)
+        .map_err(|error| core(CoreError::Sql(error)))
+}
 // Preserve native admission errors for explicit input and finite row budgets;
 // omissions and identity violations retain the SQL error produced by defaults.
 fn normalize_insert(
@@ -2610,6 +2621,9 @@ fn normalize_insert(
     columns: &[usize],
     values: Vec<Value>,
 ) -> Result<Vec<Value>> {
+    let values = columns.iter().zip(values)
+        .map(|(index, value)| assign_number(value, &table.columns[*index]))
+        .collect::<Result<Vec<_>>>()?;
     let invalid_supplied = columns.iter().zip(&values)
         .any(|(index, value)| check(value, &table.columns[*index]).is_err());
     session.normalize_insert_engine(table, columns, values).map_err(|error| match error {

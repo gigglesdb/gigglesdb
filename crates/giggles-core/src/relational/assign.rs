@@ -386,3 +386,26 @@ impl<'a> Plan<'a> {
         Ok(values)
     }
 }
+
+/// Native numeric assignment uses SQL casts only between different value families.
+/// Integer destinations retain native range admission and its Type error.
+pub(crate) fn assign_number_engine(value: super::Value, column: &ColumnDef) -> R<super::Value> {
+    let source = match &value {
+        super::Value::Int(n) if i32::try_from(*n).is_ok() => DataType::Integer,
+        super::Value::Int(_) => DataType::BigInt,
+        super::Value::Numeric(_) => DataType::Numeric,
+        super::Value::Float4(_) => DataType::Real,
+        super::Value::Float8(_) => DataType::DoublePrecision,
+        _ => return Ok(value),
+    };
+    let target = &column.data_type;
+    if !matches!(target, DataType::SmallInt | DataType::Integer | DataType::BigInt
+        | DataType::Numeric | DataType::Real | DataType::DoublePrecision)
+        || source == *target
+        || matches!(value, super::Value::Int(_))
+            && matches!(target, DataType::SmallInt | DataType::Integer | DataType::BigInt)
+    {
+        return Ok(value);
+    }
+    query::assignment::convert(value, &source, target, None)
+}

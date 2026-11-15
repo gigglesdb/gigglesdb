@@ -489,7 +489,11 @@ fn plan_unique_conflict_evaluated<'s>(
                         crate::relational::coerce_to_column(
                             src,
                             &table.columns[*index],
-                            value.clone().into_owned(),
+                            if semantics == Semantics::Native {
+                                assign_number(value.clone().into_owned(), &table.columns[*index])?
+                            } else {
+                                value.clone().into_owned()
+                            },
                         )
                         .map_err(sql)?,
                     );

@@ -434,3 +434,4 @@ mod native_views;
 #[path = "join_on_subqueries.rs"] mod join_on_subqueries;
 
 #[path = "typed_read_qualified.rs"] mod typed_read_qualified;
+#[path = "native_numeric_assignment.rs"] mod native_numeric_assignment;

@@ -12,7 +12,7 @@ mod constraint_acceptance_tests;
 mod constraints;
 mod ctid;
 pub(crate) use constraints::{DeferralState, Event as ConstraintEvent};
-mod assign;
+pub(crate) mod assign;
 pub(crate) mod clock;
 mod constraint_lookup;
 mod constraint_primary_key;

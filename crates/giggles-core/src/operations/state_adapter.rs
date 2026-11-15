@@ -9,7 +9,7 @@ pub(super) trait Context {
         if matches!(column.data_type, DataType::Varchar | DataType::Bpchar) {
             return Err(Error::Unsupported);
         }
-        Ok(value)
+        assign_number(value, column)
     }
     fn checkpoint(&self) -> std::result::Result<(), CoreError>;
     fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError>;
@@ -49,7 +49,7 @@ pub(super) trait Context {
 impl Context for SqlSession {
     type Input = CompleteRelation;
     fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
-        self.coerce_column_engine(column, value).map_err(core)
+        self.coerce_column_engine(column, assign_number(value, column)?).map_err(core)
     }
     fn checkpoint(&self) -> std::result::Result<(), CoreError> {
         crate::cancellation::check()
@@ -108,7 +108,7 @@ struct SnapshotContext {
 impl Context for SnapshotContext {
     type Input = Vec<SqlRow>;
     fn coerce_column(&self, column: &ColumnDef, value: Value) -> Result<Value> {
-        crate::relational::coerce_to_column(&self.state.sql, column, value)
+        crate::relational::coerce_to_column(&self.state.sql, column, assign_number(value, column)?)
             .map_err(|error| core(CoreError::Sql(error)))
     }
     fn checkpoint(&self) -> std::result::Result<(), CoreError> {
