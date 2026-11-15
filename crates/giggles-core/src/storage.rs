@@ -58,6 +58,7 @@ pub enum CoreError {
     },
     Exists,
     Busy,
+    Deadlock,
     Fenced,
     Cancelled,
     Limit,

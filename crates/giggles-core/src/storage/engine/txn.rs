@@ -88,7 +88,8 @@ impl From<TxnError> for crate::CoreError {
             TxnError::Serialization(_) | TxnError::SnapshotTooOld => {
                 Self::Sql(crate::relational::SqlError::Conflict)
             }
-            TxnError::Deadlock | TxnError::LockTimeout => Self::Busy,
+            TxnError::Deadlock => Self::Deadlock,
+            TxnError::LockTimeout => Self::Busy,
             // CoreError has no dedicated unknown-outcome variant; Storage follows its unknown-outcome route.
             TxnError::CommitAmbiguous => Self::Storage("engine commit outcome unknown".into()),
             TxnError::Misuse => Self::Corrupt("engine transaction misuse".into()),
@@ -713,3 +714,13 @@ mod savepoint_tests;
 #[cfg(test)]
 #[path = "txn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod f19_mapping_tests {
+    #[test]
+    fn deadlock_remains_distinct_from_lock_timeout() {
+        assert_eq!(crate::CoreError::from(super::TxnError::Deadlock), crate::CoreError::Deadlock);
+        assert_eq!(crate::local::failure(crate::CoreError::Deadlock).code, 19);
+        assert_eq!(crate::CoreError::from(super::TxnError::LockTimeout), crate::CoreError::Busy);
+    }
+}

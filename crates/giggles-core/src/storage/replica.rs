@@ -350,7 +350,8 @@ fn native_code(error: &CoreError) -> &'static str {
         CoreError::Policy(Error::IdConflict) => "GD002",
         CoreError::Policy(_) => "22023",
         CoreError::Cancelled => "57014",
-        CoreError::Busy => "53300",
+        // Native replica consumers enforce a closed code set that excludes 40P01.
+        CoreError::Busy | CoreError::Deadlock => "53300",
         CoreError::Storage(_) | CoreError::Fenced => "08007",
         _ => "XX000",
     }
@@ -414,6 +415,11 @@ fn native_task(
 #[cfg(test)]
 mod heap_gate_tests {
     use super::*;
+
+    #[test]
+    fn replica_deadlock_native_code() {
+        assert_eq!(native_code(&CoreError::Deadlock), "53300");
+    }
 
     #[test]
     fn heap_replica_and_restricted_projection_are_explicitly_unsupported() {
