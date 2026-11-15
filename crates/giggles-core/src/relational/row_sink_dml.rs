@@ -72,8 +72,66 @@ fn point_keys(state: &Relational, prepared: &Prepared, params: &[Value],
     point_keys
 }
 
+/// Statically resolved conflict witness; the caller supplies runtime lock policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Classifier is integrated with locking in the next item.
+pub(crate) enum Arbiter { PrimaryKey, Unique(u64) }
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct UpsertLockPlan { pub(crate) arbiter: Arbiter, pub(crate) rows: usize }
+
 impl Prepared {
-    /// The same logical route and candidate set as the bounded point publisher.
+    /// Conservative static admission only; no isolation or storage decisions.
+    #[allow(dead_code)] // Locking caller is added in the next item.
+    pub(crate) fn upsert_lock_plan(&self, state: &Relational,
+        indexes: &[secondary_index::Descriptor]) -> Option<UpsertLockPlan> {
+        let Statement::InsertMulti(insert) = &self.statement else { return None; };
+        if insert.source.is_some() || insert.row_count() > paged_insert::SHARED_WRITE_ROWS { return None; }
+        let sql_insert::LockConflict { columns, constraint, sets } = insert.lock_conflict()?;
+        let table = state.tables.get(&insert.table)?;
+        let primary = table.primary_key.iter().map(|i| table.columns[*i].id).collect::<BTreeSet<_>>();
+        let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).collect::<Vec<_>>();
+        let target: BTreeSet<u64> = if let Some(names) = columns {
+            let ids = names.iter().map(|name| table.columns.iter().find(|c| &c.name == name).map(|c| c.id))
+                .collect::<Option<BTreeSet<_>>>()?;
+            if ids.len() != names.len() { return None; }
+            ids
+        } else {
+            let name = constraint?;
+            if state.primary_key_constraint_name(table).as_deref() == Some(name) { primary.clone() }
+            else { unique.iter().find(|d| split_key(&d.name).1 == name)?.columns.iter().copied().collect() }
+        };
+        let matches = unique.iter().filter(|d| d.columns.iter().copied().collect::<BTreeSet<_>>() == target)
+            .copied().collect::<Vec<_>>();
+        let arbiter = if target == primary { Arbiter::PrimaryKey }
+            else if matches.len() == 1 { Arbiter::Unique(matches[0].id) } else { return None; };
+        if unique.iter().any(|d| !matches!(arbiter, Arbiter::Unique(id) if id == d.id)) { return None; }
+        let changed = |ids: &[u64]| ids.iter().any(|id| table.columns.iter()
+            .any(|c| c.id == *id && sets.contains(&c.name.as_str())));
+        if changed(&primary.iter().copied().collect::<Vec<_>>())
+            || unique.iter().any(|d| changed(&d.columns)) { return None; }
+        for (owner, constraints) in &state.ext.constraints {
+            for c in constraints {
+                let ConstraintKind::ForeignKey { columns, ref_table, ref_columns, deferral, .. } = &c.kind else { continue; };
+                if *owner != table.id && *ref_table != table.id { continue; }
+                if owner == ref_table || *deferral != Deferral::NotDeferrable
+                    || *owner == table.id && changed(columns)
+                    || *ref_table == table.id && changed(ref_columns) { return None; }
+            }
+        }
+        // The bounded default grammar exposes sequence dependencies only for
+        // nextval, optionally wrapped in unary negation or casts. Other defaults
+        // require an explicitly supplied PK, except these exact UUID generators.
+        if table.primary_key.iter().any(|i| {
+            let column = &table.columns[*i];
+            !insert.lock_supplies(&column.name) && defaults::default_sql(state, column)
+                .is_none_or(|sql| !defaults::dependencies(&sql).is_ok_and(|names| !names.is_empty())
+                    && !matches!(sql.trim(), "gen_random_uuid()" | "pg_catalog.gen_random_uuid()"))
+        }) { return None; }
+        Some(UpsertLockPlan { arbiter, rows: insert.row_count() })
+    }
+
+    /// Bounded point candidates, excluding all UNIQUE-changing updates.
     /// The storage bridge must also check its data-dependent retention fallback.
     pub(crate) fn mutation_lock_keys(&self, state: &Relational, params: &[Value],
         indexes: &[secondary_index::Descriptor],
@@ -81,6 +139,13 @@ impl Prepared {
         if !eligible(state, self) { return None; }
         let table = state.tables.get(self.table()?)?;
         let unique = indexes.iter().filter(|d| d.table == table.id && d.unique).cloned().collect::<Vec<_>>();
+        let changed = match &self.statement {
+            Statement::Update { sets, .. } => sets.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            Statement::UpdateExpressions { sets, .. } => sets.iter().map(|(name, _)| name).collect(),
+            _ => Vec::new(),
+        };
+        if unique.iter().any(|d| d.columns.iter().any(|id| table.columns.iter()
+            .any(|c| c.id == *id && changed.contains(&&c.name)))) { return None; }
         point_keys(state, self, params, &unique)
     }
 
@@ -136,7 +201,7 @@ impl Prepared {
             return false;
         }
         matches!(&self.statement, Statement::Insert { .. } | Statement::InsertExpressions(_))
-            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none())
+            || matches!(&self.statement, Statement::InsertMulti(i) if i.append_only() && i.source.is_none() && i.row_count() <= paged_insert::SHARED_WRITE_ROWS)
     }
 }
 
@@ -496,3 +561,7 @@ impl ActionWork {
         sink.apply(table, &before, &after)
     }
 }
+
+#[cfg(test)]
+#[path = "upsert_classifier_tests.rs"]
+mod upsert_classifier_tests;

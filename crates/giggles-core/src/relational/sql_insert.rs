@@ -19,6 +19,12 @@ pub(super) struct Insert {
     pub(super) returning: Option<returning::Returning>,
     pub(super) source: Option<Box<query::Query>>,
 }
+/// Borrowed syntax needed by static lock classification, without expression internals.
+pub(super) struct LockConflict<'a> {
+    pub(super) columns: Option<&'a [String]>,
+    pub(super) constraint: Option<&'a str>,
+    pub(super) sets: Vec<&'a str>,
+}
 #[derive(Debug, Clone)]
 struct Conflict {
     columns: Option<Vec<String>>,
@@ -457,6 +463,18 @@ impl Insert {
                 })
             }))
         })
+    }
+    pub(super) fn lock_conflict(&self) -> Option<LockConflict<'_>> {
+        let c = self.conflict.as_ref()?;
+        Some(LockConflict {
+            columns: c.columns.as_deref(),
+            constraint: c.constraint.as_deref(),
+            sets: c.update.as_ref().map(|u| u.sets.iter().map(|(name, _)| name.as_str()).collect())
+                .unwrap_or_default(),
+        })
+    }
+    pub(super) fn lock_supplies(&self, name: &str) -> bool {
+        self.columns.iter().any(|column| column == name)
     }
     /// Probe classification only; the conflict planner still validates the target.
     pub(super) fn conflict_arbiter_columns(&self, state: &Relational,

@@ -1,6 +1,9 @@
 //! Append pages share the outer statement snapshot, locks and savepoint.
 use super::*;
 
+/// Shared-write admission matches the bounded plain-VALUES publication page.
+pub(crate) const SHARED_WRITE_ROWS: usize = 200;
+
 pub(super) fn eligible(state: &Relational, prepared: &Prepared) -> bool {
     let Some(table) = prepared.table().and_then(|name| state.tables.get(name)) else {
         return false;
@@ -75,7 +78,7 @@ pub(super) fn execute(
             if start == insert.row_count() {
                 break;
             }
-            let end = (start + 200).min(insert.row_count());
+            let end = (start + SHARED_WRITE_ROWS).min(insert.row_count());
             let input = insert.batch(start, end);
             start = end;
             (input, false)
