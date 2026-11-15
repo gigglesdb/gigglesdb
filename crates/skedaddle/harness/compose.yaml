@@ -28,6 +28,44 @@ x-pg-matrix: &pg-matrix
     timeout: 3s
     retries: 60
 services:
+  spanner-emulator:
+    <<: *common
+    profiles: [spanner-emulator]
+    image: gcr.io/cloud-spanner-emulator/emulator@sha256:f9212d99a52ee9bf39b6e4b397eab09b90d87327dca7a985110801456b40dc9d
+    platform: linux/amd64
+    ports: ['127.0.0.1::9010', '127.0.0.1::9020']
+    # In-memory database; no persistent volumes. Bound the whole service below 1 GiB.
+    mem_limit: 768m
+    shm_size: 16m
+  # Anchor the MySQL settings here so inactive profiles leave PG config unchanged.
+  mysql80: &mysql-matrix
+    <<: *common
+    entrypoint: [bash, /harness/mysql-start.sh]
+    environment:
+      MYSQL_ROOT_PASSWORD: skedaddle
+      MYSQL_ROOT_HOST: '%'
+      HARNESS_MYSQL_GTID: ${MYSQL_GTID_MODE:-ON}
+    ports: ['127.0.0.1::3306']
+    mem_limit: 640m
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD=skedaddle mysql --host=127.0.0.1 --user=root --ssl-mode=VERIFY_CA --ssl-ca=/var/lib/mysql/harness/tls/ca.pem -Nse "SELECT 1"']
+      interval: 2s
+      timeout: 5s
+      retries: 90
+    profiles: [mysql80]
+    image: ${MYSQL80_IMAGE:-mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b}
+    volumes:
+      - mysql80data:/var/lib/mysql
+      - ./mysql-start.sh:/harness/mysql-start.sh:ro
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/10-m1.sql:ro
+  mysql84:
+    <<: *mysql-matrix
+    profiles: [mysql84]
+    image: ${MYSQL84_IMAGE:-mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902}
+    volumes:
+      - mysql84data:/var/lib/mysql
+      - ./mysql-start.sh:/harness/mysql-start.sh:ro
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/10-m1.sql:ro
   pg-source:
     <<: *pg-matrix
     volumes:
@@ -118,6 +156,13 @@ services:
       timeout: 3s
       retries: 30
 volumes:
+  # Two 480 MiB caps, including data, redo, binlogs and private TLS keys.
+  mysql80data:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
+  mysql84data:
+    labels: {skedaddle.test: '${RUN_ID}'}
+    driver_opts: {type: tmpfs, device: tmpfs, o: 'size=480m,mode=0700'}
   # Hard aggregate cap: three 256 MiB volumes = 768 MiB, including WAL/TLS.
   pgsource:
     labels: {skedaddle.test: '${RUN_ID}'}

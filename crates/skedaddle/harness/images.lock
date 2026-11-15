@@ -1,5 +1,21 @@
 {
   "images": {
+    "spanner-emulator": {
+      "tag": "gcr.io/cloud-spanner-emulator/emulator:1.5.59",
+      "ref": "gcr.io/cloud-spanner-emulator/emulator@sha256:f9212d99a52ee9bf39b6e4b397eab09b90d87327dca7a985110801456b40dc9d",
+      "size_bytes": 71865442,
+      "reason": "Official Spanner emulator, Linux amd64 manifest resolved 2026-11-15; both SQL dialects and change streams"
+    },
+    "mysql80": {
+      "tag": "mysql:8.0",
+      "ref": "mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b",
+      "reason": "GD-0064 M1 official MySQL 8.0.46, multi-platform digest"
+    },
+    "mysql84": {
+      "tag": "mysql:8.4",
+      "ref": "mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+      "reason": "GD-0064 M1 official MySQL 8.4.13, multi-platform digest"
+    },
     "rust": {
       "tag": "rust:1.99.1-bookworm",
       "ref": "rust@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c",
