@@ -74,8 +74,10 @@ fn subquery_rows_nulls_metadata_and_dependencies_match_sql() {
         #[cfg(feature = "engine-rocksdb")]
         if engine == Engine::V2 {
             s.execute("CREATE VIEW v AS SELECT n FROM u", &[], None).unwrap();
-            let hidden = read("t", Some(Exists(Box::new(read("v", None)))));
-            assert_eq!(trap(|| s.execute_typed_read(hidden, None)), Err(giggles_core::CoreError::Sql(SqlError::UnknownTable)));
+            // Typed reads see views like SQL (W2-E); PG18 allows views in subqueries.
+            let through_view = read("t", Some(Exists(Box::new(read("v", None)))));
+            assert_eq!(trap(|| s.execute_typed_read(through_view, None)),
+                s.execute("SELECT n FROM t WHERE EXISTS(SELECT n FROM v)", &[], None));
         }
         drop(s); drop(admin); std::fs::remove_dir_all(path).unwrap();
     }

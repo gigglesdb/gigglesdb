@@ -37,7 +37,7 @@ mod projector_inspection;
 pub(crate) mod projector_reconstruction;
 mod query;
 pub use query::typed_read::{SingleSourceRead, ReadProjection, ReadExpr, ReadPredicate, ReadCompare,
-    ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead, TypedRead, TypedInsertSelect};
+    ReadAggregate, ReadClauses, ReadOrder, ReadSource, ReadJoinKind, TwoSourceRead, TypedRead, TypedInsertSelect, ViewRead};
 use query::{TypmodSource, result_typmod};
 pub(crate) mod cursor;
 mod returning;
@@ -1840,6 +1840,27 @@ impl Prepared {
         prepared.statement = Statement::InsertMulti(Box::new(sql_insert::Insert::from_query(
             insert.table, insert.columns, source)));
         Ok(prepared)
+    }
+    /// Native view DDL lowers directly to the same statement as parsed SQL.
+    pub fn from_view_read(domain: u128, epoch: u64, name: String, read: Option<ViewRead>, cascade: bool) -> R<Self> {
+        ident(split_key(&name).0)?;
+        ident(split_key(&name).1)?;
+        let sources = match &read {
+            Some(ViewRead::Single(r)) => vec![r.table.clone()],
+            Some(ViewRead::Two(r)) => vec![r.left.table.clone(), r.right.table.clone()],
+            None => vec![],
+        };
+        let query = match read {
+            Some(ViewRead::Single(r)) => Some(query::Query::from_single_source_read(*r)?),
+            Some(ViewRead::Two(r)) => Some(query::typed_read::lower_join(*r)?),
+            None => None,
+        };
+        let create = query.is_some();
+        let mut p = Self::engine(Statement::View(views::Ddl::typed(name.clone(), query, cascade)), domain, epoch);
+        let (schema, leaf) = split_key(&name);
+        p.relations.push(schemas::Reference { name: leaf.into(), schema: name.contains('\0').then(|| schema.into()), create });
+        for source in sources { p.relations.push(schemas::Reference::read(source, None)); }
+        Ok(p)
     }
     pub(crate) fn create_engine(
         name: String,

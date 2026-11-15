@@ -110,8 +110,7 @@ fn joins_clauses_nulls_self_join_and_errors_match_sql() {
         if engine == Engine::V2 {
             s.execute("CREATE VIEW v AS SELECT id,tid,n FROM u", &[], None).unwrap();
             let mut view = valid.clone(); view.right.table = "v".into();
-            assert_eq!(trap(|| s.describe_typed_join(view.clone())).unwrap_err(), CoreError::Sql(SqlError::UnknownTable));
-            assert_eq!(trap(|| s.execute_typed_join(view, None)), Err(CoreError::Sql(SqlError::UnknownTable)));
+            parity(&mut s, "SELECT a.id FROM t a JOIN v b ON a.id=b.tid", view).unwrap();
         }
         s.execute("BEGIN", &[], None).unwrap();
         s.execute("INSERT INTO u VALUES(5,3,6)", &[], None).unwrap();

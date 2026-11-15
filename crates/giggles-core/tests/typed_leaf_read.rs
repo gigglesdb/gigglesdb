@@ -109,8 +109,11 @@ fn semantic_errors_and_authorization_first_are_preserved() {
         if engine == Engine::V2 {
             s.execute("CREATE VIEW v AS SELECT id,n,label FROM t", &[], None).unwrap();
             let mut view = read(None); view.table = "v".into();
-            assert_eq!(trap(|| s.describe_typed_read(view.clone())).unwrap_err(), CoreError::Sql(SqlError::UnknownTable));
-            assert_eq!(trap(|| s.execute_typed_read(view, None)).unwrap_err(), CoreError::Sql(SqlError::UnknownTable));
+            let sql = s.prepare("SELECT label AS renamed,id,7 AS fixed FROM v").unwrap();
+            let actual = trap(|| s.describe_typed_read(view.clone())).unwrap();
+            let expected = s.describe(&sql).unwrap();
+            assert_eq!((actual.columns, actual.type_oids, actual.typmods), (expected.columns, expected.type_oids, expected.typmods));
+            assert_eq!(trap(|| s.execute_typed_read(view, None)), s.execute_prepared(&sql, &[], None));
         }
         let mut extra = read(None); extra.table = "t,secret".into();
         assert!(trap(|| s.execute_typed_read(extra, None)).is_err());

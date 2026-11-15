@@ -1,7 +1,8 @@
 //! Bounded, unbound table reads. Names are exact identifiers, never SQL text.
 use super::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SingleSourceRead {
     pub table: String,
     pub projection: Vec<ReadProjection>,
@@ -16,15 +17,26 @@ pub struct TypedInsertSelect {
     pub columns: Vec<String>,
     pub source: TypedRead,
 }
+/// Typed query supplied to CREATE VIEW; SQL's supported view subset still applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewRead { Single(Box<SingleSourceRead>), Two(Box<TwoSourceRead>) }
+impl From<SingleSourceRead> for ViewRead {
+    fn from(read: SingleSourceRead) -> Self { Self::Single(Box::new(read)) }
+}
+impl From<TwoSourceRead> for ViewRead {
+    fn from(read: TwoSourceRead) -> Self { Self::Two(Box::new(read)) }
+}
 /// A table and its exact, explicit source alias.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadSource {
     pub table: String,
     pub alias: String,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadJoinKind { Inner, Left }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TwoSourceRead {
     pub left: ReadSource,
     pub right: ReadSource,
@@ -43,19 +55,22 @@ impl TwoSourceRead {
         self
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadProjection {
     pub expression: ReadExpr,
     pub alias: Option<String>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReadExpr {
     Column(String),
     QualifiedColumn { source: String, column: String },
     Literal(Value),
     Aggregate(ReadAggregate),
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReadAggregate {
     CountStar,
     /// Qualify the column of Count/Sum/Min/Max/Avg (never CountStar).
@@ -67,14 +82,16 @@ pub enum ReadAggregate {
     Avg(String),
 }
 /// Optional clauses, attached once with either read type's `with_clauses`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadClauses {
     pub group_by: Vec<String>,
     pub having: Option<ReadPredicate>,
     pub order_by: Vec<ReadOrder>,
     pub limit: Option<i64>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadOrder {
     pub expression: ReadExpr,
     pub descending: bool,
@@ -90,11 +107,12 @@ impl SingleSourceRead {
         self
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadCompare {
     Eq, Ne, Lt, Le, Gt, Ge,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReadPredicate {
     /// Root-only clause bundle; use the read type's `with_clauses`.
     Clauses { filter: Option<Box<Self>>, clauses: Box<ReadClauses> },

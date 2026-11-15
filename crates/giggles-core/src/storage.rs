@@ -2601,6 +2601,30 @@ impl SqlSession {
         if result.is_err() { self.abort(); }
         result
     }
+    /// Trusted native view DDL; callers authorize the target and read sources first.
+    /// Returns a view postimage on create and preimage on drop (no primary key).
+    pub fn execute_typed_view(&mut self, name: String, read: Option<relational::ViewRead>, cascade: bool) -> Result<relational::TableDef, CoreError> {
+        let result = (|| {
+            let (domain, epoch) = self.inspect_metadata(|s| Ok((s.view.domain, if self.is_v2_engine() { 0 } else { s.sql.epoch })))?;
+            let dropping = read.is_none();
+            let search_path = self.search_path.clone();
+            let definition = |s: &MetadataState<'_>| {
+                let key = s.sql.resolve_relation_key(&name, &search_path);
+                let id = s.sql.view_names.get(&key).map(|v| v.0);
+                Ok(s.sql.catalog_presentation().map_err(CoreError::Sql)?.views.into_iter()
+                    .find(|(view, _)| Some(*view) == id).map(|(_, v)| v.table))
+            };
+            let before = if dropping { self.inspect_metadata(definition)? } else { None };
+            let mut p = relational::Prepared::from_view_read(domain, epoch, name.clone(), read, cascade).map_err(CoreError::Sql)?;
+            p.transaction = self.transaction_id;
+            p.set_schema_context(self.search_path.clone(), self.schema_user.clone());
+            self.execute_bound_engine(&p, &[], None)?;
+            let table = if dropping { before } else { self.inspect_metadata(definition)? };
+            table.ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+        })();
+        if result.is_err() { self.abort(); }
+        result
+    }
     /// Identity for binding against an active transaction's catalog snapshot.
     pub(crate) fn snapshot_identity_engine(&mut self) -> Result<(u128, u64), CoreError> {
         let result = (|| {
@@ -3174,7 +3198,7 @@ impl SqlSession {
             // Views can introduce dependencies beyond the authorized sources.
             for table in tables.into_iter().chain(p.authorization_tables().map_err(CoreError::Sql)?) {
                 let key = s.sql.resolve_relation_key(&table, &self.search_path);
-                if !s.sql.tables.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
+                if !s.sql.tables.contains_key(&key) && !s.sql.view_names.contains_key(&key) { return Err(CoreError::Sql(relational::SqlError::UnknownTable)); }
             }
             p.bind_schemas(&s.sql).map_err(CoreError::Sql)
         };

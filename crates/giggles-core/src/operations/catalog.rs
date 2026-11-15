@@ -2,6 +2,7 @@
 use super::*;
 mod unique;
 pub use unique::*;
+pub use crate::relational::ViewRead;
 
 /// Named constraints share SQL's immediate validation and referential actions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +56,8 @@ pub enum CatalogRequest {
     AlterTable { table: String, action: AlterTableAction },
     AddConstraint { table: String, name: Option<String>, constraint: ConstraintSpec },
     DropConstraint { table: String, name: String, cascade: bool },
+    CreateView { name: String, read: ViewRead },
+    DropView { name: String, cascade: bool },
 }
 // Preserve the legacy CreateTable decoder while requiring exact new catalog
 // requests. Unknown options must never disappear during raw request decoding.
@@ -83,6 +86,9 @@ impl<'de> Deserialize<'de> for CatalogRequest {
         #[serde(deny_unknown_fields)]
         struct DropConstraint { table: String, name: String, cascade: bool }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CreateView { name: String, read: ViewRead }
+        #[derive(Deserialize)]
         enum Wire {
             CreateTable {
                 table: String,
@@ -95,11 +101,15 @@ impl<'de> Deserialize<'de> for CatalogRequest {
             AlterTable(AlterTable),
             AddConstraint(AddConstraint),
             DropConstraint(DropConstraint),
+            CreateView(CreateView),
+            DropView(DropIndex),
         }
         Ok(match Wire::deserialize(d)? {
             Wire::AlterTable(AlterTable { table, action }) => Self::AlterTable { table, action },
             Wire::AddConstraint(AddConstraint { table, name, constraint }) => Self::AddConstraint { table, name, constraint },
             Wire::DropConstraint(DropConstraint { table, name, cascade }) => Self::DropConstraint { table, name, cascade },
+            Wire::CreateView(CreateView { name, read }) => Self::CreateView { name, read },
+            Wire::DropView(DropIndex { name, cascade }) => Self::DropView { name, cascade },
             Wire::DropTable(DropTable { table, cascade }) => Self::DropTable { table, cascade },
             Wire::DropIndex(DropIndex { name, cascade }) => Self::DropIndex { name, cascade },
             Wire::CreateTable {
@@ -125,6 +135,7 @@ impl<'de> Deserialize<'de> for CatalogRequest {
 }
 /// DROP TABLE returns the table's preimage and no index ID. DROP INDEX returns
 /// its owning table's postimage and the dropped index ID; creates and ALTER return postimages.
+/// Views return their column descriptor (no primary key), postimage on create, preimage on drop.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogOutcome {
     pub catalog_epoch: u64,
@@ -223,6 +234,17 @@ fn validate_catalog_request(request: &CatalogRequest) -> Result<()> {
         crate::relational::Prepared::constraint_engine(&constraint_relation_keys(request), 0, 0).map_err(|e| core(CoreError::Sql(e)))?;
         return Ok(());
     }
+    if let CatalogRequest::CreateView { name, read } = request {
+        if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
+        validate_size(request)?;
+        crate::relational::Prepared::from_view_read(0, 0, native_relation_key(name), Some(read.clone()), false)
+            .map_err(|e| core(CoreError::Sql(e)))?;
+        return Ok(());
+    }
+    if let CatalogRequest::DropView { name, .. } = request {
+        if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
+        return validate_size(request);
+    }
     if let CatalogRequest::DropTable { table: name, .. } | CatalogRequest::DropIndex { name, .. } = request {
         if !relation_identifier(name) { return Err(Error::Bind("identifier".into())); }
         return validate_size(request);
@@ -293,7 +315,7 @@ fn bind_catalog(
 ) -> Result<BoundCatalogOperation> {
     let (database_domain, catalog_epoch) = session.snapshot_identity_engine().map_err(core)?;
     let (_, tables) = session.catalog_engine().map_err(core)?;
-    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. } | CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
+    if matches!(request, CatalogRequest::DropTable { .. } | CatalogRequest::DropIndex { .. } | CatalogRequest::AlterTable { .. } | CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. } | CatalogRequest::CreateView { .. } | CatalogRequest::DropView { .. }) {
         return Ok(BoundCatalogOperation {
             description: BoundCatalogDescription {
                 contract_version: ENGINE_CONTRACT_VERSION,
@@ -416,6 +438,19 @@ impl Engine {
         session.begin_engine().map_err(core)?;
         let staged = (|| {
             let prepared = bind(&mut session)?;
+            if matches!(prepared.description.request, CatalogRequest::CreateView { .. } | CatalogRequest::DropView { .. }) && session.is_v2_engine() {
+                session.catalog_empty_engine().map_err(core)?;
+            }
+            if let CatalogRequest::CreateView { name, read } = &prepared.description.request {
+                let table = session.execute_typed_view(native_relation_key(name), Some(read.clone()), false).map_err(core)?;
+                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+            }
+            if let CatalogRequest::DropView { name, cascade } = &prepared.description.request {
+                let table = session.execute_typed_view(native_relation_key(name), None, *cascade).map_err(core)?;
+                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+            }
             if !session.catalog_empty_engine().map_err(core)? {
                 return Err(Error::PlanRequired);
             }

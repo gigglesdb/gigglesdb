@@ -11,6 +11,11 @@ pub(super) struct Ddl {
     cascade: bool,
     replace: bool,
 }
+impl Ddl {
+    pub(super) fn typed(name: String, query: Option<query::Query>, cascade: bool) -> Self {
+        Self { names: vec![name], query, columns: vec![], optional: false, cascade, replace: false }
+    }
+}
 pub(super) fn claims(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Word(w)) if w == "create" || w == "drop")
         && (matches!(tokens.get(1), Some(Token::Word(w)) if w == "view")
