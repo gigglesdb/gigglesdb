@@ -50,6 +50,9 @@ pub(super) fn has_traces(path: &Path) -> bool {
     false
 }
 
+#[cfg(feature = "engine-rocksdb")]
+pub(crate) const DEFAULT_WRITE_SET_BYTES: usize = 1024 * 1024 * 1024;
+
 impl V2Db {
     #[cfg(feature = "engine-rocksdb")]
     pub(crate) fn create(path: &Path) -> Result<Self, CoreError> {
@@ -69,6 +72,21 @@ impl V2Db {
     }
     #[cfg(feature = "engine-rocksdb")]
     fn from_kv(kv: Arc<engine::kv::Kv>) -> Result<Self, CoreError> {
+        Self::from_kv_with_limit(kv, DEFAULT_WRITE_SET_BYTES)
+    }
+    #[cfg(feature = "engine-rocksdb")]
+    #[allow(dead_code)] // Entry point for replicated backends.
+    pub(crate) fn from_backend(
+        backend: Arc<dyn engine::kv::KvBackend>,
+        write_set_bytes: usize,
+    ) -> Result<Self, CoreError> {
+        Self::from_kv_with_limit(Arc::new(engine::kv::Kv::new(backend)), write_set_bytes)
+    }
+    #[cfg(feature = "engine-rocksdb")]
+    fn from_kv_with_limit(
+        kv: Arc<engine::kv::Kv>,
+        write_set_bytes: usize,
+    ) -> Result<Self, CoreError> {
         let meta = engine::meta::open_checks(kv.as_ref()).map_err(format_error)?;
         if !meta.stale_counters.is_empty() {
             let mut batch = engine::kv::WriteBatch::default();
@@ -82,7 +100,7 @@ impl V2Db {
             Arc::new(engine::commit::SystemClock),
             engine::commit::SequencerConfig {
                 // Atomic paged DML retains transaction writes and savepoint undo.
-                write_set_bytes: 1024 * 1024 * 1024,
+                write_set_bytes,
                 ..Default::default()
             },
         )?;
@@ -279,3 +297,7 @@ mod metadata_tests;
 #[cfg(all(test, feature = "engine-rocksdb"))]
 #[path = "v2_catalog_snapshot_tests.rs"]
 mod catalog_snapshot_tests;
+
+#[cfg(all(test, feature = "engine-rocksdb"))]
+#[path = "v2_backend_tests.rs"]
+mod backend_tests;

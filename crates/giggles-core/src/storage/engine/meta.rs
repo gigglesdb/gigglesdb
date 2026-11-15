@@ -311,6 +311,23 @@ pub(crate) fn create(
         create_inner(dir, domain, open)
     }
 }
+pub(crate) fn write_initial_meta(
+    kv: &dyn KvBackend,
+    domain: [u8; 16],
+    extra_features: u64,
+) -> Result<(), FormatError> {
+    let mut batch = WriteBatch::default();
+    for (key, value) in [
+        (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
+        (b"subversion", CURRENT_SUBVERSION.to_be_bytes().to_vec()),
+        (b"domain", domain.to_vec()),
+        (b"engine", b"rocksdb".to_vec()),
+    ] {
+        batch.put(Keyspace::Meta, key.to_vec(), value);
+    }
+    put_features(&mut batch, extra_features)?;
+    kv.write(batch, Durability::Sync).map_err(corrupt)
+}
 fn create_inner(
     dir: &Path,
     domain: [u8; 16],
@@ -324,17 +341,7 @@ fn create_inner(
     let kv = open(dir).map_err(corrupt)?;
     #[cfg(test)]
     hook(Stage::Open)?;
-    let mut batch = WriteBatch::default();
-    for (key, value) in [
-        (b"family".as_slice(), 2u32.to_be_bytes().to_vec()),
-        (b"subversion", CURRENT_SUBVERSION.to_be_bytes().to_vec()),
-        (b"domain", domain.to_vec()),
-        (b"engine", b"rocksdb".to_vec()),
-    ] {
-        batch.put(Keyspace::Meta, key.to_vec(), value);
-    }
-    put_features(&mut batch, 0)?;
-    kv.write(batch, Durability::Sync).map_err(corrupt)?;
+    write_initial_meta(kv.as_ref(), domain, 0)?;
     #[cfg(test)]
     hook(Stage::MetaBatch)?;
     let mut file = fs::File::create(dir.join(TMP)).map_err(corrupt)?;

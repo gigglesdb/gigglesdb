@@ -1096,6 +1096,18 @@ impl Admin {
             }),
         })
     }
+    #[cfg(feature = "engine-rocksdb")]
+    #[allow(dead_code)] // Entry point for replicated backends.
+    pub(crate) fn attach_v2_backend(
+        backend: Arc<dyn engine::kv::KvBackend>,
+        limits: Limits,
+        write_set_bytes: usize,
+    ) -> Result<Admin, CoreError> {
+        Self::attach_backend(
+            Backend::V2(Arc::new(v2::V2Db::from_backend(backend, write_set_bytes)?)),
+            limits,
+        )
+    }
     /// Explicit create-new directory for the chosen engine. Legacy delegates to `create`.
     pub fn create_engine(
         path: impl AsRef<Path>,
