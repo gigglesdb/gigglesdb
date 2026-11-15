@@ -134,6 +134,7 @@ async fn recovered_buffer_baseline_is_unknown_until_its_real_applied_receipt() {
     marker(&tx, heartbeat(), 30).await;
     durable(&mut capture).await;
     let runtime = f.engine.runtime();
+    runtime.flush_progress().await.unwrap();
     let checkpoint = decode_reader_checkpoint(&runtime.snapshot().progress["applied"].0).unwrap();
     runtime.7.begin(
         source(),

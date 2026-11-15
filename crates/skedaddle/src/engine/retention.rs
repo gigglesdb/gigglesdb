@@ -112,6 +112,12 @@ impl Engine {
                 .runtime
                 .local_recovery("authority raced journal-pause reacquire"));
         }
+        *self
+            .runtime
+            .2
+            .persistence
+            .lock()
+            .expect("persistence poisoned") = Persistence::default();
         *self.runtime.5.write().expect("engine authority poisoned") =
             (owner.state().owner.clone(), owner.state().epoch, None);
         *self.runtime.1.write().expect("engine snapshot poisoned") = owner.state().clone();
@@ -359,6 +365,7 @@ impl Runtime {
         result
     }
     async fn retention_step(&self, retention: &mut Retention) -> Result<()> {
+        self.flush_progress().await?;
         let result = retention.tick(self).await;
         self.sync_authority().await;
         retention.next_tick = Instant::now() + retention.cadence;

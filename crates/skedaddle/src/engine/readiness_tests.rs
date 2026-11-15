@@ -591,3 +591,85 @@ async fn journaled_dead_letters_override_an_optimistic_collector() {
 
 #[path = "stop_tests.rs"]
 mod stop_tests;
+
+#[tokio::test]
+async fn identical_readiness_is_coalesced_change_and_heartbeat_are_immediate() {
+    let f = completed().await;
+    f.engine
+        .runtime
+        .progress_marker("buffered", "manifest-durable".into(), "123".into())
+        .await
+        .unwrap();
+    let mut sample = snapshot();
+    f.engine.evaluate_sample(&sample).await.unwrap();
+    let before = f.journal.load(false).await.unwrap().applied_seq;
+    assert_eq!(
+        f.journal.load(false).await.unwrap().progress["buffered"].1,
+        "123"
+    );
+    // Hold the heartbeat deadline constant while exercising repeated evaluation.
+    f.engine
+        .runtime
+        .2
+        .persistence
+        .lock()
+        .unwrap()
+        .readiness
+        .as_mut()
+        .unwrap()
+        .1 = std::time::Instant::now() + Duration::from_secs(60);
+    for _ in 0..32 {
+        f.engine.evaluate_sample(&sample).await.unwrap();
+    }
+    assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before);
+    sample.dead_letters = Some(1);
+    f.engine.evaluate_sample(&sample).await.unwrap();
+    let changed = f.journal.load(false).await.unwrap();
+    assert_eq!(changed.applied_seq, before + 1);
+    assert_eq!(changed.lifecycle.state, State::CatchingUp);
+    assert!(
+        changed
+            .lifecycle
+            .blockers
+            .contains(&"dead-letters-present".into())
+    );
+    f.engine
+        .runtime
+        .2
+        .persistence
+        .lock()
+        .unwrap()
+        .readiness
+        .as_mut()
+        .unwrap()
+        .1 = std::time::Instant::now() - Duration::from_secs(2);
+    f.engine.evaluate_sample(&sample).await.unwrap();
+    assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before + 2);
+}
+
+#[tokio::test]
+async fn identical_readiness_still_authenticates_owner_before_suppressing_write() {
+    let f = completed().await;
+    let sample = ComponentSnapshot::default();
+    f.engine.evaluate_sample(&sample).await.unwrap();
+    f.engine
+        .runtime
+        .2
+        .persistence
+        .lock()
+        .unwrap()
+        .readiness
+        .as_mut()
+        .unwrap()
+        .1 = std::time::Instant::now() + Duration::from_secs(60);
+    let mut replacement = Coordinator::observer(
+        f.journal.clone(),
+        Local::create(f.root.join("readiness-replacement")).unwrap(),
+        "replacement",
+    )
+    .unwrap();
+    replacement.acquire().await.unwrap();
+    let before = f.journal.load(false).await.unwrap().applied_seq;
+    assert!(f.engine.evaluate_sample(&sample).await.is_err());
+    assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before);
+}

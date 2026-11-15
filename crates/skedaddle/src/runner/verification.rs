@@ -1298,6 +1298,7 @@ impl Service {
                 .await
                 .map_err(|_| invalid())?;
                 let applied = waiter.wait_until(through).await.map_err(|_| invalid())?;
+                self.runtime.flush_progress().await.map_err(|_| invalid())?;
                 let applied_state = self.runtime.state().await;
                 observed.lock().expect("observation poisoned").applied = applied;
                 let seen = observed.lock().expect("observation poisoned");

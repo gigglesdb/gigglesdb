@@ -89,9 +89,20 @@ fn run_excludes_independent_promotion_and_allows_runtime_calls() {
     let f = async_runtime.block_on(Fixture::new(true));
     let runtime = f.engine.runtime();
     let mut other = f.competitor(false);
+    async_runtime
+        .block_on(runtime.progress_marker("buffered", "manifest-durable".into(), "123".into()))
+        .unwrap();
     runtime
         .cutover_authority()
         .run(&f.key(), || {
+            assert_eq!(
+                async_runtime
+                    .block_on(f.journal.load(false))
+                    .unwrap()
+                    .progress["buffered"]
+                    .1,
+                "123"
+            );
             async_runtime
                 .block_on(runtime.marker("in-closure", "yes".into(), "1".into()))
                 .unwrap();

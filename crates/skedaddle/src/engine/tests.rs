@@ -971,7 +971,7 @@ async fn copy_throttle_never_stalls_capture() {
         }
         async fn step(&mut self) -> Result<Captured> {
             // Entering the next step proves capture_loop finished recording
-            // the preceding durable batch, including its buffered marker.
+            // the preceding durable batch and queued its buffered marker.
             if self.durable
                 && let Some(signal) = self.buffered.take()
             {
@@ -1045,6 +1045,7 @@ async fn copy_throttle_never_stalls_capture() {
             tokio::try_join!(progress, buffer_progress)
         })
         .await;
+        f.engine.runtime().flush_progress().await.unwrap();
         let state = f.engine.runtime().state().await;
         assert!(
             matches!(observed, Ok(Ok(((), ())))),
@@ -1291,4 +1292,151 @@ async fn engine_futures_stay_within_stack_budget() {
     drop(database);
     drop(f);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn progress_commit_count_and_durable_boundaries() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    let before = f.journal.load(false).await.unwrap().applied_seq;
+    for n in 1..=256 {
+        runtime.2.persistence.lock().unwrap().last_flush = std::time::Instant::now();
+        runtime
+            .progress_marker("buffered", "manifest-durable".into(), n.to_string())
+            .await
+            .unwrap();
+    }
+    let state = f.journal.load(false).await.unwrap();
+    assert_eq!(state.applied_seq - before, 4);
+    assert_eq!(state.progress["buffered"].1, "256");
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "257".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.journal.load(false).await.unwrap().progress["buffered"].1,
+        "256"
+    );
+    // Any ordinary transition (including lifecycle/fence/checkpoint-producing
+    // transitions) first publishes pending restart progress.
+    runtime
+        .marker("boundary", "checkpoint".into(), "1".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.journal.load(false).await.unwrap().progress["buffered"].1,
+        "257"
+    );
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "258".into())
+        .await
+        .unwrap();
+    runtime
+        .lifecycle(Event::Interrupt {
+            to: State::Paused,
+            reason: "stop".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.journal.load(false).await.unwrap().progress["buffered"].1,
+        "258"
+    );
+}
+
+#[tokio::test]
+async fn coalesced_progress_still_authenticates_ownership_on_every_update() {
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "1".into())
+        .await
+        .unwrap();
+    let mut replacement = Coordinator::observer(
+        f.journal.clone(),
+        Local::create(f.root.join("batch-replacement")).unwrap(),
+        "replacement",
+    )
+    .unwrap();
+    replacement.acquire().await.unwrap();
+    let before = f.journal.load(false).await.unwrap().applied_seq;
+    assert!(
+        runtime
+            .progress_marker("buffered", "manifest-durable".into(), "2".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(f.journal.load(false).await.unwrap().applied_seq, before);
+}
+
+#[tokio::test]
+async fn source_feedback_waits_for_durable_coalesced_buffered_progress() {
+    struct Probe(Arc<std::sync::Mutex<Vec<u64>>>);
+    impl source::Transport for Probe {
+        async fn next(&mut self, durable: u64) -> source::Result<Vec<u8>> {
+            self.0.lock().unwrap().push(durable);
+            Ok(vec![])
+        }
+    }
+    let f = Fixture::new().await;
+    let runtime = f.engine.runtime();
+    let baseline = crate::pg::replication::Checkpoint {
+        lineage: crate::pg::replication::Lineage {
+            system_id: 1,
+            timeline: 1,
+            database: "db".into(),
+            xlogpos: 10,
+        },
+        slot: "slot".into(),
+        durable_lsn: 10,
+    };
+    runtime
+        .marker(
+            "source-slot",
+            encode_source_checkpoint(&baseline).unwrap(),
+            "installed".into(),
+        )
+        .await
+        .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let mut probe = Probe(seen.clone());
+    let mut transport = super::pg::DurableFeedbackTransport::new(&mut probe, Some(&runtime), 0);
+    source::Transport::next(&mut transport, 30).await.unwrap();
+    runtime.2.persistence.lock().unwrap().last_flush =
+        std::time::Instant::now() + Duration::from_secs(60);
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "20".into())
+        .await
+        .unwrap();
+    source::Transport::next(&mut transport, 30).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![10, 10],
+        "pending marker cannot release source WAL"
+    );
+    runtime.flush_progress().await.unwrap();
+    source::Transport::next(&mut transport, 30).await.unwrap();
+    source::Transport::next(&mut transport, 15).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![10, 10, 20, 15],
+        "never acknowledge beyond this capture's durable buffer"
+    );
+    // A recovered prefix is independently durable even when the last batched
+    // marker lags it; never send feedback behind this connection's start.
+    let mut resumed_probe = Probe(seen.clone());
+    let mut resumed =
+        super::pg::DurableFeedbackTransport::new(&mut resumed_probe, Some(&runtime), 25);
+    source::Transport::next(&mut resumed, 30).await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![10, 10, 20, 15, 25]);
+    runtime
+        .marker("buffered", "manifest-durable".into(), "invalid".into())
+        .await
+        .unwrap();
+    assert!(source::Transport::next(&mut transport, 30).await.is_err());
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        5,
+        "invalid evidence sends no feedback"
+    );
 }

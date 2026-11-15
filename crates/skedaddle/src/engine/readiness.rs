@@ -292,13 +292,32 @@ impl Engine {
         sample: &ComponentSnapshot,
     ) -> Result<ReadinessFacts> {
         self.require_coverage()?;
+        // Suppress duplicate writes, never the old per-evaluation authority
+        // refresh (including its periodic authentication deadline).
+        Box::pin(self.runtime.refresh_owner()).await?;
         // Serialize journal state and the readiness commit with copy/apply.
         let mut coordinator = self.runtime.0.lock().await;
+        self.runtime.flush_progress_locked(&mut coordinator).await?;
         let facts = assemble(&self.runtime, &self.journal, sample).await?;
         if matches!(
             coordinator.state().lifecycle.state,
             State::CatchingUp | State::VerifiedReady
-        ) {
+        ) && self
+            .runtime
+            .2
+            .persistence
+            .lock()
+            .expect("persistence poisoned")
+            .readiness
+            .as_ref()
+            .is_none_or(|(saved, at)| {
+                saved != &facts
+                    || at.elapsed() >= Duration::from_secs(1)
+                    || coordinator.state().lifecycle.blockers != facts.blockers()
+                    || (facts.blockers().is_empty()
+                        && coordinator.state().lifecycle.state != State::VerifiedReady)
+            })
+        {
             let result = coordinator
                 .commit(Transition::Lifecycle {
                     event: Event::Readiness {
@@ -308,6 +327,12 @@ impl Engine {
                 .await;
             self.runtime.observe_journal_error(&coordinator, &result);
             result?;
+            self.runtime
+                .2
+                .persistence
+                .lock()
+                .expect("persistence poisoned")
+                .readiness = Some((facts.clone(), std::time::Instant::now()));
             *self.runtime.1.write().expect("engine snapshot poisoned") =
                 coordinator.state().clone();
         }

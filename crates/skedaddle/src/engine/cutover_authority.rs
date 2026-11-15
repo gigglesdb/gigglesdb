@@ -158,6 +158,10 @@ impl CutoverAuthority {
         let _serial = bridge(|runtime| Ok(runtime.block_on(self.runtime.2.cutover.lock())))?;
         let guard = bridge(|runtime| {
             runtime.block_on(async {
+                self.runtime
+                    .flush_progress()
+                    .await
+                    .map_err(coordinator_error)?;
                 let mut coordinator = self.runtime.0.lock().await;
                 let guard = Box::pin(coordinator.exclusive()).await;
                 *self.runtime.1.write().expect("engine snapshot poisoned") =

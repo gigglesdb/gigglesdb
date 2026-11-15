@@ -247,6 +247,31 @@ impl source::WatermarkSink for Sink {
         Ok(())
     }
 }
+// The raw source remains reusable without an engine. Engine-managed capture
+// gates every feedback opportunity on the coordinator's durable restart prefix.
+pub(super) struct DurableFeedbackTransport<'a, T> {
+    inner: &'a mut T,
+    runtime: Option<&'a Runtime>,
+    restored_floor: u64,
+}
+impl<'a, T> DurableFeedbackTransport<'a, T> {
+    pub(super) fn new(inner: &'a mut T, runtime: Option<&'a Runtime>, restored_floor: u64) -> Self {
+        Self {
+            inner,
+            runtime,
+            restored_floor,
+        }
+    }
+}
+impl<T: source::Transport> source::Transport for DurableFeedbackTransport<'_, T> {
+    async fn next(&mut self, captured: u64) -> source::Result<Vec<u8>> {
+        let durable = self.runtime.map_or(Ok(captured), |r| {
+            r.durable_feedback_lsn(captured, self.restored_floor)
+        })?;
+        self.inner.next(durable).await
+    }
+}
+
 pub struct PgCapture<R, T> {
     pub capture: source::Capture<R>,
     pub transport: T,
@@ -257,6 +282,8 @@ pub struct PgCapture<R, T> {
     schema_objects: Arc<dyn object_store::ObjectStore>,
     schema_stream: String,
     schema_owner: Option<(String, u64, String)>,
+    feedback_runtime: Option<Box<Runtime>>,
+    feedback_floor: u64,
 }
 impl<R, T> PgCapture<R, T> {
     pub fn new(
@@ -275,6 +302,8 @@ impl<R, T> PgCapture<R, T> {
             schema_objects,
             schema_stream,
             schema_owner: None,
+            feedback_runtime: None,
+            feedback_floor: 0,
         }
     }
 }
@@ -296,6 +325,7 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
             // Restore only once; replacement ownership needs a recovered writer
             // and a fresh capture, never reuse of the old epoch's binding.
             return if prepared == &owner {
+                self.feedback_runtime = Some(Box::new(runtime.clone()));
                 Ok(())
             } else {
                 Err(recovery(
@@ -311,7 +341,12 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
         }))
         .await
         .map_err(recovery)?;
+        // A fresh connection may start at a newer independently authenticated
+        // recovered writer/schema prefix than the coalesced journal marker.
+        // Keep this startup floor fixed across same-owner stop/resume.
+        self.feedback_floor = self.capture.durable_lsn();
         self.schema_owner = Some(owner);
+        self.feedback_runtime = Some(Box::new(runtime.clone()));
         Ok(())
     }
     fn schema_state(&self) -> Option<source::SchemaState> {
@@ -333,9 +368,14 @@ impl<R: source::TypeResolver, T: source::Transport> Capture for PgCapture<R, T> 
                     .map_err(|_| recovery("buffer admission closed"))?;
             }
         }
+        let mut transport = DurableFeedbackTransport::new(
+            &mut self.transport,
+            self.feedback_runtime.as_deref(),
+            self.feedback_floor,
+        );
         let step = self
             .capture
-            .step(&mut self.transport, &mut self.sink, &mut self.buffer_paused)
+            .step(&mut transport, &mut self.sink, &mut self.buffer_paused)
             .await
             .map_err(recovery)?;
         let mut captured = std::mem::take(&mut self.sink.0);
@@ -579,10 +619,18 @@ impl<D: Destination, P: PgTransactionPlanner> PgApplier<D, P> {
                     let marker = encode_reader_checkpoint(&checkpoint)
                         .map_err(|_| executor::Error::Checkpoint)?;
                     runtime
-                        .marker("applied", marker, position)
+                        .progress_marker("applied", marker, position)
                         .await
                         .map_err(|_| executor::Error::Checkpoint)?;
-                    runtime.6.applied(&applied, &checkpoint);
+                    if super::final_marker::transaction_marker(&transaction)
+                        .map_err(|_| executor::Error::Checkpoint)?
+                        .is_some()
+                    {
+                        runtime
+                            .flush_progress()
+                            .await
+                            .map_err(|_| executor::Error::Checkpoint)?;
+                    }
                     runtime.7.applied(&applied, &checkpoint);
                     runtime.queue_applied(applied, checkpoint).await;
                     Ok(())
@@ -706,7 +754,20 @@ impl<D: Destination, P: PgTransactionPlanner> Destination for PlanningDestinatio
         &mut self,
         checkpoint: &ReaderCheckpoint,
     ) -> executor::Result<()> {
-        self.destination.retain_after_checkpoint(checkpoint).await
+        // E215: replay from the durable journal boundary needs every later
+        // receipt. Never collect using the speculative ReaderLoop checkpoint.
+        let state = self.runtime.snapshot();
+        if let Some((marker, _)) = state.progress.get("applied") {
+            let durable =
+                decode_reader_checkpoint(marker).map_err(|_| executor::Error::Checkpoint)?;
+            if &durable == checkpoint {
+                self.destination.retain_after_checkpoint(&durable).await
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
     }
 }
 

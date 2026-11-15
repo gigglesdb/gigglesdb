@@ -5,7 +5,7 @@ use crate::{
         backends::ObjectBufferStore,
         format,
         gc::RetentionPolicy,
-        reader::{BufferReader, ReaderConfig},
+        reader::{BufferReader, ReaderCheckpoint, ReaderConfig},
         writer::{BufferWriter, WriterConfig},
     },
     coordinator::{
@@ -378,6 +378,7 @@ pub fn run(
             .map_err(|_| recovery("coordinator retained"))?
             .into_inner();
         let state = coordinator.state().clone();
+        let reader_checkpoint = restart_reader_checkpoint(&state, reader_checkpoint)?;
         let checkpoint = state
             .progress
             .get("source-slot")
@@ -813,9 +814,86 @@ pub fn run(
     })
 }
 
+// Receipt collection follows ordinary durable apply progress, not GC cadence.
+// Restarting behind it could require receipts that were correctly collected.
+fn restart_reader_checkpoint(
+    state: &Materialized,
+    retained: Option<ReaderCheckpoint>,
+) -> engine::Result<Option<ReaderCheckpoint>> {
+    let applied = state
+        .progress
+        .get("applied")
+        .map(|(marker, _)| engine::decode_reader_checkpoint(marker))
+        .transpose()?;
+    match (applied, retained) {
+        (Some(applied), Some(retained)) => {
+            if applied.next_mseq == retained.next_mseq && applied != retained {
+                return Err(recovery("conflicting durable reader checkpoints"));
+            }
+            Ok(Some(if applied.next_mseq >= retained.next_mseq {
+                applied
+            } else {
+                retained
+            }))
+        }
+        (Some(applied), None) => Ok(Some(applied)),
+        (None, retained) => Ok(retained),
+    }
+}
+
 #[cfg(test)]
 mod exclusion_tests {
     use super::*;
+
+    #[test]
+    fn restart_uses_durable_apply_progress_when_gc_is_absent_or_behind() {
+        let checkpoint = |n: u64| ReaderCheckpoint {
+            next_mseq: n,
+            prev_digest: [n as u8; 32],
+            last_epoch: 1,
+            last_position: Some(crate::event::Position::new("pg-test", n.to_be_bytes())),
+            last_record: Some(format::RecordBoundary {
+                source: SourceIdentity {
+                    engine: "postgres".into(),
+                    system_id: "1".into(),
+                    lineage: "1".into(),
+                    db_name: "db".into(),
+                    slot: "slot".into(),
+                },
+                chunk_rows: false,
+            }),
+            ..ReaderCheckpoint::default()
+        };
+        let applied = checkpoint(4);
+        let mut state = Materialized::default();
+        state.progress.insert(
+            "applied".into(),
+            (
+                engine::encode_reader_checkpoint(&applied).unwrap(),
+                "4".into(),
+            ),
+        );
+        for retained in [None, Some(checkpoint(2)), Some(applied.clone())] {
+            assert_eq!(
+                restart_reader_checkpoint(&state, retained).unwrap(),
+                Some(applied.clone())
+            );
+        }
+        assert_eq!(
+            restart_reader_checkpoint(&state, Some(checkpoint(5))).unwrap(),
+            Some(checkpoint(5))
+        );
+        let mut conflicting = applied.clone();
+        conflicting.prev_digest = [99; 32];
+        assert!(restart_reader_checkpoint(&state, Some(conflicting)).is_err());
+        state.progress.get_mut("applied").unwrap().0 = "corrupt".into();
+        assert!(restart_reader_checkpoint(&state, Some(checkpoint(2))).is_err());
+        state.progress.clear();
+        assert_eq!(
+            restart_reader_checkpoint(&state, Some(checkpoint(2))).unwrap(),
+            Some(checkpoint(2))
+        );
+    }
 
     #[tokio::test]
     async fn operational_coordinator_configures_exclusion_before_acquire() {

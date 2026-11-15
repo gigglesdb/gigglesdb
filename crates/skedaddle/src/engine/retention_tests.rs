@@ -854,3 +854,127 @@ async fn automatic_retention_leaves_a_gap_even_with_tiny_configured_cadence() {
     // Explicit collection remains immediately fenced, despite the deadline.
     assert!(runtime.collect_buffer_once().await.is_err());
 }
+
+#[tokio::test]
+async fn coalesced_apply_crash_replays_receipts_without_duplicate_effects() {
+    use std::sync::Mutex as StdMutex;
+    #[derive(Default)]
+    struct Receipts {
+        effects: usize,
+        saved: std::collections::BTreeMap<(u64, Vec<u8>), [u8; 32]>,
+    }
+    struct Db(Arc<StdMutex<Receipts>>);
+    #[async_trait]
+    impl Destination for Db {
+        async fn apply(
+            &mut self,
+            plan: &apply::TransactionPlan,
+        ) -> crate::pg::apply::executor::Result<CommitDecision> {
+            let mut db = self.0.lock().unwrap();
+            let key = (plan.progress.mseq, plan.progress.txn.0.clone());
+            if let Some(saved) = db.saved.get(&key) {
+                assert_eq!(*saved, plan.progress.digest);
+            } else {
+                db.saved.insert(key, plan.progress.digest);
+                db.effects += 1;
+            }
+            Ok(CommitDecision::Applied)
+        }
+        async fn retain_after_checkpoint(
+            &mut self,
+            checkpoint: &ReaderCheckpoint,
+        ) -> crate::pg::apply::executor::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .saved
+                .retain(|(mseq, _), _| *mseq >= checkpoint.next_mseq);
+            Ok(())
+        }
+    }
+    let (mut f, _, _) = buffered().await;
+    let db = Arc::new(StdMutex::new(Receipts::default()));
+    let make = |checkpoint| {
+        PgApplier::new(
+            BufferReader::new(
+                f.store.clone(),
+                f.config.clone(),
+                checkpoint,
+                Arc::new(Order),
+            )
+            .unwrap(),
+            "wal".into(),
+            Db(db.clone()),
+            planner as Planner,
+        )
+    };
+    let mut applier = make(ReaderCheckpoint::default());
+    f.engine.runtime.2.persistence.lock().unwrap().last_flush =
+        std::time::Instant::now() + Duration::from_secs(60);
+    assert!(applier.step(&f.engine.runtime).await.unwrap());
+    assert_eq!(db.lock().unwrap().effects, 1);
+    assert_eq!(
+        db.lock().unwrap().saved.len(),
+        1,
+        "speculative checkpoint must retain receipt"
+    );
+    assert!(
+        !f.journal
+            .load(false)
+            .await
+            .unwrap()
+            .progress
+            .contains_key("applied")
+    );
+    drop(applier);
+    let mut owner = Coordinator::observer(
+        f.journal.clone(),
+        Local::create(f.root.join("coalesced-crash")).unwrap(),
+        "restart",
+    )
+    .unwrap();
+    owner.acquire().await.unwrap();
+    // Discard all live state, including the pending checkpoint, as on process death.
+    f.engine = Engine::new(owner, f.journal.clone());
+    let mut applier = make(ReaderCheckpoint::default());
+    f.engine.runtime.2.persistence.lock().unwrap().last_flush =
+        std::time::Instant::now() + Duration::from_secs(60);
+    for _ in 0..3 {
+        assert!(applier.step(&f.engine.runtime).await.unwrap());
+    }
+    assert_eq!(
+        db.lock().unwrap().effects,
+        3,
+        "replayed transaction used its retained receipt"
+    );
+    f.engine.runtime.flush_progress().await.unwrap();
+    let saved = f.journal.load(false).await.unwrap();
+    let cp = decode_reader_checkpoint(&saved.progress["applied"].0).unwrap();
+    let mut restarted = make(cp);
+    assert!(!restarted.step(&f.engine.runtime).await.unwrap());
+    assert_eq!(db.lock().unwrap().effects, 3);
+}
+
+#[tokio::test]
+async fn retention_flushes_pending_restart_progress_before_proofs() {
+    let (f, _, _) = buffered().await;
+    let runtime = f.engine.runtime();
+    runtime.2.persistence.lock().unwrap().last_flush = std::time::Instant::now();
+    runtime
+        .progress_marker("buffered", "manifest-durable".into(), "41".into())
+        .await
+        .unwrap();
+    assert!(
+        !f.journal
+            .load(false)
+            .await
+            .unwrap()
+            .progress
+            .contains_key("buffered")
+    );
+    runtime.retention_tick().await.unwrap();
+    assert_eq!(
+        f.journal.load(false).await.unwrap().progress["buffered"].1,
+        "41"
+    );
+}

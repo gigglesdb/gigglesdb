@@ -136,9 +136,31 @@ pub trait Applier {
     }
 }
 
+// Process-local only. Neither Materialized nor Transition changes its wire layout.
+struct Persistence {
+    pending: std::collections::BTreeMap<String, (String, String)>,
+    updates: usize,
+    last_flush: std::time::Instant,
+    readiness: Option<(
+        crate::coordinator::readiness::ReadinessFacts,
+        std::time::Instant,
+    )>,
+}
+impl Default for Persistence {
+    fn default() -> Self {
+        Self {
+            pending: Default::default(),
+            updates: 0,
+            last_flush: std::time::Instant::now(),
+            readiness: None,
+        }
+    }
+}
+
 struct HealthHub {
     healthy: std::sync::RwLock<bool>,
     cutover: Mutex<()>,
+    persistence: std::sync::Mutex<Persistence>,
 }
 impl std::ops::Deref for HealthHub {
     type Target = std::sync::RwLock<bool>;
@@ -167,6 +189,7 @@ impl Runtime {
     }
     pub async fn commit(&self, transition: Transition) -> Result<()> {
         let mut coordinator = self.0.lock().await;
+        self.flush_progress_locked(&mut coordinator).await?;
         let result = coordinator.commit(transition).await;
         self.observe_journal_error(&coordinator, &result);
         if !coordinator.is_owner() {
@@ -178,12 +201,60 @@ impl Runtime {
     }
     pub(crate) async fn refresh_owner(&self) -> Result<()> {
         let mut coordinator = self.0.lock().await;
+        self.flush_progress_locked(&mut coordinator).await?;
         coordinator.refresh().await?;
         *self.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
         if !coordinator.is_owner() {
             return Err(coordinator::Error::LostOwnership);
         }
         Ok(())
+    }
+    // Source WAL feedback must never acknowledge a volatile buffered marker.
+    // Missing progress conservatively retains WAL at the durable slot baseline.
+    fn durable_feedback_lsn(&self, captured: u64, restored_floor: u64) -> source::Result<u64> {
+        let state = self.1.read().expect("engine snapshot poisoned");
+        let bad = || source::Error::RecoveryRequired("invalid durable capture feedback marker");
+        let durable = if let Some((_, position)) = state.progress.get("buffered") {
+            position.parse::<u64>().map_err(|_| bad())?
+        } else if let Some((marker, _)) = state.progress.get("source-slot") {
+            decode_source_checkpoint(marker)
+                .map_err(|_| bad())?
+                .durable_lsn
+        } else {
+            0
+        };
+        Ok(captured.min(durable.max(restored_floor)))
+    }
+
+    async fn progress_marker(&self, stream: &str, marker: String, position: String) -> Result<()> {
+        if matches!(stream, "applied" | "buffered") {
+            let mut coordinator = self.0.lock().await;
+            // The old per-update commit refreshed authority even when progress
+            // was diagnostic. Keep that fence check without appending an entry.
+            let refreshed = coordinator.refresh().await;
+            self.observe_journal_error(&coordinator, &refreshed);
+            *self.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+            refreshed?;
+            if !coordinator.is_owner() {
+                return Err(coordinator::Error::LostOwnership);
+            }
+            let due = {
+                let mut policy = self.2.persistence.lock().expect("persistence poisoned");
+                policy.pending.insert(stream.into(), (marker, position));
+                policy.updates += 1;
+                policy.updates >= 64 || policy.last_flush.elapsed() >= Duration::from_millis(250)
+            };
+            if due {
+                self.flush_progress_locked(&mut coordinator).await?;
+            }
+            return Ok(());
+        }
+        self.commit(Transition::Progress {
+            stream: stream.into(),
+            marker,
+            position,
+        })
+        .await
     }
     pub async fn marker(&self, stream: &str, marker: String, position: String) -> Result<()> {
         self.commit(Transition::Progress {
@@ -192,6 +263,49 @@ impl Runtime {
             position,
         })
         .await
+    }
+    /// Publish a conservative restart boundary before any consumer relies on it.
+    pub(crate) async fn flush_progress(&self) -> Result<()> {
+        let mut coordinator = self.0.lock().await;
+        self.flush_progress_locked(&mut coordinator).await
+    }
+    async fn flush_progress_locked(&self, coordinator: &mut Coordinator) -> Result<()> {
+        let pending = self
+            .2
+            .persistence
+            .lock()
+            .expect("persistence poisoned")
+            .pending
+            .clone();
+        for (stream, (marker, position)) in pending {
+            let result = coordinator
+                .commit(Transition::Progress {
+                    stream: stream.clone(),
+                    marker,
+                    position,
+                })
+                .await;
+            self.observe_journal_error(coordinator, &result);
+            *self.1.write().expect("engine snapshot poisoned") = coordinator.state().clone();
+            result?;
+            if stream == "applied" {
+                let checkpoint =
+                    decode_reader_checkpoint(&coordinator.state().progress["applied"].0)?;
+                if let Some(position) = &checkpoint.last_position {
+                    self.6.applied(position, &checkpoint);
+                }
+            }
+            self.2
+                .persistence
+                .lock()
+                .expect("persistence poisoned")
+                .pending
+                .remove(&stream);
+        }
+        let mut policy = self.2.persistence.lock().expect("persistence poisoned");
+        policy.updates = 0;
+        policy.last_flush = std::time::Instant::now();
+        Ok(())
     }
     async fn lifecycle(&self, event: Event) -> Result<()> {
         self.commit(Transition::Lifecycle { event }).await
@@ -254,6 +368,7 @@ impl Engine {
                 Arc::new(HealthHub {
                     healthy: std::sync::RwLock::new(false),
                     cutover: Mutex::new(()),
+                    persistence: std::sync::Mutex::new(Persistence::default()),
                 }),
                 Arc::new(Mutex::new(None)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -731,6 +846,7 @@ impl Engine {
     }
     async fn interrupt_run(&self, to: State, reason: String) -> Result<()> {
         let mut coordinator = self.runtime.0.lock().await;
+        self.runtime.flush_progress_locked(&mut coordinator).await?;
         // A cutover may fence after the post-join snapshot was sampled. Check
         // under the same lock as the interrupt instead of attempting an illegal
         // Paused/RecoveryRequired edge from the newly fenced lifecycle.
@@ -778,6 +894,7 @@ impl Engine {
         result.map(|_| ())
     }
     async fn reached(&self, stop_at: StopAt, target: bool) -> Result<Reached> {
+        self.runtime.flush_progress().await?;
         let sample = self
             .readiness_source
             .as_ref()
@@ -998,8 +1115,15 @@ fn capture_loop(
             runtime.queue_writer(checkpoint).await;
             if let Some(lsn) = batch.durable_lsn {
                 runtime
-                    .marker("buffered", "manifest-durable".into(), lsn.to_string())
+                    .progress_marker("buffered", "manifest-durable".into(), lsn.to_string())
                     .await?;
+            }
+            if batch
+                .transaction
+                .as_ref()
+                .is_some_and(|txn| final_marker::transaction_marker(txn).is_ok_and(|m| m.is_some()))
+            {
+                runtime.flush_progress().await?;
             }
             if batch.stop {
                 return Err(recovery("capture reached unsupported DDL safe boundary"));
@@ -1256,6 +1380,17 @@ fn apply_loop(
                 .operational_schema
                 .require_clear()
                 .map_err(recovery)?;
+            if runtime
+                .2
+                .persistence
+                .lock()
+                .expect("persistence poisoned")
+                .last_flush
+                .elapsed()
+                >= Duration::from_millis(250)
+            {
+                runtime.flush_progress().await?;
+            }
             runtime.automatic_retention_tick().await?;
             if !applier.controlled_step(runtime, cancel.clone()).await? {
                 tokio::select! {

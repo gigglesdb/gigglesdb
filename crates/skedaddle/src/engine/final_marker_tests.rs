@@ -249,7 +249,25 @@ async fn actual_manifest_durability_and_exact_reader_boundary_gate_receipts() {
         .unwrap();
     assert!(progress.receipt(&marker(), false).unwrap().is_none());
     fixture.writer.seal().await.unwrap();
+    fixture
+        .engine
+        .runtime
+        .2
+        .persistence
+        .lock()
+        .unwrap()
+        .last_flush = Instant::now();
+    fixture
+        .engine
+        .runtime
+        .progress_marker("buffered", "manifest-durable".into(), "1000000".into())
+        .await
+        .unwrap();
     fixture.buffered().await;
+    assert_eq!(
+        fixture.engine.runtime.snapshot().progress["buffered"].1,
+        "1000000"
+    );
     let buffered = progress.receipt(&marker(), false).unwrap().unwrap();
     assert_eq!(buffered.marker().lsn, 15);
     assert_eq!(buffered.commit_lsn, 20);

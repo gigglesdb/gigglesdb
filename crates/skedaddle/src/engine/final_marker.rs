@@ -539,6 +539,7 @@ impl Runtime {
         Ok(receipt)
     }
     async fn persist_final_receipt(&self, receipt: FinalMarkerReceipt) -> super::Result<()> {
+        self.flush_progress().await?;
         let applied = receipt.checkpoint.is_some();
         let mut coordinator = self.0.lock().await;
         let binding = self.6.markers.binding().map_err(recovery)?;

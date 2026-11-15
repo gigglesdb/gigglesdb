@@ -653,6 +653,18 @@ fn copy_table(
             "live-engine",
         )?;
         coordinator.acquire().await?;
+        if readiness {
+            // The live schema probe reads its scope from the durable definition.
+            let example = include_str!("../README.md").split("```json").nth(1)
+                .ok_or("definition example absent")?.split("```").next()
+                .ok_or("definition example end absent")?;
+            let mut value: serde_json::Value = serde_json::from_str(example)?;
+            value["selected_objects"] = serde_json::json!([{"schema":id,"name":"rows","kind":"table"}]);
+            value["buffer"]["backend"] = serde_json::json!({"type":"local-fs","options":{"path":root.join("buffer")}});
+            coordinator.commit(Transition::Define {
+                definition: Box::new(skedaddle::MigrationDefinition::from_json(&value.to_string())?),
+            }).await?;
+        }
         coordinator
             .commit(Transition::Lifecycle {
                 event: Event::Advance {
@@ -747,6 +759,10 @@ fn copy_table(
             tables: vec![catalog(&id)],
         };
         let tables = vec![apply_table(&id)];
+        // apply_progress/receipts are keyed by stream in a shared destination.
+        // Each migration (including the partial-copy child) needs its own key.
+        let apply_stream = serde_json::json!(["engine", id, "wal"]).to_string();
+        let plan_stream = apply_stream.clone();
         let plan_origin = origin.clone();
         let plan_installation = id.clone();
         let internal_plans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -768,7 +784,7 @@ fn copy_table(
                 txn,
                 &tables,
                 &apply::PlanContext {
-                    stream: "wal".into(),
+                    stream: plan_stream.clone(),
                     mseq,
                     origin: plan_origin.clone(),
                     synthetic_commit_time: Some(0),
@@ -794,14 +810,14 @@ fn copy_table(
                 dsn: destination_admin.into(),
                 ca: ca.into(),
             },
-            "wal".into(),
+            apply_stream.clone(),
             origin.clone(),
             1000,
         )?;
         let (apply_gate, gated) = tokio::sync::watch::channel(false);
         let applier = PgApplier::new(
             BufferReader::new(store.clone(), reader_config.clone(), ReaderCheckpoint::default(), order.clone())?,
-            "wal".into(),
+            apply_stream.clone(),
             GatedDestination {
                 destination: executor,
                 gate: gated,
@@ -1086,7 +1102,7 @@ fn copy_table(
             let mut capture = PgCapture::new(raw, transport, admission, journal_objects, serde_json::json!(["engine", id, "wal"]).to_string());
             let reader_checkpoint = state.progress.get("applied").map(|(m, _)| engine::decode_reader_checkpoint(m)).transpose()?.unwrap_or_default();
             let inner = applier.inner;
-            let mut applier = PgApplier::new(BufferReader::new(store, reader_config, reader_checkpoint, order)?, "wal".into(), inner.destination, inner.plan);
+            let mut applier = PgApplier::new(BufferReader::new(store, reader_config, reader_checkpoint, order)?, apply_stream.clone(), inner.destination, inner.plan);
             let runtime = engine.runtime();
             let key = cutover::Key { migration: id.clone(), cutover: id.clone(), epoch: state.epoch.try_into()?, coordinator: state.owner };
             let (pause, paused) = tokio::sync::watch::channel(false);
@@ -1153,8 +1169,8 @@ fn copy_table(
             );
             // UUID-scoped directories remain independent at test-threads=8.
             // Scan the actual raw buffer and coordinator journal files.
-            assert!(assert_no_sentinel(&root.join("buffer"))? > 0);
-            assert_no_sentinel(&root)?;
+            // Scan after closing the coordinator/capture handles below: Local's
+            // Windows locks intentionally prevent reading its live files.
         }
         let readiness = engine.evaluate_readiness().await?;
         assert!(readiness.all_chunks_done);
@@ -1181,6 +1197,15 @@ fn copy_table(
             assert!(engine.runtime().retention_status().await.is_none());
         }
         applier.inner.destination.destination.close().await?;
+        if partial {
+            drop(applier.inner.reader);
+            drop(capture);
+            drop(chunks);
+            drop(runtime);
+            drop(engine);
+            assert!(assert_no_sentinel(&root.join("buffer"))? > 0);
+            assert_no_sentinel(&root)?;
+        }
         TestResult::Ok(())
     }))
     .catch_unwind()

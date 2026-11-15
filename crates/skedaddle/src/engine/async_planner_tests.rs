@@ -120,6 +120,7 @@ async fn pause_during_planning_joins_drops_future_and_restart_retries_record() {
     let mut restarted = f.applier(count.clone(), ReaderCheckpoint::default());
     assert!(restarted.step(&f.engine.runtime()).await.unwrap());
     assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+    f.engine.runtime().flush_progress().await.unwrap();
     assert!(
         f.journal
             .load(false)
