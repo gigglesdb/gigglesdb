@@ -106,24 +106,59 @@ fn reserved(s: &str) -> bool {
     ]
     .contains(&s)
 }
-/// Whether text is an INSERT, or a transaction block containing one, which
-/// SQL also bounds by statement bytes and flat tuples. Node, item and
-/// serialized-tree budgets still bound everything else in a block.
-fn insert_text(s: &str) -> bool {
+/// Text budget class. An INSERT, or a transaction block with an INSERT step,
+/// is bounded as SQL bounds a statement (bytes and flat tuples); node, item
+/// and serialized-tree budgets still bound everything else in a block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextBudget {
+    /// MAX_INPUT bytes and MAX_TOKENS tokens, as before INSERT budgets.
+    Base,
+    /// Text that starts with the `insert` keyword.
+    Insert,
+    /// A `transaction` block: the INSERT budget applies only once an
+    /// `insert` keyword token starts a step (see `insert_step`). Until then
+    /// the base budgets hold, so a literal or identifier containing
+    /// "insert" never lifts them.
+    Transaction,
+}
+fn text_budget(s: &str) -> TextBudget {
     let t = s.trim_start().as_bytes();
     let word = |w: &[u8]| t.len() > w.len() && t[..w.len()].eq_ignore_ascii_case(w)
         && (t[w.len()].is_ascii_whitespace() || t[w.len()] == b'{');
-    word(b"insert")
-        || (word(b"transaction") && t.windows(6).any(|w| w.eq_ignore_ascii_case(b"insert")))
+    if word(b"insert") {
+        TextBudget::Insert
+    } else if word(b"transaction") {
+        TextBudget::Transaction
+    } else {
+        TextBudget::Base
+    }
+}
+/// Whether the last token is an `insert` keyword that starts a block step:
+/// after `{` or `;`, or as `let name = (insert ...)`.
+fn insert_step(out: &[(Token, usize)]) -> bool {
+    match out {
+        [.., (before, _), (Token::Word(word), _)] if word.eq_ignore_ascii_case("insert") => {
+            matches!(before, Token::Symbol('{' | ';'))
+                || (matches!(before, Token::Symbol('('))
+                    && matches!(out.get(out.len().wrapping_sub(3)), Some((Token::Op(Compare::Eq), _))))
+        }
+        _ => false,
+    }
 }
 fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
-    let insert = insert_text(s);
-    let (max_input, max_tokens) = if insert {
-        (MAX_INSERT_INPUT.max(MAX_INPUT), MAX_INSERT_TOKENS)
-    } else {
-        (MAX_INPUT, MAX_TOKENS)
-    };
-    if s.len() > max_input {
+    let mut budget = text_budget(s);
+    let lexed = lex_within(s, version, &mut budget);
+    // A block whose text exceeds MAX_INPUT without an INSERT step is refused
+    // with Limit before anything else, exactly as before INSERT budgets.
+    if budget == TextBudget::Transaction && s.len() > MAX_INPUT {
+        return Err(Error::Limit);
+    }
+    lexed
+}
+fn lex_within(s: &str, version: LanguageVersion, budget: &mut TextBudget) -> Result<Vec<(Token, usize)>> {
+    if (*budget == TextBudget::Base && s.len() > MAX_INPUT)
+        || s.len() > MAX_INSERT_INPUT.max(MAX_INPUT)
+    {
         return Err(Error::Limit);
     }
     let b = s.as_bytes();
@@ -282,6 +317,10 @@ fn lex(s: &str, version: LanguageVersion) -> Result<Vec<(Token, usize)>> {
             _ => return Err(Error::Syntax { offset: start }),
         };
         out.push((t, start));
+        if *budget == TextBudget::Transaction && insert_step(&out) {
+            *budget = TextBudget::Insert;
+        }
+        let max_tokens = if *budget == TextBudget::Insert { MAX_INSERT_TOKENS } else { MAX_TOKENS };
         if out.len() > max_tokens {
             return Err(Error::Limit);
         }
@@ -388,16 +427,33 @@ impl Parser {
     fn expr(&mut self, depth: usize) -> Result<Expr> {
         self.or(depth)
     }
+    /// Left-deep operator chains (`or`, `and`, `+`, `*`, ...) grow the tree
+    /// by one level per operator without recursion. Text beyond MAX_TOKENS
+    /// (INSERT text) could otherwise build a chain deep enough to overflow
+    /// the stack when it is dropped. A chain longer than MAX_DEPTH already
+    /// fails validate_depth, so it is refused here with the same Limit.
+    /// Within MAX_TOKENS the old behaviour (and error order) is unchanged.
+    fn chain(&self, links: &mut usize) -> Result<()> {
+        *links += 1;
+        if *links > MAX_DEPTH && self.tokens.len() > MAX_TOKENS {
+            return Err(Error::Limit);
+        }
+        Ok(())
+    }
     fn or(&mut self, d: usize) -> Result<Expr> {
         let mut e = self.and(d)?;
+        let mut links = 0;
         while self.word("or") {
+            self.chain(&mut links)?;
             e = Expr::Or(Box::new(e), Box::new(self.and(d + 1)?))
         }
         Ok(e)
     }
     fn and(&mut self, d: usize) -> Result<Expr> {
         let mut e = self.not(d)?;
+        let mut links = 0;
         while self.word("and") {
+            self.chain(&mut links)?;
             e = Expr::And(Box::new(e), Box::new(self.not(d + 1)?))
         }
         Ok(e)
@@ -446,6 +502,7 @@ impl Parser {
     }
     fn sum(&mut self, d: usize) -> Result<Expr> {
         let mut e = self.product(d)?;
+        let mut links = 0;
         loop {
             let op = if self.symbol('+') {
                 Arithmetic::Add
@@ -454,12 +511,14 @@ impl Parser {
             } else {
                 break;
             };
+            self.chain(&mut links)?;
             e = Expr::Arithmetic(Box::new(e), op, Box::new(self.product(d + 1)?));
         }
         Ok(e)
     }
     fn product(&mut self, d: usize) -> Result<Expr> {
         let mut e = self.unary(d)?;
+        let mut links = 0;
         loop {
             let op = if self.symbol('*') {
                 Arithmetic::Multiply
@@ -470,6 +529,7 @@ impl Parser {
             } else {
                 break;
             };
+            self.chain(&mut links)?;
             e = Expr::Arithmetic(Box::new(e), op, Box::new(self.unary(d + 1)?));
         }
         Ok(e)
@@ -1175,7 +1235,9 @@ impl Parser {
         if d > MAX_DEPTH { return Err(Error::Limit); }
         if level < 2 {
             let mut predicate = self.query_predicate(d, level + 1)?;
+            let mut links = 0;
             while self.word(if level == 0 { "or" } else { "and" }) {
+                self.chain(&mut links)?;
                 let right = self.query_predicate(d + 1, level + 1)?;
                 predicate = if level == 0 { QueryPredicate::Or(Box::new(predicate), Box::new(right)) }
                     else { QueryPredicate::And(Box::new(predicate), Box::new(right)) };

@@ -1327,9 +1327,10 @@ fn validate_expression_version(mut pending: Vec<&Expr>, version: LanguageVersion
 // Enforce the existing serialized-AST bound without allocating an unbounded
 // temporary buffer for a caller-supplied string or vector.
 pub(crate) fn validate_size(stmt: &impl serde::Serialize) -> Result<()> {
-    validate_size_within(stmt, MAX_INPUT)
+    validate_size_within(stmt, MAX_INPUT).map(drop)
 }
-fn validate_size_within(stmt: &impl serde::Serialize, budget: usize) -> Result<()> {
+/// The serialized size of `stmt`, or Limit once it exceeds `budget`.
+fn validate_size_within(stmt: &impl serde::Serialize, budget: usize) -> Result<usize> {
     struct Budget(usize);
     impl Write for Budget {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1343,7 +1344,9 @@ fn validate_size_within(stmt: &impl serde::Serialize, budget: usize) -> Result<(
             Ok(())
         }
     }
-    serde_json::to_writer(Budget(budget), stmt).map_err(|_| Error::Limit)
+    let mut left = Budget(budget);
+    serde_json::to_writer(&mut left, stmt).map_err(|_| Error::Limit)?;
+    Ok(budget - left.0)
 }
 
 fn validate_native_value(value: &ValueExpr, version: LanguageVersion) -> Result<()> {
@@ -1562,11 +1565,17 @@ pub(crate) fn validate_transaction(
             }
         }
     }
-    // INSERT MANY in a block keeps that statement's tree bound (see lower_checked).
-    let insert_many = transaction.steps.iter().any(|step| matches!(step,
-        TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. }
-            if matches!(statement_parts(statement).map(|p| p.statement), Ok(Statement::InsertMany { .. }))));
-    validate_size_within(transaction, if insert_many { MAX_INSERT_TREE_BYTES } else { MAX_INPUT })
+    // Each INSERT MANY step keeps a single statement's tree bound (see
+    // lower_checked); its bytes do not raise the bound of the other steps.
+    let mut inserts = 0usize;
+    for step in &transaction.steps {
+        if let TransactionStep::Execute(statement) | TransactionStep::Let { statement, .. } = step
+            && matches!(statement_parts(statement)?.statement, Statement::InsertMany { .. })
+        {
+            inserts = inserts.saturating_add(validate_size_within(step, MAX_INSERT_TREE_BYTES)?);
+        }
+    }
+    validate_size_within(transaction, MAX_INPUT.saturating_add(inserts)).map(drop)
 }
 pub(crate) fn lower_transaction_checked(
     transaction: &Transaction,

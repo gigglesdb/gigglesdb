@@ -720,10 +720,16 @@ that fit `usize`; output still defaults to 100. V2 explain reports
 first stage: `PrimaryKeyLookup` (the filter fixes the full primary key with
 literals of bool, integer, text, uuid, bytes or numeric keys),
 `StreamingFilter` (rows stream through the filter and only matching rows are
-retained) or `StreamingCompleteTableMaterialization` (no filter). V2 inserts and
+retained) or `StreamingCompleteTableMaterialization` (no filter). A V2 read
+retains only its top `limit` matching rows while counting every match; a V2
+update/delete with `one` or `many N` retains at most 2 or N+1 matches (every row
+is still filtered). V2 inserts and
 upserts read only the existing rows that share a proposed primary key. Filter/order evaluation still materializes complete input in memory;
 byte budgets and the 2 MiB once receipt remain (V2 once counts past 1,024 use
-GDOU version 2 and feature bit 19, `wide_once_receipts`); V2 mutations use the same input. Limits also report the Admin admission/selected-key
+GDOU version 2 and feature bit 19, `wide_once_receipts`); V2 mutations use the same input.
+Bit 19 is permanent, like the other monotone feature bits: it stays set after
+the last version 2 receipt expires, so a single once write past 1,024 rows makes
+the database unopenable by binaries that predate bit 19 (no downgrade). Limits also report the Admin admission/selected-key
 configuration and engine byte/expression/binding ceilings.
 
 Explain itself borrows committed catalog metadata and does not call `run`,

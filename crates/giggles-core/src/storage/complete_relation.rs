@@ -26,10 +26,22 @@ thread_local! {
     static NATIVE_INPUT_ROWS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-/// Rows decoded and rows retained by native v2 filtered complete input on
-/// this thread since it started. Instrumentation for tests and diagnostics.
+/// Rows decoded and rows retained (handed to native evaluation) by native v2
+/// filtered and keyed input on this thread since it started. Diagnostics
+/// only: two thread-local counter updates per call, no behaviour depends on
+/// it. It is public because integration tests in other crates assert it.
 pub fn native_input_rows() -> (u64, u64) {
     NATIVE_INPUT_ROWS.with(|n| n.get())
+}
+
+/// Reorders retained rows before the tail past a bound is released.
+pub(crate) type Reorder<'a> = dyn FnMut(&mut Vec<SqlRow>) + 'a;
+
+/// Logical bytes a retained native input row is charged.
+fn retained_bytes(row: &SqlRow) -> usize {
+    row.values.iter().fold(std::mem::size_of::<SqlRow>(), |bytes, value| {
+        bytes.saturating_add(std::mem::size_of_val(value) + crate::relational::value_bytes(value))
+    })
 }
 
 impl SqlSession {
@@ -71,13 +83,21 @@ impl SqlSession {
     /// budget applies to the matching set. With `key`, the full primary key is
     /// read directly instead of scanning the table. The caller must re-apply
     /// its filter: the relation is complete only with respect to `keep`.
+    ///
+    /// `bound` keeps at most `limit` rows: whenever the retained set reaches
+    /// twice that, `order` stably reorders it and the tail is released. A
+    /// stable order of the whole set followed by `limit` rows keeps exactly
+    /// these rows, so the caller's result is unchanged. `usize::MAX` keeps all.
     pub(crate) fn complete_read_table_where<E>(
         &mut self,
         table: &TableDef,
         key: Option<&[crate::relational::Value]>,
         keep: &mut impl FnMut(&SqlRow) -> Result<bool, E>,
+        bound: (usize, &mut Reorder<'_>),
         map: fn(CoreError) -> E,
     ) -> Result<CompleteRelation, E> {
+        let (limit, order) = bound;
+        let threshold = limit.saturating_mul(2).max(64);
         let result = (|| {
             if !self.is_v2_engine() {
                 return Err(map(CoreError::Sql(SqlError::Unsupported)));
@@ -92,19 +112,25 @@ impl SqlSession {
                 if !keep(row)? {
                     return Ok(());
                 }
-                NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + 1)));
-                let mut charge = |bytes| retained.charge(bytes).map_err(|e| map(CoreError::Sql(e)));
-                charge(std::mem::size_of::<SqlRow>())?;
-                for value in &row.values {
-                    charge(std::mem::size_of_val(value) + crate::relational::value_bytes(value))?;
-                }
+                retained.charge(retained_bytes(row)).map_err(|e| map(CoreError::Sql(e)))?;
                 rows.push(row.clone());
+                if rows.len() >= threshold {
+                    order(&mut rows);
+                    for dropped in rows.drain(limit..) {
+                        retained.release(retained_bytes(&dropped));
+                    }
+                }
                 Ok(())
             };
             match key {
                 Some(key) => self.visit_native_key(table, key, &mut visit, map)?,
                 None => self.visit_native_page(table, &mut visit, map)?,
             }
+            if rows.len() > limit {
+                order(&mut rows);
+                rows.truncate(limit);
+            }
+            NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0, n.get().1 + rows.len() as u64)));
             Ok(CompleteRelation { snapshot, rows })
         })();
         if result.is_err() {
@@ -133,18 +159,42 @@ impl SqlSession {
     }
 
     /// The existing V2 rows with these full primary keys, read by key lookup
-    /// in the statement snapshot. Missing keys contribute no row.
+    /// in the statement snapshot. Missing keys contribute no row. One
+    /// snapshot check before and after the batch fences every lookup, so the
+    /// cost is O(keys), not O(keys x catalog).
     pub(crate) fn native_key_rows(
         &mut self,
         table: &TableDef,
         keys: impl IntoIterator<Item = Vec<crate::relational::Value>>,
     ) -> Result<Vec<SqlRow>, CoreError> {
-        let mut rows = Vec::new();
-        for key in keys {
-            let input = self.complete_read_table_where(table, Some(&key), &mut |_| Ok(true), |e| e)?;
-            rows.extend(self.consume_complete_engine(input, table)?);
+        let result = (|| {
+            if !self.is_v2_engine() {
+                return Err(CoreError::Sql(SqlError::Unsupported));
+            }
+            let snapshot = self.complete_snapshot(table)?;
+            let mut rows: Vec<SqlRow> = Vec::new();
+            #[cfg(feature = "engine-rocksdb")]
+            if let super::Backend::V2(db) = &self.admin.inner.backend {
+                let db = db.clone();
+                for key in keys {
+                    self.visit_native_key_v2(&db, table, &key, &mut |row: &SqlRow| {
+                        NATIVE_INPUT_ROWS.with(|n| n.set((n.get().0 + 1, n.get().1 + 1)));
+                        rows.push(row.clone());
+                        Ok(())
+                    }, |e| e)?;
+                }
+                if self.complete_snapshot(table)? != snapshot {
+                    return Err(CoreError::Sql(SqlError::StaleSchema));
+                }
+                return Ok(rows);
+            }
+            let _ = (keys, &mut rows, snapshot);
+            Err(CoreError::Sql(SqlError::Unsupported))
+        })();
+        if result.is_err() {
+            self.abort();
         }
-        Ok(rows)
+        result
     }
 
     /// Visit the row with this full primary key, if any, in the statement snapshot.

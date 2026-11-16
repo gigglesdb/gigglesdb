@@ -472,7 +472,7 @@ impl Engine {
     }
     /// Bind and execute one bounded request in its own transaction.
     pub fn execute(&self, request: &Request, bindings: &Bindings) -> Result<Outcome> {
-        validate_request(request)?;
+        validate_request(request, Admission::engine(self.admin.engine() == crate::Engine::V2))?;
         validate_bindings(bindings)?;
         self.execute_operation(|session| bind_request(session, request, bindings))
     }
@@ -481,7 +481,7 @@ impl Engine {
     /// row scan or durable decision. Snapshot creation still clones bounded state.
     /// This is not a parameter template.
     pub fn prepare_bound(&self, request: &Request, bindings: &Bindings) -> Result<BoundOperation> {
-        validate_request(request)?;
+        validate_request(request, Admission::engine(self.admin.engine() == crate::Engine::V2))?;
         validate_bindings(bindings)?;
         let mut session = self.admin.sql_session();
         session.begin_engine().map_err(core)?;
@@ -566,7 +566,7 @@ impl SqlSession {
         if self.is_aborted() { return Err(core(CoreError::Sql(SqlError::Aborted))); }
         let owned = !self.in_transaction();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            validate_request(request)?;
+            validate_request(request, Admission::engine(self.is_v2_engine()))?;
             validate_bindings(bindings)?;
             if !matches!(request, Request::Read { .. }) { return Err(Error::Unsupported); }
             if owned { self.begin_engine().map_err(core)?; }
@@ -666,9 +666,31 @@ fn page_compare(a: &Value, b: &Value) -> Ordering {
         _ => compare(a, b),
     }
 }
-fn validate_request(request: &Request) -> Result<()> {
-    validate_depth(request)?;
-    if matches!(request.parts()?.body, Request::InsertMany { .. }) {
+/// INSERT MANY admission before binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Admission {
+    /// The pre-R2-NOCAP rules: MAX_INSERT_ROWS tuples, one aggregate
+    /// expression-node budget and MAX_INPUT serialized bytes. Once intents
+    /// keep them on every engine: the V1 intent codec inherits these rules
+    /// (see intent.rs), and changing them needs a codec decision.
+    Base,
+    /// Legacy engine: the Base row and node budgets; INSERT MANY requests
+    /// (and their transaction steps) may serialize up to
+    /// MAX_INSERT_REQUEST_BYTES, so 1,024-tuple literal text is accepted
+    /// (R2-NOCAP-3).
+    Legacy,
+    /// V2: no row bound; each flat tuple has its own node budget, as SQL
+    /// VALUES; proposed bytes are admitted at bind.
+    V2,
+}
+impl Admission {
+    pub(super) fn engine(v2: bool) -> Self {
+        if v2 { Self::V2 } else { Self::Legacy }
+    }
+}
+fn validate_request(request: &Request, admission: Admission) -> Result<()> {
+    validate_request_nodes(request, &mut 0, admission == Admission::V2)?;
+    if admission != Admission::Base && matches!(request.parts()?.body, Request::InsertMany { .. }) {
         validate_size_within(request, MAX_INSERT_REQUEST_BYTES)?;
     } else {
         validate_size(request)?;
@@ -768,9 +790,10 @@ fn identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
 fn validate_size(request: &impl Serialize) -> Result<()> {
-    validate_size_within(request, MAX_INPUT)
+    validate_size_within(request, MAX_INPUT).map(drop)
 }
-fn validate_size_within(request: &impl Serialize, budget: usize) -> Result<()> {
+/// The serialized size of `request`, or Limit once it exceeds `budget`.
+fn validate_size_within(request: &impl Serialize, budget: usize) -> Result<usize> {
     // Preserve the serialized request limit without allocating a serialized
     // copy of an oversized caller-owned literal or assignment collection.
     struct Counter(usize, usize);
@@ -786,12 +809,11 @@ fn validate_size_within(request: &impl Serialize, budget: usize) -> Result<()> {
             Ok(())
         }
     }
-    serde_json::to_writer(Counter(0, budget), request).map_err(|_| Error::Limit)
+    let mut counter = Counter(0, budget);
+    serde_json::to_writer(&mut counter, request).map_err(|_| Error::Limit)?;
+    Ok(counter.0)
 }
-pub(crate) fn validate_depth(stmt: &Request) -> Result<()> {
-    validate_request_nodes(stmt, &mut 0)
-}
-fn validate_request_nodes(stmt: &Request, nodes: &mut usize) -> Result<()> {
+fn validate_request_nodes(stmt: &Request, nodes: &mut usize, v2: bool) -> Result<()> {
     let RequestParts {
         body: stmt,
         returning,
@@ -815,8 +837,20 @@ fn validate_request_nodes(stmt: &Request, nodes: &mut usize) -> Result<()> {
                 pending.push((e, 0))
             }
         }
+        Request::InsertMany { columns, rows, .. } if !v2 => {
+            validate_insert_shape(columns, rows, MAX_INSERT_ROWS)?;
+            let roots = rows
+                .len()
+                .checked_mul(columns.len())
+                .and_then(|count| count.checked_add(pending.len()))
+                .ok_or(Error::Limit)?;
+            if roots > MAX_EXPRESSION_NODES.saturating_sub(*nodes) {
+                return Err(Error::Limit);
+            }
+            pending.extend(rows.iter().flatten().map(|expression| (expression, 0)));
+        }
         Request::InsertMany { columns, rows, .. } => {
-            // Row counts are engine-specific and checked at bind time.
+            // V2 row counts are unbounded; proposed bytes are admitted at bind.
             validate_insert_shape(columns, rows, usize::MAX)?;
             // Tuples are flat, as SQL VALUES: each has its own node budget.
             for row in rows {
@@ -1589,10 +1623,13 @@ impl Binder<'_> {
                 columns, rows, cap, ..
             } => {
                 validate_insert_shape(columns, rows, self.row_limit)?;
+                // V2 tuple literals are data, as SQL VALUES: they also share the
+                // proposed-row budget. That extra budget is spent first and only
+                // by these tuples; the base budget is restored afterwards, so
+                // later clauses and transaction steps never inherit it.
+                let base = self.remaining_value_bytes;
                 if self.row_limit > MAX_ROWS {
-                    // V2 tuple literals are data, as SQL VALUES: they share the
-                    // proposed-row budget instead of the per-row binding budget.
-                    self.remaining_value_bytes = self.remaining_value_bytes
+                    self.remaining_value_bytes = base
                         .saturating_add(MAX_INSERT_BYTES.saturating_sub(MAX_BOUND_VALUE_BYTES));
                 }
                 self.insert_targets(columns.iter().map(String::as_str))?;
@@ -1630,6 +1667,7 @@ impl Binder<'_> {
                     }
                     bound_rows.push(bound_row);
                 }
+                self.remaining_value_bytes = self.remaining_value_bytes.min(base);
                 Operation::InsertMany {
                     columns: indexes,
                     rows: bound_rows,
@@ -2246,7 +2284,13 @@ fn read_rows<C: Context>(
                 .iter()
                 .map(|i| t.columns[*i].name.clone())
                 .collect();
-            let mut remaining = crate::relational::MAX_RESULT_BYTES;
+            // V2 has no row ceiling, so its page is bounded by result bytes;
+            // legacy keeps its row-bounded behaviour unchanged.
+            let mut remaining = if s.max_read_rows() > MAX_ROWS {
+                crate::relational::MAX_RESULT_BYTES
+            } else {
+                usize::MAX
+            };
             for row in rows.iter().take(limit) {
                 s.checkpoint().map_err(core)?;
                 for index in &projection {
@@ -2349,9 +2393,37 @@ fn run_complete(
         let mut filter = filter.clone();
         filter.coerce_equality(session, table)?;
         let key = primary_key_point(table, &filter);
+        // Only the rows the result can depend on are retained. A read keeps
+        // its top `limit` rows (it counts every match); a write with a
+        // cardinality cap keeps one row past it, which run reports as
+        // TooManyMatches or AmbiguousMatch; a claim keeps its first row.
+        // Every row is still filtered, so filter errors surface as before.
+        let (limit, order) = match &operation {
+            Operation::Read { limit, order, .. } => (*limit, order.clone()),
+            Operation::Mutate { selection: Selection::One, .. } => (2, Vec::new()),
+            Operation::Mutate { selection: Selection::Many(cap), .. } => (cap.saturating_add(1), Vec::new()),
+            Operation::Mutate { selection: Selection::Claim(order), .. } => (1, order.clone()),
+            _ => (usize::MAX, Vec::new()),
+        };
+        let mut matched = 0usize;
         let input = session.complete_read_table_where(
-            table, key.as_deref(), &mut |row| filter.accepts(row), input_error)?;
-        return run(session, table, operation, input, retained);
+            table,
+            key.as_deref(),
+            &mut |row| {
+                let accepted = filter.accepts(row)?;
+                matched += usize::from(accepted);
+                Ok(accepted)
+            },
+            (limit, &mut |rows| sort(rows, &order)),
+            input_error,
+        )?;
+        let read = matches!(operation, Operation::Read { .. });
+        let mut outcome = run(session, table, operation, input, retained)?;
+        if read {
+            outcome.complete = matched <= limit;
+            outcome.matched = matched;
+        }
+        return Ok(outcome);
     }
     // V2 inserts and upserts read only the keys they propose (insert_many and
     // upsert look them up); a single insert relies on the write path's

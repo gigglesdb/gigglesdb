@@ -947,6 +947,11 @@ impl<'a> Reader<'a> {
     fn count(&mut self) -> Checked<usize> {
         self.count_or_none(false)?.ok_or(Fault::Invalid)
     }
+    /// Bound a row-vector reservation by the bytes actually present: every
+    /// row is a u64 version plus at least one value byte (arity >= 1).
+    fn rows_present(&self, rows: usize) -> Checked<()> {
+        invalid(rows.saturating_mul(9) <= self.bytes.len() - self.offset)
+    }
     fn u32(&mut self) -> Checked<usize> {
         usize::try_from(u32::from_be_bytes(
             self.take(4)?.try_into().map_err(|_| Fault::Invalid)?,
@@ -1241,6 +1246,7 @@ impl<'a> Reader<'a> {
         }
         let row_count = self.count()?;
         invalid((self.wide || row_count <= MAX_ROWS) && row_count <= counts.matched)?;
+        self.rows_present(row_count)?;
         let mut rows = vector(self.build, row_count)?;
         for _ in 0..row_count {
             let row = self.row(len, Some(&expected))?;
@@ -1323,6 +1329,7 @@ impl<'a> Reader<'a> {
                     let len = self.count()?;
                     invalid(self.wide || len <= MAX_ROWS)?;
                     let complete = self.boolean()?;
+                    self.rows_present(len)?;
                     let mut rows = vector(self.build, len)?;
                     for _ in 0..len {
                         let row = self.row(columns.len, Some(&columns))?;
@@ -2495,5 +2502,30 @@ mod tests {
         duplicate[row..row + 4].copy_from_slice(&0u32.to_be_bytes());
         bad(&duplicate);
         bad(&[b"GDOU\x03".as_slice(), &bytes[5..]].concat());
+    }
+
+    #[test]
+    fn row_counts_beyond_the_present_bytes_fail_before_reservation() {
+        // Emitted Rows: count 1500 then the complete flag. Claim u32::MAX - 1
+        // rows: the building reader refuses it as Invalid by the bytes left,
+        // instead of first trying to reserve ~4G rows (Bound).
+        let rows = EmittedValue::Rows {
+            columns: vec![column("n", DataType::BigInt, false)],
+            rows: vec![SqlRow { version: 0, values: vec![Value::Int(1)] }; 1500],
+            complete: true,
+        };
+        let bytes = wide(&transaction(vec![rows]));
+        let at = bytes.windows(5).position(|w| w == [0, 0, 5, 0xdc, 1]).unwrap();
+        let mut corrupt = bytes[..at + 5].to_vec();
+        corrupt[at..at + 4].copy_from_slice(&(u32::MAX - 1).to_be_bytes());
+        bad(&corrupt);
+        assert!(matches!(Reader::new(&corrupt, true).result(), Err(Fault::Invalid)));
+        // Operation rows: 5000 rows claimed with no row bytes present.
+        let bytes = wide(&update(5000));
+        let mut corrupt = bytes[..bytes.len() - 1].to_vec();
+        let count = corrupt.len() - 4;
+        corrupt[count..].copy_from_slice(&5000u32.to_be_bytes());
+        bad(&corrupt);
+        assert!(matches!(Reader::new(&corrupt, true).result(), Err(Fault::Invalid)));
     }
 }

@@ -5,10 +5,11 @@ impl SqlSession {
     /// Execute against this session's snapshot. An idle session owns its
     /// transaction; an existing transaction remains provisional until COMMIT.
     pub fn execute_native(&mut self, request: &Request, bindings: &Bindings) -> Result<Outcome> {
+        let v2 = self.is_v2_engine();
         self.native_scope(
             false,
             || {
-                validate_request(request)?;
+                validate_request(request, Admission::engine(v2))?;
                 validate_bindings(bindings)
             },
             |session| {
@@ -27,10 +28,11 @@ impl SqlSession {
         block: &Transaction,
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
+        let v2 = self.is_v2_engine();
         self.native_scope(
             block.read_only,
             || {
-                transaction::validate_transaction(block)?;
+                transaction::validate_transaction(block, Admission::engine(v2))?;
                 validate_bindings(bindings)
             },
             |session| {

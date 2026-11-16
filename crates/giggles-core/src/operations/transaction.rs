@@ -276,7 +276,11 @@ fn request_kind(request: &Request) -> Result<LocalKind> {
         Request::Returning { .. } | Request::OnConflict { .. } => return Err(Error::Unsupported),
     })
 }
-pub(super) fn validate_transaction(transaction: &Transaction) -> Result<()> {
+/// See `Admission`. Outside Base, each INSERT MANY step has its own
+/// MAX_INSERT_REQUEST_BYTES bound and the rest of the block keeps MAX_INPUT;
+/// Base blocks keep MAX_INPUT as a whole.
+pub(super) fn validate_transaction(transaction: &Transaction, admission: Admission) -> Result<()> {
+    let v2 = admission == Admission::V2;
     let count = transaction
         .steps
         .len()
@@ -304,7 +308,7 @@ pub(super) fn validate_transaction(transaction: &Transaction) -> Result<()> {
                 if transaction.read_only && !matches!(kind, LocalKind::Read) {
                     return Err(Error::Unsupported);
                 }
-                validate_request_nodes(request, &mut nodes)?;
+                validate_request_nodes(request, &mut nodes, v2)?;
                 if !relation_identifier(request.table()?) {
                     return Err(Error::Bind("identifier".into()));
                 }
@@ -321,12 +325,20 @@ pub(super) fn validate_transaction(transaction: &Transaction) -> Result<()> {
             }
         }
     }
-    // A block carrying INSERT MANY has that statement's tree bound, as a
-    // single INSERT MANY request does (SQL bounds each statement the same way).
-    let insert_many = transaction.steps.iter().any(|step| matches!(step,
-        TransactionStep::Execute(request) | TransactionStep::Let { request, .. }
-            if matches!(request.parts().map(|p| p.body), Ok(Request::InsertMany { .. }))));
-    validate_size_within(transaction, if insert_many { MAX_INSERT_REQUEST_BYTES } else { MAX_INPUT })
+    if admission == Admission::Base {
+        return validate_size(transaction);
+    }
+    // Each INSERT MANY step has a single request's tree bound (SQL bounds
+    // each statement the same way); its bytes do not raise other steps' bound.
+    let mut inserts = 0usize;
+    for step in &transaction.steps {
+        if let TransactionStep::Execute(request) | TransactionStep::Let { request, .. } = step
+            && matches!(request.parts()?.body, Request::InsertMany { .. })
+        {
+            inserts = inserts.saturating_add(validate_size_within(step, MAX_INSERT_REQUEST_BYTES)?);
+        }
+    }
+    validate_size_within(transaction, MAX_INPUT.saturating_add(inserts)).map(drop)
 }
 fn scalar_description(bound: &Bound, ty: Option<Ty>) -> EmitDescription {
     let data_type = match bound {
@@ -496,7 +508,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<TransactionOutcome> {
-        validate_transaction(transaction)?;
+        validate_transaction(transaction, Admission::engine(self.admin.engine() == crate::Engine::V2))?;
         validate_bindings(bindings)?;
         self.execute_transaction_plan(|session| bind_transaction(session, transaction, bindings))
     }
@@ -505,7 +517,7 @@ impl Engine {
         transaction: &Transaction,
         bindings: &Bindings,
     ) -> Result<BoundTransaction> {
-        validate_transaction(transaction)?;
+        validate_transaction(transaction, Admission::engine(self.admin.engine() == crate::Engine::V2))?;
         validate_bindings(bindings)?;
         let mut session = self.admin.sql_session();
         session.begin_engine().map_err(core)?;

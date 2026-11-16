@@ -117,10 +117,10 @@ impl Engine {
         else {
             return Err(Error::Unsupported);
         };
-        validate_request(request)?;
+        let v2 = self.admin.engine() == crate::Engine::V2;
+        validate_request(request, Admission::engine(v2))?;
         validate_bindings(bindings)?;
         let configured = self.admin.explain_limits_engine();
-        let v2 = self.admin.engine() == crate::Engine::V2;
         self.admin
             .inspect_secondary_catalog_engine(|domain, epoch, tables, descriptors| {
                 let table = tables

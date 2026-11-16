@@ -1093,7 +1093,7 @@ fn v2_point_writes_read_one_key_and_filters_stream() {
         ("items where id=19999", "select * from items where id=19999", 0, 0, 0),
         ("update pair where a=1 and b=\"y\" set n=5", "update pair set n=5 where a=1 and b='y'", 1, 1, 1),
         ("update many items where n=7 set u=1 at most 20", "update items set u=1 where n=7", 20, 19_999, 20),
-        ("items where n=7 order by id desc limit 3", "select * from items where n=7 order by id desc limit 3", 3, 19_999, 20),
+        ("items where n=7 order by id desc limit 3", "select * from items where n=7 order by id desc limit 3", 3, 19_999, 3),
         ("delete many items where n=8 or id=5 at most 21", "delete from items where n=8 or id=5", 21, 19_999, 21),
     ] {
         let before = native_input_rows();
@@ -1252,4 +1252,123 @@ fn v2_inserts_upserts_and_typed_keys_read_only_their_keys() {
     assert_eq!(native_input_rows(), before);
     let explain = engine.explain_text("explain items where id=7", &Bindings::new()).unwrap();
     assert_eq!(explain.stages[..2], [Stage::WholeStateSnapshot, Stage::BoundedCompleteTableMaterialization]);
+}
+
+/// R2-NOCAP-6 F1: a left-deep operator chain in INSERT text (which has the
+/// 1M-token budget) is refused before it can be dropped recursively. Before
+/// the fix a 500k-term chain overflowed the stack and aborted the process.
+#[test]
+fn nocap6_long_operator_chains_in_insert_text_are_limit_without_overflow() {
+    std::thread::Builder::new().stack_size(2 << 20).spawn(|| {
+        let version = LanguageVersion::Embedded021;
+        for op in ["+", "*", " or ", " and "] {
+            let terms = vec!["1"; 499_900].join(op);
+            let text = format!("insert into items(id,n,u) values({terms},1,1)");
+            assert_eq!(giggles_language::parse_with_version(&text, version), Err(Error::Limit), "{op}");
+            let text = format!("transaction {{ insert into items(id,n,u) values({terms},1,1); }}");
+            assert_eq!(giggles_language::parse_transaction_with_version(&text, version).map(|_| ()),
+                Err(Error::Limit), "{op}");
+        }
+        // Chains within MAX_DEPTH links stay parseable in large INSERT text.
+        let tuples = vec!["(1+1+1,2*2*2,3)"; 5_000].join(",");
+        assert!(giggles_language::parse_with_version(
+            &format!("insert many into items(id,n,u) values{tuples} at most 5000"), version).is_ok());
+    }).unwrap().join().unwrap();
+}
+
+/// R2-NOCAP-6 F2: only an `insert` keyword starting a block step grants the
+/// INSERT text budget; a literal or identifier containing "insert" does not.
+#[test]
+fn nocap6_insert_budget_needs_an_insert_step() {
+    let version = LanguageVersion::Embedded021;
+    let filler = vec!["id=1"; 1_100].join(" and ");
+    let padding = "x".repeat(70_000);
+    for text in [
+        format!("transaction {{ items where s=\"insert\" and {filler}; }}"),
+        format!("transaction {{ items where inserted_at=1 and {filler}; }}"),
+        format!("transaction {{ items where s=\"insert {padding}\"; }}"),
+        format!("transaction {{ items where s=\"{padding}\"; insert items set id=1; }}"),
+    ] {
+        assert_eq!(giggles_language::parse_transaction_with_version(&text, version).map(|_| ()),
+            Err(Error::Limit), "{}", &text[..60]);
+    }
+    let tuples = (0..2_000).map(|id| format!("({id},1,{id})")).collect::<Vec<_>>().join(",");
+    for text in [
+        format!("transaction {{ items where id=1; insert many into items(id,n,u) values{tuples} at most 2000; }}"),
+        format!("transaction {{ let x = (insert many into items(id,n,u) values{tuples} at most 2000); }}"),
+    ] {
+        assert!(text.len() > 16_000);
+        giggles_language::parse_transaction_with_version(&text, version)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+    }
+}
+
+/// R2-NOCAP-6 F3-F5, F7, F8: legacy INSERT MANY budgets are as before the
+/// stack; V2 budgets apply per INSERT MANY step only; V2 reads and capped
+/// writes retain only the rows their result depends on.
+#[cfg(feature = "engine-rocksdb")]
+#[test]
+fn nocap6_engine_budgets_and_bounded_retention() {
+    use giggles_core::operations::native_input_rows;
+    let (_legacy_db, legacy) = Database::fresh(StorageEngine::Legacy);
+    let (_v2_db, v2) = Database::fresh(StorageEngine::V2);
+    let (_sql_db, reference) = Database::fresh(StorageEngine::V2);
+    for admin in [&legacy, &v2, &reference] {
+        sql(admin, "create table wide(a bigint primary key, b bigint, c bigint, d bigint, e bigint)");
+        sql(admin, "create table notes(id bigint primary key, s text)");
+        sql(admin, "insert into notes values(1,'a'),(2,'b')");
+    }
+    let five = |rows: std::ops::Range<usize>| rows.map(|i| format!("({i},1,1,1,1)")).collect::<Vec<_>>().join(",");
+    // 1,000 x 5 = 5,000 tuple nodes: over the aggregate legacy budget (4,096);
+    // 1,025 tuples: over the legacy row bound. V2 admits both.
+    for (text, count) in [
+        (format!("insert many into wide(a,b,c,d,e) values{} at most 1000", five(0..1_000)), 1_000),
+        (format!("insert many into wide(a,b,c,d,e) values{} at most 1025", five(5_000..6_025)), 1_025),
+    ] {
+        let engine = Engine::with_version(legacy.clone(), LanguageVersion::Embedded021);
+        assert_eq!(engine.execute_text(&text, &Bindings::new()).map(|_| ()), Err(Error::Limit));
+        let engine = Engine::with_version(v2.clone(), LanguageVersion::Embedded021);
+        assert_eq!(engine.execute_text(&text, &Bindings::new()).unwrap().affected, count);
+    }
+    let engine = Engine::with_version(v2.clone(), LanguageVersion::Embedded021);
+    // F4: an INSERT MANY step does not lift MAX_INPUT for the other steps:
+    // 40,000 escaped newlines are 40 KB of value but 80 KB of request tree.
+    let block = format!("transaction {{ insert many into wide(a,b,c,d,e) values{} at most 10; \
+        update notes where id=1 set s=\"{}\"; }}", five(9_000..9_010), "\\n".repeat(40_000));
+    assert_eq!(engine.execute_transaction_text(&block, &Bindings::new()).map(|_| ()), Err(Error::Limit));
+    // F5: the tuples' extra value budget does not carry into later steps.
+    let big = Bindings::from_iter([("a".to_string(), Value::Text("z".repeat(40_000)))]);
+    let block = format!("transaction {{ insert many into wide(a,b,c,d,e) values{} at most 10; \
+        update notes where id=1 set s=$a; update notes where id=2 set s=$a; }}", five(9_000..9_010));
+    assert_eq!(engine.execute_transaction_text(&block, &big).map(|_| ()), Err(Error::Limit));
+    // F7/F8: reads keep their top `limit` rows while counting every match;
+    // `one` and `many N` keep at most 2 and N+1 matches.
+    for admin in [&v2, &reference] {
+        sql(admin, "create table items(id bigint primary key, n bigint, u bigint)");
+        seed(admin, "items", 0..5_000);
+        sql(admin, "update items set n=id%1000");
+    }
+    for (native, statement, kept) in [
+        ("items where n<500 limit 5", "select * from items where n<500 order by id limit 5", 5),
+        ("items where n<500 order by id desc limit 7", "select * from items where n<500 order by id desc limit 7", 7),
+        ("items where n<500 order by n desc limit 4", "select * from items where n<500 order by n desc, id limit 4", 4),
+    ] {
+        let before = native_input_rows();
+        let result = with_sql_parser_forbidden(|| engine.execute_text(native, &Bindings::new()))
+            .unwrap_or_else(|error| panic!("{native}: {error:?}"));
+        let after = native_input_rows();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (5_000, kept), "{native}");
+        assert_eq!((result.matched, result.complete), (2_500, false), "{native}");
+        let expected = reference.sql_session().execute(statement, &[], None).unwrap();
+        assert_eq!(values(result.rows), values(expected.rows), "{native}");
+    }
+    for (native, error, kept) in [
+        ("update many items where n<500 set u=1 at most 5", Error::TooManyMatches, 6),
+        ("update items where n=7 set u=1", Error::AmbiguousMatch, 2),
+        ("delete many items where n<500 at most 2499", Error::TooManyMatches, 2_500),
+    ] {
+        let before = native_input_rows();
+        assert_eq!(engine.execute_text(native, &Bindings::new()).map(|_| ()), Err(error), "{native}");
+        assert_eq!(native_input_rows().1 - before.1, kept, "{native}");
+    }
 }

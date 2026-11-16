@@ -285,7 +285,7 @@ fn admit_inner(
     {
         return Err(core(CoreError::Sql(SqlError::StaleSchema)));
     }
-    validate_request(request)?;
+    validate_request(request, Admission::Legacy)?;
     validate_bindings(bindings)?;
     let filter = match request {
         Request::Read {

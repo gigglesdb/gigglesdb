@@ -28,8 +28,15 @@ fn exercise(storage: StorageEngine) {
         sql.execute(&format!("INSERT INTO paged VALUES {tuples}"), &[], None).unwrap();
     }
     let request = request();
-    assert_eq!(engine.execute(&request, &bindings), Err(Error::Limit));
     let expected = sql.execute("SELECT note FROM paged ORDER BY bucket DESC, tenant, id DESC", &[], None).unwrap();
+    // Legacy keeps its 1,024-row complete-input cap; v2 reads any table size (R2-NOCAP).
+    if matches!(storage, StorageEngine::Legacy) {
+        assert_eq!(engine.execute(&request, &bindings), Err(Error::Limit));
+    } else {
+        let read = engine.execute(&request, &bindings).unwrap();
+        let first: Vec<_> = expected.rows.iter().take(1024).map(|row| row.values.clone()).collect();
+        assert_eq!(read.rows.into_iter().map(|row| row.values).collect::<Vec<_>>(), first);
+    }
     let mut all = vec![];
     let mut after = None;
     let mut lengths = vec![];
@@ -93,7 +100,12 @@ fn exercise(storage: StorageEngine) {
     assert!(session.read_page(&invalid, None, &bindings).is_err());
     assert!(session.is_aborted());
     session.rollback_native().unwrap();
-    assert_eq!(engine.execute(&request, &bindings), Err(Error::Limit));
+    let complete = engine.execute(&request, &bindings);
+    if matches!(storage, StorageEngine::Legacy) {
+        assert_eq!(complete, Err(Error::Limit));
+    } else {
+        assert_eq!(complete.unwrap().rows.len(), 1024);
+    }
     drop(session);
     drop(sql);
     drop(engine);

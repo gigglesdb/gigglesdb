@@ -30,7 +30,9 @@ pub(super) fn submission_identity(
     }
     match &request.body {
         OnceBody::Operation(body) => {
-            validate_request(body)?;
+            // Once admission stays engine-independent: the V1 codec inherits
+            // the pre-R2-NOCAP rules (see the golden test below).
+            validate_request(body, Admission::Base)?;
             if matches!(
                 body.parts()?.body,
                 Request::Read { .. } | Request::ReadExpressions { .. }
@@ -39,7 +41,7 @@ pub(super) fn submission_identity(
             }
         }
         OnceBody::Transaction(body) => {
-            transaction::validate_transaction(body)?;
+            transaction::validate_transaction(body, Admission::Base)?;
             if body.read_only {
                 return Err(Error::Unsupported.into());
             }
