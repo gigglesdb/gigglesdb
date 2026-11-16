@@ -2,32 +2,89 @@
 
 # Nunya
 
-Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and per-task credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with task-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
+Nunya is a separate database entry point for AI agents. Applications keep their existing direct database connections, connection strings and drivers. Agents use their own endpoint and access-session credentials; Nunya connects upstream with its own least-privilege role (`[upstream] user`) and replaces protected values with session-scoped tokens. Agents can carry tokens between approved columns without seeing the underlying values. Masked columns return a placeholder or SQL NULL. Unanalysable operations fail closed.
 
 `nunya serve --config <path>` starts the configured routes and snapshot refresh; the service also starts the admin endpoint. Upstream TLS supports `disable`, `require` (encrypted, accepts any certificate), and `verify-full` (hostname verification against `ca_file` as the only trust root). Set `upstream.dialect` to `postgres` (default) or `spanner-pg` for Google PGAdapter. `max_connections` defaults to 256 and permits 1 through 10000 concurrent agent connections. Policies reload across both routes through the admin endpoint or Unix SIGHUP; invalid policies retain the current policy. Optional `policy_watch_ms` (100 through 3600000) polls for changes and waits for two identical consecutive reads before attempting a reload. `GET /status` reports the applied policy hash, timestamps and last reload outcome. Failed or unsafe snapshot refreshes retain the old snapshot until its age causes NY008 refusals. Ctrl-C or SIGTERM stops accepting and allows sessions up to 30 seconds to drain.
 
 ## Threat model
 
-Agents must have no direct route to the database. Enforce this with network isolation and keep upstream credentials away from agents. Nunya does not protect against someone holding the database's own credentials. Unmarked columns are not protected. Counts of shared values remain visible, including equality relationships within a token domain and scope. Protect task secrets, root keys, state files and logs using filesystem permissions. Plaintext mode is only appropriate on a trusted local network.
+Agents must have no direct route to the database. Enforce this with network isolation and keep upstream credentials away from agents. Nunya does not protect against someone holding the database's own credentials. Unmarked columns are not protected. Counts of shared values remain visible, including equality relationships within a token domain and scope. Protect principal and session secrets, root keys, state files and logs using filesystem permissions. Plaintext mode is only appropriate on a trusted local network.
 
 ## Quickstart
 
-Build from this crate with `cargo build --release`. Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory. Set the upstream host, port and database to your server. Mark every sensitive column in the policy before exposing the gateway. The example uses plaintext local connections explicitly.
+Deploy once, provision a principal, then connect through an access session. The [site quickstart](site/docs/quickstart.html) has the complete local PostgreSQL configuration and Windows instructions. [Concepts](site/docs/concepts.html), [configuration](site/docs/configuration.html) and [CLI reference](site/docs/cli.html) explain scope continuity, lifetime settings and commands.
+
+### 1. Deploy once
+
+Build from this crate with `cargo build --release`. Put the binary on PATH. Copy `examples/nunya.toml` and `examples/policy.toml` into a private configuration directory, set the upstream host, port and database, and mark every sensitive column before exposing the gateway. Create a private local `state_dir` and preserve it across restarts. A local harness database is also available below.
+
+Add an authenticated management listener to the configuration (separate from the private admin listener):
+
+```toml
+[management]
+listen = "127.0.0.1:6481"
+```
+
+From the private directory, create credential files and set `root_key_file = "root.key"` at the top level and `password_file = "upstream.password"` under `[upstream]`:
 
 ```sh
 umask 077
 nunya key generate > root.key
-# Add root_key_file = "root.key" at the top level of nunya.toml.
 printf '%s\n' 'your-upstream-password' > upstream.password
-# Add password_file = "upstream.password" under [upstream].
 nunya policy check --config nunya.toml
-nunya task open --config nunya.toml --ttl 30m --label reporting
 nunya serve --config nunya.toml
-# Use the printed user and secret:
-psql 'host=127.0.0.1 port=6432 dbname=app user=task:<id> sslmode=disable'
 ```
 
-Enter the one-time task secret at psql's password prompt. `task list --config nunya.toml` lists live tasks without secrets; `task close --config nunya.toml <id>` revokes one. TTL units are `s`, `m` and `h`. Expiries are Unix milliseconds. Never commit secret files. Instead of files, supply `NUNYA_ROOT_KEY` (64 hex characters) and `NUNYA_UPSTREAM_PASSWORD`. `standing hash` reads one password line from stdin and emits a SCRAM verifier for a `[[standing]]` entry. Its output is a credential and should be protected.
+Keep serve running. Use verified TLS for remote database traffic; management requires TLS off loopback. Instead of files, the service accepts `NUNYA_ROOT_KEY` (64 hex characters) and `NUNYA_UPSTREAM_PASSWORD`. Never commit secret files.
+
+### 2. Provision an identity
+
+On Unix, use the administrator socket as the service user; substitute the absolute state directory:
+
+```sh
+nunya principal create reporting-agent --kind agent --server unix:/absolute/private/state/nunya.sock
+nunya principal grant reporting-agent --route postgres=read-only --server unix:/absolute/private/state/nunya.sock
+nunya principal credential add reporting-agent --generate-secret --server unix:/absolute/private/state/nunya.sock
+```
+
+The credential command prints an ID and then the secret once. Save only the secret line in private `principal.secret`.
+
+Windows has no socket. Before starting serve, run `nunya standing hash`, provide an administrator password on stdin, and add its verifier to the configuration:
+
+```toml
+[[management.admin]]
+name = "operator"
+verifier = "REPLACE_WITH_GENERATED_SCRAM_VERIFIER"
+```
+
+Protect the verifier and save the original password as the first line of private `operator.secret`. Replace the Unix provisioning commands with:
+
+```sh
+nunya principal create reporting-agent --kind agent --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
+nunya principal grant reporting-agent --route postgres=read-only --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
+nunya principal credential add reporting-agent --generate-secret --server http://127.0.0.1:6481 --principal operator --principal-secret-file operator.secret
+```
+
+### 3. Connect
+
+Use the agent's management credential to acquire an access session, then run psql with that session's PostgreSQL environment:
+
+```sh
+nunya session acquire --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --route postgres --context reporting --ttl 1h
+nunya exec --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting -- psql -d app -c "SELECT 1"
+```
+
+Database ports accept only session credentials: PostgreSQL user `session:<32 hex>` and the session secret. Principal credentials work only on management. `nunya session env --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting --format sh` prints credentials for other clients; choose `--format powershell` on Windows and treat the output as secret. Protect the helper's private `sessions.json`.
+
+Reconnects and renewals preserve the token scope. If a stored session has ended, the helper requires `--new-scope` before replacement; obtain fresh tokens for the new scope. Default lifetimes are 8 hours absolute and 1 hour idle. Shorten them with `[session] max_lifetime`, `idle_timeout`, or a shorter acquisition `--ttl`.
+
+Revoke while the service is still running, then stop it with Ctrl-C:
+
+```sh
+nunya session revoke --server http://127.0.0.1:6481 --principal reporting-agent --principal-secret-file principal.secret --context reporting
+```
+
+See [operations](site/docs/operations.html) for revocation, private-network reachability and recovery. A state restore can bring back revoked sessions: revoke all sessions or disable affected principals before serving traffic after any restore.
 
 ## Policy reference
 
@@ -37,7 +94,9 @@ snapshot_max_age_ms = 60000
 sink = "stdout"
 [domains.email]
 tokenize = "on"
-tokenize_limit_per_task = 20
+tokenize_limit_per_session = 20
+tokenize_limit_per_principal = 200
+tokenize_principal_window = "24h"
 [[column]]
 table = "public.customers"
 name = "email"
@@ -49,7 +108,7 @@ masked = true
 placeholder = "[hidden]"
 ```
 
-Each column has exactly one treatment: `blind` names a declared domain; `masked = true` replaces output with `placeholder`, or SQL NULL when omitted. Placeholders require textual columns. Domain names start with a lowercase letter and contain lowercase letters, digits or underscores (maximum 31 characters). Tokenization defaults to `off`; `on` requires `tokenize_limit_per_task` between 1 and 100000. Domains can declare `range = { min = 0, max = 1048575 }` for supported bounded types. A range must contain at least 2^20 values and fit every participating column's type limits. Columns sharing a domain must have compatible types and ranges. Policies are validated against the actual upstream schema, including unsafe dependent objects.
+Each column has exactly one treatment: `blind` names a declared domain; `masked = true` replaces output with `placeholder`, or SQL NULL when omitted. Placeholders require textual columns. Domain names start with a lowercase letter and contain lowercase letters, digits or underscores (maximum 31 characters). Tokenization defaults to `off`; `on` requires per-session and per-principal limits and a principal window; the principal limit must be at least the session limit. The principal window persists across reconnects, new sessions and restarts. See the [policy reference](site/docs/policy.html#limits) for bounds and reload behavior. Domains can declare `range = { min = 0, max = 1048575 }` for supported bounded types. A range must contain at least 2^20 values and fit every participating column's type limits. Columns sharing a domain must have compatible types and ranges. Policies are validated against the actual upstream schema, including unsafe dependent objects.
 
 The read-log sink is required. Use `sink = "file"`, `path = "read.log"` and optional positive `max_bytes` (default 100 MiB) for a rotating file. Relative log paths resolve against the policy directory. Snapshot maximum age defaults to 60000 ms. Unknown policy keys are errors. Read logs may contain query text and tokens; restrict access.
 
@@ -59,14 +118,18 @@ The read-log sink is required. Use `sink = "file"`, `path = "read.log"` and opti
 | --- | --- |
 | NY001 | token used outside its domain |
 | NY002 | operation not allowed on a blind column |
-| NY003 | token not valid in this task |
+| NY003 | token not valid in this session |
 | NY004 | statement could not be fully analysed |
 | NY005 | masked column used in an expression |
 | NY006 | statement kind not allowed through the gateway |
-| NY007 | tokenize limit reached for this task |
+| NY007 | tokenize limit reached |
 | NY008 | schema snapshot is stale |
 | NY009 | read log unavailable |
 | NY010 | protocol feature not allowed through the gateway |
+| NY011 | access session ended |
+| NY012 | write outcome unknown |
+
+See the [error reference](site/docs/errors.html) for recovery, including interrupted work and uncertain writes.
 
 ## Container image
 
@@ -103,15 +166,16 @@ database = "projects/my-project/instances/my-instance/databases/my-database"
 
 The native route can run alone (omit `[upstream]` and top-level `listen`) or beside
 the PostgreSQL route. At least one route is required. Both use the same policy,
-root key, task store, standing identities and inbound TLS certificate/key files.
+root key, durable session store, principals and inbound TLS certificate/key files.
 `policy check` validates the policy against every configured route's catalog.
 Admin reload and Unix SIGHUP reload both routes together after validation against
 every current catalog. Native catalog snapshots still refresh periodically.
 
-Agents supply `Authorization: Bearer nunya.<user>.<secret>` metadata, using the
-user and secret returned by `task open` (user `task:<id>`), or a configured standing
-identity. Pass GoogleSQL tokens as query parameters; literals are never decrypted.
-`PartitionQuery`, `PartitionRead` and `BatchWrite` RPCs are refused.
+Agents supply `Authorization: Bearer nunya.session:<32 hex>.<secret>` metadata
+using access-session credentials. Principal credentials authenticate only to the
+management API. Pass GoogleSQL tokens as query parameters; literals are never
+decrypted. `PartitionQuery` and `PartitionRead` RPCs are refused; read-only
+sessions also refuse DML, Commit with mutations and BatchWrite.
 For default-schema policy tables, use the leading-dot form `table = ".Customers"`.
 
 Production native upstreams use Google credentials and HTTPS (the default endpoint
