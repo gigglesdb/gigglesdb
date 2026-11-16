@@ -1129,6 +1129,14 @@ fn capture_loop(
         let _live = LiveReadinessGuard(runtime.7.clone());
         let mut schema_tick = tokio::time::interval(Duration::from_millis(50));
         let mut active: Option<Active> = None;
+        let mut last_buffered_position = runtime
+            .snapshot()
+            .progress
+            .get("buffered")
+            .map(|(_, payload)| {
+                decode_buffered_position(payload, &config.source, &config.order_domain)
+            })
+            .transpose()?;
         loop {
             // Supervise the last completed capture boundary while the next step
             // owns capture. In particular, an unclassified DDL stays unknown until
@@ -1189,20 +1197,33 @@ fn capture_loop(
                 if batch
                     .transaction
                     .as_ref()
-                    .is_none_or(|txn| txn.source != config.source)
+                    .is_some_and(|txn| txn.source != config.source)
                 {
                     return Err(BufferedProgressError::SourceMismatch.into());
                 }
                 position
                     .compare(position, order.as_ref())
                     .map_err(recovery)?;
-                runtime
-                    .progress_marker(
-                        "buffered",
-                        capture.buffered_marker(&batch)?,
-                        encode_buffered_position(&config.source, position)?,
-                    )
-                    .await?;
+                let ordering = last_buffered_position
+                    .as_ref()
+                    .map(|last| position.compare(last, order.as_ref()))
+                    .transpose()
+                    .map_err(recovery)?;
+                if ordering == Some(std::cmp::Ordering::Less) {
+                    return Err(recovery("buffered position regressed"));
+                }
+                if ordering != Some(std::cmp::Ordering::Equal) {
+                    runtime
+                        .progress_marker(
+                            "buffered",
+                            capture.buffered_marker(&batch)?,
+                            encode_buffered_position(&config.source, position)?,
+                        )
+                        .await?;
+                    // Include queued markers: batching must not let a later step
+                    // replace a transaction's newer boundary before the flush.
+                    last_buffered_position = Some(position.clone());
+                }
             }
             // Final receipts flush the current END binding before notifying
             // receipt waiters; never publish a receipt ahead of restart proof.

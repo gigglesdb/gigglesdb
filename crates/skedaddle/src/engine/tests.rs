@@ -430,6 +430,11 @@ mod opaque_capture {
             "test-frontier"
         }
         fn compare(&self, a: &[u8], b: &[u8]) -> std::result::Result<Ordering, EventError> {
+            // The zero branch models a valid frontier incomparable with the
+            // other branch, while remaining comparable with itself.
+            if a != b && (a == [0] || b == [0]) {
+                return Err(EventError::InvalidEncoding("incomparable test frontiers"));
+            }
             Ok(a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
         }
     }
@@ -455,7 +460,9 @@ mod opaque_capture {
     }
     struct FrontierCapture {
         writer: BufferWriter,
-        transactions: VecDeque<AssembledTxn>,
+        steps: VecDeque<Captured>,
+        drained: Option<oneshot::Sender<()>>,
+        buffered_markers: AtomicU64,
         // Inject shutdown precisely after admission, before durable publication.
         // All buffer I/O still goes through the real local object store.
         interrupt: Option<(Position, oneshot::Sender<()>)>,
@@ -467,17 +474,23 @@ mod opaque_capture {
         fn writer_checkpoint(&self) -> Result<Option<crate::buffer::writer::WriterCheckpoint>> {
             self.writer.checkpoint().map(Some).map_err(recovery)
         }
+        fn buffered_marker(&self, _: &Captured) -> Result<String> {
+            self.buffered_markers.fetch_add(1, AtomicOrdering::SeqCst);
+            let checkpoint = self.writer.checkpoint().map_err(recovery)?;
+            Ok(format!("manifest-durable:{}", checkpoint.next_mseq))
+        }
         async fn step(&mut self) -> Result<Captured> {
-            let Some(txn) = self.transactions.pop_front() else {
+            let Some(batch) = self.steps.pop_front() else {
+                if let Some(drained) = self.drained.take() {
+                    let _ = drained.send(());
+                }
                 return std::future::pending().await;
             };
-            let position = txn.commit_position.clone();
-            self.publish(position.clone(), txn.clone()).await?;
-            Ok(Captured {
-                transaction: Some(txn),
-                durable_position: Some(position),
-                ..Captured::default()
-            })
+            if let Some(txn) = &batch.transaction {
+                self.publish(txn.commit_position.clone(), txn.clone())
+                    .await?;
+            }
+            Ok(batch)
         }
         async fn publish(
             &mut self,
@@ -567,7 +580,16 @@ mod opaque_capture {
             .unwrap();
             FrontierCapture {
                 writer,
-                transactions,
+                steps: transactions
+                    .into_iter()
+                    .map(|txn| Captured {
+                        durable_position: Some(txn.commit_position.clone()),
+                        transaction: Some(txn),
+                        ..Captured::default()
+                    })
+                    .collect(),
+                drained: None,
+                buffered_markers: AtomicU64::new(0),
                 interrupt: None,
             }
         }
@@ -578,6 +600,185 @@ mod opaque_capture {
             )
             .unwrap()
         }
+    }
+
+    fn progress(bytes: &[u8]) -> Captured {
+        Captured {
+            durable_position: Some(Position::new(FrontierOrder.domain(), bytes)),
+            ..Captured::default()
+        }
+    }
+
+    async fn run_steps(capture: &mut FrontierCapture, runtime: &Runtime) -> Result<()> {
+        let (drained, exhausted) = oneshot::channel();
+        capture.drained = Some(drained);
+        let (_commands, receive) = mpsc::channel(1);
+        let (stop, stopped) = watch::channel(false);
+        let config = CopyConfig {
+            source: identity(),
+            order_domain: FrontierOrder.domain().into(),
+            schema_version: 1,
+            read_rows: 1,
+            read_bytes: 1024,
+            window_bytes: 1024,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let run = capture_loop(capture, receive, stopped, runtime, &config);
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result,
+                drained = exhausted => {
+                    drained.unwrap();
+                    stop.send_replace(true);
+                    run.await
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn seed_progress(seam: &Seam, bytes: &[u8]) {
+        seam.engine
+            .runtime()
+            .marker(
+                "buffered",
+                "manifest-durable:0".into(),
+                encode_buffered_position(
+                    &identity(),
+                    &Position::new(FrontierOrder.domain(), bytes),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_only_advances_buffered_position_and_survives_restart() {
+        let mut seam = Seam::new().await;
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.steps = VecDeque::from([progress(&[255]), progress(&[1, 0, 2])]);
+        run_steps(&mut capture, &seam.engine.runtime())
+            .await
+            .unwrap();
+        seam.engine.runtime().flush_progress().await.unwrap();
+        let saved = seam.journal.load(false).await.unwrap();
+        let position = Position::new(FrontierOrder.domain(), [1, 0, 2]);
+        assert_eq!(
+            decode_buffered_position(
+                &saved.progress["buffered"].1,
+                &identity(),
+                FrontierOrder.domain(),
+            )
+            .unwrap(),
+            position
+        );
+        assert_eq!(saved.progress["buffered"].0, "manifest-durable:0");
+        assert_eq!(capture.writer.checkpoint().unwrap().next_mseq, 0);
+        drop(capture);
+        let mut coordinator = Coordinator::observer(
+            seam.journal.clone(),
+            Local::create(seam.root.join("restart-local")).unwrap(),
+            "restart",
+        )
+        .unwrap();
+        coordinator.acquire().await.unwrap();
+        seam.engine = Engine::new(coordinator, seam.journal.clone());
+        assert_eq!(seam.engine.runtime().snapshot().progress, saved.progress);
+        // The buffer has no transaction position; restart must use the journal.
+        let mut resumed = seam.capture(VecDeque::new()).await;
+        assert_eq!(resumed.writer.checkpoint().unwrap().last_position, None);
+        resumed.steps.push_back(progress(position.bytes()));
+        run_steps(&mut resumed, &seam.engine.runtime())
+            .await
+            .unwrap();
+        assert_eq!(resumed.buffered_markers.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn regressing_progress_only_requires_recovery() {
+        let seam = Seam::new().await;
+        seed_progress(&seam, &[1, 0, 2]).await;
+        let saved = seam.journal.load(false).await.unwrap();
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.steps.push_back(progress(&[255]));
+        assert!(matches!(
+            run_steps(&mut capture, &seam.engine.runtime()).await,
+            Err(coordinator::Error::RecoveryRequired(reason)) if reason.contains("regressed")
+        ));
+        seam.engine.runtime().flush_progress().await.unwrap();
+        assert_eq!(seam.journal.load(false).await.unwrap(), saved);
+        assert_eq!(capture.buffered_markers.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn incomparable_progress_only_requires_recovery() {
+        let seam = Seam::new().await;
+        seed_progress(&seam, &[255]).await;
+        let saved = seam.journal.load(false).await.unwrap();
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.steps.push_back(progress(&[0]));
+        assert!(matches!(
+            run_steps(&mut capture, &seam.engine.runtime()).await,
+            Err(coordinator::Error::RecoveryRequired(reason)) if reason.contains("incomparable")
+        ));
+        seam.engine.runtime().flush_progress().await.unwrap();
+        assert_eq!(seam.journal.load(false).await.unwrap(), saved);
+        assert_eq!(capture.buffered_markers.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn equal_progress_only_writes_no_marker() {
+        let seam = Seam::new().await;
+        seed_progress(&seam, &[255]).await;
+        let saved = seam.journal.load(false).await.unwrap();
+        let mut capture = seam.capture(VecDeque::new()).await;
+        capture.steps = VecDeque::from([progress(&[255]), progress(&[255])]);
+        run_steps(&mut capture, &seam.engine.runtime())
+            .await
+            .unwrap();
+        seam.engine.runtime().flush_progress().await.unwrap();
+        assert_eq!(seam.journal.load(false).await.unwrap(), saved);
+        assert_eq!(capture.buffered_markers.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn progress_only_cannot_regress_pending_transaction_progress() {
+        let seam = Seam::new().await;
+        let txn = transaction(&[1, 0, 2]);
+        let mut capture = seam.capture(VecDeque::from([txn.clone()])).await;
+        capture.steps.push_back(progress(&[255]));
+        let runtime = seam.engine.runtime();
+        // Keep the transaction marker queued to exercise coalescing explicitly.
+        runtime.2.persistence.lock().unwrap().last_flush = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(
+            run_steps(&mut capture, &runtime).await,
+            Err(coordinator::Error::RecoveryRequired(reason)) if reason.contains("regressed")
+        ));
+        assert!(
+            !seam
+                .journal
+                .load(false)
+                .await
+                .unwrap()
+                .progress
+                .contains_key("buffered")
+        );
+        runtime.flush_progress().await.unwrap();
+        let saved = seam.journal.load(false).await.unwrap();
+        assert_eq!(
+            decode_buffered_position(
+                &saved.progress["buffered"].1,
+                &identity(),
+                FrontierOrder.domain(),
+            )
+            .unwrap(),
+            txn.commit_position
+        );
+        assert_eq!(saved.progress["buffered"].0, "manifest-durable:1");
+        assert_eq!(seam.manifest(0).await.last_pos, txn.commit_position);
+        assert_eq!(capture.buffered_markers.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
