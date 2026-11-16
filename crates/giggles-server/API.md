@@ -588,8 +588,8 @@ a SQLSTATE, even where SQL accepts the expression). FK actions are
 retained search_path. Outcomes name the constrained table, without `indexId`.
 ADD/DROP require table ownership; REFERENCES also requires referenced-table
 ownership under the shared SQL rule. Application roles cannot perform DDL.
-Authorization precedes column and constraint binding. Native and SQL currently
-both reject DROP CONSTRAINT CASCADE with 42601; PostgreSQL 18.6 supports it.
+Authorization precedes column and constraint binding. DROP CONSTRAINT CASCADE
+succeeds in native and SQL alike, matching PostgreSQL 18.6.
 Duplicate named UNIQUE reports 42P07 for the existing backing-index name,
 matching PostgreSQL 18.6.
 Legacy native catalog requests on populated databases retain the existing

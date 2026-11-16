@@ -60,11 +60,12 @@ async fn constraints_sql_twins_and_authority() {
             for fixture in [&f,&twin] {let result=fixture.service.role_session("owner").unwrap().execute_sql(q,&[]); assert_eq!(result.as_ref().err().map(giggles_server::sqlstate).unwrap_or("ok"),code,"{q}: {result:?}");}
         }
         for fixture in [&f,&twin] {assert!(fixture.admin.sql_session().execute("SELECT * FROM app.t",&[],None).unwrap().rows.is_empty());}
-        for cascade in [true,false] {
+        // DROP CONSTRAINT CASCADE succeeds in SQL and native alike (PG18.6); the plain repeat then finds nothing.
+        for (cascade,code) in [(true,"ok"),(false,"42704")] {
             let request=json!({"catalog":{"dropConstraint":{"table":"app.t","name":"fk","cascade":cascade}}});
-            let code=if cascade {"42601"} else {"ok"}; assert_code(&execute(&f,&token,request,grpc).await,code);
+            assert_code(&execute(&f,&token,request,grpc).await,code);
             let q=if cascade {"ALTER TABLE app.t DROP CONSTRAINT fk CASCADE"} else {"ALTER TABLE app.t DROP CONSTRAINT fk"};
-            let result=sql.execute_sql(q,&[]); assert_eq!(result.as_ref().err().map(giggles_server::sqlstate).unwrap_or("ok"),code);
+            let result=sql.execute_sql(q,&[]); assert_eq!(result.as_ref().err().map(giggles_server::sqlstate).unwrap_or("ok"),code,"{q}: {result:?}");
         }
         for fixture in [&f,&twin] {let mut session=fixture.service.role_session("owner").unwrap();
             session.execute_sql("INSERT INTO app.t VALUES(3,99)",&[]).unwrap(); session.execute_sql("DELETE FROM app.t WHERE id=3",&[]).unwrap();}
