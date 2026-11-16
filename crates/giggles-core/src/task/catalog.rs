@@ -848,7 +848,7 @@ impl TaskCatalog {
     }
 
     /// Deletes a task record. Phase 6 retention only; its name becomes reusable.
-    #[cfg_attr(not(test), allow(dead_code))] // The retention sweeper (Phase 6) is the first caller.
+    #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))] // The retention sweeper (Phase 6) is the first caller.
     pub(crate) fn purge(&self, id: TaskObjectId) -> Result<(), TaskDdlError> {
         let (mut txn, _) = self.begin_write(None)?;
         let view = self.db()?.catalog().committed_view(&mut txn)?;
@@ -986,7 +986,7 @@ fn parse_expiry(text: &str) -> Result<WallClockMs, TaskDdlError> {
 impl TaskDef {
     /// Bind-time recheck (design rows 9 to 11): the table and every column the
     /// task names still exist, and every writable column still satisfies D7.
-    #[cfg_attr(not(test), allow(dead_code))] // Phases 2 and 3 call it at bind.
+    #[cfg_attr(not(all(test, feature = "engine-rocksdb")), allow(dead_code))] // Phases 2 and 3 call it at bind.
     pub(crate) fn check_against(&self, view: &CatalogView) -> Result<(), SqlError> {
         let entry = view.by_id.get(&self.table).ok_or(SqlError::UnknownTable)?;
         let known = |c: &str| entry.def.logical_columns().any(|col| col.name == c);
