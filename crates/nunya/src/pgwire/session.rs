@@ -95,6 +95,8 @@ pub struct Session {
     extended_deferred_bytes: usize,
     extended_execute_forwarded: bool,
     rollback_on_sync: bool,
+    last_row_refresh_ms: Option<u64>,
+    end_requested: Option<crate::state::registry::EndReason>,
 }
 impl Session {
     /// Construct an authenticated session with independently derived scope keys.
@@ -127,6 +129,8 @@ impl Session {
             extended_deferred_bytes: 0,
             extended_execute_forwarded: false,
             rollback_on_sync: false,
+            last_row_refresh_ms: None,
+            end_requested: None,
         }
     }
     /// Attach the registered connection identifier.
@@ -171,7 +175,7 @@ impl Session {
         };
         let failed = self.ctx.readlog.write_lifecycle(&record).is_err();
         Actions {
-            client: vec![Backend::ErrorResponse(nunya_error(if failed {
+            client: vec![Backend::ErrorResponse(nunya_error(if failed && code == NyCode::SessionEnded {
                 NyCode::ReadLogUnavailable
             } else { code }))],
             close: true,
@@ -491,6 +495,25 @@ impl Session {
     }
     /// Consume an upstream response, sanitizing every data-bearing result.
     pub fn backend(&mut self, msg: Backend) -> Actions {
+        if self.end_requested.is_some() {
+            return Actions::default();
+        }
+        if matches!(msg, Backend::DataRow(_)) {
+            let now = (self.ctx.clock)();
+            if self.last_row_refresh_ms.is_none_or(|last| now.saturating_sub(last) >= 1000) {
+                if self.ctx.authority.admit(self.session, Operation::Read).is_err() {
+                    use crate::state::{model::EndReason as StoredEnd, registry::EndReason};
+                    self.end_requested = Some(match self.ctx.authority.session(self.session)
+                        .and_then(|row| row.revoke_reason) {
+                        Some(StoredEnd::Expired | StoredEnd::IdleTimeout) => EndReason::Expired,
+                        _ => EndReason::Revoked,
+                    });
+                    // The socket loop must cancel upstream and audit before its final error.
+                    return Actions::default();
+                }
+                self.last_row_refresh_ms = Some(now);
+            }
+        }
         if !self.pending.is_empty() {
             return self.extended_backend(msg);
         }
@@ -1000,6 +1023,19 @@ impl Agent {
         self.io.flush().await.map_err(|_| protocol())
     }
 }
+async fn send_or_end(
+    agent: &mut Agent,
+    end: &mut crate::state::registry::EndSignal,
+    messages: &[Backend],
+) -> Result<Option<crate::state::registry::EndReason>, Refusal> {
+    tokio::select! {
+        biased;
+        reason = end.ended() => Ok(Some(reason)),
+        result = agent.send(messages) => result.map(|()| None),
+    }
+}
+const FINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 struct CancelGuard {
     ctx: Arc<GatewayContext>,
     key: (i32, [u8; 4]),
@@ -1020,9 +1056,10 @@ pub async fn serve_tcp(tcp: tokio::net::TcpStream, ctx: Arc<GatewayContext>) {
         ctx: ctx.clone(),
     };
     if let Err(error) = serve(&mut agent, ctx).await {
-        let _ = agent
-            .send(&[Backend::ErrorResponse(nunya_error(error.code))])
-            .await;
+        let _ = tokio::time::timeout(
+            FINAL_SEND_TIMEOUT,
+            agent.send(&[Backend::ErrorResponse(nunya_error(error.code))]),
+        ).await;
     }
     let _ = agent.io.shutdown().await;
 }
@@ -1032,12 +1069,14 @@ async fn end_connection(
     session: &mut Session,
     reason: crate::state::registry::EndReason,
 ) -> Result<(), Refusal> {
-    if session.waiting || session.write_in_flight() {
+    if session.waiting || !session.pending.is_empty() || session.write_in_flight() {
         let (pid, secret) = upstream.backend_key();
         let _ = send_cancel(&session.ctx.upstream, pid, &secret).await;
     }
     let actions = session.end(reason);
-    agent.send(&actions.client).await
+    // A failed or timed-out best-effort final send just closes the connection.
+    let _ = tokio::time::timeout(FINAL_SEND_TIMEOUT, agent.send(&actions.client)).await;
+    Ok(())
 }
 async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusal> {
     let mut tls = false;
@@ -1252,10 +1291,24 @@ async fn serve(agent: &mut Agent, ctx: Arc<GatewayContext>) -> Result<(), Refusa
                 request=agent.recv()=>session.frontend(request?),
             }
         };
-        if !actions.upstream.is_empty() {
-            upstream.send(&actions.upstream).await?;
+        if let Some(reason) = session.end_requested.take() {
+            end_connection(agent, &mut upstream, &mut session, reason).await?;
+            return Ok(());
         }
-        agent.send(&actions.client).await?;
+        if !actions.upstream.is_empty() {
+            tokio::select! {
+                biased;
+                reason = end.ended() => {
+                    end_connection(agent, &mut upstream, &mut session, reason).await?;
+                    return Ok(());
+                }
+                result = upstream.send(&actions.upstream) => result?,
+            }
+        }
+        if let Some(reason) = send_or_end(agent, &mut end, &actions.client).await? {
+            end_connection(agent, &mut upstream, &mut session, reason).await?;
+            return Ok(());
+        }
         if actions.close {
             break;
         }
@@ -2004,16 +2057,127 @@ mod tests {
         assert!(f.identities.lock().unwrap().is_empty());
     }
     #[test]
-    fn end_audit_failure_returns_ny009() {
+    fn end_audit_failure_with_write_in_flight_is_ny012() {
         let f = Fixture::new();
         let mut s = f.session();
         s.frontend(Frontend::Query("COMMIT".into()));
         f.fail.store(true, Ordering::Relaxed);
         let out = s.end(crate::state::registry::EndReason::Revoked);
-        assert_eq!(code(&out), "NY009");
+        assert_eq!(code(&out), "NY012");
         assert!(out.close);
         assert!(out.upstream.is_empty());
         assert_eq!(out.client.len(), 1);
+    }
+    #[test]
+    fn end_audit_failure_with_read_in_flight_is_ny009() {
+        let f = Fixture::new();
+        let mut s = f.session();
+        assert_eq!(s.frontend(Frontend::Query("SELECT 1".into())).upstream.len(), 1);
+        f.fail.store(true, Ordering::Relaxed);
+        let out = s.end(crate::state::registry::EndReason::Revoked);
+        assert_eq!(code(&out), "NY009");
+        assert!(out.close);
+        assert_eq!(out.client.len(), 1);
+    }
+    #[tokio::test]
+    async fn blocked_agent_send_observes_revocation() {
+        let f = Fixture::new();
+        let s = f.session();
+        let (_guard, mut end) = f.ctx.registry.register(
+            s.session, s.principal, f.ctx.route.as_str(), None,
+        );
+        let (io, _unread) = tokio::io::duplex(64);
+        let mut agent = Agent { io: Box::new(io), buffer: BytesMut::new(), ctx: f.ctx.clone() };
+        let messages = [Backend::DataRow(vec![Some(vec![b'x'; 1024])])];
+        let mut sending = Box::pin(send_or_end(&mut agent, &mut end, &messages));
+        // Poll until the tiny pipe blocks; the receiver never drains it.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut sending).await.is_err());
+        f.ctx.authority.revoke(s.session, crate::state::model::EndReason::AdminRevoked).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), sending).await.unwrap().unwrap(),
+            Some(crate::state::registry::EndReason::Revoked),
+        );
+    }
+    fn row_clock_fixture() -> (Fixture, Arc<std::sync::atomic::AtomicU64>) {
+        use crate::state::{authority::{Authority, SessionLimits}, store::RedbStore};
+        let mut f = Fixture::new();
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let store_clock = now.clone();
+        let store = Arc::new(RedbStore::with_clock(
+            &f.dir.join("row-clock"), &RootKey::from_hex(&"00".repeat(32)).unwrap(),
+            Arc::new(move || store_clock.load(Ordering::Relaxed)),
+        ).unwrap());
+        let ctx = Arc::get_mut(&mut f.ctx).unwrap();
+        ctx.authority = Authority::load(store, SessionLimits {
+            idle_timeout_ms: Some(1500), ..SessionLimits::default()
+        }).unwrap();
+        let gateway_clock = now.clone();
+        ctx.clock = Arc::new(move || gateway_clock.load(Ordering::Relaxed));
+        (f, now)
+    }
+    fn start_rows(f: &Fixture, extended: bool) -> Session {
+        let mut s = f.session();
+        if extended {
+            prepare_admission_portal(&mut s, "SELECT value FROM items");
+            assert_eq!(s.frontend(Frontend::Execute { portal: "p".into(), max_rows: 0 }).upstream.len(), 1);
+        } else {
+            assert_eq!(s.frontend(Frontend::Query("SELECT value FROM items".into())).upstream.len(), 1);
+            assert!(!s.backend(Backend::RowDescription(vec![field()])).close);
+        }
+        s
+    }
+    #[test]
+    fn relayed_rows_refresh_activity_beyond_idle_timeout() {
+        for extended in [false, true] {
+            let (f, now) = row_clock_fixture();
+            let mut s = start_rows(&f, extended);
+            for tick in [1100, 2100, 3100, 4100, 5100] {
+                now.store(tick, Ordering::Relaxed);
+                let out = s.backend(Backend::DataRow(vec![Some(b"value".to_vec())]));
+                assert!(!out.close);
+                assert!(matches!(out.client.as_slice(), [Backend::DataRow(_)]));
+                assert_eq!(f.ctx.authority.session(s.session).unwrap().last_used_ms, tick);
+                assert!(s.end_requested.is_none());
+            }
+            assert!(f.ctx.authority.admit(s.session, Operation::Read).is_ok());
+        }
+    }
+    #[test]
+    fn row_activity_refresh_is_limited_to_once_per_second() {
+        for extended in [false, true] {
+            let (f, now) = row_clock_fixture();
+            let mut s = start_rows(&f, extended);
+            for (tick, expected) in [(200, 200), (400, 200), (1199, 200), (1200, 1200), (1300, 1200)] {
+                now.store(tick, Ordering::Relaxed);
+                let out = s.backend(Backend::DataRow(vec![None]));
+                assert!(matches!(out.client.as_slice(), [Backend::DataRow(_)]));
+                assert_eq!(f.ctx.authority.session(s.session).unwrap().last_used_ms, expected);
+            }
+        }
+    }
+    #[test]
+    fn failed_row_refresh_requests_end_without_releasing_more_rows() {
+        for extended in [false, true] {
+            for write in [false, true] {
+                let (f, now) = row_clock_fixture();
+                let mut s = start_rows(&f, extended);
+                if write {
+                    // A forwarded commit remains indeterminate when the read response ends.
+                    let mut commit = f.session();
+                    assert_eq!(commit.frontend(Frontend::Query("COMMIT".into())).upstream.len(), 1);
+                    s.active.extend(commit.active);
+                }
+                now.store(1700, Ordering::Relaxed);
+                let out = s.backend(Backend::DataRow(vec![Some(b"value".to_vec())]));
+                assert!(out.client.is_empty());
+                assert_eq!(s.end_requested, Some(crate::state::registry::EndReason::Expired));
+                // A second row cannot escape even while refresh is rate limited.
+                assert!(s.backend(Backend::DataRow(vec![None])).client.is_empty());
+                let out = s.end(s.end_requested.unwrap());
+                assert_eq!(code(&out), if write { "NY012" } else { "NY011" });
+                assert!(out.close);
+            }
+        }
     }
     #[tokio::test]
     async fn registered_connection_receives_authority_revocation() {
