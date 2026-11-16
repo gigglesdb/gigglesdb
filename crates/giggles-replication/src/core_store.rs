@@ -9,10 +9,7 @@ use giggles_core::replicated as gr;
 use raft::StateRole;
 use std::{
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, PoisonError, RwLock},
 };
 
 impl From<AppliedPosition> for gr::AppliedPosition {
@@ -77,35 +74,44 @@ impl StateMachine for gr::ReplicaStore {
 pub struct TermSink {
     handle: ReplicaHandle,
     term: u64,
-    fenced: AtomicBool,
+    // Writers check the flag and submit under the read lock, so once `fence`
+    // has returned no proposal from this sink can reach the Raft log.
+    fenced: RwLock<bool>,
 }
 impl TermSink {
     pub fn new(handle: ReplicaHandle, term: u64) -> Self {
         Self {
             handle,
             term,
-            fenced: AtomicBool::new(false),
+            fenced: RwLock::new(false),
         }
     }
+    /// Refuse all later writes. Waits for any write that already passed the
+    /// fence check to finish submitting its proposal, never for it to commit.
     pub fn fence(&self) {
-        self.fenced.store(true, Ordering::SeqCst);
+        *self.fenced.write().unwrap_or_else(PoisonError::into_inner) = true;
     }
     pub fn is_fenced(&self) -> bool {
-        self.fenced.load(Ordering::SeqCst)
+        *self.fenced.read().unwrap_or_else(PoisonError::into_inner)
     }
 }
 impl gr::BatchSink for TermSink {
     fn replicate(&self, batch: Vec<u8>) -> Result<(), gr::ReplicateError> {
-        let role = self.handle.role();
-        let result =
-            if self.is_fenced() || role.state != StateRole::Leader || role.term != self.term {
-                Err(gr::ReplicateError::NotLeader)
+        let submitted = {
+            let fenced = self.fenced.read().unwrap_or_else(PoisonError::into_inner);
+            let role = self.handle.role();
+            if *fenced || role.state != StateRole::Leader || role.term != self.term {
+                Err(ReplicateError::NotLeader)
             } else {
-                self.handle.replicate(batch).map_err(|e| match e {
-                    ReplicateError::NotLeader => gr::ReplicateError::NotLeader,
-                    e => gr::ReplicateError::Unavailable(e.to_string()),
-                })
-            };
+                self.handle.submit(batch)
+            }
+        };
+        let result = submitted
+            .and_then(|reply| reply.recv().unwrap_or(Err(ReplicateError::Stopped)))
+            .map_err(|e| match e {
+                ReplicateError::NotLeader => gr::ReplicateError::NotLeader,
+                e => gr::ReplicateError::Unavailable(e.to_string()),
+            });
         if result.is_err() {
             self.fence();
         }

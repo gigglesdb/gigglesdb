@@ -35,6 +35,46 @@ struct Shared<E> {
     serving: Serving<E>,
     stop: bool,
 }
+/// Wait until this leader has applied every entry already in its log.
+///
+/// The previous engine was fenced before this runs, so it can submit no new
+/// proposal; capturing the last index through the FIFO command channel covers
+/// every proposal it did submit, committed or not. Opening only after those
+/// apply keeps an old engine's in-flight write from applying underneath the
+/// new engine. Gives up if leadership or the term changes, or on stop.
+fn drained<E>(
+    handle: &ReplicaHandle,
+    term: u64,
+    shared: &(Mutex<Shared<E>>, Condvar),
+    poll: Duration,
+) -> bool {
+    let Ok(last) = handle.last_index() else {
+        return false;
+    };
+    loop {
+        // Ok(read) also confirms leadership and means applied >= read.
+        match handle.read_barrier() {
+            Ok(read) if read >= last => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        let role = handle.role();
+        if handle.is_stopped() || role.state != StateRole::Leader || role.term != term {
+            return false;
+        }
+        let (lock, changed) = shared;
+        let (state, _) = changed
+            .wait_timeout_while(
+                lock.lock().expect("role manager mutex poisoned"),
+                poll,
+                |s| !s.stop,
+            )
+            .expect("role manager mutex poisoned");
+        if state.stop {
+            return false;
+        }
+    }
+}
 pub struct RoleManager<E: Engine> {
     shared: Arc<(Mutex<Shared<E>>, Condvar)>,
     join: thread::JoinHandle<()>,
@@ -91,7 +131,7 @@ impl<E: Engine + Sync> RoleManager<E> {
                     drop(state);
                     if !handle.is_stopped()
                         && role.state == StateRole::Leader
-                        && handle.read_barrier().is_ok()
+                        && drained(&handle, role.term, &worker, poll)
                     {
                         // The barrier or open callback may have overlapped a term change.
                         let confirmed = handle.role();

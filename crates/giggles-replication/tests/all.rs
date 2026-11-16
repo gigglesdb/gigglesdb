@@ -94,6 +94,8 @@ mod admin_net;
 mod measure;
 #[path = "recovery_matrix.rs"]
 mod recovery_matrix;
+#[path = "reopen_inflight.rs"]
+mod reopen_inflight;
 #[path = "sql_history.rs"]
 mod sql_history;
 

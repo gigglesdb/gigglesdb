@@ -49,6 +49,7 @@ pub trait Outbox: Send {
     }
 }
 type Reply<T> = mpsc::Sender<Result<T, ReplicateError>>;
+pub(crate) type Receiver<T> = mpsc::Receiver<Result<T, ReplicateError>>;
 #[derive(Clone, Debug)]
 pub struct MembershipStatus {
     pub membership: Membership,
@@ -103,6 +104,7 @@ enum Command {
     BuildSnapshot(Reply<u64>),
     Propose(Vec<u8>, Reply<()>),
     Read(Reply<u64>),
+    LastIndex(Reply<u64>),
     Step(u64, Message),
     ReportSnapshot(u64, bool),
     Shutdown,
@@ -116,11 +118,28 @@ pub struct ReplicaHandle {
 }
 impl ReplicaHandle {
     pub fn replicate(&self, encoded_batch: Vec<u8>) -> Result<(), ReplicateError> {
+        self.submit(encoded_batch)?
+            .recv()
+            .unwrap_or(Err(ReplicateError::Stopped))
+    }
+    /// Queue a proposal on the driver thread and return its reply channel.
+    ///
+    /// Once this returns, any later [`ReplicaHandle::last_index`] covers the
+    /// proposal: the command channel is FIFO.
+    pub(crate) fn submit(&self, encoded_batch: Vec<u8>) -> Result<Receiver<()>, ReplicateError> {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Command::Propose(encoded_batch, tx))
             .map_err(|_| ReplicateError::Stopped)?;
-        rx.recv().unwrap_or(Err(ReplicateError::Stopped))
+        Ok(rx)
+    }
+    /// The last index in this replica's Raft log, committed or not.
+    ///
+    /// The request is answered by the driver thread in command order, so the
+    /// result includes every proposal submitted through this handle before the
+    /// call (or that proposal was refused before reaching the log).
+    pub fn last_index(&self) -> Result<u64, ReplicateError> {
+        self.request(Command::LastIndex)
     }
     pub fn propose_admin(&self, cmd: AdminCommand) -> Result<(), ReplicateError> {
         self.request(|tx| Command::Admin(cmd, tx))
@@ -141,6 +160,8 @@ impl ReplicaHandle {
             .map_err(|_| ReplicateError::Stopped)?;
         rx.recv().unwrap_or(Err(ReplicateError::Stopped))
     }
+    /// Confirm leadership through a ReadIndex round and wait until that read
+    /// index is applied here; `Ok` carries the read index (so applied >= it).
     pub fn read_barrier(&self) -> Result<u64, ReplicateError> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -247,6 +268,9 @@ pub fn spawn_with_policy(
                         let _ = replica.step(from, m);
                     }
                     Ok(Command::ReportSnapshot(to, ok)) => replica.report_snapshot(to, ok),
+                    Ok(Command::LastIndex(reply)) => {
+                        let _ = reply.send(Ok(replica.last_index()));
+                    }
                     Ok(Command::Status(reply)) => {
                         let membership = replica.membership().clone();
                         let learner_matched = membership
