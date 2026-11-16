@@ -1,10 +1,9 @@
 //! Operator commands.
+/// Principal administration and connection inspection.
+pub mod principal;
 /// Session helper and command implementation.
 pub mod session;
-use crate::{
-    config::Config,
-    task::{TaskStore, format_task_id, parse_task_id},
-};
+use crate::config::Config;
 use clap::{Parser, Subcommand};
 use std::{
     io::{self, BufRead},
@@ -33,9 +32,13 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    Task {
+    Principal {
         #[command(subcommand)]
-        command: TaskCommand,
+        command: principal::PrincipalCommand,
+    },
+    Connections {
+        #[command(subcommand)]
+        command: principal::ConnectionsCommand,
     },
     Standing {
         #[command(subcommand)]
@@ -54,97 +57,12 @@ enum PolicyCommand {
     },
 }
 #[derive(Subcommand)]
-enum TaskCommand {
-    Open {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long, value_parser=parse_ttl)]
-        ttl: u64,
-        #[arg(long)]
-        label: Option<String>,
-    },
-    Close {
-        #[arg(long)]
-        config: PathBuf,
-        id: String,
-    },
-    List {
-        #[arg(long)]
-        config: PathBuf,
-    },
-}
-#[derive(Subcommand)]
 enum StandingCommand {
     Hash,
 }
 #[derive(Subcommand)]
 enum KeyCommand {
     Generate,
-}
-fn parse_ttl(text: &str) -> Result<u64, String> {
-    let (number, scale) = match text.as_bytes().last() {
-        Some(b's') => (&text[..text.len() - 1], 1000),
-        Some(b'm') => (&text[..text.len() - 1], 60_000),
-        Some(b'h') => (&text[..text.len() - 1], 3_600_000),
-        _ => return Err("TTL must use s, m or h".into()),
-    };
-    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("invalid TTL".into());
-    }
-    number
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(scale))
-        .filter(|n| *n > 0)
-        .ok_or_else(|| "invalid TTL".into())
-}
-fn store(cfg: &Config) -> Result<TaskStore, Vec<String>> {
-    TaskStore::open_dir(&cfg.state_dir.join("tasks"))
-        .map_err(|_| vec!["task store unavailable".into()])
-}
-fn task(command: TaskCommand) -> Result<i32, Vec<String>> {
-    match command {
-        TaskCommand::Open { config, ttl, label } => {
-            let cfg = Config::load(&config)?;
-            let opened = store(&cfg)?
-                .open(ttl, label)
-                .map_err(|_| vec!["unable to open task".into()])?;
-            println!(
-                "user: task:{}\nsecret: {}\nexpires_unix_ms: {}",
-                format_task_id(&opened.id),
-                opened.secret,
-                opened.expires_unix_ms
-            );
-            eprintln!("Save this secret now; it cannot be shown again.");
-        }
-        TaskCommand::Close { config, id } => {
-            let id = parse_task_id(id.strip_prefix("task:").unwrap_or(&id))
-                .ok_or_else(|| vec!["invalid task identifier".into()])?;
-            let cfg = Config::load(&config)?;
-            if !store(&cfg)?
-                .close(&id)
-                .map_err(|_| vec!["unable to close task".into()])?
-            {
-                return Err(vec!["task not found".into()]);
-            }
-            println!("task closed");
-        }
-        TaskCommand::List { config } => {
-            let cfg = Config::load(&config)?;
-            for (id, expiry, label) in store(&cfg)?
-                .list()
-                .map_err(|_| vec!["unable to list tasks".into()])?
-            {
-                println!(
-                    "task:{}\t{}\t{}",
-                    format_task_id(&id),
-                    expiry,
-                    label.unwrap_or_default()
-                );
-            }
-        }
-    }
-    Ok(0)
 }
 async fn validate(path: &Path) -> Result<(), Vec<String>> {
     let cfg = Config::load(path)?;
@@ -162,7 +80,6 @@ async fn validate(path: &Path) -> Result<(), Vec<String>> {
     {
         *path = cfg.policy.parent().unwrap_or(Path::new(".")).join(&*path);
     }
-    let _store = store(&cfg)?;
     let _sink = crate::readlog::open_sink(&policy.readlog)
         .map_err(|_| vec!["read log unavailable".into()])?;
     if let Some(upstream) = cfg.upstream_config() {
@@ -221,7 +138,8 @@ fn execute(command: Command) -> Result<i32, Vec<String>> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
-        Command::Task { command } => task(command),
+        Command::Principal { command } => Ok(principal::run_command(command)),
+        Command::Connections { command } => Ok(principal::run_connections(command)),
         Command::Key {
             command: KeyCommand::Generate,
         } => {
@@ -280,7 +198,11 @@ pub fn run() -> i32 {
         Ok(cli) => cli,
         Err(error) => {
             let code = i32::from(error.use_stderr());
-            let _ = error.print();
+            if error.use_stderr() {
+                eprintln!("invalid command arguments");
+            } else {
+                let _ = error.print();
+            }
             return code;
         }
     };
@@ -437,13 +359,114 @@ mod tests {
         }
     }
     #[test]
-    fn durations() {
-        for (text, ms) in [("30m", 1_800_000), ("2h", 7_200_000), ("3600s", 3_600_000)] {
-            assert_eq!(parse_ttl(text).unwrap(), ms);
+    fn principal_commands() {
+        let verifier =
+            crate::pgwire::auth::ScramVerifier::from_password("test", b"salt", 4096).to_pg_string();
+        let valid = vec![
+            vec!["create", "alice", "--kind", "person"],
+            vec![
+                "create",
+                "alice",
+                "--kind",
+                "agent",
+                "--admin",
+                "--generate-secret",
+            ],
+            vec![
+                "create",
+                "alice",
+                "--kind",
+                "service",
+                "--verifier",
+                &verifier,
+            ],
+            vec!["list"],
+            vec!["show", "alice"],
+            vec!["disable", "alice"],
+            vec!["enable", "alice"],
+            vec![
+                "credential",
+                "add",
+                "alice",
+                "--generate-secret",
+                "--expires",
+                "1h",
+            ],
+            vec!["credential", "add", "alice", "--verifier", &verifier],
+            vec![
+                "credential",
+                "delete",
+                "alice",
+                "0123456789abcdef0123456789abcdef",
+            ],
+            vec![
+                "grant",
+                "alice",
+                "--route",
+                "postgres=read-write",
+                "--route",
+                "other=read-only",
+            ],
+            vec!["grant", "alice", "--none"],
+        ];
+        for args in valid {
+            assert!(
+                Cli::try_parse_from(["nunya", "principal"].into_iter().chain(args).chain([
+                    "--server",
+                    "http://127.0.0.1:8000",
+                    "--ca-file",
+                    "ca",
+                    "--principal",
+                    "admin",
+                    "--principal-secret-file",
+                    "secret",
+                    "--context",
+                    "admin",
+                ]))
+                .is_ok()
+            );
         }
-        for text in ["", "0s", "1d", "-2h", "1.5h", "18446744073709551615h", "é"] {
-            assert!(parse_ttl(text).is_err());
+        for args in [
+            vec![
+                "create",
+                "alice",
+                "--kind",
+                "person",
+                "--verifier",
+                &verifier,
+                "--generate-secret",
+            ],
+            vec![
+                "credential",
+                "add",
+                "alice",
+                "--verifier",
+                &verifier,
+                "--generate-secret",
+            ],
+            vec!["grant", "alice"],
+            vec!["grant", "alice", "--none", "--route", "postgres=read-only"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    ["nunya", "principal"]
+                        .into_iter()
+                        .chain(args)
+                        .chain(["--server", "http://127.0.0.1:8000"])
+                )
+                .is_err()
+            );
         }
+        assert!(
+            Cli::try_parse_from([
+                "nunya",
+                "connections",
+                "list",
+                "--server",
+                "http://127.0.0.1:8000"
+            ])
+            .is_ok()
+        );
     }
     #[test]
     fn commands() {
@@ -451,16 +474,17 @@ mod tests {
             vec!["nunya", "version"],
             vec!["nunya", "serve", "--config", "x"],
             vec!["nunya", "policy", "check", "--config", "x"],
-            vec!["nunya", "task", "open", "--config", "x", "--ttl", "30m"],
-            vec!["nunya", "task", "close", "--config", "x", "abc"],
-            vec!["nunya", "task", "list", "--config", "x"],
             vec!["nunya", "standing", "hash"],
             vec!["nunya", "key", "generate"],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
-        assert!(
-            Cli::try_parse_from(["nunya", "task", "open", "--config", "x", "--ttl", "0s"]).is_err()
-        );
+        for removed in [
+            vec!["nunya", "task", "open", "--config", "x", "--ttl", "30m"],
+            vec!["nunya", "task", "close", "--config", "x", "abc"],
+            vec!["nunya", "task", "list", "--config", "x"],
+        ] {
+            assert!(Cli::try_parse_from(removed).is_err());
+        }
     }
 }

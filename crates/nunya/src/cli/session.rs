@@ -266,7 +266,7 @@ impl ConnectionOpts {
     fn name(&self) -> &str {
         self.context.as_deref().unwrap_or("default")
     }
-    fn client(&self) -> Result<MgmtClient, HelperError> {
+    pub(super) fn client(&self) -> Result<MgmtClient, HelperError> {
         let credentials = if self.server.starts_with("unix:") {
             Credentials::None
         } else {

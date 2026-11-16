@@ -1921,3 +1921,156 @@ async fn helper_acquire_resume_scope_replacement_and_isolation() -> TransportRes
     drop(authority);
     finish_server(tx, server).await
 }
+
+#[tokio::test]
+async fn principal_cli_lifecycle() -> TransportResult {
+    use nunya::{
+        cli::{
+            principal::{self, CredentialOpts},
+            session::{AcquireOpts, ConnectionOpts, HelperStore, acquire_or_resume},
+        },
+        mgmt::{client::ClientError, server::spawn},
+    };
+    let mut f = Fixture::new();
+    let ctx = Arc::new(f.ctx.take().ok_or("missing fixture context")?);
+    let authority = ctx.authority.clone();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let server = spawn(ctx, &listener_section(false), &f.dir, rx).await?;
+    let admin = api_client(server.tcp_addr, "admin", "admin-private.secret");
+    let opts = CredentialOpts {
+        verifier: None,
+        generate_secret: true,
+    };
+    let issued = principal::create(
+        &admin,
+        "cli-principal",
+        PrincipalKind::Service,
+        false,
+        &opts,
+    )
+    .await?;
+    let id = issued.value.id;
+    let first_id = issued.value.credentials[0].id.clone();
+    let secret = issued.secret.ok_or("missing generated secret")?;
+    assert_eq!(secret.len(), 64);
+    assert!(!format!("{opts:?}").contains(secret.as_str()));
+    assert_eq!(principal::resolve(&admin, "cli-principal").await?, id);
+    assert_eq!(principal::resolve(&admin, &id.to_uppercase()).await?, id);
+    assert_eq!(
+        principal::resolve(&admin, "unknown")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "principal not found"
+    );
+    assert!(principal::list(&admin).await?.iter().any(|p| p.id == id));
+    assert_eq!(
+        principal::grant(
+            &admin,
+            &id,
+            &["postgres=read-only".into(), "postgres=read-write".into()]
+        )
+        .await
+        .unwrap_err()
+        .to_string(),
+        "duplicate route grant"
+    );
+    assert!(principal::show(&admin, &id).await?.grants.is_empty());
+    let invalid = CredentialOpts {
+        verifier: Some("private-invalid-verifier".into()),
+        generate_secret: false,
+    };
+    assert_eq!(
+        principal::credential_add(&admin, &id, &invalid, None)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "invalid SCRAM verifier"
+    );
+    let granted =
+        principal::grant(&admin, "cli-principal", &["postgres=read-write".into()]).await?;
+    assert_eq!(granted.grants[0].mode, Mode::ReadWrite);
+    let client = api_client(server.tcp_addr, "cli-principal", &secret);
+    let store = HelperStore::at(f.dir.join("principal-cli-helper"));
+    let acquire = AcquireOpts {
+        connection: ConnectionOpts {
+            server: format!("http://{}", server.tcp_addr),
+            ca_file: None,
+            principal: Some("cli-principal".into()),
+            principal_secret_file: None,
+            context: None,
+        },
+        route: "postgres".into(),
+        mode: Some(Mode::ReadWrite),
+        ttl: Some("30m".into()),
+        label: None,
+        new_scope: false,
+        rotate: false,
+        pg_host: "127.0.0.1".into(),
+        pg_port: 6432,
+        isolated: false,
+    };
+    let session = acquire_or_resume(&client, &store, &acquire).await?;
+    let second = principal::credential_add(&admin, "cli-principal", &opts, Some("1h")).await?;
+    assert!(second.value.expires_ms.is_some());
+    assert_eq!(
+        principal::credential_delete(&admin, &id, &first_id)
+            .await?
+            .state,
+        CredentialState::Revoked
+    );
+    assert_eq!(
+        client.sessions().await.unwrap_err(),
+        ClientError::Api {
+            status: 401,
+            code: "unauthorized".into()
+        }
+    );
+    let new_secret = second.secret.ok_or("missing second secret")?;
+    let new_client = api_client(server.tcp_addr, "cli-principal", &new_secret);
+    assert_eq!(
+        acquire_or_resume(&new_client, &store, &acquire)
+            .await?
+            .session_id,
+        session.session_id
+    );
+    assert_eq!(
+        principal::disable(&admin, "cli-principal").await?.state,
+        PrincipalState::Disabled
+    );
+    let sid = SessionId::from_hex(&session.session_id).ok_or("invalid session id")?;
+    assert_eq!(
+        authority
+            .session(sid)
+            .ok_or("missing session")?
+            .revoke_reason,
+        Some(EndReason::PrincipalDisabled)
+    );
+    assert_eq!(
+        new_client.sessions().await.unwrap_err(),
+        ClientError::Api {
+            status: 401,
+            code: "unauthorized".into()
+        }
+    );
+    assert_eq!(
+        principal::enable(&admin, &id).await?.state,
+        PrincipalState::Enabled
+    );
+    assert!(new_client.sessions().await.is_ok());
+    let connections = principal::connections_list(&admin).await?;
+    assert_eq!(connections.len(), 1);
+    let row = &connections[0];
+    assert_eq!(
+        (
+            row.id,
+            row.session.as_str(),
+            row.principal.as_str(),
+            row.route.as_str()
+        ),
+        (7, "session-id", "principal-id", "postgres")
+    );
+    assert!(principal::grant(&admin, &id, &[]).await?.grants.is_empty());
+    drop(authority);
+    finish_server(tx, server).await
+}
