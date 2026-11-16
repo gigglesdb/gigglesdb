@@ -126,7 +126,7 @@ pub enum OriginPolicy {
 #[derive(Clone)]
 pub struct SourcePositions {
     order: Arc<dyn PositionOrder + Send + Sync>,
-    policy: OriginPolicy,
+    pub(crate) policy: OriginPolicy,
 }
 impl fmt::Debug for SourcePositions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,7 +160,7 @@ impl SourcePositions {
             .map_err(ApplyError::Position)
     }
     /// Decode only where PostgreSQL's native origin API needs an LSN.
-    fn native_lsn(&self, position: &Position) -> Result<u64> {
+    pub(crate) fn native_lsn(&self, position: &Position) -> Result<u64> {
         self.validate(position)?;
         Ok(u64::from_be_bytes(
             position.bytes().try_into().expect("validated LSN"),
@@ -313,6 +313,15 @@ pub struct RecordEvidence {
     identity: (String, u64, TxnId, Position, ContentDigest),
 }
 impl RecordEvidence {
+    pub(crate) fn kind(&self) -> RecordKind {
+        self.kind
+    }
+    pub(crate) fn manifest_digest(&self) -> &ContentDigest {
+        &self.manifest_digest
+    }
+    pub(crate) fn previous_manifest_digest(&self) -> &ContentDigest {
+        &self.previous_manifest_digest
+    }
     pub(crate) fn new(
         kind: RecordKind,
         manifest_digest: ContentDigest,

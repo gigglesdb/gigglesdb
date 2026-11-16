@@ -420,7 +420,7 @@ impl<C: Connector> Destination for Executor<C> {
     }
 }
 
-async fn execute_statement(client: &Client, statement: &Statement) -> Result<u64> {
+pub(crate) async fn execute_statement(client: &Client, statement: &Statement) -> Result<u64> {
     let parameters: Vec<&(dyn ToSql + Sync)> =
         statement.parameters.iter().map(|p| p as _).collect();
     // Explicit types are required: a parameter's text/binary format belongs to
@@ -443,7 +443,7 @@ fn receipt_position(progress: &Progress) -> &[u8] {
     progress.position.bytes()
 }
 
-fn decode_progress(stream: &str, positions: &SourcePositions, row: &Row) -> Result<Progress> {
+pub(crate) fn decode_progress(stream: &str, positions: &SourcePositions, row: &Row) -> Result<Progress> {
     let sequence: String = row.try_get(0)?;
     let position: Vec<u8> = row.try_get(2)?;
     let digest: Vec<u8> = row.try_get(3)?;
