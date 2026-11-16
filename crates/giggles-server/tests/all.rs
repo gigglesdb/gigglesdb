@@ -227,3 +227,5 @@ mod fk_section_network;
 #[path = "replication_history.rs"] mod replication_history;
 
 #[path = "xact_status_network.rs"] mod xact_status_network;
+#[path = "isolation_anomalies.rs"]
+mod isolation_anomalies;
