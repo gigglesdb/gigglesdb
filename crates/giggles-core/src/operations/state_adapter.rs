@@ -13,6 +13,10 @@ pub(super) trait Context {
     }
     fn checkpoint(&self) -> std::result::Result<(), CoreError>;
     fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError>;
+    /// A view a read may name instead of a table; snapshot contexts have none.
+    fn resolve_view_engine(&mut self, _name: &str) -> std::result::Result<Option<TableDef>, CoreError> {
+        Ok(None)
+    }
     fn consume_complete_engine(
         &mut self,
         input: Self::Input,
@@ -59,6 +63,9 @@ impl Context for SqlSession {
     }
     fn resolve_table_engine(&mut self, name: &str) -> std::result::Result<TableDef, CoreError> {
         SqlSession::native_table_engine(self, name)
+    }
+    fn resolve_view_engine(&mut self, name: &str) -> std::result::Result<Option<TableDef>, CoreError> {
+        SqlSession::native_view_engine(self, name)
     }
     fn consume_complete_engine(
         &mut self,

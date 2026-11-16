@@ -233,15 +233,19 @@ impl MetadataSql<'_> {
         metadata.epoch = self.epoch;
         metadata.comments = self.comments.cloned().unwrap_or_default();
         metadata.views = self.views.into_iter().flatten().map(|(&id, v)| (id, relational::CatalogView {
-            table: relational::TableDef { id, name: v.name.clone(), primary_key: vec![],
-                columns: v.columns.iter().map(|c| relational::ColumnDef { id: c.id, name: c.name.clone(),
-                    data_type: c.storage_type.clone(), not_null: false }).collect() },
+            table: view_table(id, v),
             definition: format!("{};", v.select),
             type_oids: v.columns.iter().map(|c| c.pg_type_oid).collect(),
             typmods: v.columns.iter().map(|c| c.typmod).collect(),
         })).collect();
         Ok(metadata)
     }
+}
+// A view's relation descriptor, as SQL presents it; it has no primary key.
+fn view_table(id: u64, v: &SqlViewDef) -> relational::TableDef {
+    relational::TableDef { id, name: v.name.clone(), primary_key: vec![],
+        columns: v.columns.iter().map(|c| relational::ColumnDef { id: c.id, name: c.name.clone(),
+            data_type: c.storage_type.clone(), not_null: false }).collect() }
 }
 impl<'a> MetadataState<'a> {
     fn new(image: &'a relational::Relational, epoch: u64, domain: u128) -> Self {
@@ -2513,6 +2517,43 @@ impl SqlSession {
             let key = s.sql.resolve_relation_key(name, &self.search_path);
             s.sql.tables.get(&key).cloned()
                 .ok_or(CoreError::Sql(relational::SqlError::UnknownTable))
+        })
+    }
+    /// A native read target that names a view rather than a table, as SQL
+    /// resolves FROM names: its descriptor, or None when `name` is no view.
+    pub(crate) fn native_view_engine(&self, name: &str) -> Result<Option<relational::TableDef>, CoreError> {
+        self.inspect_metadata(|s| {
+            let key = s.sql.resolve_relation_key(name, &self.search_path);
+            if s.sql.tables.contains_key(&key) { return Ok(None); }
+            let Some(&(id, _)) = s.sql.view_names.get(&key) else { return Ok(None) };
+            Ok(s.sql.views.and_then(|views| views.get(&id)).map(|v| view_table(id, v)))
+        })
+    }
+    /// Rows of a current view through SQL's own expansion (`SELECT * FROM`),
+    /// in this transaction's snapshot. None when `view` is not a current view.
+    /// Like a native table, the relation must fit in one complete input.
+    pub(crate) fn native_view_rows_engine(&mut self, view: &relational::TableDef)
+        -> Result<Option<Vec<relational::SqlRow>>, CoreError> {
+        let Some(key) = self.native_view_key(view)? else { return Ok(None) };
+        let p = self.prepare_typed_read(vec![key.clone()], |domain, epoch|
+            relational::Prepared::from_relation_read(domain, epoch, key))?;
+        let rows = self.execute_bound_engine(&p, &[], None)?.rows;
+        if rows.len() > relational::MAX_ROWS { return Err(CoreError::Limit); }
+        Ok(Some(rows))
+    }
+    /// Whether `view` still describes a current view of this snapshot.
+    pub(crate) fn native_view_engine_current(&self, view: &relational::TableDef) -> Result<bool, CoreError> {
+        Ok(self.native_view_key(view)?.is_some())
+    }
+    // The schema-qualified key of the current view `view` describes exactly.
+    fn native_view_key(&self, view: &relational::TableDef) -> Result<Option<String>, CoreError> {
+        self.inspect_metadata(|s| {
+            let current = s.sql.views.and_then(|views| views.get(&view.id)).map(|v| view_table(view.id, v));
+            if current.as_ref() != Some(view) { return Ok(None); }
+            Ok(s.sql.view_names.iter().find(|(_, (id, _))| *id == view.id).map(|(key, _)| {
+                let (schema, name) = relational::split_key(key);
+                format!("{schema} {name}")
+            }))
         })
     }
     pub(crate) fn native_creation_key_engine(&self, name: &str) -> Result<String, CoreError> {

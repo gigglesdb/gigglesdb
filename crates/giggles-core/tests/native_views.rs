@@ -57,8 +57,11 @@ fn native_views_share_sql_lifecycle_dependencies_and_reopen() {
     let actual = s.describe_typed_read(read("v")).unwrap();
     let expected = s.describe(&prepared).unwrap();
     assert_eq!((actual.columns, actual.type_oids, actual.typmods), (expected.columns, expected.type_oids, expected.typmods));
-    // The native table adapter does not read views; since profile 0.18 an unresolved native table is 42P01.
-    assert_eq!(engine.execute(&operations::Request::Read { table: "v".into(), filter: None, order: vec![], limit: None, projection: vec![] }, &operations::Bindings::new()).unwrap_err().sqlstate(), Some("42P01"));
+    // Native reads of a view read SQL's expansion of it (PG 18.6 reads views in FROM).
+    let bare = engine.execute(&operations::Request::Read { table: "v".into(), filter: None, order: vec![], limit: None, projection: vec![] }, &operations::Bindings::new()).unwrap();
+    let expected = s.execute("SELECT * FROM v", &[], None).unwrap();
+    assert_eq!((bare.columns, bare.rows.into_iter().map(|r| r.values).collect::<Vec<_>>()),
+        (expected.columns, expected.rows.into_iter().map(|r| r.values).collect::<Vec<_>>()));
     engine.execute_catalog(&create("w", "v")).unwrap();
     assert_eq!(engine.execute_catalog(&drop_view("v", false)), Err(state("2BP01")));
     s.execute("BEGIN", &[], None).unwrap();

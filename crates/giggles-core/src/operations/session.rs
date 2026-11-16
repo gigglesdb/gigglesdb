@@ -13,14 +13,7 @@ impl SqlSession {
             },
             |session| {
                 let (table, operation) = bind_request(session, request, bindings)?;
-                operation.check_input_cap()?;
-                let input = session
-                    .complete_table_engine(&table)
-                    .map_err(|error| match error {
-                        CoreError::Limit => Error::Limit,
-                        other => core(other),
-                    })?;
-                run(session, &table, operation, input, None)
+                run_complete(session, &table, operation, None)
             },
         )
     }

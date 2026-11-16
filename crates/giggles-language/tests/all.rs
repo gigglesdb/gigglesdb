@@ -51,6 +51,8 @@ mod native_schema_parity;
 mod native_sqlstate_parity;
 #[path = "native_view_parity.rs"]
 mod native_view_parity;
+#[path = "parity_view_reads.rs"]
+mod parity_view_reads;
 #[path = "native_view_read_parity.rs"]
 mod native_view_read_parity;
 #[path = "once.rs"]

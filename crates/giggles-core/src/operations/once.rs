@@ -285,17 +285,7 @@ impl Engine {
                     std::slice::from_ref(&table),
                     intent::AcceptedOutput::Operation(&columns),
                 )?;
-                let result = (|| {
-                    operation.check_input_cap()?;
-                    let input =
-                        session
-                            .complete_table_engine(&table)
-                            .map_err(|error| match error {
-                                CoreError::Limit => Error::Limit,
-                                other => core(other),
-                            })?;
-                    run(&mut session, &table, operation, input, None)
-                })();
+                let result = run_complete(&mut session, &table, operation, None);
                 let description = OnceDescription {
                     catalog_epoch,
                     output: OnceSchema::Operation(columns),

@@ -1878,7 +1878,13 @@ impl Prepared {
     }
     /// Construct an unbound read; callers still perform their normal authorization.
     pub fn from_single_source_read(domain: u128, epoch: u64, read: SingleSourceRead) -> R<Self> {
-        let query = query::Query::from_single_source_read(read)?;
+        Self::typed_query(domain, epoch, query::Query::from_single_source_read(read)?)
+    }
+    /// Every column of one catalog relation key, as `SELECT * FROM` it.
+    pub(crate) fn from_relation_read(domain: u128, epoch: u64, key: String) -> R<Self> {
+        Self::typed_query(domain, epoch, query::typed_read::lower_relation(key)?)
+    }
+    fn typed_query(domain: u128, epoch: u64, query: query::Query) -> R<Self> {
         let tables = query.authorization_tables()?;
         let mut prepared = Self::engine(Statement::Query(query), domain, epoch);
         for table in tables {

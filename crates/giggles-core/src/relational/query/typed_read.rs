@@ -251,6 +251,15 @@ fn lower_single(read: SingleSourceRead, budget: &mut Budget, depth: usize) -> R<
     lower_sources(budget, depth, vec![Source { alias: read.table.rsplit('.').next().unwrap().into(), name: read.table }],
         None, vec![], read.projection, read.filter)
 }
+/// `SELECT * FROM` one catalog relation key; native reads of views use it.
+pub(in crate::relational) fn lower_relation(key: String) -> R<Query> {
+    let (schema, alias) = split_key(&key);
+    ident(schema)?;
+    ident(alias)?;
+    let alias = alias.to_owned();
+    Ok(Query { explain: false, sources: vec![Source { name: key, alias }], joins: vec![],
+        items: vec![(Item::Star, None)], predicates: vec![], filter: None, order: vec![], limit: None })
+}
 pub(in crate::relational) fn lower_join(read: TwoSourceRead) -> R<Query> {
     let sources = [read.left, read.right].into_iter().map(|s| {
         name(&s.alias)?;

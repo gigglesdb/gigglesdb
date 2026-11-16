@@ -378,7 +378,7 @@ pub(super) fn bind_transaction(
             }
             TransactionStep::Execute(request) | TransactionStep::Let { request, .. } => {
                 let name = request.table()?;
-                bound_table = session.native_table_engine(&native_relation_key(name)).map_err(core)?;
+                bound_table = resolve_relation(session, &native_relation_key(name), request)?;
                 let table = &bound_table;
                 if table.hidden_rowid().is_some() {
                     return Err(Error::Unsupported);
@@ -514,14 +514,16 @@ impl Engine {
             let description = &prepared.description;
             let (domain, epoch) = session.snapshot_identity_engine().map_err(core)?;
             let (_, tables) = session.catalog_engine().map_err(core)?;
-            if description.contract_version != ENGINE_CONTRACT_VERSION
+            let mut stale = description.contract_version != ENGINE_CONTRACT_VERSION
                 || domain != description.database_domain
-                || epoch != description.catalog_epoch
-                || description
-                    .tables
-                    .iter()
-                    .any(|expected| !tables.iter().any(|table| table == expected))
-            {
+                || epoch != description.catalog_epoch;
+            for expected in &description.tables {
+                // Only reads bind a view; its descriptor must still be current.
+                stale = stale || (!tables.iter().any(|table| table == expected)
+                    && !(expected.primary_key.is_empty()
+                        && session.native_view_engine_current(expected).map_err(core)?));
+            }
+            if stale {
                 return Err(core(CoreError::Sql(SqlError::StaleSchema)));
             }
             Ok(prepared.clone())
@@ -719,17 +721,10 @@ pub(super) fn run_transaction(
                 let mut operation = operation.clone();
                 operation.resolve_locals(&locals, &mut remaining_values)?;
                 let table = &plan.description.tables[*table];
-                let input = session
-                    .complete_table_engine(table)
-                    .map_err(|error| match error {
-                        CoreError::Limit => Error::Limit,
-                        other => core(other),
-                    })?;
-                let outcome = run(
+                let outcome = run_complete(
                     session,
                     table,
                     operation,
-                    input,
                     if *retain { Some(&mut retained) } else { None },
                 )?;
                 summaries.push(StepSummary {

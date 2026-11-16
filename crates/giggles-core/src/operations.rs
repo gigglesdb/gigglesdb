@@ -512,7 +512,8 @@ impl Engine {
             if description.contract_version != ENGINE_CONTRACT_VERSION
                 || domain != description.database_domain
                 || epoch != description.catalog_epoch
-                || !tables.iter().any(|table| table == &description.table)
+                || !(tables.iter().any(|table| table == &description.table)
+                    || current_view(session, &description.table, &prepared.operation)?)
             {
                 return Err(core(CoreError::Sql(SqlError::StaleSchema)));
             }
@@ -529,14 +530,7 @@ impl Engine {
         let staged = (|| {
             // Catalog binding and every read use the same transaction snapshot.
             let (table, operation) = bind(&mut session)?;
-            operation.check_input_cap()?;
-            let input = session
-                .complete_table_engine(&table)
-                .map_err(|error| match error {
-                    CoreError::Limit => Error::Limit,
-                    other => core(other),
-                })?;
-            run(&mut session, &table, operation, input, None)
+            run_complete(&mut session, &table, operation, None)
         })();
         let outcome = match staged {
             Ok(v) => v,
@@ -589,7 +583,10 @@ impl SqlSession {
 }
 
 fn read_page(session: &mut SqlSession, request: &Request, after: Option<&[Value]>, bindings: &Bindings) -> Result<Page> {
-    let (table, operation) = bind_request(session, request, bindings)?;
+    // Keyset pages need a primary key, so they read tables only.
+    let key = native_relation_key(request.table()?);
+    let table = session.resolve_table_engine(&key).map_err(core)?;
+    let (table, operation) = bind_table(table, request, bindings)?;
     let Request::Read { order: requested, .. } = request else { return Err(Error::Unsupported); };
     let Operation::Read { filter, order, limit, projection } = operation else { return Err(Error::Unsupported); };
     if requested.len() < table.primary_key.len()
@@ -692,7 +689,34 @@ fn bind_request(
     bindings: &Bindings,
 ) -> Result<(TableDef, Operation)> {
     let key = native_relation_key(request.table()?);
-    let table = session.resolve_table_engine(&key).map_err(core)?;
+    let table = resolve_relation(session, &key, request)?;
+    bind_table(table, request, bindings)
+}
+/// Resolve a request's target. Reads may name a view, as SQL FROM may; every
+/// other request, and any unknown name, keeps the table resolution and 42P01.
+fn resolve_relation(session: &mut impl Context, key: &str, request: &Request) -> Result<TableDef> {
+    match session.resolve_table_engine(key) {
+        Err(CoreError::Sql(SqlError::UnknownTable))
+            if matches!(request, Request::Read { .. } | Request::ReadExpressions { .. }) =>
+        {
+            session.resolve_view_engine(key)
+                .and_then(|view| view.ok_or(CoreError::Sql(SqlError::UnknownTable)))
+        }
+        other => other,
+    }
+    .map_err(core)
+}
+/// Whether a bound read's descriptor is a current view (its prepared fence).
+fn current_view(session: &mut SqlSession, table: &TableDef, operation: &Operation) -> Result<bool> {
+    Ok(table.primary_key.is_empty()
+        && matches!(operation, Operation::Read { .. } | Operation::ReadExpressions { .. })
+        && session.native_view_engine_current(table).map_err(core)?)
+}
+fn bind_table(
+    table: TableDef,
+    request: &Request,
+    bindings: &Bindings,
+) -> Result<(TableDef, Operation)> {
     if table.hidden_rowid().is_some() {
         return Err(Error::Unsupported);
     }
@@ -2162,6 +2186,125 @@ fn project_returning<'a>(
         })
         .collect()
 }
+/// Filter, order, page and project complete read input: a table's rows, or
+/// the rows of SQL's expansion of a view.
+fn read_rows<C: Context>(
+    s: &mut C,
+    t: &TableDef,
+    op: Operation,
+    rows: Vec<SqlRow>,
+    mut retained: Option<&mut usize>,
+) -> Result<Outcome> {
+    let mut out = Outcome::default();
+    match op {
+        Operation::Read {
+            filter,
+            order,
+            limit,
+            projection,
+        } => {
+            let mut rows = matching_rows(s, rows, &filter)?;
+            sort(&mut rows, &order);
+            out.matched = rows.len();
+            out.complete = rows.len() <= limit;
+            out.columns = projection
+                .iter()
+                .map(|i| t.columns[*i].name.clone())
+                .collect();
+            for row in rows.iter().take(limit) {
+                s.checkpoint().map_err(core)?;
+                for index in &projection {
+                    charge_retained(&mut retained, &row.values[*index])?;
+                }
+            }
+            out.rows = rows
+                .into_iter()
+                .take(limit)
+                .map(|r| SqlRow {
+                    version: r.version,
+                    values: projection.iter().map(|i| r.values[*i].clone()).collect(),
+                })
+                .collect();
+        }
+        Operation::ReadExpressions {
+            filter,
+            order,
+            limit,
+            projection,
+        } => {
+            let mut rows = matching_rows(s, rows, &filter)?;
+            sort(&mut rows, &order);
+            out.matched = rows.len();
+            out.complete = rows.len() <= limit;
+            out.columns = projection
+                .iter()
+                .map(|item| item.column.name.clone())
+                .collect();
+            let mut remaining = crate::relational::MAX_RESULT_BYTES;
+            for (index, row) in rows.iter().enumerate() {
+                s.checkpoint().map_err(core)?;
+                let mut values = Vec::new();
+                for item in &projection {
+                    let value = item.expression.eval(&row.values)?;
+                    // Charge all eligible output, including rows beyond the
+                    // page. Large borrowed leaves are admitted before cloning.
+                    charge_value(&mut remaining, value.as_ref())?;
+                    values.push(value);
+                }
+                if index < limit {
+                    for value in &values {
+                        charge_retained(&mut retained, value)?;
+                    }
+                    out.rows.push(SqlRow {
+                        version: row.version,
+                        values: values.into_iter().map(Cow::into_owned).collect(),
+                    });
+                }
+            }
+        }
+        _ => return Err(Error::Unsupported),
+    }
+    Ok(out)
+}
+/// A read of a view: its rows come from SQL's own view expansion in the same
+/// transaction snapshot, then native evaluation applies as for a table.
+fn run_view(
+    s: &mut SqlSession,
+    t: &TableDef,
+    mut op: Operation,
+    rows: Vec<SqlRow>,
+    retained: Option<&mut usize>,
+) -> Result<Outcome> {
+    match &mut op {
+        Operation::Read { filter, .. } | Operation::ReadExpressions { filter, .. } => {
+            filter.coerce_equality(s, t)?;
+        }
+        _ => return Err(Error::Unsupported),
+    }
+    read_rows(s, t, op, rows, retained)
+}
+/// Run a bound operation on its complete input. A table supplies certified
+/// complete rows; a read bound to a view descriptor reads the view's rows.
+fn run_complete(
+    session: &mut SqlSession,
+    table: &TableDef,
+    operation: Operation,
+    retained: Option<&mut usize>,
+) -> Result<Outcome> {
+    operation.check_input_cap()?;
+    let limit = |error| match error {
+        CoreError::Limit => Error::Limit,
+        other => core(other),
+    };
+    if table.primary_key.is_empty()
+        && matches!(operation, Operation::Read { .. } | Operation::ReadExpressions { .. })
+        && let Some(rows) = session.native_view_rows_engine(table).map_err(limit)?
+    {
+        return run_view(session, table, operation, rows, retained);
+    }
+    let input = session.complete_table_engine(table).map_err(limit)?;
+    run(session, table, operation, input, retained)
+}
 fn run<C: Context>(
     s: &mut C,
     t: &TableDef,
@@ -2258,71 +2401,12 @@ fn run<C: Context>(
         Operation::InsertExpressions { .. } | Operation::Upsert { .. } => {
             return Err(Error::Unsupported);
         }
-        Operation::Read {
-            filter,
-            order,
-            limit,
-            projection,
-        } => {
-            let rows = secondary_selector::read(s, t, &filter, rows)?;
-            let mut rows = matching_rows(s, rows, &filter)?;
-            sort(&mut rows, &order);
-            out.matched = rows.len();
-            out.complete = rows.len() <= limit;
-            out.columns = projection
-                .iter()
-                .map(|i| t.columns[*i].name.clone())
-                .collect();
-            for row in rows.iter().take(limit) {
-                s.checkpoint().map_err(core)?;
-                for index in &projection {
-                    charge_retained(&mut retained, &row.values[*index])?;
-                }
-            }
-            out.rows = rows
-                .into_iter()
-                .take(limit)
-                .map(|r| SqlRow {
-                    version: r.version,
-                    values: projection.iter().map(|i| r.values[*i].clone()).collect(),
-                })
-                .collect();
-        }
-        Operation::ReadExpressions {
-            filter,
-            order,
-            limit,
-            projection,
-        } => {
-            let mut rows = matching_rows(s, rows, &filter)?;
-            sort(&mut rows, &order);
-            out.matched = rows.len();
-            out.complete = rows.len() <= limit;
-            out.columns = projection
-                .iter()
-                .map(|item| item.column.name.clone())
-                .collect();
-            let mut remaining = crate::relational::MAX_RESULT_BYTES;
-            for (index, row) in rows.iter().enumerate() {
-                s.checkpoint().map_err(core)?;
-                let mut values = Vec::new();
-                for item in &projection {
-                    let value = item.expression.eval(&row.values)?;
-                    // Charge all eligible output, including rows beyond the
-                    // page. Large borrowed leaves are admitted before cloning.
-                    charge_value(&mut remaining, value.as_ref())?;
-                    values.push(value);
-                }
-                if index < limit {
-                    for value in &values {
-                        charge_retained(&mut retained, value)?;
-                    }
-                    out.rows.push(SqlRow {
-                        version: row.version,
-                        values: values.into_iter().map(Cow::into_owned).collect(),
-                    });
-                }
-            }
+        read @ (Operation::Read { .. } | Operation::ReadExpressions { .. }) => {
+            let rows = match &read {
+                Operation::Read { filter, .. } => secondary_selector::read(s, t, filter, rows)?,
+                _ => rows,
+            };
+            return read_rows(s, t, read, rows, retained);
         }
         Operation::Insert { columns, values, returning } => {
             let values = normalize_insert(s.session()?, t, &columns, values)?;

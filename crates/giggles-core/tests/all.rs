@@ -427,6 +427,8 @@ mod native_alter_table;
 #[path = "parity_legacy_populated_ddl.rs"] mod parity_legacy_populated_ddl;
 #[path = "native_views.rs"]
 mod native_views;
+#[path = "parity_view_reads.rs"]
+mod parity_view_reads;
 
 #[path = "qualified_dml_targets.rs"] mod qualified_dml_targets;
 
