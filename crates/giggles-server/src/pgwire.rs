@@ -919,6 +919,8 @@ struct Portal {
     params: Vec<Value>,
     formats: Vec<u16>,
     result: Option<SqlResult>,
+    // v2 RETURNING rows past the in-memory threshold, read once in order.
+    spilled: Option<giggles_core::relational::spill::SpilledRows>,
     cursor: Option<giggles_core::Cursor>,
     catalog_params: Vec<giggles_pg_catalog::Value>,
     catalog_result: Option<giggles_pg_catalog::ResultSet>,
@@ -1548,6 +1550,7 @@ impl State {
                         params,
                         formats: output,
                         result: None,
+                        spilled: None,
                         cursor: None,
                         catalog_params,
                         catalog_result: None,
@@ -1910,12 +1913,13 @@ impl State {
                     if !matches!(command, "BEGIN" | "COMMIT" | "ROLLBACK") {
                         self.settings.queried = true;
                     }
-                    let result = if command == "BEGIN" && self.implicit {
+                    let (result, spilled) = if command == "BEGIN" && self.implicit {
                         self.implicit = false;
-                        SqlResult::default()
+                        (SqlResult::default(), None)
                     } else {
-                        self.diagnostic
-                            .core(session.execute_prepared(prepared, &p.params))?
+                        let (result, spilled) = giggles_core::relational::spill::streaming(
+                            || session.execute_prepared(prepared, &p.params));
+                        (self.diagnostic.core(result)?, spilled)
                     };
                     if !session.in_transaction() {
                         self.implicit = false;
@@ -1931,6 +1935,31 @@ impl State {
                     }
                     // Admit retained bytes before caching OR appending any rows.
                     p.result = Some(result);
+                    p.spilled = spilled;
+                }
+                if let Some(spilled) = p.spilled.as_mut() {
+                    // Stream spilled rows like a cursor; an exhausted handle replays completion.
+                    let mut remaining = if max == 0 { usize::MAX } else { max as usize };
+                    while remaining > 0 && !spilled.is_empty() {
+                        let chunk = spilled.by_ref().take(remaining.min(CURSOR_ROWS))
+                            .collect::<Result<Vec<_>, _>>();
+                        let chunk = SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() };
+                        let count = chunk.rows.len();
+                        rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            &chunk, &p.s.d, &p.formats, 0, count, out)?;
+                        p.at += count;
+                        remaining -= count;
+                        flush_output(&self.output, out)?;
+                    }
+                    if spilled.is_empty() {
+                        complete(prepared.command(), p.result.as_ref().expect("spilled result"), out)?;
+                    } else {
+                        frame(b's', &[], out)?;
+                    }
+                    if was_transaction && !session.in_transaction() {
+                        self.portals.clear();
+                    }
+                    return Ok(true);
                 }
                 let result = p.result.as_ref().unwrap();
                 let end = if max == 0 {

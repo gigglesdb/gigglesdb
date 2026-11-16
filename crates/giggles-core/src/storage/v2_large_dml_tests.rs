@@ -131,7 +131,7 @@ fn failure_on_last_page_rolls_back_200_000_updates() {
 }
 
 #[test]
-fn returning_exceeds_legacy_row_cap_and_keeps_output_budget() {
+fn returning_exceeds_legacy_row_cap_and_spills_past_output_budget() {
     let f = super::large_ddl::large_table(2050, false, true);
     let result = f
         .admin()
@@ -146,15 +146,16 @@ fn returning_exceeds_legacy_row_cap_and_keeps_output_budget() {
         .execute("DELETE FROM t RETURNING id", &[], None)
         .unwrap();
     assert_eq!(result.rows.len(), 2050);
+    // R2-PGLIMITS-2: v2 RETURNING spills past 1 MiB instead of failing 54000.
     let f = super::large_ddl::large_table(20_000, false, false);
-    let before = row(&f, 0).unwrap();
-    assert_eq!(
-        f.admin()
-            .sql_session()
-            .execute("UPDATE t SET v = v + 1 RETURNING id, v", &[], None),
-        Err(CoreError::Sql(SqlError::Limit))
-    );
-    assert_eq!(row(&f, 0).unwrap(), before);
+    let result = f
+        .admin()
+        .sql_session()
+        .execute("UPDATE t SET v = v + 1 RETURNING id, v", &[], None)
+        .unwrap();
+    assert_eq!((result.affected, result.rows.len()), (20_000, 20_000));
+    let ids = result.rows.iter().map(|r| r.values[0].clone()).collect::<Vec<_>>();
+    assert_eq!(ids, (0..20_000).map(Int).collect::<Vec<_>>());
 }
 
 fn count(f: &Fixture, name: &str) -> usize {

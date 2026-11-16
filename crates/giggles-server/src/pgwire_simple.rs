@@ -489,10 +489,22 @@ impl State {
                     catalog_complete(count, out)?;
                     return Ok(());
                 }
-                let result = self.diagnostic.core(session.execute_prepared(&p, &[]))?;
+                let (result, spilled) = giggles_core::relational::spill::streaming(
+                    || session.execute_prepared(&p, &[]));
+                let result = self.diagnostic.core(result)?;
                 self.settings
                     .transaction(was_transaction, session.in_transaction(), p.command());
-                if !d.columns.is_empty() {
+                if let Some(mut spilled) = spilled {
+                    // v2 RETURNING past the in-memory threshold streams from its spill file.
+                    row_description(&d, &[], out)?;
+                    while !spilled.is_empty() {
+                        let chunk = spilled.by_ref().take(CURSOR_ROWS).collect::<Result<Vec<_>, _>>();
+                        let chunk = SqlResult { rows: self.diagnostic.core(chunk)?, ..SqlResult::default() };
+                        rows(&self.settings.current, session.zone().unwrap_or(SessionZone::Fixed(0)),
+                            &chunk, &d, &[], 0, chunk.rows.len(), out)?;
+                        flush_output(&self.output, out)?;
+                    }
+                } else if !d.columns.is_empty() {
                     row_description(&d, &[], out)?;
                     rows(
                         &self.settings.current,

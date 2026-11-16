@@ -3572,7 +3572,19 @@ impl SqlSession {
     ) -> Result<relational::SqlResult, CoreError> {
         self.execute_bound_clocked(p, params, expected_version, None)
     }
+    // A spilled v2 RETURNING result is materialised here unless the caller
+    // streams it (`relational::spill::streaming`); errors drop the spill.
     fn execute_bound_clocked(
+        &mut self,
+        p: &relational::Prepared,
+        params: &[relational::Value],
+        expected_version: Option<u64>,
+        clock: Option<&relational::clock::ExecutionClock>,
+    ) -> Result<relational::SqlResult, CoreError> {
+        relational::spill::clear();
+        relational::spill::settle(self.execute_bound_clocked_once(p, params, expected_version, clock))
+    }
+    fn execute_bound_clocked_once(
         &mut self,
         p: &relational::Prepared,
         params: &[relational::Value],
@@ -3582,7 +3594,7 @@ impl SqlSession {
         if p.schema_context_differs(&self.search_path, &self.schema_user) {
             let mut bound = p.clone();
             bound.set_schema_context(self.search_path.clone(), self.schema_user.clone());
-            return self.execute_bound_clocked(&bound, params, expected_version, clock);
+            return self.execute_bound_clocked_once(&bound, params, expected_version, clock);
         }
         if let Backend::V2(db) = &self.admin.inner.backend {
             let db = db.clone();

@@ -267,7 +267,7 @@ pub(super) fn execute(
     let mut pending = deferred.as_deref().cloned().unwrap_or_default();
     let mut immediate = DeferralState::default();
     let mut checks = scan::Retention::new(scan::retention_limit());
-    let mut output = scan::Retention::new(MAX_RESULT_BYTES);
+    let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
     let point_keys = keys.is_none().then(|| point_keys(state, prepared, params, &unique)).flatten();
     // External UNIQUE witnesses are checked after each old page. Combining keys
     // can mask that error with a later CHECK, and even one row's RETURNING can
@@ -304,13 +304,8 @@ pub(super) fn execute(
             return Err(CoreError::Sql(SqlError::Limit));
         }
         state.next_version = page.next_version;
-        for row in &batch.rows {
-            output
-                .charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?)
-                .map_err(CoreError::Sql)?;
-        }
         result.affected += batch.affected;
-        result.rows.extend(batch.rows);
+        output.extend(batch.rows)?;
         for (key, new) in &page.rows[&table.id] {
             for c in state.ext.constraints.get(&table.id).into_iter().flatten() {
                 let ConstraintKind::ForeignKey { columns, deferral, .. } = &c.kind else { continue; };
@@ -331,6 +326,7 @@ pub(super) fn execute(
     paged_pending(state, &mut immediate, &[], false, sink)?;
     if deferred.is_none() { paged_pending(state, &mut pending, &[], false, sink)?; }
     if let Some(deferred) = deferred { *deferred = pending; }
+    output.finish(&mut result)?;
     Ok(result)
 }
 
@@ -417,7 +413,7 @@ pub(super) fn cascade(
     let first_version = state.next_version;
     let mut work = ActionWork { queue: std::collections::VecDeque::new(),
         retention: scan::Retention::new(scan::retention_limit()), visited: BTreeSet::new(), pending, immediate: DeferralState::default() };
-    let mut output = scan::Retention::new(MAX_RESULT_BYTES);
+    let mut output = spill::RowBuffer::new(std::mem::take(&mut result.rows))?;
     let candidates = if !pk_move && keys.is_none() {
         searched::target(prepared).and_then(|q| q.mutation_primary_keys(state, &table, params))
             .map(|keys| sink.mutation_candidates(&table, &keys)).transpose()?.flatten()
@@ -451,11 +447,8 @@ pub(super) fn cascade(
             let mut events = Vec::new();
             let batch = page.execute_statement_inner(prepared, params, None,
                 || crate::cancellation::check().is_err(), clock, None, &mut events).map_err(CoreError::Sql)?;
-            for row in &batch.rows {
-                output.charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?).map_err(CoreError::Sql)?;
-            }
             result.affected += batch.affected;
-            result.rows.extend(batch.rows);
+            output.extend(batch.rows)?;
             state.next_version = page.next_version;
             work.publish(state, sink, &table, rows, page.rows.remove(&table.id).unwrap(), events, None, &descriptors, version_end)?;
         }
@@ -525,6 +518,7 @@ pub(super) fn cascade(
     paged_pending(state, &mut work.immediate, &[], false, sink)?;
     if deferred.is_none() { paged_pending(state, &mut work.pending, &[], false, sink)?; }
     if let Some(d) = deferred { *d = work.pending; }
+    output.finish(&mut result)?;
     Ok(result)
 }
 

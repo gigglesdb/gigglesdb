@@ -487,3 +487,5 @@ mod isolation_levels;
 #[path = "task_labels.rs"] mod task_labels;
 #[path = "v2_sum_avg_unbounded.rs"]
 mod v2_sum_avg_unbounded;
+#[path = "v2_returning_spill.rs"]
+mod v2_returning_spill;

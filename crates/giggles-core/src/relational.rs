@@ -47,6 +47,7 @@ pub(crate) mod cursor;
 mod returning;
 pub(crate) mod row_sink;
 pub(crate) mod scan;
+pub mod spill;
 mod searched;
 #[cfg(test)]
 mod source_plumbing_tests;

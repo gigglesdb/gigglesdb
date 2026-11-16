@@ -49,7 +49,7 @@ pub(super) fn execute(
     let mut template = prepared.clone();
     template.parameter_types = prepared.describe(state).map_err(CoreError::Sql)?.parameters.into_iter().map(Some).collect();
     template.statement = Statement::InsertMulti(Box::new(insert.batch(0, 0)));
-    let mut output = scan::Retention::new(MAX_RESULT_BYTES);
+    let mut output = spill::RowBuffer::new(Vec::new())?;
     let mut result = SqlResult::default();
     let mut after = None;
     let mut start = 0;
@@ -103,14 +103,9 @@ pub(super) fn execute(
             deferred.as_deref_mut(),
         )?;
         state.next_version = page.next_version;
-        for row in &part.rows {
-            output
-                .charge(searched::retained_row_bytes(&[], row).map_err(CoreError::Sql)?)
-                .map_err(CoreError::Sql)?;
-        }
         result.columns = part.columns;
         result.affected += part.affected;
-        result.rows.extend(part.rows);
+        output.extend(part.rows)?;
         if done {
             break;
         }
@@ -118,6 +113,7 @@ pub(super) fn execute(
     if foreign_keys {
         validate_append(state, &table, first_version, state.next_version, sink, deferred, clock)?;
     }
+    output.finish(&mut result)?;
     Ok(result)
 }
 
