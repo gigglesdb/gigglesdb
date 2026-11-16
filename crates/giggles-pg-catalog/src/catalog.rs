@@ -410,7 +410,7 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("inherit_option", T::Bool),
             ("set_option", T::Bool),
         ],
-        "pg_timezone_names" => &[("name", T::Text), ("is_dst", T::Bool)],
+        "pg_timezone_names" => &[("name", T::Text), ("abbrev", T::Text), ("utc_offset", T::Interval), ("is_dst", T::Bool)],
         "pg_timezone_abbrevs" => &[("abbrev", T::Text), ("is_dst", T::Bool)],
         "pg_tablespace" => &[
             ("oid", T::Oid),
@@ -447,7 +447,7 @@ fn storage_schema(name: &str) -> Option<Vec<Field>> {
             ("umserver", T::Oid),
             ("umoptions", T::TextArray),
         ],
-        // No PostgreSQL lock manager or assigned transaction xid is exposed.
+        // Relation locks come from the engine; transaction xid locks are not exposed.
         "pg_locks" => &[
             ("locktype", T::Text),
             ("database", T::Oid),
@@ -1540,8 +1540,23 @@ pub(crate) fn build(snapshot: &CatalogSnapshot) -> R<BTreeMap<String, Relation>>
             add("pg_shadow", row);
         }
     }
-    // No timezone conversion database exists. Startup timezone presentation
-    // labels do not establish a PostgreSQL timezone catalog.
+    let now = snapshot.timezone_now.unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |v| v.as_secs() as i64)
+    });
+    for name in giggles_pg_types::temporal::TIMEZONE_NAMES.lines() {
+        let (abbrev, seconds, dst) = giggles_pg_types::temporal::timezone_info(name, now)
+            .map_err(|_| Error::InvalidSnapshot)?;
+        let sign = if seconds < 0 { "-" } else { "" };
+        let seconds = seconds.unsigned_abs();
+        let interval = format!("{sign}{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+        add("pg_timezone_names", vec![s(name), s(&abbrev), s(&interval), B(dst)]);
+    }
+    for (txn, table, pid, mode) in &snapshot.table_locks {
+        add("pg_locks", vec![s("relation"), I(16384), I(i64::from(table_oid(*table)?)),
+            N, N, N, N, N, N, N, s(&format!("{pid}/{txn}")), I(i64::from(*pid)),
+            s(mode), B(true), B(false), N]);
+    }
     // Catalog relations are genuine virtual tables, with their actual columns below.
     for &name in known_names() {
         let oid = relation_oid(name).unwrap() as i64;

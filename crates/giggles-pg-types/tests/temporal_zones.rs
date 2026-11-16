@@ -8,7 +8,7 @@ fn local(s: &str) -> Timestamp {
 }
 #[test]
 fn explicit_context_and_limits() {
-    assert_eq!(TZDATA_VERSION, "2025b");
+    assert_eq!(TZDATA_VERSION, "2026f");
     let z = SessionZone::named("America/New_York").unwrap();
     for (s, out) in [
         ("2024-03-10 02:30", "2024-03-10 07:30:00+00"),

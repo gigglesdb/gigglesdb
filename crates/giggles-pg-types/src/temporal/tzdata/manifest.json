@@ -1,5 +1,7 @@
 {
-  "version": "2025b",
+  "version": "2026f",
+  "package": "2026f-0+deb13u1",
+  "source": "postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42",
   "files": [
     {
       "name": "Africa/Abidjan",
@@ -69,7 +71,7 @@
     {
       "name": "Africa/Casablanca",
       "file": "13.tzif",
-      "sha256": "e11a956f0fc5dd9b9ca29202da2bc027c583c23e7044e0c007aeed0697577200"
+      "sha256": "a7f132b9488727f34030a78a111d9b84f5e0bbb8f56c6eb83e26f26730394171"
     },
     {
       "name": "Africa/Ceuta",
@@ -104,7 +106,7 @@
     {
       "name": "Africa/El_Aaiun",
       "file": "20.tzif",
-      "sha256": "516082a902c9c5df2ab13630f36933f56d6cbb05b94d1827670df5b03583cf6d"
+      "sha256": "d9b5d8cf88070b1958cfef9a9bedb8fc252f8cbae64a29dd2b3690f8f58e96d1"
     },
     {
       "name": "Africa/Freetown",
@@ -269,12 +271,12 @@
     {
       "name": "America/Adak",
       "file": "53.tzif",
-      "sha256": "201d4387025000a6e13c9f631cb7fccd6e4369dec7224052f9d86feb81353a53"
+      "sha256": "9d767d4f8dfffee4fdf29e594a8552a41aa77d41cdb4a2e5f7687c94b5699e54"
     },
     {
       "name": "America/Anchorage",
       "file": "54.tzif",
-      "sha256": "a190353523d2d8159dca66299c21c53bc0656154be965e4a2e0d84cfd09b113b"
+      "sha256": "385fe1232365859f607e890bbc1b37bcac6c2d13932ecf8cee82ed76ee156043"
     },
     {
       "name": "America/Anguilla",
@@ -289,7 +291,7 @@
     {
       "name": "America/Araguaina",
       "file": "57.tzif",
-      "sha256": "1babfdc18159f040785907c8b2a45b6e288a7766f6ee3ed9b797458c16f3c76a"
+      "sha256": "12f374d7188f5df06fa84f506598a1631dc2d619af10e6319c6638df3200061a"
     },
     {
       "name": "America/Argentina/Buenos_Aires",
@@ -369,12 +371,12 @@
     {
       "name": "America/Atka",
       "file": "73.tzif",
-      "sha256": "201d4387025000a6e13c9f631cb7fccd6e4369dec7224052f9d86feb81353a53"
+      "sha256": "9d767d4f8dfffee4fdf29e594a8552a41aa77d41cdb4a2e5f7687c94b5699e54"
     },
     {
       "name": "America/Bahia",
       "file": "74.tzif",
-      "sha256": "aa2edd03a1687c384bc553267762fc6cadc779a42773d5fe8e28a3c327e1b378"
+      "sha256": "6fd2bcc4829dbf7ab61a4e29c3e9487a71178a1466026c3ba927554fa219ae7f"
     },
     {
       "name": "America/Bahia_Banderas",
@@ -389,7 +391,7 @@
     {
       "name": "America/Belem",
       "file": "77.tzif",
-      "sha256": "69931482d1437473484a9ab241161b992d88043f81012dc26899e1bbaa272c26"
+      "sha256": "1174cede75f41a66191c0865cf13e52ffdafa720446ccd9c35c999e5760cdafb"
     },
     {
       "name": "America/Belize",
@@ -404,12 +406,12 @@
     {
       "name": "America/Boa_Vista",
       "file": "80.tzif",
-      "sha256": "74cb5a1b5d641a526b8092601961036590269cefc77d3dcbe17f2923bd8b2c56"
+      "sha256": "924414c11d4fb22bb9c62f1cdabc3159e6cb48c60c3502e9558cd3860579cab5"
     },
     {
       "name": "America/Bogota",
       "file": "81.tzif",
-      "sha256": "6757ab9d9646431ba513c28558761670cdd25758e7dbf404735434389cc745a9"
+      "sha256": "bf2235f43af0084d48823ee6ad21024299281e7bbc51620863daa154781978dd"
     },
     {
       "name": "America/Boise",
@@ -424,7 +426,7 @@
     {
       "name": "America/Campo_Grande",
       "file": "84.tzif",
-      "sha256": "8083625e0e62d9ee9187635ba366c5aa13c024be05e1c02a1a705a9e45d30d7c"
+      "sha256": "db4868eb9d86709ae5c128d655ddb88c7434818eb798a13aef956efaf4b52866"
     },
     {
       "name": "America/Cancun",
@@ -484,7 +486,7 @@
     {
       "name": "America/Cuiaba",
       "file": "96.tzif",
-      "sha256": "19126a92145736c3947208d975d43144825d4586b0f6933f60b59bba7f3c7648"
+      "sha256": "a8a102fc6d086d744d0d38f997c0051384b9d869d166d70efd70faf6a06adbe6"
     },
     {
       "name": "America/Curacao",
@@ -524,12 +526,12 @@
     {
       "name": "America/Edmonton",
       "file": "104.tzif",
-      "sha256": "f939087dcdd096f6827f4a7c08e678dd8d47441025fa7011522f8975778ad6f1"
+      "sha256": "b5e3d3820009abc262c82a3ebfa9261dd12fc210f77322ef121067b040866587"
     },
     {
       "name": "America/Eirunepe",
       "file": "105.tzif",
-      "sha256": "8f9784c648c56aab42f83f172b4ac6ce817dc8481b4a54db3ea546f562a111af"
+      "sha256": "2eff4dfa5726a1efd1558f58ae9bb28fe124e6b9a19b5c2f16d39bd55477de78"
     },
     {
       "name": "America/El_Salvador",
@@ -539,12 +541,12 @@
     {
       "name": "America/Ensenada",
       "file": "107.tzif",
-      "sha256": "4a5b95ef1cd99b6e0b80c5d2515b75703d40944ef2fdb744eb91e10c87572dcb"
+      "sha256": "8c2e7b321726e6345912da396796bdb3672bfc4bd1a91c65ee58b38e004d4ca5"
     },
     {
       "name": "America/Fortaleza",
       "file": "108.tzif",
-      "sha256": "ae3892074ab5701b8c0ce33da2b5bfbb07b950e2c1c1395f8c5a2dc0e61ed665"
+      "sha256": "6ffd5753bb0a8e60959e04123a4468b4e0bce1763dae19fcca24eb5efec16b0a"
     },
     {
       "name": "America/Fort_Nelson",
@@ -599,7 +601,7 @@
     {
       "name": "America/Havana",
       "file": "119.tzif",
-      "sha256": "1d441e02e281b04908e522d98eaca75c808e51539a8e42b3287e6bf8ebf939d7"
+      "sha256": "63cfa33a3bee9f32ed51e4b57a9c6db453bfacf842ca4dea9ac1519d8109e9ac"
     },
     {
       "name": "America/Hermosillo",
@@ -649,7 +651,7 @@
     {
       "name": "America/Inuvik",
       "file": "129.tzif",
-      "sha256": "e89fa66a90e7ae4f40d4bb6cc28137e2da92cbfb9f79d70404dc62c64ac48c8a"
+      "sha256": "3992044b9bfa8c0abde7438eab008bc4efd5d36792ae0ca26f7037dd57ef728a"
     },
     {
       "name": "America/Iqaluit",
@@ -664,7 +666,7 @@
     {
       "name": "America/Juneau",
       "file": "132.tzif",
-      "sha256": "93b8716f46864677e713e0c18b72e472303344fc807f4fc7c34bd515f8c679bd"
+      "sha256": "17db0b8cc14d0ae8f210903ffda6a5f68679cbbfa7cc270834acedb3a4086b31"
     },
     {
       "name": "America/Kentucky/Louisville",
@@ -704,7 +706,7 @@
     {
       "name": "America/Maceio",
       "file": "140.tzif",
-      "sha256": "dd1e439527b7da44039a8495216a5cca4da8eeaa21afeae58b0a834861483324"
+      "sha256": "9c2baff82ca3f6b99464457e11d2aecfd239f153e2818abbaf2164bf48814b40"
     },
     {
       "name": "America/Managua",
@@ -714,7 +716,7 @@
     {
       "name": "America/Manaus",
       "file": "142.tzif",
-      "sha256": "17a44b38e78e8bd972999890990f6947cb45a4f67a120b8d74f7ce73a0615c31"
+      "sha256": "c08edf4aede919b8c9a2e47fbb9f10e2e292c6730f6e6330e9bf9ad0485f00e5"
     },
     {
       "name": "America/Marigot",
@@ -749,7 +751,7 @@
     {
       "name": "America/Metlakatla",
       "file": "149.tzif",
-      "sha256": "b709a27864d563657e53c9c5c6abf1edab18bfc1958de59d2edace23b500a552"
+      "sha256": "09fb18b409c5defed5f7d11d9fdc10dafc8fd2e0267afd2e07679ddfbcbbb657"
     },
     {
       "name": "America/Mexico_City",
@@ -804,12 +806,12 @@
     {
       "name": "America/Nome",
       "file": "160.tzif",
-      "sha256": "da2cccdfe3fe3ea27dcdae8c761cc57ccbcf14dabb1a29baf6d02f1303de636b"
+      "sha256": "b0cf6377a846706c9fcff994a561dfde0c88347b21ab57798d3541cc8339f28d"
     },
     {
       "name": "America/Noronha",
       "file": "161.tzif",
-      "sha256": "7de7910228d0a8aca5660a9ef389ca86c14bc9c4f9cc8066ee62c8bddc86c38c"
+      "sha256": "059264e0572701db3b6eb7a7a3539a5506134b245591215d8aa275d8179379f2"
     },
     {
       "name": "America/North_Dakota/Beulah",
@@ -864,7 +866,7 @@
     {
       "name": "America/Porto_Acre",
       "file": "172.tzif",
-      "sha256": "d20a49525e3a8506e9d0fe978f54b4340ac859e02bcaeb835e3b2576f0791871"
+      "sha256": "c9b698b68af1f26810fe0f2ebc849d0f6600d82e34bbb302216a59289855428f"
     },
     {
       "name": "America/Port_of_Spain",
@@ -874,7 +876,7 @@
     {
       "name": "America/Porto_Velho",
       "file": "174.tzif",
-      "sha256": "b92315da16568fe572061141c02f79d3071385f3778eae8a9727044a64132ce0"
+      "sha256": "233f667f613cf1bd311fc0e75a7c0d6e61e26f6a5165f2fd618328c92221981f"
     },
     {
       "name": "America/Puerto_Rico",
@@ -889,7 +891,7 @@
     {
       "name": "America/Rainy_River",
       "file": "177.tzif",
-      "sha256": "ecffbf610ae77857289fb40a4933a79221a3129a450e7dd9e3c309d6aabc541c"
+      "sha256": "4cbeda42e9c21c0e3b8017248071bbd194136350581e3c71ee3312c0f6ddb383"
     },
     {
       "name": "America/Rankin_Inlet",
@@ -899,7 +901,7 @@
     {
       "name": "America/Recife",
       "file": "179.tzif",
-      "sha256": "6c9fc7134f89162a38fa8c29674a4b3bc5376a2d1f886bbc4072f40dec4b88b7"
+      "sha256": "946334cffb237592a3f1f965adb70151ca9be711cb63ca7bbf11f5ed8130bfd2"
     },
     {
       "name": "America/Regina",
@@ -914,17 +916,17 @@
     {
       "name": "America/Rio_Branco",
       "file": "182.tzif",
-      "sha256": "d20a49525e3a8506e9d0fe978f54b4340ac859e02bcaeb835e3b2576f0791871"
+      "sha256": "c9b698b68af1f26810fe0f2ebc849d0f6600d82e34bbb302216a59289855428f"
     },
     {
       "name": "America/Santa_Isabel",
       "file": "183.tzif",
-      "sha256": "4a5b95ef1cd99b6e0b80c5d2515b75703d40944ef2fdb744eb91e10c87572dcb"
+      "sha256": "8c2e7b321726e6345912da396796bdb3672bfc4bd1a91c65ee58b38e004d4ca5"
     },
     {
       "name": "America/Santarem",
       "file": "184.tzif",
-      "sha256": "56664ff52e693ee705c72a80395f74f049965d066f8028162e6949253525d0b1"
+      "sha256": "e106fab4b8c51e3ad7e5b19e1ae1a655b2cdd43cf74552323e5709c09c99462b"
     },
     {
       "name": "America/Santiago",
@@ -939,7 +941,7 @@
     {
       "name": "America/Sao_Paulo",
       "file": "187.tzif",
-      "sha256": "04c06744ee3fe078ef3b8b779e38eb30666bf993e67a092fcaf2fc28f63a64ce"
+      "sha256": "20d194f66d88edfb5df2a7d18585063ae146665b7ab2484bd0a6ea9547bbaa68"
     },
     {
       "name": "America/Scoresbysund",
@@ -954,7 +956,7 @@
     {
       "name": "America/Sitka",
       "file": "190.tzif",
-      "sha256": "6a24bb164dfb859a7367d56478941e17e06a4cb442d503930a03002704fc5310"
+      "sha256": "4c55dbd6a95eeb899aea20d3197b2287e693ad80150a4b7c19e2df4c14806842"
     },
     {
       "name": "America/St_Barthelemy",
@@ -1009,7 +1011,7 @@
     {
       "name": "America/Tijuana",
       "file": "201.tzif",
-      "sha256": "4a5b95ef1cd99b6e0b80c5d2515b75703d40944ef2fdb744eb91e10c87572dcb"
+      "sha256": "8c2e7b321726e6345912da396796bdb3672bfc4bd1a91c65ee58b38e004d4ca5"
     },
     {
       "name": "America/Toronto",
@@ -1024,7 +1026,7 @@
     {
       "name": "America/Vancouver",
       "file": "204.tzif",
-      "sha256": "b249ca1f48d23d66a6f831df337e6a5ecf0d6a6edde5316591423d4a0c6bcb28"
+      "sha256": "e182e20ec67c46a7dd0aedb3d45fb1395edcb14ff2af2ac694a5776b307bed31"
     },
     {
       "name": "America/Virgin",
@@ -1039,17 +1041,17 @@
     {
       "name": "America/Winnipeg",
       "file": "207.tzif",
-      "sha256": "ecffbf610ae77857289fb40a4933a79221a3129a450e7dd9e3c309d6aabc541c"
+      "sha256": "4cbeda42e9c21c0e3b8017248071bbd194136350581e3c71ee3312c0f6ddb383"
     },
     {
       "name": "America/Yakutat",
       "file": "208.tzif",
-      "sha256": "b45c2729bbf0872ca7e0b353027e727bf2560ddc6309eacd0edee83b05303b63"
+      "sha256": "bba6f211a06eba4abf0cc777414ef41431e634bd72573b13caadd61a24b873f6"
     },
     {
       "name": "America/Yellowknife",
       "file": "209.tzif",
-      "sha256": "f939087dcdd096f6827f4a7c08e678dd8d47441025fa7011522f8975778ad6f1"
+      "sha256": "b5e3d3820009abc262c82a3ebfa9261dd12fc210f77322ef121067b040866587"
     },
     {
       "name": "Antarctica/Casey",
@@ -1479,7 +1481,7 @@
     {
       "name": "Asia/Tehran",
       "file": "295.tzif",
-      "sha256": "2dbd87f410815edcfcd7d14be84de0040ef0d913a22203e0c7e7f4f17a6a915a"
+      "sha256": "30095335232a07c7181a1ced11b253f3912069845b8f43ea5f897d24349cd0ce"
     },
     {
       "name": "Asia/Tel_Aviv",
@@ -1909,7 +1911,7 @@
     {
       "name": "Europe/Chisinau",
       "file": "381.tzif",
-      "sha256": "a7527faea144d77a4bf1ca4146b1057beb5e088f1fd1f28ae2e4d4cbfe1d885e"
+      "sha256": "7b4941ae82ed7958f8897d198bf937e7ccf5460065caca2728e2a471cb3e9d93"
     },
     {
       "name": "Europe/Copenhagen",
@@ -1919,7 +1921,7 @@
     {
       "name": "Europe/Dublin",
       "file": "383.tzif",
-      "sha256": "40e8d2a1c3b572284da39f6f4245b1bc814f452c44f5aa73d0a011571d5ccc43"
+      "sha256": "0676251fa5226d9b79a6967c02b110e59399cdedc423610af2350715f3431684"
     },
     {
       "name": "Europe/Gibraltar",
@@ -2104,7 +2106,7 @@
     {
       "name": "Europe/Tiraspol",
       "file": "420.tzif",
-      "sha256": "a7527faea144d77a4bf1ca4146b1057beb5e088f1fd1f28ae2e4d4cbfe1d885e"
+      "sha256": "7b4941ae82ed7958f8897d198bf937e7ccf5460065caca2728e2a471cb3e9d93"
     },
     {
       "name": "Europe/Ulyanovsk",

@@ -130,3 +130,5 @@ mod privilege_functions;
 
 #[path = "lateral_unnest.rs"]
 mod lateral_unnest;
+
+#[path = "locks_timezone_parity.rs"] mod locks_timezone_parity;

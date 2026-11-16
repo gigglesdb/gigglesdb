@@ -178,8 +178,9 @@ fn same_and_weaker_acquisitions_are_reentrant() {
         acquire(&lm, 1, key.clone(), strong);
         acquire(&lm, 1, key.clone(), weak);
         let held = lm.held(TxnId(1));
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0], (key.clone(), strong));
+        assert_eq!(held.len(), if strong.is_table() { 2 } else { 1 });
+        assert!(held.contains(&(key.clone(), strong)));
+        if strong.is_table() { assert!(held.contains(&(key.clone(), weak))); }
         assert_eq!(lm.waiting_count(), 0);
         lm.release_all(TxnId(1));
         assert!(lm.held(TxnId(1)).is_empty());

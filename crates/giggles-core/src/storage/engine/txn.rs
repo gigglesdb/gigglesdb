@@ -647,6 +647,24 @@ impl Transaction {
     pub(crate) fn id(&self) -> TxnId {
         self.id
     }
+    pub(crate) fn held_table_locks(&self) -> Vec<(u64, &'static str)> {
+        let locks = match &self.services {
+            TxnServices::Local { locks, .. } => locks.as_ref(),
+            TxnServices::Cluster(cluster) => cluster.gateway_locks(),
+        };
+        locks.held(self.id).into_iter().filter_map(|(key, mode)| {
+            use LockMode::*;
+            let LockKey::Table(table) = key else { return None; };
+            let name = match mode {
+                AccessShare => "AccessShareLock", RowShare => "RowShareLock",
+                RowExclusive => "RowExclusiveLock", ShareUpdateExclusive => "ShareUpdateExclusiveLock",
+                Share => "ShareLock", ShareRowExclusive => "ShareRowExclusiveLock",
+                ExclusiveTable => "ExclusiveLock", AccessExclusive => "AccessExclusiveLock",
+                Shared | Exclusive => return None,
+            };
+            Some((table, name))
+        }).collect()
+    }
     pub(crate) fn catalog_generation(&self) -> u64 {
         self.catalog_generation
     }

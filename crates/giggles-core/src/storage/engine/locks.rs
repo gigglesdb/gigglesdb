@@ -214,6 +214,9 @@ impl LockManager {
             .and_then(|k| k.holders.get(&txn))
             .copied();
         if held.is_some_and(|held| held.iter().any(|held| held.covers(mode))) {
+            if mode.is_table() {
+                state.keys.get_mut(&key).unwrap().holders.get_mut(&txn).unwrap().insert(mode);
+            }
             return Ok(());
         }
         let immediate = state.keys.get(&key).is_none_or(|locks| {

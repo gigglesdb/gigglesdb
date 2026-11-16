@@ -2692,6 +2692,13 @@ impl SqlSession {
             Ok(relational::relation_key(schema, table))
         })
     }
+    /// Held v2 table locks as (transaction identity, table ID, PostgreSQL mode).
+    /// Legacy sessions have no lock manager and return no rows.
+    pub fn held_table_locks(&self) -> Vec<(u64, u64, &'static str)> {
+        self.v2_transaction.as_ref().map_or_else(Vec::new, |txn| {
+            txn.held_table_locks().into_iter().map(|(table, mode)| (txn.id().0, table, mode)).collect()
+        })
+    }
     /// Acquire explicit table locks in list order on the open v2 transaction.
     /// Legacy sessions retain their historical validated no-op behaviour.
     pub fn lock_tables(

@@ -182,6 +182,10 @@ pub struct CatalogSnapshot {
     pub comments: std::collections::BTreeMap<(u64, u64), String>,
     /// Current wire backend identity, supplied by the host (0 in offline snapshots).
     pub backend_pid: i32,
+    /// Granted relation locks supplied by the engine: (transaction, table ID, pid, mode).
+    pub table_locks: Vec<(u64, u64, i32, String)>,
+    /// Optional explicit Unix second for deterministic timezone presentation.
+    pub timezone_now: Option<i64>,
     /// Whether this connection actually completed a TLS handshake.
     pub backend_ssl: bool,
     /// Freshly authorized application rows, supplied by the hosting session.
@@ -228,6 +232,8 @@ impl Default for CatalogSnapshot {
             column_identities: Default::default(), primary_names: Default::default(),
             comments: Default::default(),
             backend_pid: 0,
+            table_locks: Vec::new(),
+            timezone_now: None,
             backend_ssl: false,
             user_relations: Default::default(),
             user_types: Vec::new(),
@@ -297,6 +303,8 @@ pub enum PgType {
     AnyArray,
     /// Metadata descriptor only; subscription LSNs are always NULL.
     PgLsn,
+    /// Timezone offsets, represented as PostgreSQL interval text.
+    Interval,
     /// Metadata descriptor only; lock wait timestamps are always NULL.
     TimestampTz,
 }
@@ -335,6 +343,7 @@ impl PgType {
             Self::AnyArray => 2277,
             Self::PgLsn => 3220,
             Self::TimestampTz => 1184,
+            Self::Interval => 1186,
         }
     }
     pub fn type_size(self) -> i16 {
@@ -344,6 +353,7 @@ impl PgType {
             Self::Int4 | Self::Oid | Self::Xid | Self::Float4 | Self::Regproc => 4,
             Self::Int8 | Self::Float8 | Self::PgLsn | Self::TimestampTz => 8,
             Self::Name => 64,
+            Self::Interval => 16,
             _ => -1,
         }
     }

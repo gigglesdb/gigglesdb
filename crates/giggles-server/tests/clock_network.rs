@@ -181,39 +181,87 @@ async fn timezone_settings_drive_local_clocks_and_restore_after_transactions() {
     stream.write_all(body).await.unwrap();
     wire_cycle(&mut stream).await;
     row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
-    for set in ["SET TimeZone='America/Chicago'", "SET TimeZone='Not/AZone'"] {
-        let result = wire_query(&mut stream, set).await;
-        assert!(!result.iter().any(|(tag, _)| *tag == b'E'), "{result:?}");
-        if set.contains("America/Chicago") {
-            row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
-        }
-    }
-    let failure = wire_query(&mut stream, "SELECT CURRENT_DATE").await;
+    let result = wire_query(&mut stream, "SET TimeZone='America/Chicago'").await;
+    assert!(!result.iter().any(|(tag, _)| *tag == b'E'), "{result:?}");
+    row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
+    let failure = wire_query(&mut stream, "SET TimeZone='Not/AZone'").await;
     assert!(
         failure
             .iter()
-            .any(|(tag, body)| *tag == b'E' && body.windows(7).any(|part| part == b"C0A000\0")),
+            .any(|(tag, body)| *tag == b'E' && body.windows(7).any(|part| part == b"C22023\0")),
         "{failure:?}"
     );
+    assert_eq!(
+        row(&wire_query(&mut stream, "SHOW TimeZone").await),
+        ["America/Chicago"]
+    );
+    row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
     row(&wire_query(&mut stream, "SELECT now()").await);
     for reset in ["RESET TimeZone", "RESET ALL"] {
         wire_query(&mut stream, reset).await;
+        assert_eq!(
+            row(&wire_query(&mut stream, "SHOW TimeZone").await),
+            ["America/Chicago"]
+        );
         row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
-        wire_query(&mut stream, "SET TimeZone='Not/AZone'").await;
+        wire_query(&mut stream, "SET TimeZone='UTC'").await;
     }
     wire_query(&mut stream, "SET TimeZone='America/Chicago'").await;
     for close in ["COMMIT", "ROLLBACK"] {
         wire_query(&mut stream, "BEGIN").await;
-        wire_query(&mut stream, "SET LOCAL TimeZone='Not/AZone'").await;
+        wire_query(&mut stream, "SET LOCAL TimeZone='UTC'").await;
+        assert_eq!(
+            row(&wire_query(&mut stream, "SHOW TimeZone").await),
+            ["UTC"]
+        );
         wire_query(&mut stream, close).await;
+        assert_eq!(
+            row(&wire_query(&mut stream, "SHOW TimeZone").await),
+            ["America/Chicago"]
+        );
         row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
     }
+    wire_query(&mut stream, "BEGIN").await;
+    let failure = wire_query(&mut stream, "SET LOCAL TimeZone='Not/AZone'").await;
+    assert!(
+        failure
+            .iter()
+            .any(|(tag, body)| *tag == b'E' && body.windows(7).any(|part| part == b"C22023\0")),
+        "{failure:?}"
+    );
+    let failure = wire_query(&mut stream, "SELECT CURRENT_DATE").await;
+    assert!(
+        failure
+            .iter()
+            .any(|(tag, body)| *tag == b'E' && body.windows(7).any(|part| part == b"C25P02\0")),
+        "{failure:?}"
+    );
+    wire_query(&mut stream, "ROLLBACK").await;
+    assert_eq!(
+        row(&wire_query(&mut stream, "SHOW TimeZone").await),
+        ["America/Chicago"]
+    );
+    row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
     // An error in an implicit simple-query batch also restores the session zone.
-    wire_query(
+    let failure = wire_query(
         &mut stream,
         "SET LOCAL TimeZone='Not/AZone'; SELECT CURRENT_DATE",
     )
     .await;
+    assert!(
+        failure
+            .iter()
+            .any(|(tag, body)| *tag == b'E' && body.windows(7).any(|part| part == b"C22023\0")),
+        "{failure:?}"
+    );
+    assert!(
+        !failure.iter().any(|(tag, _)| *tag == b'D' || *tag == b'C'),
+        "{failure:?}"
+    );
+    assert_eq!(
+        row(&wire_query(&mut stream, "SHOW TimeZone").await),
+        ["America/Chicago"]
+    );
     row(&wire_query(&mut stream, "SELECT CURRENT_DATE, LOCALTIMESTAMP").await);
     // Check local wall values, rather than only observing that the calls succeed.
     wire_query(&mut stream, "BEGIN").await;

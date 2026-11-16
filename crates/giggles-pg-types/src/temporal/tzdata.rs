@@ -1,3 +1,6 @@
+// Debian tzdata 2026f-0+deb13u1 (2026f), dereferenced from:
+// postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+// Mechanically generated from timezone_names.txt; hashes are in tzdata/manifest.json.
 pub(super) static FILES: &[(&str, &[u8])] = &[
     ("Africa/Abidjan", include_bytes!("tzdata/0.tzif")),
     ("Africa/Accra", include_bytes!("tzdata/1.tzif")),

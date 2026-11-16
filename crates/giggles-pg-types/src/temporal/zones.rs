@@ -36,7 +36,40 @@ fn offset(zone: &tz::TimeZone, unix: i64) -> Result<i32, Error> {
         .map_err(|_| Error::Unimplemented)
 }
 const UNIX_EPOCH_DELTA: i64 = 946684800;
-pub const TZDATA_VERSION: &str = chrono_tz::IANA_TZDB_VERSION;
+/// Names exposed by PostgreSQL 18.6's pinned timezone installation.
+pub const TIMEZONE_NAMES: &str = include_str!("timezone_names.txt");
+fn named_zone(name: &str) -> Option<(Tz, &'static str)> {
+    let canonical = TIMEZONE_NAMES
+        .lines()
+        .find(|n| n.eq_ignore_ascii_case(name))?;
+    let target = match canonical {
+        "localtime" => "Etc/UTC",
+        "posixrules" => "America/New_York",
+        "Factory" => "UTC",
+        name => name,
+    };
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .find(|z| z.name() == target)
+        .copied()
+        .map(|z| (z, canonical))
+}
+/// Current timezone presentation at an explicit Unix second, without a host clock.
+pub fn timezone_info(name: &str, unix: i64) -> Result<(String, i32, bool), Error> {
+    if name == "Factory" {
+        return Ok(("-00".into(), 0, false));
+    }
+    let (zone, _) = named_zone(name).ok_or(Error::Syntax)?;
+    let db = database(zone)?;
+    let info = db.find_local_time_type(unix).map_err(|_| Error::Range)?;
+    Ok((
+        info.time_zone_designation().into(),
+        info.ut_offset(),
+        info.is_dst(),
+    ))
+}
+/// Version of the embedded TZif data; chrono-tz supplies zone identifiers only.
+pub const TZDATA_VERSION: &str = "2026f";
 /// A session zone never consults process settings or the clock.
 #[derive(Clone, Copy, Debug)]
 pub enum SessionZone {
@@ -49,10 +82,13 @@ impl SessionZone {
     }
     pub fn named(name: &str) -> Result<Self, Error> {
         let name = bounded(name)?;
-        let zone = chrono_tz::TZ_VARIANTS
-            .iter()
-            .find(|zone| zone.name().eq_ignore_ascii_case(name))
-            .copied();
+        let zone = named_zone(name)
+            .map(|(zone, _)| zone)
+            .or(match name {
+                "EST5EDT" => Some(Tz::America__New_York),
+                "PST8PDT" => Some(Tz::America__Los_Angeles),
+                _ => None,
+            });
         match zone {
             Some(zone) => Ok(Self::Named(zone)),
             None => posix_offset(name).map(Self::Fixed).ok_or(Error::Syntax),
@@ -75,8 +111,14 @@ impl SessionZone {
             let seconds = (hours * 3600.0).round() as i32;
             return Self::interval_setting(seconds);
         }
-        if let Ok(Self::Named(zone)) = Self::named(value) {
-            return Ok((Self::Named(zone), zone.name().into()));
+        if let Some((zone, label)) = named_zone(value) {
+            return Ok((Self::Named(zone), label.into()));
+        }
+        if value.eq_ignore_ascii_case("EST5EDT") {
+            return Ok((Self::Named(Tz::America__New_York), value.into()));
+        }
+        if value.eq_ignore_ascii_case("PST8PDT") {
+            return Ok((Self::Named(Tz::America__Los_Angeles), value.into()));
         }
         let seconds = posix_offset(value).ok_or(Error::Syntax)?;
         Ok((Self::Fixed(seconds), value.into()))
@@ -352,5 +394,41 @@ mod setting_tests {
                 .unwrap(),
             "2024-07-01 20:04:05-07"
         );
+    }
+}
+
+#[cfg(test)]
+mod parity_catalog_tests {
+    use super::*;
+    #[test]
+    fn pinned_names_and_current_rows() {
+        assert_eq!(TIMEZONE_NAMES.lines().count(), 487);
+        for row in include_str!("timezone_rows_20261116.txt").lines() {
+            let cols: Vec<_> = row.split('|').collect();
+            let (abbrev, seconds, dst) = timezone_info(cols[0], 1794844800).unwrap();
+            let abs = seconds.unsigned_abs();
+            let shown = format!(
+                "{}{:02}:{:02}:{:02}",
+                if seconds < 0 { "-" } else { "" },
+                abs / 3600,
+                abs / 60 % 60,
+                abs % 60
+            );
+            assert_eq!(
+                (abbrev.as_str(), shown.as_str(), dst),
+                (cols[1], cols[2], cols[3] == "t"),
+                "{}",
+                cols[0]
+            );
+            assert_eq!(
+                SessionZone::setting(&cols[0].to_ascii_lowercase())
+                    .unwrap()
+                    .1,
+                cols[0]
+            );
+        }
+        for name in ["Zulu", "US/Eastern"] {
+            assert!(SessionZone::setting(name).is_err());
+        }
     }
 }
