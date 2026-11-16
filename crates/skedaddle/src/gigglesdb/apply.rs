@@ -6,7 +6,8 @@
 use crate::{
     buffer::reader::ReaderCheckpoint,
     pg::apply::{
-        ApplyError, CommitDecision, OriginPolicy, Progress, RowCount, SourcePositions, TransactionPlan,
+        ApplyError, CommitDecision, OriginPolicy, Progress, RowCount, SourcePositions,
+        TransactionPlan,
         executor::{
             Connector, Destination, Error, INSTALL_INTENT, Observer, PROGRESS_DDL, Result, Seam,
             decode_progress, execute_statement,
@@ -90,7 +91,12 @@ pub struct GigglesdbExecutor<C> {
 }
 
 impl<C: Connector> GigglesdbExecutor<C> {
-    pub fn new(connector: C, stream: String, max_receipts: u32, positions: SourcePositions) -> Result<Self> {
+    pub fn new(
+        connector: C,
+        stream: String,
+        max_receipts: u32,
+        positions: SourcePositions,
+    ) -> Result<Self> {
         if positions.policy != OriginPolicy::NativePgLsn {
             return Err(ApplyError::OriginPolicyMismatch.into());
         }
@@ -131,7 +137,11 @@ impl<C: Connector> GigglesdbExecutor<C> {
         // No native origin exists. Derive its consistency argument from the same
         // committed row, preserving resolve_commit's identity/digest/receipt and
         // ordering checks without claiming an independent native high-water mark.
-        let origin_lsn = latest.as_ref().map(|p| self.positions.native_lsn(&p.position)).transpose()?.unwrap_or(0);
+        let origin_lsn = latest
+            .as_ref()
+            .map(|p| self.positions.native_lsn(&p.position))
+            .transpose()?
+            .unwrap_or(0);
         Ok(resolve_commit(
             &self.positions,
             target,

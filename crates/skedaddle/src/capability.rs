@@ -158,8 +158,10 @@ impl CapabilityReport {
         ]
         .into_iter()
         .filter(|(side, connection)| {
-            !matches!(connection.engine, Engine::Postgresql | Engine::Spanner | Engine::Gigglesdb)
-                && !(*side == "source" && connection.engine == Engine::Mysql)
+            !matches!(
+                connection.engine,
+                Engine::Postgresql | Engine::Spanner | Engine::Gigglesdb
+            ) && !(*side == "source" && connection.engine == Engine::Mysql)
         })
         .map(|(side, connection)| format!("{side}: {}", connection.engine))
         .collect();

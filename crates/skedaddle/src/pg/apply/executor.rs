@@ -443,7 +443,11 @@ fn receipt_position(progress: &Progress) -> &[u8] {
     progress.position.bytes()
 }
 
-pub(crate) fn decode_progress(stream: &str, positions: &SourcePositions, row: &Row) -> Result<Progress> {
+pub(crate) fn decode_progress(
+    stream: &str,
+    positions: &SourcePositions,
+    row: &Row,
+) -> Result<Progress> {
     let sequence: String = row.try_get(0)?;
     let position: Vec<u8> = row.try_get(2)?;
     let digest: Vec<u8> = row.try_get(3)?;

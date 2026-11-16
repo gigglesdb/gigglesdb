@@ -357,8 +357,12 @@ fn gigglesdb_char_budget_requires_length_and_restores_padding() {
         "rpad(v.c::text, 5, ' ')"
     );
     for typmod in [None, Some(-1), Some(4), Some(i32::MIN)] {
-        assert!(matches!(SqlDialect::Gigglesdb.size_expression("v.c", &ty, typmod),
-            Err(VerifyError::Invalid("GigglesDB verification char byte budget requires a known positive char(n) length modifier"))));
+        assert!(matches!(
+            SqlDialect::Gigglesdb.size_expression("v.c", &ty, typmod),
+            Err(VerifyError::Invalid(
+                "GigglesDB verification char byte budget requires a known positive char(n) length modifier"
+            ))
+        ));
     }
     assert_eq!(
         SqlDialect::Postgres

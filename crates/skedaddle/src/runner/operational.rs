@@ -857,11 +857,13 @@ pub fn run(
         };
         let executor = if gigglesdb {
             RunnerDestination::Gigglesdb(
-                GigglesdbExecutor::new(connector, stream.clone(), 1000, positions).map_err(recovery)?,
+                GigglesdbExecutor::new(connector, stream.clone(), 1000, positions)
+                    .map_err(recovery)?,
             )
         } else {
             RunnerDestination::Postgresql(
-                Executor::new(connector, stream.clone(), origin, 1000, positions).map_err(recovery)?,
+                Executor::new(connector, stream.clone(), origin, 1000, positions)
+                    .map_err(recovery)?,
             )
         };
         let mut reader_config = config;

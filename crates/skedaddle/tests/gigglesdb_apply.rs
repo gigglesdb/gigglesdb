@@ -6,7 +6,8 @@ use skedaddle::{
     gigglesdb::apply::{GigglesdbExecutor, install_progress, plan_for_gigglesdb},
     mapping::{PgType, Value},
     pg::apply::{
-        ApplyError, Column, CommitDecision, PlanContext, SourcePositions, RangeState, Table, TransactionPlan,
+        ApplyError, Column, CommitDecision, PlanContext, RangeState, SourcePositions, Table,
+        TransactionPlan,
         executor::{self, Connector, Destination, Error, INSTALL_INTENT, Observer, Seam},
         plan_transaction,
     },
@@ -286,7 +287,12 @@ async fn two_table_transaction_redelivery_and_digest_conflict() -> TestResult<()
         return Ok(());
     };
     let plan = plan("forward", 1);
-    let mut executor = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     assert_eq!(executor.apply(&plan).await?, CommitDecision::Applied);
     let expected = (vec![(1, 10), (2, 21)], vec![(4, 40)]);
     assert_eq!(rows(&client).await?, expected);
@@ -322,7 +328,12 @@ async fn row_count_fault_rolls_back_both_tables_and_evidence() -> TestResult<()>
     };
     client.batch_execute("DELETE FROM n3_b").await?;
     let before = rows(&client).await?;
-    let mut executor = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     assert!(matches!(
         executor.apply(&plan("forward", 1)).await,
         Err(Error::Apply(ApplyError::MissingRow { .. }))
@@ -339,7 +350,12 @@ async fn receipt_bound_and_checkpoint_retention() -> TestResult<()> {
     let Some((server, client)) = fixture().await? else {
         return Ok(());
     };
-    let mut executor = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 1, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        1,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     let first = plan("forward", 1);
     executor.apply(&first).await?;
     // Empty source transactions still consume a receipt.
@@ -350,7 +366,12 @@ async fn receipt_bound_and_checkpoint_retention() -> TestResult<()> {
     ));
     assert_eq!(count(&client, "apply_receipts", "forward").await?, 1);
     executor.close().await?;
-    let mut executor = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 1, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        1,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     executor
         .retain_after_checkpoint(&ReaderCheckpoint {
             next_mseq: 1,
@@ -380,7 +401,12 @@ async fn retained_receipt_proves_historical_replay_and_rejects_digest_conflict()
     let Some((server, client)) = fixture().await? else {
         return Ok(());
     };
-    let mut executor = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     let first = plan("forward", 1);
     executor.apply(&first).await?;
     executor
@@ -427,14 +453,24 @@ async fn socket_killed_before_commit_is_not_applied() -> TestResult<()> {
     };
     let connection = Connection::new(server.port);
     let mut observer = CutBeforeCommit(connection.socket.clone());
-    let mut executor = GigglesdbExecutor::new(connection, "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        connection,
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     let plan = plan("forward", 1);
     assert!(matches!(
         executor.apply_observed(&plan, &mut observer).await,
         Err(Error::Database)
     ));
     drop(executor);
-    let mut fresh = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut fresh = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     assert_eq!(
         fresh.decision(&plan.progress).await?,
         CommitDecision::NotApplied
@@ -527,7 +563,12 @@ async fn lost_commit_reply_recovers_and_fresh_executor_confirms_applied() -> Tes
     connection.proxy = Some(port);
     connection.drained = Some(drained);
     let connections = connection.connections.clone();
-    let mut executor = GigglesdbExecutor::new(connection, "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut executor = GigglesdbExecutor::new(
+        connection,
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     let plan = plan("forward", 1);
     let result = tokio::time::timeout(Duration::from_secs(30), executor.apply(&plan)).await;
     if !matches!(result, Ok(Ok(CommitDecision::Applied))) {
@@ -541,7 +582,12 @@ async fn lost_commit_reply_recovers_and_fresh_executor_confirms_applied() -> Tes
         "lost reply must reconnect"
     );
     executor.close().await?;
-    let mut fresh = GigglesdbExecutor::new(Connection::new(server.port), "forward".into(), 10, SourcePositions::native_pg("gigglesdb/source"))?;
+    let mut fresh = GigglesdbExecutor::new(
+        Connection::new(server.port),
+        "forward".into(),
+        10,
+        SourcePositions::native_pg("gigglesdb/source"),
+    )?;
     assert_eq!(
         fresh.decision(&plan.progress).await?,
         CommitDecision::Applied
