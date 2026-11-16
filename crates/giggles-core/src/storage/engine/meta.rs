@@ -21,7 +21,9 @@ pub(crate) const SQL_VIEWS: u64 = 1 << 14;
 pub(crate) const RELATION_COMMENTS: u64 = 1 << 15;
 pub(crate) const REPLICATED: u64 = 1 << 16;
 pub(crate) const KEY_DEPENDENCY_IDENTITY: u64 = 1 << 17;
-pub(crate) const FEATURE_TABLE: [(u64, &str); 18] = [
+/// Range-local Meta keys (`range/<id BE8>/<sub>`); requires REPLICATED.
+pub(crate) const RANGES: u64 = 1 << 18;
+pub(crate) const FEATURE_TABLE: [(u64, &str); 19] = [
     (1, "typed_values"),
     (2, "native_outcomes"),
     (4, "secondary_indexes"),
@@ -40,7 +42,14 @@ pub(crate) const FEATURE_TABLE: [(u64, &str); 18] = [
     (RELATION_COMMENTS, "relation_comments"),
     (REPLICATED, "replicated"),
     (KEY_DEPENDENCY_IDENTITY, "key_dependency_identity"),
+    (RANGES, "ranges"),
 ];
+#[path = "meta_range.rs"]
+mod range_local;
+#[cfg_attr(not(feature = "engine-rocksdb"), allow(unused_imports))] // used by storage::range
+pub(crate) use range_local::{
+    RangeLocalKey, check_range_value, parse_range_local_key, range_local_key, range_local_prefix,
+};
 const MARKER: &str = "GIGGLES_FORMAT";
 const TMP: &str = "GIGGLES_FORMAT.tmp";
 const V2: &[u8] = b"giggles-v2\n";
@@ -183,6 +192,16 @@ fn optional(kv: &dyn KvRead, key: &[u8]) -> Result<Option<u64>, FormatError> {
         .transpose()
 }
 pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
+    // Features gate the key allowlist; a missing or malformed value gates
+    // nothing and fails below exactly as before.
+    let gate = kv
+        .get(Keyspace::Meta, b"features")
+        .map_err(corrupt)?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes);
+    if gate & RANGES != 0 {
+        check_features(gate)?;
+    }
     for item in kv
         .range(
             Keyspace::Meta,
@@ -192,7 +211,13 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
         )
         .map_err(corrupt)?
     {
-        let (key, _) = item.map_err(corrupt)?;
+        let (key, value) = item.map_err(corrupt)?;
+        if gate & RANGES != 0
+            && let Some((id, sub)) = parse_range_local_key(&key)
+        {
+            range_local::check_range_value(id, &sub, &value, gate)?;
+            continue;
+        }
         if !matches!(
             key.as_slice(),
             b"family"
@@ -260,7 +285,11 @@ pub(crate) fn validate_meta(kv: &dyn KvRead) -> Result<MetaInfo, FormatError> {
             live += 1;
         }
     }
-    if (features & 512 != 0 && live != 1) || (features & 512 == 0 && live != 0) {
+    // In range mode (R5) the node's features are the union of its ranges' bits and the role
+    // catalog lives in the system range only; the range engine checks it per range at open.
+    if features & RANGES == 0
+        && ((features & 512 != 0 && live != 1) || (features & 512 == 0 && live != 0))
+    {
         return Err(corrupt("role bootstrap feature/catalog mismatch"));
     }
     Ok(MetaInfo {
@@ -284,7 +313,10 @@ pub(crate) fn check_subversion(version: u32, supported: u32) -> Result<(), Forma
     Ok(())
 }
 pub(crate) fn check_features(bits: u64) -> Result<(), FormatError> {
-    check_features_allowed(bits, 0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED | KEY_DEPENDENCY_IDENTITY)
+    check_features_allowed(
+        bits,
+        0x3FFF | SQL_VIEWS | RELATION_COMMENTS | REPLICATED | KEY_DEPENDENCY_IDENTITY | RANGES,
+    )
 }
 fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     if bits & !allowed != 0 {
@@ -292,6 +324,9 @@ fn check_features_allowed(bits: u64, allowed: u64) -> Result<(), FormatError> {
     }
     if bits & KEY_DEPENDENCY_IDENTITY != 0 && bits & 64 == 0 {
         return Err(corrupt("key dependency identity requires catalog_ext"));
+    }
+    if bits & RANGES != 0 && bits & REPLICATED == 0 {
+        return Err(corrupt("ranges requires replicated"));
     }
     if bits & UNIQUE_CONSTRAINT_IDENTITY != 0 && bits & 68 != 68 {
         return Err(corrupt("unique constraint identity requires catalog_ext and secondary_indexes"));

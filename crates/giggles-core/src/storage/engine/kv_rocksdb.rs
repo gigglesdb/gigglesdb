@@ -1,7 +1,8 @@
 //! Optional RocksDB implementation of the storage-engine KV seam.
 use super::kv::*;
 use rocksdb::{
-    BlockBasedOptions, Cache, DB, DBCompressionType, ErrorKind, IteratorMode, Options, WriteOptions,
+    BlockBasedOptions, Cache, DB, DBCompressionType, ErrorKind, IngestExternalFileOptions,
+    IteratorMode, Options, SstFileWriter, WriteOptions,
 };
 use std::{
     collections::BTreeMap,
@@ -147,6 +148,179 @@ impl RocksKv {
                 _writer_lock: writer_lock,
             }),
         })
+    }
+}
+
+/// One exported SST part. `path` is `None` when the interval was empty at the
+/// snapshot (RocksDB cannot write an SST with no entries).
+#[cfg_attr(not(test), allow(dead_code, reason = "R5-04 export.rs consumes this"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SstFile {
+    pub(crate) ks: Keyspace,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) bytes: u64,
+    pub(crate) keys: u64,
+}
+
+/// Files of one export, in `parts` order, plus what the caller read at the
+/// same RocksDB snapshot (for example the range's applied position).
+#[cfg_attr(not(test), allow(dead_code, reason = "R5-04 export.rs consumes this"))]
+#[derive(Debug)]
+pub(crate) struct SstExport<T> {
+    pub(crate) files: Vec<SstFile>,
+    pub(crate) at_snapshot: T,
+}
+
+/// `(keyspace, start, end)` interval to export.
+pub(crate) type SstPart = (Keyspace, OwnedBound, OwnedBound);
+/// `(keyspace, start, end, file)` interval to replace; `None` empties it.
+pub(crate) type SstInstall = (Keyspace, OwnedBound, OwnedBound, Option<PathBuf>);
+
+/// A `KvRead` over a borrowed native snapshot, valid only inside `export_sst`.
+struct BorrowedSnapshot<'a> {
+    db: &'a DB,
+    snapshot: &'a rocksdb::Snapshot<'a>,
+}
+
+impl KvRead for BorrowedSnapshot<'_> {
+    fn get(&self, ks: Keyspace, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        self.snapshot
+            .get_cf(self.db.cf_handle(ks.name()).unwrap(), key)
+            .map_err(map_error)
+    }
+
+    fn range(
+        &self,
+        ks: Keyspace,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        dir: Direction,
+    ) -> Result<KvIter<'_>, KvError> {
+        let (start, end) = (own(start), own(end));
+        let iter = self.snapshot.iterator_cf(
+            self.db.cf_handle(ks.name()).unwrap(),
+            mode(&start, &end, dir),
+        );
+        Ok(bounded(iter, start, end, dir))
+    }
+}
+
+/// Smallest key strictly greater than `key` in bytewise order.
+fn successor(key: &[u8]) -> Vec<u8> {
+    let mut next = Vec::with_capacity(key.len() + 1);
+    next.extend_from_slice(key);
+    next.push(0);
+    next
+}
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "R5-04/R5-05 range transfer uses these")
+)]
+impl RocksKv {
+    /// Export each interval, as of ONE RocksDB snapshot, to one SST file per
+    /// non-empty part under `dir` (`part-NNNN-<ks>.sst`, overwritten if present).
+    /// `at_snapshot` runs against that same snapshot, so values it reads are
+    /// consistent with the exported files.
+    pub(crate) fn export_sst<T>(
+        &self,
+        dir: &Path,
+        parts: &[SstPart],
+        at_snapshot: impl FnOnce(&dyn KvRead) -> Result<T, KvError>,
+    ) -> Result<SstExport<T>, KvError> {
+        let io_error = |error: std::io::Error| KvError::Io(error.to_string());
+        std::fs::create_dir_all(dir).map_err(io_error)?;
+        let db: &DB = &self.db.db;
+        let snapshot = db.snapshot();
+        let mut options = Options::default();
+        options.set_compression_type(DBCompressionType::Lz4);
+        let mut files = Vec::with_capacity(parts.len());
+        for (index, (ks, start, end)) in parts.iter().enumerate() {
+            let path = native_path(&dir.join(format!("part-{index:04}-{}.sst", ks.name())));
+            let iter = snapshot.iterator_cf(
+                db.cf_handle(ks.name()).unwrap(),
+                mode(start, end, Direction::Forward),
+            );
+            let mut writer = SstFileWriter::create(&options);
+            let mut keys = 0u64;
+            for pair in bounded(iter, start.clone(), end.clone(), Direction::Forward) {
+                let (key, value) = pair?;
+                if keys == 0 {
+                    writer.open(&path).map_err(map_error)?;
+                }
+                writer.put(key, value).map_err(map_error)?;
+                keys += 1;
+            }
+            let file = if keys == 0 {
+                SstFile {
+                    ks: *ks,
+                    path: None,
+                    bytes: 0,
+                    keys,
+                }
+            } else {
+                writer.finish().map_err(map_error)?;
+                let bytes = std::fs::metadata(&path).map_err(io_error)?.len();
+                SstFile {
+                    ks: *ks,
+                    path: Some(path),
+                    bytes,
+                    keys,
+                }
+            };
+            files.push(file);
+        }
+        let at_snapshot = at_snapshot(&BorrowedSnapshot {
+            db,
+            snapshot: &snapshot,
+        })?;
+        Ok(SstExport { files, at_snapshot })
+    }
+
+    /// Replace each interval's contents with its file (or nothing): a synced
+    /// `delete_range_cf` of the interval, then ingestion with move_files=false,
+    /// allow_global_seqno=true, ingest_behind=false. Not atomic across parts;
+    /// repeating the same call converges to the same contents.
+    ///
+    /// Bounds map to the half-open `[from, to)` of `delete_range_cf` through the
+    /// bytewise successor `key ++ 0x00`. An unbounded start is the empty key. An
+    /// unbounded end has no finite bound, so it is the successor of the last key
+    /// currently in the CF (nothing to delete if there is none); the caller must
+    /// keep writers out of the interval while installing.
+    pub(crate) fn ingest_sst(&self, parts: &[SstInstall]) -> Result<(), KvError> {
+        let db: &DB = &self.db.db;
+        let mut ingest = IngestExternalFileOptions::default();
+        ingest.set_move_files(false);
+        ingest.set_allow_global_seqno(true);
+        ingest.set_ingest_behind(false);
+        let mut sync = WriteOptions::default();
+        sync.set_sync(true);
+        for (ks, start, end, file) in parts {
+            let cf = db.cf_handle(ks.name()).unwrap();
+            let from = match start {
+                Bound::Included(key) => key.clone(),
+                Bound::Excluded(key) => successor(key),
+                Bound::Unbounded => Vec::new(),
+            };
+            let to = match end {
+                Bound::Included(key) => Some(successor(key)),
+                Bound::Excluded(key) => Some(key.clone()),
+                Bound::Unbounded => match db.iterator_cf(cf, IteratorMode::End).next() {
+                    Some(pair) => Some(successor(&pair.map_err(map_error)?.0)),
+                    None => None,
+                },
+            };
+            if let Some(to) = to.filter(|to| from < *to) {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.delete_range_cf(cf, from, to);
+                db.write_opt(batch, &sync).map_err(map_error)?;
+            }
+            if let Some(path) = file {
+                db.ingest_external_file_cf_opts(cf, &ingest, vec![native_path(path)])
+                    .map_err(map_error)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -472,6 +646,10 @@ impl Drop for SnapshotIter<'_> {
         let _ = self.snapshot.send(Request::DropRange(self.id));
     }
 }
+
+#[cfg(test)]
+#[path = "kv_rocksdb_sst_tests.rs"]
+mod sst_tests;
 
 #[cfg(test)]
 mod tests {

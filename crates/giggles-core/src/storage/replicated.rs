@@ -11,6 +11,9 @@ use super::{
     v2,
 };
 use crate::{Admin, CoreError, Limits};
+
+/// The multi-range store (GD-0075 R5-03).
+pub use super::range::{RangeApplyOutcome, RangeStore};
 use std::{
     ops::Bound,
     path::Path,
@@ -148,7 +151,9 @@ impl ReplicaStore {
         }
         let kv = Arc::new(RocksKv::open(path, 64 << 20)?);
         let info = meta::validate_meta(kv.as_ref()).map_err(v2::format_error)?;
-        if info.features & meta::REPLICATED == 0 {
+        // A range-mode directory (R5) keeps per-range applied positions; one group must not
+        // apply into it.
+        if info.features & meta::REPLICATED == 0 || info.features & meta::RANGES != 0 {
             return Err(CoreError::Unsupported);
         }
         Ok(Self {

@@ -153,7 +153,7 @@ fn real_legacy_directory_has_no_rocks_files() {
 fn feature_positions_and_validation() {
     assert_eq!(
         FEATURE_TABLE.iter().fold(0, |bits, (bit, _)| bits | bit),
-        0x1FFFF | KEY_DEPENDENCY_IDENTITY
+        0x1FFFF | KEY_DEPENDENCY_IDENTITY | RANGES
     );
     for (i, (bit, _)) in FEATURE_TABLE[..14].iter().enumerate() {
         assert_eq!(*bit, 1u64 << i);
@@ -161,6 +161,7 @@ fn feature_positions_and_validation() {
     assert_eq!(FEATURE_TABLE[14].0, SQL_VIEWS);
     assert_eq!(FEATURE_TABLE[16].0, REPLICATED);
     assert_eq!(FEATURE_TABLE[17].0, KEY_DEPENDENCY_IDENTITY);
+    assert_eq!(FEATURE_TABLE[18], (RANGES, "ranges"));
     assert_eq!(FEATURE_TABLE[10].0, TEXT_BACKED_COLUMN_TYPES);
     assert_eq!(
         FEATURE_TABLE[11].0,
@@ -179,7 +180,7 @@ fn feature_positions_and_validation() {
     );
     let kv = base();
     assert_eq!(validate_meta(&kv).unwrap().features, 0);
-    for i in 18..64 {
+    for i in 19..64 {
         put(&kv, b"features", &(1u64 << i).to_be_bytes());
         assert!(matches!(
             validate_meta(&kv),
@@ -302,9 +303,9 @@ fn features_share_caller_atomic_batch() {
 #[test]
 fn invalid_features_leave_batch_unchanged() {
     for (bits, expected) in [
-        (1 << 18, FormatError::Unsupported("feature bits".into())),
+        (1 << 19, FormatError::Unsupported("feature bits".into())),
         (
-            (1 << 18) | 0xC00,
+            (1 << 19) | 0xC00,
             FormatError::Unsupported("feature bits".into()),
         ),
         (256, corrupt("sequence counters require catalog_ext")),
@@ -475,10 +476,199 @@ fn replicated_creation_is_v2() {
 fn key_dependency_feature_requires_catalog_ext_and_is_monotone() {
     assert!(check_features(64 | KEY_DEPENDENCY_IDENTITY).is_ok());
     assert!(matches!(check_features(KEY_DEPENDENCY_IDENTITY), Err(FormatError::Corrupt(_))));
-    for unknown in [1 << 18, 1 << 40] {
+    for unknown in [1 << 19, 1 << 40] {
         assert!(matches!(check_features(unknown | KEY_DEPENDENCY_IDENTITY), Err(FormatError::Unsupported(_))));
     }
     let kv = base();
     put(&kv, b"features", &(64 | KEY_DEPENDENCY_IDENTITY).to_be_bytes());
     assert_eq!(open_checks(&kv).unwrap().features, 64 | KEY_DEPENDENCY_IDENTITY);
+}
+
+#[test]
+fn ranges_feature_requires_replicated() {
+    assert_eq!(check_features(RANGES), Err(corrupt("ranges requires replicated")));
+    assert_eq!(check_features(RANGES | 64), Err(corrupt("ranges requires replicated")));
+    check_features(RANGES | REPLICATED).unwrap();
+    let kv = base();
+    put(&kv, b"features", &RANGES.to_be_bytes());
+    assert_eq!(validate_meta(&kv).unwrap_err(), corrupt("ranges requires replicated"));
+    put(&kv, b"features", &(RANGES | REPLICATED).to_be_bytes());
+    assert_eq!(validate_meta(&kv).unwrap().features, RANGES | REPLICATED);
+}
+
+use crate::storage::range_api::{Epoch, RangeDescriptor, RangeId, SYSTEM_RANGE};
+const RANGE_SUBS: [RangeLocalKey; 9] = [
+    RangeLocalKey::Applied,
+    RangeLocalKey::LastCommitTs,
+    RangeLocalKey::Descriptor,
+    RangeLocalKey::Features,
+    RangeLocalKey::OracleHw,
+    RangeLocalKey::Install,
+    RangeLocalKey::Prepared(0x0102_0304_0506_0708),
+    RangeLocalKey::Home(0),
+    RangeLocalKey::Marker(u64::MAX),
+];
+fn raw_range_key(id: u64, sub: &[u8]) -> Vec<u8> {
+    let mut key = b"range/".to_vec();
+    key.extend_from_slice(&id.to_be_bytes());
+    key.push(b'/');
+    key.extend_from_slice(sub);
+    key
+}
+fn descriptor(id: u64) -> Vec<u8> {
+    RangeDescriptor {
+        id: RangeId(id),
+        epoch: Epoch(1),
+        start: Vec::new(),
+        end: None,
+        replicas: Vec::new(),
+    }
+    .encode()
+    .unwrap()
+}
+
+#[test]
+fn range_local_keys_round_trip() {
+    let mut prepared = b"prepared/".to_vec();
+    prepared.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+    assert_eq!(
+        range_local_key(RangeId(2), &RANGE_SUBS[6]),
+        raw_range_key(2, &prepared)
+    );
+    assert_eq!(range_local_prefix(RangeId(2)), raw_range_key(2, b""));
+    assert_eq!(
+        range_local_key(RangeId(2), &RangeLocalKey::LastCommitTs),
+        raw_range_key(2, b"last_commit_ts")
+    );
+    for id in [RangeId(1), RangeId(2), RangeId(u64::MAX)] {
+        for sub in RANGE_SUBS {
+            let key = range_local_key(id, &sub);
+            assert!(key.starts_with(&range_local_prefix(id)));
+            assert_eq!(parse_range_local_key(&key), Some((id, sub)));
+        }
+    }
+}
+
+#[test]
+fn malformed_range_local_keys_do_not_parse() {
+    let mut applied_trailing = raw_range_key(2, b"applied");
+    applied_trailing.push(0);
+    for key in [
+        raw_range_key(0, b"applied"),
+        b"range/\0\0\0\x01".to_vec(),
+        b"range/\0\0\0\0\0\0\0\x01applied".to_vec(),
+        b"range/".to_vec(),
+        raw_range_key(2, b""),
+        raw_range_key(2, b"future"),
+        raw_range_key(2, b"Applied"),
+        applied_trailing,
+        raw_range_key(2, b"prepared/\0\0\0\0\0\0\x01"),
+        raw_range_key(2, b"prepared/\0\0\0\0\0\0\0\x01\0"),
+        raw_range_key(2, b"home/"),
+        raw_range_key(2, b"marker"),
+        b"ranges/\0\0\0\0\0\0\0\x01/applied".to_vec(),
+    ] {
+        assert_eq!(parse_range_local_key(&key), None, "{key:?}");
+    }
+}
+
+fn ranged() -> MemKv {
+    let kv = base();
+    put(&kv, b"features", &(RANGES | REPLICATED).to_be_bytes());
+    put(&kv, &raw_range_key(1, b"applied"), &[0; 16]);
+    put(&kv, &raw_range_key(1, b"last_commit_ts"), &7u64.to_be_bytes());
+    put(&kv, &raw_range_key(1, b"descriptor"), &descriptor(1));
+    put(&kv, &raw_range_key(1, b"features"), &REPLICATED.to_be_bytes());
+    put(&kv, &raw_range_key(1, b"oracle_hw"), &9u64.to_be_bytes());
+    put(&kv, &raw_range_key(1, b"gc_watermark"), &3u64.to_be_bytes());
+    put(&kv, &raw_range_key(1, b"install"), b"opaque");
+    for sub in &RANGE_SUBS[6..] {
+        let value: &[u8] = match sub {
+            RangeLocalKey::Marker(_) => &[1; 8],
+            _ => b"any",
+        };
+        put(&kv, &range_local_key(RangeId(2), sub), value);
+    }
+    put(&kv, &raw_range_key(2, b"descriptor"), &descriptor(2));
+    put(&kv, &raw_range_key(2, b"features"), &(RANGES | REPLICATED).to_be_bytes());
+    kv
+}
+
+#[test]
+fn validate_meta_checks_range_local_values() {
+    assert_eq!(validate_meta(&ranged()).unwrap().features, RANGES | REPLICATED);
+    let len = || corrupt("wrong range metadata length");
+    let unknown = || FormatError::Unsupported("unknown metadata key".into());
+    let marker = range_local_key(RangeId(2), &RangeLocalKey::Marker(3));
+    let cases: Vec<(Vec<u8>, Vec<u8>, FormatError)> = vec![
+        (raw_range_key(1, b"applied"), vec![0; 15], corrupt("wrong range applied length")),
+        (raw_range_key(1, b"applied"), vec![0; 17], corrupt("wrong range applied length")),
+        (raw_range_key(1, b"last_commit_ts"), vec![0; 7], len()),
+        (raw_range_key(2, b"features"), vec![0; 9], len()),
+        (raw_range_key(1, b"oracle_hw"), vec![0; 7], len()),
+        (marker.clone(), vec![0; 7], len()),
+        (marker, vec![0; 9], len()),
+        (
+            raw_range_key(2, b"oracle_hw"),
+            9u64.to_be_bytes().to_vec(),
+            corrupt("oracle_hw outside the system range"),
+        ),
+        (
+            raw_range_key(2, b"descriptor"),
+            descriptor(3),
+            corrupt("range descriptor id mismatch"),
+        ),
+        (
+            raw_range_key(2, b"features"),
+            (REPLICATED | 64).to_be_bytes().to_vec(),
+            corrupt("range features exceed node features"),
+        ),
+        (
+            raw_range_key(2, b"features"),
+            RANGES.to_be_bytes().to_vec(),
+            corrupt("ranges requires replicated"),
+        ),
+        (
+            raw_range_key(2, b"features"),
+            (1u64 << 19).to_be_bytes().to_vec(),
+            FormatError::Unsupported("feature bits".into()),
+        ),
+        (raw_range_key(2, b"future"), Vec::new(), unknown()),
+        (raw_range_key(0, b"applied"), vec![0; 16], unknown()),
+    ];
+    for (key, value, expected) in cases {
+        let kv = ranged();
+        put(&kv, &key, &value);
+        assert_eq!(validate_meta(&kv).unwrap_err(), expected, "{key:?}");
+    }
+    for bad in [Vec::new(), vec![2], descriptor(1)[..20].to_vec()] {
+        let kv = ranged();
+        put(&kv, &raw_range_key(1, b"descriptor"), &bad);
+        assert!(matches!(validate_meta(&kv), Err(FormatError::Corrupt(_))));
+    }
+    assert_eq!(SYSTEM_RANGE, RangeId(1));
+}
+
+#[test]
+fn range_keys_are_unknown_without_ranges_feature() {
+    let key = range_local_key(RangeId(1), &RangeLocalKey::Applied);
+    let unknown = FormatError::Unsupported("unknown metadata key".into());
+    for features in [Some(0), Some(REPLICATED), Some(64 | KEY_DEPENDENCY_IDENTITY), None] {
+        let kv = base();
+        match features {
+            Some(bits) => put(&kv, b"features", &bits.to_be_bytes()),
+            None => {
+                let mut b = WriteBatch::default();
+                b.delete(Keyspace::Meta, b"features".to_vec());
+                kv.write(b, Durability::Sync).unwrap();
+            }
+        }
+        assert!(features.is_none() || validate_meta(&kv).is_ok());
+        put(&kv, &key, &[0; 16]);
+        assert_eq!(validate_meta(&kv).unwrap_err(), unknown);
+    }
+    let kv = base();
+    put(&kv, b"features", &[0; 7]);
+    put(&kv, &key, &[0; 16]);
+    assert_eq!(validate_meta(&kv).unwrap_err(), unknown);
 }
