@@ -199,3 +199,26 @@ fn retired_peer_is_rejected() {
             .is_err()
     );
 }
+// Check-quorum clears raft-rs's `recent_active` for every peer once per election
+// timeout. Reachability judged from that flag dropped a healthy voter until its
+// next heartbeat response, refusing replacements at random (GD-0074). A lost
+// voter must still drop out once a whole election timeout passes in silence.
+#[test]
+fn healthy_voter_stays_reachable_across_check_quorum() {
+    let mut c = Cluster::new("reachable-window", 3, 7406);
+    c.elect(2);
+    c.crash(1);
+    for tick in 0..40 {
+        for (&id, node) in &mut c.nodes {
+            node.set_election_timeout(10 + id as usize);
+            node.tick();
+        }
+        // Sampled before the heartbeat sent on this tick is answered.
+        let reachable = c.nodes[&2].reachable_voters();
+        assert!(reachable.contains(&3), "tick {tick}: {reachable:?}");
+        if tick > 10 {
+            assert_eq!(reachable, [2, 3].into(), "tick {tick}");
+        }
+        c.pump();
+    }
+}

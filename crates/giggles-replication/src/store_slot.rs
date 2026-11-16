@@ -5,9 +5,11 @@ use crate::{
 };
 use giggles_core::replicated as gr;
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    thread,
+    time::{Duration, Instant},
 };
 
 pub struct StoreSlot {
@@ -31,6 +33,30 @@ fn remove(path: &Path) -> std::io::Result<()> {
         fs::remove_dir_all(path)?;
     }
     Ok(())
+}
+/// How long an install keeps retrying a directory swap that Windows refuses.
+const LOCKED_RETRY: Duration = Duration::from_secs(5);
+/// Windows refuses to rename or delete a directory while any handle inside it is
+/// open, and a virus scanner or indexer can briefly hold one on files just written
+/// (a received snapshot) or just closed (the replaced store). A failed install stops
+/// the replica for good, so retry such refusals for a bounded time (GD-0074).
+fn retry_locked<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let deadline = Instant::now() + LOCKED_RETRY;
+    let mut wait = Duration::from_millis(10);
+    loop {
+        match op() {
+            // ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32).
+            Err(e)
+                if cfg!(windows)
+                    && matches!(e.raw_os_error(), Some(5 | 32))
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(wait);
+                wait = (wait * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
 }
 impl StoreSlot {
     pub fn open_or_create(data_dir: &Path, domain: [u8; 16]) -> Result<Self, Error> {
@@ -108,13 +134,13 @@ impl StoreSlot {
                 return Err(StateError("store busy".into()));
             }
         }
-        if let Err(e) = fs::rename(&self.data_dir, &old) {
+        if let Err(e) = retry_locked(|| fs::rename(&self.data_dir, &old)) {
             *current = gr::ReplicaStore::open(&self.data_dir).ok().map(Arc::new);
             return Err(state_error(e));
         }
         crate::failpoint::hit(&self.domain(), None, "slot.install.old");
         let result = (|| {
-            fs::rename(source, &self.data_dir).map_err(state_error)?;
+            retry_locked(|| fs::rename(source, &self.data_dir)).map_err(state_error)?;
             crate::failpoint::hit(&self.domain(), None, "slot.install.new");
             let store = gr::ReplicaStore::open(&self.data_dir).map_err(state_error)?;
             if store.domain() != self.domain {
@@ -124,7 +150,7 @@ impl StoreSlot {
                 .applied()
                 .map_err(state_error)?
                 .ok_or_else(|| StateError("snapshot has no applied position".into()))?;
-            remove(&old).map_err(state_error)?;
+            retry_locked(|| remove(&old)).map_err(state_error)?;
             Ok((store, at.into()))
         })();
         match result {
@@ -135,9 +161,9 @@ impl StoreSlot {
             Err(e) => {
                 let rollback = (|| -> std::io::Result<()> {
                     if self.data_dir.exists() {
-                        fs::rename(&self.data_dir, &failed)?;
+                        retry_locked(|| fs::rename(&self.data_dir, &failed))?;
                     }
-                    fs::rename(&old, &self.data_dir)
+                    retry_locked(|| fs::rename(&old, &self.data_dir))
                 })();
                 *current = gr::ReplicaStore::open(&self.data_dir)
                     .or_else(|_| gr::ReplicaStore::open(&old))

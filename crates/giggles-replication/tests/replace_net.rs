@@ -24,6 +24,9 @@ struct Cluster {
     nodes: Vec<Option<Node>>,
     configs: Vec<NodeConfig>,
     root: PathBuf,
+    // Each stopped node's listen port stays bound here until the node starts,
+    // so a concurrent test process cannot take it (os error 10048).
+    reserved: Vec<Option<TcpListener>>,
 }
 impl Cluster {
     fn new() -> Self {
@@ -67,16 +70,15 @@ impl Cluster {
                 write_set_bytes: 64 << 20,
             })
             .collect();
-        drop(listeners);
         let mut c = Self {
-            nodes: vec![],
+            nodes: (0..4).map(|_| None).collect(),
             configs,
             root,
+            reserved: listeners.into_iter().map(Some).collect(),
         };
-        for config in &c.configs[..3] {
-            c.nodes.push(Some(Node::start(config.clone()).unwrap()));
+        for i in 0..3 {
+            c.start(i);
         }
-        c.nodes.push(None);
         c
     }
 
@@ -130,9 +132,11 @@ impl Cluster {
 
     fn stop(&mut self, i: usize) {
         self.nodes[i].take().unwrap().stop();
+        self.reserved[i] = TcpListener::bind(&self.configs[i].transport.listen).ok();
     }
 
     fn start(&mut self, i: usize) {
+        drop(self.reserved[i].take());
         self.nodes[i] = Some(Node::start(self.configs[i].clone()).unwrap());
     }
 
@@ -153,21 +157,25 @@ impl Cluster {
         self.leader().0
     }
     fn complete(&self) {
-        let (leader, engine) = self.leader();
-        drop(engine);
-        let handle = &self.nodes[leader].as_ref().unwrap().handle;
-        until(|| {
-            let _ = handle.read_barrier();
-            handle
-                .membership_status()
-                .unwrap()
-                .reachable
-                .iter()
-                .filter(|id| **id != 1)
-                .count()
-                >= 2
-        });
-        replace::run(handle, &self.request(), Duration::from_secs(60)).unwrap();
+        // A leader change (likely on a busy machine) interrupts the run. Resume it
+        // on the new leader, as an operator would: replacement is resumable.
+        let resume_until = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (leader, engine) = self.leader();
+            drop(engine);
+            let handle = &self.nodes[leader].as_ref().unwrap().handle;
+            until(|| {
+                let _ = handle.read_barrier();
+                let s = handle.membership_status().unwrap();
+                s.role.state != raft::StateRole::Leader
+                    || s.reachable.iter().filter(|id| **id != 1).count() >= 2
+            });
+            match replace::run(handle, &self.request(), Duration::from_secs(60)) {
+                Ok(_) => break,
+                Err(ReplaceError::NotLeader { .. }) if Instant::now() < resume_until => {}
+                Err(e) => panic!("replace failed: {e}"),
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         until(|| {
             let statuses: Vec<_> = self

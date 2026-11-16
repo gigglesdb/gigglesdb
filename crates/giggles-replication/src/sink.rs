@@ -364,8 +364,12 @@ pub fn spawn_with_policy(
                     }
                 }
             }
-            let Ok(out) = replica.drive() else {
-                break;
+            let out = match replica.drive() {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("replica {} stopped: {e}", replica.node_id());
+                    break;
+                }
             };
             if out.membership_changed {
                 outbox.apply_membership(replica.membership());

@@ -12,7 +12,11 @@ use raft::{
     Config, RawNode, ReadOnlyOption, StateRole,
     eraftpb::{ConfChangeV2, ConfState, Entry, EntryType, Message, MessageType},
 };
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoleInfo {
@@ -33,6 +37,9 @@ pub struct Output {
 const QUIESCE: &[u8] = b"GDQUIESCE1";
 /// Consecutive idle leader ticks before a group quiesces (two heartbeat rounds).
 const QUIESCE_AFTER_TICKS: u32 = 4;
+/// Election timeout in ticks. It is also the window within which a leader must
+/// have heard from a voter to count it reachable (`reachable_voters`).
+const ELECTION_TICK: usize = 10;
 struct Pending {
     waiter: u64,
     index: u64,
@@ -55,6 +62,10 @@ pub struct Replica {
     /// Peer nodes the host's liveness tracker currently reports dead.
     dead: BTreeSet<u64>,
     idle_ticks: u32,
+    /// Ticks this replica has run; quiesced (ignored) ticks do not count.
+    ticks: u64,
+    /// The tick at which a message from each peer node was last stepped.
+    heard: BTreeMap<u64, u64>,
     /// Messages built outside raft-rs (quiesce heartbeats), sent with the next drive.
     outgoing: Vec<Message>,
 }
@@ -87,7 +98,7 @@ impl Replica {
         let membership = Self::decode_membership(log.membership()?.as_deref())?;
         let config = Config {
             id: node_id,
-            election_tick: 10,
+            election_tick: ELECTION_TICK,
             heartbeat_tick: 2,
             check_quorum: true,
             pre_vote: true,
@@ -114,6 +125,8 @@ impl Replica {
             quiesce_hold: false,
             dead: BTreeSet::new(),
             idle_ticks: 0,
+            ticks: 0,
+            heard: BTreeMap::new(),
             outgoing: Vec::new(),
         })
     }
@@ -136,6 +149,14 @@ impl Replica {
             .then(|| self.raw.raft.prs().get(id).map(|p| p.matched))
             .flatten()
     }
+    /// The voters (this leader included) heard from within the last election
+    /// timeout and not reported dead by the host's liveness tracker.
+    ///
+    /// This is a sliding window over the leader's own record of received messages,
+    /// not raft-rs's `recent_active`: check-quorum clears that flag for every peer
+    /// once per election timeout, so a healthy voter reads as unreachable until its
+    /// next heartbeat response arrives. Sampling it refused voter replacements at
+    /// random, more often on a busy machine (GD-0074).
     pub fn reachable_voters(&self) -> BTreeSet<u64> {
         if self.role().state != StateRole::Leader {
             return BTreeSet::new();
@@ -147,7 +168,12 @@ impl Replica {
             .chain(std::iter::once(&self.node_id))
             .copied()
             .filter(|&id| {
-                id == self.node_id || self.raw.raft.prs().get(id).is_some_and(|p| p.recent_active)
+                id == self.node_id
+                    || (!self.dead.contains(&id)
+                        && self
+                            .heard
+                            .get(&id)
+                            .is_some_and(|&at| self.ticks - at <= ELECTION_TICK as u64))
             })
             .collect()
     }
@@ -250,6 +276,7 @@ impl Replica {
         if self.quiesced {
             return;
         }
+        self.ticks += 1;
         // Judged before the tick: a heartbeat tick leaves outgoing messages pending.
         let idle = self.can_quiesce();
         self.raw.tick();
@@ -287,6 +314,9 @@ impl Replica {
                     pr.recent_active = false;
                 }
             }
+            // The tick clock stopped while quiesced: what was heard is as old as
+            // the quiescence, so reachability starts again from fresh messages.
+            self.heard.clear();
             self.raw.raft.election_elapsed = 0;
         }
         self.quiesced = false;
@@ -453,6 +483,7 @@ impl Replica {
         if m.get_msg_type() == MessageType::MsgHeartbeat {
             m.commit = m.commit.min(self.raw.raft.raft_log.last_index());
         }
+        self.heard.insert(from, self.ticks);
         self.raw.step(m).map_err(Error::Raft)?;
         if quiesce_request {
             let raft = &self.raw.raft;
