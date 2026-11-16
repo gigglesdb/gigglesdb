@@ -1,5 +1,6 @@
 use crate::{catalog, *};
 mod flat_union;
+mod numeric_literals;
 mod join_selection;
 mod regtype;
 mod subscripts;
@@ -619,6 +620,8 @@ fn plan_inner(
     if sql.len() > MAX_SQL {
         return Err(Error::Limit);
     }
+    let normalized = numeric_literals::normalize(sql)?;
+    let sql = normalized.as_ref();
     // sqlparser's recursion guard does not bound left-associative ASTs:
     // rejecting a deep tree after parsing can still overflow during Drop.
     // Tokenize first (flat storage), then bound tokens that can construct AST
@@ -1991,6 +1994,11 @@ impl Compiler {
                 return Ok(match v {
                     a::Value::Null => null(),
                     a::Value::Boolean(b) => literal(Value::Bool(*b), PgType::Bool),
+                    a::Value::Number(n, _) if n.contains(['.', 'e', 'E']) || n.parse::<i64>().is_err() => {
+                        let numeric =
+                            giggles_pg_types::Numeric::parse(n).map_err(|_| Error::Type)?;
+                        literal(Value::Numeric(numeric), PgType::Numeric)
+                    }
                     a::Value::Number(n, _) => {
                         let i = n.parse::<i64>().map_err(|_| Error::Type)?;
                         literal(

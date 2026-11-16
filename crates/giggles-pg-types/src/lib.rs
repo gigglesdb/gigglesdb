@@ -9,6 +9,8 @@ pub mod integer;
 mod numeric_aggregate;
 mod numeric_arith;
 mod numeric_math;
+mod numeric_syntax;
+pub use numeric_syntax::numeric_literal;
 pub mod temporal;
 pub mod typmod;
 pub use float::{Float4, Float8};

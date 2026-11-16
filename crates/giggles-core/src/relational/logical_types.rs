@@ -55,16 +55,12 @@ pub fn coerce(value: Value, ty: &DataType) -> R<Value> {
                 .into_iter()
                 .map(|v| {
                     v.map(|s| match ty {
-                        DataType::IntArray => s
-                            .trim()
-                            .parse::<i32>()
+                        DataType::IntArray => giggles_pg_types::integer::parse_i32(&s)
                             .map(|n| n.to_string())
-                            .map_err(|_| bad()),
-                        DataType::BigIntArray => s
-                            .trim()
-                            .parse::<i64>()
+                            .map_err(integer_input_error),
+                        DataType::BigIntArray => giggles_pg_types::integer::parse_i64(&s)
                             .map(|n| n.to_string())
-                            .map_err(|_| bad()),
+                            .map_err(integer_input_error),
                         _ => Ok(array_quote(&s)),
                     })
                     .transpose()
@@ -243,4 +239,13 @@ pub fn eval(name: &str, ty: &DataType, values: &[Value]) -> R<Value> {
             _ => Value::Text(json_output(found)?),
         }
     })
+}
+
+fn integer_input_error(error: giggles_pg_types::integer::IntegerError) -> SqlError {
+    use giggles_pg_types::integer::IntegerError;
+    match error {
+        IntegerError::Syntax => SqlError::InvalidTextRepresentation,
+        IntegerError::Range => SqlError::Overflow,
+        IntegerError::Limit => SqlError::Limit,
+    }
 }

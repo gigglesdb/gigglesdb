@@ -2954,6 +2954,13 @@ fn numeric_input_error(text: &str, error: giggles_pg_types::Error) -> SqlError {
         Error::Limit if text.len() > giggles_pg_types::MAX_TEXT => SqlError::Limit,
         Error::Limit => {
             let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
+            let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+            let normalized = match crate::relational::numeric_syntax::literal(unsigned, 0) {
+                Ok((number, end)) if end == unsigned.len() => number,
+                Err(SqlError::Limit) => return SqlError::Overflow,
+                _ => return SqlError::InvalidTextRepresentation,
+            };
+            let text = normalized.as_str();
             let mut bytes = text.bytes().peekable();
             if matches!(bytes.peek(), Some(b'+' | b'-')) {
                 bytes.next();

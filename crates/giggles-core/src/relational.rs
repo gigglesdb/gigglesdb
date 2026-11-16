@@ -1,4 +1,7 @@
 //! Bounded trusted relational subset. This module grants no task authority.
+mod numeric_syntax;
+#[cfg(test)]
+mod numeric_literal_tests;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 mod alter_table;
@@ -849,28 +852,12 @@ fn lex_into(s: &str, out: &mut Vec<Token>, routing: bool) -> R<()> {
                 i += 1;
             }
             out.push(Token::Word(s[start..i].to_ascii_lowercase()));
-        } else if c.is_ascii_digit() {
-            let start = i;
-            i += 1;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            if b.get(i) == Some(&b'.') {
-                i += 1;
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if b.get(i).is_some_and(|c| *c == b'e' || *c == b'E') {
-                i += 1;
-                if b.get(i).is_some_and(|c| *c == b'+' || *c == b'-') {
-                    i += 1;
-                }
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            out.push(Token::Number(s[start..i].into()));
+        } else if c.is_ascii_digit()
+            || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+        {
+            let (number, end) = numeric_syntax::literal(s, i)?;
+            out.push(Token::Number(number));
+            i = end;
         } else if c == b'$' {
             if b.get(i + 1) == Some(&b'$') {
                 i += 2;
