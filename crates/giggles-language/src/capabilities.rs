@@ -279,6 +279,9 @@ pub fn capability_manifest_for(version: LanguageVersion) -> CapabilityManifest {
             add(interface, "column_defaults", CapabilityState::Implemented,
                 "CREATE TABLE column DEFAULT (literal or nextval(seq)), GENERATED ALWAYS|BY DEFAULT AS IDENTITY and serial/bigserial through SQL's default validation, stored default text and owned sequences. Text literals are typed (no unknown-literal coercion); no clock defaults.",
                 vec![evidence("crates/giggles-language/tests/native_column_defaults21_parity.rs", "defaults_identity_serial_match_sql")], vec![]);
+            add(interface, "create_table_foreign_keys", CapabilityState::Implemented,
+                "CREATE TABLE column [CONSTRAINT n] REFERENCES p [(c)] and table [CONSTRAINT n] FOREIGN KEY (..) REFERENCES p [(..)], with ON DELETE/ON UPDATE actions, alongside column defaults. Core's native CreateTable carries no constraints, so this runs as the table plus one ADD CONSTRAINT per key in one catalog commit; a failing key leaves no table. Names and SQLSTATEs match SQL; on V2 constraint IDs follow ALTER TABLE allocation. Not preparable as a bound catalog operation (Unsupported).",
+                vec![evidence("crates/giggles-language/tests/native_create_fk21_parity.rs", "create_table_foreign_keys_match_sql")], vec![]);
         }
         for interface in [CapabilityInterface::RustText, CapabilityInterface::RustTree] {
             add(interface, "sequences", CapabilityState::Implemented,

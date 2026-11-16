@@ -589,8 +589,14 @@ impl Engine {
     /// Execute a definition; use [`Self::execute_catalog_optional`] for DROP VIEW IF EXISTS or DROP CONSTRAINT IF EXISTS.
     pub fn execute_catalog(&self, statement: &CatalogStatement) -> Result<CatalogOutcome> {
         reject_optional_catalog(statement)?;
-        let request = lower_catalog_checked(statement, self.version)?;
-        self.inner.execute_catalog(&request).map_err(error)
+        self.execute_catalog_lowered(statement)
+    }
+    /// Profile 0.21 CREATE TABLE with foreign keys runs as CreateTable then one
+    /// AddConstraint per key, in one core catalog commit.
+    fn execute_catalog_lowered(&self, statement: &CatalogStatement) -> Result<CatalogOutcome> {
+        let (request, constraints) = lower_catalog_parts(statement, self.version)?;
+        if constraints.is_empty() { self.inner.execute_catalog(&request) }
+        else { self.inner.execute_catalog_with_constraints(&request, &constraints) }.map_err(error)
     }
     /// Execute catalog text, returning None for a missing optional view or constraint target.
     pub fn execute_catalog_optional_text(&self, text: &str) -> Result<Option<CatalogOutcome>> {
@@ -599,8 +605,7 @@ impl Engine {
     /// Execute catalog DDL; optional views suppress SQL 42P01/3F000; optional constraints suppress 42704.
     pub fn execute_catalog_optional(&self, statement: &CatalogStatement) -> Result<Option<CatalogOutcome>> {
         if matches!(statement, CatalogStatement::CreateSequence { .. } | CatalogStatement::DropSequence { .. }) { return Err(Error::Unsupported); }
-        let request = lower_catalog_checked(statement, self.version)?;
-        match self.inner.execute_catalog(&request).map_err(error) {
+        match self.execute_catalog_lowered(statement) {
             Err(Error::Sql { sqlstate }) if matches!(statement, CatalogStatement::DropView { if_exists: true, .. })
                 && matches!(sqlstate.as_str(), "42P01" | "3F000") => Ok(None),
             Err(Error::Sql { sqlstate }) if matches!(statement, CatalogStatement::AlterTable { action: AlterTableAction::DropConstraint { if_exists: true, .. }, .. })
@@ -614,6 +619,7 @@ impl Engine {
         self.prepare_catalog_bound(&parse_catalog_with_version(text, self.version)?)
     }
     /// Prepare a definition; DROP VIEW IF EXISTS and DROP CONSTRAINT IF EXISTS require [`Self::execute_catalog_optional`].
+    /// CREATE TABLE with foreign keys has no single bound request and is Unsupported here.
     pub fn prepare_catalog_bound(
         &self,
         statement: &CatalogStatement,
@@ -657,14 +663,18 @@ pub(crate) fn validate_catalog(
     version: LanguageVersion,
 ) -> Result<()> {
     if let CatalogStatement::CreateTableWith { table, columns, primary_key, constraints } = statement {
-        if !version.supports_r2_wave3() || !constraints.is_empty() { return Err(Error::Unsupported); }
-        if columns.len() > giggles_core::relational::MAX_COLUMNS || primary_key.len() > giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
+        // Only foreign keys are admitted; each is validated as its ALTER TABLE ADD CONSTRAINT.
+        if !version.supports_r2_wave3() || constraints.iter().any(|c| !matches!(c.constraint, ConstraintSpec::ForeignKey { .. })) { return Err(Error::Unsupported); }
+        if columns.len() > giggles_core::relational::MAX_COLUMNS || primary_key.len() > giggles_core::relational::MAX_COLUMNS
+            || constraints.len() > giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
         validate_size(statement)?;
         for column in columns {
             if let Some(ColumnDefaultSpec::Nextval(name)) = &column.default
                 && !parser::semantic_relation(name, version) { return Err(Error::Bind("identifier".into())); }
         }
-        return validate_catalog(&CatalogStatement::CreateTable { table: table.clone(), columns: columns.iter().map(|c| c.column.clone()).collect(), primary_key: primary_key.clone() }, version);
+        validate_catalog(&CatalogStatement::CreateTable { table: table.clone(), columns: columns.iter().map(|c| c.column.clone()).collect(), primary_key: primary_key.clone() }, version)?;
+        for constraint in constraints { validate_catalog(&table_constraint_statement(table, constraint), version)?; }
+        return Ok(());
     }
     if let CatalogStatement::CreateSequence { name, .. } | CatalogStatement::DropSequence { name, .. } = statement {
         if !version.supports_r2_wave3() { return Err(Error::Unsupported); }
@@ -753,7 +763,36 @@ pub(crate) fn validate_catalog(
     validate_size(statement)
 }
 
+fn table_constraint_statement(table: &str, constraint: &TableConstraint) -> CatalogStatement {
+    CatalogStatement::AlterTable { table: table.to_owned(), action: AlterTableAction::AddConstraint {
+        name: constraint.name.clone(), constraint: constraint.constraint.clone() } }
+}
+
+/// A single catalog request; CREATE TABLE with foreign keys has none (Unsupported).
 fn lower_catalog_checked(
+    statement: &CatalogStatement,
+    version: LanguageVersion,
+) -> Result<operations::CatalogRequest> {
+    let (request, constraints) = lower_catalog_parts(statement, version)?;
+    if !constraints.is_empty() { return Err(Error::Unsupported); }
+    Ok(request)
+}
+
+/// The catalog request, plus the AddConstraint requests that must follow it in
+/// the same commit (CREATE TABLE foreign keys; core's CreateTable carries none).
+fn lower_catalog_parts(
+    statement: &CatalogStatement,
+    version: LanguageVersion,
+) -> Result<(operations::CatalogRequest, Vec<operations::CatalogRequest>)> {
+    let request = lower_catalog_single(statement, version)?;
+    let CatalogStatement::CreateTableWith { table, constraints, .. } = statement else { return Ok((request, Vec::new())) };
+    let constraints = constraints.iter()
+        .map(|constraint| lower_catalog_single(&table_constraint_statement(table, constraint), version))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((request, constraints))
+}
+
+fn lower_catalog_single(
     statement: &CatalogStatement,
     version: LanguageVersion,
 ) -> Result<operations::CatalogRequest> {

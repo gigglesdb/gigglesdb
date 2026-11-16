@@ -622,7 +622,10 @@ pub enum CatalogStatement {
         columns: Vec<ColumnSpec>,
         primary_key: Vec<String>,
     },
-    /// Profile 0.21: column defaults and generation; table constraints are reserved.
+    /// Profile 0.21: column defaults and generation, plus foreign keys (column
+    /// REFERENCES or table FOREIGN KEY, in source order). Other constraint kinds
+    /// are Unsupported. The table and then each key (as ALTER TABLE ADD
+    /// CONSTRAINT) run in one atomic catalog commit, like SQL CREATE TABLE.
     CreateTableWith {
         table: String, columns: Vec<TableColumn>, primary_key: Vec<String>,
         constraints: Vec<TableConstraint>,

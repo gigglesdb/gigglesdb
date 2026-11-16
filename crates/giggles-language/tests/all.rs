@@ -44,6 +44,7 @@ mod native_paging_parity;
 mod native_parity;
 #[path = "native_qualified_query_parity.rs"] mod native_qualified_query_parity;
 #[path = "native_recovery21_parity.rs"] mod native_recovery21_parity;
+#[path = "native_create_fk21_parity.rs"] mod native_create_fk21_parity;
 #[path = "native_schema_parity.rs"]
 mod native_schema_parity;
 #[path = "native_sqlstate_parity.rs"]

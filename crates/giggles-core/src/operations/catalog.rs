@@ -479,99 +479,38 @@ impl Engine {
     fn execute_catalog_plan_with_index_creator(
         &self,
         bind: impl FnOnce(&mut SqlSession) -> Result<BoundCatalogOperation>,
-        create_index: impl FnOnce(
-            &mut SqlSession,
-            &TableDef,
-            &str,
-            &[u64],
-        ) -> std::result::Result<u64, CoreError>,
+        create_index: impl FnOnce(&mut SqlSession, &TableDef, &str, &[u64]) -> std::result::Result<u64, CoreError>,
+    ) -> Result<CatalogOutcome> {
+        self.execute_catalog_plan_then(bind, create_index, &[])
+    }
+    /// Execute a native CREATE TABLE and then its table constraints (each an
+    /// AddConstraint on that table) in one fresh snapshot and one commit
+    /// decision, like SQL CREATE TABLE with REFERENCES: any failure leaves no table.
+    pub fn execute_catalog_with_constraints(&self, create: &CatalogRequest, constraints: &[CatalogRequest]) -> Result<CatalogOutcome> {
+        if !matches!(create, CatalogRequest::CreateTable { .. })
+            || constraints.iter().any(|c| !matches!(c, CatalogRequest::AddConstraint { .. })) {
+            return Err(Error::Unsupported);
+        }
+        validate_catalog_request(create)?;
+        for constraint in constraints { validate_catalog_request(constraint)?; }
+        self.execute_catalog_plan_then(|session| bind_catalog(session, create), SqlSession::create_index_engine, constraints)
+    }
+    fn execute_catalog_plan_then(
+        &self,
+        bind: impl FnOnce(&mut SqlSession) -> Result<BoundCatalogOperation>,
+        create_index: impl FnOnce(&mut SqlSession, &TableDef, &str, &[u64]) -> std::result::Result<u64, CoreError>,
+        then: &[CatalogRequest],
     ) -> Result<CatalogOutcome> {
         let mut session = self.admin.sql_session();
         session.begin_engine().map_err(core)?;
         let staged = (|| {
             let prepared = bind(&mut session)?;
-            if matches!(prepared.description.request, CatalogRequest::CreateView { .. } | CatalogRequest::DropView { .. }) && session.is_v2_engine() {
-                session.catalog_empty_engine().map_err(core)?;
+            let mut outcome = stage_catalog(&mut session, &prepared.description.request, create_index)?;
+            for request in then {
+                let prepared = bind_catalog(&mut session, request)?;
+                outcome = stage_catalog(&mut session, &prepared.description.request, SqlSession::create_index_engine)?;
             }
-            if let CatalogRequest::CreateView { name, read } = &prepared.description.request {
-                let table = session.execute_typed_view(native_relation_key(name), Some(read.clone()), false).map_err(core)?;
-                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
-            }
-            if let CatalogRequest::DropView { name, cascade } = &prepared.description.request {
-                let table = session.execute_typed_view(native_relation_key(name), None, *cascade).map_err(core)?;
-                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
-            }
-            if !session.catalog_empty_engine().map_err(core)? {
-                return Err(Error::PlanRequired);
-            }
-            if matches!(&prepared.description.request, CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
-                let table = session.constraint_catalog_engine(&constraint_relation_keys(&prepared.description.request)).map_err(core)?;
-                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
-            }
-            if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = &prepared.description.request {
-                let is_index = matches!(prepared.description.request, CatalogRequest::DropIndex { .. });
-                let (table, index_id) = session.drop_catalog_engine(native_relation_key(name), *cascade, is_index).map_err(core)?;
-                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-                return Ok(CatalogOutcome { catalog_epoch, table, index_id });
-            }
-            if let CatalogRequest::AlterTable { table, action } = &prepared.description.request {
-                let table = session.alter_table_engine(native_relation_key(table), action.clone()).map_err(core)?;
-                let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-                return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
-            }
-            let index_id;
-            let table_name;
-            if let CatalogRequest::CreateIndex {
-                table,
-                name,
-                columns,
-            } = &prepared.description.request
-            {
-                let definition = session.native_table_engine(&native_relation_key(table)).map_err(core)?;
-                let ids = columns
-                    .iter()
-                    .map(|name| {
-                        definition
-                            .columns
-                            .iter()
-                            .find(|c| c.name == *name)
-                            .map(|c| c.id)
-                            .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                index_id = Some(create_index(&mut session, &definition, name, &ids).map_err(core)?);
-                table_name = native_relation_key(table);
-            } else {
-                let CatalogRequest::CreateTable {
-                    table,
-                    columns,
-                    primary_key,
-                } = &prepared.description.request
-                else {
-                    unreachable!()
-                };
-                let (defaults, sequences) = native_options(columns)?;
-                session
-                    .create_table_defaults_engine(
-                        session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?,
-                        columns_for_create(columns),
-                        primary_key.clone(),
-                        defaults, sequences,
-                    )
-                    .map_err(core)?;
-                table_name = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;
-                index_id = None;
-            }
-            let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
-            let table = session.native_table_engine(&table_name).map_err(core)?;
-            Ok(CatalogOutcome {
-                catalog_epoch,
-                table,
-                index_id,
-            })
+            Ok(outcome)
         })();
         let outcome = match staged {
             Ok(outcome) => outcome,
@@ -593,6 +532,96 @@ impl Engine {
             }
         }
     }
+}
+
+/// Stage one bound catalog request in the caller's snapshot; the caller decides commit.
+fn stage_catalog(
+    session: &mut SqlSession,
+    request: &CatalogRequest,
+    create_index: impl FnOnce(&mut SqlSession, &TableDef, &str, &[u64]) -> std::result::Result<u64, CoreError>,
+) -> Result<CatalogOutcome> {
+    if matches!(request, CatalogRequest::CreateView { .. } | CatalogRequest::DropView { .. }) && session.is_v2_engine() {
+        session.catalog_empty_engine().map_err(core)?;
+    }
+    if let CatalogRequest::CreateView { name, read } = request {
+        let table = session.execute_typed_view(native_relation_key(name), Some(read.clone()), false).map_err(core)?;
+        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+    }
+    if let CatalogRequest::DropView { name, cascade } = request {
+        let table = session.execute_typed_view(native_relation_key(name), None, *cascade).map_err(core)?;
+        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+    }
+    if !session.catalog_empty_engine().map_err(core)? {
+        return Err(Error::PlanRequired);
+    }
+    if matches!(request, CatalogRequest::AddConstraint { .. } | CatalogRequest::DropConstraint { .. }) {
+        let table = session.constraint_catalog_engine(&constraint_relation_keys(request)).map_err(core)?;
+        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+    }
+    if let CatalogRequest::DropTable { table: name, cascade } | CatalogRequest::DropIndex { name, cascade } = request {
+        let is_index = matches!(request, CatalogRequest::DropIndex { .. });
+        let (table, index_id) = session.drop_catalog_engine(native_relation_key(name), *cascade, is_index).map_err(core)?;
+        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        return Ok(CatalogOutcome { catalog_epoch, table, index_id });
+    }
+    if let CatalogRequest::AlterTable { table, action } = request {
+        let table = session.alter_table_engine(native_relation_key(table), action.clone()).map_err(core)?;
+        let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+        return Ok(CatalogOutcome { catalog_epoch, table, index_id: None });
+    }
+    let index_id;
+    let table_name;
+    if let CatalogRequest::CreateIndex {
+        table,
+        name,
+        columns,
+    } = request
+    {
+        let definition = session.native_table_engine(&native_relation_key(table)).map_err(core)?;
+        let ids = columns
+            .iter()
+            .map(|name| {
+                definition
+                    .columns
+                    .iter()
+                    .find(|c| c.name == *name)
+                    .map(|c| c.id)
+                    .ok_or_else(|| core(CoreError::Sql(SqlError::UnknownColumn)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        index_id = Some(create_index(session, &definition, name, &ids).map_err(core)?);
+        table_name = native_relation_key(table);
+    } else {
+        let CatalogRequest::CreateTable {
+            table,
+            columns,
+            primary_key,
+        } = request
+        else {
+            unreachable!()
+        };
+        let (defaults, sequences) = native_options(columns)?;
+        session
+            .create_table_defaults_engine(
+                session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?,
+                columns_for_create(columns),
+                primary_key.clone(),
+                defaults, sequences,
+            )
+            .map_err(core)?;
+        table_name = session.native_creation_key_engine(&native_relation_key(table)).map_err(core)?;
+        index_id = None;
+    }
+    let (catalog_epoch, _) = session.catalog_engine().map_err(core)?;
+    let table = session.native_table_engine(&table_name).map_err(core)?;
+    Ok(CatalogOutcome {
+        catalog_epoch,
+        table,
+        index_id,
+    })
 }
 
 #[cfg(test)]

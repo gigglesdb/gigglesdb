@@ -1412,11 +1412,16 @@ impl Parser {
         }
         let mut columns = Vec::new();
         let mut primary_key = None;
+        let mut constraints = Vec::new();
         loop {
             let key_clause = matches!(&self.tokens[self.pos..],
                 [(Token::Word(primary), _), (Token::Word(key), _), ..]
                     if primary == "primary" && key == "key");
-            if key_clause {
+            if self.version.supports_r2_wave3() && self.table_foreign_key_ahead() {
+                if constraints.len() >= giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
+                let name = if self.word("constraint") { Some(self.name()?) } else { None };
+                constraints.push(TableConstraint { name, constraint: self.catalog_constraint()? });
+            } else if key_clause {
                 if primary_key.is_some() {
                     return Err(self.error());
                 }
@@ -1439,7 +1444,15 @@ impl Parser {
                 if columns.len() >= giggles_core::relational::MAX_COLUMNS {
                     return Err(Error::Limit);
                 }
-                columns.push(self.table_column()?);
+                let column = self.table_column()?;
+                // Column REFERENCES: `[CONSTRAINT n] REFERENCES p [(c)] [ON ...]`, repeatable.
+                while self.version.supports_r2_wave3() && self.column_reference_ahead() {
+                    if constraints.len() >= giggles_core::relational::MAX_COLUMNS { return Err(Error::Limit); }
+                    let name = if self.word("constraint") { Some(self.name()?) } else { None };
+                    self.need("references")?;
+                    constraints.push(TableConstraint { name, constraint: self.references_tail(vec![column.column.name.clone()])? });
+                }
+                columns.push(column);
             }
             if !self.symbol(',') {
                 break;
@@ -1449,11 +1462,21 @@ impl Parser {
             return Err(self.error());
         }
         let primary_key = primary_key.ok_or_else(|| self.error())?;
-        if columns.iter().any(|c| c.default.is_some() || c.generated.is_some()) {
-            Ok(CatalogStatement::CreateTableWith { table, columns, primary_key, constraints: vec![] })
+        if !constraints.is_empty() || columns.iter().any(|c| c.default.is_some() || c.generated.is_some()) {
+            Ok(CatalogStatement::CreateTableWith { table, columns, primary_key, constraints })
         } else {
             Ok(CatalogStatement::CreateTable { table, columns: columns.into_iter().map(|c| c.column).collect(), primary_key })
         }
+    }
+    /// `FOREIGN KEY` or `CONSTRAINT n FOREIGN` starts a CREATE TABLE element.
+    fn table_foreign_key_ahead(&self) -> bool {
+        let word = |i: usize, w: &str| matches!(self.tokens.get(self.pos + i), Some((Token::Word(x), _)) if x == w);
+        (word(0, "foreign") && word(1, "key")) || (word(0, "constraint") && word(2, "foreign"))
+    }
+    /// `REFERENCES` or `CONSTRAINT n REFERENCES` follows a CREATE TABLE column.
+    fn column_reference_ahead(&self) -> bool {
+        let word = |i: usize, w: &str| matches!(self.tokens.get(self.pos + i), Some((Token::Word(x), _)) if x == w);
+        word(0, "references") || (word(0, "constraint") && word(2, "references"))
     }
     fn constraint_columns(&mut self) -> Result<Vec<String>> {
         if !self.symbol('(') { return Err(self.error()); }
@@ -1485,6 +1508,10 @@ impl Parser {
         self.need("foreign")?; self.need("key")?;
         let columns = self.constraint_columns()?;
         self.need("references")?;
+        self.references_tail(columns)
+    }
+    /// `p [(c, ...)] [ON DELETE a] [ON UPDATE a]` after REFERENCES (ALTER TABLE and CREATE TABLE).
+    fn references_tail(&mut self, columns: Vec<String>) -> Result<ConstraintSpec> {
         let ref_table = self.relation_name()?;
         let ref_columns = if matches!(self.tokens.get(self.pos), Some((Token::Symbol('('), _))) { Some(self.constraint_columns()?) } else { None };
         let (mut on_delete, mut on_update) = (None, None);
